@@ -42,7 +42,7 @@ use write_set::{derive_plan, invariant_pins, no_change, resource_stalled, Derive
 /// A complete projected write set awaiting independent invariant verification.
 #[derive(Clone, Debug)]
 pub(crate) struct PlanCandidate {
-    pub(super) before: EngineSnapshot,
+    pub(super) snapshot_before_commit: EngineSnapshot,
     pub(super) change_set: ChangeSet,
     pub(super) graph_delta: GraphDelta,
     pub(super) domain: TransitionDomain,
@@ -73,10 +73,12 @@ pub(crate) struct TransitionPlan {
 }
 
 impl TransitionPlan {
+    /// Wrap a candidate that has already passed independent invariant verification.
     fn from_verified(candidate: PlanCandidate) -> Self {
         Self { candidate }
     }
 
+    /// Borrow the verified inner candidate (tests and fuzzing only).
     #[cfg(test)]
     pub(super) const fn candidate(&self) -> &PlanCandidate {
         &self.candidate
@@ -87,9 +89,9 @@ impl TransitionPlan {
         &self.candidate.change_set
     }
 
-    /// Return the coherent state observed before planning.
-    pub const fn before(&self) -> &EngineSnapshot {
-        &self.candidate.before
+    /// Return the snapshot before commit.
+    pub const fn snapshot_before_commit(&self) -> &EngineSnapshot {
+        &self.candidate.snapshot_before_commit
     }
 
     /// Return the submitted transition domain.
@@ -104,7 +106,8 @@ impl TransitionPlan {
 
     /// Return true when the evidence was valid but changed no durable fact.
     pub fn is_no_change(&self) -> bool {
-        self.candidate.before.state_version == self.candidate.change_set.metadata.state_version
+        self.candidate.snapshot_before_commit.state_version
+            == self.candidate.change_set.metadata.state_version
     }
 
     /// Return the opaque graph transition that matches the durable write set.
@@ -179,7 +182,7 @@ pub enum TransitionFailure {
 
 /// Derive one atomic transition without mutating the engine.
 ///
-/// Pure: freezes `engine` as the before-state, projects `input` under
+/// Pure: freezes `engine` as the snapshot before commit, projects `input` under
 /// `context`, and returns a [`TransitionPlan`] only after independent
 /// commit-time invariant verification. Failure is [`TransitionFailure`] with
 /// zero durable effects—distinct from a verified no-change plan.
@@ -194,20 +197,31 @@ pub(super) fn derive_transition_plan(
     Ok(TransitionPlan::from_verified(candidate))
 }
 
+/// Project `input` into an unverified [`PlanCandidate`] without mutating `engine`.
+///
+/// Callers must still run [`super::verify_candidate`]
+/// before treating the result as commit-capable.
 fn derive_plan_candidate(
     engine: &HeaderChainEngine,
     input: TransitionInput,
     context: &TransitionContext<'_>,
 ) -> Result<PlanCandidate, TransitionFailure> {
     // Phase 1: authenticate / admit
-    let (before, mut metadata, admitted) = authenticate_and_admit(engine, &input, context)?;
+    let (snapshot_before_commit, mut metadata, admitted) =
+        authenticate_and_admit(engine, &input, context)?;
 
     // Phase 2: bind replay and freshness
-    let bound = bind_replay_and_freshness(engine, &input, &before, &metadata, admitted)?;
+    let bound = bind_replay_and_freshness(
+        engine,
+        &input,
+        &snapshot_before_commit,
+        &metadata,
+        admitted,
+    )?;
     if let Some(effect) = bound.no_change_effect {
         return no_change(
             engine,
-            before,
+            snapshot_before_commit,
             metadata,
             bound.event,
             context,
@@ -228,7 +242,7 @@ fn derive_plan_candidate(
         engine,
         input: &input,
         transition: context,
-        before: &before,
+        snapshot_before_commit: &snapshot_before_commit,
         old_selected,
         migrated_pin_refuted: migrated_pin,
     };
@@ -239,7 +253,7 @@ fn derive_plan_candidate(
         engine,
         projected,
         metadata,
-        before: &before,
+        snapshot_before_commit: &snapshot_before_commit,
         event: &event,
         header_rebase: bound.header_rebase,
         context,
@@ -247,7 +261,7 @@ fn derive_plan_candidate(
     })?;
     let settled = match settlement {
         FinalityRetentionOutcome::ResourceStalled => {
-            return resource_stalled(engine, before, domain, context);
+            return resource_stalled(engine, snapshot_before_commit, domain, context);
         }
         FinalityRetentionOutcome::Settled(settled) => *settled,
     };
@@ -255,7 +269,7 @@ fn derive_plan_candidate(
     // Phase 5: assemble writes
     assemble_writes(
         engine,
-        before,
+        snapshot_before_commit,
         old_selected,
         old_verified,
         settled,
@@ -264,6 +278,7 @@ fn derive_plan_candidate(
     )
 }
 
+/// Admitted event after replay and freshness checks (or a short-circuit no-change).
 struct BoundRequest {
     event: crate::TransitionEvent,
     domain: TransitionDomain,
@@ -271,10 +286,15 @@ struct BoundRequest {
     no_change_effect: Option<TransitionEffect>,
 }
 
+/// Check replay identity, async ownership, and version freshness for an admitted request.
+///
+/// Returns `no_change_effect` when the event matches the last committed fingerprint or the
+/// header is already present; otherwise returns the event for further planning. Conflicting
+/// replay keys or stale versions fail.
 fn bind_replay_and_freshness(
     engine: &HeaderChainEngine,
     input: &TransitionInput,
-    before: &EngineSnapshot,
+    snapshot_before_commit: &EngineSnapshot,
     metadata: &crate::EngineMetadata,
     request: AdmittedRequest,
 ) -> Result<BoundRequest, TransitionFailure> {
@@ -283,12 +303,13 @@ fn bind_replay_and_freshness(
         expected_version,
     } = request;
     let domain = event.domain();
-    let header_rebase = rebase_header_insertion(&mut event, before, engine.graph(), input)?;
+    let header_rebase =
+        rebase_header_insertion(&mut event, snapshot_before_commit, engine.graph(), input)?;
     if let Some(owner) = event.header_sync_owner() {
-        validate_header_sync_owner(owner, before)?;
+        validate_header_sync_owner(owner, snapshot_before_commit)?;
     }
     if let Some(owner) = event.body_owner() {
-        validate_body_owner(owner, before)?;
+        validate_body_owner(owner, snapshot_before_commit)?;
     }
 
     let fingerprint = event.fingerprint();
@@ -311,12 +332,12 @@ fn bind_replay_and_freshness(
     if !has_async_authority {
         let Some(expected_version) = expected_version else {
             return Err(TransitionFailure::Stale {
-                current: before.state_version,
+                current: snapshot_before_commit.state_version,
             });
         };
-        if expected_version != before.state_version {
+        if expected_version != snapshot_before_commit.state_version {
             return Err(TransitionFailure::Stale {
-                current: before.state_version,
+                current: snapshot_before_commit.state_version,
             });
         }
     }
@@ -329,9 +350,10 @@ fn bind_replay_and_freshness(
     })
 }
 
+/// Assemble the durable write set and graph delta from a fully settled projection.
 fn assemble_writes<'a>(
     engine: &'a HeaderChainEngine,
-    before: EngineSnapshot,
+    snapshot_before_commit: EngineSnapshot,
     old_selected: &'a [Frontier],
     old_verified: &'a [Frontier],
     settled: settlement::SettledTransition<'a>,
@@ -347,7 +369,7 @@ fn assemble_writes<'a>(
         metadata,
     } = settled;
     derive_plan(DerivePlanInputs {
-        before,
+        snapshot_before_commit,
         metadata,
         base_graph: engine.graph(),
         projected,

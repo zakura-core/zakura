@@ -20,7 +20,7 @@ pub(in crate::transition::planner) struct ApplyEventContext<'a> {
     pub(super) engine: &'a HeaderChainEngine,
     pub(super) input: &'a TransitionInput,
     pub(super) transition: &'a TransitionContext<'a>,
-    pub(super) before: &'a EngineSnapshot,
+    pub(super) snapshot_before_commit: &'a EngineSnapshot,
     pub(super) old_selected: &'a [Frontier],
     pub(super) migrated_pin_refuted: Option<Frontier>,
 }

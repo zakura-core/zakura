@@ -20,10 +20,10 @@ fn committed_transition_reports_a_stale_source_without_panicking() {
     let mut engine = test_engine(&store);
     let first = engine
         .plan_transition(input(), &context(&config, &clock, None))
-        .expect("the first transition plans from the source snapshot");
+        .expect("the first transition plans from the snapshot before commit");
     let stale = engine
         .plan_transition(input(), &context(&config, &clock, None))
-        .expect("the second transition plans from the same source snapshot");
+        .expect("the second transition plans from the same snapshot before commit");
 
     engine
         .install_committed_transition(first)
@@ -220,9 +220,9 @@ fn committed_transition_applies_to_a_cloned_source_engine() {
         )
         .expect("the stateful engine plans the insertion");
 
-    assert_eq!(transition.before(), &before);
+    assert_eq!(transition.snapshot_before_commit(), &before);
     assert_ne!(
-        transition.after().state_version,
+        transition.snapshot_after_commit().state_version,
         before.state_version,
         "a state-changing insertion advances the durable version"
     );
@@ -231,7 +231,7 @@ fn committed_transition_applies_to_a_cloned_source_engine() {
         before,
         "planning must leave the source engine unchanged"
     );
-    let expected = transition.after();
+    let expected = transition.snapshot_after_commit();
     let mut projected = engine.clone();
     projected
         .install_committed_transition(transition)

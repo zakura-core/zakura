@@ -838,7 +838,7 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
         };
         match apply_transition(&store, request, &context) {
             Ok(plan) => {
-                assert_eq!(plan.before(), &before);
+                assert_eq!(plan.snapshot_before_commit(), &before);
                 let no_change = plan.is_no_change();
                 let eligibility_changed = !plan.change_set().eligibility_changes.is_empty();
                 let header_graph_changed = !plan.change_set().index_changes.inserted.is_empty()
@@ -1194,7 +1194,7 @@ fn assert_incident_recovery() -> [u8; 32] {
     };
     let held_a_plan = apply_transition(&store, late_a.clone(), &held_context)
         .expect("A's held insertion is valid before B replaces it");
-    assert_eq!(held_a_plan.before(), &store.snapshot());
+    assert_eq!(held_a_plan.snapshot_before_commit(), &store.snapshot());
 
     let losing_b = commit_fixture_insertion(&mut store, &clock, &authority, anchor, 2, 102, 0xb1);
     assert_eq!(
@@ -1475,7 +1475,7 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
         let plan = apply_transition(&store, request, &context)
             .expect("every typed payload mismatch is informational to the header DAG");
         assert!(plan.is_no_change());
-        assert_eq!(plan.before(), &before);
+        assert_eq!(plan.snapshot_before_commit(), &before);
         assert_eq!(retained_digest(&store), before_digest);
         hasher.update([match kind {
             BodyCommitmentKind::HeaderHash => 0,

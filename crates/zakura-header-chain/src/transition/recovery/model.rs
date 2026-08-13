@@ -14,7 +14,7 @@ use super::contracts::{AuditViolation, StoreAuditRead, ValidationContextRecord};
 
 /// Exhaustive durable rows loaded before any authoritative audit.
 pub(super) struct StoreImage {
-    pub(super) before: EngineSnapshot,
+    pub(super) snapshot_before_repair: EngineSnapshot,
     pub(super) metadata: EngineMetadata,
     pub(super) source_nodes: Vec<HeaderNode>,
     pub(super) tombstones: Vec<ConsensusInvalidBodyTombstone>,
@@ -25,7 +25,7 @@ pub(super) struct StoreImage {
 
 /// Authoritative source that passed fail-closed audit.
 pub(super) struct AuditedSource {
-    pub(super) before: EngineSnapshot,
+    pub(super) snapshot_before_repair: EngineSnapshot,
     pub(super) metadata: EngineMetadata,
     pub(super) source_nodes: Vec<HeaderNode>,
     pub(super) tombstones: Vec<ConsensusInvalidBodyTombstone>,
@@ -57,11 +57,11 @@ pub(super) fn load_store_image<S: StoreAuditRead>(
     config: &EngineConfig,
     allow_trust_anchor_update: bool,
 ) -> Result<StoreImage, StoreError> {
-    let before = store.snapshot()?;
+    let snapshot_before_repair = store.snapshot()?;
     let metadata = store.metadata()?;
     let mut early_violations = Vec::new();
     let trust_anchor_changed = metadata.anchor_manifest_digest != config.trust_anchor_digest();
-    if before != metadata.snapshot()
+    if snapshot_before_repair != metadata.snapshot()
         || metadata.disk_format.0 != 1
         || metadata.mode != config.mode
         || metadata.network_id != config.network.kind()
@@ -109,7 +109,7 @@ pub(super) fn load_store_image<S: StoreAuditRead>(
     }
     let validation_contexts = store.validation_context_records()?;
     Ok(StoreImage {
-        before,
+        snapshot_before_repair,
         metadata,
         source_nodes,
         tombstones,

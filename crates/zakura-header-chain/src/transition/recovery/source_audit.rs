@@ -23,7 +23,7 @@ pub(super) fn audit_authoritative<S: StoreAuditRead>(
     now: DateTime<Utc>,
 ) -> Result<AuditedSource, RecoveryFailure> {
     let StoreImage {
-        before,
+        snapshot_before_repair,
         metadata,
         source_nodes,
         tombstones,
@@ -91,7 +91,7 @@ pub(super) fn audit_authoritative<S: StoreAuditRead>(
         return Err(RecoveryFailure::Source { violations });
     }
     Ok(AuditedSource {
-        before,
+        snapshot_before_repair,
         metadata,
         source_nodes,
         tombstones,

@@ -384,8 +384,8 @@ fn finalization_and_replacement_match_serial_histories() {
         &context(&config, &clock, Some(&authority)),
     )
     .expect("finalization can pause after planning");
-    assert_eq!(held_replacement_plan.before(), &base.snapshot());
-    assert_eq!(held_finality_plan.before(), &base.snapshot());
+    assert_eq!(held_replacement_plan.snapshot_before_commit(), &base.snapshot());
+    assert_eq!(held_finality_plan.snapshot_before_commit(), &base.snapshot());
 
     let mut replacement_then_finality = base.clone();
     let replacement_plan = apply_transition(

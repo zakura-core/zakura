@@ -153,7 +153,7 @@ pub(super) fn apply(
                 || event.aux[0].tree_aux.is_none()
                 || selected_target != parent
                 || event.owner.header_authority().branch.target_tip_hash
-                    != event_context.before.frontiers.header_best.hash
+                    != event_context.snapshot_before_commit.frontiers.header_best.hash
                 || event_context
                     .old_selected
                     .iter()

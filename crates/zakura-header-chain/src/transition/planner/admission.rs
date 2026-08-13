@@ -40,9 +40,9 @@ pub(super) fn authenticate_and_admit(
     input: &TransitionInput,
     context: &TransitionContext<'_>,
 ) -> Result<(EngineSnapshot, EngineMetadata, AdmittedRequest), TransitionFailure> {
-    let before = engine.snapshot();
+    let snapshot_before_commit = engine.snapshot();
     let metadata = engine.metadata().clone();
-    validate_snapshot(&before, &metadata, context)?;
+    validate_snapshot(&snapshot_before_commit, &metadata, context)?;
     if context.retention_references.len() > context.config.limits.max_retention_references.get() {
         return Err(
             InvalidTransitionEvidence::Limit(LimitViolation::RetentionReferencesExceeded).into(),
@@ -52,7 +52,7 @@ pub(super) fn authenticate_and_admit(
     validate_event_resource_bounds(engine, &event, context.config.limits)?;
     validate_authority(&event, context)?;
     Ok((
-        before,
+        snapshot_before_commit,
         metadata,
         AdmittedRequest {
             event,
@@ -171,17 +171,19 @@ pub(super) fn validate_authority(
 
 pub(super) fn validate_header_sync_owner(
     owner: HeaderSyncWorkOwner,
-    before: &EngineSnapshot,
+    snapshot_before_commit: &EngineSnapshot,
 ) -> Result<(), TransitionFailure> {
     let header = owner.header_authority();
-    if header.header_generation != before.header_generation
+    if header.header_generation != snapshot_before_commit.header_generation
         || owner
             .body_authority()
-            .is_some_and(|authority| authority.verified_generation != before.verified_generation)
-        || header.branch.anchor_hash != before.frontiers.finalized.hash
+            .is_some_and(|authority| {
+                authority.verified_generation != snapshot_before_commit.verified_generation
+            })
+        || header.branch.anchor_hash != snapshot_before_commit.frontiers.finalized.hash
     {
         return Err(TransitionFailure::Stale {
-            current: before.state_version,
+            current: snapshot_before_commit.state_version,
         });
     }
     Ok(())
@@ -189,14 +191,14 @@ pub(super) fn validate_header_sync_owner(
 
 pub(super) fn validate_body_owner(
     owner: BodyWorkOwner,
-    before: &EngineSnapshot,
+    snapshot_before_commit: &EngineSnapshot,
 ) -> Result<(), TransitionFailure> {
-    if owner.header_generation != before.header_generation
-        || owner.verified_generation != before.verified_generation
-        || owner.branch.anchor_hash != before.frontiers.finalized.hash
+    if owner.header_generation != snapshot_before_commit.header_generation
+        || owner.verified_generation != snapshot_before_commit.verified_generation
+        || owner.branch.anchor_hash != snapshot_before_commit.frontiers.finalized.hash
     {
         return Err(TransitionFailure::Stale {
-            current: before.state_version,
+            current: snapshot_before_commit.state_version,
         });
     }
     Ok(())

@@ -15,7 +15,7 @@ pub(super) fn classify_and_plan<S: StoreAuditRead>(
     config: &EngineConfig,
 ) -> Result<RecoveryPlan, RecoveryFailure> {
     let AuditedSource {
-        before,
+        snapshot_before_repair,
         mut metadata,
         trust_anchor_changed,
         ..
@@ -94,7 +94,7 @@ pub(super) fn classify_and_plan<S: StoreAuditRead>(
     }
 
     Ok(RecoveryPlan {
-        before,
+        snapshot_before_repair,
         metadata,
         header_nodes,
         header_child_edges,

@@ -31,7 +31,7 @@ pub enum EngineHydrationError {
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CommittedTransitionError {
     /// Another transition changed the engine after the planner created this transition.
-    #[error("committed header transition no longer matches its source snapshot")]
+    #[error("committed header transition no longer matches its snapshot before commit")]
     StaleSource,
     /// The graph rejected the verified delta.
     #[error(transparent)]
@@ -380,7 +380,7 @@ impl HeaderChainEngine {
     /// Callers own everything after this returns: persist
     /// [`EngineTransition::change_set`], then
     /// [`Self::install_committed_transition`], then publish
-    /// [`EngineTransition::after`]. This method never writes durable state or
+    /// [`EngineTransition::snapshot_after_commit`]. This method never writes durable state or
     /// publishes watches.
     ///
     /// # Returns
@@ -396,7 +396,7 @@ impl HeaderChainEngine {
     /// # Install contract
     ///
     /// Install succeeds only if this engine's snapshot is still
-    /// [`EngineTransition::before`]. Concurrent commits make the plan stale;
+    /// [`EngineTransition::snapshot_before_commit`]. Concurrent commits make the plan stale;
     /// re-plan against the current engine rather than forcing install.
     pub fn plan_transition(
         &self,
@@ -411,7 +411,7 @@ impl HeaderChainEngine {
     ///
     /// Callers must already have persisted [`EngineTransition::change_set`].
     /// This advances the in-memory engine only; it does not write durable state
-    /// or publish watches—publish [`EngineTransition::after`] after success.
+    /// or publish watches—publish [`EngineTransition::snapshot_after_commit`] after success.
     ///
     /// # Returns
     ///
@@ -426,7 +426,7 @@ impl HeaderChainEngine {
         &mut self,
         transition: EngineTransition,
     ) -> Result<(), CommittedTransitionError> {
-        if self.snapshot() != *transition.before() {
+        if self.snapshot() != *transition.snapshot_before_commit() {
             return Err(CommittedTransitionError::StaleSource);
         }
         self.apply_verified_plan(&transition.plan)?;
@@ -435,7 +435,7 @@ impl HeaderChainEngine {
 
     /// Apply a verified plan's write set to this engine's in-memory state.
     ///
-    /// Caller must have already checked the source snapshot; graph apply is the
+    /// Caller must have already checked the snapshot before commit; graph apply is the
     /// only fallible step and leaves the engine unchanged on error.
     fn apply_verified_plan(&mut self, plan: &TransitionPlan) -> Result<(), GraphError> {
         self.graph.apply_delta(plan.graph_delta())?;
@@ -504,13 +504,13 @@ pub struct EngineTransition {
 }
 
 impl EngineTransition {
-    /// Return the coherent state observed before planning.
-    pub const fn before(&self) -> &EngineSnapshot {
-        self.plan.before()
+    /// Return the snapshot before commit.
+    pub const fn snapshot_before_commit(&self) -> &EngineSnapshot {
+        self.plan.snapshot_before_commit()
     }
 
-    /// Return the coherent state that exists after this transition commits.
-    pub fn after(&self) -> EngineSnapshot {
+    /// Return the snapshot after commit.
+    pub fn snapshot_after_commit(&self) -> EngineSnapshot {
         self.plan.change_set().metadata.snapshot()
     }
 

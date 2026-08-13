@@ -21,7 +21,7 @@ pub(super) struct SettlementInputs<'engine, 'ctx> {
     pub(super) engine: &'engine HeaderChainEngine,
     pub(super) projected: ProjectedTransitionState<'engine>,
     pub(super) metadata: EngineMetadata,
-    pub(super) before: &'ctx EngineSnapshot,
+    pub(super) snapshot_before_commit: &'ctx EngineSnapshot,
     pub(super) event: &'ctx TransitionEvent,
     pub(super) header_rebase: HeaderInsertionRebase,
     pub(super) context: &'ctx TransitionContext<'ctx>,
@@ -60,7 +60,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         engine,
         mut projected,
         mut metadata,
-        before,
+        snapshot_before_commit,
         event,
         header_rebase,
         context,
@@ -92,7 +92,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
 
     let mut finality = None;
     if let Some((new_finalized, evidence)) = full_state_finalized {
-        if new_finalized.height < before.frontiers.finalized.height {
+        if new_finalized.height < snapshot_before_commit.frontiers.finalized.height {
             return Err(InvalidTransitionEvidence::Finality(FinalityViolation::Retreated).into());
         }
         if !projected.verified().contains(&new_finalized) {
@@ -186,7 +186,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
 
     header_best = projected.graph().view_select_best_header_chain()?.0;
     let selected = if effect.is_checkpoint_finality()
-        && header_best == before.frontiers.header_best
+        && header_best == snapshot_before_commit.frontiers.header_best
         && finality_append.is_some_and(|record| {
             old_selected
                 .binary_search_by_key(&record.current.height, |frontier| frontier.height)

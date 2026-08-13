@@ -376,7 +376,7 @@ fn graph_boundary_and_transition_invariants_reject_corruption() {
     );
 
     let mut corrupt = plan.clone();
-    corrupt.change_set.metadata.header_generation = plan.before.header_generation;
+    corrupt.change_set.metadata.header_generation = plan.snapshot_before_commit.header_generation;
     assert_eq!(
         verify_plan(&test_engine(&store), &corrupt),
         Err(InvariantViolation::Generation)

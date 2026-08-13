@@ -20,7 +20,7 @@ use super::{
 
 /// Inputs required to derive the atomic write set from settled projections.
 pub(super) struct DerivePlanInputs<'a> {
-    pub(super) before: EngineSnapshot,
+    pub(super) snapshot_before_commit: EngineSnapshot,
     pub(super) metadata: EngineMetadata,
     pub(super) base_graph: &'a MemHeaderStore,
     pub(super) projected: SettledProjectedState<'a>,
@@ -41,7 +41,7 @@ pub(super) fn derive_plan(
     inputs: DerivePlanInputs<'_>,
 ) -> Result<PlanCandidate, TransitionFailure> {
     let DerivePlanInputs {
-        before,
+        snapshot_before_commit,
         mut metadata,
         base_graph,
         projected,
@@ -102,7 +102,7 @@ pub(super) fn derive_plan(
         BodyValidationState::Unavailable(summary) if summary.alarmed => Some(*summary),
         _ => None,
     };
-    let alarm_changed = metadata.alarms != before.alarms;
+    let alarm_changed = metadata.alarms != snapshot_before_commit.alarms;
     let changed = !put_nodes.is_empty()
         || !delete_nodes.is_empty()
         || !aux_changes.is_empty()
@@ -147,8 +147,8 @@ pub(super) fn derive_plan(
             .iter()
             .map(|node| node.height)
             .min()
-            .map_or(before.oldest_retained_height, |height| {
-                height.min(before.oldest_retained_height)
+            .map_or(snapshot_before_commit.oldest_retained_height, |height| {
+                height.min(snapshot_before_commit.oldest_retained_height)
             })
     } else {
         graph
@@ -179,7 +179,7 @@ pub(super) fn derive_plan(
         metadata,
     };
     Ok(PlanCandidate {
-        before,
+        snapshot_before_commit,
         change_set,
         graph_delta,
         domain,
@@ -192,7 +192,7 @@ pub(super) fn derive_plan(
 /// Construct a zero-effect plan after re-checking authority.
 pub(super) fn no_change(
     engine: &HeaderChainEngine,
-    before: EngineSnapshot,
+    snapshot_before_commit: EngineSnapshot,
     metadata: EngineMetadata,
     event: TransitionEvent,
     context: &TransitionContext<'_>,
@@ -201,7 +201,7 @@ pub(super) fn no_change(
 ) -> Result<PlanCandidate, TransitionFailure> {
     validate_authority(&event, context)?;
     Ok(PlanCandidate {
-        before,
+        snapshot_before_commit,
         change_set: ChangeSet {
             put_nodes: Vec::new(),
             delete_nodes: Vec::new(),
@@ -225,7 +225,7 @@ pub(super) fn no_change(
 /// Construct an alarm-only resource-stall plan that discards staged event effects.
 pub(super) fn resource_stalled(
     engine: &HeaderChainEngine,
-    before: EngineSnapshot,
+    snapshot_before_commit: EngineSnapshot,
     domain: TransitionDomain,
     context: &TransitionContext<'_>,
 ) -> Result<PlanCandidate, TransitionFailure> {
@@ -235,7 +235,7 @@ pub(super) fn resource_stalled(
         metadata.state_version = metadata.state_version.checked_next()?;
     }
     Ok(PlanCandidate {
-        before,
+        snapshot_before_commit,
         change_set: ChangeSet {
             put_nodes: Vec::new(),
             delete_nodes: Vec::new(),

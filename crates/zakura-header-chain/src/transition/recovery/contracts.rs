@@ -125,7 +125,7 @@ pub enum RecoveryRepair {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryPlan {
     /// Snapshot that recovery observed before repair.
-    pub before: EngineSnapshot,
+    pub snapshot_before_repair: EngineSnapshot,
     /// Corrected metadata with counters advanced exactly once when required.
     pub metadata: EngineMetadata,
     /// Header nodes with reconstructed inherited eligibility caches.

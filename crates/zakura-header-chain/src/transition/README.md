@@ -22,7 +22,8 @@ corresponding engine state is ready to publish.
 
 - the retained header DAG and auxiliary deliveries;
 - the **selected projection**, the strongest eligible header path; and
-- the **verified projection**, the contiguous path accepted by full state.
+- the **verified projection**, the contiguous full-state-accepted path in
+  integrated mode, or just finality in headers-only mode.
 
 Selected and verified are deliberately separate. Full state can verify a weaker
 side path without replacing the greater-work header winner. Finality anchors
@@ -36,7 +37,7 @@ durable writes, async scheduling, or publication.
 
 | Abstraction | Role |
 | --- | --- |
-| `TransitionEvent` / `TransitionRequest` | Claimed facts about completed work, never requested consequences |
+| `TransitionEvent` / `TransitionRequest` | Evidence or commands describing the trigger, never caller-selected consequences |
 | `TransitionInput` | One event plus only the durable facts that variant may consume |
 | `TransitionContext` | Frozen config, authoritative clock, capability provider, and active retention references |
 | `HeaderChainEngine` | Coherent graph and projections; owns transition policy |
@@ -44,7 +45,7 @@ durable writes, async scheduling, or publication.
 | `ChangeSet` | Complete atomic header-chain write set |
 | `EngineSnapshot` | Externally meaningful metadata view to publish after commit |
 | `ApplyResult` | Adapter receipt: committed, no-change, stale, or resource-stalled |
-| `RecoveryPlan` | Audited, deterministic repair of reconstructible durable views |
+| `RecoveryPlan` | Audited startup repair and hydration plan, deterministic for a given store, config, and recovery time |
 
 The state adapter is the trust boundary. It authenticates higher-level work,
 loads event-specific durable rows, supplies capabilities and local time, and
@@ -81,7 +82,7 @@ Planning has six phases:
 1. **Authenticate and admit.** Check configuration, mode, capabilities, bounded
    input, and event-specific preconditions.
 2. **Bind replay and freshness.** Validate the event's state version or async
-   work owner, and recognize exact adjacent replay.
+   work owner, and recognize an exact replay in the current fingerprint slot.
 3. **Project the evidence.** Stage graph, body, eligibility, and auxiliary
    changes in a copy-on-write view; the engine remains unchanged.
 4. **Settle global policy.** Recompute verified and selected paths as needed,
@@ -105,7 +106,7 @@ not a forced install, restores one coherent state.
 ### Runtime exceptions to the ordinary path
 
 - A header-chain no-change may still accompany an atomic full-state write and
-  memory swap; it means only that the header-chain `ChangeSet` is empty.
+  memory swap; it means only that the header chain has no durable effect.
 - Repeating a resource stall whose alarm is already durable performs no write
   and publishes nothing.
 - The combined auxiliary-authentication/checkpoint path privately stages the
@@ -121,9 +122,10 @@ not a forced install, restores one coherent state.
 Admission is event-specific. Integrated full-state events require integrated
 mode and exact full-state authority; operator retries require scheduler
 authority; header completions require registered completion authority.
-Deferred-time reevaluation is mode-independent. Prepared headers and validation
-leases are still rechecked against canonical hashes, ancestry, network,
-trust-anchor, difficulty, time, ownership, and provenance.
+Deferred-time reevaluation is mode-independent. Prepared headers are rechecked
+for identity, ancestry, configuration, contextual difficulty/time, and
+ownership. Validation leases are checked for network/trust-anchor binding,
+hash/ancestry coherence, overlap, and adapter authority.
 
 Freshness has two forms:
 
@@ -137,11 +139,13 @@ prove that finality advanced monotonically over its prepared range. The planner
 then trims the consumed prefix, rebinds the suffix, or reports the work already
 applied. Missing or contradictory history is stale.
 
-Replay protection stores only the most recent state-changing fingerprint. Exact
-adjacent replay is a verified no-change even if its version is old, but it must
-still pass authority checks. Reusing the same domain-local key for a different
-payload fails as `ConflictingReplay`; evidence older than an intervening commit
-is planned again. This is not a historical replay ledger.
+Replay protection stores the most recent fingerprint-bearing state-changing
+transition. An exact replay is a verified no-change even if its serialized
+version is old, but authority and asynchronous-owner freshness checks still
+apply. Reusing the current domain-local key for a different payload fails as
+`ConflictingReplay`. A later fingerprint-bearing commit replaces the slot;
+non-fingerprinted changes such as deferred reevaluation or a resource-stall
+alarm do not. This is not a historical replay ledger.
 
 `TransitionFailure::Stale` is the normal reload/reschedule result.
 `StalePreparation` is different: prepared work no longer matches its durable
@@ -189,12 +193,12 @@ signals; the coordinator must consume them and add any exact owners to retire.
 
 The durable write set distinguishes source of truth from caches:
 
-- **Authoritative:** nodes, permanent invalid-body tombstones, direct
-  eligibility reasons, auxiliary rows, finality history, and singleton
-  metadata.
-- **Reconstructible:** indexes, selected and verified projections, inherited
-  eligibility, retention metadata, and the selected-tip body-unavailability
-  alarm.
+- **Authoritative:** node source fields and direct eligibility reasons,
+  permanent invalid-body tombstones, auxiliary rows, finality history, and
+  non-derived singleton metadata.
+- **Reconstructible:** indexes; selected projection, frontier, and score;
+  verified projection; inherited eligibility; oldest-retained metadata; and the
+  selected-tip body-unavailability alarm.
 
 All fields must land in one transaction. Partial application is undefined.
 
@@ -212,9 +216,9 @@ All fields must land in one transaction. Partial application is undefined.
 `TransitionEffect` records orthogonal facts that may coexist: header-work
 rebase, finality advancement, auxiliary authentication, and resource stall.
 
-`MissingDurableFacts` means the adapter omitted required `TransitionInput` rows
-such as a validation lease, rebase history, or migrated pin. It is an adapter
-contract failure, not store I/O.
+`MissingDurableFacts` means required durable validation context could not be
+supplied or authenticated, such as a missing or incoherent validation lease. It
+is an adapter contract failure, not store I/O.
 
 ### Keep the three resource outcomes separate
 
@@ -239,10 +243,10 @@ classifies one atomic `RecoveryPlan`. Production startup uses
 trust-anchor-manifest digest rebind in addition to ordinary repairs.
 
 Recovery can rebuild indexes, projections, inherited eligibility, retention
-metadata, elapsed time deferrals, and the selected-tip body-unavailability
-alarm. It does not generically rebuild every alarm: resource-stall state
-participates in authoritative limit auditing, and migrated-pin refutation blocks
-startup.
+metadata, and the selected-tip body-unavailability alarm, and can promote
+elapsed time deferrals. It does not generically rebuild every alarm:
+resource-stall state participates in authoritative limit auditing, and
+migrated-pin refutation blocks startup.
 
 The adapter commits any repairs before hydrating `HeaderChainEngine` with
 `from_audited_state` and creating the publisher. `StoreAuditRead` must expose one
@@ -261,7 +265,8 @@ that durable state.
 - Selected and verified tips can legitimately name different forks.
 - A global version change does not necessarily stale generation-owned async
   work.
-- Replay protection remembers one adjacent fingerprint, not all prior events.
+- Replay protection remembers one current fingerprint slot, which
+  non-fingerprinted commits do not replace.
 - `RetiredWork::from_snapshots` reports generation changes; it does not itself
   cancel or retire coordinator work.
 

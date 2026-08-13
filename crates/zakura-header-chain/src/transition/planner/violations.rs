@@ -1,4 +1,4 @@
-//! Domain-specific invalid-evidence failures for the transition planner.
+//! Domain-specific violation taxonomy for the transition planner.
 
 use thiserror::Error;
 

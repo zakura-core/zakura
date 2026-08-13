@@ -22,7 +22,7 @@ pub use planner::{
     LimitViolation, OperatorViolation, PlannerCoherenceViolation, ProjectionKind,
     TransitionFailure,
 };
-pub(crate) use planner::{PlanCandidate, TransitionPlan};
+pub(crate) use planner::plan::{PlanCandidate, TransitionPlan};
 pub use recovery::{
     audit_store, audit_store_at, audit_store_for_trust_anchor_update, AuditViolation,
     RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead, ValidationContextRecord,

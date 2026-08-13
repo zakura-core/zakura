@@ -1434,10 +1434,18 @@ mod tests {
 
     #[test]
     fn production_planner_has_no_full_graph_clone_or_node_map_diff() {
-        let planner = include_str!("../transition/planner.rs");
-        assert!(!planner.contains("let mut graph = engine.graph().clone()"));
-        assert!(!planner.contains("fn node_map"));
-        assert!(!planner.contains("old_nodes"));
-        assert!(!planner.contains("new_nodes"));
+        // Guard the planner pipeline (facade + write-set assembly) against full-graph
+        // clone / node-map diff patterns; product types live in planner/plan.rs.
+        let planner_sources = [
+            include_str!("../transition/planner.rs"),
+            include_str!("../transition/planner/write_set.rs"),
+            include_str!("../transition/planner/replay.rs"),
+        ];
+        for planner in planner_sources {
+            assert!(!planner.contains("let mut graph = engine.graph().clone()"));
+            assert!(!planner.contains("fn node_map"));
+            assert!(!planner.contains("old_nodes"));
+            assert!(!planner.contains("new_nodes"));
+        }
     }
 }

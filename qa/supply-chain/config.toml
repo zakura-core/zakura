@@ -325,10 +325,6 @@ notes = "Audit hold: recursive directory enumeration follows directory symlinks,
 version = "0.2.13"
 criteria = "safe-to-deploy"
 
-[[exemptions.futures-channel]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
 [[exemptions.futures-lite]]
 version = "2.6.1"
 criteria = "safe-to-deploy"

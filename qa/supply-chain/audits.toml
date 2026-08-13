@@ -676,15 +676,15 @@ criteria = "safe-to-deploy"
 delta = "0.3.30 -> 0.3.31"
 
 [[audits.futures-channel]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.32"
+notes = "Reviewed all packaged source, manifest, channel state machines, lock-free MPSC queue, and tests. The try-lock serializes every UnsafeCell access with a SeqCst flag; oneshot send, receive, cancellation, and waker paths recheck their SeqCst completion flag around registration and data access. The MPSC queue publishes stub-linked nodes with Acquire/Release ordering and restricts popping and reclamation to the sole receiver, while channel counters and close state use SeqCst transitions. No build script, I/O, or ambient capability. All 49 active unit and integration tests and the doctest passed with all features, including the receiver-close race stress test."
+
+[[audits.futures-channel]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.30 -> 0.3.31"
-
-[[audits.futures-channel]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "0.3.31 -> 0.3.32"
-notes = "Reviewed the complete published-source delta and manifest changes. The new Recv future pins only an Unpin borrowed stream, try_recv delegates to the existing channel state machine, and the typed receive errors contain no executable behavior; no unsafe code, build script, I/O, or ambient capability was added. The all-feature library test passed. Packaged integration tests and the doctest reference futures and futures-test workspace dev dependencies omitted from the normalized manifest, so they could not compile from the archive."
 
 [[audits.futures-core]]
 who = "OpenAI Codex <noreply@openai.com>"

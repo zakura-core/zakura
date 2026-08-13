@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block},
     parameters::{testnet::RegtestParameters, Network},
@@ -215,6 +215,34 @@ fn invalid_version_is_rejected_before_link_hashing() {
             ..
         })
     ));
+}
+
+#[test]
+fn out_of_range_timestamp_is_reported_as_an_encoding_failure() {
+    let (rules, lease, anchor) = fixture();
+
+    for timestamp in [-1, i64::from(u32::MAX) + 1] {
+        let mut invalid = *child(lease.parent, &anchor, 1);
+        invalid.time = Utc
+            .timestamp_opt(timestamp, 0)
+            .single()
+            .expect("the test timestamp fits in chrono's supported range");
+        let invalid = Arc::new(invalid);
+
+        assert!(matches!(
+            prepare_headers(
+                HeaderBatchInput::new(std::slice::from_ref(&invalid)),
+                lease.parent(),
+                &rules,
+                &FixedClock(anchor.time),
+            ),
+            Err(HeaderFailure::Invalid {
+                offset: 0,
+                rule: HeaderRule::EncodingVersionHash,
+                ..
+            })
+        ));
+    }
 }
 
 #[test]

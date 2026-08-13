@@ -1,4 +1,5 @@
 use super::super::*;
+use chrono::{TimeZone, Utc};
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block},
     work::difficulty::{ExpandedDifficulty, U256},
@@ -21,7 +22,7 @@ fn canonical_version_hash_link_and_height_boundaries() {
     too_old.version = 3;
     assert!(matches!(
         validate_encoding_version_hash(&too_old),
-        Err(HeaderEncodingError { version: 3, .. })
+        Err(HeaderEncodingError::Version { version: 3, .. })
     ));
     let mut high_bit = header;
     high_bit.version = 1 << 31;
@@ -50,6 +51,22 @@ fn canonical_version_hash_link_and_height_boundaries() {
         infer_height(block::Height::MAX, None),
         Err(HeaderHeightError::Overflow(block::Height::MAX))
     );
+}
+
+#[test]
+fn out_of_range_timestamps_are_rejected_before_hashing() {
+    for timestamp in [-1, i64::from(u32::MAX) + 1] {
+        let mut header = *regtest_genesis_block().header;
+        header.time = Utc
+            .timestamp_opt(timestamp, 0)
+            .single()
+            .expect("the test timestamp fits in chrono's supported range");
+
+        assert_eq!(
+            validate_encoding_version_hash(&header),
+            Err(HeaderEncodingError::Timestamp { timestamp })
+        );
+    }
 }
 
 #[test]

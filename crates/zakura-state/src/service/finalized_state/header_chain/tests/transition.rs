@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn authenticated_full_state_retention_uses_only_the_staged_fork_set() {
+    let staged = [block::Hash([0x21; 32]), block::Hash([0x22; 32])];
+    let stale_lease = [block::Hash([0x20; 32])];
+
+    assert_eq!(
+        combined_retention_references(&staged, None).as_ref(),
+        staged,
+        "authenticated full state must be able to retire stale header leases"
+    );
+    assert_eq!(
+        combined_retention_references(&staged, Some(&stale_lease)).as_ref(),
+        [stale_lease[0], staged[0], staged[1]],
+        "ordinary transitions must preserve active header leases"
+    );
+}
+
+#[test]
 fn finality_rebase_reads_only_the_generation_bounded_recent_suffix() {
     let cache = tempfile::tempdir().expect("the test cache directory is created");
     let db_config = Config {

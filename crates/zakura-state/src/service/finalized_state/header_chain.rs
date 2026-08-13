@@ -3,6 +3,7 @@
 #![allow(dead_code)] // Constructed by the full-state migration and service wiring in PR-9.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
@@ -104,6 +105,24 @@ impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
     fn authorizes_validation_lease(&self, lease: &ValidationLease) -> bool {
         self.validation_leases.contains(lease)
     }
+}
+
+fn combined_retention_references<'a>(
+    context_references: &'a [block::Hash],
+    active_lease_references: Option<&'a [block::Hash]>,
+) -> Cow<'a, [block::Hash]> {
+    let Some(active_lease_references) = active_lease_references else {
+        return Cow::Borrowed(context_references);
+    };
+    if context_references.is_empty() {
+        return Cow::Borrowed(active_lease_references);
+    }
+
+    let mut references = context_references.to_vec();
+    references.extend(active_lease_references.iter().copied());
+    references.sort_unstable_by_key(|hash| hash.0);
+    references.dedup();
+    Cow::Owned(references)
 }
 
 #[cfg(test)]
@@ -2251,22 +2270,26 @@ impl HeaderChainRuntime {
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let lease_references = self
-            .leases
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .active_references(Instant::now());
-        let merged_references;
-        let retention_references = if context.retention_references.is_empty() {
-            lease_references.as_ref()
+        let authoritative_full_state_fork_set = matches!(
+            &request.event,
+            TransitionEvent::VerifiedChainChanged(_) | TransitionEvent::VerifiedBlockAccepted(_)
+        ) && context
+            .full_state_authority
+            .is_some_and(|authority| authority.authorizes_full_state(&request.event));
+        let lease_references = if authoritative_full_state_fork_set {
+            None
         } else {
-            let mut references = context.retention_references.to_vec();
-            references.extend(lease_references.iter().copied());
-            references.sort_unstable_by_key(|hash| hash.0);
-            references.dedup();
-            merged_references = references;
-            merged_references.as_slice()
+            Some(
+                self.leases
+                    .lock()
+                    .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+                    .active_references(Instant::now()),
+            )
         };
+        let retention_references = combined_retention_references(
+            context.retention_references,
+            lease_references.as_deref(),
+        );
         #[cfg(test)]
         let test_header_authority = TestHeaderCompletionAuthority(context.full_state_authority);
         #[cfg(test)]
@@ -2277,7 +2300,7 @@ impl HeaderChainRuntime {
             config: context.config,
             clock: context.clock,
             full_state_authority,
-            retention_references,
+            retention_references: retention_references.as_ref(),
         };
         let before = transition_engine.snapshot();
         if let Some(pin) = before.alarms.migrated_pin_refuted {

@@ -175,8 +175,15 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         projected.force_headers_only_verified();
     }
 
+    let authoritative_full_state_fork_set = matches!(
+        event,
+        TransitionEvent::VerifiedChainChanged(_) | TransitionEvent::VerifiedBlockAccepted(_)
+    ) && context
+        .full_state_authority
+        .is_some_and(|authority| authority.authorizes_full_state(event));
     let retention = projected.enforce_retention(
         header_best,
+        !authoritative_full_state_fork_set,
         context.retention_references.iter().copied(),
         context.config.limits,
     )?;

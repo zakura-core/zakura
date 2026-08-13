@@ -680,6 +680,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.30 -> 0.3.31"
 
+[[audits.futures-channel]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.3.31 -> 0.3.32"
+notes = "Reviewed the complete published-source delta and manifest changes. The new Recv future pins only an Unpin borrowed stream, try_recv delegates to the existing channel state machine, and the typed receive errors contain no executable behavior; no unsafe code, build script, I/O, or ambient capability was added. The all-feature library test passed. Packaged integration tests and the doctest reference futures and futures-test workspace dev dependencies omitted from the normalized manifest, so they could not compile from the archive."
+
 [[audits.futures-core]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -868,6 +874,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.1.1"
 notes = "Reviewed all packaged source, manifest, and tests. This crate only wraps Duration and SystemTime parsing and formatting from separately policy-checked humantime in Serde traits. Unsafe code is forbidden and there is no build script, runtime I/O, or ambient capability. All 4 behavioral unit tests and 3 doctests passed; an upstream version-sync metadata test fails because html_root_url still names version 1.0 instead of 1.1."
+
+[[audits.hybrid-array]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.3"
+notes = "Reviewed all packaged source, generated size mappings, manifest, and tests. ArraySize is effectively sealed through typenum::Unsigned and maps each supported type-level size to the exact core array layout used by reference casts; fallible construction tracks and drops only initialized elements, slice conversions validate exact lengths, and split and flatten arithmetic remains bounded. Optional Serde, bytemuck, and zeroize implementations retain their element trait bounds, with no build script, I/O, or ambient capability. Default features passed 17 integration tests and 6 doctests; all features passed 20 tests and the same 6 doctests."
 
 [[audits.hyper]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1625,6 +1637,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.8.4 -> 0.8.5"
 
+[[audits.regex-syntax]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.8.5 -> 0.8.11"
+notes = "Reviewed the complete published-source delta and manifest changes. The optimized interval insertion preserves sorted non-overlapping canonical ranges by merging the predecessor and every overlapping successor, and Unicode property negation now uses the parsed class's effective negation state. Remaining changes are formatting, documentation, packaging, and tests. Unsafe code remains forbidden and no build script, I/O, or ambient capability was added. All 147 all-feature unit tests and 48 doctests passed."
+
 [[audits.resolv-conf]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1896,6 +1914,12 @@ criteria = "safe-to-deploy"
 version = "2.0.1"
 notes = "Reviewed all packaged source, manifests, tests, and quoting guidance. The string facade accepts valid UTF-8, the byte parser preserves multibyte sequences, and unchecked facade conversion APIs explicitly require that invariant before using unchecked UTF-8 conversions. Quoting is bounded by caller input, rejects NUL by default, and documents that control characters must not be sent to interactive shells or terminal input. The dependency-free library has no build script, runtime I/O, process execution, or ambient capabilities. All 7 unit tests and 1 doctest passed with both default and no-default features."
 
+[[audits.signal-hook-registry]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.4.8"
+notes = "Reviewed all packaged source, manifest, signal registration paths, lock-free reader synchronization, and tests. Registration is unsafe and documents callback signal-safety obligations; the handler performs only atomic reads, saved errno access, prior-handler and callback invocation, and async-signal-safe write or abort fallbacks. HalfLock serializes writers outside handlers, increments a reader counter before loading the published pointer, and delays reclamation until both generation counters have quiesced. There is no build script or authority beyond explicitly requested process signal registration. On Unix, all 14 unit and integration tests and 1 doctest passed."
+
 [[audits.simd-adler32]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2089,6 +2113,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.26.4"
 notes = "Reviewed all packaged source, manifest, client/server handshake state machines, stream adapters, and local tests. The crate contains no unsafe code or build script and performs I/O only through caller-supplied async streams while delegating TLS cryptography and protocol validation to separately policy-checked rustls providers. All 20 local default-provider tests and all 23 ring-provider tests passed against Zakura's rustls 0.23.41; external badssl network tests were not run. Enabling both providers simultaneously requires explicit rustls provider selection by design, which Zakura supplies when building its TLS configuration."
+
+[[audits.tokio-stream]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.18"
+notes = "Reviewed all packaged source, manifest, stream combinators, wrapper adapters, pin projections, and tests. The only explicit unsafe code marks Empty and Pending as Send and Sync although their phantom item types are never stored or produced; all stateful projections are generated over fields that remain pinned. Collection and timeout state transitions retain buffered values across Pending, while filesystem, network, signal, and channel wrappers act only on caller-supplied Tokio handles. There is no build script or implicit ambient access. All 70 active all-feature integration tests and 65 active doctests passed; 1 timing test and 6 illustrative doctests were intentionally ignored."
 
 [[audits.tokio-stream]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

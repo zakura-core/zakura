@@ -41,6 +41,33 @@ pub enum Error {
 #[error("solver was cancelled")]
 pub struct SolverCancelled;
 
+/// How a solver run should react to a change while it is in flight.
+#[cfg(feature = "internal-miner")]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SolverAction {
+    /// Keep hashing.
+    Continue,
+    /// Finish the current nonce, then stop before starting another one.
+    StopAtNonceBoundary,
+    /// Stop at the next digit boundary and discard the current nonce.
+    StopNow,
+}
+
+#[cfg(feature = "internal-miner")]
+fn should_cancel_at(
+    point: equihash_solver::tromp::CancellationPoint,
+    action: SolverAction,
+) -> bool {
+    matches!(
+        (point, action),
+        (_, SolverAction::StopNow)
+            | (
+                equihash_solver::tromp::CancellationPoint::NonceBoundary,
+                SolverAction::StopAtNonceBoundary,
+            )
+    )
+}
+
 /// The size of an Equihash solution in bytes (always 1344).
 pub(crate) const SOLUTION_SIZE: usize = 1344;
 
@@ -185,7 +212,7 @@ impl Solution {
     /// Mines and returns one or more [`Solution`]s based on a template `header`.
     /// The returned header contains a valid `nonce` and `solution`.
     ///
-    /// If `cancel_fn()` returns an error, returns early with `Err(SolverCancelled)`.
+    /// Returns early with `Err(SolverCancelled)` when `solver_action()` requests a stop.
     ///
     /// The `nonce` in the header template is taken as the starting nonce. If you are running multiple
     /// solvers at the same time, start them with different nonces.
@@ -197,10 +224,10 @@ impl Solution {
     #[allow(clippy::unwrap_in_result)]
     pub fn solve<F>(
         mut header: Header,
-        mut cancel_fn: F,
+        mut solver_action: F,
     ) -> Result<AtLeastOne<Header>, SolverCancelled>
     where
-        F: FnMut() -> Result<(), SolverCancelled>,
+        F: FnMut() -> SolverAction,
     {
         use crate::shutdown::is_shutting_down;
 
@@ -214,18 +241,38 @@ impl Solution {
 
         while !is_shutting_down() {
             // Don't run the solver if we'd just cancel it anyway.
-            cancel_fn()?;
+            if solver_action() != SolverAction::Continue {
+                return Err(SolverCancelled);
+            }
 
-            let solutions = equihash::tromp::solve_200_9(input, || {
-                // Cancel the solver if we have a new template.
-                if cancel_fn().is_err() {
-                    return None;
+            let solve_result = equihash_solver::tromp::solve_200_9_cancellable(
+                input,
+                || {
+                    // This skips the first nonce, which doesn't matter in practice.
+                    Self::next_nonce(&mut header.nonce);
+                    Some(*header.nonce)
+                },
+                |point| {
+                    if is_shutting_down() {
+                        return true;
+                    }
+
+                    should_cancel_at(point, solver_action())
+                },
+            );
+
+            let solutions = match solve_result.into_outcome() {
+                equihash_solver::tromp::CancellableSolveOutcome::Completed(solutions) => solutions,
+                equihash_solver::tromp::CancellableSolveOutcome::Cancelled => {
+                    return Err(SolverCancelled);
                 }
+            };
 
-                // This skips the first nonce, which doesn't matter in practice.
-                Self::next_nonce(&mut header.nonce);
-                Some(*header.nonce)
-            });
+            // Give an invalidating update precedence over a solution that raced
+            // with the callback after the final digit.
+            if solver_action() == SolverAction::StopNow {
+                return Err(SolverCancelled);
+            }
 
             let mut valid_solutions = Vec::new();
 
@@ -373,5 +420,40 @@ impl FromHex for Solution {
     fn from_hex<T: AsRef<[u8]>>(hex: T) -> Result<Self, Self::Error> {
         let bytes = Vec::from_hex(hex)?;
         Solution::from_bytes(&bytes).map_err(|_| FromHexError::InvalidStringLength)
+    }
+}
+
+#[cfg(all(test, feature = "internal-miner"))]
+mod tests {
+    use equihash_solver::tromp::CancellationPoint;
+
+    use super::{should_cancel_at, SolverAction};
+
+    #[test]
+    fn solver_actions_have_distinct_cancellation_boundaries() {
+        assert!(!should_cancel_at(
+            CancellationPoint::NonceBoundary,
+            SolverAction::Continue
+        ));
+        assert!(!should_cancel_at(
+            CancellationPoint::DigitBoundary,
+            SolverAction::Continue
+        ));
+        assert!(should_cancel_at(
+            CancellationPoint::NonceBoundary,
+            SolverAction::StopAtNonceBoundary
+        ));
+        assert!(!should_cancel_at(
+            CancellationPoint::DigitBoundary,
+            SolverAction::StopAtNonceBoundary
+        ));
+        assert!(should_cancel_at(
+            CancellationPoint::NonceBoundary,
+            SolverAction::StopNow
+        ));
+        assert!(should_cancel_at(
+            CancellationPoint::DigitBoundary,
+            SolverAction::StopNow
+        ));
     }
 }

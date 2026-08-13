@@ -348,9 +348,11 @@ fn build_block(
 fn solve_header(header: Header) -> Result<Header, crate::BoxError> {
     #[cfg(feature = "internal-miner")]
     {
-        let cancel_fn = || Ok(());
+        use crate::work::equihash::SolverAction;
+
+        let solver_action = || SolverAction::Continue;
         let solved_headers =
-            Solution::solve(header, cancel_fn).map_err(|_| "Equihash solver was cancelled")?;
+            Solution::solve(header, solver_action).map_err(|_| "Equihash solver was cancelled")?;
         solved_headers
             .into_iter()
             .next()

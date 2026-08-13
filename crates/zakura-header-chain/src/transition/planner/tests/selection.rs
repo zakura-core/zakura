@@ -132,6 +132,56 @@ fn full_commit_ensures_exact_node_body_and_independent_selection() {
 }
 
 #[test]
+fn full_state_insertion_rejects_a_contextually_invalid_header() {
+    let (store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let anchor = store.graph.finalized_frontier();
+    let parent = store
+        .graph
+        .header_node(anchor.hash)
+        .expect("the finalized anchor exists");
+    let mut header = *regtest_genesis_block().header;
+    header.previous_block_hash = anchor.hash;
+    header.difficulty_threshold = parent.header.difficulty_threshold;
+    header.time = parent.header.time;
+    header.nonce.0[0] = 0x5b;
+    let header = Arc::new(header);
+    let hash = header.hash();
+
+    let request = TransitionRequest {
+        expected_version: store.metadata.state_version,
+        event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+            full_state_transition_id: EvidenceId::from_digest([0x5c; 32]),
+            old_tip: anchor,
+            new_path: vec![crate::VerifiedHeaderRef {
+                height: anchor
+                    .height
+                    .next()
+                    .expect("the fixture anchor has a next height"),
+                hash,
+                header,
+            }],
+            cause: crate::VerifiedChangeCause::Grow,
+        }),
+    };
+
+    assert!(matches!(
+        apply_transition(&store, request, &context(&config, &clock, Some(&authority)),),
+        Err(TransitionFailure::InvalidEvidence(
+            InvalidTransitionEvidence::Header(crate::HeaderViolation::Validation {
+                source: crate::HeaderValidationSource::FullState,
+                check: HeaderValidationCheck::ContextualValidation,
+            })
+        ))
+    ));
+    assert!(
+        store.graph.header_node(hash).is_none(),
+        "rejected full-state evidence must not install the supplied header"
+    );
+}
+
+#[test]
 fn accepted_side_path_does_not_replace_the_verified_winner() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());

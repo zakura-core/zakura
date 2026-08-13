@@ -4,16 +4,13 @@
 //! Higher-level crates own network transport, async runtime, consensus services, and databases.
 
 mod config;
+mod discovery;
 mod error;
-mod frontier;
 mod graph;
-mod header_node;
-mod ids;
-mod locator;
-mod ownership;
-mod retention;
+mod identity;
 mod transition;
 mod validation;
+mod work;
 
 #[cfg(any(test, feature = "fuzz-impl"))]
 mod fuzz;
@@ -24,37 +21,34 @@ pub use config::{
     MAX_AUX_DELIVERIES_TOTAL_V1, MAX_CANDIDATE_TIPS_V1, MAX_HEADERS_PER_TRANSITION_V1,
     MAX_NON_FINALIZED_NODES_V1, MAX_STAGED_TARGETS_V1,
 };
+pub use discovery::{HeaderLocator, VctRepairContext, MAX_HEADER_LOCATOR_HASHES};
 pub use error::{Attribution, ErrorCategory, ErrorSubject, HeaderChainError, RuleId};
-pub use frontier::{
-    ChainScore, Frontier, FrontierSet, SuffixWork, WorkCoordinate, WorkCoordinateError,
-};
 #[cfg(any(test, feature = "fuzz-impl"))]
 pub use fuzz::{replay_fork_transition_bytes, ForkReplaySummary};
 pub use graph::{
-    ConsensusInvalidBodyTombstone, GraphError, GraphRevision, HeaderGraphReconstruction,
-    HeaderNodeInvariant, InsertResult, MemHeaderStore,
+    BodyRuleId, BodyUnavailableSummary, BodyValidationState, ChainScore,
+    ConsensusInvalidBodyTombstone, DurableNodeError, EligibilityReason, EligibilityState, Frontier,
+    FrontierSet, GraphError, GraphRevision, HeaderGraphReconstruction, HeaderNode,
+    HeaderNodeInvariant, HeaderValidationState, InsertResult, MemHeaderStore, SuffixWork,
+    WorkCoordinate, WorkCoordinateError,
 };
-pub use header_node::{
-    BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
-    EligibilityState, HeaderNode, HeaderValidationState,
-};
-pub use ids::{
-    BodyWorkAuthority, BodyWorkOwner, BranchId, CounterExhausted, EvidenceId, FinalityEpoch,
-    HeaderGeneration, HeaderId, HeaderSyncWorkOwner, HeaderWorkAuthority, HeaderWorkOwner,
+pub use identity::{
+    BranchId, CounterExhausted, EvidenceId, FinalityEpoch, HeaderGeneration, HeaderId,
     OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration,
 };
-pub use locator::{HeaderLocator, VctRepairContext, MAX_HEADER_LOCATOR_HASHES};
-pub use ownership::{CompletionDecision, CompletionOwner, Gate, PendingOwners, StaleReason};
 pub use transition::*;
 pub use validation::{
-    infer_height, prepare_headers, validate_commitment_structure,
-    validate_compact_target, validate_contextual_difficulty_and_time,
-    validate_encoding_version_hash, validate_future_time, validate_hash_filter, validate_link,
-    AdjustedDifficulty, AdjustedDifficultyError, CompactTargetError, ContextualValidationError,
-    HashFilterError, HeaderBatchInput, HeaderEncodingError, HeaderFailure, HeaderHeightError,
-    HeaderLinkError, HeaderRule, HeaderRules, PowPolicy, PowPolicyError,
-    BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN, POW_MEDIAN_BLOCK_SPAN,
-    POW_PREDECESSOR_CONTEXT_SPAN,
+    infer_height, prepare_headers, validate_commitment_structure, validate_compact_target,
+    validate_contextual_difficulty_and_time, validate_encoding_version_hash, validate_future_time,
+    validate_hash_filter, validate_link, AdjustedDifficulty, AdjustedDifficultyError,
+    CompactTargetError, ContextualValidationError, HashFilterError, HeaderBatchInput,
+    HeaderEncodingError, HeaderFailure, HeaderHeightError, HeaderLinkError, HeaderRule,
+    HeaderRules, PowPolicy, PowPolicyError, BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN,
+    POW_MEDIAN_BLOCK_SPAN, POW_PREDECESSOR_CONTEXT_SPAN,
+};
+pub use work::{
+    BodyWorkAuthority, BodyWorkOwner, CompletionDecision, CompletionOwner, Gate,
+    HeaderSyncWorkOwner, HeaderWorkAuthority, HeaderWorkOwner, PendingOwners, StaleReason,
 };
 
 #[cfg(test)]
@@ -94,7 +88,7 @@ mod tests {
             "pub fn set_header_validation_state(",
         ] {
             assert!(
-                !include_str!("graph.rs").contains(raw_entry_point),
+                !include_str!("graph/mod.rs").contains(raw_entry_point),
                 "raw DAG mutation entry point escaped: {raw_entry_point}"
             );
         }
@@ -103,7 +97,7 @@ mod tests {
             .next()
             .expect("the production public surface precedes its tests");
         assert!(
-            !public_surface.contains("pub use retention::enforce_retention"),
+            !public_surface.contains("enforce_retention"),
             "retention stays behind the transition planner"
         );
 

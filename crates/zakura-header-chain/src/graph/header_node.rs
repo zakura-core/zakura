@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zakura_chain::{block, work::difficulty::Work};
 
-use crate::{EvidenceId, Frontier, OperatorInvalidationId, SourceId, WorkCoordinate};
+use super::{Frontier, WorkCoordinate};
+use crate::{EvidenceId, OperatorInvalidationId, SourceId};
 
 /// Stable full-state consensus rule identity attached to body evidence.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

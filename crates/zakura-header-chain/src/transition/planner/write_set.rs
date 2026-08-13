@@ -3,7 +3,6 @@
 use std::{borrow::Cow, sync::Arc};
 
 use crate::graph::{GraphDelta, HeaderGraphView};
-use crate::retention::RetentionPlan;
 use crate::{
     BodyValidationState, ChangeSet, EligibilityDelta, EngineLimits, EngineMetadata, EngineSnapshot,
     Frontier, FrontierSet, GraphError, HeaderChainEngine, IndexChanges, MemHeaderStore,
@@ -13,6 +12,7 @@ use crate::{
 
 use super::admission::validate_authority;
 use super::projected_state::SettledProjectedState;
+use super::retention::RetentionPlan;
 use super::{
     InvalidTransitionEvidence, PlanCandidate, PlannerCoherenceViolation, ProjectionKind,
     TransitionFailure,

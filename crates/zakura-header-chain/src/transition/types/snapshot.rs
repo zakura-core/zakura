@@ -3,8 +3,8 @@
 use zakura_chain::{block, parameters::NetworkKind};
 
 use crate::{
-    BodyUnavailableSummary, ChainScore, EngineMode, FinalityEpoch, Frontier, FrontierSet,
-    HeaderGeneration, StateVersion, VerifiedGeneration,
+    BodyUnavailableSummary, BodyWorkAuthority, BranchId, ChainScore, EngineMode, FinalityEpoch,
+    Frontier, FrontierSet, HeaderGeneration, HeaderWorkAuthority, StateVersion, VerifiedGeneration,
 };
 
 use super::event::TransitionFingerprint;
@@ -43,6 +43,32 @@ pub struct EngineSnapshot {
     pub oldest_retained_height: block::Height,
     /// Durable operator-visible alarms.
     pub alarms: AlarmSet,
+}
+
+impl HeaderWorkAuthority {
+    /// Capture authority for one exact advertised header target.
+    pub fn for_target(snapshot: &EngineSnapshot, target_tip_hash: block::Hash) -> Self {
+        Self {
+            header_generation: snapshot.header_generation,
+            branch: BranchId::new(snapshot.frontiers.finalized.hash, target_tip_hash),
+        }
+    }
+}
+
+impl BodyWorkAuthority {
+    /// Capture body-affecting authority from one atomic committed snapshot.
+    pub fn for_snapshot(snapshot: &EngineSnapshot) -> Self {
+        Self {
+            header: HeaderWorkAuthority {
+                header_generation: snapshot.header_generation,
+                branch: BranchId::new(
+                    snapshot.frontiers.finalized.hash,
+                    snapshot.frontiers.header_best.hash,
+                ),
+            },
+            verified_generation: snapshot.verified_generation,
+        }
+    }
 }
 
 /// Singleton durable metadata row that serves as the logical root of one committed state.

@@ -12,13 +12,19 @@ use zakura_chain::{
     work::difficulty::{Work, U256},
 };
 
-use crate::{
-    BodyRuleId, BodyValidationState, ChainScore, EligibilityReason, EligibilityState, EvidenceId,
-    Frontier, HeaderNode, HeaderValidationState, OperatorInvalidationId, WorkCoordinate,
-    WorkCoordinateError,
-};
+use crate::{EvidenceId, OperatorInvalidationId};
 
+mod frontier;
+mod header_node;
 mod overlay;
+
+pub use frontier::{
+    ChainScore, Frontier, FrontierSet, SuffixWork, WorkCoordinate, WorkCoordinateError,
+};
+pub use header_node::{
+    BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
+    EligibilityState, HeaderNode, HeaderValidationState,
+};
 pub(crate) use overlay::{GraphDelta, GraphOverlay};
 
 #[cfg(test)]

@@ -11,15 +11,15 @@ use crate::{
 
 /// Deterministic result of enforcing DAG resource bounds.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RetentionPlan {
+pub(super) struct RetentionPlan {
     /// True when protected paths prevented enforcement of the node bound.
-    pub admission_refused: bool,
+    pub(super) admission_refused: bool,
     /// True when integrated verification/finality must advance before admission can resume.
-    pub resource_stalled: bool,
+    pub(super) resource_stalled: bool,
 }
 
 /// Enforce deterministic retention while protecting selected, verified, and context paths.
-pub(crate) fn enforce_retention<G: HeaderGraphEdit>(
+pub(super) fn enforce_retention<G: HeaderGraphEdit>(
     store: &mut G,
     header_best: Frontier,
     verified_best: Frontier,

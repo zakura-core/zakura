@@ -6,7 +6,6 @@ use super::{
     FinalityViolation, InvalidTransitionEvidence, PlannerCoherenceViolation, TransitionFailure,
 };
 use crate::graph::HeaderGraphView;
-use crate::retention::RetentionPlan;
 use crate::{
     AuxiliaryEffect, EngineMetadata, EngineMode, EngineSnapshot, FinalityEffect, FinalityRecord,
     FinalitySource, Frontier, HeaderChainEngine, HeaderWorkEffect, TransitionContext,
@@ -15,6 +14,7 @@ use crate::{
 
 use super::admission::HeaderInsertionRebase;
 use super::projected_state::{path, ProjectedTransitionState, SettledProjectedState};
+use super::retention::RetentionPlan;
 
 /// Inputs required to settle finality and retention after event evidence.
 pub(super) struct SettlementInputs<'engine, 'ctx> {

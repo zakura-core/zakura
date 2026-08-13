@@ -8,11 +8,12 @@ use std::{borrow::Cow, collections::HashSet, sync::Arc};
 use zakura_chain::block;
 
 use crate::graph::{GraphDelta, GraphOverlay, HeaderGraphEdit, HeaderGraphView};
-use crate::retention::RetentionPlan;
 use crate::{
     AuxDelta, BodyValidationState, EligibilityReason, EngineLimits, EvidenceId, Frontier,
     GraphError, HeaderChainEngine, HeaderValidationState, InsertResult, OperatorInvalidationId,
 };
+
+use super::retention::RetentionPlan;
 
 /// Mutable projected state accumulated while applying one transition event.
 pub(super) struct ProjectedTransitionState<'a> {
@@ -180,7 +181,7 @@ impl<'a> ProjectedTransitionState<'a> {
             .last()
             .copied()
             .unwrap_or_else(|| self.graph.view_finalized_frontier());
-        Ok(crate::retention::enforce_retention(
+        Ok(super::retention::enforce_retention(
             &mut self.graph,
             header_best,
             verified_best,

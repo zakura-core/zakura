@@ -1,160 +1,8 @@
-//! Stable identities and generation counters.
+//! Snapshot-bound authority and exact transport ownership for asynchronous work.
 
-use std::{fmt, num::NonZeroU64};
+use std::num::NonZeroU64;
 
-use thiserror::Error;
-use zakura_chain::block;
-
-/// A version or generation counter reached `u64::MAX`.
-#[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
-#[error("header-chain {counter} counter is exhausted at u64::MAX")]
-pub struct CounterExhausted {
-    counter: &'static str,
-}
-
-macro_rules! counter_type {
-    ($name:ident, $label:literal, $docs:literal) => {
-        #[doc = $docs]
-        #[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub struct $name(u64);
-
-        impl $name {
-            /// Construct a counter from its durable integer representation.
-            pub const fn new(value: u64) -> Self {
-                Self(value)
-            }
-
-            /// Return the durable integer representation.
-            pub const fn get(self) -> u64 {
-                self.0
-            }
-
-            /// Return the next counter value, failing closed at `u64::MAX`.
-            pub fn checked_next(self) -> Result<Self, CounterExhausted> {
-                self.0
-                    .checked_add(1)
-                    .map(Self)
-                    .ok_or(CounterExhausted { counter: $label })
-            }
-        }
-    };
-}
-
-counter_type!(
-    StateVersion,
-    "state version",
-    "Monotonic version of the complete durable header-chain state."
-);
-counter_type!(
-    HeaderGeneration,
-    "header generation",
-    "Generation that owns selected-header forward work."
-);
-counter_type!(
-    VerifiedGeneration,
-    "verified generation",
-    "Generation that owns verified-body forward work."
-);
-counter_type!(
-    FinalityEpoch,
-    "finality epoch",
-    "Monotonic epoch of irreversible finality changes."
-);
-
-/// Hash-qualified identity of one admitted header.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct HeaderId(block::Hash);
-
-impl HeaderId {
-    /// Construct an identity from the header's raw internal hash.
-    pub const fn new(hash: block::Hash) -> Self {
-        Self(hash)
-    }
-
-    /// Return the identified header hash.
-    pub const fn hash(self) -> block::Hash {
-        self.0
-    }
-}
-
-impl From<block::Hash> for HeaderId {
-    fn from(hash: block::Hash) -> Self {
-        Self::new(hash)
-    }
-}
-
-/// Stable identifier for deduplicated validation or operator evidence.
-#[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct EvidenceId([u8; 32]);
-
-impl EvidenceId {
-    /// Construct an ID from a domain-separated evidence digest.
-    pub const fn from_digest(digest: [u8; 32]) -> Self {
-        Self(digest)
-    }
-
-    /// Return the opaque digest bytes.
-    pub const fn digest(self) -> [u8; 32] {
-        self.0
-    }
-}
-
-impl fmt::Debug for EvidenceId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("EvidenceId").field(&self.0).finish()
-    }
-}
-
-/// Stable identifier for one independently removable operator invalidation.
-#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct OperatorInvalidationId([u8; 16]);
-
-impl OperatorInvalidationId {
-    /// Construct an ID from its stable opaque bytes.
-    pub const fn new(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-
-    /// Return the stable opaque bytes.
-    pub const fn bytes(self) -> [u8; 16] {
-        self.0
-    }
-}
-
-/// Opaque stable digest of a peer identity and connection domain.
-#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SourceId([u8; 32]);
-
-impl SourceId {
-    /// Construct a source ID from its stable digest.
-    pub const fn from_digest(digest: [u8; 32]) -> Self {
-        Self(digest)
-    }
-
-    /// Return the opaque digest bytes.
-    pub const fn digest(self) -> [u8; 32] {
-        self.0
-    }
-}
-
-/// Exact branch identity, qualified by both anchor and target hashes.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct BranchId {
-    /// Immutable branch anchor hash.
-    pub anchor_hash: block::Hash,
-    /// Exact target tip hash.
-    pub target_tip_hash: block::Hash,
-}
-
-impl BranchId {
-    /// Construct an exact branch identity.
-    pub const fn new(anchor_hash: block::Hash, target_tip_hash: block::Hash) -> Self {
-        Self {
-            anchor_hash,
-            target_tip_hash,
-        }
-    }
-}
+use crate::{BranchId, HeaderGeneration, VerifiedGeneration};
 
 /// Header-generation and branch authority captured before asynchronous header work.
 ///
@@ -169,14 +17,6 @@ pub struct HeaderWorkAuthority {
 }
 
 impl HeaderWorkAuthority {
-    /// Capture authority for one exact advertised header target.
-    pub fn for_target(snapshot: &crate::EngineSnapshot, target_tip_hash: block::Hash) -> Self {
-        Self {
-            header_generation: snapshot.header_generation,
-            branch: BranchId::new(snapshot.frontiers.finalized.hash, target_tip_hash),
-        }
-    }
-
     /// Bind this authority to the exact transport session and request.
     pub const fn bind(self, session_id: u64, request_id: NonZeroU64) -> HeaderWorkOwner {
         HeaderWorkOwner {
@@ -197,20 +37,6 @@ pub struct BodyWorkAuthority {
 }
 
 impl BodyWorkAuthority {
-    /// Capture body-affecting authority from one atomic committed snapshot.
-    pub fn for_snapshot(snapshot: &crate::EngineSnapshot) -> Self {
-        Self {
-            header: HeaderWorkAuthority {
-                header_generation: snapshot.header_generation,
-                branch: BranchId::new(
-                    snapshot.frontiers.finalized.hash,
-                    snapshot.frontiers.header_best.hash,
-                ),
-            },
-            verified_generation: snapshot.verified_generation,
-        }
-    }
-
     /// Bind this authority to the exact transport session and request.
     pub const fn bind(self, session_id: u64, request_id: NonZeroU64) -> BodyWorkOwner {
         BodyWorkOwner {
@@ -394,33 +220,9 @@ impl From<BodyWorkOwner> for HeaderSyncWorkOwner {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use zakura_chain::block;
 
-    #[test]
-    fn generation_counters_fail_closed_at_exhaustion() {
-        assert_eq!(
-            StateVersion::new(8).checked_next(),
-            Ok(StateVersion::new(9))
-        );
-        assert_eq!(
-            HeaderGeneration::new(u64::MAX).checked_next(),
-            Err(CounterExhausted {
-                counter: "header generation"
-            })
-        );
-        assert_eq!(
-            VerifiedGeneration::new(u64::MAX).checked_next(),
-            Err(CounterExhausted {
-                counter: "verified generation"
-            })
-        );
-        assert_eq!(
-            FinalityEpoch::new(u64::MAX).checked_next(),
-            Err(CounterExhausted {
-                counter: "finality epoch"
-            })
-        );
-    }
+    use super::*;
 
     #[test]
     fn domain_authority_binds_transport_identity_without_irrelevant_coordinates() {

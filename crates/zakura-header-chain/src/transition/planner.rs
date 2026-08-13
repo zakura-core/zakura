@@ -5,6 +5,7 @@ mod event_effects;
 pub(crate) mod plan;
 mod projected_state;
 mod replay;
+mod retention;
 mod settlement;
 mod violations;
 mod write_set;

@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::contracts::{source_failure, AuditViolation, RecoveryFailure};
-use super::model::{AuditedSource, DerivedState};
+use super::phases::{AuditedSource, DerivedState};
 
 /// Promote elapsed deferrals and reconstruct every derived view.
 pub(super) fn derive_state(

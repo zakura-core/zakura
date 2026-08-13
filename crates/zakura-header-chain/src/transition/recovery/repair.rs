@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use crate::EngineConfig;
 
 use super::contracts::{RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead};
-use super::model::{AuditedSource, DerivedState};
+use super::phases::{AuditedSource, DerivedState};
 
 /// Compare reconstructed state with durable caches and assemble one recovery plan.
 pub(super) fn classify_and_plan<S: StoreAuditRead>(

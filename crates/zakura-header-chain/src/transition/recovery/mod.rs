@@ -1,10 +1,10 @@
 //! Exhaustive startup audit and deterministic reconstruction planning.
 
+mod audit;
 mod contracts;
-mod model;
+mod phases;
 mod reconstruction;
 mod repair;
-mod source_audit;
 
 #[cfg(test)]
 mod tests;
@@ -18,10 +18,10 @@ pub use contracts::{
     ValidationContextRecord,
 };
 
-use model::load_store_image;
+use audit::audit_authoritative;
+use phases::load_store_image;
 use reconstruction::derive_state;
 use repair::classify_and_plan;
-use source_audit::audit_authoritative;
 
 /// Audit authoritative rows and derive only reconstructible repairs.
 pub fn audit_store<S: StoreAuditRead>(

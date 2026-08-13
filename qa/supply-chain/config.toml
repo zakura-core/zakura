@@ -974,19 +974,19 @@ notes = "Audit hold: the optional old_rust feature deliberately uses a pre-1.51 
 version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Sentry 0.47 upgrade"
+notes = "Audit hold: the Retry-After and X-Sentry-Rate-Limits parsers accept unbounded floating-point seconds, cast values such as 1e300 to u64::MAX, and add that duration to SystemTime with panicking arithmetic. Both remote-header paths were reproduced panicking the transport code. Retain the exemption pending finite bounded parsing and checked time addition."
 
 [[exemptions.sentry-core]]
 version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Sentry 0.47 upgrade"
+notes = "Audit hold: on non-main threads, safe Hub::with exposes &Arc<Hub> from a thread-local UnsafeCell while safe HubSwitchGuard::new can mutably swap that same Arc before the callback borrow ends. This permits overlapping shared and mutable access to the Arc storage. Retain the exemption pending a cloned callback value or another design that prevents mutation during the shared borrow."
 
 [[exemptions.sentry-types]]
 version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Sentry 0.47 upgrade"
+notes = "Audit hold: Attachment::to_writer interpolates caller-controlled filename, custom attachment type, and content type directly into a JSON envelope header without escaping. A safe filename containing a quote was reproduced producing invalid JSON, and newline-bearing values can alter envelope framing. Retain the exemption pending serde-based header serialization or validated field characters."
 
 [[exemptions.serde_json]]
 version = "1.0.150"

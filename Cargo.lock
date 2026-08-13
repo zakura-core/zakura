@@ -1783,7 +1783,7 @@ dependencies = [
 [[package]]
 name = "equihash"
 version = "0.3.0"
-source = "git+https://github.com/valargroup/librustzcash?rev=09fd73db1b49e38ac8830c9ab8a4164bf68eaf7d#09fd73db1b49e38ac8830c9ab8a4164bf68eaf7d"
+source = "git+https://github.com/valargroup/librustzcash?rev=f02666ca85119be817a336313cd28d3c3a9bc9c4#f02666ca85119be817a336313cd28d3c3a9bc9c4"
 dependencies = [
  "blake2b_simd",
  "cc",
@@ -6679,7 +6679,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -8385,7 +8385,7 @@ dependencies = [
  "dirs",
  "ed25519-zebra",
  "equihash 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "equihash 0.3.0 (git+https://github.com/valargroup/librustzcash?rev=09fd73db1b49e38ac8830c9ab8a4164bf68eaf7d)",
+ "equihash 0.3.0 (git+https://github.com/valargroup/librustzcash?rev=f02666ca85119be817a336313cd28d3c3a9bc9c4)",
  "futures",
  "group",
  "halo2_proofs",

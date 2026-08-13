@@ -67,7 +67,7 @@ derive-new = "0.5"
 dirs = "6.0"
 ed25519-zebra = "4.2"
 equihash = "0.3"
-equihash-solver = { package = "equihash", version = "0.3", git = "https://github.com/valargroup/librustzcash", rev = "09fd73db1b49e38ac8830c9ab8a4164bf68eaf7d" }
+equihash-solver = { package = "equihash", version = "0.3", git = "https://github.com/valargroup/librustzcash", rev = "f02666ca85119be817a336313cd28d3c3a9bc9c4" }
 ff = "0.13"
 futures = "0.3.31"
 futures-core = "0.3.31"

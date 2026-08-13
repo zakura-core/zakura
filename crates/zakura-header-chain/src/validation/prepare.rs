@@ -209,6 +209,7 @@ pub fn prepare_headers(
     rules: &HeaderRules,
     clock: &dyn Clock,
 ) -> Result<PreparedHeaderBatch, HeaderFailure> {
+    // Batch nonempty and within the per-transition header limit.
     if input.headers.is_empty() {
         return Err(HeaderFailure::Empty);
     }
@@ -219,6 +220,7 @@ pub fn prepare_headers(
         });
     }
 
+    // Supported encoded version and locally computed header hash.
     let hash_results: Vec<_> = input
         .headers
         .par_iter()
@@ -229,10 +231,14 @@ pub fn prepare_headers(
         })
         .collect();
     let hashes: Vec<_> = hash_results.into_iter().collect::<Result<_, _>>()?;
+
+    // Local-clock bound for future-timestamp classification.
     let now = clock.now();
     let future_limit = now
         .checked_add_signed(Duration::hours(2))
         .ok_or(HeaderFailure::ClockRange)?;
+
+    // Checked height inference from the supplied parent height.
     let mut parent_height = parent_frontier.height;
     let heights: Vec<_> = (0..input.headers.len())
         .map(|offset| {
@@ -242,6 +248,7 @@ pub fn prepare_headers(
             Ok(height)
         })
         .collect::<Result<_, HeaderFailure>>()?;
+
     let context_free: Vec<_> = input
         .headers
         .par_iter()
@@ -249,19 +256,27 @@ pub fn prepare_headers(
         .zip(&heights)
         .enumerate()
         .map(|(offset, ((header, hash), height))| {
+            // Height-dependent commitment interpretation.
             validate_commitment_structure(header, &rules.network, *height)
                 .map_err(|error| invalid(offset, HeaderRule::CommitmentStructure, error))?;
+
+            // Compact target canonical encoding and network limit.
             let target = validate_compact_target(header, &rules.network)
                 .map_err(|error| invalid(offset, HeaderRule::CompactTarget, error))?;
+
+            // Hash-to-target filter, unless authenticated custom policy waives PoW.
             if !rules.pow_policy.is_authenticated_custom_waiver() {
                 validate_hash_filter(*hash, target)
                     .map_err(|error| invalid(offset, HeaderRule::HashToTarget, error))?;
             }
+
+            // Equihash solution under the authenticated proof-of-work policy.
             rules
                 .pow_policy
                 .validate_solution(header)
                 .map_err(|error| invalid(offset, HeaderRule::Equihash, error))?;
 
+            // Accept current timestamps; assign an exact deadline to future ones.
             let canonical_header_time = header
                 .time
                 .with_nanosecond(0)
@@ -275,6 +290,8 @@ pub fn prepare_headers(
             } else {
                 HeaderValidationState::Valid
             };
+
+            // Exact per-block work from the compact target.
             let block_work = header
                 .difficulty_threshold
                 .to_work()
@@ -294,6 +311,7 @@ pub fn prepare_headers(
         prepared.push(prepared_header?);
     }
 
+    // Seal the batch to the parent, network policy, and trust-anchor digest.
     let evidence = PreparedHeaderBatch::context_free_evidence(
         parent_frontier,
         rules.trust_anchor_digest,

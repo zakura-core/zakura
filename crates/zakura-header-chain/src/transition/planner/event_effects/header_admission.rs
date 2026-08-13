@@ -1,7 +1,7 @@
 //! Prepared header insertion and atomic auxiliary delivery admission.
 
 use super::super::{
-    AuxiliaryViolation, HeaderPathKind, HeaderPathProblem, HeaderValidationCheck, HeaderViolation,
+    AuxiliaryViolation, HeaderPathKind, HeaderPathProblem, HeaderViolation,
     InvalidTransitionEvidence, TransitionFailure,
 };
 use std::collections::{HashMap, HashSet};
@@ -10,7 +10,9 @@ use crate::graph::HeaderGraphView;
 use crate::{BodyValidationState, Frontier, GraphError, HeaderValidationState, TargetCompletion};
 
 use super::super::projected_state::ProjectedTransitionState;
-use super::header_validation::{anchor_reasons, retained_header_context};
+use super::header_validation::{
+    anchor_reasons, check_contextual_difficulty_and_time, retained_header_context,
+};
 use super::EventProjectionContext;
 
 /// Admit a prepared header batch and any accompanying unauthenticated auxiliary deliveries.
@@ -85,28 +87,14 @@ pub(super) fn admit_prepared_headers(
             )
             .into());
         }
-        let adjustment = crate::AdjustedDifficulty::new_from_header_time(
+        check_contextual_difficulty_and_time(
             prepared.header.time,
+            prepared.header.difficulty_threshold,
             parent.height,
             &context.config.network,
             contextual.iter().copied(),
-        )
-        .map_err(|_| {
-            InvalidTransitionEvidence::Header(crate::HeaderViolation::Validation {
-                source: crate::HeaderValidationSource::Prepared,
-                check: HeaderValidationCheck::IncompleteDifficultyContext,
-            })
-        })?;
-        crate::validate_contextual_difficulty_and_time(
-            prepared.header.difficulty_threshold,
-            adjustment,
-        )
-        .map_err(|_| {
-            InvalidTransitionEvidence::Header(crate::HeaderViolation::Validation {
-                source: crate::HeaderValidationSource::Prepared,
-                check: HeaderValidationCheck::ContextualValidation,
-            })
-        })?;
+            crate::HeaderValidationSource::Prepared,
+        )?;
         let validation = match prepared.validation {
             HeaderValidationState::DeferredUntil(until) if until <= context.clock.now() => {
                 HeaderValidationState::Valid

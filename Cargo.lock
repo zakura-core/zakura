@@ -1783,7 +1783,7 @@ dependencies = [
 [[package]]
 name = "cpu-equihash-solver"
 version = "0.3.0"
-source = "git+https://github.com/valargroup/librustzcash?rev=da4cdf609a131c91552ccee88905b6c6dffd4cd8#da4cdf609a131c91552ccee88905b6c6dffd4cd8"
+source = "git+https://github.com/valargroup/librustzcash?rev=658533c4c604818610657d9699e82102e7379c76#658533c4c604818610657d9699e82102e7379c76"
 dependencies = [
  "blake2b_simd",
  "cc",

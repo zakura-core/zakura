@@ -49,7 +49,9 @@ use cached_peer_addr_response::CachedPeerAddrResponse;
 #[cfg(test)]
 mod tests;
 
-use downloads::{Downloads as BlockDownloads, GossipedTipChildHeightMismatch};
+use downloads::{
+    Downloads as BlockDownloads, GossipedBehindTipHeightMismatch, GossipedTipChildHeightMismatch,
+};
 
 /// The maximum amount of time an inbound service response can take.
 ///
@@ -491,6 +493,24 @@ impl Service<zn::Request> for Inbound {
 
                         // The outcome, including a replacement refused by the queue bounds, is
                         // logged by `retry_poisoned` itself.
+                        let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        continue;
+                    }
+
+                    // A rewritten coinbase height on a behind-tip block (not a tip child) is
+                    // detected by a parent header lookup in the download task. The peer must be
+                    // scored and the hash re-requested, for the same reason as the tip-child
+                    // case: the poisoned response held the per-hash dedupe slot while it was
+                    // outstanding, so honest peers' `inv`s for the same hash were already
+                    // dropped as `AlreadyQueued`.
+                    if let Some(mismatch) = err.downcast_ref::<GossipedBehindTipHeightMismatch>() {
+                        if let Some(advertiser_addr) = advertiser_addr {
+                            let _ = misbehavior_sender.try_send((
+                                advertiser_addr,
+                                zn::constants::MAX_PEER_MISBEHAVIOR_SCORE,
+                            ));
+                        }
+
                         let _ = block_downloads.retry_poisoned(mismatch.hash);
                         continue;
                     }

@@ -1,5 +1,129 @@
-use super::super::projected_state::trim_projection;
+use super::super::{
+    projected_state::{select_fully_verified_path, trim_projection},
+    write_set::projection_delta,
+};
 use super::*;
+
+#[test]
+fn malformed_full_state_paths_fail_with_exact_shape_errors() {
+    let (store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let apply = |event| {
+        apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                event,
+            },
+            &context(&config, &clock, Some(&authority)),
+        )
+    };
+
+    assert!(matches!(
+        apply(TransitionEvent::VerifiedBlockAccepted(
+            crate::VerifiedBlockAccepted {
+                full_state_transition_id: EvidenceId::from_digest([0x60; 32]),
+                path: Vec::new(),
+            }
+        )),
+        Err(TransitionFailure::InvalidEvidence(
+            InvalidTransitionEvidence::Header(HeaderViolation::Path {
+                kind: HeaderPathKind::AcceptedSide,
+                problem: HeaderPathProblem::Empty,
+            })
+        ))
+    ));
+    assert_eq!(
+        apply(TransitionEvent::VerifiedChainChanged(
+            crate::VerifiedChainChanged {
+                full_state_transition_id: EvidenceId::from_digest([0x61; 32]),
+                old_tip: Frontier::new(block::Height(0), block::Hash([0x62; 32])),
+                new_path: Vec::new(),
+                cause: crate::VerifiedChangeCause::Grow,
+            }
+        ))
+        .expect_err("the old verified tip is an exact freshness guard"),
+        TransitionFailure::StalePreparation
+    );
+
+    let request = insertion(&store, 1, EvidenceId::from_digest([0x63; 32]));
+    let TransitionEvent::InsertHeaders(insert) = request.event else {
+        unreachable!("the fixture constructs a header insertion")
+    };
+    let prepared = &insert.batch.headers()[0];
+    assert!(matches!(
+        apply(TransitionEvent::VerifiedBlockAccepted(
+            crate::VerifiedBlockAccepted {
+                full_state_transition_id: EvidenceId::from_digest([0x64; 32]),
+                path: vec![crate::VerifiedHeaderRef {
+                    height: block::Height(prepared.height.0 + 1),
+                    hash: prepared.hash,
+                    header: prepared.header.clone(),
+                }],
+            }
+        )),
+        Err(TransitionFailure::InvalidEvidence(
+            InvalidTransitionEvidence::Header(HeaderViolation::Path {
+                kind: HeaderPathKind::AcceptedSide,
+                problem: HeaderPathProblem::Discontinuous,
+            })
+        ))
+    ));
+}
+
+#[test]
+fn projection_delta_and_verified_selection_cover_fork_boundaries() {
+    let a0 = Frontier::new(block::Height(0), block::Hash([0x70; 32]));
+    let a1 = Frontier::new(block::Height(1), block::Hash([0x71; 32]));
+    let a2 = Frontier::new(block::Height(2), block::Hash([0x72; 32]));
+    let b1 = Frontier::new(block::Height(1), block::Hash([0x81; 32]));
+    let b2 = Frontier::new(block::Height(2), block::Hash([0x82; 32]));
+    assert_eq!(
+        projection_delta(&[a0, a1], &[a0, a1, a2]),
+        ProjectionDelta {
+            remove_before: None,
+            remove_from: Some(block::Height(2)),
+            put: vec![a2],
+        }
+    );
+    assert_eq!(
+        projection_delta(&[a0, a1, a2], &[a0, b1, b2]),
+        ProjectionDelta {
+            remove_before: None,
+            remove_from: Some(block::Height(1)),
+            put: vec![b1, b2],
+        }
+    );
+    assert_eq!(
+        projection_delta(&[a0, a1, a2], &[a1, a2]),
+        ProjectionDelta {
+            remove_before: Some(block::Height(1)),
+            remove_from: None,
+            put: Vec::new(),
+        }
+    );
+
+    let (mut store, _) = TestStore::new(EngineMode::Integrated);
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = regtest_genesis_block().header.difficulty_threshold;
+    let tip = insert_verified_branch(&mut store.graph, anchor, 2, difficulty, 0x73);
+    let first = store
+        .graph
+        .header_ancestor(tip.hash, block::Height(1))
+        .expect("the test ancestry is coherent")
+        .expect("the two-header branch contains height one");
+    store
+        .graph
+        .set_body_validation_state(first.hash, BodyValidationState::Unknown)
+        .expect("the intermediate body becomes unverified");
+    assert_eq!(
+        select_fully_verified_path(&store.graph)
+            .expect("verified selection remains finalized-rooted"),
+        vec![anchor],
+        "a verified descendant cannot jump over an unverified parent"
+    );
+}
 
 #[test]
 fn complete_unchanged_projection_remains_borrowed() {

@@ -284,3 +284,296 @@ impl HeaderChainEngine {
             .find(|delivery| delivery.delivery_id == delivery_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroU64, sync::Arc};
+
+    use zakura_chain::{
+        block::{self, genesis::regtest_genesis_block},
+        parameters::NetworkKind,
+    };
+
+    use super::*;
+    use crate::{
+        AlarmSet, AuxAuthentication, BodySizeHint, BodyValidationState, BranchId, EngineMode,
+        EvidenceId, FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderGeneration,
+        HeaderValidationState, HeaderWorkAuthority, InsertResult, SourceId, StateVersion,
+        VerifiedGeneration,
+    };
+
+    #[derive(Clone)]
+    struct AuditedView {
+        graph: MemHeaderStore,
+        metadata: EngineMetadata,
+        selected: Vec<Frontier>,
+        verified: Vec<Frontier>,
+        deliveries: Vec<AuxDelivery>,
+    }
+
+    type HydrationCase = (&'static str, fn(&mut AuditedView), EngineHydrationError);
+
+    fn audited_view() -> AuditedView {
+        let genesis = regtest_genesis_block();
+        let anchor = Frontier::new(block::Height(0), genesis.hash());
+        let work = genesis
+            .header
+            .difficulty_threshold
+            .to_work()
+            .expect("the regtest target has valid work");
+        let mut graph = MemHeaderStore::new(anchor, genesis.header.clone(), work, work.as_u256())
+            .expect("the anchor is coherent");
+        let mut header = *genesis.header;
+        header.previous_block_hash = anchor.hash;
+        header.nonce = [1; 32].into();
+        let child = match graph
+            .insert(
+                Arc::new(header),
+                HeaderValidationState::Valid,
+                [],
+                BodyValidationState::Unknown,
+            )
+            .expect("the child inserts")
+        {
+            InsertResult::Inserted(frontier) | InsertResult::AlreadyPresent(frontier) => frontier,
+        };
+        let score = graph
+            .header_chain_score(child.hash)
+            .expect("the child is retained");
+        AuditedView {
+            graph,
+            metadata: EngineMetadata {
+                disk_format: HeaderChainDiskVersion(1),
+                mode: EngineMode::Integrated,
+                network_id: NetworkKind::Testnet,
+                anchor_manifest_digest: [1; 32],
+                work_origin: anchor,
+                state_version: StateVersion::new(0),
+                header_generation: HeaderGeneration::new(0),
+                verified_generation: VerifiedGeneration::new(0),
+                finality_epoch: FinalityEpoch::new(0),
+                frontiers: FrontierSet {
+                    finalized: anchor,
+                    header_best: child,
+                    verified_best: anchor,
+                },
+                header_best_score: score,
+                oldest_retained_height: anchor.height,
+                alarms: AlarmSet::default(),
+                last_transition: None,
+            },
+            selected: vec![anchor, child],
+            verified: vec![anchor],
+            deliveries: Vec::new(),
+        }
+    }
+
+    fn delivery(id: u8, header_hash: block::Hash) -> AuxDelivery {
+        let owner = HeaderWorkAuthority {
+            header_generation: HeaderGeneration::new(0),
+            branch: BranchId::new(header_hash, header_hash),
+        }
+        .bind(
+            1,
+            NonZeroU64::new(1).expect("the fixture request ID is nonzero"),
+        );
+        AuxDelivery {
+            delivery_id: EvidenceId::from_digest([id; 32]),
+            header_hash,
+            source: SourceId::from_digest([id.saturating_add(1); 32]),
+            owner: owner.into(),
+            body_size: BodySizeHint::Unknown,
+            tree_aux: None,
+            authentication: AuxAuthentication::Unauthenticated,
+        }
+    }
+
+    fn finality_disagrees(view: &mut AuditedView) {
+        view.metadata.frontiers.finalized =
+            Frontier::new(block::Height(0), block::Hash([0xf0; 32]));
+    }
+
+    fn projection_endpoints_disagree(view: &mut AuditedView) {
+        view.selected.clear();
+    }
+
+    fn projection_height_disagrees(view: &mut AuditedView) {
+        let child = *view
+            .selected
+            .last()
+            .expect("the fixture selected projection is nonempty");
+        let wrong = Frontier::new(block::Height(2), child.hash);
+        *view
+            .selected
+            .last_mut()
+            .expect("the fixture selected projection is nonempty") = wrong;
+        view.metadata.frontiers.header_best = wrong;
+    }
+
+    fn projection_is_disconnected(view: &mut AuditedView) {
+        let anchor = view.metadata.frontiers.finalized;
+        view.selected.insert(1, anchor);
+    }
+
+    fn verified_projection_has_unverified_body(view: &mut AuditedView) {
+        let child = view.metadata.frontiers.header_best;
+        view.verified.push(child);
+        view.metadata.frontiers.verified_best = child;
+    }
+
+    fn headers_only_verified_projection_extends(view: &mut AuditedView) {
+        view.metadata.mode = EngineMode::HeadersOnly;
+        let child = view.metadata.frontiers.header_best;
+        view.verified.push(child);
+        view.metadata.frontiers.verified_best = child;
+    }
+
+    fn selected_frontier_disagrees(view: &mut AuditedView) {
+        let anchor = view.metadata.frontiers.finalized;
+        view.selected = vec![anchor];
+        view.metadata.frontiers.header_best = anchor;
+        view.metadata.header_best_score = view
+            .graph
+            .header_chain_score(anchor.hash)
+            .expect("the anchor is retained");
+    }
+
+    fn selected_score_disagrees(view: &mut AuditedView) {
+        view.metadata.header_best_score.tip_hash = block::Hash([0xf1; 32]);
+    }
+
+    fn delivery_has_no_header(view: &mut AuditedView) {
+        view.deliveries.push(delivery(1, block::Hash([0xf2; 32])));
+    }
+
+    fn delivery_id_is_duplicated(view: &mut AuditedView) {
+        let child = view.metadata.frontiers.header_best;
+        let row = delivery(2, child.hash);
+        view.graph
+            .record_auxiliary_evidence_delivery(child.hash, row.delivery_id)
+            .expect("the child is retained");
+        view.deliveries.extend([row, row]);
+    }
+
+    fn delivery_is_absent_from_graph_index(view: &mut AuditedView) {
+        let child = view.metadata.frontiers.header_best;
+        view.deliveries.push(delivery(3, child.hash));
+    }
+
+    fn graph_index_has_no_delivery(view: &mut AuditedView) {
+        let child = view.metadata.frontiers.header_best;
+        view.graph
+            .record_auxiliary_evidence_delivery(child.hash, EvidenceId::from_digest([4; 32]))
+            .expect("the child is retained");
+    }
+
+    #[test]
+    fn from_audited_state_rejects_each_incoherent_view() {
+        let cases: &[HydrationCase] = &[
+            (
+                "finality",
+                finality_disagrees,
+                EngineHydrationError::Incoherent("graph finality disagrees with metadata"),
+            ),
+            (
+                "projection endpoints",
+                projection_endpoints_disagree,
+                EngineHydrationError::Incoherent("projection endpoints disagree with metadata"),
+            ),
+            (
+                "projection height",
+                projection_height_disagrees,
+                EngineHydrationError::Incoherent("projection frontier height disagrees with graph"),
+            ),
+            (
+                "projection connectivity",
+                projection_is_disconnected,
+                EngineHydrationError::Incoherent("projection is not a contiguous graph path"),
+            ),
+            (
+                "verified body",
+                verified_projection_has_unverified_body,
+                EngineHydrationError::Incoherent("verified projection contains an unverified body"),
+            ),
+            (
+                "headers-only verified projection",
+                headers_only_verified_projection_extends,
+                EngineHydrationError::Incoherent(
+                    "headers-only verified projection extends past finality",
+                ),
+            ),
+            (
+                "selected frontier",
+                selected_frontier_disagrees,
+                EngineHydrationError::Incoherent("selected frontier or score disagrees with graph"),
+            ),
+            (
+                "selected score",
+                selected_score_disagrees,
+                EngineHydrationError::Incoherent("selected frontier or score disagrees with graph"),
+            ),
+            (
+                "delivery header",
+                delivery_has_no_header,
+                EngineHydrationError::Incoherent("auxiliary delivery has no retained header"),
+            ),
+            (
+                "duplicate delivery ID",
+                delivery_id_is_duplicated,
+                EngineHydrationError::Incoherent("auxiliary delivery index disagrees with graph"),
+            ),
+            (
+                "delivery missing from node index",
+                delivery_is_absent_from_graph_index,
+                EngineHydrationError::Incoherent("auxiliary delivery index disagrees with graph"),
+            ),
+            (
+                "node index missing delivery",
+                graph_index_has_no_delivery,
+                EngineHydrationError::Incoherent("graph auxiliary index has no delivery"),
+            ),
+        ];
+
+        for (name, corrupt, expected) in cases {
+            let mut view = audited_view();
+            corrupt(&mut view);
+            let result = HeaderChainEngine::from_audited_state(
+                view.graph,
+                view.metadata,
+                view.selected,
+                view.verified,
+                view.deliveries,
+            );
+            assert_eq!(
+                result.expect_err("the corrupted audited view must be rejected"),
+                expected.clone(),
+                "{name}",
+            );
+        }
+    }
+
+    #[test]
+    fn from_audited_state_normalizes_delivery_order() {
+        let mut view = audited_view();
+        let child = view.metadata.frontiers.header_best;
+        let first = delivery(1, child.hash);
+        let second = delivery(2, child.hash);
+        for row in [second, first] {
+            view.graph
+                .record_auxiliary_evidence_delivery(child.hash, row.delivery_id)
+                .expect("the child is retained");
+            view.deliveries.push(row);
+        }
+
+        let engine = HeaderChainEngine::from_audited_state(
+            view.graph,
+            view.metadata,
+            view.selected,
+            view.verified,
+            view.deliveries,
+        )
+        .expect("the matching audited views are coherent");
+
+        assert_eq!(engine.aux_deliveries(child.hash), &[first, second]);
+    }
+}

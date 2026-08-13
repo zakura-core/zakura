@@ -680,6 +680,84 @@ fn headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication() {
 }
 
 #[test]
+fn headers_only_finality_is_strictly_deeper_than_the_configured_depth() {
+    let (mut store, mut config) = TestStore::new(EngineMode::HeadersOnly);
+    config.limits.local_finality_depth = std::num::NonZeroU32::new(2).expect("two is nonzero");
+    let clock = ManualClock(Utc::now());
+    let anchor = store.metadata.frontiers.finalized;
+
+    let at_depth = apply_transition(
+        &store,
+        insertion(&store, 2, EvidenceId::from_digest([0x65; 32])),
+        &context(&config, &clock, None),
+    )
+    .expect("a tip exactly at the depth is admitted without finality");
+    assert_eq!(at_depth.change_set.metadata.frontiers.finalized, anchor);
+    assert_eq!(at_depth.change_set.finality_append, None);
+    assert!(!at_depth.effect().is_headers_only_finality());
+    store.commit(&at_depth);
+
+    let beyond_depth = apply_transition(
+        &store,
+        insertion(&store, 1, EvidenceId::from_digest([0x66; 32])),
+        &context(&config, &clock, None),
+    )
+    .expect("the first block beyond the depth advances finality");
+    assert_eq!(
+        beyond_depth.change_set.metadata.frontiers.finalized,
+        store.selected[1]
+    );
+    assert!(beyond_depth.effect().is_headers_only_finality());
+    assert!(matches!(
+        beyond_depth
+            .change_set
+            .finality_append
+            .expect("strict-depth finality appends one record")
+            .source,
+        FinalitySource::HeadersOnlyDepth { selected_tip }
+            if selected_tip.height == block::Height(3)
+    ));
+}
+
+#[test]
+fn full_state_finality_rejects_proof_mismatch_and_unverified_frontier() {
+    let (store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let anchor = store.metadata.frontiers.finalized;
+    let apply = |new_finalized, verified_path_proof| {
+        apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                event: TransitionEvent::FullStateFinalized(crate::FullStateFinalized {
+                    full_state_transition_id: EvidenceId::from_digest([0x67; 32]),
+                    new_finalized,
+                    verified_path_proof,
+                }),
+            },
+            &context(&config, &clock, Some(&authority)),
+        )
+    };
+
+    assert!(matches!(
+        apply(anchor, Vec::new()),
+        Err(TransitionFailure::InvalidEvidence(
+            InvalidTransitionEvidence::Finality(FinalityViolation::ProofMismatch)
+        ))
+    ));
+    assert!(matches!(
+        apply(
+            Frontier::new(block::Height(1), block::Hash([0x68; 32])),
+            vec![anchor.hash],
+        ),
+        Err(TransitionFailure::InvalidEvidence(
+            InvalidTransitionEvidence::Finality(FinalityViolation::OutsideVerifiedProjection)
+        ))
+    ));
+}
+
+#[test]
 fn integrated_finality_requires_authority_and_exact_verified_path() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
@@ -724,6 +802,7 @@ fn integrated_finality_requires_authority_and_exact_verified_path() {
     )
     .expect("the state writer authenticates its verified-path transition");
     store.commit(&verified_plan);
+    let old_finalized = store.metadata.frontiers.finalized;
     let new_finalized = store.verified[1];
     let finality_id = EvidenceId::from_digest([5; 32]);
     let finalize = TransitionRequest {
@@ -744,6 +823,25 @@ fn integrated_finality_requires_authority_and_exact_verified_path() {
     assert!(matches!(
         plan.change_set.finality_append.expect("full-state finality is recorded").source,
         FinalitySource::FullState { evidence } if evidence == finality_id
+    ));
+    store.commit(&plan);
+
+    assert!(matches!(
+        apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                event: TransitionEvent::FullStateFinalized(crate::FullStateFinalized {
+                    full_state_transition_id: EvidenceId::from_digest([6; 32]),
+                    new_finalized: old_finalized,
+                    verified_path_proof: Vec::new(),
+                }),
+            },
+            &context(&config, &clock, Some(&authority)),
+        ),
+        Err(TransitionFailure::InvalidEvidence(
+            InvalidTransitionEvidence::Finality(FinalityViolation::Retreated)
+        ))
     ));
 }
 
@@ -808,7 +906,7 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
         |header_node| header_node.body_validation_state = BodyValidationState::Unknown,
     );
     assert_eq!(
-        crate::verify_plan_production(&test_engine(&store), &unverified),
+        verify_plan(&test_engine(&store), &unverified),
         Err(InvariantViolation::VerifiedProjection(checkpoint.hash))
     );
 

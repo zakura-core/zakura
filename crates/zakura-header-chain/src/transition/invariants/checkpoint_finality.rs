@@ -117,6 +117,7 @@ pub(crate) fn verify_incremental_checkpoint_against_graph<G: HeaderGraphView>(
     let source_metadata = engine_before_commit.metadata();
 
     if source_metadata.state_version != source.state_version
+        || super::immutable_metadata_changed(source_metadata, metadata)
         || metadata.mode != source.mode
         || metadata.work_origin != source_metadata.work_origin
     {
@@ -215,4 +216,134 @@ pub(crate) fn verify_incremental_checkpoint_against_graph<G: HeaderGraphView>(
     )?;
     verify_aux(engine_before_commit, graph, plan, mode)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::work::difficulty::U256;
+
+    use super::super::test_support::{checkpoint_fixture, hash, projected_graph};
+    use super::*;
+    use crate::{EvidenceId, HeaderValidationState, WorkCoordinate};
+
+    fn verify_changed_node(
+        fixture: &super::super::test_support::Fixture,
+        plan: &PlanCandidate,
+    ) -> Result<(), InvariantViolation> {
+        let graph = projected_graph(&fixture.engine, plan);
+        verify_incremental_checkpoint_against_graph(
+            &fixture.engine,
+            plan,
+            &fixture.engine.snapshot(),
+            &graph,
+            fixture.child,
+            VerificationMode::Production,
+        )
+    }
+
+    #[test]
+    fn valid_incremental_checkpoint_matches_production_and_exhaustive_verification() {
+        let (fixture, plan) = checkpoint_fixture();
+        assert!(is_incremental_checkpoint_finality(&fixture.engine, &plan));
+        assert_eq!(
+            verify_incremental_checkpoint_finality(
+                &fixture.engine,
+                &plan,
+                VerificationMode::Production,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            verify_incremental_checkpoint_finality(
+                &fixture.engine,
+                &plan,
+                VerificationMode::Exhaustive,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn incremental_checkpoint_classifies_each_changed_node_failure() {
+        let (fixture, baseline) = checkpoint_fixture();
+
+        let mut corrupt = baseline.clone();
+        let mut other_header = *corrupt.change_set.put_nodes[0].header;
+        other_header.nonce.0[0] ^= 1;
+        corrupt.change_set.put_nodes[0].header = std::sync::Arc::new(other_header);
+        assert_eq!(
+            verify_changed_node(&fixture, &corrupt),
+            Err(InvariantViolation::NodeHash(fixture.child.hash))
+        );
+
+        let mut corrupt = baseline.clone();
+        corrupt.change_set.put_nodes[0].height = zakura_chain::block::Height(2);
+        assert_eq!(
+            verify_changed_node(&fixture, &corrupt),
+            Err(InvariantViolation::Parent(fixture.child.hash))
+        );
+
+        let mut corrupt = baseline.clone();
+        corrupt.change_set.put_nodes[0].work_coordinate =
+            WorkCoordinate::new(hash(0x61), U256::zero());
+        assert_eq!(
+            verify_changed_node(&fixture, &corrupt),
+            Err(InvariantViolation::Work(fixture.child.hash))
+        );
+
+        let mut corrupt = baseline.clone();
+        corrupt.change_set.put_nodes[0].validation =
+            HeaderValidationState::DeferredUntil(chrono::Utc::now() + chrono::Duration::seconds(1));
+        assert_eq!(
+            verify_changed_node(&fixture, &corrupt),
+            Err(InvariantViolation::Eligibility(fixture.child.hash))
+        );
+
+        let mut corrupt = baseline.clone();
+        corrupt.change_set.put_nodes[0]
+            .aux_delivery_ids
+            .push(EvidenceId::from_digest([0x62; 32]));
+        assert_eq!(
+            verify_changed_node(&fixture, &corrupt),
+            Err(InvariantViolation::Auxiliary(fixture.child.hash))
+        );
+
+        let mut corrupt = baseline.clone();
+        corrupt.change_set.put_nodes[0].body_validation_state = BodyValidationState::Unknown;
+        assert_eq!(
+            verify_changed_node(&fixture, &corrupt),
+            Err(InvariantViolation::VerifiedProjection(fixture.child.hash))
+        );
+
+        let mut corrupt = baseline;
+        corrupt.change_set.put_nodes[0].body_validation_state = BodyValidationState::Verified {
+            evidence: EvidenceId::from_digest([0x63; 32]),
+        };
+        assert_eq!(
+            verify_changed_node(&fixture, &corrupt),
+            Err(InvariantViolation::Index(fixture.child.hash))
+        );
+    }
+
+    #[test]
+    fn incremental_checkpoint_rejects_immutable_metadata_drift() {
+        let (fixture, mut plan) = checkpoint_fixture();
+        plan.change_set.metadata.anchor_manifest_digest = [0x64; 32];
+        assert_eq!(
+            verify_incremental_checkpoint_finality(
+                &fixture.engine,
+                &plan,
+                VerificationMode::Production,
+            ),
+            Err(InvariantViolation::SnapshotBeforeCommit)
+        );
+        assert_eq!(
+            verify_incremental_checkpoint_finality(
+                &fixture.engine,
+                &plan,
+                VerificationMode::Exhaustive,
+            ),
+            Err(InvariantViolation::SnapshotBeforeCommit)
+        );
+    }
 }

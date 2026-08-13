@@ -1,6 +1,8 @@
 mod auxiliary;
 mod body_evidence;
 mod coherence;
+mod counters;
+mod deferred;
 mod finality;
 mod guards;
 mod insertion;
@@ -21,8 +23,8 @@ use super::{projected_state::path, EngineTransition, TransitionFailure};
 use crate::{
     verify_plan, AlarmSet, AuxiliaryViolation, BodyEvidence, BodyValidationState, BodyViolation,
     BranchId, CheckpointSet, EligibilityReason, EngineConfig, EngineMetadata, EngineMode,
-    EngineSnapshot, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
-    FrontierSet, GraphError, HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration,
+    EngineSnapshot, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, FinalityViolation,
+    Frontier, FrontierSet, GraphError, HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration,
     HeaderInsertionFacts, HeaderPathKind, HeaderPathProblem, HeaderValidationCheck,
     HeaderValidationFacts, HeaderValidationState, HeaderViolation, HeaderWorkEffect,
     InvalidTransitionEvidence, LimitViolation, MemHeaderStore, OperatorViolation, PreparedHeader,

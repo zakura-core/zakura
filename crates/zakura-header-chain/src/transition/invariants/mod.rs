@@ -3,6 +3,8 @@
 mod aux_authentication;
 mod checkpoint_finality;
 mod checks;
+#[cfg(test)]
+mod test_support;
 
 #[cfg(any(test, not(feature = "fuzz-impl")))]
 use std::collections::HashSet;
@@ -132,6 +134,15 @@ fn graph_error_violation(error: GraphError, plan: &PlanCandidate) -> InvariantVi
     InvariantViolation::Index(hash)
 }
 
+fn immutable_metadata_changed(
+    source: &crate::EngineMetadata,
+    projected: &crate::EngineMetadata,
+) -> bool {
+    projected.disk_format != source.disk_format
+        || projected.network_id != source.network_id
+        || projected.anchor_manifest_digest != source.anchor_manifest_digest
+}
+
 /// Independently check that `plan`'s projection obeys every transition invariant under `engine_before_commit`.
 ///
 /// Pure gate between [`PlanCandidate`] and [`EngineTransition`]: no mutation; success is required
@@ -215,6 +226,7 @@ fn verify_plan_against_graph<G: HeaderGraphView>(
         source_metadata.work_origin
     };
     if source_metadata.state_version != source.state_version
+        || immutable_metadata_changed(source_metadata, metadata)
         || metadata.mode != source.mode
         || metadata.work_origin != expected_work_origin
         || metadata.headers_only_migration_epoch != source_metadata.headers_only_migration_epoch
@@ -390,4 +402,270 @@ pub(crate) fn verify_plan_production(
         plan.candidate(),
         VerificationMode::Production,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use zakura_chain::{block::genesis::regtest_genesis_block, parameters::Network};
+
+    use super::test_support::{candidate_with_delta, fixture, hash, no_change_candidate};
+    use super::*;
+    use crate::graph::GraphOverlay;
+    use crate::{
+        BodyRuleId, BodyValidationState, EligibilityReason, EngineMode, EvidenceId,
+        HeaderNodeInvariant, WorkCoordinateError,
+    };
+
+    fn stage_tombstone_only(
+        overlay: &mut GraphOverlay<'_>,
+        parent_hash: block::Hash,
+        nonce: u8,
+    ) -> block::Hash {
+        let mut header = *regtest_genesis_block().header;
+        header.previous_block_hash = parent_hash;
+        header.nonce.0[0] = nonce;
+        let header = Arc::new(header);
+        let tombstone_hash = header.hash();
+        overlay
+            .insert(
+                header,
+                crate::HeaderValidationState::Valid,
+                [],
+                BodyValidationState::Unknown,
+            )
+            .expect("the temporary tombstoned child is inserted");
+        overlay
+            .set_body_validation_state(
+                tombstone_hash,
+                BodyValidationState::ConsensusInvalid {
+                    evidence: EvidenceId::from_digest([0x33; 32]),
+                    rule: BodyRuleId::new("test.graph-error-fallback"),
+                },
+            )
+            .expect("the temporary child accepts a permanent tombstone");
+        overlay
+            .remove_header_leaf(tombstone_hash)
+            .expect("removing a new child leaves only its append-only tombstone");
+        tombstone_hash
+    }
+
+    #[test]
+    fn graph_errors_map_to_the_exact_subject() {
+        let fixture = fixture(EngineMode::HeadersOnly);
+        let plan = no_change_candidate(&fixture.engine);
+        let expected = hash(0x11);
+        let actual = hash(0x12);
+        let header = hash(0x13);
+        let parent = hash(0x14);
+        let candidate = hash(0x15);
+        let cases = [
+            (
+                GraphError::AnchorHashMismatch { expected, actual },
+                InvariantViolation::Index(expected),
+            ),
+            (
+                GraphError::UnknownParent { header, parent },
+                InvariantViolation::Index(header),
+            ),
+            (
+                GraphError::InvalidHeaderNode {
+                    header,
+                    invariant: HeaderNodeInvariant::CanonicalHeaderHash,
+                },
+                InvariantViolation::Index(header),
+            ),
+            (
+                GraphError::HeightOverflow { parent },
+                InvariantViolation::Index(parent),
+            ),
+            (
+                GraphError::ConflictingDuplicate(hash(0x20)),
+                InvariantViolation::Index(hash(0x20)),
+            ),
+            (
+                GraphError::DuplicateHeaderNode(hash(0x21)),
+                InvariantViolation::Index(hash(0x21)),
+            ),
+            (
+                GraphError::UnknownHeaderNode(hash(0x22)),
+                InvariantViolation::Index(hash(0x22)),
+            ),
+            (
+                GraphError::IneligibleFinalizedFrontier(hash(0x23)),
+                InvariantViolation::Index(hash(0x23)),
+            ),
+            (
+                GraphError::HeaderNodeHasChildren(hash(0x24)),
+                InvariantViolation::Index(hash(0x24)),
+            ),
+            (
+                GraphError::PermanentBodyInvalidity(hash(0x25)),
+                InvariantViolation::Index(hash(0x25)),
+            ),
+            (
+                GraphError::FinalizedFrontierNotDescendant {
+                    current: hash(0x26),
+                    candidate,
+                },
+                InvariantViolation::Index(candidate),
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(graph_error_violation(error, &plan), expected);
+        }
+        assert_eq!(
+            graph_error_violation(
+                GraphError::StaleDelta {
+                    current_revision: crate::GraphRevision::default(),
+                    delta_base_revision: crate::GraphRevision::default(),
+                },
+                &plan,
+            ),
+            InvariantViolation::SnapshotBeforeCommit
+        );
+    }
+
+    #[test]
+    fn graph_error_fallback_prefers_updated_deleted_tombstone_then_finalized() {
+        let fixture = fixture(EngineMode::HeadersOnly);
+        let mut graph = fixture.engine.graph().clone();
+        let mut sibling_header = *regtest_genesis_block().header;
+        sibling_header.previous_block_hash = fixture.anchor.hash;
+        sibling_header.nonce.0[0] = 0x30;
+        let sibling = match graph
+            .insert(
+                Arc::new(sibling_header),
+                crate::HeaderValidationState::Valid,
+                [EligibilityReason::FinalityConflict {
+                    finalized: fixture.anchor,
+                }],
+                BodyValidationState::Unknown,
+            )
+            .expect("the ineligible sibling is retained without changing fork choice")
+        {
+            crate::InsertResult::Inserted(frontier)
+            | crate::InsertResult::AlreadyPresent(frontier) => frontier,
+        };
+        let engine = HeaderChainEngine::from_audited_state(
+            graph,
+            fixture.engine.metadata().clone(),
+            fixture.engine.selected_projection().to_vec(),
+            fixture.engine.verified_projection().to_vec(),
+            [],
+        )
+        .expect("the fallback fixture remains coherent with an ineligible sibling");
+
+        let mut updated_overlay = GraphOverlay::new(engine.graph());
+        updated_overlay
+            .set_body_validation_state(
+                fixture.child.hash,
+                BodyValidationState::Verified {
+                    evidence: EvidenceId::from_digest([0x31; 32]),
+                },
+            )
+            .expect("the fixture child accepts a body-state update");
+        updated_overlay
+            .remove_header_leaf(sibling.hash)
+            .expect("the ineligible sibling is a removable leaf");
+        let tombstone_hash = stage_tombstone_only(&mut updated_overlay, fixture.child.hash, 0x32);
+        let updated = candidate_with_delta(&engine, updated_overlay.delta());
+
+        let mut deleted_overlay = GraphOverlay::new(engine.graph());
+        deleted_overlay
+            .remove_header_leaf(sibling.hash)
+            .expect("the ineligible sibling is a removable leaf");
+        stage_tombstone_only(&mut deleted_overlay, fixture.child.hash, 0x32);
+        let deleted = candidate_with_delta(&engine, deleted_overlay.delta());
+
+        let mut tombstone_overlay = GraphOverlay::new(engine.graph());
+        stage_tombstone_only(&mut tombstone_overlay, fixture.child.hash, 0x32);
+        let tombstone = candidate_with_delta(&engine, tombstone_overlay.delta());
+
+        let fallback_error = || GraphError::Work(WorkCoordinateError::Overflow);
+        assert_eq!(
+            graph_error_violation(fallback_error(), &updated),
+            InvariantViolation::Index(fixture.child.hash)
+        );
+        assert_eq!(
+            graph_error_violation(fallback_error(), &deleted),
+            InvariantViolation::Index(sibling.hash)
+        );
+        assert_eq!(
+            graph_error_violation(fallback_error(), &tombstone),
+            InvariantViolation::Index(tombstone_hash)
+        );
+        assert_eq!(
+            graph_error_violation(fallback_error(), &no_change_candidate(&fixture.engine)),
+            InvariantViolation::Index(fixture.anchor.hash)
+        );
+    }
+
+    #[test]
+    fn every_fallback_only_graph_error_uses_the_same_subject() {
+        let fixture = fixture(EngineMode::HeadersOnly);
+        let plan = no_change_candidate(&fixture.engine);
+        for error in [
+            GraphError::RevisionExhausted,
+            GraphError::InvalidAncestorHeight {
+                ancestor: block::Height(2),
+                descendant: block::Height(1),
+            },
+            GraphError::Work(WorkCoordinateError::Underflow),
+        ] {
+            assert_eq!(
+                graph_error_violation(error, &plan),
+                InvariantViolation::Index(fixture.anchor.hash)
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_metadata_drift_fails_closed_in_both_verifiers() {
+        let fixture = fixture(EngineMode::HeadersOnly);
+        let mut cases = Vec::new();
+
+        let mut disk_format = no_change_candidate(&fixture.engine);
+        disk_format.change_set.metadata.disk_format = crate::HeaderChainDiskVersion(2);
+        cases.push(disk_format);
+
+        let mut network = no_change_candidate(&fixture.engine);
+        network.change_set.metadata.network_id = Network::Mainnet.kind();
+        cases.push(network);
+
+        let mut manifest = no_change_candidate(&fixture.engine);
+        manifest.change_set.metadata.anchor_manifest_digest = [0xff; 32];
+        cases.push(manifest);
+
+        for plan in cases {
+            for mode in [VerificationMode::Production, VerificationMode::Exhaustive] {
+                assert_eq!(
+                    verify_plan_with_mode(&fixture.engine, &plan, mode),
+                    Err(InvariantViolation::SnapshotBeforeCommit)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_and_exhaustive_paths_agree_on_valid_and_corrupt_candidates() {
+        let fixture = fixture(EngineMode::HeadersOnly);
+        let valid = no_change_candidate(&fixture.engine);
+        assert_eq!(
+            verify_plan_with_mode(&fixture.engine, &valid, VerificationMode::Production),
+            verify_plan_with_mode(&fixture.engine, &valid, VerificationMode::Exhaustive)
+        );
+        assert_eq!(
+            verify_plan_with_mode(&fixture.engine, &valid, VerificationMode::Exhaustive),
+            Ok(())
+        );
+
+        let mut corrupt = valid;
+        corrupt.change_set.metadata.anchor_manifest_digest = [0xfe; 32];
+        assert_eq!(
+            verify_plan_with_mode(&fixture.engine, &corrupt, VerificationMode::Production),
+            verify_plan_with_mode(&fixture.engine, &corrupt, VerificationMode::Exhaustive)
+        );
+    }
 }

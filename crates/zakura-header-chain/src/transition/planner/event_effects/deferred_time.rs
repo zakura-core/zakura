@@ -11,16 +11,13 @@ pub(super) fn reevaluate_elapsed_deferrals(
     projected: &mut ProjectedTransitionState<'_>,
     event_context: &EventProjectionContext<'_>,
 ) -> Result<(), TransitionFailure> {
+    let now = event_context.transition.clock.now();
     let due: Vec<_> = projected
         .graph()
         .view_header_nodes()
         .into_iter()
         .filter_map(|node| match node.validation {
-            HeaderValidationState::DeferredUntil(until)
-                if until <= event_context.transition.clock.now() =>
-            {
-                Some(node.hash)
-            }
+            HeaderValidationState::DeferredUntil(until) if until <= now => Some(node.hash),
             _ => None,
         })
         .collect();

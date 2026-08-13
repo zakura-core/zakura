@@ -20,11 +20,50 @@ use crate::{
     StateVersion, StoreError, SuffixWork, TrustedAnchor, VerifiedGeneration, WorkCoordinate,
 };
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum AuditRead {
+    Snapshot,
+    Metadata,
+    HeaderNodes,
+    Tombstones,
+    BodyStateAuthority,
+    ChildEdges,
+    SelectedProjection,
+    VerifiedProjection,
+    DeferredEntries,
+    EligibilityRoots,
+    AuxDeliveries,
+    ValidationContexts,
+    CanonicalHash,
+    FinalityHistory,
+}
+
+impl AuditRead {
+    pub(super) const ALL: [Self; 14] = [
+        Self::Snapshot,
+        Self::Metadata,
+        Self::HeaderNodes,
+        Self::Tombstones,
+        Self::BodyStateAuthority,
+        Self::ChildEdges,
+        Self::SelectedProjection,
+        Self::VerifiedProjection,
+        Self::DeferredEntries,
+        Self::EligibilityRoots,
+        Self::AuxDeliveries,
+        Self::ValidationContexts,
+        Self::CanonicalHash,
+        Self::FinalityHistory,
+    ];
+}
+
 #[derive(Clone)]
 pub(super) struct AuditStore {
     pub(super) metadata: EngineMetadata,
     pub(super) snapshot: EngineSnapshot,
     pub(super) nodes: Vec<HeaderNode>,
+    pub(super) tombstones: Vec<ConsensusInvalidBodyTombstone>,
+    pub(super) body_state_authority: bool,
     pub(super) children: Vec<(block::Hash, block::Hash)>,
     pub(super) selected: Vec<Frontier>,
     pub(super) verified: Vec<Frontier>,
@@ -34,38 +73,40 @@ pub(super) struct AuditStore {
     pub(super) contexts: Vec<ValidationContextRecord>,
     pub(super) canonical: HashMap<block::Height, block::Hash>,
     pub(super) finality: Vec<FinalityRecord>,
+    pub(super) failed_read: Option<AuditRead>,
+}
+
+impl AuditStore {
+    fn check_read(&self, read: AuditRead) -> Result<(), StoreError> {
+        if self.failed_read == Some(read) {
+            Err(injected_store_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl StoreAuditRead for AuditStore {
     fn snapshot(&self) -> Result<EngineSnapshot, StoreError> {
+        self.check_read(AuditRead::Snapshot)?;
         Ok(self.snapshot.clone())
     }
 
     fn metadata(&self) -> Result<EngineMetadata, StoreError> {
+        self.check_read(AuditRead::Metadata)?;
         Ok(self.metadata.clone())
     }
 
     fn all_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
+        self.check_read(AuditRead::HeaderNodes)?;
         Ok(self.nodes.clone())
     }
 
     fn all_consensus_invalid_body_tombstones(
         &self,
     ) -> Result<Vec<ConsensusInvalidBodyTombstone>, StoreError> {
-        Ok(self
-            .nodes
-            .iter()
-            .filter_map(|node| match &node.body_validation_state {
-                BodyValidationState::ConsensusInvalid { evidence, rule } => {
-                    Some(ConsensusInvalidBodyTombstone {
-                        hash: node.hash,
-                        evidence: *evidence,
-                        rule: rule.clone(),
-                    })
-                }
-                _ => None,
-            })
-            .collect())
+        self.check_read(AuditRead::Tombstones)?;
+        Ok(self.tombstones.clone())
     }
 
     fn full_state_attests_to_body_validation_state(
@@ -73,34 +114,42 @@ impl StoreAuditRead for AuditStore {
         _hash: block::Hash,
         _state: &BodyValidationState,
     ) -> Result<bool, StoreError> {
-        Ok(true)
+        self.check_read(AuditRead::BodyStateAuthority)?;
+        Ok(self.body_state_authority)
     }
 
     fn header_child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError> {
+        self.check_read(AuditRead::ChildEdges)?;
         Ok(self.children.clone())
     }
 
     fn selected_projection(&self) -> Result<Vec<Frontier>, StoreError> {
+        self.check_read(AuditRead::SelectedProjection)?;
         Ok(self.selected.clone())
     }
 
     fn verified_projection(&self) -> Result<Vec<Frontier>, StoreError> {
+        self.check_read(AuditRead::VerifiedProjection)?;
         Ok(self.verified.clone())
     }
 
     fn deferred_entries(&self) -> Result<Vec<(DateTime<Utc>, block::Hash)>, StoreError> {
+        self.check_read(AuditRead::DeferredEntries)?;
         Ok(self.deferred.clone())
     }
 
     fn eligibility_roots(&self) -> Result<Vec<(block::Hash, EligibilityReason)>, StoreError> {
+        self.check_read(AuditRead::EligibilityRoots)?;
         Ok(self.reasons.clone())
     }
 
     fn all_aux_deliveries(&self) -> Result<Vec<AuxDelivery>, StoreError> {
+        self.check_read(AuditRead::AuxDeliveries)?;
         Ok(self.aux.clone())
     }
 
     fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError> {
+        self.check_read(AuditRead::ValidationContexts)?;
         Ok(self.contexts.clone())
     }
 
@@ -108,6 +157,7 @@ impl StoreAuditRead for AuditStore {
         &self,
         height: block::Height,
     ) -> Result<Option<block::Hash>, StoreError> {
+        self.check_read(AuditRead::CanonicalHash)?;
         Ok(self.canonical.get(&height).copied())
     }
 
@@ -115,6 +165,7 @@ impl StoreAuditRead for AuditStore {
         &self,
         visitor: &mut dyn FnMut(FinalityRecord) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
+        self.check_read(AuditRead::FinalityHistory)?;
         for record in &self.finality {
             visitor(*record)?;
         }
@@ -208,6 +259,8 @@ pub(super) fn fixture() -> (AuditStore, EngineConfig) {
             snapshot: metadata.snapshot(),
             metadata,
             nodes: vec![anchor_node, child_node],
+            tombstones: Vec::new(),
+            body_state_authority: true,
             children: vec![(anchor.hash, child.hash)],
             selected: vec![anchor, child],
             verified: vec![anchor],
@@ -224,9 +277,14 @@ pub(super) fn fixture() -> (AuditStore, EngineConfig) {
                 },
                 epoch: FinalityEpoch::new(0),
             }],
+            failed_read: None,
         },
         config,
     )
+}
+
+pub(super) fn injected_store_error() -> StoreError {
+    StoreError::Unavailable("injected recovery audit read failure")
 }
 
 pub(super) fn violations(store: &AuditStore, config: &EngineConfig) -> Vec<AuditViolation> {

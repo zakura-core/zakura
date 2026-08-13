@@ -63,6 +63,17 @@ fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
     );
     store.commit(&refused);
 
+    let repeated = apply_transition(
+        &store,
+        insertion(&store, 2, EvidenceId::from_digest([0x32; 32])),
+        &context(&config, &clock, None),
+    )
+    .expect("a repeated refusal remains an explicit resource-stall receipt");
+    assert!(repeated.effect().is_resource_stalled());
+    assert!(repeated.is_no_change());
+    assert_eq!(repeated.change_set.metadata, store.metadata);
+    assert!(repeated.graph_delta.is_empty());
+
     let recovered = apply_transition(
         &store,
         insertion(&store, 1, EvidenceId::from_digest([0x31; 32])),

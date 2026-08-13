@@ -1,6 +1,6 @@
 //! Private phase values that enforce the recovery pipeline order.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use zakura_chain::block;
@@ -72,14 +72,13 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditRead>(
 
     let mut source_nodes = store.all_header_nodes()?;
     let tombstones = store.all_consensus_invalid_body_tombstones()?;
-    let tombstones_by_hash: HashMap<_, _> = tombstones
-        .iter()
-        .map(|tombstone| (tombstone.hash, tombstone))
-        .collect();
-    if tombstones_by_hash.len() != tombstones.len() {
-        early_violations.push(AuditViolation::ConsensusInvalidBodyTombstone(
-            metadata.frontiers.finalized.hash,
-        ));
+    let mut tombstone_hashes = HashSet::new();
+    for tombstone in &tombstones {
+        if !tombstone_hashes.insert(tombstone.hash) {
+            early_violations.push(AuditViolation::ConsensusInvalidBodyTombstone(
+                tombstone.hash,
+            ));
+        }
     }
     for tombstone in &tombstones {
         let state = BodyValidationState::ConsensusInvalid {

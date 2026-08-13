@@ -85,17 +85,6 @@ impl EngineTransition {
     pub(crate) const fn graph_delta(&self) -> &GraphDelta {
         &self.candidate.graph_delta
     }
-
-    /// Derive ownership retirement from the before/after commit snapshots.
-    ///
-    /// Delegates to [`crate::RetiredWork::from_snapshots`]. Coordinators that
-    /// also retire exact owners should call [`crate::RetiredWork::with_owners`].
-    pub fn retired_work(&self) -> crate::RetiredWork {
-        crate::RetiredWork::from_snapshots(
-            self.snapshot_before_commit(),
-            &self.snapshot_after_commit(),
-        )
-    }
 }
 
 #[cfg(test)]

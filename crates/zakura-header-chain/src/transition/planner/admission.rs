@@ -26,7 +26,7 @@ pub(super) struct AdmittedRequest {
 /// How a pure header insertion related to newer monotone finality.
 ///
 /// Maps to published [`crate::HeaderWorkEffect`] via [`Self::header_work_effect`].
-/// Settlement and replay must use that conversion rather than open-coding the match.
+/// Replay binding uses that conversion when publishing an early no-change outcome.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum HeaderInsertionRebase {
     /// The insertion already targeted the current finality anchor.
@@ -45,7 +45,7 @@ impl HeaderInsertionRebase {
     ///   coordinates rebase independently).
     /// - [`Self::Rebased`] → [`crate::HeaderWorkEffect::Rebased`]
     /// - [`Self::AlreadyApplied`] → [`crate::HeaderWorkEffect::AlreadyApplied`]
-    ///   (normally surfaced as a verified no-change before settlement).
+    ///   (surfaced as a verified no-change before settlement).
     pub(super) const fn header_work_effect(self) -> Option<crate::HeaderWorkEffect> {
         match self {
             Self::Current => None,

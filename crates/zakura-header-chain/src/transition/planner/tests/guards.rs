@@ -1,6 +1,103 @@
 use super::*;
 
 #[test]
+fn mode_and_capability_gates_precede_event_projection() {
+    let (headers_only_store, headers_only_config) = TestStore::new(EngineMode::HeadersOnly);
+    let clock = ManualClock(Utc::now());
+    let body_event =
+        TransitionEvent::BodyEvidence(BodyEvidence::PayloadMismatch(crate::BodyPayloadMismatch {
+            evidence: EvidenceId::from_digest([0x50; 32]),
+            requested: headers_only_store.metadata.frontiers.header_best.hash,
+            delivered: block::Hash([0x51; 32]),
+            kind: crate::BodyCommitmentKind::HeaderHash,
+            source: SourceId::from_digest([0x52; 32]),
+        }));
+    assert_eq!(
+        apply_transition(
+            &headers_only_store,
+            TransitionRequest {
+                expected_version: headers_only_store.metadata.state_version,
+                event: body_event.clone(),
+            },
+            &context(&headers_only_config, &clock, Some(&Authority)),
+        )
+        .expect_err("full-state evidence is unavailable in headers-only mode"),
+        TransitionFailure::Mode
+    );
+
+    let (integrated_store, integrated_config) = TestStore::new(EngineMode::Integrated);
+    assert_eq!(
+        apply_transition(
+            &integrated_store,
+            TransitionRequest {
+                expected_version: integrated_store.metadata.state_version,
+                event: body_event,
+            },
+            &context(&integrated_config, &clock, None),
+        )
+        .expect_err("integrated evidence still requires exact authority"),
+        TransitionFailure::Authority
+    );
+
+    let no_authority = TransitionContext {
+        config: &integrated_config,
+        clock: &clock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    assert_eq!(
+        apply_transition(
+            &integrated_store,
+            insertion(&integrated_store, 1, EvidenceId::from_digest([0x53; 32]),),
+            &no_authority,
+        )
+        .expect_err("registered completion capability is mandatory"),
+        TransitionFailure::Authority
+    );
+    assert_eq!(
+        apply_transition(
+            &integrated_store,
+            TransitionRequest {
+                expected_version: integrated_store.metadata.state_version,
+                event: TransitionEvent::OperatorBodyRetry(crate::OperatorBodyRetry {
+                    hash: integrated_store.metadata.frontiers.header_best.hash,
+                    evidence: EvidenceId::from_digest([0x54; 32]),
+                    availability: crate::BodyUnavailableSummary::default(),
+                }),
+            },
+            &no_authority,
+        )
+        .expect_err("registered scheduler capability is mandatory"),
+        TransitionFailure::Authority
+    );
+}
+
+#[test]
+fn active_prepared_header_limit_accepts_exactly_limit_and_rejects_one_more() {
+    let (store, mut config) = TestStore::new(EngineMode::HeadersOnly);
+    config.limits.max_headers_per_transition =
+        std::num::NonZeroUsize::new(2).expect("two is nonzero");
+    let clock = ManualClock(Utc::now());
+
+    apply_transition(
+        &store,
+        insertion(&store, 2, EvidenceId::from_digest([0x55; 32])),
+        &context(&config, &clock, None),
+    )
+    .expect("a batch at the active runtime limit is admitted");
+    assert!(matches!(
+        apply_transition(
+            &store,
+            insertion(&store, 3, EvidenceId::from_digest([0x56; 32])),
+            &context(&config, &clock, None),
+        ),
+        Err(TransitionFailure::InvalidEvidence(
+            InvalidTransitionEvidence::Limit(LimitViolation::PreparedHeadersExceeded)
+        ))
+    ));
+}
+
+#[test]
 fn retention_references_admit_all_staged_targets_and_candidate_tips() {
     let (store, config) = TestStore::new(EngineMode::HeadersOnly);
     let clock = ManualClock(Utc::now());
@@ -56,7 +153,7 @@ fn retention_references_are_bounded_before_ancestry_walks() {
 }
 
 #[test]
-fn typed_header_authority_ignores_global_version_but_rejects_stale_generation() {
+fn typed_header_authority_ignores_global_version_but_binds_branch_freshness() {
     let (store, config) = TestStore::new(EngineMode::HeadersOnly);
     let clock = ManualClock(Utc::now());
     let mut request = insertion(&store, 1, EvidenceId::from_digest([6; 32]));
@@ -64,26 +161,42 @@ fn typed_header_authority_ignores_global_version_but_rejects_stale_generation() 
     apply_transition(&store, request, &context(&config, &clock, None))
         .expect("global state versions do not authorize header work");
 
-    let mut request = insertion(&store, 1, EvidenceId::from_digest([7; 32]));
-    let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
+    let request = insertion(&store, 1, EvidenceId::from_digest([7; 32]));
+    let TransitionEvent::InsertHeaders(insert) = &request.event else {
         panic!("the fixture constructs a header insertion");
     };
     let owner = insert
         .owner
         .header_owner()
         .expect("the fixture is ordinary header work");
-    insert.owner = crate::HeaderWorkOwner {
-        authority: crate::HeaderWorkAuthority {
+    let stale_authorities = [
+        crate::HeaderWorkAuthority {
             header_generation: HeaderGeneration::new(9),
             ..owner.authority
         },
-        ..owner
+        crate::HeaderWorkAuthority {
+            branch: BranchId::new(
+                block::Hash([0x58; 32]),
+                owner.authority.branch.target_tip_hash,
+            ),
+            ..owner.authority
+        },
+        crate::HeaderWorkAuthority {
+            branch: BranchId::new(owner.authority.branch.anchor_hash, block::Hash([0x59; 32])),
+            ..owner.authority
+        },
+    ];
+    for authority in stale_authorities {
+        let mut stale = request.clone();
+        let TransitionEvent::InsertHeaders(insert) = &mut stale.event else {
+            unreachable!("the cloned fixture remains a header insertion");
+        };
+        insert.owner = crate::HeaderWorkOwner { authority, ..owner }.into();
+        assert!(matches!(
+            apply_transition(&store, stale, &context(&config, &clock, None)),
+            Err(TransitionFailure::Stale { current }) if current == StateVersion::new(0)
+        ));
     }
-    .into();
-    assert!(matches!(
-        apply_transition(&store, request, &context(&config, &clock, None)),
-        Err(TransitionFailure::Stale { current }) if current == StateVersion::new(0)
-    ));
 }
 
 #[test]
@@ -128,7 +241,7 @@ fn typed_body_authority_ignores_global_version_but_rejects_stale_generation() {
         evidence: EvidenceId::from_digest([0xa4; 32]),
         boundary_hash,
     };
-    let mut request = TransitionRequest {
+    let request = TransitionRequest {
         expected_version: StateVersion::new(9),
         event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
             owner,
@@ -143,24 +256,48 @@ fn typed_body_authority_ignores_global_version_but_rejects_stale_generation() {
     )
     .expect("global state versions do not authorize auxiliary evidence");
 
-    let TransitionEvent::AuxEvidence(event) = &mut request.event else {
+    let TransitionEvent::AuxEvidence(event) = &request.event else {
         panic!("the fixture constructs auxiliary evidence");
     };
-    event.owner = crate::BodyWorkOwner {
-        authority: crate::BodyWorkAuthority {
-            verified_generation: VerifiedGeneration::new(9),
-            ..event.owner.authority
+    let owner = event.owner;
+    let stale_authorities = [
+        crate::BodyWorkAuthority {
+            header: crate::HeaderWorkAuthority {
+                header_generation: HeaderGeneration::new(9),
+                ..owner.authority.header
+            },
+            ..owner.authority
         },
-        ..event.owner
-    };
-    assert!(matches!(
-        apply_transition(
-            &store,
-            request,
-            &context(&config, &clock, Some(&Authority)),
-        ),
-        Err(TransitionFailure::Stale { current }) if current == store.metadata.state_version
-    ));
+        crate::BodyWorkAuthority {
+            verified_generation: VerifiedGeneration::new(9),
+            ..owner.authority
+        },
+        crate::BodyWorkAuthority {
+            header: crate::HeaderWorkAuthority {
+                branch: BranchId::new(
+                    block::Hash([0x5a; 32]),
+                    owner.authority.header.branch.target_tip_hash,
+                ),
+                ..owner.authority.header
+            },
+            ..owner.authority
+        },
+    ];
+    for authority in stale_authorities {
+        let mut stale = request.clone();
+        let TransitionEvent::AuxEvidence(event) = &mut stale.event else {
+            unreachable!("the cloned fixture remains auxiliary evidence");
+        };
+        event.owner = crate::BodyWorkOwner { authority, ..owner };
+        assert!(matches!(
+            apply_transition(
+                &store,
+                stale,
+                &context(&config, &clock, Some(&Authority)),
+            ),
+            Err(TransitionFailure::Stale { current }) if current == store.metadata.state_version
+        ));
+    }
 }
 
 #[test]

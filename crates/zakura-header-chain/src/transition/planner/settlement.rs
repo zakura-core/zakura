@@ -127,13 +127,12 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     }
 
     let mut effect = TransitionEffect::none();
-    // HeaderInsertionRebase::header_work_effect is the sole rebase→effect map;
-    // work-coordinate rebase from finality settlement may still force Rebased.
-    if work_rebased {
-        effect.header_work = Some(HeaderWorkEffect::Rebased);
-    } else {
-        effect.header_work = header_rebase.header_work_effect();
-    }
+    debug_assert_ne!(
+        header_rebase,
+        HeaderInsertionRebase::AlreadyApplied,
+        "already-applied header work returns during replay binding before settlement"
+    );
+    effect.header_work = settlement_header_work_effect(work_rebased, header_rebase);
     if matches!(
         event,
         TransitionEvent::VerifiedChainChanged(ref event)
@@ -230,5 +229,45 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
 pub(super) fn apply_migrated_pin_alarm(metadata: &mut EngineMetadata, pin: Option<Frontier>) {
     if let Some(pin) = pin {
         metadata.alarms.migrated_pin_refuted = Some(pin);
+    }
+}
+
+fn settlement_header_work_effect(
+    work_rebased: bool,
+    header_rebase: HeaderInsertionRebase,
+) -> Option<HeaderWorkEffect> {
+    (work_rebased || header_rebase == HeaderInsertionRebase::Rebased)
+        .then_some(HeaderWorkEffect::Rebased)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_work_effect_preserves_settlement_fallbacks() {
+        assert_eq!(
+            settlement_header_work_effect(false, HeaderInsertionRebase::Current),
+            None
+        );
+        assert_eq!(
+            settlement_header_work_effect(false, HeaderInsertionRebase::Rebased),
+            Some(HeaderWorkEffect::Rebased)
+        );
+        assert_eq!(
+            settlement_header_work_effect(false, HeaderInsertionRebase::AlreadyApplied),
+            None
+        );
+
+        for header_rebase in [
+            HeaderInsertionRebase::Current,
+            HeaderInsertionRebase::Rebased,
+            HeaderInsertionRebase::AlreadyApplied,
+        ] {
+            assert_eq!(
+                settlement_header_work_effect(true, header_rebase),
+                Some(HeaderWorkEffect::Rebased)
+            );
+        }
     }
 }

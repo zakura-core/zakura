@@ -246,3 +246,383 @@ impl TransitionInput {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroU64, sync::Arc};
+
+    use zakura_chain::{
+        block::{self, genesis::regtest_genesis_block},
+        parameters::{testnet::RegtestParameters, Network},
+    };
+
+    use super::*;
+    use crate::{
+        AuxAuthentication, BodyRuleId, BodyUnavailableSummary, BodyWorkAuthority, BranchId,
+        EvidenceId, FinalityEpoch, FinalitySource, HeaderContextFact, HeaderGeneration,
+        HeaderValidationState, HeaderWorkAuthority, OperatorInvalidationId, PreparedHeader,
+        PreparedHeaderBatch, SourceId, TargetCompletion, VerifiedBodyEvidence, VerifiedChangeCause,
+        VerifiedGeneration,
+    };
+
+    fn frontier(byte: u8, height: u32) -> Frontier {
+        Frontier::new(block::Height(height), block::Hash([byte; 32]))
+    }
+
+    fn header_owner() -> crate::HeaderSyncWorkOwner {
+        HeaderWorkAuthority {
+            header_generation: HeaderGeneration::new(3),
+            branch: BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
+        }
+        .bind(
+            4,
+            NonZeroU64::new(5).expect("the fixture request ID is nonzero"),
+        )
+        .into()
+    }
+
+    fn body_owner() -> crate::BodyWorkOwner {
+        BodyWorkAuthority {
+            header: HeaderWorkAuthority {
+                header_generation: HeaderGeneration::new(3),
+                branch: BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
+            },
+            verified_generation: VerifiedGeneration::new(6),
+        }
+        .bind(
+            7,
+            NonZeroU64::new(8).expect("the fixture request ID is nonzero"),
+        )
+    }
+
+    fn prepared_batch() -> PreparedHeaderBatch {
+        let genesis = regtest_genesis_block();
+        let parent = Frontier::new(block::Height(0), genesis.hash());
+        let mut header = *genesis.header;
+        header.previous_block_hash = parent.hash;
+        header.nonce = [9; 32].into();
+        let header = Arc::new(header);
+        let prepared = PreparedHeader {
+            hash: header.hash(),
+            height: block::Height(1),
+            block_work: header
+                .difficulty_threshold
+                .to_work()
+                .expect("the regtest target has valid work"),
+            validation: HeaderValidationState::Valid,
+            header,
+        };
+        PreparedHeaderBatch::new(
+            vec![prepared],
+            parent,
+            Network::new_regtest(RegtestParameters::default()),
+            [10; 32],
+            EvidenceId::from_digest([11; 32]),
+        )
+        .expect("the fixture batch is nonempty")
+    }
+
+    fn validation_facts() -> HeaderValidationFacts {
+        let genesis = regtest_genesis_block();
+        let parent = Frontier::new(block::Height(0), genesis.hash());
+        HeaderValidationFacts {
+            validation_leases: vec![ValidationLease::new(
+                parent,
+                vec![HeaderContextFact {
+                    frontier: parent,
+                    header: genesis.header.clone(),
+                }],
+                Network::new_regtest(RegtestParameters::default()),
+                [10; 32],
+            )],
+        }
+    }
+
+    struct InputCase {
+        name: &'static str,
+        input: TransitionInput,
+        event: TransitionEvent,
+        expected_version: Option<StateVersion>,
+        validation_lease_count: Option<usize>,
+        rebase_history: Option<Vec<FinalityRecord>>,
+        preserved_pin: Option<Option<Frontier>>,
+    }
+
+    #[test]
+    fn transition_input_accessors_match_each_variant() {
+        let version = StateVersion::new(12);
+        let parent = prepared_batch().receipt().parent();
+        let insert = InsertHeaders {
+            owner: header_owner(),
+            source: SourceId::from_digest([13; 32]),
+            parent_hash: parent.hash,
+            target_tip_hash: block::Hash([14; 32]),
+            completion: TargetCompletion::TargetComplete {
+                common_ancestor: parent,
+            },
+            batch: prepared_batch(),
+            aux: Vec::new(),
+        };
+        let verified_change = VerifiedChainChanged {
+            full_state_transition_id: EvidenceId::from_digest([15; 32]),
+            old_tip: parent,
+            new_path: Vec::new(),
+            cause: VerifiedChangeCause::Reset,
+        };
+        let verified_accept = VerifiedBlockAccepted {
+            full_state_transition_id: EvidenceId::from_digest([16; 32]),
+            path: Vec::new(),
+        };
+        let body = BodyEvidence::Verified(VerifiedBodyEvidence {
+            hash: block::Hash([17; 32]),
+            evidence: EvidenceId::from_digest([18; 32]),
+        });
+        let supplier = BodySupplierDiscovered {
+            hash: block::Hash([19; 32]),
+            evidence: EvidenceId::from_digest([20; 32]),
+            availability: BodyUnavailableSummary::default(),
+        };
+        let retry = OperatorBodyRetry {
+            hash: block::Hash([21; 32]),
+            evidence: EvidenceId::from_digest([22; 32]),
+            availability: BodyUnavailableSummary::default(),
+        };
+        let invalidate = OperatorInvalidate {
+            target: block::Hash([23; 32]),
+            id: OperatorInvalidationId::new([24; 16]),
+            operator_reason_digest: [25; 32],
+            evidence: EvidenceId::from_digest([26; 32]),
+        };
+        let reconsider = OperatorReconsider {
+            target: block::Hash([27; 32]),
+            id: OperatorInvalidationId::new([28; 16]),
+            invalidation_evidence: Some(EvidenceId::from_digest([29; 32])),
+            evidence: EvidenceId::from_digest([30; 32]),
+        };
+        let finalized = FullStateFinalized {
+            full_state_transition_id: EvidenceId::from_digest([31; 32]),
+            new_finalized: frontier(32, 4),
+            verified_path_proof: vec![block::Hash([33; 32])],
+        };
+        let pin = frontier(34, 5);
+        let refutation = MigratedPinRefutation {
+            full_state_transition_id: EvidenceId::from_digest([35; 32]),
+            pin,
+            invalid_header: frontier(36, 3),
+            rule: BodyRuleId::new("body.rule"),
+        };
+        let auxiliary = AuxEvidence {
+            owner: body_owner(),
+            deliveries: Vec::new(),
+            authentication: AuxAuthentication::Unauthenticated,
+        };
+        let rebase = FinalityRecord {
+            previous: parent,
+            current: frontier(37, 1),
+            source: FinalitySource::FullState {
+                evidence: EvidenceId::from_digest([38; 32]),
+            },
+            epoch: FinalityEpoch::new(1),
+        };
+
+        let cases = vec![
+            InputCase {
+                name: "insert headers",
+                event: TransitionEvent::InsertHeaders(Box::new(insert.clone())),
+                input: TransitionInput::InsertHeaders {
+                    event: Box::new(insert),
+                    facts: HeaderInsertionFacts {
+                        validation: validation_facts(),
+                        finality_rebase_history: vec![rebase],
+                    },
+                },
+                expected_version: None,
+                validation_lease_count: Some(1),
+                rebase_history: Some(vec![rebase]),
+                preserved_pin: None,
+            },
+            InputCase {
+                name: "verified chain changed",
+                event: TransitionEvent::VerifiedChainChanged(verified_change.clone()),
+                input: TransitionInput::VerifiedChainChanged {
+                    expected_version: version,
+                    event: verified_change,
+                    facts: validation_facts(),
+                },
+                expected_version: Some(version),
+                validation_lease_count: Some(1),
+                rebase_history: None,
+                preserved_pin: None,
+            },
+            InputCase {
+                name: "verified block accepted",
+                event: TransitionEvent::VerifiedBlockAccepted(verified_accept.clone()),
+                input: TransitionInput::VerifiedBlockAccepted {
+                    expected_version: version,
+                    event: verified_accept,
+                    facts: validation_facts(),
+                },
+                expected_version: Some(version),
+                validation_lease_count: Some(1),
+                rebase_history: None,
+                preserved_pin: None,
+            },
+            InputCase {
+                name: "body evidence",
+                event: TransitionEvent::BodyEvidence(body.clone()),
+                input: TransitionInput::BodyEvidence {
+                    expected_version: version,
+                    event: body,
+                },
+                expected_version: Some(version),
+                validation_lease_count: None,
+                rebase_history: None,
+                preserved_pin: None,
+            },
+            InputCase {
+                name: "body supplier discovered",
+                event: TransitionEvent::BodySupplierDiscovered(supplier),
+                input: TransitionInput::BodySupplierDiscovered {
+                    expected_version: version,
+                    event: supplier,
+                },
+                expected_version: Some(version),
+                validation_lease_count: None,
+                rebase_history: None,
+                preserved_pin: None,
+            },
+            InputCase {
+                name: "operator body retry",
+                event: TransitionEvent::OperatorBodyRetry(retry),
+                input: TransitionInput::OperatorBodyRetry {
+                    expected_version: version,
+                    event: retry,
+                },
+                expected_version: Some(version),
+                validation_lease_count: None,
+                rebase_history: None,
+                preserved_pin: None,
+            },
+            InputCase {
+                name: "operator invalidate",
+                event: TransitionEvent::OperatorInvalidate(invalidate),
+                input: TransitionInput::OperatorInvalidate {
+                    expected_version: version,
+                    event: invalidate,
+                },
+                expected_version: Some(version),
+                validation_lease_count: None,
+                rebase_history: None,
+                preserved_pin: None,
+            },
+            InputCase {
+                name: "operator reconsider",
+                event: TransitionEvent::OperatorReconsider(reconsider),
+                input: TransitionInput::OperatorReconsider {
+                    expected_version: version,
+                    event: reconsider,
+                },
+                expected_version: Some(version),
+                validation_lease_count: None,
+                rebase_history: None,
+                preserved_pin: None,
+            },
+            InputCase {
+                name: "full-state finalized",
+                event: TransitionEvent::FullStateFinalized(finalized.clone()),
+                input: TransitionInput::FullStateFinalized {
+                    expected_version: version,
+                    event: finalized,
+                },
+                expected_version: Some(version),
+                validation_lease_count: None,
+                rebase_history: None,
+                preserved_pin: None,
+            },
+            InputCase {
+                name: "migrated pin present",
+                event: TransitionEvent::MigratedPinRefutation(refutation.clone()),
+                input: TransitionInput::MigratedPinRefutation {
+                    expected_version: version,
+                    event: refutation.clone(),
+                    preserved_pin: Some(pin),
+                },
+                expected_version: Some(version),
+                validation_lease_count: None,
+                rebase_history: None,
+                preserved_pin: Some(Some(pin)),
+            },
+            InputCase {
+                name: "migrated pin absent",
+                event: TransitionEvent::MigratedPinRefutation(refutation.clone()),
+                input: TransitionInput::MigratedPinRefutation {
+                    expected_version: version,
+                    event: refutation,
+                    preserved_pin: None,
+                },
+                expected_version: Some(version),
+                validation_lease_count: None,
+                rebase_history: None,
+                preserved_pin: Some(None),
+            },
+            InputCase {
+                name: "auxiliary evidence",
+                event: TransitionEvent::AuxEvidence(Box::new(auxiliary.clone())),
+                input: TransitionInput::AuxEvidence {
+                    event: Box::new(auxiliary),
+                },
+                expected_version: None,
+                validation_lease_count: None,
+                rebase_history: None,
+                preserved_pin: None,
+            },
+            InputCase {
+                name: "reevaluate deferred",
+                event: TransitionEvent::ReevaluateDeferred,
+                input: TransitionInput::ReevaluateDeferred {
+                    expected_version: version,
+                },
+                expected_version: Some(version),
+                validation_lease_count: None,
+                rebase_history: None,
+                preserved_pin: None,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(case.input.event(), case.event, "{} event", case.name);
+            assert_eq!(
+                case.input.domain(),
+                case.event.domain(),
+                "{} domain",
+                case.name
+            );
+            assert_eq!(
+                case.input.expected_version(),
+                case.expected_version,
+                "{} version",
+                case.name
+            );
+            assert_eq!(
+                case.input
+                    .header_validation_facts()
+                    .map(|facts| facts.validation_leases.len()),
+                case.validation_lease_count,
+                "{} validation facts",
+                case.name
+            );
+            assert_eq!(
+                case.input.finality_rebase_history(),
+                case.rebase_history.as_deref(),
+                "{} rebase history",
+                case.name
+            );
+            assert_eq!(
+                case.input.preserved_migrated_pin(),
+                case.preserved_pin,
+                "{} preserved pin",
+                case.name
+            );
+        }
+    }
+}

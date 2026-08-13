@@ -81,6 +81,81 @@ mod tests {
         }
     }
 
+    /// The retained DAG mutates only through one planned, verified transition,
+    /// and planning derives its write set incrementally.
+    #[test]
+    fn architecture_keeps_dag_mutation_and_planning_encapsulated() {
+        for raw_entry_point in [
+            "pub fn insert(",
+            "pub fn add_eligibility_reason(",
+            "pub fn remove_operator_invalidation(",
+            "pub fn set_consensus_body_invalid(",
+            "pub fn set_body_validation_state(",
+            "pub fn set_header_validation_state(",
+        ] {
+            assert!(
+                !include_str!("graph.rs").contains(raw_entry_point),
+                "raw DAG mutation entry point escaped: {raw_entry_point}"
+            );
+        }
+        let public_surface = include_str!("lib.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the production public surface precedes its tests");
+        assert!(
+            !public_surface.contains("pub use retention::enforce_retention"),
+            "retention stays behind the transition planner"
+        );
+
+        fn planner_sources(path: &std::path::Path, sources: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(path).expect("the planner source directory is readable")
+            {
+                let entry = entry.expect("the source directory entry is readable");
+                let path = entry.path();
+                // Planner test fixtures may build whole graphs; production planning may not.
+                if path.file_name().and_then(|name| name.to_str()) == Some("tests") {
+                    continue;
+                }
+                if path.is_dir() {
+                    planner_sources(&path, sources);
+                } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                    sources.push((
+                        path.display().to_string(),
+                        std::fs::read_to_string(&path).expect("the Rust source is readable"),
+                    ));
+                }
+            }
+        }
+
+        let mut sources = vec![(
+            "transition/planner.rs".to_owned(),
+            include_str!("transition/planner.rs").to_owned(),
+        )];
+        planner_sources(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/transition/planner")
+                .as_path(),
+            &mut sources,
+        );
+        assert!(
+            !sources.is_empty(),
+            "the planner guard must inspect real planner sources"
+        );
+        for (path, source) in &sources {
+            for forbidden in [
+                "engine.graph().clone()",
+                "fn node_map",
+                "old_nodes",
+                "new_nodes",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{path} derives the write set by whole-graph diff: {forbidden}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn architecture_excludes_wallet_flyclient_and_block_sync_surfaces() {
         fn production_sources(path: &std::path::Path, sources: &mut Vec<(String, String)>) {

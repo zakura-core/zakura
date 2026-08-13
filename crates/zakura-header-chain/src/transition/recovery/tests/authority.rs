@@ -12,13 +12,13 @@ use super::super::{
     audit_store, audit_store_at, AuditViolation, RecoveryFailure, RecoveryRepair,
     ValidationContextRecord,
 };
-use super::{fixture, violations};
+use super::{fixture, injected_store_error, violations, AuditRead};
 use crate::{
     AuxAuthentication, AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId,
-    ChainScore, CheckpointSet, EligibilityReason, EligibilityState, EngineMode, EvidenceId,
-    FinalityEpoch, FinalityRecord, FinalitySource, Frontier, HeaderGeneration, HeaderNode,
-    HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, SourceId, SuffixWork,
-    WorkCoordinate,
+    ChainScore, CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState,
+    EngineMode, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
+    HeaderGeneration, HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner,
+    SourceId, SuffixWork, WorkCoordinate,
 };
 
 #[test]
@@ -97,6 +97,171 @@ fn persisted_valid_flags_do_not_bypass_header_consensus_validation() {
     store.canonical.insert(block::Height(1), invalid_hash);
 
     assert!(violations(&store, &config).contains(&AuditViolation::HeaderValidation(invalid_hash)));
+}
+
+#[test]
+fn rejects_missing_duplicate_orphan_and_mismatched_tombstones() {
+    let (base, config) = fixture();
+    let child_hash = base.nodes[1].hash;
+    let evidence = EvidenceId::from_digest([0x21; 32]);
+    let rule = BodyRuleId::new("body.rule");
+    let invalid = BodyValidationState::ConsensusInvalid {
+        evidence,
+        rule: rule.clone(),
+    };
+    let matching = ConsensusInvalidBodyTombstone {
+        hash: child_hash,
+        evidence,
+        rule,
+    };
+    let cases = [
+        ("missing", invalid.clone(), Vec::new()),
+        (
+            "duplicate",
+            invalid.clone(),
+            vec![matching.clone(), matching.clone()],
+        ),
+        (
+            "orphan",
+            BodyValidationState::Unknown,
+            vec![matching.clone()],
+        ),
+        (
+            "mismatched",
+            invalid,
+            vec![ConsensusInvalidBodyTombstone {
+                evidence: EvidenceId::from_digest([0x22; 32]),
+                ..matching
+            }],
+        ),
+    ];
+
+    for (name, body_state, tombstones) in cases {
+        let mut store = base.clone();
+        store.nodes[1].body_validation_state = body_state;
+        store.tombstones = tombstones;
+        assert_eq!(
+            violations(&store, &config),
+            vec![AuditViolation::ConsensusInvalidBodyTombstone(child_hash)],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn denies_body_states_without_full_state_authority() {
+    let (base, config) = fixture();
+    let child_hash = base.nodes[1].hash;
+    let evidence = EvidenceId::from_digest([0x31; 32]);
+    let rule = BodyRuleId::new("body.rule");
+    let cases = [
+        (
+            "verified",
+            BodyValidationState::Verified { evidence },
+            Vec::new(),
+        ),
+        (
+            "consensus invalid",
+            BodyValidationState::ConsensusInvalid {
+                evidence,
+                rule: rule.clone(),
+            },
+            vec![ConsensusInvalidBodyTombstone {
+                hash: child_hash,
+                evidence,
+                rule,
+            }],
+        ),
+    ];
+
+    for (name, body_state, tombstones) in cases {
+        let mut store = base.clone();
+        store.nodes[1].body_validation_state = body_state;
+        store.tombstones = tombstones;
+        store.body_state_authority = false;
+        assert_eq!(
+            violations(&store, &config),
+            vec![AuditViolation::BodyValidationEvidenceAuthority(child_hash)],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn propagates_every_store_audit_read_error() {
+    for failed_read in AuditRead::ALL {
+        let (mut store, mut config) = fixture();
+        match failed_read {
+            AuditRead::BodyStateAuthority => {
+                store.nodes[1].body_validation_state = BodyValidationState::Verified {
+                    evidence: EvidenceId::from_digest([0x41; 32]),
+                };
+            }
+            AuditRead::CanonicalHash => {
+                let anchor = store.metadata.frontiers.finalized;
+                config.replace_local_checkpoints(
+                    CheckpointSet::new([anchor]).expect("the anchor checkpoint is unique"),
+                );
+                store.metadata.anchor_manifest_digest = config.trust_anchor_digest();
+                store.snapshot = store.metadata.snapshot();
+            }
+            _ => {}
+        }
+        store.failed_read = Some(failed_read);
+
+        assert_eq!(
+            audit_store(&store, &config),
+            Err(RecoveryFailure::Store(injected_store_error())),
+            "{failed_read:?}"
+        );
+    }
+}
+
+#[test]
+fn violations_are_sorted_and_deduplicated() {
+    let (mut store, config) = fixture();
+    let child_hash = store.nodes[1].hash;
+    store.nodes[1].block_work = zakura_chain::work::difficulty::Work::zero();
+    store.nodes.push(store.nodes[1].clone());
+    store.tombstones.push(ConsensusInvalidBodyTombstone {
+        hash: child_hash,
+        evidence: EvidenceId::from_digest([0x51; 32]),
+        rule: BodyRuleId::new("body.rule"),
+    });
+    store.body_state_authority = false;
+
+    assert_eq!(
+        violations(&store, &config),
+        vec![
+            AuditViolation::NodeHash(child_hash),
+            AuditViolation::Work(child_hash),
+            AuditViolation::ConsensusInvalidBodyTombstone(child_hash),
+            AuditViolation::BodyValidationEvidenceAuthority(child_hash),
+        ]
+    );
+}
+
+#[test]
+fn rejects_invalid_verified_paths_in_both_modes() {
+    for mode in [EngineMode::HeadersOnly, EngineMode::Integrated] {
+        let (mut store, mut config) = fixture();
+        let child = store.metadata.frontiers.header_best;
+        config.mode = mode;
+        store.metadata.mode = mode;
+        store.metadata.frontiers.verified_best = child;
+        store.snapshot = store.metadata.snapshot();
+        if mode == EngineMode::HeadersOnly {
+            store.finality[0].source = FinalitySource::MigratedHeadersOnly;
+        }
+
+        assert_eq!(
+            audit_store(&store, &config),
+            Err(RecoveryFailure::Source {
+                violations: vec![AuditViolation::ProtectedPath(child.hash)],
+            }),
+            "{mode:?}"
+        );
+    }
 }
 
 #[test]
@@ -279,10 +444,17 @@ fn audits_each_normative_invariant() {
     assert!(violations(&store, &config).contains(&AuditViolation::Work(child_hash)));
 
     let mut store = base.clone();
+    let evidence = EvidenceId::from_digest([2; 32]);
+    let rule = BodyRuleId::new("body.rule");
     store.nodes[1].body_validation_state = BodyValidationState::ConsensusInvalid {
-        evidence: EvidenceId::from_digest([2; 32]),
-        rule: BodyRuleId::new("body.rule"),
+        evidence,
+        rule: rule.clone(),
     };
+    store.tombstones.push(ConsensusInvalidBodyTombstone {
+        hash: child_hash,
+        evidence,
+        rule,
+    });
     let plan = audit_store(&store, &config)
         .expect("body invalidity is authoritative without an eligibility reason");
     assert_eq!(

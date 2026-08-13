@@ -55,6 +55,60 @@ fn auxiliary_delivery_ids_are_globally_unique_across_headers() {
 }
 
 #[test]
+fn auxiliary_evidence_rejects_invalid_counts_and_duplicate_identity() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let mut insert = insertion(&store, 1, EvidenceId::from_digest([0xd6; 32]));
+    let TransitionEvent::InsertHeaders(insert_event) = &mut insert.event else {
+        unreachable!("the fixture constructs a header insertion")
+    };
+    let delivery = unauthenticated_delivery(insert_event, EvidenceId::from_digest([0xd7; 32]));
+    insert_event.aux.push(delivery);
+    let plan = apply_transition(&store, insert, &context(&config, &clock, None))
+        .expect("the exact unauthenticated delivery is admitted");
+    store.commit(&plan);
+
+    let cases = [
+        ("empty", Vec::new(), AuxiliaryViolation::DeliveryCount),
+        (
+            "three deliveries",
+            vec![delivery, delivery, delivery],
+            AuxiliaryViolation::DeliveryCount,
+        ),
+        (
+            "duplicate identity",
+            vec![delivery, delivery],
+            AuxiliaryViolation::DuplicateDelivery,
+        ),
+    ];
+    for (label, deliveries, violation) in cases {
+        let result = apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
+                    owner: body_owner(&store.snapshot(), 7, 1),
+                    deliveries,
+                    authentication: crate::AuxAuthentication::Rejected {
+                        evidence: EvidenceId::from_digest([0xd9; 32]),
+                    },
+                })),
+            },
+            &context(&config, &clock, Some(&Authority)),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(TransitionFailure::InvalidEvidence(
+                    InvalidTransitionEvidence::Auxiliary(actual)
+                )) if actual == violation
+            ),
+            "{label}: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn same_transition_auxiliary_eviction_has_no_generation_effect() {
     use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
 
@@ -603,7 +657,7 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
     };
     corrupt_delivery.source = SourceId::from_digest([0xee; 32]);
     assert_eq!(
-        crate::verify_plan_production(&test_engine(&store), &corrupt),
+        verify_plan(&test_engine(&store), &corrupt),
         Err(InvariantViolation::Auxiliary(header_hash))
     );
     store.commit(&authenticated);

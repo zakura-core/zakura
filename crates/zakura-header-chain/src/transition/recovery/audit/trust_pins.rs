@@ -57,34 +57,124 @@ pub(super) fn check_trust_pins(
                 violations.push(AuditViolation::EligibilityRoot(node.hash));
             }
         }
-        let expected = if settled.is_some_and(|pin| pin.activation.height == node.height) {
-            settled.map(|pin| (pin.activation.hash, true))
-        } else {
-            config
-                .local_checkpoints()
-                .hash(node.height)
-                .map(|hash| (hash, false))
-        };
-        let Some((expected, settled_reason)) = expected else {
-            continue;
-        };
-        let reason = node
-            .eligibility
-            .direct_reasons
-            .iter()
-            .any(|reason| match reason {
-                EligibilityReason::SettledUpgradeConflict {
-                    height,
-                    expected: hash,
-                } if settled_reason => *height == node.height && *hash == expected,
-                EligibilityReason::CheckpointConflict {
-                    height,
-                    expected: hash,
-                } if !settled_reason => *height == node.height && *hash == expected,
-                _ => false,
+        // Settled pins and local checkpoints are independent trust sources. Check both
+        // when they share a height so one source cannot mask the other's conflict reason.
+        if let Some(expected) = settled
+            .filter(|pin| pin.activation.height == node.height)
+            .map(|pin| pin.activation.hash)
+        {
+            let reason = node.eligibility.direct_reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    EligibilityReason::SettledUpgradeConflict {
+                        height,
+                        expected: hash,
+                    } if *height == node.height && *hash == expected
+                )
             });
-        if (node.hash == expected && reason) || (node.hash != expected && !reason) {
-            violations.push(AuditViolation::TrustPin(node.height, node.hash));
+            // A matching hash must have no conflict reason; a mismatch must have one.
+            if (node.hash == expected && reason) || (node.hash != expected && !reason) {
+                violations.push(AuditViolation::TrustPin(node.height, node.hash));
+            }
         }
+        // Deliberately do not make this an `else`: the checkpoint can coincide with
+        // the settled pin while requiring a distinct CheckpointConflict reason.
+        if let Some(expected) = config.local_checkpoints().hash(node.height) {
+            let reason = node.eligibility.direct_reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    EligibilityReason::CheckpointConflict {
+                        height,
+                        expected: hash,
+                    } if *height == node.height && *hash == expected
+                )
+            });
+            if (node.hash == expected && reason) || (node.hash != expected && !reason) {
+                violations.push(AuditViolation::TrustPin(node.height, node.hash));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use zakura_chain::{
+        block::{self, Block},
+        parameters::Network,
+        serialization::ZcashDeserialize,
+    };
+
+    use super::*;
+    use crate::{
+        CheckpointSet, EligibilityState, EngineMode, HeaderValidationState, TrustedAnchor,
+        WorkCoordinate,
+    };
+
+    #[test]
+    fn settled_pin_does_not_mask_checkpoint_conflict_at_the_same_height() {
+        let genesis = Arc::<Block>::zcash_deserialize(
+            zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
+        )
+        .expect("the mainnet genesis vector is canonical");
+        let anchor = Frontier::new(block::Height(0), genesis.hash());
+        let mut config = EngineConfig::new(
+            EngineMode::Integrated,
+            Network::Mainnet,
+            TrustedAnchor {
+                frontier: anchor,
+                header: genesis.header.clone(),
+            },
+            CheckpointSet::default(),
+        )
+        .expect("the mainnet configuration has a settled pin");
+        let settled = config
+            .settled_manifest()
+            .pin_for_network(&config.network)
+            .expect("mainnet has a settled pin")
+            .activation;
+        let checkpoint = Frontier::new(settled.height, block::Hash([0x5c; 32]));
+        config.replace_local_checkpoints(
+            CheckpointSet::new([checkpoint]).expect("the checkpoint fixture is unique"),
+        );
+
+        let block_work = genesis
+            .header
+            .difficulty_threshold
+            .to_work()
+            .expect("the genesis target has work");
+        let mut node = HeaderNode::from_durable_parts(
+            genesis.header.clone(),
+            genesis.hash(),
+            genesis.header.previous_block_hash,
+            anchor.height,
+            block_work,
+            WorkCoordinate::new(anchor.hash, block_work.as_u256()),
+            HeaderValidationState::Valid,
+            EligibilityState::default(),
+            BodyValidationState::Unknown,
+            Vec::new(),
+        )
+        .expect("the genesis node fields agree");
+        node.height = settled.height;
+        node.hash = settled.hash;
+
+        let mut violations = Vec::new();
+        check_trust_pins(&[node.clone()], anchor, &config, &mut violations);
+        assert_eq!(
+            violations,
+            vec![AuditViolation::TrustPin(settled.height, settled.hash)]
+        );
+
+        node.eligibility
+            .direct_reasons
+            .insert(EligibilityReason::CheckpointConflict {
+                height: checkpoint.height,
+                expected: checkpoint.hash,
+            });
+        violations.clear();
+        check_trust_pins(&[node], anchor, &config, &mut violations);
+        assert!(violations.is_empty());
     }
 }

@@ -1339,7 +1339,7 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
     let valid = child(1);
     let prepared = crate::prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&valid)),
-        &lease,
+        lease.parent(),
         &rules,
         &clock,
     )
@@ -1353,7 +1353,7 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
     let historical_version = Arc::new(historical_version);
     crate::prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&historical_version)),
-        &lease,
+        lease.parent(),
         &rules,
         &clock,
     )
@@ -1363,7 +1363,7 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
     let future = child(future_offset);
     let prepared = crate::prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&future)),
-        &lease,
+        lease.parent(),
         &rules,
         &clock,
     )
@@ -1380,7 +1380,14 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
         wrong_parent_hash.0[0] ^= 1;
     }
     wrong_parent.previous_block_hash = wrong_parent_hash;
-    cases.push((Arc::new(wrong_parent), HeaderRule::ParentLink));
+    let wrong_parent = Arc::new(wrong_parent);
+    crate::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&wrong_parent)),
+        lease.parent(),
+        &rules,
+        &clock,
+    )
+    .expect("prepare does not claim parent-link continuity");
     let mut bad_version = *valid;
     bad_version.version = if parameter(2, 0) & 1 == 0 {
         u32::from(parameter(2, 0) % 4)
@@ -1402,17 +1409,23 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
             0x1d,
         ]);
     cases.push((Arc::new(bad_target), HeaderRule::CompactTarget));
-    cases.push((
-        child(-i64::from(parameter(7, 0))),
-        HeaderRule::ContextualDifficultyAndTime,
-    ));
+    let early_time = child(-i64::from(parameter(7, 0)));
+    crate::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&early_time)),
+        lease.parent(),
+        &rules,
+        &clock,
+    )
+    .expect("prepare does not claim median-time continuity");
 
     let mut hasher = Sha256::new();
     hasher.update(parameters.get(..8).unwrap_or(parameters));
+    // Preserve historical digest order for removed prepare-time rejection cases.
+    hasher.update([HeaderRule::ParentLink as u8]);
     for (header, expected_rule) in cases {
         let failure = crate::prepare_headers(
             HeaderBatchInput::new(std::slice::from_ref(&header)),
-            &lease,
+            lease.parent(),
             &rules,
             &clock,
         )
@@ -1423,9 +1436,9 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
         ));
         hasher.update([expected_rule as u8]);
     }
+    hasher.update([HeaderRule::ContextualDifficultyAndTime as u8]);
     hasher.finalize().into()
 }
-
 fn assert_body_evidence_matrix() -> [u8; 32] {
     let mut store = FuzzStore::new(EngineMode::Integrated);
     let clock = ManualClock::new();

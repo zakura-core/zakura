@@ -25,7 +25,7 @@ fn startup_restores_a_missing_full_state_side_path_idempotently() {
     let side_header = Arc::new(side_header);
     let prepared = zakura_header_chain::prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&side_header)),
-        &lease,
+        lease.parent(),
         &rules,
         &SystemClock,
     )
@@ -164,7 +164,7 @@ fn header_valid_body_invalidity_reselects_after_authenticated_evidence() {
     let child_header = Arc::new(child_header);
     let batch = zakura_header_chain::prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&child_header)),
-        &lease,
+        lease.parent(),
         &rules,
         &SystemClock,
     )
@@ -297,7 +297,7 @@ fn contextual_finalization_commits_full_state_header_rows_and_memory_together() 
         .expect("the validation lease carries the configured rules");
     zakura_header_chain::prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&block2.header)),
-        &lease,
+        lease.parent(),
         &rules,
         &SystemClock,
     )

@@ -117,7 +117,7 @@ pub(super) fn validate_full_state_header<G: HeaderGraphView>(
         InvalidTransitionEvidence::full_state_header(HeaderValidationCheck::PolicyIncoherent)
     })?;
     let headers = [header.header.clone()];
-    let prepared = crate::prepare_context_free_headers(
+    let prepared = crate::prepare_headers(
         crate::HeaderBatchInput::new(&headers),
         parent,
         &rules,

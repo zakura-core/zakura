@@ -288,7 +288,7 @@ fn monotone_finality_sends_exact_prepared_header_work_to_state_for_rebase() {
         .expect("the authenticated regtest policy is valid");
     let batch = zakura_header_chain::prepare_headers(
         zakura_header_chain::HeaderBatchInput::new(&headers),
-        &lease,
+        lease.parent(),
         &rules,
         &zakura_header_chain::SystemClock,
     )

@@ -391,7 +391,7 @@ impl Harness {
         let headers: Vec<_> = rows.iter().map(|row| row.header.clone()).collect();
         let Ok(batch) = zakura_header_chain::prepare_headers(
             HeaderBatchInput::new(&headers),
-            &lease,
+            lease.parent(),
             &rules,
             &SystemClock,
         ) else {

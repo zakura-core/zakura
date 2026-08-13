@@ -540,7 +540,7 @@ fn unrelated_body_commit_cannot_stale_current_header_generation_work() {
     let child_header = Arc::new(child_header);
     let batch = zakura_header_chain::prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&child_header)),
-        &lease,
+        lease.parent(),
         &rules,
         &SystemClock,
     )
@@ -656,7 +656,7 @@ fn lazy_work_rebase_commits_coordinates_and_reopens() {
     let child_header = Arc::new(child_header);
     let batch = zakura_header_chain::prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&child_header)),
-        &lease,
+        lease.parent(),
         &rules,
         &SystemClock,
     )
@@ -768,7 +768,7 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
     let second_header = Arc::new(second_header);
     let batch = zakura_header_chain::prepare_headers(
         HeaderBatchInput::new(&[first_header, second_header.clone()]),
-        &lease,
+        lease.parent(),
         &rules,
         &SystemClock,
     )

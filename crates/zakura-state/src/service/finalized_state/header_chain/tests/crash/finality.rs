@@ -222,7 +222,7 @@ pub(super) fn crash_fixture_finality_advance_reopens_complete_before_or_after() 
             .expect("the authenticated custom-network policy is valid");
         let prepared = zakura_header_chain::prepare_headers(
             HeaderBatchInput::new(std::slice::from_ref(&next_header)),
-            &lease,
+            lease.parent(),
             &rules,
             &SystemClock,
         )
@@ -290,7 +290,7 @@ pub(super) fn crash_fixture_operator_reason_changes_reopen_complete_before_or_af
             let headers = [higher_header];
             let batch = zakura_header_chain::prepare_headers(
                 HeaderBatchInput::new(&headers),
-                &lease,
+                lease.parent(),
                 &rules,
                 &SystemClock,
             )

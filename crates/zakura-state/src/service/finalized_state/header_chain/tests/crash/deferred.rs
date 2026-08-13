@@ -53,7 +53,7 @@ pub(super) fn crash_fixture_deferred_header_reevaluation_reopens_complete_before
         let headers = [future_header.clone()];
         let batch = zakura_header_chain::prepare_headers(
             HeaderBatchInput::new(&headers),
-            &lease,
+            lease.parent(),
             &rules,
             &preparation_clock,
         )

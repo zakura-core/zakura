@@ -372,7 +372,7 @@ fn generated_nu5_graph_matches_full_state_before_finalization() {
             .expect("the custom network authenticates its PoW waiver");
         let batch = zakura_header_chain::prepare_headers(
             HeaderBatchInput::new(std::slice::from_ref(&block.header)),
-            &lease,
+            lease.parent(),
             &rules,
             &SystemClock,
         )

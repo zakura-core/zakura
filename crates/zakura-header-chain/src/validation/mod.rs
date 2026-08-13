@@ -10,8 +10,7 @@ pub use contextual::{
     POW_MEDIAN_BLOCK_SPAN, POW_PREDECESSOR_CONTEXT_SPAN,
 };
 pub use prepare::{
-    prepare_context_free_headers, prepare_headers, HeaderBatchInput, HeaderFailure, HeaderRule,
-    HeaderRules,
+    prepare_headers, HeaderBatchInput, HeaderFailure, HeaderRule, HeaderRules,
 };
 
 use chrono::{DateTime, Utc};

@@ -9,15 +9,14 @@ use zakura_chain::{block, parameters::Network};
 
 use super::{
     infer_height, validate_commitment_structure, validate_compact_target,
-    validate_contextual_difficulty_and_time, validate_encoding_version_hash, validate_hash_filter,
-    AdjustedDifficulty, PowPolicy, PowPolicyError, POW_ADJUSTMENT_BLOCK_SPAN,
+    validate_encoding_version_hash, validate_hash_filter, PowPolicy, PowPolicyError,
 };
 use crate::{
-    Clock, EngineConfig, HeaderContextFact, HeaderValidationState, PreparedHeader,
-    PreparedHeaderBatch, RuleId, ValidationLease,
+    Clock, EngineConfig, HeaderValidationState, PreparedHeader, PreparedHeaderBatch, RuleId,
+    ValidationLease,
 };
 
-/// Ordered, nonempty canonical headers to validate against one exact parent lease.
+/// Ordered, nonempty canonical headers to validate against one exact parent frontier.
 #[derive(Copy, Clone, Debug)]
 pub struct HeaderBatchInput<'a> {
     /// Headers in exact parent-first wire order.
@@ -204,35 +203,9 @@ fn invalid(offset: usize, rule: HeaderRule, error: impl std::fmt::Display) -> He
 /// contextual difficulty and median time against retained ancestry. The planner
 /// also applies finality, checkpoint, settled-pin, target-completion, and
 /// auxiliary-provenance rules.
-pub fn prepare_context_free_headers(
-    input: HeaderBatchInput<'_>,
-    parent: crate::Frontier,
-    rules: &HeaderRules,
-    clock: &dyn Clock,
-) -> Result<PreparedHeaderBatch, HeaderFailure> {
-    prepare_headers_inner(input, parent, None, rules, clock)
-}
-
-/// Validate a complete batch without mutation and seal its results to `lease`.
-///
-/// The compatibility entry point retains contextual validation until production callers have
-/// moved to [`prepare_context_free_headers`] and the engine performs the graph-dependent rules.
 pub fn prepare_headers(
     input: HeaderBatchInput<'_>,
-    lease: &ValidationLease,
-    rules: &HeaderRules,
-    clock: &dyn Clock,
-) -> Result<PreparedHeaderBatch, HeaderFailure> {
-    if !lease.is_coherent(&rules.network, rules.trust_anchor_digest) {
-        return Err(HeaderFailure::InvalidLease);
-    }
-    prepare_headers_inner(input, lease.parent, Some(lease), rules, clock)
-}
-
-fn prepare_headers_inner(
-    input: HeaderBatchInput<'_>,
     parent_frontier: crate::Frontier,
-    contextual_lease: Option<&ValidationLease>,
     rules: &HeaderRules,
     clock: &dyn Clock,
 ) -> Result<PreparedHeaderBatch, HeaderFailure> {
@@ -256,21 +229,6 @@ fn prepare_headers_inner(
         })
         .collect();
     let hashes: Vec<_> = hash_results.into_iter().collect::<Result<_, _>>()?;
-    if contextual_lease.is_some() {
-        let mut expected_parent = parent_frontier.hash;
-        for (offset, (header, hash)) in input.headers.iter().zip(&hashes).enumerate() {
-            if header.previous_block_hash != expected_parent {
-                let error = super::HeaderLinkError {
-                    offset,
-                    expected: expected_parent,
-                    actual: header.previous_block_hash,
-                };
-                return Err(invalid(offset, HeaderRule::ParentLink, error));
-            }
-            expected_parent = *hash;
-        }
-    }
-
     let now = clock.now();
     let future_limit = now
         .checked_add_signed(Duration::hours(2))
@@ -331,44 +289,9 @@ fn prepare_headers_inner(
             })
         })
         .collect();
-    let mut parent = parent_frontier;
-    let mut context = contextual_lease.map(|lease| lease.predecessors.clone());
     let mut prepared = Vec::with_capacity(input.headers.len());
-
-    for (offset, prepared_header) in context_free.into_iter().enumerate() {
-        let prepared_header = prepared_header?;
-        let header = &prepared_header.header;
-        if let Some(context) = context.as_ref() {
-            let adjustment = AdjustedDifficulty::new_from_header_time(
-                header.time,
-                parent.height,
-                &rules.network,
-                context
-                    .iter()
-                    .map(|fact| (fact.header.difficulty_threshold, fact.header.time)),
-            )
-            .map_err(|error| {
-                invalid(
-                    offset,
-                    HeaderRule::ContextualDifficultyAndTime,
-                    error.to_string(),
-                )
-            })?;
-            validate_contextual_difficulty_and_time(header.difficulty_threshold, adjustment)
-                .map_err(|error| invalid(offset, HeaderRule::ContextualDifficultyAndTime, error))?;
-        }
-        parent = crate::Frontier::new(prepared_header.height, prepared_header.hash);
-        if let Some(context) = context.as_mut() {
-            context.insert(
-                0,
-                HeaderContextFact {
-                    frontier: parent,
-                    header: header.clone(),
-                },
-            );
-            context.truncate(POW_ADJUSTMENT_BLOCK_SPAN);
-        }
-        prepared.push(prepared_header);
+    for prepared_header in context_free {
+        prepared.push(prepared_header?);
     }
 
     let evidence = PreparedHeaderBatch::context_free_evidence(
@@ -395,7 +318,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{CheckpointSet, EngineMode, Frontier, TrustedAnchor};
+    use crate::{CheckpointSet, EngineMode, Frontier, HeaderContextFact, TrustedAnchor};
 
     #[derive(Copy, Clone)]
     struct FixedClock(DateTime<Utc>);
@@ -453,7 +376,7 @@ mod tests {
 
         let batch = prepare_headers(
             HeaderBatchInput::new(&headers),
-            &lease,
+            lease.parent(),
             &rules,
             &FixedClock(anchor.time + Duration::hours(1)),
         )
@@ -483,7 +406,7 @@ mod tests {
         let headers = [first.clone(), second.clone(), third.clone()];
         let clock = FixedClock(anchor.time + Duration::hours(1));
 
-        let mut prepared = prepare_context_free_headers(
+        let mut prepared = prepare_headers(
             HeaderBatchInput::new(&headers),
             lease.parent(),
             &rules,
@@ -495,7 +418,7 @@ mod tests {
             .rebase_after(first_frontier)
             .expect("the prepared path contains the finalized parent");
 
-        let fresh_suffix = prepare_context_free_headers(
+        let fresh_suffix = prepare_headers(
             HeaderBatchInput::new(&[second, third]),
             first_frontier,
             &rules,
@@ -516,7 +439,7 @@ mod tests {
         let now = anchor.time;
         let batch = prepare_headers(
             HeaderBatchInput::new(std::slice::from_ref(&future)),
-            &lease,
+            lease.parent(),
             &rules,
             &FixedClock(now),
         )
@@ -529,18 +452,13 @@ mod tests {
         let mut disconnected = *future;
         disconnected.previous_block_hash = block::Hash([0x55; 32]);
         let disconnected = Arc::new(disconnected);
-        assert!(matches!(
-            prepare_headers(
-                HeaderBatchInput::new(std::slice::from_ref(&disconnected)),
-                &lease,
-                &rules,
-                &FixedClock(now),
-            ),
-            Err(HeaderFailure::Invalid {
-                rule: HeaderRule::ParentLink,
-                ..
-            })
-        ));
+        prepare_headers(
+            HeaderBatchInput::new(std::slice::from_ref(&disconnected)),
+            lease.parent(),
+            &rules,
+            &FixedClock(now),
+        )
+        .expect("graph-independent preparation does not claim parent linkage");
     }
 
     #[test]
@@ -551,7 +469,7 @@ mod tests {
         assert!(matches!(
             prepare_headers(
                 HeaderBatchInput::new(&headers),
-                &lease,
+                lease.parent(),
                 &rules,
                 &FixedClock(anchor.time),
             ),
@@ -569,7 +487,7 @@ mod tests {
         disconnected.previous_block_hash = block::Hash([0x55; 32]);
         let disconnected = Arc::new(disconnected);
 
-        let batch = prepare_context_free_headers(
+        let batch = prepare_headers(
             HeaderBatchInput::new(std::slice::from_ref(&disconnected)),
             lease.parent(),
             &rules,
@@ -596,7 +514,7 @@ mod tests {
         assert!(matches!(
             prepare_headers(
                 HeaderBatchInput::new(std::slice::from_ref(&invalid)),
-                &lease,
+                lease.parent(),
                 &rules,
                 &FixedClock(anchor.time),
             ),
@@ -608,50 +526,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_mutated_leases_fail_before_header_validation() {
+    fn empty_batch_is_rejected_before_header_validation() {
         let (rules, lease, anchor) = fixture();
         assert!(matches!(
             prepare_headers(
                 HeaderBatchInput::new(&[]),
-                &lease,
+                lease.parent(),
                 &rules,
                 &FixedClock(anchor.time),
             ),
             Err(HeaderFailure::Empty)
-        ));
-
-        let mut mutated = lease.clone();
-        mutated.parent.height = block::Height(1);
-        let header = child(lease.parent, &anchor, 1);
-        assert!(matches!(
-            prepare_headers(
-                HeaderBatchInput::new(std::slice::from_ref(&header)),
-                &mutated,
-                &rules,
-                &FixedClock(anchor.time),
-            ),
-            Err(HeaderFailure::InvalidLease)
-        ));
-
-        let high_parent = Frontier::new(block::Height(100), lease.parent.hash);
-        let short_lease = ValidationLease::new(
-            high_parent,
-            vec![HeaderContextFact {
-                frontier: high_parent,
-                header: anchor.clone(),
-            }],
-            lease.network.clone(),
-            lease.trust_anchor_digest,
-        );
-        let header = child(high_parent, &anchor, 1);
-        assert!(matches!(
-            prepare_headers(
-                HeaderBatchInput::new(std::slice::from_ref(&header)),
-                &short_lease,
-                &rules,
-                &FixedClock(anchor.time),
-            ),
-            Err(HeaderFailure::InvalidLease)
         ));
     }
 

@@ -47,7 +47,7 @@ pub use locator::{HeaderLocator, VctRepairContext, MAX_HEADER_LOCATOR_HASHES};
 pub use ownership::{CompletionDecision, CompletionOwner, Gate, PendingOwners, StaleReason};
 pub use transition::*;
 pub use validation::{
-    infer_height, prepare_context_free_headers, prepare_headers, validate_commitment_structure,
+    infer_height, prepare_headers, validate_commitment_structure,
     validate_compact_target, validate_contextual_difficulty_and_time,
     validate_encoding_version_hash, validate_future_time, validate_hash_filter, validate_link,
     AdjustedDifficulty, AdjustedDifficultyError, CompactTargetError, ContextualValidationError,

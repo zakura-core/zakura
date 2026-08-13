@@ -55,14 +55,14 @@ pub enum SolverAction {
 
 #[cfg(feature = "internal-miner")]
 fn should_cancel_at(
-    point: equihash_solver::tromp::CancellationPoint,
+    point: cpu_equihash_solver::tromp::CancellationPoint,
     action: SolverAction,
 ) -> bool {
     matches!(
         (point, action),
         (_, SolverAction::StopNow)
             | (
-                equihash_solver::tromp::CancellationPoint::NonceBoundary,
+                cpu_equihash_solver::tromp::CancellationPoint::NonceBoundary,
                 SolverAction::StopAtNonceBoundary,
             )
     )
@@ -264,7 +264,7 @@ impl Solution {
                 return Err(SolverCancelled);
             }
 
-            let solve_result = equihash_solver::tromp::solve_200_9_cancellable(
+            let solve_result = cpu_equihash_solver::tromp::solve_200_9_cancellable(
                 input,
                 || {
                     // This skips the first nonce, which doesn't matter in practice.
@@ -281,8 +281,10 @@ impl Solution {
             );
 
             let solutions = match solve_result.into_outcome() {
-                equihash_solver::tromp::CancellableSolveOutcome::Completed(solutions) => solutions,
-                equihash_solver::tromp::CancellableSolveOutcome::Cancelled => {
+                cpu_equihash_solver::tromp::CancellableSolveOutcome::Completed(solutions) => {
+                    solutions
+                }
+                cpu_equihash_solver::tromp::CancellableSolveOutcome::Cancelled => {
                     return Err(SolverCancelled);
                 }
             };
@@ -444,7 +446,7 @@ impl FromHex for Solution {
 
 #[cfg(all(test, feature = "internal-miner"))]
 mod tests {
-    use equihash_solver::tromp::CancellationPoint;
+    use cpu_equihash_solver::tromp::CancellationPoint;
 
     use super::{should_cancel_at, SolverAction};
 

@@ -20,17 +20,16 @@ use crate::{
     AlarmSet, AuxDelivery, AuxDelta, BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch,
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, BranchId, ChainScore, CheckpointSet,
     Clock, ConsensusBodyInvalid, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
-    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
-    FullStateEvidenceAuthority, FullStateFinalized, GraphError, HeaderBatchInput,
+    EngineTransition, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
+    FrontierSet, FullStateEvidenceAuthority, FullStateFinalized, GraphError, HeaderBatchInput,
     HeaderChainDiskVersion, HeaderChainEngine, HeaderContextFact, HeaderFailure, HeaderGeneration,
     HeaderInsertionFacts, HeaderRule, HeaderRules, HeaderValidationFacts, HeaderValidationState,
     HeaderWorkAuthority, HeaderWorkOwner, InsertHeaders, MemHeaderStore, OperatorInvalidate,
     OperatorInvalidationId, OperatorReconsider, PreparedHeader, PreparedHeaderBatch,
     ProjectionDelta, SourceId, StateVersion, SuffixWork, TargetCompletion, TransientBodyFailure,
     TransientBodyFailureKind, TransitionContext, TransitionFailure, TransitionInput,
-    TransitionPlan, TransitionRequest, TrustedAnchor, ValidationLease, VerifiedBodyEvidence,
-    VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef,
-    MAX_CANDIDATE_TIPS_V1,
+    TransitionRequest, TrustedAnchor, ValidationLease, VerifiedBodyEvidence, VerifiedChainChanged,
+    VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef, MAX_CANDIDATE_TIPS_V1,
 };
 
 /// Deterministic summary of one bounded structured-operation replay.
@@ -148,7 +147,7 @@ impl FuzzStore {
         self.metadata.snapshot()
     }
 
-    fn commit(&mut self, plan: &TransitionPlan) {
+    fn commit(&mut self, plan: &EngineTransition) {
         for node in self.graph.header_nodes() {
             self.context_archive
                 .insert(node.hash, (node.height, node.header.clone()));
@@ -493,7 +492,7 @@ fn apply_transition(
     store: &FuzzStore,
     request: TransitionRequest,
     context: &TransitionContext<'_>,
-) -> Result<TransitionPlan, TransitionFailure> {
+) -> Result<EngineTransition, TransitionFailure> {
     let engine = HeaderChainEngine::from_audited_state(
         store.graph.clone(),
         store.metadata.clone(),
@@ -502,9 +501,7 @@ fn apply_transition(
         store.aux.clone(),
     )
     .expect("the fuzz fixture engine is coherent");
-    engine
-        .plan_transition(fuzz_transition_input(store, request), context)
-        .map(crate::EngineTransition::into_plan)
+    engine.plan_transition(fuzz_transition_input(store, request), context)
 }
 
 struct ManualClock(AtomicI64);

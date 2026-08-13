@@ -9,8 +9,8 @@ use thiserror::Error;
 use zakura_chain::block;
 
 use crate::{
-    AuxDelivery, EngineMetadata, EngineSnapshot, GraphError, MemHeaderStore, TransitionContext,
-    TransitionFailure, TransitionPlan,
+    AuxDelivery, EngineMetadata, EngineSnapshot, EngineTransition, GraphError, MemHeaderStore,
+    TransitionContext, TransitionFailure,
 };
 
 use super::planner::derive_transition_plan;
@@ -192,8 +192,7 @@ impl HeaderChainEngine {
         input: TransitionInput,
         context: &TransitionContext<'_>,
     ) -> Result<EngineTransition, TransitionFailure> {
-        let plan = derive_transition_plan(self, input, context)?;
-        Ok(EngineTransition { plan })
+        derive_transition_plan(self, input, context)
     }
 
     /// Install a verified transition after its durable batch has committed.
@@ -218,7 +217,7 @@ impl HeaderChainEngine {
         if self.snapshot() != *transition.snapshot_before_commit() {
             return Err(CommittedTransitionError::StaleSource);
         }
-        self.install_verified_plan(&transition.plan)?;
+        self.install_verified_plan(&transition)?;
         Ok(())
     }
 
@@ -226,7 +225,7 @@ impl HeaderChainEngine {
     ///
     /// Caller must have already checked the snapshot before commit; graph apply is the
     /// only fallible step and leaves the engine unchanged on error.
-    fn install_verified_plan(&mut self, plan: &TransitionPlan) -> Result<(), GraphError> {
+    fn install_verified_plan(&mut self, plan: &EngineTransition) -> Result<(), GraphError> {
         self.graph.apply_delta(plan.graph_delta())?;
         self.metadata = plan.change_set().metadata.clone();
         merge_projection_delta(
@@ -283,62 +282,5 @@ impl HeaderChainEngine {
             .values()
             .flatten()
             .find(|delivery| delivery.delivery_id == delivery_id)
-    }
-}
-
-/// A verified durable write set ready for one post-commit in-memory installation.
-#[derive(Clone, Debug)]
-pub struct EngineTransition {
-    plan: TransitionPlan,
-}
-
-impl EngineTransition {
-    /// Return the snapshot before commit.
-    pub const fn snapshot_before_commit(&self) -> &EngineSnapshot {
-        self.plan.snapshot_before_commit()
-    }
-
-    /// Return the snapshot after commit.
-    pub fn snapshot_after_commit(&self) -> EngineSnapshot {
-        self.plan.change_set().metadata.snapshot()
-    }
-
-    /// Return the atomic durable write set.
-    pub const fn change_set(&self) -> &crate::ChangeSet {
-        self.plan.change_set()
-    }
-
-    /// Return true when admission produced no durable effects.
-    ///
-    /// This covers exact adjacent replay, already-applied work, immediately
-    /// evicted insertions, and other zero-effect admissions.
-    pub fn is_no_change(&self) -> bool {
-        self.plan.is_no_change()
-    }
-
-    /// Return the submitted transition domain.
-    pub const fn domain(&self) -> crate::TransitionDomain {
-        self.plan.domain()
-    }
-
-    /// Return the orthogonal effects produced by this transition.
-    pub const fn effect(&self) -> crate::TransitionEffect {
-        self.plan.effect()
-    }
-
-    /// Derive ownership retirement from the before/after commit snapshots.
-    ///
-    /// Delegates to [`crate::RetiredWork::from_snapshots`]. Coordinators that
-    /// also retire exact owners should call [`crate::RetiredWork::with_owners`].
-    pub fn retired_work(&self) -> crate::RetiredWork {
-        crate::RetiredWork::from_snapshots(
-            self.snapshot_before_commit(),
-            &self.snapshot_after_commit(),
-        )
-    }
-
-    #[cfg(any(test, feature = "fuzz-impl"))]
-    pub(crate) fn into_plan(self) -> TransitionPlan {
-        self.plan
     }
 }

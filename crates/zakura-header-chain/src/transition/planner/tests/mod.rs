@@ -17,7 +17,7 @@ use zakura_chain::{
     serialization::ZcashDeserialize,
 };
 
-use super::{projected_state::path, TransitionFailure, TransitionPlan};
+use super::{projected_state::path, EngineTransition, TransitionFailure};
 use crate::{
     verify_plan, AlarmSet, AuxiliaryViolation, BodyEvidence, BodyValidationState, BodyViolation,
     BranchId, CheckpointSet, EligibilityReason, EngineConfig, EngineMetadata, EngineMode,
@@ -129,7 +129,7 @@ impl TestStore {
         }
     }
 
-    fn commit(&mut self, plan: &TransitionPlan) {
+    fn commit(&mut self, plan: &EngineTransition) {
         for node in self.graph.header_nodes() {
             self.context_archive
                 .insert(node.hash, (node.height, node.header.clone()));
@@ -189,7 +189,7 @@ impl TestStore {
     }
 }
 
-fn projected_graph(base_graph: &MemHeaderStore, plan: &TransitionPlan) -> MemHeaderStore {
+fn projected_graph(base_graph: &MemHeaderStore, plan: &EngineTransition) -> MemHeaderStore {
     let mut projected_graph = base_graph.clone();
     projected_graph
         .apply_delta(plan.graph_delta())
@@ -349,7 +349,7 @@ fn apply_transition(
     store: &TestStore,
     request: TransitionRequest,
     context: &TransitionContext<'_>,
-) -> Result<TransitionPlan, TransitionFailure> {
+) -> Result<EngineTransition, TransitionFailure> {
     let engine = crate::HeaderChainEngine::from_audited_state(
         store.graph.clone(),
         store.metadata.clone(),
@@ -359,9 +359,7 @@ fn apply_transition(
     )
     .expect("the planner fixture is coherent before transition");
     let input = fixture_transition_input(store, request);
-    let plan = engine
-        .plan_transition(input, context)
-        .map(crate::EngineTransition::into_plan)?;
+    let plan = engine.plan_transition(input, context)?;
     if let Err(error) = crate::verify_plan_production(&engine, &plan) {
         panic!(
             "production overlay and boundary-node verification must accept plans that pass the exhaustive verifier: {error:?}"

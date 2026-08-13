@@ -15,8 +15,8 @@ mod tests;
 use thiserror::Error;
 
 use crate::{
-    CounterExhausted, EngineSnapshot, GraphError, HeaderChainEngine, StoreError, TransitionContext,
-    TransitionInput,
+    CounterExhausted, EngineSnapshot, EngineTransition, GraphError, HeaderChainEngine, StoreError,
+    TransitionContext, TransitionInput,
 };
 
 pub use violations::{
@@ -25,7 +25,7 @@ pub use violations::{
     LimitViolation, OperatorViolation, PlannerCoherenceViolation, ProjectionKind,
 };
 
-pub(crate) use plan::{PlanCandidate, TransitionPlan};
+pub(crate) use plan::PlanCandidate;
 
 use admission::authenticate_and_admit;
 use event_effects::{migrated_pin_refuted, project_event_evidence, EventProjectionContext};
@@ -100,18 +100,18 @@ pub enum TransitionFailure {
 /// Derive one atomic transition without mutating the engine.
 ///
 /// Pure: freezes `engine` as the snapshot before commit, projects `input` under
-/// `context`, and returns a [`TransitionPlan`] only after independent
+/// `context`, and returns an [`EngineTransition`] only after independent
 /// commit-time invariant verification. Failure is [`TransitionFailure`] with
 /// zero durable effects—distinct from a verified no-change plan.
 pub(super) fn derive_transition_plan(
     engine: &HeaderChainEngine,
     input: TransitionInput,
     context: &TransitionContext<'_>,
-) -> Result<TransitionPlan, TransitionFailure> {
+) -> Result<EngineTransition, TransitionFailure> {
     let candidate = derive_plan_candidate(engine, input, context)?;
     // Phase 6: verify invariants
     super::verify_candidate(engine, &candidate)?;
-    Ok(TransitionPlan::from_verified(candidate))
+    Ok(EngineTransition::from_verified(candidate))
 }
 
 /// Project `input` into an unverified [`PlanCandidate`] without mutating `engine`.

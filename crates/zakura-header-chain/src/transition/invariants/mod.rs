@@ -4,6 +4,7 @@ mod aux_authentication;
 mod checkpoint_finality;
 mod checks;
 
+#[cfg(any(test, not(feature = "fuzz-impl")))]
 use std::collections::HashSet;
 
 use thiserror::Error;
@@ -11,7 +12,7 @@ use zakura_chain::block;
 
 use crate::graph::{GraphError, GraphOverlay, HeaderGraphView};
 #[cfg(test)]
-use crate::TransitionPlan;
+use crate::EngineTransition;
 use crate::{EngineMode, FinalitySource, Frontier, HeaderChainEngine, HeaderNode, PlanCandidate};
 
 use aux_authentication::verify_incremental_aux_authentication;
@@ -133,8 +134,8 @@ fn graph_error_violation(error: GraphError, plan: &PlanCandidate) -> InvariantVi
 
 /// Independently check that `plan`'s projection obeys every transition invariant under `engine_before_commit`.
 ///
-/// Pure gate between [`PlanCandidate`] and [`TransitionPlan`]: no mutation; success is required
-/// before `TransitionPlan::from_verified`; failure is [`InvariantViolation`].
+/// Pure gate between [`PlanCandidate`] and [`EngineTransition`]: no mutation; success is required
+/// before `EngineTransition::from_verified`; failure is [`InvariantViolation`].
 pub(crate) fn verify_candidate(
     engine_before_commit: &HeaderChainEngine,
     plan: &PlanCandidate,
@@ -369,7 +370,7 @@ fn changed_boundary_nodes<'a, G: HeaderGraphView>(
 #[cfg(test)]
 pub(crate) fn verify_plan(
     engine_before_commit: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &EngineTransition,
 ) -> Result<(), InvariantViolation> {
     verify_plan_with_mode(
         engine_before_commit,
@@ -382,7 +383,7 @@ pub(crate) fn verify_plan(
 #[cfg(test)]
 pub(crate) fn verify_plan_production(
     engine_before_commit: &HeaderChainEngine,
-    plan: &TransitionPlan,
+    plan: &EngineTransition,
 ) -> Result<(), InvariantViolation> {
     verify_plan_with_mode(
         engine_before_commit,

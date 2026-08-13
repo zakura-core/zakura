@@ -59,24 +59,22 @@ fn apply_with_header_rebase_facts(
     config: &EngineConfig,
     clock: &ManualClock,
     validation: ValidationLease,
-) -> Result<TransitionPlan, TransitionFailure> {
+) -> Result<EngineTransition, TransitionFailure> {
     let TransitionEvent::InsertHeaders(event) = request.event else {
         panic!("rebase fixtures insert headers");
     };
-    test_engine(store)
-        .plan_transition(
-            TransitionInput::InsertHeaders {
-                event,
-                facts: HeaderInsertionFacts {
-                    validation: HeaderValidationFacts {
-                        validation_leases: vec![validation],
-                    },
-                    finality_rebase_history: store.finality.clone(),
+    test_engine(store).plan_transition(
+        TransitionInput::InsertHeaders {
+            event,
+            facts: HeaderInsertionFacts {
+                validation: HeaderValidationFacts {
+                    validation_leases: vec![validation],
                 },
+                finality_rebase_history: store.finality.clone(),
             },
-            &context(config, clock, None),
-        )
-        .map(crate::EngineTransition::into_plan)
+        },
+        &context(config, clock, None),
+    )
 }
 
 #[test]

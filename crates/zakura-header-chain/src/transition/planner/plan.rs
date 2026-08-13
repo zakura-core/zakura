@@ -1,4 +1,4 @@
-//! Projected write-set product types awaiting or wrapping invariant verification.
+//! Projected write-set product types before and after invariant verification.
 
 use std::sync::Arc;
 
@@ -9,7 +9,7 @@ use crate::{
 
 /// A complete projected write set awaiting independent invariant verification.
 #[derive(Clone, Debug)]
-pub(crate) struct PlanCandidate {
+pub struct PlanCandidate {
     pub(crate) snapshot_before_commit: EngineSnapshot,
     pub(crate) change_set: ChangeSet,
     pub(crate) graph_delta: GraphDelta,
@@ -31,16 +31,14 @@ impl PlanCandidate {
     }
 }
 
-/// A candidate accepted by the independent transition invariant verifier.
-///
-/// Production callers consume [`crate::EngineTransition`]; this verified type
-/// stays crate-private so adapters cannot construct unchecked transitions.
-#[derive(Clone, Debug)]
-pub(crate) struct TransitionPlan {
+/// A verified durable write set ready for one post-commit in-memory installation.
+#[cfg_attr(test, derive(Clone))]
+#[derive(Debug)]
+pub struct EngineTransition {
     candidate: PlanCandidate,
 }
 
-impl TransitionPlan {
+impl EngineTransition {
     /// Wrap a candidate that has already passed independent invariant verification.
     pub(super) fn from_verified(candidate: PlanCandidate) -> Self {
         Self { candidate }
@@ -60,6 +58,11 @@ impl TransitionPlan {
     /// Return the snapshot before commit.
     pub const fn snapshot_before_commit(&self) -> &EngineSnapshot {
         &self.candidate.snapshot_before_commit
+    }
+
+    /// Return the snapshot after commit.
+    pub fn snapshot_after_commit(&self) -> EngineSnapshot {
+        self.candidate.change_set.metadata.snapshot()
     }
 
     /// Return the submitted transition domain.
@@ -82,10 +85,21 @@ impl TransitionPlan {
     pub(crate) const fn graph_delta(&self) -> &GraphDelta {
         &self.candidate.graph_delta
     }
+
+    /// Derive ownership retirement from the before/after commit snapshots.
+    ///
+    /// Delegates to [`crate::RetiredWork::from_snapshots`]. Coordinators that
+    /// also retire exact owners should call [`crate::RetiredWork::with_owners`].
+    pub fn retired_work(&self) -> crate::RetiredWork {
+        crate::RetiredWork::from_snapshots(
+            self.snapshot_before_commit(),
+            &self.snapshot_after_commit(),
+        )
+    }
 }
 
 #[cfg(test)]
-impl std::ops::Deref for TransitionPlan {
+impl std::ops::Deref for EngineTransition {
     type Target = PlanCandidate;
 
     fn deref(&self) -> &Self::Target {
@@ -94,7 +108,7 @@ impl std::ops::Deref for TransitionPlan {
 }
 
 #[cfg(test)]
-impl std::ops::DerefMut for TransitionPlan {
+impl std::ops::DerefMut for EngineTransition {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.candidate
     }

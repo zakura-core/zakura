@@ -49,13 +49,39 @@ pub async fn run_with_services(
 
 #[cfg(test)]
 mod tests {
-    use std::{net::UdpSocket, time::Duration};
+    use std::{
+        net::UdpSocket,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use super::*;
     use tokio::time::timeout;
+    use zakura_network::zakura::{Peer, Service, Stream, ZakuraConnId, ZakuraPeerId};
+
+    #[derive(Debug)]
+    struct RegistrationProbe(Arc<AtomicBool>);
+
+    impl Service for RegistrationProbe {
+        fn name(&self) -> &'static str {
+            "registration-probe"
+        }
+
+        fn streams(&self) -> &[Stream] {
+            self.0.store(true, Ordering::Relaxed);
+            &[]
+        }
+
+        fn add_peer(&self, _peer: Peer) {}
+
+        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
+    }
 
     #[tokio::test]
-    async fn dropping_node_future_shuts_down_zakura_endpoint() {
+    async fn embedded_node_registers_custom_service_and_shuts_down_on_drop() {
         let _guard = zakura_test::init();
         let native_socket = UdpSocket::bind("127.0.0.1:0").expect("test UDP port is available");
         let native_addr = native_socket
@@ -73,9 +99,13 @@ mod tests {
         config.network.zakura.listen_addr = Some(native_addr);
         config.network.zakura.bootstrap_peers.clear();
         config.state = zakura_state::Config::ephemeral();
+        let service_registered = Arc::new(AtomicBool::new(false));
         let mut node = Box::pin(run_with_services(
             config,
-            Vec::new(),
+            vec![CustomService {
+                service: Arc::new(RegistrationProbe(service_registered.clone())),
+                advertised_services: Vec::new(),
+            }],
             CancellationToken::new(),
         ));
         timeout(Duration::from_secs(30), async {
@@ -84,13 +114,16 @@ mod tests {
                     result = &mut node => panic!("node exited before starting: {result:?}"),
                     _ = tokio::time::sleep(Duration::from_millis(25)) => {}
                 }
-                if UdpSocket::bind(native_addr).is_err() {
+                if service_registered.load(Ordering::Relaxed)
+                    && UdpSocket::bind(native_addr).is_err()
+                {
                     break;
                 }
             }
         })
         .await
-        .expect("node starts its Zakura endpoint");
+        .expect("node registers its custom service and starts its Zakura endpoint");
+
         drop(node);
 
         let socket = timeout(Duration::from_secs(30), async {

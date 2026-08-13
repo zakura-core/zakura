@@ -2505,6 +2505,7 @@ impl HeaderChainStore {
         let history = self.finality_history()?;
         let mut metadata = self.metadata()?;
         metadata.mode = EngineMode::Integrated;
+        metadata.headers_only_migration_epoch = Some(metadata.finality_epoch);
         metadata.state_version = metadata.state_version.checked_next()?;
         metadata.header_generation = metadata.header_generation.checked_next()?;
         metadata.verified_generation = metadata.verified_generation.checked_next()?;

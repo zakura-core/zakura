@@ -1279,6 +1279,9 @@ impl FallibleDiskValue for EngineMetadata {
         encoder.u64(value.header_generation.get());
         encoder.u64(value.verified_generation.get());
         encoder.u64(value.finality_epoch.get());
+        encoder.optional(value.headers_only_migration_epoch, |encoder, epoch| {
+            encoder.u64(epoch.get());
+        });
         put_frontier(&mut encoder, value.frontiers.finalized);
         put_frontier(&mut encoder, value.frontiers.header_best);
         put_frontier(&mut encoder, value.frontiers.verified_best);
@@ -1336,6 +1339,8 @@ impl FallibleDiskValue for EngineMetadata {
         let header_generation = HeaderGeneration::new(decoder.u64()?);
         let verified_generation = VerifiedGeneration::new(decoder.u64()?);
         let finality_epoch = FinalityEpoch::new(decoder.u64()?);
+        let headers_only_migration_epoch =
+            decoder.optional(|decoder| Ok(FinalityEpoch::new(decoder.u64()?)))?;
         let frontiers = FrontierSet {
             finalized: get_frontier(&mut decoder)?,
             header_best: get_frontier(&mut decoder)?,
@@ -1374,6 +1379,7 @@ impl FallibleDiskValue for EngineMetadata {
             header_generation,
             verified_generation,
             finality_epoch,
+            headers_only_migration_epoch,
             frontiers,
             header_best_score,
             oldest_retained_height,
@@ -1599,6 +1605,7 @@ mod tests {
             header_generation: HeaderGeneration::new(3),
             verified_generation: VerifiedGeneration::new(4),
             finality_epoch: FinalityEpoch::new(5),
+            headers_only_migration_epoch: Some(FinalityEpoch::new(4)),
             frontiers: FrontierSet {
                 finalized: frontier(1, 2),
                 header_best: frontier(2, 3),

@@ -131,6 +131,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
         header_generation: HeaderGeneration::new(1),
         verified_generation: VerifiedGeneration::new(1),
         finality_epoch: FinalityEpoch::new(0),
+        headers_only_migration_epoch: None,
         frontiers: FrontierSet {
             finalized: anchor,
             header_best: anchor,

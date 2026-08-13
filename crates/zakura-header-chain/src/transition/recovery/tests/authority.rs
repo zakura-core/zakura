@@ -180,6 +180,63 @@ fn finality_and_historical_pins_require_an_independent_canonical_index() {
 }
 
 #[test]
+fn migrated_finality_requires_an_explicit_integrated_migration_boundary() {
+    let (mut store, config) = fixture();
+    store.finality[0].source = FinalitySource::MigratedHeadersOnly;
+
+    assert!(violations(&store, &config).contains(&AuditViolation::Finality));
+
+    store.metadata.headers_only_migration_epoch = Some(FinalityEpoch::new(0));
+    store.snapshot = store.metadata.snapshot();
+    audit_store(&store, &config).expect("the explicit migration boundary authenticates the prefix");
+
+    store.metadata.headers_only_migration_epoch = Some(FinalityEpoch::new(1));
+    store.snapshot = store.metadata.snapshot();
+    assert!(violations(&store, &config).contains(&AuditViolation::Finality));
+}
+
+#[test]
+fn migrated_finality_is_rejected_after_the_migration_boundary() {
+    let (mut store, config) = fixture();
+    let anchor = store.metadata.frontiers.finalized;
+    let child = store.metadata.frontiers.header_best;
+    let anchor_header = store.nodes[0].header.clone();
+
+    store.finality[0].source = FinalitySource::MigratedHeadersOnly;
+    store.finality.push(FinalityRecord {
+        previous: anchor,
+        current: child,
+        source: FinalitySource::FullState {
+            evidence: EvidenceId::from_digest([0x81; 32]),
+        },
+        epoch: FinalityEpoch::new(1),
+    });
+    store.metadata.headers_only_migration_epoch = Some(FinalityEpoch::new(0));
+    store.metadata.finality_epoch = FinalityEpoch::new(1);
+    store.metadata.frontiers.finalized = child;
+    store.metadata.frontiers.verified_best = child;
+    store.metadata.header_best_score = ChainScore::new(SuffixWork::zero(), child.hash);
+    store.metadata.oldest_retained_height = child.height;
+    store.snapshot = store.metadata.snapshot();
+    store.nodes[1].body_validation_state = BodyValidationState::Verified {
+        evidence: EvidenceId::from_digest([0x82; 32]),
+    };
+    store.nodes.remove(0);
+    store.children.clear();
+    store.selected = vec![child];
+    store.verified = vec![child];
+    store.contexts = vec![ValidationContextRecord {
+        header: anchor_header,
+        height: anchor.height,
+    }];
+
+    audit_store(&store, &config).expect("full-state provenance after the boundary audits cleanly");
+
+    store.finality[1].source = FinalitySource::MigratedHeadersOnly;
+    assert!(violations(&store, &config).contains(&AuditViolation::Finality));
+}
+
+#[test]
 fn audits_each_normative_invariant() {
     let (base, config) = fixture();
     let child_hash = base.metadata.frontiers.header_best.hash;

@@ -66,6 +66,8 @@ pub struct EngineMetadata {
     pub verified_generation: VerifiedGeneration,
     /// Finality advancement epoch.
     pub finality_epoch: FinalityEpoch,
+    /// Last finality epoch imported by a headers-only to integrated mode migration.
+    pub headers_only_migration_epoch: Option<FinalityEpoch>,
     /// Exact durable frontiers.
     pub frontiers: FrontierSet,
     /// Exact selected-header score.

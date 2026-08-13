@@ -72,6 +72,7 @@ fn engine_fixture() -> (HeaderChainEngine, EngineConfig, ValidationLease) {
         header_generation: HeaderGeneration::new(0),
         verified_generation: VerifiedGeneration::new(0),
         finality_epoch: FinalityEpoch::new(0),
+        headers_only_migration_epoch: None,
         frontiers: FrontierSet {
             finalized: anchor,
             header_best: anchor,

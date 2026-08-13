@@ -151,6 +151,14 @@ fn migrated_headers_only_pin_refutation_is_durable_and_fail_closed() {
         .migrate_headers_only_to_integrated(&integrated_config, anchor_frontier)
         .expect("the explicit mode migration succeeds before publication");
     assert_eq!(report.current.mode, EngineMode::Integrated);
+    assert_eq!(
+        runtime
+            .store
+            .metadata()
+            .expect("the migrated metadata is readable")
+            .headers_only_migration_epoch,
+        Some(FinalityEpoch::new(0))
+    );
     assert!(matches!(
         runtime.store.finality_history().as_deref(),
         Ok([FinalityRecord {

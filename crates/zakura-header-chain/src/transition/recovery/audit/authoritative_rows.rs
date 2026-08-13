@@ -119,7 +119,7 @@ pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
             previous.current != record.previous
                 || previous.epoch.get().checked_add(1) != Some(record.epoch.get())
                 || record.current.height <= record.previous.height
-        }) || !source_matches_mode(&record, metadata.mode, config)
+        }) || !source_matches_mode(&record, metadata, config)
         {
             invalid_history = true;
         }
@@ -133,7 +133,12 @@ pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
             || record.previous != config.bootstrap_anchor().frontier
             || record.current.height < record.previous.height
             || record.current.height == record.previous.height && record.current != record.previous
-    }) || invalid_history
+    }) || metadata
+        .headers_only_migration_epoch
+        .is_some_and(|boundary| {
+            metadata.mode != EngineMode::Integrated || boundary > metadata.finality_epoch
+        })
+        || invalid_history
         || last.is_some_and(|record| {
             record.current != metadata.frontiers.finalized
                 || record.epoch != metadata.finality_epoch
@@ -168,11 +173,27 @@ pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
     Ok(())
 }
 
-fn source_matches_mode(record: &FinalityRecord, mode: EngineMode, config: &EngineConfig) -> bool {
-    match (mode, record.source) {
-        (EngineMode::Integrated, FinalitySource::FullState { .. })
-        | (_, FinalitySource::MigratedHeadersOnly) => true,
-        (EngineMode::HeadersOnly, FinalitySource::HeadersOnlyDepth { selected_tip }) => {
+fn source_matches_mode(
+    record: &FinalityRecord,
+    metadata: &EngineMetadata,
+    config: &EngineConfig,
+) -> bool {
+    match (
+        metadata.mode,
+        metadata.headers_only_migration_epoch,
+        record.source,
+    ) {
+        (EngineMode::Integrated, None, FinalitySource::FullState { .. }) => true,
+        (EngineMode::Integrated, Some(boundary), FinalitySource::MigratedHeadersOnly) => {
+            record.epoch <= boundary
+        }
+        (EngineMode::Integrated, Some(boundary), FinalitySource::FullState { .. }) => {
+            record.epoch > boundary
+        }
+        (EngineMode::HeadersOnly, None, FinalitySource::MigratedHeadersOnly) => {
+            record.epoch == crate::FinalityEpoch::new(0)
+        }
+        (EngineMode::HeadersOnly, None, FinalitySource::HeadersOnlyDepth { selected_tip }) => {
             record.current.height > record.previous.height
                 && selected_tip
                     .height

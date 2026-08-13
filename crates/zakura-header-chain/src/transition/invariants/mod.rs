@@ -216,6 +216,7 @@ fn verify_plan_against_graph<G: HeaderGraphView>(
     if source_metadata.state_version != source.state_version
         || metadata.mode != source.mode
         || metadata.work_origin != expected_work_origin
+        || metadata.headers_only_migration_epoch != source_metadata.headers_only_migration_epoch
     {
         return Err(InvariantViolation::SnapshotBeforeCommit);
     }
@@ -251,7 +252,7 @@ fn verify_plan_against_graph<G: HeaderGraphView>(
                         .flatten()
                         == Some(record.current)
             }
-            FinalitySource::MigratedHeadersOnly => true,
+            FinalitySource::MigratedHeadersOnly => false,
         };
         if !valid_source {
             return Err(InvariantViolation::Protected(record.current.hash));

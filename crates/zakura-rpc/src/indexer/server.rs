@@ -1,9 +1,26 @@
 //! A tonic RPC server for Zebra's indexer API.
 
-use std::{fs, net::SocketAddr, path::Path};
+use std::{
+    fs, io,
+    net::SocketAddr,
+    path::Path,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
-use tokio::task::JoinHandle;
-use tonic::transport::{server::TcpIncoming, Certificate, Identity, Server, ServerTlsConfig};
+use futures::{stream, Stream, StreamExt};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+};
+use tonic::transport::{
+    server::{Connected, TcpConnectInfo, TcpIncoming},
+    Certificate, Identity, Server, ServerTlsConfig,
+};
 use tower::BoxError;
 use zakura_chain::chain_tip::ChainTip;
 use zakura_node_services::mempool::MempoolTxSubscriber;
@@ -15,6 +32,58 @@ use crate::{
 };
 
 type ServerTask = JoinHandle<Result<(), BoxError>>;
+
+/// Maximum number of TCP connections accepted by the indexer RPC server.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Maximum number of concurrent HTTP/2 streams on each connection.
+const MAX_CONCURRENT_STREAMS_PER_CONNECTION: u32 = 16;
+
+/// Maximum time an unauthenticated connection may spend negotiating TLS.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A TCP connection that retains one server-wide connection permit.
+#[derive(Debug)]
+struct LimitedTcpStream {
+    inner: TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsyncRead for LimitedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for LimitedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Connected for LimitedTcpStream {
+    type ConnectInfo = TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.inner.connect_info()
+    }
+}
 
 /// Indexer RPC service.
 pub struct IndexerRPC<ReadStateService, Tip>
@@ -54,7 +123,11 @@ where
         .build_v1()
         .unwrap();
 
-    let mut server = Server::builder();
+    let request_limit = usize::try_from(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
+        .expect("the small HTTP/2 stream limit fits in usize");
+    let mut server = Server::builder()
+        .concurrency_limit_per_connection(request_limit)
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION);
     if let Some(tls) = tls {
         server = server.tls_config(tls)?;
     }
@@ -66,17 +139,45 @@ where
     let listen_addr = tcp_listener.local_addr()?;
     tracing::info!("{OPENED_RPC_ENDPOINT_MSG}{}", listen_addr);
 
+    let incoming = limited_tcp_incoming(tcp_listener, MAX_CONNECTIONS);
     let server_task: JoinHandle<Result<(), BoxError>> = tokio::spawn(async move {
         server
             .add_service(reflection_service)
             .add_service(IndexerServer::new(indexer_service))
-            .serve_with_incoming(TcpIncoming::from(tcp_listener))
+            .serve_with_incoming(incoming)
             .await?;
 
         Ok(())
     });
 
     Ok((server_task, listen_addr))
+}
+
+/// Limits accepted TCP connections until an earlier connection closes.
+fn limited_tcp_incoming(
+    listener: TcpListener,
+    max_connections: usize,
+) -> impl Stream<Item = io::Result<LimitedTcpStream>> {
+    let incoming = TcpIncoming::from(listener);
+    let connection_permits = Arc::new(Semaphore::new(max_connections));
+
+    stream::unfold(
+        (incoming, connection_permits),
+        |(mut incoming, connection_permits)| async move {
+            let permit = connection_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the connection semaphore is never closed");
+            let connection = incoming.next().await?;
+            let connection = connection.map(|inner| LimitedTcpStream {
+                inner,
+                _permit: permit,
+            });
+
+            Some((connection, (incoming, connection_permits)))
+        },
+    )
 }
 
 /// Rejects remotely reachable plaintext indexer listeners.
@@ -105,7 +206,8 @@ fn load_mtls_config(tls: IndexerTlsConfig) -> Result<ServerTlsConfig, BoxError> 
 
     Ok(ServerTlsConfig::new()
         .identity(Identity::from_pem(cert, key))
-        .client_ca_root(Certificate::from_pem(client_ca)))
+        .client_ca_root(Certificate::from_pem(client_ca))
+        .timeout(TLS_HANDSHAKE_TIMEOUT))
 }
 
 /// Ensures tonic TLS connections have a rustls crypto provider.
@@ -129,7 +231,49 @@ pub(crate) fn read_tls_file(path: &Path, role: &str) -> Result<Vec<u8>, BoxError
 
 #[cfg(test)]
 mod tests {
-    use super::validate_transport;
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::{limited_tcp_incoming, validate_transport};
+
+    #[tokio::test]
+    async fn limits_accepted_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let listen_addr = listener
+            .local_addr()
+            .expect("bound listener should have an address");
+        let mut incoming = Box::pin(limited_tcp_incoming(listener, 1));
+
+        let _first_client = TcpStream::connect(listen_addr)
+            .await
+            .expect("first test client should connect");
+        let first_server = incoming
+            .next()
+            .await
+            .expect("listener should remain open")
+            .expect("listener should accept the first connection");
+
+        let _second_client = TcpStream::connect(listen_addr)
+            .await
+            .expect("second test client should connect to the socket backlog");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), incoming.next())
+                .await
+                .is_err(),
+            "a second connection was accepted before a permit was available"
+        );
+
+        drop(first_server);
+        tokio::time::timeout(Duration::from_secs(5), incoming.next())
+            .await
+            .expect("a permit should become available")
+            .expect("listener should remain open")
+            .expect("listener should accept the second connection");
+    }
 
     #[test]
     fn rejects_non_loopback_plaintext_listener() {

@@ -93,6 +93,10 @@ impl IndexerClientTlsConfig {
 }
 
 /// Connection configuration for a trusted indexer RPC server.
+///
+/// Converting a loopback [`SocketAddr`] creates a plaintext connection, which
+/// trusts every process and user on the local host. Use [`Self::mtls`] on
+/// multi-user or otherwise untrusted hosts, even for loopback addresses.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexerClientConfig {
     address: SocketAddr,

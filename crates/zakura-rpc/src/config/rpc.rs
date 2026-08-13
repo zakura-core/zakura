@@ -55,6 +55,12 @@ pub struct Config {
     ///
     /// Plaintext indexer RPC is restricted to loopback addresses. Configuring
     /// a non-loopback address requires [`Self::indexer_tls`].
+    ///
+    /// Loopback does not authenticate the peer: every process and user on the
+    /// host can connect to the listener or impersonate it after it stops. Only
+    /// use plaintext loopback between trusted processes on a single-tenant
+    /// host. Configure [`Self::indexer_tls`] on multi-user or otherwise
+    /// untrusted hosts, even when using a loopback address.
     pub indexer_listen_addr: Option<SocketAddr>,
 
     /// Mutual TLS configuration for the indexer RPC listener.

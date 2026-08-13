@@ -80,7 +80,12 @@ impl BlockAndHash {
                     .zcash_deserialize_into()
                     .map_err(|err| tracing::warn!(?err, "failed to deserialize block",))
                     .ok()
-                    .zip(Some(hash))
+                    .and_then(|block: block::Block| {
+                        block.coinbase_height().map(|_| (block, hash)).or_else(|| {
+                            tracing::warn!("decoded block is missing a coinbase height");
+                            None
+                        })
+                    })
             })
     }
 }

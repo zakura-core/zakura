@@ -170,6 +170,21 @@ async fn indexer_server_requires_a_trusted_client_certificate() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn block_and_hash_decode_rejects_a_missing_coinbase() -> Result<()> {
+    let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    block.transactions.clear();
+    let hash = block.hash();
+    let encoded = indexer::BlockAndHash::new(hash, Arc::new(block));
+
+    assert!(
+        encoded.decode().is_none(),
+        "a block without a coinbase height must be rejected before state preparation"
+    );
+
+    Ok(())
+}
+
 /// Tests that `GetBlock` returns the requested block and rejects invalid
 /// requests.
 async fn test_get_block(

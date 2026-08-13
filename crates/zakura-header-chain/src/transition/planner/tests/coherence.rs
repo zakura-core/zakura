@@ -5,6 +5,27 @@ use super::*;
 use zakura_chain::parameters::NetworkKind;
 
 #[test]
+fn hydration_rejects_metadata_work_origin_that_disagrees_with_graph() {
+    let (mut store, _config) = TestStore::new(EngineMode::Integrated);
+    store.metadata.work_origin =
+        Frontier::new(store.metadata.work_origin.height, block::Hash([0x42; 32]));
+
+    let error = crate::HeaderChainEngine::from_audited_state(
+        store.graph,
+        store.metadata,
+        store.selected,
+        store.verified,
+        store.aux,
+    )
+    .expect_err("metadata work origin must agree with every graph node");
+
+    assert_eq!(
+        error,
+        crate::EngineHydrationError::Incoherent("graph work origin disagrees with metadata")
+    );
+}
+
+#[test]
 fn validate_snapshot_rejects_configuration_and_metadata_mismatches() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());

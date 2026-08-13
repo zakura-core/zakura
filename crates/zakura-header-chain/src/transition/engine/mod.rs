@@ -88,6 +88,14 @@ impl HeaderChainEngine {
                 "graph finality disagrees with metadata",
             ));
         }
+        if graph
+            .header_nodes()
+            .any(|node| node.work_coordinate().origin_hash() != metadata.work_origin.hash)
+        {
+            return Err(EngineHydrationError::Incoherent(
+                "graph work origin disagrees with metadata",
+            ));
+        }
         verify_projection(&graph, &selected, metadata.frontiers.header_best, false)?;
         verify_projection(
             &graph,

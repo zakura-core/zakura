@@ -2897,9 +2897,7 @@ where
             _ => unreachable!("unmatched response to a solution rate request"),
         };
 
-        Ok(solution_rate
-            .try_into()
-            .expect("per-second solution rate always fits in u64"))
+        Ok(u64::try_from(solution_rate).unwrap_or(u64::MAX))
     }
 
     async fn get_network_info(&self) -> Result<GetNetworkInfoResponse> {

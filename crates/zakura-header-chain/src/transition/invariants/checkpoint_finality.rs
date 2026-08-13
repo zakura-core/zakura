@@ -7,7 +7,9 @@ use crate::{
     PlanCandidate, ProjectionDelta,
 };
 
-use super::checks::{verify_aux, verify_generations, verify_indexes, verify_protected};
+use super::checks::{
+    verify_aux, verify_generations, verify_indexes, verify_pins, verify_protected,
+};
 #[cfg(any(test, feature = "fuzz-impl"))]
 use super::materialize_projected_graph;
 use super::{InvariantViolation, VerificationMode};
@@ -170,6 +172,9 @@ pub(crate) fn verify_incremental_checkpoint_against_graph<G: HeaderGraphView>(
 
     verify_indexes(engine_before_commit, plan)?;
     let selected = engine_before_commit.selected_projection();
+    let selected_start = selected
+        .binary_search_by_key(&finalized.height, |frontier| frontier.height)
+        .map_err(|_| InvariantViolation::SelectedProjection(finalized.hash))?;
     for hash in &plan.change_set.delete_nodes {
         let Some(node) = engine_before_commit.graph().header_node(*hash) else {
             return Err(InvariantViolation::Index(*hash));
@@ -190,14 +195,12 @@ pub(crate) fn verify_incremental_checkpoint_against_graph<G: HeaderGraphView>(
     if best.0 != metadata.frontiers.header_best || best.1 != metadata.header_best_score {
         return Err(InvariantViolation::Selection);
     }
-    if let Ok(index) = plan
-        .trust_pins
-        .binary_search_by_key(&finalized.height, |pin| pin.height)
-    {
-        if plan.trust_pins[index].hash != finalized.hash {
-            return Err(InvariantViolation::TrustPin(finalized.height));
-        }
-    }
+    verify_pins(
+        &plan.trust_pins,
+        &selected[selected_start..],
+        &[finalized],
+        &plan.change_set.put_nodes,
+    )?;
     verify_protected(graph, plan)?;
     if graph.view_header_node_count().saturating_sub(1) > plan.limits.max_non_finalized_nodes.get()
         || graph.view_eligible_header_tips().len() > plan.limits.max_candidate_tips.get()

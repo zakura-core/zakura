@@ -834,6 +834,18 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
         Err(InvariantViolation::SelectedProjection(selected_tip.hash))
     );
 
+    let mut retained_pin_conflict = plan.clone();
+    retained_pin_conflict.trust_pins =
+        vec![Frontier::new(selected_tip.height, block::Hash([0xfe; 32]))].into();
+    assert_eq!(
+        crate::verify_plan_production(&test_engine(&store), &retained_pin_conflict),
+        Err(InvariantViolation::TrustPin(selected_tip.height))
+    );
+    assert_eq!(
+        verify_plan(&test_engine(&store), &retained_pin_conflict),
+        Err(InvariantViolation::TrustPin(selected_tip.height))
+    );
+
     let mut pin_conflict = plan;
     pin_conflict.trust_pins =
         vec![Frontier::new(checkpoint.height, block::Hash([0xff; 32]))].into();

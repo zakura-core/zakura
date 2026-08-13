@@ -1,0 +1,143 @@
+# No-upload proof of concept for crates.io Trusted Publishing.
+#
+# This workflow performs Cargo dry-run publishing before it requests an OIDC
+# token. The token is never exported to repository code, and there is
+# deliberately no registry upload command.
+name: Dry-run crate publishing
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Published release tag to inspect, for example v1.0.3"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: publish-crates-poc-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  dry-run:
+    name: Plan and verify crate publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    outputs:
+      target_sha: ${{ steps.release.outputs.target_sha }}
+    steps:
+      - name: Resolve the published release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$SOURCE_REF" != "refs/heads/main" ]; then
+            echo "Run this workflow from main, not ${SOURCE_REF}." >&2
+            exit 1
+          fi
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+            echo "release_tag must match vX.Y.Z or vX.Y.Z-rcN." >&2
+            exit 1
+          fi
+
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          if [ "$(jq -r '.draft' <<<"$release_json")" != "false" ]; then
+            echo "Release ${RELEASE_TAG} is still a draft." >&2
+            exit 1
+          fi
+
+          ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          object_type="$(jq -r '.object.type' <<<"$ref_json")"
+          target_sha="$(jq -r '.object.sha' <<<"$ref_json")"
+          while [ "$object_type" = "tag" ]; do
+            tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${target_sha}")"
+            object_type="$(jq -r '.object.type' <<<"$tag_json")"
+            target_sha="$(jq -r '.object.sha' <<<"$tag_json")"
+          done
+          if [ "$object_type" != "commit" ]; then
+            echo "Tag ${RELEASE_TAG} resolves to ${object_type}, not a commit." >&2
+            exit 1
+          fi
+
+          echo "target_sha=${target_sha}" >> "$GITHUB_OUTPUT"
+          echo "Release ${RELEASE_TAG} resolves to ${target_sha}."
+
+      - name: Checkout publishing tools from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: main
+
+      - name: Checkout the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ steps.release.outputs.target_sha }}
+          path: release
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          cache-key: publish-crates-poc
+          cache-on-failure: true
+          cache-save-if: false
+
+      - uses: ./.github/actions/setup-zakura-build
+
+      - name: Confirm the tag matches the zakura package
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: ./release/scripts/check-release-version.sh "$RELEASE_TAG"
+
+      - name: Plan and fully dry-run crate publishing
+        env:
+          ZAKURA_REPO_ROOT: ${{ github.workspace }}/release
+        run: ./scripts/publish-crates.sh verify --output "$RUNNER_TEMP/publish-plan.json"
+
+      - name: Summarize the dry-run
+        if: ${{ !cancelled() }}
+        env:
+          PLAN: ${{ runner.temp }}/publish-plan.json
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TARGET_SHA: ${{ steps.release.outputs.target_sha }}
+        run: |
+          if [ ! -f "$PLAN" ]; then
+            echo "No publish plan was produced." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## Crates.io dry-run"
+            echo
+            echo "- Release: \`${RELEASE_TAG}\`"
+            echo "- Commit: \`${TARGET_SHA}\`"
+            echo
+            echo "| Crate | Version | Status |"
+            echo "| --- | --- | --- |"
+            jq -r '.packages[] | "| `\(.name)` | `\(.version)` | `\(.status)` |"' "$PLAN"
+            echo
+            jq -r '
+              "Selected: \(.counts.to_publish + .counts.initial_publish_required); " +
+              "already published: \(.counts.already_published); " +
+              "initial publishes required: \(.counts.initial_publish_required)."
+            ' "$PLAN"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  oidc-smoke:
+    name: Exchange and revoke crates.io OIDC token
+    needs: [dry-run]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: crates-io
+    permissions:
+      id-token: write
+    steps:
+      # Keep this as the only step: no repository code receives the real,
+      # short-lived production token returned by the action.
+      - name: Authenticate with crates.io
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5

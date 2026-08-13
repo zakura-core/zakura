@@ -80,6 +80,50 @@ elsewhere. Every release is initially a pre-release; see
 [Promotion and the "Latest" release](#promotion-and-the-latest-release) for
 when and how a release is promoted.
 
+## Crates.io Trusted Publishing Dry Run
+
+The manually dispatched
+[`Dry-run crate publishing`](../.github/workflows/publish-crates.yml) workflow
+is a no-upload proof of concept. It checks out an existing published release
+tag, computes the exact workspace versions absent from crates.io, and runs
+Cargo's complete dry-run publishing checks. A separate checkout-free job then
+exchanges GitHub's OIDC identity for a short-lived production crates.io token
+and immediately revokes it. The token is never passed to repository code, and
+the workflow contains no registry upload command.
+
+One-time setup requires two distinct permission levels:
+
+1. A repository administrator creates a GitHub Actions environment named
+   `crates-io`, restricts its deployment branch to `main`, and configures no
+   required reviewers, secrets, or variables. The environment constrains the
+   OIDC identity; manually dispatching the workflow is the POC's only trigger.
+2. An owner of each existing crate opens that crate's **Settings > Trusted
+   Publishing** page on crates.io and adds a GitHub Actions publisher with:
+   - repository owner `zakura-core`
+   - repository name `zakura`
+   - workflow filename `publish-crates.yml`
+   - environment `crates-io`
+
+Only a crates.io owner can configure a crate's trusted publisher. An existing
+owner can grant another maintainer access from the crate's Owners settings or
+with `cargo owner`. A crate that has never been published must first be
+published manually with a narrowly scoped token from a trusted maintainer
+machine; never store that bootstrap token in GitHub.
+
+After setup, an operator needs repository Write access or higher, but no
+crates.io account permission:
+
+1. Open **Actions > Dry-run crate publishing > Run workflow**.
+2. Select `main`, enter the existing release tag, and dispatch the run.
+3. Review the crate/version/status table in the workflow summary and confirm
+   both jobs pass.
+
+There is no deployment approval prompt. A successful OIDC exchange proves that
+at least one trusted-publisher configuration matches; Cargo dry-run does not
+exercise registry upload authorization for every crate. Audit every crate's
+configuration before adding real publication in a later change. Continue to
+use the manual crates.io publishing procedure during this POC.
+
 ## Promotion and the "Latest" Release
 
 Both release workflows publish every release with `prerelease: true`, whatever

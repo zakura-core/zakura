@@ -49,12 +49,17 @@ for cmd in cargo curl git jq tar; do
   command -v "$cmd" >/dev/null || { echo "Missing required tool: $cmd" >&2; exit 1; }
 done
 
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+tool_root="$(cd "$(dirname "$0")/.." && pwd)"
+repo_root="${ZAKURA_REPO_ROOT:-$tool_root}"
+[ -f "${repo_root}/Cargo.toml" ] || {
+  echo "ZAKURA_REPO_ROOT has no Cargo.toml: ${repo_root}" >&2
+  exit 1
+}
 cd "$repo_root"
 
 # The library is linted as a standalone shellcheck input in lint.yml.
 # shellcheck source=scripts/lib/crates-index.sh disable=SC1091
-. "${repo_root}/scripts/lib/crates-index.sh"
+. "${tool_root}/scripts/lib/crates-index.sh"
 
 allow_unpublishable="${ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH:-0}"
 

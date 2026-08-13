@@ -210,9 +210,14 @@ impl AdjustedDifficulty {
             self.candidate_height,
         );
 
-        let threshold = (self.mean_target_difficulty() / averaging_window_timespan.num_seconds())
-            * self.median_timespan_bounded().num_seconds();
-        let threshold = min(self.network.target_difficulty_limit(), threshold);
+        let bounded_timespan = self.median_timespan_bounded().num_seconds();
+        let scaled_mean = self.mean_target_difficulty() / averaging_window_timespan.num_seconds();
+        let target_limit = self.network.target_difficulty_limit();
+        let threshold = if scaled_mean > target_limit / bounded_timespan {
+            target_limit
+        } else {
+            min(target_limit, scaled_mean * bounded_timespan)
+        };
 
         threshold.to_compact()
     }

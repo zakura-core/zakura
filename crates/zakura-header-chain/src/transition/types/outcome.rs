@@ -2,7 +2,7 @@
 
 use zakura_chain::block;
 
-use crate::{BranchId, EvidenceId, HeaderSyncWorkOwner, StateVersion, TransitionDomain};
+use crate::{BranchId, EvidenceId, HeaderSyncWorkOwner, StateVersion};
 
 /// How ordinary header work related to newer monotone finality.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -33,7 +33,7 @@ pub enum AuxiliaryEffect {
 
 /// Orthogonal effects produced by one planned transition.
 ///
-/// The submitted [`TransitionDomain`] identifies the input. This record describes
+/// The submitted [`crate::TransitionDomain`] identifies the input. This record describes
 /// the resulting admission transformations and side effects, which may coexist.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct TransitionEffect {

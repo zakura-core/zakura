@@ -11,6 +11,71 @@ independently.
 
 ## [Unreleased]
 
+## [1.2.0-rc0] - 2026-08-14
+
+### Added
+
+- Added the `GetBlockRange` method to the indexer gRPC service, streaming a
+  height range of finalized blocks in ascending order. Blocks are served from
+  the stored raw bytes instead of the per-block deserialize/re-serialize round
+  trip `GetBlock` performs, so indexers can backfill finalized history without
+  a request round trip per block. Serving block ranges requires building with
+  the `indexer` compile-time feature; without it the method returns
+  `UNIMPLEMENTED` ([#612](https://github.com/zakura-core/zakura/pull/612)).
+
+### Changed
+
+- Orchard Halo2 proofs verified from the mempool are no longer verified a second
+  time when the block that mines them arrives. The result is cached per Orchard
+  circuit era under a key that hashes the bundle's consensus encoding, its bundle
+  version and the sighash, so a reused result is bit-identical to the computation
+  it replaces; every other consensus check still runs at the block's own height.
+  New `zakura.consensus.halo2.cache.{hit,miss,insert,evict}` counters and a
+  `zakura.consensus.halo2.cache.size` gauge report the cache's behaviour
+  ([#597](https://github.com/zakura-core/zakura/pull/597)).
+- The generated `Indexer` gRPC service trait in the `zakura-rpc` crate has a
+  new required `get_block_range` method and `GetBlockRangeStream` associated
+  type, a breaking change for external implementers of the trait; `zakura-rpc`
+  takes its major version bump to 7.0.0 in this PR
+  ([#612](https://github.com/zakura-core/zakura/pull/612)).
+- Block work and cumulative chain work are now stored at their exact 256-bit
+  width, so valid hard targets are representable instead of failing conversion.
+  Fork choice and the committed chain history root are unchanged for Mainnet and
+  Testnet, and no database migration is required
+  ([#637](https://github.com/zakura-core/zakura/pull/637)).
+- The maximum-block-time activation height is now a per-network parameter.
+  Configured networks and Regtest default to activating the MTP-plus-90-minutes
+  rule at height 2 instead of inheriting the public Testnet height, generated
+  local networks activate it after their seed chain, and Regtest accepts a
+  `max_block_time_start_height` config field. Mainnet and public Testnet
+  behaviour is unchanged
+  ([#640](https://github.com/zakura-core/zakura/pull/640)).
+
+### Removed
+
+- Removed `Work::as_u128` and `PartialCumulativeWork::as_u128` from
+  `zakura-chain` in favour of `as_u256`
+  ([#637](https://github.com/zakura-core/zakura/pull/637)).
+- Removed internal-miner stale-template cancellation until its CPU Equihash
+  solver dependency is ready for release
+  ([#657](https://github.com/zakura-core/zakura/pull/657)).
+
+### Fixed
+
+- Zakura protocol services now enforce their declared frame caps for inbound and
+  outbound application frames
+  ([#592](https://github.com/zakura-core/zakura/pull/592)).
+- Stopped the internal miner from submitting solutions for stale templates and
+  reduced stale work by cancelling between Equihash digit rounds
+  ([#643](https://github.com/zakura-core/zakura/pull/643)).
+
+### Security
+
+- Required mutual TLS for indexer RPC listeners on non-loopback addresses,
+  bounded indexer connections and streams, and rejected blocks without a
+  coinbase height before state preparation
+  ([#596](https://github.com/zakura-core/zakura/pull/596)).
+
 ## [1.1.1] - 2026-08-10
 
 ### Added

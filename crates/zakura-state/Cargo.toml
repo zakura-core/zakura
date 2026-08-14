@@ -1,6 +1,6 @@
 [package]
 name = "zakura-state"
-version = "6.2.0-rc0"
+version = "6.2.0"
 authors.workspace = true
 description = "State contextual verification and storage code for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -74,8 +74,8 @@ tracing = { workspace = true }
 
 sapling-crypto = { workspace = true }
 
-zakura-node-services = { path = "../zakura-node-services", version = "3.2.0-rc0" }
-zakura-chain = { path = "../zakura-chain", version = "5.0.0-rc0", features = ["async-error"] }
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.0" }
+zakura-chain = { path = "../zakura-chain", version = "5.0.0", features = ["async-error"] }
 
 # prod feature progress-bar
 howudoin = { workspace = true, optional = true }
@@ -108,7 +108,7 @@ orchard = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-chain = { path = "../zakura-chain", version = "5.0.0-rc0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "5.0.0", features = ["proptest-impl"] }
 zakura-test = { path = "../zakura-test/", version = "2.1.0" }
 
 [lints]

@@ -92,9 +92,11 @@ jobs:
           # the action's default `-D warnings` would report new-since-the-tag
           # warnings as publishing failures.
           rustflags: ""
-          cache-key: publish-crates-poc
-          cache-on-failure: true
-          cache-save-if: false
+          # No cache: `cargo publish --dry-run` verifies each crate in its own
+          # target directory under target/package/, so almost nothing a cache
+          # could carry is reused, and the action would cache the tooling
+          # checkout rather than the release checkout that does the building.
+          cache: false
 
       - uses: ./.github/actions/setup-zakura-build
 

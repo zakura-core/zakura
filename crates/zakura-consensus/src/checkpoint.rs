@@ -595,13 +595,16 @@ where
         &self,
         block: Arc<Block>,
     ) -> Result<CheckpointVerifiedBlock, VerifyCheckpointError> {
-        let hash = block.hash();
+        let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
+            .map_err(BlockError::from)?;
         let height = block
             .coinbase_height()
             .ok_or(VerifyCheckpointError::CoinbaseHeight { hash })?;
         self.check_height(height)?;
 
-        if self.network.disable_pow() {
+        let pow_policy = zakura_header_chain::PowPolicy::for_network(&self.network)
+            .map_err(VerifyBlockError::from)?;
+        if pow_policy.is_authenticated_custom_waiver() {
             crate::block::check::difficulty_threshold_is_valid(
                 &block.header,
                 &self.network,

@@ -73,6 +73,9 @@ pub enum VerifyBlockError {
     },
 
     #[error(transparent)]
+    PowPolicy(#[from] zakura_header_chain::PowPolicyError),
+
+    #[error(transparent)]
     Time(zakura_chain::block::BlockTimeError),
 
     /// Error when attempting to commit a block after semantic verification.
@@ -214,7 +217,8 @@ where
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         async move {
-            let hash = block.hash();
+            let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
+                .map_err(BlockError::from)?;
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");
             match state_service
@@ -246,7 +250,8 @@ where
             // > The block data MUST be validated and checked against the server's usual
             // > acceptance rules (excluding the check for a valid proof-of-work).
             // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
-            if request.is_proposal() || network.disable_pow() {
+            let pow_policy = zakura_header_chain::PowPolicy::for_network(&network)?;
+            if request.is_proposal() || pow_policy.is_authenticated_custom_waiver() {
                 check::difficulty_threshold_is_valid(&block.header, &network, &height, &hash)?;
             } else {
                 // Do the difficulty checks first, to raise the threshold for

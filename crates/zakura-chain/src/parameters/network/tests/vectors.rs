@@ -16,6 +16,7 @@ use crate::{
         ConsensusBranchId, Network, NetworkKind, NetworkUpgrade, MAINNET_ACTIVATION_HEIGHTS,
         TESTNET_ACTIVATION_HEIGHTS,
     },
+    work::equihash::Solution,
 };
 
 /// Checks that every method in the `Parameters` impl for `zakura_chain::Network` has the same output
@@ -378,6 +379,12 @@ fn configured_max_block_time_policy_is_local() {
     assert_eq!(configured_regtest.kind(), NetworkKind::Regtest);
     assert!(!configured_regtest.is_max_block_time_enforced(Height(41)));
     assert!(configured_regtest.is_max_block_time_enforced(regtest_height));
+    Solution::for_proposal_for_network(&configured_regtest)
+        .validate_shape(&configured_regtest)
+        .expect("a configured Regtest keeps the authenticated (48, 5) solution shape");
+    assert!(Solution::for_proposal()
+        .validate_shape(&configured_regtest)
+        .is_err());
 }
 
 /// Regtest must not activate NU6.3 unless it is explicitly configured, and

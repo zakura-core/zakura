@@ -68,11 +68,15 @@ jobs:
           echo "target_sha=${target_sha}" >> "$GITHUB_OUTPUT"
           echo "Release ${RELEASE_TAG} resolves to ${target_sha}."
 
-      - name: Checkout publishing tools from main
+      # The dispatch is restricted to main above, so this is main's tip as of
+      # the dispatch. Pinning the commit rather than the branch keeps a run
+      # using the tooling it was dispatched with, even if main advances while
+      # the run is queued.
+      - name: Checkout publishing tools from the dispatched commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: main
+          ref: ${{ github.sha }}
 
       - name: Checkout the release commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

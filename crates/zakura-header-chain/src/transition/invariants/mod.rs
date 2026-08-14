@@ -116,9 +116,9 @@ fn graph_error_violation(error: GraphError, plan: &PlanCandidate) -> InvariantVi
     let hash = match error {
         GraphError::StaleDelta { .. } => return InvariantViolation::SnapshotBeforeCommit,
         GraphError::AnchorHashMismatch { expected, .. } => expected,
-        GraphError::UnknownParent { header, .. } | GraphError::InvalidHeaderNode { header, .. } => {
-            header
-        }
+        GraphError::UnknownParent { header, .. }
+        | GraphError::InvalidHeaderNode { header, .. }
+        | GraphError::DirectEligibilityReasonLimit { header, .. } => header,
         GraphError::HeightOverflow { parent } => parent,
         GraphError::ConflictingDuplicate(hash)
         | GraphError::DuplicateHeaderNode(hash)

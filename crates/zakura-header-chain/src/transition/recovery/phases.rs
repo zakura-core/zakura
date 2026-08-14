@@ -7,11 +7,11 @@ use zakura_chain::block;
 
 use crate::{
     BodyValidationState, ChainScore, ConsensusInvalidBodyTombstone, EngineConfig, EngineMetadata,
-    EngineSnapshot, Frontier, HeaderNode, RowLimit, StoreCollection, StoreError,
+    EngineSnapshot, Frontier, HeaderNode, RowLimit, StoreError,
 };
 
 use super::contracts::{
-    source_failure, AuditViolation, RecoveryFailure, StoreAuditRead, ValidationContextRecord,
+    source_failure, AuditViolation, RecoveryFailure, StoreAuditSnapshot, ValidationContextRecord,
 };
 
 /// Exhaustive durable rows loaded before any authoritative audit.
@@ -54,7 +54,7 @@ pub(super) struct ReconstructedDerivedViews {
 }
 
 /// Load the complete durable rows used by startup audit.
-pub(super) fn load_pre_audit_store_rows<S: StoreAuditRead>(
+pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
     store: &S,
     config: &EngineConfig,
     allow_trust_anchor_update: bool,
@@ -81,32 +81,19 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditRead>(
         .ok_or(StoreError::Incoherent(
             "header-node recovery limit overflow",
         ))?;
-    preflight(store, StoreCollection::HeaderNodes, maximum_nodes)?;
-    let accepted_nodes =
-        store.collection_count_up_to(StoreCollection::HeaderNodes, RowLimit::new(maximum_nodes))?;
-    for collection in [
-        StoreCollection::ChildEdges,
-        StoreCollection::SelectedProjection,
-        StoreCollection::VerifiedProjection,
-        StoreCollection::DeferredRows,
-    ] {
-        preflight(store, collection, accepted_nodes)?;
+    let mut source_nodes = Vec::with_capacity(maximum_nodes);
+    store.visit_header_nodes(RowLimit::new(maximum_nodes), &mut |node| {
+        source_nodes.push(node);
+        Ok(())
+    })?;
+    let mut tombstones = Vec::with_capacity(source_nodes.len().min(65_536));
+    store.visit_consensus_invalid_body_tombstones(RowLimit::new(65_536), &mut |tombstone| {
+        tombstones.push(tombstone);
+        Ok(())
+    })?;
+    if store.consensus_invalid_body_tombstone_count()? != tombstones.len() {
+        return Err(StoreError::Incoherent("consensus-invalid tombstone count mismatch").into());
     }
-    let reason_limit = accepted_nodes
-        .checked_mul(16)
-        .ok_or(StoreError::Incoherent(
-            "eligibility-reason recovery limit overflow",
-        ))?;
-    preflight(store, StoreCollection::EligibilityReasons, reason_limit)?;
-    let maximum_aux = config.limits.max_aux_deliveries_total.get();
-    preflight(store, StoreCollection::AuxiliaryDeliveries, maximum_aux)?;
-    let maximum_contexts = crate::POW_PREDECESSOR_CONTEXT_SPAN;
-    preflight(store, StoreCollection::ValidationContexts, maximum_contexts)?;
-    preflight(store, StoreCollection::FinalityHistory, 65_536)?;
-    preflight(store, StoreCollection::ConsensusInvalidTombstones, 65_536)?;
-
-    let mut source_nodes = store.all_header_nodes()?;
-    let tombstones = store.all_consensus_invalid_body_tombstones()?;
     let mut tombstone_hashes = HashSet::new();
     for tombstone in &tombstones {
         if !tombstone_hashes.insert(tombstone.hash) {
@@ -141,7 +128,14 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditRead>(
             early_violations.push(AuditViolation::BodyValidationEvidenceAuthority(node.hash));
         }
     }
-    let validation_contexts = store.validation_context_records()?;
+    let mut validation_contexts = Vec::with_capacity(crate::POW_PREDECESSOR_CONTEXT_SPAN);
+    store.visit_validation_context_records(
+        RowLimit::new(crate::POW_PREDECESSOR_CONTEXT_SPAN),
+        &mut |record| {
+            validation_contexts.push(record);
+            Ok(())
+        },
+    )?;
     Ok(PreAuditStoreRows {
         snapshot_before_repair,
         metadata,
@@ -151,16 +145,4 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditRead>(
         trust_anchor_changed,
         early_violations,
     })
-}
-
-fn preflight<S: StoreAuditRead>(
-    store: &S,
-    collection: StoreCollection,
-    maximum: usize,
-) -> Result<(), RecoveryFailure> {
-    let limit = RowLimit::new(maximum);
-    if store.collection_count_up_to(collection, limit)? > maximum {
-        return Err(StoreError::LimitExceeded { collection, limit }.into());
-    }
-    Ok(())
 }

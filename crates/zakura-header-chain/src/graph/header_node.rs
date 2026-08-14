@@ -10,6 +10,9 @@ use zakura_chain::{block, work::difficulty::Work};
 use super::{Frontier, WorkCoordinate};
 use crate::{EvidenceId, OperatorInvalidationId, SourceId};
 
+/// Maximum direct eligibility reasons retained for one header.
+pub const MAX_DIRECT_ELIGIBILITY_REASONS_V1: usize = 16;
+
 /// Stable full-state consensus rule identity attached to body evidence.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BodyRuleId(Arc<str>);
@@ -322,6 +325,9 @@ impl HeaderNode {
         if header.difficulty_threshold.to_work() != Some(block_work) {
             return Err(DurableNodeError::Work);
         }
+        if eligibility.direct_reasons.len() > MAX_DIRECT_ELIGIBILITY_REASONS_V1 {
+            return Err(DurableNodeError::EligibilityReasons);
+        }
         Ok(Self {
             header,
             hash,
@@ -349,4 +355,7 @@ pub enum DurableNodeError {
     /// The stored per-block work did not match the compact target.
     #[error("durable header work mismatch")]
     Work,
+    /// The row exceeded the direct eligibility-reason bound.
+    #[error("durable header has too many direct eligibility reasons")]
+    EligibilityReasons,
 }

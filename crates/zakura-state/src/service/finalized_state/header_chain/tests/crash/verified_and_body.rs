@@ -704,13 +704,15 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
                 "{target:?}, consensus_invalid={consensus_invalid}"
             );
             if committed {
+                let audit = observation
+                    .reopened
+                    .store
+                    .audit_snapshot()
+                    .expect("the audit snapshot opens");
                 assert!(
-                    StoreAuditRead::full_state_attests_to_body_validation_state(
-                        &observation.reopened.store,
-                        child.hash,
-                        &expected_body,
-                    )
-                    .expect("the body evidence authority row decodes"),
+                    audit
+                        .full_state_attests_to_body_validation_state(child.hash, &expected_body)
+                        .expect("the body evidence authority row decodes"),
                     "{target:?}, consensus_invalid={consensus_invalid}"
                 );
             }
@@ -731,6 +733,7 @@ pub(super) fn crash_fixture_body_conclusions_reopen_complete_before_or_after() {
                 (committed && consensus_invalid).then(|| {
                     zakura_header_chain::ConsensusInvalidBodyTombstone {
                         hash: child.hash,
+                        height: child.height,
                         evidence,
                         rule: rule.clone(),
                     }

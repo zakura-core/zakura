@@ -25,7 +25,6 @@ use crate::{
 pub(super) enum AuditRead {
     Snapshot,
     Metadata,
-    CollectionCount,
     HeaderNodes,
     Tombstones,
     BodyStateAuthority,
@@ -37,14 +36,15 @@ pub(super) enum AuditRead {
     AuxDeliveries,
     ValidationContexts,
     CanonicalHash,
+    FinalityCheckpoint,
+    FinalityCount,
     FinalityHistory,
 }
 
 impl AuditRead {
-    pub(super) const ALL: [Self; 15] = [
+    pub(super) const ALL: [Self; 16] = [
         Self::Snapshot,
         Self::Metadata,
-        Self::CollectionCount,
         Self::HeaderNodes,
         Self::Tombstones,
         Self::BodyStateAuthority,
@@ -56,6 +56,8 @@ impl AuditRead {
         Self::AuxDeliveries,
         Self::ValidationContexts,
         Self::CanonicalHash,
+        Self::FinalityCheckpoint,
+        Self::FinalityCount,
         Self::FinalityHistory,
     ];
 }
@@ -75,6 +77,7 @@ pub(super) struct AuditStore {
     pub(super) aux: Vec<AuxDelivery>,
     pub(super) contexts: Vec<ValidationContextRecord>,
     pub(super) canonical: HashMap<block::Height, block::Hash>,
+    pub(super) finality_checkpoint: Option<crate::FinalityHistoryCheckpoint>,
     pub(super) finality: Vec<FinalityRecord>,
     pub(super) failed_read: Option<AuditRead>,
 }
@@ -87,9 +90,35 @@ impl AuditStore {
             Ok(())
         }
     }
+
+    fn visit_bounded<T: Clone>(
+        &self,
+        read: AuditRead,
+        collection: StoreCollection,
+        rows: &[T],
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(T) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        if rows.len() > limit.get() {
+            return Err(StoreError::LimitExceeded { collection, limit });
+        }
+        self.check_read(read)?;
+        for row in rows {
+            visitor(row.clone())?;
+        }
+        Ok(())
+    }
 }
 
 impl StoreAuditRead for AuditStore {
+    type Snapshot<'a> = &'a Self;
+
+    fn audit_snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
+        Ok(self)
+    }
+}
+
+impl StoreAuditSnapshot for &AuditStore {
     fn snapshot(&self) -> Result<EngineSnapshot, StoreError> {
         self.check_read(AuditRead::Snapshot)?;
         Ok(self.snapshot.clone())
@@ -100,37 +129,36 @@ impl StoreAuditRead for AuditStore {
         Ok(self.metadata.clone())
     }
 
-    fn collection_count_up_to(
+    fn visit_header_nodes(
         &self,
-        collection: StoreCollection,
         limit: RowLimit,
-    ) -> Result<usize, StoreError> {
-        self.check_read(AuditRead::CollectionCount)?;
-        let count = match collection {
-            StoreCollection::HeaderNodes => self.nodes.len(),
-            StoreCollection::ChildEdges => self.children.len(),
-            StoreCollection::SelectedProjection => self.selected.len(),
-            StoreCollection::VerifiedProjection => self.verified.len(),
-            StoreCollection::DeferredRows => self.deferred.len(),
-            StoreCollection::EligibilityReasons => self.reasons.len(),
-            StoreCollection::AuxiliaryDeliveries => self.aux.len(),
-            StoreCollection::ValidationContexts => self.contexts.len(),
-            StoreCollection::FinalityHistory => self.finality.len(),
-            StoreCollection::ConsensusInvalidTombstones => self.tombstones.len(),
-        };
-        Ok(count.min(limit.get().saturating_add(1)))
+        visitor: &mut dyn FnMut(HeaderNode) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.visit_bounded(
+            AuditRead::HeaderNodes,
+            StoreCollection::HeaderNodes,
+            &self.nodes,
+            limit,
+            visitor,
+        )
     }
 
-    fn all_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
-        self.check_read(AuditRead::HeaderNodes)?;
-        Ok(self.nodes.clone())
-    }
-
-    fn all_consensus_invalid_body_tombstones(
+    fn visit_consensus_invalid_body_tombstones(
         &self,
-    ) -> Result<Vec<ConsensusInvalidBodyTombstone>, StoreError> {
-        self.check_read(AuditRead::Tombstones)?;
-        Ok(self.tombstones.clone())
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(ConsensusInvalidBodyTombstone) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.visit_bounded(
+            AuditRead::Tombstones,
+            StoreCollection::ConsensusInvalidTombstones,
+            &self.tombstones,
+            limit,
+            visitor,
+        )
+    }
+
+    fn consensus_invalid_body_tombstone_count(&self) -> Result<usize, StoreError> {
+        Ok(self.tombstones.len())
     }
 
     fn full_state_attests_to_body_validation_state(
@@ -142,37 +170,84 @@ impl StoreAuditRead for AuditStore {
         Ok(self.body_state_authority)
     }
 
-    fn header_child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError> {
-        self.check_read(AuditRead::ChildEdges)?;
-        Ok(self.children.clone())
-    }
-
-    fn selected_projection(&self) -> Result<Vec<Frontier>, StoreError> {
-        self.check_read(AuditRead::SelectedProjection)?;
-        Ok(self.selected.clone())
-    }
-
-    fn verified_projection(&self) -> Result<Vec<Frontier>, StoreError> {
-        self.check_read(AuditRead::VerifiedProjection)?;
-        Ok(self.verified.clone())
-    }
-
-    fn deferred_entries(&self) -> Result<Vec<(DateTime<Utc>, block::Hash)>, StoreError> {
-        self.check_read(AuditRead::DeferredEntries)?;
-        Ok(self.deferred.clone())
-    }
-
-    fn eligibility_roots(&self) -> Result<Vec<(block::Hash, EligibilityReason)>, StoreError> {
-        self.check_read(AuditRead::EligibilityRoots)?;
-        Ok(self.reasons.clone())
-    }
-
-    fn all_aux_deliveries(
+    fn visit_header_child_edges(
         &self,
-    ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>
-    {
-        self.check_read(AuditRead::AuxDeliveries)?;
-        Ok(self
+        limit: RowLimit,
+        visitor: &mut dyn FnMut((block::Hash, block::Hash)) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.visit_bounded(
+            AuditRead::ChildEdges,
+            StoreCollection::ChildEdges,
+            &self.children,
+            limit,
+            visitor,
+        )
+    }
+
+    fn visit_selected_projection(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(Frontier) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.visit_bounded(
+            AuditRead::SelectedProjection,
+            StoreCollection::SelectedProjection,
+            &self.selected,
+            limit,
+            visitor,
+        )
+    }
+
+    fn visit_verified_projection(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(Frontier) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.visit_bounded(
+            AuditRead::VerifiedProjection,
+            StoreCollection::VerifiedProjection,
+            &self.verified,
+            limit,
+            visitor,
+        )
+    }
+
+    fn visit_deferred_entries(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut((DateTime<Utc>, block::Hash)) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.visit_bounded(
+            AuditRead::DeferredEntries,
+            StoreCollection::DeferredRows,
+            &self.deferred,
+            limit,
+            visitor,
+        )
+    }
+
+    fn visit_eligibility_roots(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut((block::Hash, EligibilityReason)) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.visit_bounded(
+            AuditRead::EligibilityRoots,
+            StoreCollection::EligibilityReasons,
+            &self.reasons,
+            limit,
+            visitor,
+        )
+    }
+
+    fn visit_aux_deliveries(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(
+            (AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>),
+        ) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let rows: Vec<_> = self
             .aux
             .iter()
             .map(|delivery| {
@@ -195,12 +270,28 @@ impl StoreAuditRead for AuditStore {
                 );
                 (base, status, observations, delivery.outcome_boundary_hash())
             })
-            .collect())
+            .collect();
+        self.visit_bounded(
+            AuditRead::AuxDeliveries,
+            StoreCollection::AuxiliaryDeliveries,
+            &rows,
+            limit,
+            visitor,
+        )
     }
 
-    fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError> {
-        self.check_read(AuditRead::ValidationContexts)?;
-        Ok(self.contexts.clone())
+    fn visit_validation_context_records(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(ValidationContextRecord) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.visit_bounded(
+            AuditRead::ValidationContexts,
+            StoreCollection::ValidationContexts,
+            &self.contexts,
+            limit,
+            visitor,
+        )
     }
 
     fn authenticated_canonical_hash(
@@ -213,13 +304,28 @@ impl StoreAuditRead for AuditStore {
 
     fn visit_finality_history(
         &self,
+        limit: RowLimit,
         visitor: &mut dyn FnMut(FinalityRecord) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
-        self.check_read(AuditRead::FinalityHistory)?;
-        for record in &self.finality {
-            visitor(*record)?;
-        }
-        Ok(())
+        self.visit_bounded(
+            AuditRead::FinalityHistory,
+            StoreCollection::FinalityHistory,
+            &self.finality,
+            limit,
+            visitor,
+        )
+    }
+
+    fn finality_history_checkpoint(
+        &self,
+    ) -> Result<Option<crate::FinalityHistoryCheckpoint>, StoreError> {
+        self.check_read(AuditRead::FinalityCheckpoint)?;
+        Ok(self.finality_checkpoint)
+    }
+
+    fn finality_history_count(&self) -> Result<usize, StoreError> {
+        self.check_read(AuditRead::FinalityCount)?;
+        Ok(self.finality.len())
     }
 }
 
@@ -319,6 +425,7 @@ pub(super) fn fixture() -> (AuditStore, EngineConfig) {
             aux: Vec::new(),
             contexts: Vec::new(),
             canonical: HashMap::from([(anchor.height, anchor.hash), (child.height, child.hash)]),
+            finality_checkpoint: None,
             finality: vec![FinalityRecord {
                 previous: anchor,
                 current: anchor,

@@ -11,10 +11,10 @@ use chrono::{DateTime, Utc};
 
 use crate::{
     transition::engine::validate_recovered_auxiliary_rows, BodyValidationState, EngineConfig,
-    HeaderGraphReconstruction, MemHeaderStore,
+    HeaderGraphReconstruction, MemHeaderStore, RowLimit,
 };
 
-use super::contracts::{violation_key, AuditViolation, RecoveryFailure, StoreAuditRead};
+use super::contracts::{violation_key, AuditViolation, RecoveryFailure, StoreAuditSnapshot};
 use super::phases::{AuditedSource, PreAuditStoreRows};
 
 use authoritative_rows::check_authoritative_rows;
@@ -23,7 +23,7 @@ use nodes::check_nodes;
 use trust_pins::check_trust_pins;
 
 /// Audit every authoritative row and reject before any reconstruction.
-pub(super) fn audit_authoritative<S: StoreAuditRead>(
+pub(super) fn audit_authoritative<S: StoreAuditSnapshot>(
     store: &S,
     rows: PreAuditStoreRows,
     config: &EngineConfig,
@@ -70,16 +70,30 @@ pub(super) fn audit_authoritative<S: StoreAuditRead>(
             tombstones_by_hash.get(&node.hash),
         ) {
             (BodyValidationState::ConsensusInvalid { evidence, rule }, Some(tombstone))
-                if *evidence == tombstone.evidence && *rule == tombstone.rule => {}
+                if *evidence == tombstone.evidence
+                    && *rule == tombstone.rule
+                    && node.height == tombstone.height => {}
             (BodyValidationState::ConsensusInvalid { .. }, _) | (_, Some(_)) => {
                 violations.push(AuditViolation::ConsensusInvalidBodyTombstone(node.hash));
             }
             (_, None) => {}
         }
     }
+    for tombstone in &tombstones {
+        if tombstone.height <= finalized.height {
+            violations.push(AuditViolation::ConsensusInvalidBodyTombstone(
+                tombstone.hash,
+            ));
+        }
+    }
     check_finalized_connectivity(&source_nodes, finalized, &mut violations);
     check_trust_pins(&source_nodes, finalized, config, &mut violations);
-    let untrusted_deliveries = store.all_aux_deliveries()?;
+    let maximum_aux = config.limits.max_aux_deliveries_total.get();
+    let mut untrusted_deliveries = Vec::with_capacity(maximum_aux.min(source_nodes.len()));
+    store.visit_aux_deliveries(RowLimit::new(maximum_aux), &mut |delivery| {
+        untrusted_deliveries.push(delivery);
+        Ok(())
+    })?;
     let recovered_deliveries = if untrusted_deliveries.is_empty() {
         Some(Vec::new())
     } else {

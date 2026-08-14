@@ -8,7 +8,7 @@ use zakura_chain::{
 };
 use zakura_header_chain::{
     prepare_headers, CheckpointSet, EngineConfig, EngineMode, Frontier, HeaderBatchInput,
-    HeaderRules, StoreAuditRead, SystemClock, TrustedAnchor,
+    HeaderRules, SystemClock, TrustedAnchor,
 };
 
 use super::{
@@ -59,7 +59,8 @@ fn clean_store_initializes_only_from_finalized_full_state() {
     assert_eq!(report.startup.current.frontiers.header_best, anchor);
     assert_eq!(runtime.publisher().snapshot(), report.startup.current);
     assert_eq!(
-        StoreAuditRead::selected_projection(&HeaderChainStore::new(state.header_chain_disk_db()))
+        HeaderChainStore::new(state.header_chain_disk_db())
+            .selected_projection()
             .expect("the initialized selection decodes"),
         vec![anchor]
     );
@@ -112,9 +113,9 @@ fn predecessor_overlay_fails_closed_without_mutation_or_publication() {
         initialize_header_chain_reconciled(&state, &config, Vec::new()),
         Err(HeaderChainInitializationError::IncompatibleLegacyOverlay)
     ));
-    assert!(
-        StoreAuditRead::metadata(&HeaderChainStore::new(state.header_chain_disk_db())).is_err()
-    );
+    assert!(HeaderChainStore::new(state.header_chain_disk_db())
+        .metadata()
+        .is_err());
     assert_eq!(
         state
             .db

@@ -151,7 +151,7 @@ fn assert_transition_engine_matches_store(runtime: &HeaderChainRuntime) {
         .expect("the transition engine mutex is not poisoned");
     let durable_nodes = runtime
         .store
-        .all_header_nodes()
+        .load_header_nodes()
         .expect("the durable nodes are readable");
     assert_eq!(engine.graph().header_node_count(), durable_nodes.len());
     for node in durable_nodes {
@@ -183,7 +183,7 @@ fn assert_transition_engine_matches_store(runtime: &HeaderChainRuntime) {
     let mut durable_headers = HashSet::new();
     for delivery in runtime
         .store
-        .all_aux_deliveries()
+        .load_aux_deliveries()
         .expect("the durable auxiliary deliveries are readable")
     {
         durable_headers.insert(delivery.0.header_hash);

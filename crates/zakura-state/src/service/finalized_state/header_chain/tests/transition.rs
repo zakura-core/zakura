@@ -432,6 +432,106 @@ fn failed_batch_encoding_has_zero_durable_effects() {
 }
 
 #[test]
+fn finality_history_creates_an_authenticated_checkpoint_at_the_retained_bound() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor_node, metadata) = fixture();
+    let anchor = metadata.frontiers.finalized;
+    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    store
+        .initialize(metadata.clone(), anchor_node)
+        .expect("the bounded history fixture initializes");
+
+    let mut seed = DiskWriteBatch::new();
+    for epoch in 1..u64::try_from(FINALITY_HISTORY_LIMIT).expect("the limit fits u64") {
+        let record = FinalityRecord {
+            previous: anchor,
+            current: anchor,
+            source: FinalitySource::FullState {
+                evidence: EvidenceId::from_digest([0x90; 32]),
+            },
+            epoch: FinalityEpoch::new(epoch),
+        };
+        store
+            .put_value(
+                &mut seed,
+                HEADER_FINALITY_HISTORY,
+                HeaderFinalityKey(record.epoch).as_bytes(),
+                &record,
+            )
+            .expect("the retained history row encodes");
+    }
+    store
+        .put_value(
+            &mut seed,
+            HEADER_ENGINE_META,
+            FINALITY_HISTORY_COUNT_KEY,
+            &HeaderRowCountDisk(u64::try_from(FINALITY_HISTORY_LIMIT).expect("the limit fits u64")),
+        )
+        .expect("the retained history count encodes");
+    store.db.write(seed).expect("the bounded history seeds");
+
+    let appended = FinalityRecord {
+        previous: anchor,
+        current: anchor,
+        source: FinalitySource::FullState {
+            evidence: EvidenceId::from_digest([0x91; 32]),
+        },
+        epoch: FinalityEpoch::new(
+            u64::try_from(FINALITY_HISTORY_LIMIT).expect("the limit fits u64"),
+        ),
+    };
+    let mut next_metadata = metadata;
+    next_metadata.finality_epoch = appended.epoch;
+    let changes = ChangeSet {
+        put_nodes: Vec::new(),
+        delete_nodes: Vec::new(),
+        put_consensus_invalid_body_tombstones: Vec::new(),
+        index_changes: zakura_header_chain::IndexChanges::default(),
+        selected_projection: zakura_header_chain::ProjectionDelta::default(),
+        verified_projection: zakura_header_chain::ProjectionDelta::default(),
+        eligibility_changes: Vec::new(),
+        aux_changes: Vec::new(),
+        finality_append: Some(appended),
+        metadata: next_metadata,
+    };
+    let batch = store
+        .batch_for(&changes)
+        .expect("the bounded append creates a checkpoint");
+    store
+        .db
+        .write(batch)
+        .expect("the checkpoint commits atomically");
+
+    let audit = store
+        .audit_snapshot()
+        .expect("the checkpoint snapshot opens");
+    assert_eq!(
+        audit
+            .finality_history_checkpoint()
+            .expect("the checkpoint decodes"),
+        Some(FinalityHistoryCheckpoint {
+            epoch: FinalityEpoch::new(0),
+            frontier: anchor,
+        })
+    );
+    assert_eq!(
+        audit
+            .finality_history_count()
+            .expect("the retained count decodes"),
+        FINALITY_HISTORY_LIMIT
+    );
+    let mut epochs = Vec::with_capacity(FINALITY_HISTORY_LIMIT);
+    audit
+        .visit_finality_history(RowLimit::new(FINALITY_HISTORY_LIMIT), &mut |record| {
+            epochs.push(record.epoch);
+            Ok(())
+        })
+        .expect("the retained history remains bounded");
+    assert_eq!(epochs.first(), Some(&FinalityEpoch::new(1)));
+    assert_eq!(epochs.last(), Some(&appended.epoch));
+}
+
+#[test]
 fn prepared_full_state_swaps_only_after_combined_commit() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
@@ -868,7 +968,7 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
     assert_eq!(
         runtime
             .store
-            .all_header_nodes()
+            .load_header_nodes()
             .expect("the retained graph is readable"),
         vec![anchor]
     );

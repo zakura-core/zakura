@@ -18,11 +18,11 @@ use zakura_header_chain::{
     AlarmSet, AuxDelivery, BodyRuleId, BodySizeHint, BodyUnavailableSummary, BodyValidationState,
     BodyWorkAuthority, BodyWorkOwner, BranchId, ChainScore, ConsensusInvalidBodyTombstone,
     EligibilityReason, EligibilityState, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch,
-    FinalityRecord, FinalitySource, Frontier, FrontierSet, HeaderChainDiskVersion,
-    HeaderContextFact, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner, HeaderValidationState,
-    HeaderWorkAuthority, HeaderWorkOwner, OperatorInvalidationId, SourceId, StateVersion,
-    SuffixWork, TransitionDomain, TransitionFingerprint, TreeAuxRecordV1, VerifiedGeneration,
-    WorkCoordinate,
+    FinalityHistoryCheckpoint, FinalityRecord, FinalitySource, Frontier, FrontierSet,
+    HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner,
+    HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, OperatorInvalidationId, SourceId,
+    StateVersion, SuffixWork, TransitionDomain, TransitionFingerprint, TreeAuxRecordV1,
+    VerifiedGeneration, WorkCoordinate,
 };
 
 use super::FallibleDiskValue;
@@ -30,6 +30,37 @@ use super::FallibleDiskValue;
 const MAX_HEADER_BYTES: usize = 2 * 1024;
 const MAX_RULE_ID_BYTES: usize = 128;
 const MAX_AUX_DELIVERY_IDS: usize = zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS * 16;
+
+/// Bounded collection count stored with the atomic header-chain root.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderRowCountDisk(pub u64);
+
+impl FallibleDiskValue for HeaderRowCountDisk {
+    type Error = HeaderChainValueError;
+
+    fn encode(&self) -> Result<Vec<u8>, Self::Error> {
+        let mut encoder = Encoder::default();
+        encoder.u8(1);
+        encoder.u64(self.0);
+        Ok(encoder.0)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let mut decoder = Decoder::new(bytes);
+        match decoder.u8()? {
+            1 => {}
+            value => {
+                return Err(HeaderChainValueError::UnknownDiscriminant {
+                    field: "header_row_count_version",
+                    value,
+                })
+            }
+        }
+        let count = Self(decoder.u64()?);
+        decoder.finish()?;
+        Ok(count)
+    }
+}
 
 /// Malformed, truncated, oversized, or unknown version-one value data.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -357,8 +388,9 @@ impl FallibleDiskValue for ConsensusInvalidBodyTombstone {
 
     fn encode(&self) -> Result<Vec<u8>, Self::Error> {
         let mut encoder = Encoder::default();
-        encoder.u8(1);
+        encoder.u8(2);
         encoder.fixed(&self.hash.0);
+        encoder.u32(self.height.0);
         encoder.fixed(&self.evidence.digest());
         encoder.bounded(
             "consensus_invalid_rule",
@@ -371,7 +403,7 @@ impl FallibleDiskValue for ConsensusInvalidBodyTombstone {
     fn decode(bytes: &[u8]) -> Result<Self, Self::Error> {
         let mut decoder = Decoder::new(bytes);
         match decoder.u8()? {
-            1 => {}
+            2 => {}
             value => {
                 return Err(HeaderChainValueError::UnknownDiscriminant {
                     field: "consensus_invalid_tombstone_version",
@@ -380,6 +412,7 @@ impl FallibleDiskValue for ConsensusInvalidBodyTombstone {
             }
         }
         let hash = block::Hash(decoder.array()?);
+        let height = block::Height(decoder.u32()?);
         let evidence = EvidenceId::from_digest(decoder.array()?);
         let rule =
             std::str::from_utf8(decoder.bounded("consensus_invalid_rule", MAX_RULE_ID_BYTES)?)
@@ -387,6 +420,7 @@ impl FallibleDiskValue for ConsensusInvalidBodyTombstone {
         decoder.finish()?;
         Ok(Self {
             hash,
+            height,
             evidence,
             rule: BodyRuleId::new(rule),
         })
@@ -411,6 +445,7 @@ impl FullStateBodyValidationEvidenceAuthorityDisk {
     /// Build authority for a body-validation state that requires full-state authentication.
     pub fn from_body_validation_state(
         header_hash: block::Hash,
+        header_height: block::Height,
         body_validation_state: &BodyValidationState,
     ) -> Option<Self> {
         match body_validation_state {
@@ -421,6 +456,7 @@ impl FullStateBodyValidationEvidenceAuthorityDisk {
             BodyValidationState::ConsensusInvalid { evidence, rule } => {
                 Some(Self::ConsensusInvalid(ConsensusInvalidBodyTombstone {
                     hash: header_hash,
+                    height: header_height,
                     evidence: *evidence,
                     rule: rule.clone(),
                 }))
@@ -461,7 +497,7 @@ impl FallibleDiskValue for FullStateBodyValidationEvidenceAuthorityDisk {
 
     fn encode(&self) -> Result<Vec<u8>, Self::Error> {
         let mut encoder = Encoder::default();
-        encoder.u8(1);
+        encoder.u8(2);
         match self {
             Self::Verified { hash, evidence } => {
                 encoder.u8(0);
@@ -471,6 +507,7 @@ impl FallibleDiskValue for FullStateBodyValidationEvidenceAuthorityDisk {
             Self::ConsensusInvalid(tombstone) => {
                 encoder.u8(1);
                 encoder.fixed(&tombstone.hash.0);
+                encoder.u32(tombstone.height.0);
                 encoder.fixed(&tombstone.evidence.digest());
                 encoder.bounded(
                     "body_evidence_rule",
@@ -484,7 +521,7 @@ impl FallibleDiskValue for FullStateBodyValidationEvidenceAuthorityDisk {
 
     fn decode(bytes: &[u8]) -> Result<Self, Self::Error> {
         let mut decoder = Decoder::new(bytes);
-        if decoder.u8()? != 1 {
+        if decoder.u8()? != 2 {
             return Err(HeaderChainValueError::UnknownDiscriminant {
                 field: "body_evidence_authority_version",
                 value: bytes.first().copied().unwrap_or_default(),
@@ -492,15 +529,20 @@ impl FallibleDiskValue for FullStateBodyValidationEvidenceAuthorityDisk {
         }
         let kind = decoder.u8()?;
         let hash = block::Hash(decoder.array()?);
-        let evidence = EvidenceId::from_digest(decoder.array()?);
         let authority = match kind {
-            0 => Self::Verified { hash, evidence },
+            0 => Self::Verified {
+                hash,
+                evidence: EvidenceId::from_digest(decoder.array()?),
+            },
             1 => {
+                let height = block::Height(decoder.u32()?);
+                let evidence = EvidenceId::from_digest(decoder.array()?);
                 let rule =
                     std::str::from_utf8(decoder.bounded("body_evidence_rule", MAX_RULE_ID_BYTES)?)
                         .map_err(|_| HeaderChainValueError::RuleId)?;
                 Self::ConsensusInvalid(ConsensusInvalidBodyTombstone {
                     hash,
+                    height,
                     evidence,
                     rule: BodyRuleId::new(rule),
                 })
@@ -1206,6 +1248,37 @@ impl FallibleDiskValue for FinalityRecord {
             source,
             epoch,
         })
+    }
+}
+
+impl FallibleDiskValue for FinalityHistoryCheckpoint {
+    type Error = HeaderChainValueError;
+
+    fn encode(&self) -> Result<Vec<u8>, Self::Error> {
+        let mut encoder = Encoder::default();
+        encoder.u8(1);
+        encoder.u64(self.epoch.get());
+        put_frontier(&mut encoder, self.frontier);
+        Ok(encoder.0)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let mut decoder = Decoder::new(bytes);
+        match decoder.u8()? {
+            1 => {}
+            value => {
+                return Err(HeaderChainValueError::UnknownDiscriminant {
+                    field: "finality_history_checkpoint_version",
+                    value,
+                })
+            }
+        }
+        let checkpoint = Self {
+            epoch: FinalityEpoch::new(decoder.u64()?),
+            frontier: get_frontier(&mut decoder)?,
+        };
+        decoder.finish()?;
+        Ok(checkpoint)
     }
 }
 

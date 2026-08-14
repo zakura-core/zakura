@@ -26,6 +26,7 @@ pub use planner::{
 };
 pub use recovery::{
     audit_store, audit_store_at, audit_store_for_trust_anchor_update, AuditViolation,
-    RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead, ValidationContextRecord,
+    RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead, StoreAuditSnapshot,
+    ValidationContextRecord,
 };
 pub use types::*;

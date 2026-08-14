@@ -1,27 +1,34 @@
 use super::*;
 
 #[test]
-fn f_225519_rocksdb_count_stops_at_the_first_extra_row_without_decoding() {
+fn f_225519_rocksdb_snapshot_stops_at_the_first_extra_row_without_decoding() {
     let db_config = Config::ephemeral();
-    let (engine_config, _, _) = fixture();
+    let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    store
+        .initialize(metadata, anchor)
+        .expect("the valid anchor initializes the fixture");
     let cf = store
         .cf(HEADER_NODE_BY_HASH)
         .expect("the node column family exists");
-    for marker in 0_u8..3 {
-        store
-            .db
-            .put_cf(&cf, [marker; 32], b"intentionally malformed")
-            .expect("the malformed fixture row writes");
-    }
+    store
+        .db
+        .put_cf(&cf, [0xff; 32], b"intentionally malformed")
+        .expect("the malformed extra row writes");
 
+    let audit = store.audit_snapshot().expect("the audit snapshot opens");
+    let mut decoded = 0;
     assert_eq!(
-        store
-            .db
-            .raw_count_cf_up_to(&cf, 1)
-            .expect("the bounded raw scan succeeds"),
-        2
+        audit.visit_header_nodes(RowLimit::new(1), &mut |_| {
+            decoded += 1;
+            Ok(())
+        }),
+        Err(StoreError::LimitExceeded {
+            collection: StoreCollection::HeaderNodes,
+            limit: RowLimit::new(1),
+        })
     );
+    assert_eq!(decoded, 1);
 }
 
 #[test]
@@ -201,7 +208,7 @@ fn startup_reconciliation_chunks_finalized_gaps_at_the_node_limit() {
     assert_eq!(
         runtime
             .store
-            .all_header_nodes()
+            .load_header_nodes()
             .expect("the retained nodes are readable")
             .len(),
         1,

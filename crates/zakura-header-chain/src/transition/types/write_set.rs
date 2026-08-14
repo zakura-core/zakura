@@ -84,6 +84,15 @@ pub struct FinalityRecord {
     pub epoch: FinalityEpoch,
 }
 
+/// Authenticated frontier immediately before the retained finality-history window.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct FinalityHistoryCheckpoint {
+    /// Last finality epoch removed from the retained window.
+    pub epoch: crate::FinalityEpoch,
+    /// Canonical frontier reached by `epoch`.
+    pub frontier: Frontier,
+}
+
 /// Complete pure write plan applied atomically by the state adapter.
 ///
 /// # Authoritative vs reconstructible

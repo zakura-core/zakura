@@ -2,13 +2,13 @@
 
 use std::collections::BTreeSet;
 
-use crate::EngineConfig;
+use crate::{EngineConfig, RowLimit};
 
-use super::contracts::{RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead};
+use super::contracts::{RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditSnapshot};
 use super::phases::{AuditedSource, ReconstructedDerivedViews};
 
 /// Compare reconstructed state with durable caches and assemble one recovery plan.
-pub(super) fn classify_and_plan<S: StoreAuditRead>(
+pub(super) fn classify_and_plan<S: StoreAuditSnapshot>(
     store: &S,
     audited: AuditedSource,
     derived: ReconstructedDerivedViews,
@@ -42,27 +42,48 @@ pub(super) fn classify_and_plan<S: StoreAuditRead>(
         repairs.insert(RecoveryRepair::ElapsedDeferrals);
         repairs.insert(RecoveryRepair::DeferredIndex);
     }
+    let accepted_nodes = header_nodes.len();
+    let mut actual_child_edges = Vec::with_capacity(accepted_nodes);
+    store.visit_header_child_edges(RowLimit::new(accepted_nodes), &mut |edge| {
+        actual_child_edges.push(edge);
+        Ok(())
+    })?;
     compare_by_key(
-        store.header_child_edges()?,
+        actual_child_edges,
         &header_child_edges,
         |(parent, child)| (parent.0, child.0),
         RecoveryRepair::ChildIndex,
         &mut repairs,
     );
+    let mut actual_deferred_entries = Vec::with_capacity(deferred_entries.len());
+    store.visit_deferred_entries(RowLimit::new(accepted_nodes), &mut |entry| {
+        actual_deferred_entries.push(entry);
+        Ok(())
+    })?;
     compare_by_key(
-        store.deferred_entries()?,
+        actual_deferred_entries,
         &deferred_entries,
         |(until, hash)| (until.timestamp(), until.timestamp_subsec_nanos(), hash.0),
         RecoveryRepair::DeferredIndex,
         &mut repairs,
     );
-    if store.selected_projection()? != selected_projection
+    let mut actual_selected = Vec::with_capacity(selected_projection.len());
+    store.visit_selected_projection(RowLimit::new(accepted_nodes), &mut |frontier| {
+        actual_selected.push(frontier);
+        Ok(())
+    })?;
+    if actual_selected != selected_projection
         || metadata.frontiers.header_best != selected_tip
         || metadata.header_best_score != selected_score
     {
         repairs.insert(RecoveryRepair::SelectedProjection);
     }
-    if store.verified_projection()? != verified_projection {
+    let mut actual_verified = Vec::with_capacity(verified_projection.len());
+    store.visit_verified_projection(RowLimit::new(accepted_nodes), &mut |frontier| {
+        actual_verified.push(frontier);
+        Ok(())
+    })?;
+    if actual_verified != verified_projection {
         repairs.insert(RecoveryRepair::VerifiedProjection);
     }
     if promoted_source_nodes != header_nodes {

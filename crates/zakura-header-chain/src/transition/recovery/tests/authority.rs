@@ -111,6 +111,7 @@ fn rejects_missing_duplicate_orphan_and_mismatched_tombstones() {
     };
     let matching = ConsensusInvalidBodyTombstone {
         hash: child_hash,
+        height: block::Height(1),
         evidence,
         rule,
     };
@@ -168,6 +169,7 @@ fn denies_body_states_without_full_state_authority() {
             },
             vec![ConsensusInvalidBodyTombstone {
                 hash: child_hash,
+                height: block::Height(1),
                 evidence,
                 rule,
             }],
@@ -225,6 +227,7 @@ fn violations_are_sorted_and_deduplicated() {
     store.nodes.push(store.nodes[1].clone());
     store.tombstones.push(ConsensusInvalidBodyTombstone {
         hash: child_hash,
+        height: block::Height(1),
         evidence: EvidenceId::from_digest([0x51; 32]),
         rule: BodyRuleId::new("body.rule"),
     });
@@ -489,11 +492,11 @@ fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
 }
 
 #[test]
-fn fatal_configuration_mismatch_fails_before_collection_preflight() {
+fn fatal_configuration_mismatch_fails_before_collection_visit() {
     let (mut store, config) = fixture();
     store.metadata.mode = EngineMode::HeadersOnly;
     store.snapshot = store.metadata.snapshot();
-    store.failed_read = Some(AuditRead::CollectionCount);
+    store.failed_read = Some(AuditRead::HeaderNodes);
 
     assert_eq!(
         audit_store(&store, &config),
@@ -501,6 +504,31 @@ fn fatal_configuration_mismatch_fails_before_collection_preflight() {
             violations: vec![AuditViolation::Configuration],
         })
     );
+}
+
+#[test]
+fn bounded_finality_history_continues_from_an_authenticated_checkpoint() {
+    let (mut store, config) = fixture();
+    let anchor = store.metadata.frontiers.finalized;
+    store.finality_checkpoint = Some(crate::FinalityHistoryCheckpoint {
+        epoch: FinalityEpoch::new(0),
+        frontier: anchor,
+    });
+    store.finality = vec![FinalityRecord {
+        previous: anchor,
+        current: anchor,
+        source: FinalitySource::FullState {
+            evidence: EvidenceId::from_digest([0x71; 32]),
+        },
+        epoch: FinalityEpoch::new(1),
+    }];
+    store.metadata.finality_epoch = FinalityEpoch::new(1);
+    store.snapshot = store.metadata.snapshot();
+
+    audit_store(&store, &config).expect("the authenticated checkpoint continues finality audit");
+
+    store.canonical.remove(&anchor.height);
+    assert!(violations(&store, &config).contains(&AuditViolation::Finality));
 }
 
 #[test]
@@ -554,6 +582,7 @@ fn audits_each_normative_invariant() {
     };
     store.tombstones.push(ConsensusInvalidBodyTombstone {
         hash: child_hash,
+        height: block::Height(1),
         evidence,
         rule,
     });

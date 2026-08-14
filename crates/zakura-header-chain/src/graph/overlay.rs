@@ -392,6 +392,12 @@ impl<'a> GraphOverlay<'a> {
         }
 
         let direct_reasons: BTreeSet<_> = direct_reasons.into_iter().collect();
+        if direct_reasons.len() > super::MAX_DIRECT_ELIGIBILITY_REASONS_V1 {
+            return Err(GraphError::DirectEligibilityReasonLimit {
+                header: hash,
+                limit: super::MAX_DIRECT_ELIGIBILITY_REASONS_V1,
+            });
+        }
 
         let eligible = validation == HeaderValidationState::Valid
             && direct_reasons.is_empty()
@@ -446,11 +452,17 @@ impl<'a> GraphOverlay<'a> {
         hash: block::Hash,
         reason: EligibilityReason,
     ) -> Result<bool, GraphError> {
-        let changed = self
-            .stage_header_node(hash)?
-            .eligibility
-            .direct_reasons
-            .insert(reason);
+        let reasons = &mut self.stage_header_node(hash)?.eligibility.direct_reasons;
+        if reasons.contains(&reason) {
+            return Ok(false);
+        }
+        if reasons.len() == super::MAX_DIRECT_ELIGIBILITY_REASONS_V1 {
+            return Err(GraphError::DirectEligibilityReasonLimit {
+                header: hash,
+                limit: super::MAX_DIRECT_ELIGIBILITY_REASONS_V1,
+            });
+        }
+        let changed = reasons.insert(reason);
         if changed {
             self.recompute_descendant_eligibility(hash)?;
         }
@@ -492,10 +504,15 @@ impl<'a> GraphOverlay<'a> {
         hash: block::Hash,
         body_validation_state: BodyValidationState,
     ) -> Result<bool, GraphError> {
+        let height = self
+            .header_node(hash)
+            .ok_or(GraphError::UnknownHeaderNode(hash))?
+            .height;
         let tombstone = match &body_validation_state {
             BodyValidationState::ConsensusInvalid { evidence, rule } => {
                 Some(ConsensusInvalidBodyTombstone {
                     hash,
+                    height,
                     evidence: *evidence,
                     rule: rule.clone(),
                 })

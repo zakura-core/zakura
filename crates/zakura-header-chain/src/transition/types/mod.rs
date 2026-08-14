@@ -35,6 +35,6 @@ pub use preparation::{
 };
 pub use snapshot::{AlarmSet, EngineMetadata, EngineSnapshot, HeaderChainDiskVersion};
 pub use write_set::{
-    AuxDelta, ChangeSet, EligibilityDelta, FinalityRecord, FinalitySource, IndexChanges,
-    ProjectionDelta,
+    AuxDelta, ChangeSet, EligibilityDelta, FinalityHistoryCheckpoint, FinalityRecord,
+    FinalitySource, IndexChanges, ProjectionDelta,
 };

@@ -30,7 +30,7 @@ pub use graph::{
     ConsensusInvalidBodyTombstone, DurableNodeError, EligibilityReason, EligibilityState, Frontier,
     FrontierSet, GraphError, GraphRevision, HeaderGraphReconstruction, HeaderNode,
     HeaderNodeInvariant, HeaderValidationState, InsertResult, MemHeaderStore, SuffixWork,
-    WorkCoordinate, WorkCoordinateError,
+    WorkCoordinate, WorkCoordinateError, MAX_DIRECT_ELIGIBILITY_REASONS_V1,
 };
 pub use identity::{
     AuxObservationId, BranchId, CounterExhausted, EvidenceId, FinalityEpoch, HeaderGeneration,

@@ -599,6 +599,11 @@ impl DiskWriteBatch {
 }
 
 impl DiskDb {
+    /// Open one coherent RocksDB snapshot for a multi-collection audit.
+    pub(crate) fn rocksdb_snapshot(&self) -> rocksdb::SnapshotWithThreadMode<'_, DB> {
+        rocksdb::SnapshotWithThreadMode::new(&self.db)
+    }
+
     /// Prints rocksdb metrics for each column family along with total database disk size, live data disk size and database memory size.
     pub fn print_db_metrics(&self) {
         let mut total_size_on_disk = 0;
@@ -1239,28 +1244,6 @@ impl DiskDb {
             visitor(&key, &value).map_err(RawVisitError::Visitor)?;
         }
         Ok(())
-    }
-
-    /// Count at most `limit + 1` rows without collecting keys or values.
-    pub(crate) fn raw_count_cf_up_to<C>(
-        &self,
-        cf: &C,
-        limit: usize,
-    ) -> Result<usize, rocksdb::Error>
-    where
-        C: rocksdb::AsColumnFamilyRef,
-    {
-        let stop_after = limit.saturating_add(1);
-        let mut count: usize = 0;
-        for entry in self
-            .db
-            .iterator_cf(cf, rocksdb::IteratorMode::Start)
-            .take(stop_after)
-        {
-            entry?;
-            count = count.saturating_add(1);
-        }
-        Ok(count)
     }
 
     /// Collect a raw half-open key range without panicking on iterator failure.

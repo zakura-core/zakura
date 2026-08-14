@@ -464,6 +464,21 @@ fn header_failure_evidence(
     zakura_header_chain::EvidenceId::from_digest(hasher.finalize().into())
 }
 
+/// Returns a deterministic, domain-separated delivery ID for the source, owner, and header.
+fn header_aux_delivery_id(
+    source: zakura_header_chain::SourceId,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+    hash: block::Hash,
+) -> zakura_header_chain::EvidenceId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-header-aux-delivery-v1");
+    hasher.update(source.digest());
+    hasher.update(owner.session_id().to_le_bytes());
+    hasher.update(owner.request_id().get().to_le_bytes());
+    hasher.update(hash.0);
+    zakura_header_chain::EvidenceId::from_digest(hasher.finalize().into())
+}
+
 fn classify_header_preparation_failure(
     error: zakura_header_chain::HeaderFailure,
     entries: &[port::TargetEntry],
@@ -636,14 +651,8 @@ where
                         source,
                     ))
                 })?;
-            let mut hasher = Sha256::new();
-            hasher.update(b"zakura-header-aux-delivery-v1");
-            hasher.update(source.digest());
-            hasher.update(owner.session_id().to_le_bytes());
-            hasher.update(owner.request_id().get().to_le_bytes());
-            hasher.update(prepared.hash.0);
             aux.push(zakura_header_chain::AuxDelivery {
-                delivery_id: zakura_header_chain::EvidenceId::from_digest(hasher.finalize().into()),
+                delivery_id: header_aux_delivery_id(source, owner, prepared.hash),
                 header_hash: prepared.hash,
                 source,
                 owner,

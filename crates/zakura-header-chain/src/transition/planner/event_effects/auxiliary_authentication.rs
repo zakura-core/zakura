@@ -68,19 +68,24 @@ pub(super) fn authenticate_auxiliary_deliveries(
             )
             .into());
         }
-        if let crate::AuxAuthentication::Authenticated { boundary_hash, .. } = event.authentication
+        if let crate::AuxAuthentication::Authenticated { boundary_hash, .. }
+        | crate::AuxAuthentication::Rejected { boundary_hash, .. } = event.authentication
         {
             let boundary = projected.graph().view_header_node(boundary_hash).ok_or(
                 TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::Auxiliary(
                     AuxiliaryViolation::UnknownBoundary,
                 )),
             )?;
-            let expected_height = header.height.next().map_err(|_| {
-                InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::BoundaryHeightOverflow)
-            })?;
             let boundary_frontier = Frontier::new(boundary.height, boundary.hash);
-            if boundary.height != expected_height
-                || boundary.parent_hash != header.hash
+            let boundary_is_header = boundary.hash == header.hash;
+            let boundary_is_successor = header.height.next().is_ok_and(|expected_height| {
+                boundary.height == expected_height && boundary.parent_hash == header.hash
+            });
+            let self_boundary_allowed = matches!(
+                event.authentication,
+                crate::AuxAuthentication::Rejected { .. }
+            );
+            if !(boundary_is_successor || self_boundary_allowed && boundary_is_header)
                 || projected
                     .graph()
                     .view_header_ancestor(event.owner.branch.target_tip_hash, boundary.height)?

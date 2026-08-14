@@ -91,6 +91,7 @@ fn auxiliary_evidence_rejects_invalid_counts_and_duplicate_identity() {
                     deliveries,
                     authentication: crate::AuxAuthentication::Rejected {
                         evidence: EvidenceId::from_digest([0xd9; 32]),
+                        boundary_hash: delivery.header_hash,
                     },
                 })),
             },
@@ -530,7 +531,7 @@ fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
 }
 
 #[test]
-fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
+fn auxiliary_outcomes_require_exact_provenance_and_an_owned_boundary() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let mut insert = insertion(&store, 2, EvidenceId::from_digest([0xb0; 32]));
@@ -578,8 +579,8 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
         evidence: EvidenceId::from_digest([0xb4; 32]),
         boundary_hash,
     };
-    let request = |delivery, authentication| TransitionRequest {
-        expected_version: store.metadata.state_version,
+    let request = |expected_version, delivery, authentication| TransitionRequest {
+        expected_version,
         event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
             owner: repair_owner,
             deliveries: vec![delivery],
@@ -592,7 +593,11 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
     assert!(matches!(
         apply_transition(
             &store,
-            request(changed_provenance, authentication),
+            request(
+                store.metadata.state_version,
+                changed_provenance,
+                authentication,
+            ),
             &context(&config, &clock, Some(&Authority)),
         ),
         Err(TransitionFailure::InvalidEvidence(
@@ -606,7 +611,7 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
     assert!(matches!(
         apply_transition(
             &store,
-            request(delivery, wrong_boundary),
+            request(store.metadata.state_version, delivery, wrong_boundary),
             &context(&config, &clock, Some(&Authority)),
         ),
         Err(TransitionFailure::InvalidEvidence(
@@ -617,7 +622,7 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
     let before = store.snapshot();
     let authenticated = apply_transition(
         &store,
-        request(delivery, authentication),
+        request(store.metadata.state_version, delivery, authentication),
         &context(&config, &clock, Some(&Authority)),
     )
     .expect("exact integrated evidence authenticates metadata only");
@@ -662,8 +667,28 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
     );
     store.commit(&authenticated);
 
+    let unbound_rejection = crate::AuxAuthentication::Rejected {
+        evidence: EvidenceId::from_digest([0xc4; 32]),
+        boundary_hash: block::Hash([0xc4; 32]),
+    };
+    assert!(matches!(
+        apply_transition(
+            &store,
+            request(
+                store.metadata.state_version,
+                second_delivery,
+                unbound_rejection,
+            ),
+            &context(&config, &clock, Some(&Authority)),
+        ),
+        Err(TransitionFailure::InvalidEvidence(
+            InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::UnknownBoundary)
+        ))
+    ));
+
     let rejection = crate::AuxAuthentication::Rejected {
         evidence: EvidenceId::from_digest([0xc5; 32]),
+        boundary_hash,
     };
     let rejection_owner = body_owner(&store.snapshot(), 2, 2);
     let rejected = apply_transition(

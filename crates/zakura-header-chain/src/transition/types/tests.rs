@@ -406,6 +406,7 @@ fn event_cases() -> Vec<EventCase> {
                 deliveries: Vec::new(),
                 authentication: AuxAuthentication::Rejected {
                     evidence: aux_evidence,
+                    boundary_hash: block::Hash([40; 32]),
                 },
             })),
             domain: TransitionDomain::AuxEvidence,
@@ -437,6 +438,7 @@ fn auxiliary_authentication_transitions_only_refine_evidence() {
     };
     let rejected = AuxAuthentication::Rejected {
         evidence: other_evidence,
+        boundary_hash: block::Hash([4; 32]),
     };
 
     for next_state in [disputed, authenticated, rejected] {

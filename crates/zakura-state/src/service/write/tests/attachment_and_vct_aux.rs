@@ -102,6 +102,7 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
         1,
         zakura_header_chain::AuxAuthentication::Rejected {
             evidence: EvidenceId::from_digest([8; 32]),
+            boundary_hash: block::Hash([10; 32]),
         },
         true,
     );
@@ -280,14 +281,38 @@ fn stale_vct_auxiliary_failure_evidence_has_zero_durable_effects() {
         tree_aux: None,
         authentication: AuxAuthentication::Unauthenticated,
     };
+    let no_boundary = writer
+        .record_vct_auxiliary_failure(
+            &VctAuxiliaryWindow {
+                engine_snapshot: stale.clone(),
+                delivery_header: anchor.header.clone(),
+                delivery: current,
+                successor_height: None,
+                successor: None,
+            },
+            VctAuxiliaryFailureAttribution::CurrentDelivery,
+            crate::error::VctCommitFailure::CurrentRoots,
+        )
+        .expect("missing boundary evidence has no durable outcome");
+    assert_eq!(no_boundary, None);
+    assert_eq!(writer.runtime.publisher().snapshot(), before);
+
+    let mut successor_header = *anchor.header;
+    successor_header.previous_block_hash = anchor.hash();
+    successor_header.nonce = [0x75; 32].into();
+    let successor = VctSuccessorWitness::from_header(
+        Arc::new(successor_header),
+        block::Height(1),
+        zakura_chain::block::merkle::AuthDataRoot::from([0x76; 32]),
+    );
     let result = writer
         .record_vct_auxiliary_failure(
             &VctAuxiliaryWindow {
                 engine_snapshot: stale,
                 delivery_header: anchor.header.clone(),
                 delivery: current,
-                successor_height: None,
-                successor: None,
+                successor_height: Some(block::Height(1)),
+                successor: Some(successor),
             },
             VctAuxiliaryFailureAttribution::CurrentDelivery,
             crate::error::VctCommitFailure::CurrentRoots,

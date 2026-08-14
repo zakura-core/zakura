@@ -1027,9 +1027,13 @@ fn put_aux(encoder: &mut Encoder, value: AuxDelivery) {
             encoder.fixed(&evidence.digest());
             encoder.fixed(&boundary_hash.0);
         }
-        AuxAuthentication::Rejected { evidence } => {
+        AuxAuthentication::Rejected {
+            evidence,
+            boundary_hash,
+        } => {
             encoder.u8(2);
             encoder.fixed(&evidence.digest());
+            encoder.fixed(&boundary_hash.0);
         }
         AuxAuthentication::Disputed { evidence } => {
             encoder.u8(3);
@@ -1071,6 +1075,7 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueErr
         },
         2 => AuxAuthentication::Rejected {
             evidence: EvidenceId::from_digest(decoder.array()?),
+            boundary_hash: block::Hash(decoder.array()?),
         },
         3 => AuxAuthentication::Disputed {
             evidence: EvidenceId::from_digest(decoder.array()?),
@@ -1575,6 +1580,17 @@ mod tests {
         assert_eq!(
             AuxDelivery::decode(&aux.encode().expect("aux encodes")),
             Ok(aux)
+        );
+        let rejected_aux = AuxDelivery {
+            authentication: AuxAuthentication::Rejected {
+                evidence: EvidenceId::from_digest([13; 32]),
+                boundary_hash: block::Hash([14; 32]),
+            },
+            ..aux
+        };
+        assert_eq!(
+            AuxDelivery::decode(&rejected_aux.encode().expect("rejected aux encodes")),
+            Ok(rejected_aux)
         );
         let disputed_aux = AuxDelivery {
             authentication: AuxAuthentication::Disputed {

@@ -410,9 +410,13 @@ fn hash_aux_authentication(hasher: &mut Sha256, authentication: AuxAuthenticatio
             hasher.update(evidence.digest());
             hasher.update(boundary_hash.0);
         }
-        AuxAuthentication::Rejected { evidence } => {
+        AuxAuthentication::Rejected {
+            evidence,
+            boundary_hash,
+        } => {
             hasher.update([2]);
             hasher.update(evidence.digest());
+            hasher.update(boundary_hash.0);
         }
         AuxAuthentication::Disputed { evidence } => {
             hasher.update([3]);

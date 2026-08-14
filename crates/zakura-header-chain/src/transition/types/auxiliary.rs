@@ -52,6 +52,8 @@ pub enum AuxAuthentication {
     Rejected {
         /// Stable rejection evidence.
         evidence: EvidenceId,
+        /// Exact verified header boundary that established the rejection.
+        boundary_hash: block::Hash,
     },
     /// Verification failed at a boundary that combines two untrusted deliveries.
     ///

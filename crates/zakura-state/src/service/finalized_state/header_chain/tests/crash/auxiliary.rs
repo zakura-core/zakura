@@ -603,7 +603,10 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
             .expect("the two-delivery fixture audits");
         let before = runtime.publisher().snapshot();
         let evidence = EvidenceId::from_digest([marker.wrapping_add(5); 32]);
-        let authentication = zakura_header_chain::AuxAuthentication::Rejected { evidence };
+        let authentication = zakura_header_chain::AuxAuthentication::Rejected {
+            evidence,
+            boundary_hash: anchor.hash,
+        };
         let authority = Authority(evidence);
         let context = TransitionContext {
             config: &engine_config,

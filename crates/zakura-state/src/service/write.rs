@@ -712,6 +712,13 @@ impl HeaderChainWriter {
         if deliveries.is_empty() {
             return Ok(None);
         }
+        let Some(boundary_hash) = auxiliary_window
+            .successor
+            .as_ref()
+            .map(|successor| successor.hash)
+        else {
+            return Ok(None);
+        };
 
         let mut hasher = Sha256::new();
         hasher.update(b"zakura.vct.aux.rejection.v1");
@@ -719,6 +726,7 @@ impl HeaderChainWriter {
             crate::error::VctCommitFailure::CurrentRoots => 1,
             crate::error::VctCommitFailure::SuccessorBoundary => 2,
         }]);
+        hasher.update(boundary_hash.0);
         for delivery in &deliveries {
             hasher.update(delivery.delivery_id.digest());
             hasher.update(delivery.header_hash.0);
@@ -734,7 +742,10 @@ impl HeaderChainWriter {
         let authentication = if attribution.requires_dispute() {
             AuxAuthentication::Disputed { evidence }
         } else {
-            AuxAuthentication::Rejected { evidence }
+            AuxAuthentication::Rejected {
+                evidence,
+                boundary_hash,
+            }
         };
         let request = TransitionRequest {
             expected_version: auxiliary_window.engine_snapshot.state_version,

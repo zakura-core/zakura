@@ -8,7 +8,7 @@ retention, and the exact next state. It does not read from storage or perform as
 
 This guide covers the transition model itself. The
 [engine specification](../../../../docs/specs/fork-aware-header-chain-engine.md) defines the normative `LC-*`
-requirements. The [conformance manifest](../../conformance.toml) maps those requirements to code owners and tests.
+requirements.
 
 ## Engine state
 
@@ -191,7 +191,7 @@ decision:
 
 Update unit, property, conformance, and recovery tests for every affected rule.
 If the behavior changes an `LC-*` requirement, update the normative
-specification and the conformance manifest in the same change.
+specification and corresponding tests in the same change.
 
 The main transition entry points are
 [`engine/mod.rs`](engine/mod.rs), [`planner.rs`](planner.rs), and

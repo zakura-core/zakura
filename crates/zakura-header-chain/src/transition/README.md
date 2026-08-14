@@ -1,289 +1,199 @@
-# Atomic header-chain transitions
+# Transition engine maintainer guide
 
-The header chain receives evidence from work that finishes at different times:
-downloaded headers, full-state verification, body outcomes, checkpoint growth,
-and operator actions. Applying each result directly would let the retained fork
-graph, selected header path, verified path, finality, and published frontiers
-disagree.
+The transition engine converts one authenticated event and its durable facts into an invariant-verified
+`EngineTransition`. If planning fails, it returns a `TransitionFailure` and plans no effects.
 
-This package is the synchronous policy boundary that prevents that split. It
-projects one admitted event over a frozen `HeaderChainEngine`, settles all
-affected chain policy together, and returns one invariant-verified
-`EngineTransition`. Higher layers still own asynchronous work, durable storage,
-and publication.
+The engine is a synchronous policy boundary. It decides admissibility, freshness, replay, fork choice, finality,
+retention, and the exact next state. It does not read from storage or perform asynchronous work.
 
-The most important constraint is that planning is not a commit: observers may
-rely on the result only after the complete write set is durable and the
-corresponding engine state is ready to publish.
+This guide covers the transition model itself. The
+[engine specification](../../../../docs/specs/fork-aware-header-chain-engine.md) defines the normative `LC-*`
+requirements. The [conformance manifest](../../conformance.toml) maps those requirements to code owners and tests.
 
-## Mental model
+## Engine state
 
-`HeaderChainEngine` owns one coherent in-memory view:
+`HeaderChainEngine` owns one coherent in-memory state with these parts:
 
-- the retained header DAG and auxiliary deliveries;
-- the **selected projection**, the strongest eligible header path; and
-- the **verified projection**, the contiguous full-state-accepted path in
-  integrated mode, or just finality in headers-only mode.
+- The retained header graph contains the finalized anchor, retained descendants, validation
+  state, eligibility state, body state, and auxiliary delivery references.
+- The selected projection is the deterministic greatest-work eligible path from finality to `header_best`.
+- The verified projection is the contiguous full-state-accepted path in integrated mode. In headers-only mode,
+  it contains only the finalized frontier.
+- The finalized frontier anchors both projections. Finality never moves
+  backward.
+- `EngineMetadata` holds the frontiers, score, retention floor, alarms, replay fingerprint, configuration identity,
+  and counters.
 
-Selected and verified are deliberately separate. Full state can verify a weaker
-side path without replacing the greater-work header winner. Finality anchors
-both projections, while retention may keep other eligible or verified branches.
+The counters describe different kinds of change:
 
-The engine decides admissibility, freshness, replay, eligibility, fork choice,
-finality, retention, and the exact next state. It performs no store reads,
-durable writes, async scheduling, or publication.
+- `state_version` advances for every actual header-chain effect.
+- `header_generation` advances when header topology, validation, eligibility, selection, or finality invalidates
+  header work.
+- `verified_generation` advances when the verified projection or finality invalidates body-forward work.
 
-## Boundary and client surface
+Selected and verified projections can name different forks. Full state can
+verify a weaker side path without replacing the greater-work selected path.
 
-| Abstraction | Role |
-| --- | --- |
-| `TransitionEvent` / `TransitionRequest` | Evidence or commands describing the trigger, never caller-selected consequences |
-| `TransitionInput` | One event plus only the durable facts that variant may consume |
-| `TransitionContext` | Frozen config, authoritative clock, capability provider, and active retention references |
-| `HeaderChainEngine` | Coherent graph and projections; owns transition policy |
-| `EngineTransition` | Verified before/after snapshots, exact `ChangeSet`, domain, and effects |
-| `ChangeSet` | Complete atomic header-chain write set |
-| `EngineSnapshot` | Externally meaningful metadata view to publish after commit |
-| `ApplyResult` | Adapter receipt: committed, no-change, stale, or resource-stalled |
-| `RecoveryPlan` | Audited startup repair and hydration plan, deterministic for a given store, config, and recovery time |
+## Planning contract
 
-The state adapter is the trust boundary. It authenticates higher-level work,
-loads event-specific durable rows, supplies capabilities and local time, and
-serializes planning with storage. Admission checks the claimed event against
-those capabilities; the event type alone does not make evidence authoritative.
+`HeaderChainEngine::plan_transition` receives a `TransitionInput` and a frozen `TransitionContext`.
+The input binds a `TransitionEvent` to the durable facts that the event may consume. The context supplies immutable
+configuration, time, authenticated capabilities, and active retention references.
 
-## One transition
-
-The ordinary path is:
-
-```text
-higher-level result + durable facts + capabilities
-                         |
-                         v
-              pure transition planning
-                         |
-              +----------+----------+
-              |                     |
-       TransitionFailure      EngineTransition
-        zero effects          verified write set
-                                    |
-                                    v
-                         atomic durable commit
-                                    |
-                                    v
-                         install into engine
-                                    |
-                                    v
-                         publish EngineSnapshot
-```
+The planner never mutates the source engine. It builds a `PlanCandidate` over a graph overlay that stages edits without
+changing the source graph. The resulting `EngineTransition` exposes the before and after snapshots, exact `ChangeSet`,
+domain, and effects through a crate-private verified `TransitionPlan`.
 
 Planning has six phases:
 
-1. **Authenticate and admit.** Check configuration, mode, capabilities, bounded
-   input, and event-specific preconditions.
-2. **Bind replay and freshness.** Validate the event's state version or async
-   work owner, and recognize an exact replay in the current fingerprint slot.
-3. **Project the evidence.** Stage graph, body, eligibility, and auxiliary
-   changes in a copy-on-write view; the engine remains unchanged.
-4. **Settle global policy.** Recompute verified and selected paths as needed,
-   derive finality, enforce retention, and discard event effects on a protected
-   resource stall.
-5. **Assemble writes.** Derive graph, projection, index, finality, auxiliary,
-   alarm, and metadata changes from the settled view.
-6. **Verify independently.** Recheck the projected result and wrap it in the
-   crate-private verified plan type only if every commit invariant holds.
+1. Authenticate and admit. The planner checks the engine mode, capability,
+   configuration, input bounds, and event-specific preconditions.
+2. Bind replay and freshness. The planner checks the serialized version or the asynchronous work
+   owner. It also recognizes an exact replay in the current fingerprint slot.
+3. Project event evidence. The event handler stages graph, validation, body,
+   eligibility, and auxiliary changes in `ProjectedTransitionState`.
+4. Settle global policy. The planner recomputes the verified and selected projections, derives
+   finality, applies retention, and converts protected resource pressure into a resource-stall
+   plan.
+5. Assemble writes. The planner derives the graph delta, projections, indexes,
+   finality record, auxiliary rows, alarms, and metadata from the settled
+   state.
+6. Verify independently. The invariant verifier checks the candidate against the source engine.
+   A failed check returns `TransitionFailure::Invariant` with no planned effects.
 
-On the normal runtime path, the adapter writes the entire `ChangeSet` atomically
-with singleton metadata last, installs that same transition into the engine,
-swaps any related full-state memory, and publishes the after-snapshot.
+## Freshness and replay
 
-`install_committed_transition` also checks that the engine still equals the
-plan's before-snapshot, and applying the private graph delta can fail. Before
-commit, stale work can be replanned. After the durable batch commits, an install
-failure is fail-closed because disk may already be ahead of memory; recovery,
-not a forced install, restores one coherent state.
+Serialized events use an exact `state_version` comparison. A mismatch returns
+`TransitionFailure::Stale`.
 
-### Runtime exceptions to the ordinary path
+Asynchronous header work uses its `header_generation`, finalized anchor, and branch identity. Body-forward work also
+uses `verified_generation`. An unrelated `state_version` change does not stale an owner that still matches those fields.
 
-- A header-chain no-change may still accompany an atomic full-state write and
-  memory swap; it means only that the header chain has no durable effect.
-- Repeating a resource stall whose alarm is already durable performs no write
-  and publishes nothing.
-- The combined auxiliary-authentication/checkpoint path privately stages the
-  first transition in the locked engine so it can plan the second, then commits
-  both with full-state changes in one batch. A pre-commit failure reloads the
-  engine from unchanged durable state.
-- Refuting a migrated headers-only pin commits and installs the fatal alarm but
-  returns an error before publication. Startup and future applies then fail
-  closed until the state is deleted and resynchronized.
+Durable finality history can rebase older header work across monotone finality. The planner can trim the consumed
+prefix, bind the remaining suffix to the new anchor, or report that finality already applied all work. Missing or
+contradictory history makes the work stale.
 
-## Authority, freshness, and replay
+Replay protection retains the fingerprint of the most recent fingerprint-bearing state-changing transition. The
+fingerprint includes a stable domain, a domain-local evidence key, and a canonical payload digest.
 
-Admission is event-specific. Integrated full-state events require integrated
-mode and exact full-state authority; operator retries require scheduler
-authority; header completions require registered completion authority.
-Deferred-time reevaluation is mode-independent. Prepared headers are rechecked
-for identity, ancestry, configuration, contextual difficulty/time, and
-ownership. Validation leases are checked for network/trust-anchor binding,
-hash/ancestry coherence, overlap, and adapter authority.
+An exact replay in that slot produces a verified no-change plan even when its serialized version is old. Authority and
+owner freshness checks still apply. Reusing the current domain-local key with a different payload returns
+`TransitionFailure::ConflictingReplay`.
 
-Freshness has two forms:
+A later fingerprint-bearing state change replaces the slot. A transition with
+no fingerprint does not replace it. The slot is not a historical replay
+ledger.
 
-- Serialized events use an exact `state_version` compare-and-swap.
-- Asynchronous header work uses header generation plus its finalized anchor and
-  branch. Body-forward work additionally uses verified generation. Unrelated
-  changes may advance `state_version` without invalidating those owners.
-
-Older header work has one narrow recovery path: durable finality history may
-prove that finality advanced monotonically over its prepared range. The planner
-then trims the consumed prefix, rebinds the suffix, or reports the work already
-applied. Missing or contradictory history is stale.
-
-Replay protection stores the most recent fingerprint-bearing state-changing
-transition. An exact replay is a verified no-change even if its serialized
-version is old, but authority and asynchronous-owner freshness checks still
-apply. Reusing the current domain-local key for a different payload fails as
-`ConflictingReplay`. A later fingerprint-bearing commit replaces the slot;
-non-fingerprinted changes such as deferred reevaluation or a resource-stall
-alarm do not. This is not a historical replay ledger.
-
-`TransitionFailure::Stale` is the normal reload/reschedule result.
-`StalePreparation` is different: prepared work no longer matches its durable
-validation context and must be reconstructed or revalidated.
+`TransitionFailure::StalePreparation` has a narrower meaning than `Stale`. Prepared headers return
+`StalePreparation` when they no longer match their durable validation context and require new preparation or validation.
 
 ## Fork choice, finality, and retention
 
-Event-local changes do not choose their own consequences. Settlement always
-recomputes policy over the complete projected state:
+Settlement evaluates the complete projected state after the event handler
+finishes.
 
-- The selected tip is the deterministic greatest-work eligible tip.
-- In integrated mode, the verified projection contains contiguous full-state
-  accepted bodies. Explicit and checkpoint finality must lie on that path.
-- In headers-only mode, a sufficiently deep selected tip advances a local depth
-  pin, and the verified projection collapses to finality.
-- Advancing finality appends provenance, removes old ancestors and competing
-  sibling subtrees, and rebases retained work coordinates to the new anchor.
-- Retention protects selected and verified paths, every full-state-verified body
-  path, and active adapter references. It evicts only weaker unprotected
-  branches.
+- Fork choice selects the deterministic greatest-work eligible tip.
+- Integrated finality must lie on the verified projection and must come from
+  authenticated full-state evidence.
+- Headers-only finality advances a local depth pin when the selected path
+  exceeds the configured depth.
+- Finality removes old ancestors and competing sibling subtrees. It also
+  rebases retained work coordinates to the new anchor.
+- Retention protects selected and verified paths, every retained full-state-verified body path, and active retention
+  references.
+- Retention evicts only weaker unprotected branches.
 
-If protected paths alone exceed limits, the planner discards the submitted
-event's effects rather than deleting authority-owned state and returns a
-verified resource-stall transition.
+When protected paths alone exceed the limits, settlement discards the event's projected effects. It returns a verified
+resource-stall transition that keeps or raises the durable resource alarm.
 
-## Commit invariants and durable state
+## Invariant gate
 
-Before a plan becomes commit-capable, verification checks the graph delta and
-write set against the source snapshot, including:
+The invariant verifier treats the candidate as untrusted. It derives its checks from the source
+engine, graph delta, and proposed write set rather than from the event handler's conclusions.
 
-- canonical hashes, parent/child/height indexes, accumulated work, and
-  permanent invalid-body tombstones;
-- contiguous finalized-rooted selected and verified projections and
-  deterministic fork choice;
-- monotone finality, checkpoint and migrated trust pins, and protected paths;
-- exact version/generation increments, retention limits, and auxiliary foreign
-  keys.
+The verifier checks:
 
-`state_version` advances for any actual header-chain effect.
-`header_generation` advances only when header topology, validation,
-eligibility, selection, or finality changes invalidate header work.
-`verified_generation` advances only when the verified projection or finality
-changes invalidate body-forward work. Snapshot comparison derives retirement
-signals; the coordinator must consume them and add any exact owners to retire.
+- canonical node hashes, ancestry, heights, indexes, and accumulated work;
+- direct and inherited eligibility, plus permanent invalid-body tombstones;
+- contiguous finalized-rooted selected and verified projections;
+- deterministic fork choice and mode-specific verified state;
+- monotone finality, finality provenance, and authenticated trust pins;
+- protected paths, frozen resource limits, and auxiliary foreign keys; and
+- exact state, generation, and finality counter changes.
 
-The durable write set distinguishes source of truth from caches:
+`EngineTransition` remains commit-capable only because callers cannot construct
+its crate-private verified plan directly.
 
-- **Authoritative:** node source fields and direct eligibility reasons,
-  permanent invalid-body tombstones, auxiliary rows, finality history, and
-  non-derived singleton metadata.
-- **Reconstructible:** indexes; selected projection, frontier, and score;
-  verified projection; inherited eligibility; oldest-retained metadata; and the
-  selected-tip body-unavailability alarm.
+## Planner outcomes
 
-All fields must land in one transaction. Partial application is undefined.
+The planner has four main outcomes:
 
-## Outcomes and failures
-
-| Planner result | Adapter outcome |
+| Planner outcome | Meaning |
 | --- | --- |
-| verified header-chain mutation | `ApplyResult::Committed` |
-| verified header-chain no-change | `ApplyResult::NoChange` |
-| verified `resource_stalled` | `ApplyResult::ResourceStalled` |
-| `TransitionFailure::Stale` | `ApplyResult::Stale` with zero effects |
-| any other `TransitionFailure` | adapter error/refusal with zero planned effects |
-| migrated-pin refutation | commit fatal alarm, then adapter error without publication |
+| State-changing `EngineTransition` | Valid evidence produced a complete write set. |
+| No-change `EngineTransition` | Valid evidence produced no durable effect. |
+| Resource-stall `EngineTransition` | Retention refused the event and may change only the alarm. |
+| `TransitionFailure` | Planning failed and produced no planned effects. |
 
-`TransitionEffect` records orthogonal facts that may coexist: header-work
-rebase, finality advancement, auxiliary authentication, and resource stall.
+Replay, already-applied rebased work, immediate retention eviction, and valid redundant evidence can all produce no
+change. Callers must inspect `EngineTransition::is_no_change` and `EngineTransition::effect` instead of assuming that
+success changed state.
 
-`MissingDurableFacts` means required durable validation context could not be
-supplied or authenticated, such as a missing or incoherent validation lease. It
-is an adapter contract failure, not store I/O.
+Keep these three resource-limit outcomes separate:
 
-### Keep the three resource outcomes separate
+1. `TransitionFailure::AuxiliaryLimitExceeded` refuses the event before any
+   mutation and does not raise the resource-stall alarm.
+2. A verified `resource_stalled` effect means retention cannot meet limits
+   without evicting protected state. The plan keeps or raises the alarm.
+3. `InvariantViolation::Limits` means verification found a projected graph
+   above frozen limits. Planning fails with no effects and does not return a
+   resource-stall plan.
 
-1. **`TransitionFailure::AuxiliaryLimitExceeded`** refuses the event before any
-   durable mutation and raises no resource-stall alarm.
-2. **Verified `resource_stalled`** means retention cannot enforce limits without
-   breaking protected paths. The durable alarm may be recorded or retained.
-3. **`InvariantViolation::Limits`** means commit verification found a projected
-   graph above frozen limits. Planning fails closed with zero effects and does
-   not return a stall receipt.
+## Recovery audit
 
-Prepared header count is also checked twice: admission uses the active engine's
-`limits.max_headers_per_transition`, while `PreparedHeaderBatch::new` enforces
-the frozen `MAX_HEADERS_PER_TRANSITION_V1` format bound.
+Recovery reads a coherent durable snapshot and audits every authoritative row. It fails closed on contradictions in
+node identity, ancestry, work, validation, body authority, trust pins, eligibility roots, auxiliary provenance,
+finality, configuration, protected paths, or limits.
 
-## Startup audit and recovery
+After that audit, recovery reconstructs derived views. These views include
+indexes, projections, inherited eligibility, retention metadata, elapsed time
+deferrals, and the selected-tip body-unavailability alarm.
 
-Publication stays unavailable while recovery loads every durable row, fails
-closed on authoritative contradictions, reconstructs derived views, and
-classifies one atomic `RecoveryPlan`. Production startup uses
-`audit_store_for_trust_anchor_update`, which permits only an audited
-trust-anchor-manifest digest rebind in addition to ordinary repairs.
+The audit returns a `RecoveryPlan`. The plan contains corrected metadata, graph
+rows, indexes, projections, deferred entries, and an exact set of
+`RecoveryRepair` values. `RecoveryPlan::is_clean` reports whether the store
+needs a repair.
 
-Recovery can rebuild indexes, projections, inherited eligibility, retention
-metadata, and the selected-tip body-unavailability alarm, and can promote
-elapsed time deferrals. It does not generically rebuild every alarm:
-resource-stall state participates in authoritative limit auditing, and
-migrated-pin refutation blocks startup.
+For a fixed store snapshot, configuration, and recovery time, the audit returns
+the same plan. `audit_store_for_trust_anchor_update` permits only the audited
+manifest-digest rebind in addition to ordinary reconstructible repairs.
 
-The adapter commits any repairs before hydrating `HeaderChainEngine` with
-`from_audited_state` and creating the publisher. `StoreAuditRead` must expose one
-coherent `state_version` across a pass, visit finality history once in ascending
-epoch order, and perform no writes or publication.
+## Changing the transition model
 
-Atomic storage gives crash recovery a simple rule: reopening exposes either the
-complete before-state or the complete durable after-state. Durable state may be
-ahead of a publication interrupted after commit; startup audits and republishes
-that durable state.
+When you add or change an event, update each part of the model that owns a
+decision:
 
-## Surprises for maintainers
+1. Add exhaustive event dispatch. Define the variant, its admission authority, its durable input
+   facts, and its handler under [`planner/event_effects`](planner/event_effects/mod.rs).
+2. Define replay identity. Keep existing `TransitionDomain` codes stable,
+   append new codes, choose the domain-local evidence key, and hash every field
+   that can change effects in
+   [`types/event/replay.rs`](types/event/replay.rs).
+3. Derive writes after settlement. Event handlers should mutate only `ProjectedTransitionState`;
+   [`planner/write_set.rs`](planner/write_set.rs) must derive the complete write set from the
+   settled state.
+4. Preserve verifier independence. Add checks under [`invariants`](invariants/mod.rs) that
+   recompute the new invariant from the source engine and candidate. Do not trust a flag or value
+   produced only by the event handler.
+5. Keep graph mutation inside the overlay. Use the graph edit methods exposed
+   by `ProjectedTransitionState`. Do not mutate `HeaderChainEngine` while
+   planning or construct graph and index writes separately.
 
-- A successful plan is not proof of a mutation; replay, already-applied work,
-  and an insertion immediately removed by retention can all be no-change.
-- Selected and verified tips can legitimately name different forks.
-- A global version change does not necessarily stale generation-owned async
-  work.
-- Replay protection remembers one current fingerprint slot, which
-  non-fingerprinted commits do not replace.
-- `RetiredWork::from_snapshots` reports generation changes; it does not itself
-  cancel or retire coordinator work.
+Update unit, property, conformance, and recovery tests for every affected rule.
+If the behavior changes an `LC-*` requirement, update the normative
+specification and the conformance manifest in the same change.
 
-## Source map
-
-- Engine boundary and installation: [`engine/mod.rs`](engine/mod.rs)
-- Planning phases: [`planner.rs`](planner.rs)
-- Admission and freshness: [`planner/admission.rs`](planner/admission.rs),
-  [`planner/replay.rs`](planner/replay.rs)
-- Finality and retention settlement:
-  [`planner/settlement.rs`](planner/settlement.rs)
-- Write derivation and invariant gate:
-  [`planner/write_set.rs`](planner/write_set.rs),
-  [`invariants/mod.rs`](invariants/mod.rs)
-- Outcomes and durable DTOs: [`types/outcome.rs`](types/outcome.rs),
-  [`types/write_set.rs`](types/write_set.rs)
-- Recovery contracts and phases: [`recovery/contracts.rs`](recovery/contracts.rs),
-  [`recovery/mod.rs`](recovery/mod.rs)
-- Runtime commit/publication integration:
-  [`zakura-state/header_chain.rs`](../../../zakura-state/src/service/finalized_state/header_chain.rs)
+The main transition entry points are
+[`engine/mod.rs`](engine/mod.rs), [`planner.rs`](planner.rs), and
+[`recovery/mod.rs`](recovery/mod.rs). Public transition types are re-exported
+from [`mod.rs`](mod.rs).

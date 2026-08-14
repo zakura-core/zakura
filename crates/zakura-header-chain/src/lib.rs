@@ -4,16 +4,13 @@
 //! Higher-level crates own network transport, async runtime, consensus services, and databases.
 
 mod config;
+mod discovery;
 mod error;
-mod frontier;
 mod graph;
-mod header_node;
-mod ids;
-mod locator;
-mod ownership;
-mod retention;
+mod identity;
 mod transition;
 mod validation;
+mod work;
 
 #[cfg(any(test, feature = "fuzz-impl"))]
 mod fuzz;
@@ -24,37 +21,34 @@ pub use config::{
     MAX_AUX_DELIVERIES_TOTAL_V1, MAX_CANDIDATE_TIPS_V1, MAX_HEADERS_PER_TRANSITION_V1,
     MAX_NON_FINALIZED_NODES_V1, MAX_STAGED_TARGETS_V1,
 };
+pub use discovery::{HeaderLocator, VctRepairContext, MAX_HEADER_LOCATOR_HASHES};
 pub use error::{Attribution, ErrorCategory, ErrorSubject, HeaderChainError, RuleId};
-pub use frontier::{
-    ChainScore, Frontier, FrontierSet, SuffixWork, WorkCoordinate, WorkCoordinateError,
-};
 #[cfg(any(test, feature = "fuzz-impl"))]
 pub use fuzz::{replay_fork_transition_bytes, ForkReplaySummary};
 pub use graph::{
-    ConsensusInvalidBodyTombstone, GraphError, GraphRevision, HeaderGraphReconstruction,
-    HeaderNodeInvariant, InsertResult, MemHeaderStore,
+    BodyRuleId, BodyUnavailableSummary, BodyValidationState, ChainScore,
+    ConsensusInvalidBodyTombstone, DurableNodeError, EligibilityReason, EligibilityState, Frontier,
+    FrontierSet, GraphError, GraphRevision, HeaderGraphReconstruction, HeaderNode,
+    HeaderNodeInvariant, HeaderValidationState, InsertResult, MemHeaderStore, SuffixWork,
+    WorkCoordinate, WorkCoordinateError,
 };
-pub use header_node::{
-    BodyRuleId, BodyUnavailableSummary, BodyValidationState, DurableNodeError, EligibilityReason,
-    EligibilityState, HeaderNode, HeaderValidationState,
-};
-pub use ids::{
-    BodyWorkAuthority, BodyWorkOwner, BranchId, CounterExhausted, EvidenceId, FinalityEpoch,
-    HeaderGeneration, HeaderId, HeaderSyncWorkOwner, HeaderWorkAuthority, HeaderWorkOwner,
+pub use identity::{
+    BranchId, CounterExhausted, EvidenceId, FinalityEpoch, HeaderGeneration, HeaderId,
     OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration,
 };
-pub use locator::{HeaderLocator, VctRepairContext, MAX_HEADER_LOCATOR_HASHES};
-pub use ownership::{CompletionDecision, CompletionOwner, Gate, PendingOwners, StaleReason};
 pub use transition::*;
 pub use validation::{
-    infer_height, prepare_context_free_headers, prepare_headers, validate_commitment_structure,
-    validate_compact_target, validate_contextual_difficulty_and_time,
-    validate_encoding_version_hash, validate_future_time, validate_hash_filter, validate_link,
-    AdjustedDifficulty, AdjustedDifficultyError, CompactTargetError, ContextualValidationError,
-    HashFilterError, HeaderBatchInput, HeaderEncodingError, HeaderFailure, HeaderHeightError,
-    HeaderLinkError, HeaderRule, HeaderRules, PowPolicy, PowPolicyError,
-    BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN, POW_MEDIAN_BLOCK_SPAN,
-    POW_PREDECESSOR_CONTEXT_SPAN,
+    infer_height, prepare_headers, validate_commitment_structure, validate_compact_target,
+    validate_contextual_difficulty_and_time, validate_encoding_version_hash, validate_future_time,
+    validate_hash_filter, validate_link, AdjustedDifficulty, AdjustedDifficultyError,
+    CompactTargetError, ContextualValidationError, HashFilterError, HeaderBatchInput,
+    HeaderEncodingError, HeaderFailure, HeaderHeightError, HeaderLinkError, HeaderRule,
+    HeaderRules, PowPolicy, PowPolicyError, BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN,
+    POW_MEDIAN_BLOCK_SPAN, POW_PREDECESSOR_CONTEXT_SPAN,
+};
+pub use work::{
+    BodyWorkAuthority, BodyWorkOwner, CompletionDecision, CompletionOwner, Gate,
+    HeaderSyncWorkOwner, HeaderWorkAuthority, HeaderWorkOwner, PendingOwners, StaleReason,
 };
 
 #[cfg(test)]
@@ -78,6 +72,63 @@ mod tests {
                 !dependencies.contains_key(forbidden),
                 "header-chain architecture forbids a production dependency on {forbidden}"
             );
+        }
+    }
+
+    /// Planning derives its write set incrementally and keeps retention private.
+    #[test]
+    fn architecture_keeps_planning_encapsulated() {
+        let public_surface = include_str!("lib.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the production public surface precedes its tests");
+        assert!(
+            !public_surface.contains("enforce_retention"),
+            "retention stays behind the transition planner"
+        );
+
+        fn planner_sources(path: &std::path::Path, sources: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(path).expect("the planner source directory is readable")
+            {
+                let entry = entry.expect("the source directory entry is readable");
+                let path = entry.path();
+                // Planner test fixtures may build whole graphs; production planning may not.
+                if path.file_name().and_then(|name| name.to_str()) == Some("tests") {
+                    continue;
+                }
+                if path.is_dir() {
+                    planner_sources(&path, sources);
+                } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                    sources.push((
+                        path.display().to_string(),
+                        std::fs::read_to_string(&path).expect("the Rust source is readable"),
+                    ));
+                }
+            }
+        }
+
+        let mut sources = vec![(
+            "transition/planner.rs".to_owned(),
+            include_str!("transition/planner.rs").to_owned(),
+        )];
+        planner_sources(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/transition/planner")
+                .as_path(),
+            &mut sources,
+        );
+        for (path, source) in &sources {
+            for forbidden in [
+                "engine.graph().clone()",
+                "fn node_map",
+                "old_nodes",
+                "new_nodes",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{path} derives the write set by whole-graph diff: {forbidden}"
+                );
+            }
         }
     }
 

@@ -168,6 +168,14 @@ fn migrated_headers_only_pin_refutation_is_durable_and_fail_closed() {
         .migrate_headers_only_to_integrated(&integrated_config, anchor_frontier)
         .expect("the explicit mode migration succeeds before publication");
     assert_eq!(report.current.mode, EngineMode::Integrated);
+    assert_eq!(
+        runtime
+            .store
+            .metadata()
+            .expect("the migrated metadata is readable")
+            .headers_only_migration_epoch,
+        Some(FinalityEpoch::new(0))
+    );
     assert!(matches!(
         runtime.store.finality_history().as_deref(),
         Ok([FinalityRecord {
@@ -545,7 +553,7 @@ fn unrelated_body_commit_cannot_stale_current_header_generation_work() {
     let child_header = Arc::new(child_header);
     let batch = zakura_header_chain::prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&child_header)),
-        &lease,
+        lease.parent(),
         &rules,
         &SystemClock,
     )
@@ -661,7 +669,7 @@ fn lazy_work_rebase_commits_coordinates_and_reopens() {
     let child_header = Arc::new(child_header);
     let batch = zakura_header_chain::prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&child_header)),
-        &lease,
+        lease.parent(),
         &rules,
         &SystemClock,
     )
@@ -773,7 +781,7 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
     let second_header = Arc::new(second_header);
     let batch = zakura_header_chain::prepare_headers(
         HeaderBatchInput::new(&[first_header, second_header.clone()]),
-        &lease,
+        lease.parent(),
         &rules,
         &SystemClock,
     )

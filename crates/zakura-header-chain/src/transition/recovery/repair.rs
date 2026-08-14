@@ -5,22 +5,22 @@ use std::collections::BTreeSet;
 use crate::EngineConfig;
 
 use super::contracts::{RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead};
-use super::model::{AuditedSource, DerivedState};
+use super::phases::{AuditedSource, ReconstructedDerivedViews};
 
 /// Compare reconstructed state with durable caches and assemble one recovery plan.
 pub(super) fn classify_and_plan<S: StoreAuditRead>(
     store: &S,
     audited: AuditedSource,
-    derived: DerivedState,
+    derived: ReconstructedDerivedViews,
     config: &EngineConfig,
 ) -> Result<RecoveryPlan, RecoveryFailure> {
     let AuditedSource {
-        before,
+        snapshot_before_repair,
         mut metadata,
         trust_anchor_changed,
         ..
     } = audited;
-    let DerivedState {
+    let ReconstructedDerivedViews {
         promoted_source_nodes,
         header_nodes,
         header_child_edges,
@@ -94,7 +94,7 @@ pub(super) fn classify_and_plan<S: StoreAuditRead>(
     }
 
     Ok(RecoveryPlan {
-        before,
+        snapshot_before_repair,
         metadata,
         header_nodes,
         header_child_edges,

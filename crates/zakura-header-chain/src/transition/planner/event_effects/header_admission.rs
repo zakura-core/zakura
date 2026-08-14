@@ -4,20 +4,23 @@ use super::super::{
     AuxiliaryViolation, HeaderPathKind, HeaderPathProblem, HeaderValidationCheck, HeaderViolation,
     InvalidTransitionEvidence, TransitionFailure,
 };
+use chrono::Duration;
 use std::collections::{HashMap, HashSet};
 
 use crate::graph::HeaderGraphView;
 use crate::{BodyValidationState, Frontier, GraphError, HeaderValidationState, TargetCompletion};
 
 use super::super::projected_state::ProjectedTransitionState;
-use super::header_validation::{anchor_reasons, retained_header_context};
-use super::ApplyEventContext;
+use super::header_validation::{
+    anchor_reasons, check_contextual_difficulty_and_time, retained_header_context,
+};
+use super::EventProjectionContext;
 
 /// Admit a prepared header batch and any accompanying unauthenticated auxiliary deliveries.
-pub(super) fn apply(
+pub(super) fn admit_prepared_headers(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::InsertHeaders,
-    event_context: &ApplyEventContext<'_>,
+    event_context: &EventProjectionContext<'_>,
 ) -> Result<(), TransitionFailure> {
     let engine = event_context.engine;
     let facts = event_context.input.header_validation_facts();
@@ -61,6 +64,13 @@ pub(super) fn apply(
     let mut contextual =
         retained_header_context(projected.graph(), parent_frontier, facts, context)?;
     let mut parent = parent_frontier;
+    let admission_now = context.clock.now();
+    let future_limit = admission_now.checked_add_signed(Duration::hours(2)).ok_or(
+        InvalidTransitionEvidence::Header(HeaderViolation::Validation {
+            source: crate::HeaderValidationSource::Prepared,
+            check: HeaderValidationCheck::IdentityOrLocalTime,
+        }),
+    )?;
     for prepared in event.batch.headers() {
         if prepared.header.previous_block_hash != parent.hash
             || prepared.hash != prepared.header.hash()
@@ -85,30 +95,30 @@ pub(super) fn apply(
             )
             .into());
         }
-        let adjustment = crate::AdjustedDifficulty::new_from_header_time(
+        check_contextual_difficulty_and_time(
             prepared.header.time,
+            prepared.header.difficulty_threshold,
             parent.height,
             &context.config.network,
             contextual.iter().copied(),
-        )
-        .map_err(|_| {
-            InvalidTransitionEvidence::Header(crate::HeaderViolation::Validation {
-                source: crate::HeaderValidationSource::Prepared,
-                check: HeaderValidationCheck::IncompleteDifficultyContext,
-            })
-        })?;
-        crate::validate_contextual_difficulty_and_time(
-            prepared.header.difficulty_threshold,
-            adjustment,
-        )
-        .map_err(|_| {
-            InvalidTransitionEvidence::Header(crate::HeaderViolation::Validation {
-                source: crate::HeaderValidationSource::Prepared,
-                check: HeaderValidationCheck::ContextualValidation,
-            })
-        })?;
+            crate::HeaderValidationSource::Prepared,
+        )?;
         let validation = match prepared.validation {
-            HeaderValidationState::DeferredUntil(until) if until <= context.clock.now() => {
+            HeaderValidationState::Valid if prepared.header.time > future_limit => {
+                HeaderValidationState::DeferredUntil(
+                    prepared
+                        .header
+                        .time
+                        .checked_sub_signed(Duration::hours(2))
+                        .ok_or(InvalidTransitionEvidence::Header(
+                            HeaderViolation::Validation {
+                                source: crate::HeaderValidationSource::Prepared,
+                                check: HeaderValidationCheck::IdentityOrLocalTime,
+                            },
+                        ))?,
+                )
+            }
+            HeaderValidationState::DeferredUntil(until) if until <= admission_now => {
                 HeaderValidationState::Valid
             }
             state => state,
@@ -153,7 +163,11 @@ pub(super) fn apply(
                 || event.aux[0].tree_aux.is_none()
                 || selected_target != parent
                 || event.owner.header_authority().branch.target_tip_hash
-                    != event_context.before.frontiers.header_best.hash
+                    != event_context
+                        .snapshot_before_commit
+                        .frontiers
+                        .header_best
+                        .hash
                 || event_context
                     .old_selected
                     .iter()

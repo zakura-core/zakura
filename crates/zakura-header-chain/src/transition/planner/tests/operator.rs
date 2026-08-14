@@ -384,13 +384,31 @@ fn full_state_authority_is_bound_to_the_complete_event_payload() {
     apply_transition(&store, request.clone(), &exact_context)
         .expect("the exact staged payload is authorized");
 
-    let mut substituted = request;
+    let evidence = request
+        .event
+        .idempotency_key()
+        .expect("operator invalidation carries stable evidence");
+    let mut substituted = request.clone();
     let TransitionEvent::OperatorInvalidate(event) = &mut substituted.event else {
         unreachable!("the fixture is an operator invalidation")
     };
     event.operator_reason_digest[0] ^= 1;
     assert!(matches!(
         apply_transition(&store, substituted, &exact_context),
+        Err(TransitionFailure::Authority)
+    ));
+
+    let cross_variant = TransitionRequest {
+        expected_version: request.expected_version,
+        event: TransitionEvent::OperatorReconsider(crate::OperatorReconsider {
+            target: tip.hash,
+            id: crate::OperatorInvalidationId::new([0x71; 16]),
+            invalidation_evidence: None,
+            evidence,
+        }),
+    };
+    assert!(matches!(
+        apply_transition(&store, cross_variant, &exact_context),
         Err(TransitionFailure::Authority)
     ));
 }

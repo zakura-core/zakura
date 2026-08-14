@@ -37,7 +37,7 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
         let headers = [child_header.clone()];
         let insertion_batch = zakura_header_chain::prepare_headers(
             HeaderBatchInput::new(&headers),
-            &lease,
+            lease.parent(),
             &rules,
             &SystemClock,
         )
@@ -92,7 +92,7 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
             .expect("the authenticated repair policy is valid");
         let repair_batch = zakura_header_chain::prepare_headers(
             HeaderBatchInput::new(&headers),
-            &repair_lease,
+            repair_lease.parent(),
             &repair_rules,
             &SystemClock,
         )
@@ -324,7 +324,7 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
         let headers = [current_header.clone(), boundary_header.clone()];
         let batch = zakura_header_chain::prepare_headers(
             HeaderBatchInput::new(&headers),
-            &lease,
+            lease.parent(),
             &rules,
             &SystemClock,
         )

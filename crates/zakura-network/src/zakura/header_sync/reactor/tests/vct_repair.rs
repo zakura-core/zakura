@@ -226,7 +226,7 @@ async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
     let repair_headers = vec![entry.header.clone()];
     let batch = zakura_header_chain::prepare_headers(
         zakura_header_chain::HeaderBatchInput::new(&repair_headers),
-        &lease,
+        lease.parent(),
         &rules,
         &zakura_header_chain::SystemClock,
     )

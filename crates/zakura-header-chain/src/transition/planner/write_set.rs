@@ -3,7 +3,6 @@
 use std::{borrow::Cow, sync::Arc};
 
 use crate::graph::{GraphDelta, HeaderGraphView};
-use crate::retention::RetentionPlan;
 use crate::{
     BodyValidationState, ChangeSet, EligibilityDelta, EngineLimits, EngineMetadata, EngineSnapshot,
     Frontier, FrontierSet, GraphError, HeaderChainEngine, IndexChanges, MemHeaderStore,
@@ -13,6 +12,7 @@ use crate::{
 
 use super::admission::validate_authority;
 use super::projected_state::SettledProjectedState;
+use super::retention::RetentionPlan;
 use super::{
     InvalidTransitionEvidence, PlanCandidate, PlannerCoherenceViolation, ProjectionKind,
     TransitionFailure,
@@ -20,7 +20,7 @@ use super::{
 
 /// Inputs required to derive the atomic write set from settled projections.
 pub(super) struct DerivePlanInputs<'a> {
-    pub(super) before: EngineSnapshot,
+    pub(super) snapshot_before_commit: EngineSnapshot,
     pub(super) metadata: EngineMetadata,
     pub(super) base_graph: &'a MemHeaderStore,
     pub(super) projected: SettledProjectedState<'a>,
@@ -41,7 +41,7 @@ pub(super) fn derive_plan(
     inputs: DerivePlanInputs<'_>,
 ) -> Result<PlanCandidate, TransitionFailure> {
     let DerivePlanInputs {
-        before,
+        snapshot_before_commit,
         mut metadata,
         base_graph,
         projected,
@@ -89,20 +89,20 @@ pub(super) fn derive_plan(
             .header_node(node.hash)
             .is_some_and(|old| old.is_eligible() != node.is_eligible())
     });
-    let header_best = *selected.last().ok_or(TransitionFailure::InvalidEvidence(
+    let selected_tip = *selected.last().ok_or(TransitionFailure::InvalidEvidence(
         InvalidTransitionEvidence::Planner(PlannerCoherenceViolation::EmptyProjection(
             ProjectionKind::Selected,
         )),
     ))?;
     metadata.alarms.resource_stalled = retention.resource_stalled;
-    let header_best_node = graph
-        .view_header_node(header_best.hash)
-        .ok_or(GraphError::UnknownHeaderNode(header_best.hash))?;
-    metadata.alarms.header_best_body_unavailable = match &header_best_node.body_validation_state {
+    let selected_tip_node = graph
+        .view_header_node(selected_tip.hash)
+        .ok_or(GraphError::UnknownHeaderNode(selected_tip.hash))?;
+    metadata.alarms.header_best_body_unavailable = match &selected_tip_node.body_validation_state {
         BodyValidationState::Unavailable(summary) if summary.alarmed => Some(*summary),
         _ => None,
     };
-    let alarm_changed = metadata.alarms != before.alarms;
+    let alarm_changed = metadata.alarms != snapshot_before_commit.alarms;
     let changed = !put_nodes.is_empty()
         || !delete_nodes.is_empty()
         || !aux_changes.is_empty()
@@ -131,24 +131,24 @@ pub(super) fn derive_plan(
             metadata.last_transition = Some(fingerprint);
         }
     }
-    let verified_best = *verified.last().ok_or(TransitionFailure::InvalidEvidence(
+    let verified_tip = *verified.last().ok_or(TransitionFailure::InvalidEvidence(
         InvalidTransitionEvidence::Planner(PlannerCoherenceViolation::EmptyProjection(
             ProjectionKind::Verified,
         )),
     ))?;
     metadata.frontiers = FrontierSet {
         finalized: graph.view_finalized_frontier(),
-        header_best,
-        verified_best,
+        header_best: selected_tip,
+        verified_best: verified_tip,
     };
-    metadata.header_best_score = graph.view_header_chain_score(header_best.hash)?;
+    metadata.header_best_score = graph.view_header_chain_score(selected_tip.hash)?;
     metadata.oldest_retained_height = if delete_nodes.is_empty() {
         put_nodes
             .iter()
             .map(|node| node.height)
             .min()
-            .map_or(before.oldest_retained_height, |height| {
-                height.min(before.oldest_retained_height)
+            .map_or(snapshot_before_commit.oldest_retained_height, |height| {
+                height.min(snapshot_before_commit.oldest_retained_height)
             })
     } else {
         graph
@@ -179,7 +179,7 @@ pub(super) fn derive_plan(
         metadata,
     };
     Ok(PlanCandidate {
-        before,
+        snapshot_before_commit,
         change_set,
         graph_delta,
         domain,
@@ -192,7 +192,7 @@ pub(super) fn derive_plan(
 /// Construct a zero-effect plan after re-checking authority.
 pub(super) fn no_change(
     engine: &HeaderChainEngine,
-    before: EngineSnapshot,
+    snapshot_before_commit: EngineSnapshot,
     metadata: EngineMetadata,
     event: TransitionEvent,
     context: &TransitionContext<'_>,
@@ -201,7 +201,7 @@ pub(super) fn no_change(
 ) -> Result<PlanCandidate, TransitionFailure> {
     validate_authority(&event, context)?;
     Ok(PlanCandidate {
-        before,
+        snapshot_before_commit,
         change_set: ChangeSet {
             put_nodes: Vec::new(),
             delete_nodes: Vec::new(),
@@ -225,7 +225,7 @@ pub(super) fn no_change(
 /// Construct an alarm-only resource-stall plan that discards staged event effects.
 pub(super) fn resource_stalled(
     engine: &HeaderChainEngine,
-    before: EngineSnapshot,
+    snapshot_before_commit: EngineSnapshot,
     domain: TransitionDomain,
     context: &TransitionContext<'_>,
 ) -> Result<PlanCandidate, TransitionFailure> {
@@ -235,7 +235,7 @@ pub(super) fn resource_stalled(
         metadata.state_version = metadata.state_version.checked_next()?;
     }
     Ok(PlanCandidate {
-        before,
+        snapshot_before_commit,
         change_set: ChangeSet {
             put_nodes: Vec::new(),
             delete_nodes: Vec::new(),

@@ -7,6 +7,9 @@ use tokio::time::Instant;
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, SourceId, VctRepairContext};
 
+/// Maximum distinct suppliers retained and tried before one repair backoff cycle.
+const MAX_SUPPLIERS_PER_CYCLE: usize = 3;
+
 /// Structurally complete state of one auxiliary repair task.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::zakura::header_sync) enum RepairPolicyState {
@@ -154,7 +157,9 @@ impl RepairRequirement {
             _ => return Err(RepairPolicyError::IllegalState),
         };
         self.attempts = self.attempts.saturating_add(1);
-        self.tried_sources.insert(source);
+        if self.tried_sources.len() < MAX_SUPPLIERS_PER_CYCLE {
+            self.tried_sources.insert(source);
+        }
         self.state = RepairPolicyState::Ready { context };
         Ok(())
     }
@@ -165,11 +170,18 @@ impl RepairRequirement {
             return Err(RepairPolicyError::IllegalState);
         }
         self.attempts = self.attempts.saturating_add(1);
-        self.tried_sources.insert(source);
+        if self.tried_sources.len() < MAX_SUPPLIERS_PER_CYCLE {
+            self.tried_sources.insert(source);
+        }
         Ok(())
     }
 
-    /// Pause after a complete supplier cycle, then make every supplier eligible again.
+    /// Whether this repair must pause before trying another supplier.
+    pub fn supplier_cycle_exhausted(&self) -> bool {
+        self.tried_sources.len() >= MAX_SUPPLIERS_PER_CYCLE
+    }
+
+    /// Pause after a complete or bounded supplier cycle, then make every supplier eligible again.
     pub fn defer_retry_until(&mut self, deadline: Instant) -> Result<(), RepairPolicyError> {
         let RepairPolicyState::Ready { context } = &self.state else {
             return Err(RepairPolicyError::IllegalState);
@@ -417,6 +429,39 @@ mod tests {
         assert!(task.tried_sources.is_empty());
         assert_eq!(task.state, RepairPolicyState::Ready { context });
         assert_eq!(task.attempts, 2);
+    }
+
+    #[test]
+    fn supplier_cycle_retains_at_most_three_distinct_sources() {
+        let mut task = task(&snapshot());
+        let context = context();
+        mark_context_requested(&mut task);
+        task.resolve(context.clone())
+            .expect("the exact context resolves");
+
+        for byte in [1_u8, 2, 3] {
+            task.assign(task.owner).expect("ready work can go on wire");
+            task.retry(SourceId::from_digest([byte; 32]))
+                .expect("each distinct supplier can fail");
+        }
+        assert!(task.supplier_cycle_exhausted());
+        assert_eq!(task.tried_sources.len(), 3);
+        assert_eq!(task.attempts, 3);
+
+        task.record_failed_source(SourceId::from_digest([4; 32]))
+            .expect("ready work can record another failed supplier");
+        assert!(task.supplier_cycle_exhausted());
+        assert_eq!(task.tried_sources.len(), 3);
+        assert!(!task.tried_sources.contains(&SourceId::from_digest([4; 32])));
+        assert_eq!(task.attempts, 4);
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        task.defer_retry_until(deadline)
+            .expect("a bounded supplier cycle backs off");
+        task.resume_retry_cycle(deadline);
+        assert!(!task.supplier_cycle_exhausted());
+        assert!(task.tried_sources.is_empty());
+        assert_eq!(task.state, RepairPolicyState::Ready { context });
     }
 
     #[test]

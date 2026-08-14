@@ -22,10 +22,22 @@ pub struct ValidationContextRecord {
 }
 
 /// The startup audit uses this complete row and index view while publication is disabled.
+///
+/// # Contract
+///
+/// - **Cross-row `state_version` consistency.** Every method on one audit pass
+///   must observe the same durable version as [`Self::snapshot`] /
+///   [`Self::metadata`]. Mixing rows from concurrent commits is undefined and
+///   must surface as [`StoreError::Incoherent`] or fail closed in the audit.
+/// - **Visit ordering.** [`Self::visit_finality_history`] yields records in
+///   ascending finality-epoch order, contiguous from the bootstrap epoch.
+/// - **No side effects.** Implementations are read-only: no writes, no
+///   publication, no repair mutations. Reconstruction plans are returned by
+///   the audit API, not applied through this trait.
 pub trait StoreAuditRead {
     /// Return the atomic externally meaningful snapshot.
     fn snapshot(&self) -> Result<EngineSnapshot, StoreError>;
-    /// Return complete singleton metadata from the same version.
+    /// Return complete singleton metadata from the same version as [`Self::snapshot`].
     fn metadata(&self) -> Result<EngineMetadata, StoreError>;
     /// Return every header-node row, including disconnected rows.
     fn all_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError>;
@@ -59,6 +71,9 @@ pub trait StoreAuditRead {
         height: block::Height,
     ) -> Result<Option<block::Hash>, StoreError>;
     /// Visit append-only finality provenance in ascending epoch order.
+    ///
+    /// The visitor must see each record exactly once, oldest epoch first, with
+    /// no durable mutation between visits.
     fn visit_finality_history(
         &self,
         visitor: &mut dyn FnMut(FinalityRecord) -> Result<(), StoreError>,
@@ -125,7 +140,7 @@ pub enum RecoveryRepair {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryPlan {
     /// Snapshot that recovery observed before repair.
-    pub before: EngineSnapshot,
+    pub snapshot_before_repair: EngineSnapshot,
     /// Corrected metadata with counters advanced exactly once when required.
     pub metadata: EngineMetadata,
     /// Header nodes with reconstructed inherited eligibility caches.

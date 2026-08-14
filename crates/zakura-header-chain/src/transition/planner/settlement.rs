@@ -6,7 +6,6 @@ use super::{
     FinalityViolation, InvalidTransitionEvidence, PlannerCoherenceViolation, TransitionFailure,
 };
 use crate::graph::HeaderGraphView;
-use crate::retention::RetentionPlan;
 use crate::{
     AuxiliaryEffect, EngineMetadata, EngineMode, EngineSnapshot, FinalityEffect, FinalityRecord,
     FinalitySource, Frontier, HeaderChainEngine, HeaderWorkEffect, TransitionContext,
@@ -15,13 +14,14 @@ use crate::{
 
 use super::admission::HeaderInsertionRebase;
 use super::projected_state::{path, ProjectedTransitionState, SettledProjectedState};
+use super::retention::RetentionPlan;
 
 /// Inputs required to settle finality and retention after event evidence.
 pub(super) struct SettlementInputs<'engine, 'ctx> {
     pub(super) engine: &'engine HeaderChainEngine,
     pub(super) projected: ProjectedTransitionState<'engine>,
     pub(super) metadata: EngineMetadata,
-    pub(super) before: &'ctx EngineSnapshot,
+    pub(super) snapshot_before_commit: &'ctx EngineSnapshot,
     pub(super) event: &'ctx TransitionEvent,
     pub(super) header_rebase: HeaderInsertionRebase,
     pub(super) context: &'ctx TransitionContext<'ctx>,
@@ -60,7 +60,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         engine,
         mut projected,
         mut metadata,
-        before,
+        snapshot_before_commit,
         event,
         header_rebase,
         context,
@@ -72,7 +72,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     }
     projected.refresh_verified_after_operator_change()?;
 
-    let (mut header_best, _) = projected.graph().view_select_best_header_chain()?;
+    let (mut selected_tip, _) = projected.graph().view_select_best_header_chain()?;
     let full_state_finalized = match event {
         TransitionEvent::FullStateFinalized(event) => {
             Some((event.new_finalized, event.full_state_transition_id))
@@ -92,7 +92,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
 
     let mut finality = None;
     if let Some((new_finalized, evidence)) = full_state_finalized {
-        if new_finalized.height < before.frontiers.finalized.height {
+        if new_finalized.height < snapshot_before_commit.frontiers.finalized.height {
             return Err(InvalidTransitionEvidence::Finality(FinalityViolation::Retreated).into());
         }
         if !projected.verified().contains(&new_finalized) {
@@ -104,16 +104,16 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         finality = Some((new_finalized, FinalitySource::FullState { evidence }));
     } else if context.config.mode == EngineMode::HeadersOnly {
         let depth = context.config.limits.local_finality_depth.get();
-        if header_best
+        if selected_tip
             .height
             .0
             .saturating_sub(projected.graph().view_finalized_frontier().height.0)
             > depth
         {
-            let height = zakura_chain::block::Height(header_best.height.0 - depth);
+            let height = zakura_chain::block::Height(selected_tip.height.0 - depth);
             let new_finalized = projected
                 .graph()
-                .view_header_ancestor(header_best.hash, height)?
+                .view_header_ancestor(selected_tip.hash, height)?
                 .ok_or(TransitionFailure::InvalidEvidence(
                     InvalidTransitionEvidence::Planner(
                         PlannerCoherenceViolation::IncompleteSelectedAncestry,
@@ -121,17 +121,18 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                 ))?;
             finality = Some((
                 new_finalized,
-                FinalitySource::HeadersOnlyDepth {
-                    selected_tip: header_best,
-                },
+                FinalitySource::HeadersOnlyDepth { selected_tip },
             ));
         }
     }
 
     let mut effect = TransitionEffect::none();
-    if work_rebased || header_rebase == HeaderInsertionRebase::Rebased {
-        effect.header_work = Some(HeaderWorkEffect::Rebased);
-    }
+    debug_assert_ne!(
+        header_rebase,
+        HeaderInsertionRebase::AlreadyApplied,
+        "already-applied header work returns during replay binding before settlement"
+    );
+    effect.header_work = settlement_header_work_effect(work_rebased, header_rebase);
     if matches!(
         event,
         TransitionEvent::VerifiedChainChanged(ref event)
@@ -156,7 +157,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                 source,
                 epoch,
             });
-            header_best = projected.graph().view_select_best_header_chain()?.0;
+            selected_tip = projected.graph().view_select_best_header_chain()?.0;
             match source {
                 FinalitySource::HeadersOnlyDepth { .. } => {
                     effect.finality = Some(FinalityEffect::HeadersOnlyDepth);
@@ -182,7 +183,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         .full_state_authority
         .is_some_and(|authority| authority.authorizes_full_state(event));
     let retention = projected.enforce_retention(
-        header_best,
+        selected_tip,
         !authoritative_full_state_fork_set,
         context.retention_references.iter().copied(),
         context.config.limits,
@@ -191,9 +192,9 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         return Ok(FinalityRetentionOutcome::ResourceStalled);
     }
 
-    header_best = projected.graph().view_select_best_header_chain()?.0;
+    selected_tip = projected.graph().view_select_best_header_chain()?.0;
     let selected = if effect.is_checkpoint_finality()
-        && header_best == before.frontiers.header_best
+        && selected_tip == snapshot_before_commit.frontiers.header_best
         && finality_append.is_some_and(|record| {
             old_selected
                 .binary_search_by_key(&record.current.height, |frontier| frontier.height)
@@ -215,7 +216,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
             })?;
         Cow::Borrowed(&old_selected[index..])
     } else {
-        Cow::Owned(path(projected.graph(), header_best)?)
+        Cow::Owned(path(projected.graph(), selected_tip)?)
     };
 
     let projected = projected.finish_after_retention(engine)?;
@@ -235,5 +236,45 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
 pub(super) fn apply_migrated_pin_alarm(metadata: &mut EngineMetadata, pin: Option<Frontier>) {
     if let Some(pin) = pin {
         metadata.alarms.migrated_pin_refuted = Some(pin);
+    }
+}
+
+fn settlement_header_work_effect(
+    work_rebased: bool,
+    header_rebase: HeaderInsertionRebase,
+) -> Option<HeaderWorkEffect> {
+    (work_rebased || header_rebase == HeaderInsertionRebase::Rebased)
+        .then_some(HeaderWorkEffect::Rebased)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_work_effect_preserves_settlement_fallbacks() {
+        assert_eq!(
+            settlement_header_work_effect(false, HeaderInsertionRebase::Current),
+            None
+        );
+        assert_eq!(
+            settlement_header_work_effect(false, HeaderInsertionRebase::Rebased),
+            Some(HeaderWorkEffect::Rebased)
+        );
+        assert_eq!(
+            settlement_header_work_effect(false, HeaderInsertionRebase::AlreadyApplied),
+            None
+        );
+
+        for header_rebase in [
+            HeaderInsertionRebase::Current,
+            HeaderInsertionRebase::Rebased,
+            HeaderInsertionRebase::AlreadyApplied,
+        ] {
+            assert_eq!(
+                settlement_header_work_effect(true, header_rebase),
+                Some(HeaderWorkEffect::Rebased)
+            );
+        }
     }
 }

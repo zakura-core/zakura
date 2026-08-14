@@ -558,12 +558,7 @@ impl PursuitHarness {
                 .expect("at most 128 fuzz operations cannot exhaust header generations");
         }
         let retired = self.pending.apply_retirement(
-            &RetiredWork {
-                header_generation_changed: previous.header_generation
-                    != self.snapshot.header_generation,
-                verified_generation_changed: false,
-                owners: Vec::new(),
-            },
+            &RetiredWork::from_snapshots(&previous, &self.snapshot),
             &self.snapshot,
         );
         for owner in retired {
@@ -597,11 +592,7 @@ impl PursuitHarness {
         self.snapshot.header_best_score =
             ChainScore::new(SuffixWork::new(U256::from(marker)), replacement.hash);
         let retired = self.pending.apply_retirement(
-            &RetiredWork {
-                header_generation_changed: true,
-                verified_generation_changed: false,
-                owners: Vec::new(),
-            },
+            &RetiredWork::from_snapshots(&previous, &self.snapshot),
             &self.snapshot,
         );
         for owner in retired {

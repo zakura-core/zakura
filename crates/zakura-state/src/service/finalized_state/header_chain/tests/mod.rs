@@ -130,6 +130,7 @@ fn fixture() -> (EngineConfig, HeaderNode, EngineMetadata) {
         header_generation: HeaderGeneration::new(1),
         verified_generation: VerifiedGeneration::new(1),
         finality_epoch: FinalityEpoch::new(0),
+        headers_only_migration_epoch: None,
         frontiers: FrontierSet {
             finalized: frontier,
             header_best: frontier,

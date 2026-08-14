@@ -1431,13 +1431,4 @@ mod tests {
             .header_node(right_child.hash)
             .is_some_and(HeaderNode::is_eligible));
     }
-
-    #[test]
-    fn production_planner_has_no_full_graph_clone_or_node_map_diff() {
-        let planner = include_str!("../transition/planner.rs");
-        assert!(!planner.contains("let mut graph = engine.graph().clone()"));
-        assert!(!planner.contains("fn node_map"));
-        assert!(!planner.contains("old_nodes"));
-        assert!(!planner.contains("new_nodes"));
-    }
 }

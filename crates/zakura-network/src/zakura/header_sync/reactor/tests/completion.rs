@@ -854,7 +854,7 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
     let headers: Vec<_> = entries.iter().map(|entry| entry.header.clone()).collect();
     let batch = zakura_header_chain::prepare_headers(
         zakura_header_chain::HeaderBatchInput::new(&headers),
-        &lease,
+        lease.parent(),
         &rules,
         &zakura_header_chain::SystemClock,
     )

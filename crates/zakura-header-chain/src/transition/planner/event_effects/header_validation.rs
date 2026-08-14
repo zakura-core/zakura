@@ -1,6 +1,12 @@
-//! Shared retained-context and full-state header validation for event handlers.
+//! Shared retained-context and contextual header checks for event handlers.
 
-use super::super::{HeaderValidationCheck, InvalidTransitionEvidence, TransitionFailure};
+use chrono::{DateTime, Utc};
+use zakura_chain::{block, parameters::Network, work::difficulty::CompactDifficulty};
+
+use super::super::{
+    HeaderValidationCheck, HeaderValidationSource, HeaderViolation, InvalidTransitionEvidence,
+    TransitionFailure,
+};
 use crate::graph::HeaderGraphView;
 use crate::{
     EligibilityReason, Frontier, HeaderValidationFacts, HeaderValidationState, StoreError,
@@ -32,9 +38,9 @@ pub(in crate::transition::planner) fn retained_header_context<G: HeaderGraphView
     while context.len() < required {
         let Some(node) = graph.view_header_node(hash) else {
             let Some(facts) = facts else {
-                return Err(
-                    StoreError::Unavailable("retained predecessor context is incomplete").into(),
-                );
+                return Err(TransitionFailure::MissingDurableFacts(
+                    "retained predecessor context is incomplete",
+                ));
             };
             let authorized_lease = facts.validation_leases.iter().find_map(|lease| {
                 if !lease.is_coherent(
@@ -64,9 +70,9 @@ pub(in crate::transition::planner) fn retained_header_context<G: HeaderGraphView
                     .then_some((lease, overlap))
             });
             let Some((lease, overlap)) = authorized_lease else {
-                return Err(
-                    StoreError::Unavailable("durable predecessor context is incoherent").into(),
-                );
+                return Err(TransitionFailure::MissingDurableFacts(
+                    "durable predecessor context is incoherent",
+                ));
             };
             context.truncate(overlap);
             context.extend(
@@ -83,9 +89,9 @@ pub(in crate::transition::planner) fn retained_header_context<G: HeaderGraphView
                     }),
             );
             if context.len() != required {
-                return Err(
-                    StoreError::Unavailable("durable predecessor context is incomplete").into(),
-                );
+                return Err(TransitionFailure::MissingDurableFacts(
+                    "durable predecessor context is incomplete",
+                ));
             }
             return Ok(context
                 .into_iter()
@@ -105,6 +111,38 @@ pub(in crate::transition::planner) fn retained_header_context<G: HeaderGraphView
         .collect())
 }
 
+/// Apply branch-local difficulty and median-time rules for one parent-linked header.
+pub(in crate::transition::planner) fn check_contextual_difficulty_and_time(
+    header_time: DateTime<Utc>,
+    difficulty_threshold: CompactDifficulty,
+    parent_height: block::Height,
+    network: &Network,
+    predecessor_context: impl IntoIterator<Item = (CompactDifficulty, DateTime<Utc>)>,
+    source: HeaderValidationSource,
+) -> Result<(), TransitionFailure> {
+    let adjustment = crate::AdjustedDifficulty::new_from_header_time(
+        header_time,
+        parent_height,
+        network,
+        predecessor_context,
+    )
+    .map_err(|_| {
+        InvalidTransitionEvidence::Header(HeaderViolation::Validation {
+            source,
+            check: HeaderValidationCheck::IncompleteDifficultyContext,
+        })
+    })?;
+    crate::validate_contextual_difficulty_and_time(difficulty_threshold, adjustment).map_err(
+        |_| {
+            InvalidTransitionEvidence::Header(HeaderViolation::Validation {
+                source,
+                check: HeaderValidationCheck::ContextualValidation,
+            })
+        },
+    )?;
+    Ok(())
+}
+
 /// Validate a full-state header against observable and retained contextual rules.
 pub(super) fn validate_full_state_header<G: HeaderGraphView>(
     graph: &G,
@@ -117,7 +155,7 @@ pub(super) fn validate_full_state_header<G: HeaderGraphView>(
         InvalidTransitionEvidence::full_state_header(HeaderValidationCheck::PolicyIncoherent)
     })?;
     let headers = [header.header.clone()];
-    let prepared = crate::prepare_context_free_headers(
+    let prepared = crate::prepare_headers(
         crate::HeaderBatchInput::new(&headers),
         parent,
         &rules,
@@ -142,23 +180,14 @@ pub(super) fn validate_full_state_header<G: HeaderGraphView>(
         .into());
     }
     let contextual = retained_header_context(graph, parent, facts, context)?;
-    let adjustment = crate::AdjustedDifficulty::new_from_header_time(
+    check_contextual_difficulty_and_time(
         header.header.time,
+        header.header.difficulty_threshold,
         parent.height,
         &context.config.network,
         contextual,
-    )
-    .map_err(|_| {
-        InvalidTransitionEvidence::full_state_header(
-            HeaderValidationCheck::IncompleteDifficultyContext,
-        )
-    })?;
-    crate::validate_contextual_difficulty_and_time(header.header.difficulty_threshold, adjustment)
-        .map_err(|_| {
-            InvalidTransitionEvidence::full_state_header(
-                HeaderValidationCheck::ContextualValidation,
-            )
-        })?;
+        HeaderValidationSource::FullState,
+    )?;
     Ok(prepared.block_work)
 }
 

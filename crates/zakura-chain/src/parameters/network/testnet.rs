@@ -852,7 +852,12 @@ impl ParametersBuilder {
 
     /// Converts the builder to a [`Parameters`] struct
     fn finish(self) -> Parameters {
-        let max_block_time_start_height = self.max_block_time_start_height.unwrap_or(Height(2));
+        // The builder defaults to public Testnet consensus parameters, so an unset
+        // activation height must inherit the public Testnet soft-fork height. Regtest
+        // and other networks that want Height(2) must set it explicitly.
+        let max_block_time_start_height = self
+            .max_block_time_start_height
+            .unwrap_or(TESTNET_MAX_TIME_START_HEIGHT);
         let Self {
             network_name,
             network_magic,
@@ -919,13 +924,9 @@ impl ParametersBuilder {
 
     /// Returns true if these [`Parameters`] should be compatible with the default Testnet parameters.
     pub fn is_compatible_with_default_parameters(&self) -> bool {
-        let max_block_time_start_height = self.max_block_time_start_height.unwrap_or_else(|| {
-            if self == &Self::default() {
-                TESTNET_MAX_TIME_START_HEIGHT
-            } else {
-                Height(2)
-            }
-        });
+        let max_block_time_start_height = self
+            .max_block_time_start_height
+            .unwrap_or(TESTNET_MAX_TIME_START_HEIGHT);
         let Self {
             network_name: _,
             network_magic,
@@ -1073,9 +1074,10 @@ impl Parameters {
             .with_lockbox_disbursements(lockbox_disbursements.unwrap_or_default())
             .with_checkpoints(checkpoints.unwrap_or_default())?;
 
-        if let Some(height) = max_block_time_start_height {
-            parameters = parameters.with_max_block_time_start_height(height);
-        }
+        // Regtest's local default is Height(2), matching zcashd-style private chains.
+        // Do not inherit the public Testnet soft-fork height from ParametersBuilder::finish().
+        parameters = parameters
+            .with_max_block_time_start_height(max_block_time_start_height.unwrap_or(Height(2)));
 
         if Some(true) == extend_funding_stream_addresses_as_required {
             parameters = parameters.extend_funding_streams();

@@ -387,7 +387,7 @@ impl Fixture {
             HeaderRules::for_validation_lease(&lease).expect("the custom network waives PoW");
         let batch = zakura_header_chain::prepare_headers(
             HeaderBatchInput::new(&headers),
-            &lease,
+            lease.parent(),
             &rules,
             &SystemClock,
         )
@@ -473,7 +473,7 @@ impl Fixture {
             HeaderRules::for_validation_lease(&lease).expect("the custom network waives PoW");
         let batch = zakura_header_chain::prepare_headers(
             HeaderBatchInput::new(std::slice::from_ref(&target.header)),
-            &lease,
+            lease.parent(),
             &rules,
             &SystemClock,
         )

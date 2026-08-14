@@ -5,17 +5,17 @@ use crate::graph::HeaderGraphView;
 use crate::BodyValidationState;
 
 use super::super::projected_state::ProjectedTransitionState;
-use super::ApplyEventContext;
+use super::EventProjectionContext;
 
 /// Payload mismatches are informational and must not mutate the header DAG.
-pub(super) fn apply_payload_mismatch(
+pub(super) fn admit_payload_mismatch(
     _event: &crate::BodyPayloadMismatch,
 ) -> Result<(), TransitionFailure> {
     Ok(())
 }
 
 /// Record a transient body-unavailable episode without regressing verified bodies.
-pub(super) fn apply_transient(
+pub(super) fn project_transient_body_failure(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::TransientBodyFailure,
 ) -> Result<(), TransitionFailure> {
@@ -44,10 +44,10 @@ pub(super) fn apply_transient(
 }
 
 /// Expand the selected persistent body's supplier set for an already-due probe.
-pub(super) fn apply_supplier_discovery(
+pub(super) fn project_body_supplier_discovery(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::BodySupplierDiscovered,
-    event_context: &ApplyEventContext<'_>,
+    event_context: &EventProjectionContext<'_>,
 ) -> Result<(), TransitionFailure> {
     let context = event_context.transition;
     let old = match projected

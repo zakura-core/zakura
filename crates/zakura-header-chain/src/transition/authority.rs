@@ -22,6 +22,20 @@ impl Clock for SystemClock {
 }
 
 /// State-writer capability that authenticates staged full-state transition IDs.
+///
+/// # Authority matrix by [`crate::EventAdmission`]
+///
+/// | [`crate::EventAdmission`] | Required capability | Failure |
+/// | --- | --- | --- |
+/// | `AnyMode` | none (mode-independent) | — |
+/// | `IntegratedFullState` | integrated mode **and** [`Self::authorizes_full_state`] | [`crate::TransitionFailure::Mode`] / [`crate::TransitionFailure::Authority`] |
+/// | `RegisteredScheduler` | [`Self::authorizes_scheduler_retry`] for the exact retry | [`crate::TransitionFailure::Authority`] |
+/// | `RegisteredHeaderCompletion` | [`Self::authorizes_header_completion`] for the exact insert | [`crate::TransitionFailure::Authority`] |
+///
+/// Validation leases used while reconstructing predecessor context additionally
+/// require [`Self::authorizes_validation_lease`]. Absent
+/// [`TransitionContext::full_state_authority`] fails every gate that needs a
+/// capability check.
 pub trait FullStateEvidenceAuthority: Send + Sync {
     /// Return true only when the complete event is the writer's staged mutation.
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool;
@@ -43,6 +57,11 @@ pub trait FullStateEvidenceAuthority: Send + Sync {
 }
 
 /// Trusted dependencies used while deriving a transition plan.
+///
+/// Carries the config, clock, and optional [`FullStateEvidenceAuthority`] that
+/// the planner consults for the [`crate::EventAdmission`] matrix documented on
+/// that trait. The planner never loads durable rows itself; adapters must supply
+/// event-specific facts on [`crate::TransitionInput`].
 pub struct TransitionContext<'a> {
     /// Immutable mode, anchors, and resource limits.
     pub config: &'a EngineConfig,

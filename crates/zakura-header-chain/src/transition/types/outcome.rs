@@ -130,6 +130,28 @@ pub struct RetiredWork {
     pub owners: Vec<HeaderSyncWorkOwner>,
 }
 
+impl RetiredWork {
+    /// Derive generation-retirement signals from the published snapshot pair.
+    ///
+    /// This is the authoritative mapping from commit frontiers to ownership
+    /// retirement. Call sites that only need generation deltas should use this
+    /// instead of hand-comparing fields. Exact owner lists are still filled by
+    /// the coordinator when narrower causes apply.
+    pub fn from_snapshots(before: &crate::EngineSnapshot, after: &crate::EngineSnapshot) -> Self {
+        Self {
+            header_generation_changed: before.header_generation != after.header_generation,
+            verified_generation_changed: before.verified_generation != after.verified_generation,
+            owners: Vec::new(),
+        }
+    }
+
+    /// Attach exact owners retired for narrower causes than generation change.
+    pub fn with_owners(mut self, owners: Vec<HeaderSyncWorkOwner>) -> Self {
+        self.owners = owners;
+        self
+    }
+}
+
 /// Successful admission that produced no durable effects.
 ///
 /// This covers exact adjacent replay of the most recent state-changing
@@ -164,7 +186,31 @@ pub struct CommittedStallReceipt {
     pub attempted_branch: Option<BranchId>,
 }
 
-/// Serialized transition outcome.
+/// Serialized transition outcome returned by the state adapter after planning.
+///
+/// # Mapping from planner results
+///
+/// | Planner result | Adapter outcome |
+/// | --- | --- |
+/// | verified plan with durable mutation | [`Self::Committed`] |
+/// | verified no-change plan (`is_no_change`) | [`Self::NoChange`] |
+/// | verified plan with `effect.resource_stalled` | [`Self::ResourceStalled`] (alarm may commit) |
+/// | [`crate::TransitionFailure::Stale`] | [`Self::Stale`] (zero durable effects) |
+/// | any other [`crate::TransitionFailure`] | adapter error / refuse; zero durable effects |
+///
+/// # Stall / limit three-way distinction
+///
+/// These must not be collapsed:
+///
+/// 1. **[`crate::TransitionFailure::AuxiliaryLimitExceeded`]** — planner refuses
+///    before any durable mutation; no resource-stall alarm.
+/// 2. **Verified `resource_stalled` → [`Self::ResourceStalled`]** — retention could
+///    not enforce limits without breaking protected paths; the durable
+///    resource-stall alarm may be recorded or retained.
+/// 3. **[`crate::InvariantViolation::Limits`]** (via
+///    [`crate::TransitionFailure::Invariant`]) — commit-time verification found a
+///    projected graph above frozen limits; planning fails closed with zero
+///    effects (not a stall receipt).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplyResult {
     /// State adapter durably committed.

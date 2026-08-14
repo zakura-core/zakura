@@ -72,6 +72,7 @@ fn engine_fixture() -> (HeaderChainEngine, EngineConfig, ValidationLease) {
         header_generation: HeaderGeneration::new(0),
         verified_generation: VerifiedGeneration::new(0),
         finality_epoch: FinalityEpoch::new(0),
+        headers_only_migration_epoch: None,
         frontiers: FrontierSet {
             finalized: anchor,
             header_best: anchor,
@@ -125,8 +126,13 @@ fn production_incremental_verifier_accepts_exact_auxiliary_evidence() {
         headers.push(header);
     }
     let rules = HeaderRules::for_validation_lease(&lease).expect("the fixture rules are valid");
-    let batch = prepare_headers(HeaderBatchInput::new(&headers), &lease, &rules, &clock)
-        .expect("the fixture headers prepare");
+    let batch = prepare_headers(
+        HeaderBatchInput::new(&headers),
+        lease.parent(),
+        &rules,
+        &clock,
+    )
+    .expect("the fixture headers prepare");
     let header_hash = batch.headers()[0].hash;
     let boundary_hash = batch.headers()[1].hash;
     let target_tip_hash = boundary_hash;

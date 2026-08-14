@@ -262,7 +262,7 @@ pub(super) fn crash_fixture_requester_insertion_reopens_complete_before_or_after
         let headers = [child_header.clone()];
         let batch = zakura_header_chain::prepare_headers(
             HeaderBatchInput::new(&headers),
-            &lease,
+            lease.parent(),
             &rules,
             &SystemClock,
         )

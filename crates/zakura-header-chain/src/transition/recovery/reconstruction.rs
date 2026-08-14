@@ -11,14 +11,14 @@ use crate::{
 };
 
 use super::contracts::{source_failure, AuditViolation, RecoveryFailure};
-use super::model::{AuditedSource, DerivedState};
+use super::phases::{AuditedSource, ReconstructedDerivedViews};
 
 /// Promote elapsed deferrals and reconstruct every derived view.
-pub(super) fn derive_state(
+pub(super) fn reconstruct_derived_views(
     audited: &AuditedSource,
     config: &EngineConfig,
     now: DateTime<Utc>,
-) -> Result<DerivedState, RecoveryFailure> {
+) -> Result<ReconstructedDerivedViews, RecoveryFailure> {
     let mut promoted_source_nodes = audited.source_nodes.clone();
     let mut elapsed_deferrals = false;
     for node in &mut promoted_source_nodes {
@@ -85,7 +85,7 @@ pub(super) fn derive_state(
         crate::BodyValidationState::Unavailable(summary) if summary.alarmed => Some(*summary),
         _ => None,
     };
-    Ok(DerivedState {
+    Ok(ReconstructedDerivedViews {
         promoted_source_nodes,
         header_nodes,
         header_child_edges,

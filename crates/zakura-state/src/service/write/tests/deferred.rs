@@ -125,7 +125,7 @@ fn idle_writer_promotes_a_due_persisted_deferred_header() {
     let future_header = Arc::new(future_header);
     let batch = zakura_header_chain::prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&future_header)),
-        &lease,
+        lease.parent(),
         &rules,
         &preparation_clock,
     )

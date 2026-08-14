@@ -1,10 +1,10 @@
 //! Exhaustive startup audit and deterministic reconstruction planning.
 
+mod audit;
 mod contracts;
-mod model;
+mod phases;
 mod reconstruction;
 mod repair;
-mod source_audit;
 
 #[cfg(test)]
 mod tests;
@@ -18,10 +18,10 @@ pub use contracts::{
     ValidationContextRecord,
 };
 
-use model::load_store_image;
-use reconstruction::derive_state;
+use audit::audit_authoritative;
+use phases::load_pre_audit_store_rows;
+use reconstruction::reconstruct_derived_views;
 use repair::classify_and_plan;
-use source_audit::audit_authoritative;
 
 /// Audit authoritative rows and derive only reconstructible repairs.
 pub fn audit_store<S: StoreAuditRead>(
@@ -60,11 +60,11 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
     allow_trust_anchor_update: bool,
 ) -> Result<RecoveryPlan, RecoveryFailure> {
     // Phase 1: load exhaustive durable rows
-    let image = load_store_image(store, config, allow_trust_anchor_update)?;
+    let rows = load_pre_audit_store_rows(store, config, allow_trust_anchor_update)?;
     // Phase 2: fail closed on authoritative contradictions
-    let audited = audit_authoritative(store, image, config, now)?;
+    let audited = audit_authoritative(store, rows, config, now)?;
     // Phase 3: reconstruct derived views from audited source
-    let derived = derive_state(&audited, config, now)?;
+    let derived = reconstruct_derived_views(&audited, config, now)?;
     // Phase 4: classify reconstructible repairs and assemble the plan
     classify_and_plan(store, audited, derived, config)
 }

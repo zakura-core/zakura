@@ -5,13 +5,13 @@ use crate::graph::HeaderGraphView;
 use crate::Frontier;
 
 use super::super::projected_state::ProjectedTransitionState;
-use super::ApplyEventContext;
+use super::EventProjectionContext;
 
 /// Authenticate or reject previously admitted auxiliary deliveries.
-pub(super) fn apply(
+pub(super) fn authenticate_auxiliary_deliveries(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::AuxEvidence,
-    event_context: &ApplyEventContext<'_>,
+    event_context: &EventProjectionContext<'_>,
 ) -> Result<(), TransitionFailure> {
     let engine = event_context.engine;
     if event.deliveries.is_empty() || event.deliveries.len() > 2 {

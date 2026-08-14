@@ -1,6 +1,6 @@
 //! Authenticated transition events and version-qualified requests.
 
-mod aux;
+mod auxiliary_evidence;
 mod body;
 mod finality;
 mod header;
@@ -8,7 +8,7 @@ mod operator;
 mod replay;
 mod verified;
 
-pub use aux::AuxEvidence;
+pub use auxiliary_evidence::AuxEvidence;
 pub use body::{
     BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch, BodySupplierDiscovered,
     BodyVerificationClass, BodyVerificationOutcome, ConsensusBodyInvalid, OperatorBodyRetry,

@@ -1,6 +1,6 @@
 use std::{
     cell::Cell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     num::NonZeroU64,
     panic::AssertUnwindSafe,
@@ -154,6 +154,7 @@ fn build_header_sync_reactor(
         lifecycle: lifecycle_rx,
         actions: actions_tx,
         pending_port_operations: FuturesUnordered::new(),
+        pending_locator_queries: HashSet::new(),
         retained_paths: HashMap::new(),
         tip: tip_tx,
         peers: peers_tx,
@@ -242,6 +243,8 @@ struct HeaderSyncReactor {
     #[cfg_attr(not(any(test, feature = "zakura-testkit")), allow(dead_code))]
     actions: mpsc::Sender<HeaderPortOperation>,
     pending_port_operations: FuturesUnordered<PendingPortOperation>,
+    /// Peers with one direct continuation-locator read currently in flight.
+    pending_locator_queries: HashSet<ZakuraPeerId>,
     #[cfg_attr(any(test, feature = "zakura-testkit"), allow(dead_code))]
     retained_paths: HashMap<u64, zakura_node_services::header_chain::RetainedHeaderPath>,
     tip: watch::Sender<(block::Height, block::Hash)>,
@@ -2053,6 +2056,47 @@ impl HeaderSyncReactor {
         }
     }
 
+    fn finish_header_locator_query(
+        &mut self,
+        peer: ZakuraPeerId,
+        query_scope: zakura_header_chain::HeaderWorkAuthority,
+        locator: Option<zakura_header_chain::HeaderLocator>,
+    ) {
+        self.pending_locator_queries.remove(&peer);
+        let Some(target) = self.peer_work_queue.awaiting_target(&peer).cloned() else {
+            metrics::counter!("sync.header.target.stale_locator").increment(1);
+            return;
+        };
+        // Locators are derived from the local selected path, so tip churn under the same
+        // generation and finality anchor can reuse one in-flight read. A generation or
+        // reanchor change must not consume a locator fetched under the prior authority.
+        let same_selected_path_authority = target.scope.header_generation
+            == query_scope.header_generation
+            && target.scope.branch.anchor_hash == query_scope.branch.anchor_hash;
+        let superseded_tip = target.status.selected_tip_hash != query_scope.branch.target_tip_hash;
+        if !same_selected_path_authority || (locator.is_none() && superseded_tip) {
+            // Authority moved, or a timed-out/failed read belonged to a replaced tip.
+            // Keep the current staged target and fetch a fresh locator for it.
+            metrics::counter!("sync.header.target.stale_locator").increment(1);
+            if !self.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
+                peer: peer.clone(),
+                session_id: target.session_id,
+                target_tip_hash: target.status.selected_tip_hash,
+                scope: target.scope,
+            }) {
+                self.peer_work_queue.remove_unstarted(&peer);
+            }
+            return;
+        }
+        self.handle_header_locator_ready(
+            peer,
+            target.session_id,
+            target.status.selected_tip_hash,
+            target.scope,
+            locator,
+        );
+    }
+
     fn handle_header_locator_ready(
         &mut self,
         peer: ZakuraPeerId,
@@ -2496,6 +2540,14 @@ impl HeaderSyncReactor {
         let RepairPolicyState::Ready { context } = &task.state else {
             return;
         };
+        if task.supplier_cycle_exhausted() {
+            let _ = self
+                .vct_repair
+                .get_mut(task.owner)
+                .expect("the ready repair was cloned above")
+                .defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
+            return;
+        }
         let Some(predecessor) = context.locator.entries().first().copied() else {
             return;
         };
@@ -2559,6 +2611,10 @@ impl HeaderSyncReactor {
                     self.emit_queue_send_failed(&peer, &session, "GetHeaders", &error, None);
                     if let Some(current) = self.vct_repair.get_mut(task.owner) {
                         let _ = current.record_failed_source(source);
+                        if current.supplier_cycle_exhausted() {
+                            let _ = current.defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
+                            return;
+                        }
                     }
                     continue;
                 }
@@ -3271,6 +3327,11 @@ impl HeaderSyncReactor {
     fn dispatch_direct_port_operation(&mut self, action: HeaderPortOperation) -> bool {
         use zakura_node_services::header_chain as port;
 
+        if let HeaderPortOperation::QueryHeaderLocator { peer, .. } = &action {
+            if !self.pending_locator_queries.insert(peer.clone()) {
+                return true;
+            }
+        }
         let panic_context = self.port_panic_context(&action);
         let header_chain = self.startup.header_chain_port.clone();
         let request_timeout = self.startup.request_timeout;
@@ -3295,26 +3356,28 @@ impl HeaderSyncReactor {
                 }
                 HeaderPortOperation::QueryHeaderLocator {
                     peer,
-                    session_id,
-                    target_tip_hash,
+                    session_id: _,
+                    target_tip_hash: _,
                     scope,
                 } => Box::pin(async move {
-                    let locator =
-                        header_chain
-                            .continuation_locator()
-                            .await
-                            .unwrap_or_else(|error| {
-                                tracing::debug!(?peer, ?error, "header locator unavailable");
-                                None
-                            });
+                    let locator = match tokio::time::timeout(
+                        request_timeout,
+                        header_chain.continuation_locator(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(locator)) => locator,
+                        Ok(Err(error)) => {
+                            tracing::debug!(?peer, ?error, "header locator unavailable");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::debug!(?peer, "header locator query timed out");
+                            None
+                        }
+                    };
                     Box::new(move |reactor: &mut HeaderSyncReactor| {
-                        reactor.handle_header_locator_ready(
-                            peer,
-                            session_id,
-                            target_tip_hash,
-                            scope,
-                            locator,
-                        );
+                        reactor.finish_header_locator_query(peer, scope, locator);
                     }) as HeaderSyncPortCompletion
                 }),
                 HeaderPortOperation::QueryVctRepairContext { owner, height } => {
@@ -3783,6 +3846,12 @@ impl HeaderSyncReactor {
             row.insert(hs_trace::OPERATION.into(), context.operation.into());
         });
 
+        if context.operation == "query_header_locator" {
+            if let Some(peer) = context.peer.as_ref() {
+                self.pending_locator_queries.remove(peer);
+            }
+        }
+
         if let Some(session) = context.session.as_ref() {
             session.disconnect_for_port_panic();
         }
@@ -3820,12 +3889,7 @@ impl HeaderSyncReactor {
         self.handle_typed_failure(peer.clone(), source, &failure);
 
         if context.operation == "query_header_locator" {
-            if let (Some(session_id), Some(target_tip_hash), Some(scope)) =
-                (context.session_id, context.target_tip_hash, context.scope)
-            {
-                self.peer_work_queue
-                    .remove_awaiting(peer, session_id, target_tip_hash, scope);
-            }
+            self.peer_work_queue.remove_unstarted(peer);
         }
 
         if let Some(owner) = context.owner {

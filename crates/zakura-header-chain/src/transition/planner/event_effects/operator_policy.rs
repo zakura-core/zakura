@@ -9,7 +9,7 @@ use crate::{BodyValidationState, EligibilityReason};
 use super::super::projected_state::ProjectedTransitionState;
 
 /// Restart the selected persistent body alarm with a fresh episode.
-pub(super) fn apply_body_retry(
+pub(super) fn project_operator_body_retry(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::OperatorBodyRetry,
 ) -> Result<(), TransitionFailure> {
@@ -40,7 +40,7 @@ pub(super) fn apply_body_retry(
 }
 
 /// Add one reversible operator invalidation reason and dirty verified selection.
-pub(super) fn apply_invalidate(
+pub(super) fn project_operator_invalidation(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::OperatorInvalidate,
 ) -> Result<(), TransitionFailure> {
@@ -66,7 +66,7 @@ pub(super) fn apply_invalidate(
 }
 
 /// Remove one reversible operator invalidation and dirty verified selection when needed.
-pub(super) fn apply_reconsider(
+pub(super) fn project_operator_reconsideration(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::OperatorReconsider,
 ) -> Result<(), TransitionFailure> {

@@ -116,6 +116,70 @@ fn body_unavailability_alarm_is_reconstructed_from_the_selected_node() {
 }
 
 #[test]
+fn repairs_retention_metadata_without_advancing_projection_generations() {
+    let (mut store, config) = fixture();
+    let retained_height = store.metadata.frontiers.finalized.height;
+    store.metadata.oldest_retained_height = store.metadata.frontiers.header_best.height;
+    store.snapshot = store.metadata.snapshot();
+
+    let plan = audit_store(&store, &config).expect("retention metadata is reconstructible");
+
+    assert_eq!(
+        plan.repairs,
+        BTreeSet::from([RecoveryRepair::RetentionMetadata])
+    );
+    assert_eq!(plan.metadata.oldest_retained_height, retained_height);
+    assert_eq!(plan.metadata.state_version, StateVersion::new(2));
+    assert_eq!(plan.metadata.header_generation, HeaderGeneration::new(1));
+    assert_eq!(
+        plan.metadata.verified_generation,
+        VerifiedGeneration::new(1)
+    );
+}
+
+#[test]
+fn fails_closed_when_each_repair_counter_is_exhausted() {
+    enum Counter {
+        State,
+        Header,
+        Verified,
+    }
+
+    let cases = [
+        (Counter::State, "state version"),
+        (Counter::Header, "header generation"),
+        (Counter::Verified, "verified generation"),
+    ];
+    for (counter, label) in cases {
+        let (mut store, config) = fixture();
+        match counter {
+            Counter::State => {
+                store.metadata.state_version = StateVersion::new(u64::MAX);
+                store.metadata.oldest_retained_height = store.metadata.frontiers.header_best.height;
+            }
+            Counter::Header => {
+                store.metadata.header_generation = HeaderGeneration::new(u64::MAX);
+                store.selected.clear();
+            }
+            Counter::Verified => {
+                store.metadata.verified_generation = VerifiedGeneration::new(u64::MAX);
+                store.verified.clear();
+            }
+        }
+        store.snapshot = store.metadata.snapshot();
+
+        let error = match audit_store(&store, &config) {
+            Err(RecoveryFailure::Counter(error)) => error,
+            other => panic!("expected {label} exhaustion, got {other:?}"),
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("header-chain {label} counter is exhausted at u64::MAX")
+        );
+    }
+}
+
+#[test]
 fn recompute_not_cached_projection() {
     let (mut store, config) = fixture();
     let anchor = store.metadata.frontiers.finalized;

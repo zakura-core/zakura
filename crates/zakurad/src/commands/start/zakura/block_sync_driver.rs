@@ -13,7 +13,7 @@ use futures::{
 use sha2::{Digest, Sha256};
 use tokio::{pin, select, sync::mpsc};
 use tower::{util::BoxCloneService, Service, ServiceExt};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use zakura_chain::{block, chain_tip::ChainTip};
 use zakura_network::zakura::{
@@ -328,26 +328,35 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     );
                     continue;
                 };
-                match tokio::time::timeout(
-                    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-                    writer
-                        .clone()
-                        .oneshot(zakura_state::Request::RecordHeaderChainBodyInvalid {
-                            prepared: authority.from_full_verifier(expected_version, invalid),
-                        }),
+                match persist_consensus_body_invalid(
+                    writer.clone(),
+                    authority,
+                    expected_version,
+                    invalid,
                 )
                 .await
                 {
-                    Ok(Ok(zakura_state::Response::HeaderChainBodyInvalidRecorded(_))) => {}
-                    Ok(Ok(response)) => warn!(
-                        ?response,
-                        "unexpected header-chain invalid-body persistence response"
-                    ),
-                    Ok(Err(error)) => debug!(
-                        ?error,
-                        "header-chain invalid-body persistence was stale or unavailable"
-                    ),
-                    Err(_) => warn!("timed out persisting header-chain invalid-body evidence"),
+                    BodyInvalidPersistOutcome::Recorded => {}
+                    BodyInvalidPersistOutcome::FailedClosed { reason, invalid } => {
+                        error!(
+                            ?invalid,
+                            reason, "failing closed after losing consensus-invalid body evidence"
+                        );
+                        metrics::counter!(
+                            "sync.block.body_invalid.persist.fail_closed",
+                            "reason" => reason
+                        )
+                        .increment(1);
+                        shutting_down = true;
+                        block_sync_handoff.request_apply_shutdown();
+                        release_pending_applies(&block_sync, &mut pending_applies, &trace);
+                        release_pending_probe_applies(
+                            &block_sync,
+                            &mut pending_probe_applies,
+                            &trace,
+                        );
+                        deferred_actions.clear();
+                    }
                 }
             }
             BlockSyncAction::RestartBodyAvailability {
@@ -722,6 +731,117 @@ fn abandoned_pending_apply_finished_events(
         }
     }
     events
+}
+
+/// Bound on refreshing a stale expected version while persisting consensus-invalid body evidence.
+const BODY_INVALID_STALE_REFRESH_LIMIT: u8 = 3;
+
+#[derive(Debug)]
+enum BodyInvalidPersistOutcome {
+    Recorded,
+    FailedClosed {
+        reason: &'static str,
+        invalid: zakura_header_chain::ConsensusBodyInvalid,
+    },
+}
+
+/// Persist deterministic body invalidity, refreshing a stale version a bounded number of times.
+///
+/// Any non-durable outcome fails closed: silent discard would leave a body-invalid branch selected.
+async fn persist_consensus_body_invalid(
+    writer: BoxCloneService<zakura_state::Request, zakura_state::Response, zakura_state::BoxError>,
+    authority: &zakura_state::HeaderChainBodyEvidenceAuthority,
+    mut expected_version: zakura_header_chain::StateVersion,
+    invalid: zakura_header_chain::ConsensusBodyInvalid,
+) -> BodyInvalidPersistOutcome {
+    let mut stale_refreshes = 0u8;
+    loop {
+        match tokio::time::timeout(
+            ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+            writer
+                .clone()
+                .oneshot(zakura_state::Request::RecordHeaderChainBodyInvalid {
+                    prepared: authority.from_full_verifier(expected_version, invalid.clone()),
+                }),
+        )
+        .await
+        {
+            Ok(Ok(zakura_state::Response::HeaderChainBodyInvalidRecorded(
+                zakura_header_chain::ApplyResult::Committed
+                | zakura_header_chain::ApplyResult::NoChange(_),
+            ))) => return BodyInvalidPersistOutcome::Recorded,
+            Ok(Ok(zakura_state::Response::HeaderChainBodyInvalidRecorded(
+                zakura_header_chain::ApplyResult::Stale(receipt),
+            ))) => {
+                if stale_refreshes >= BODY_INVALID_STALE_REFRESH_LIMIT {
+                    error!(
+                        ?invalid,
+                        ?receipt,
+                        refreshes = stale_refreshes,
+                        "exhausted stale refreshes while persisting consensus-invalid body evidence"
+                    );
+                    return BodyInvalidPersistOutcome::FailedClosed {
+                        reason: "stale_refresh_exhausted",
+                        invalid,
+                    };
+                }
+                stale_refreshes = stale_refreshes.saturating_add(1);
+                warn!(
+                    ?invalid,
+                    previous_version = ?expected_version,
+                    current_version = ?receipt.current_version,
+                    refreshes = stale_refreshes,
+                    "refreshing expected version for consensus-invalid body evidence"
+                );
+                expected_version = receipt.current_version;
+            }
+            Ok(Ok(zakura_state::Response::HeaderChainBodyInvalidRecorded(
+                zakura_header_chain::ApplyResult::ResourceStalled(receipt),
+            ))) => {
+                error!(
+                    ?invalid,
+                    ?receipt,
+                    "resource-stalled while persisting consensus-invalid body evidence"
+                );
+                return BodyInvalidPersistOutcome::FailedClosed {
+                    reason: "resource_stalled",
+                    invalid,
+                };
+            }
+            Ok(Ok(response)) => {
+                error!(
+                    ?invalid,
+                    ?response,
+                    "unexpected response while persisting consensus-invalid body evidence"
+                );
+                return BodyInvalidPersistOutcome::FailedClosed {
+                    reason: "unexpected_response",
+                    invalid,
+                };
+            }
+            Ok(Err(error)) => {
+                error!(
+                    ?invalid,
+                    ?error,
+                    "state error while persisting consensus-invalid body evidence"
+                );
+                return BodyInvalidPersistOutcome::FailedClosed {
+                    reason: "state_error",
+                    invalid,
+                };
+            }
+            Err(_) => {
+                error!(
+                    ?invalid,
+                    "timed out persisting consensus-invalid body evidence"
+                );
+                return BodyInvalidPersistOutcome::FailedClosed {
+                    reason: "timeout",
+                    invalid,
+                };
+            }
+        }
+    }
 }
 
 pub(crate) fn coalesce_ready_needed_block_queries(

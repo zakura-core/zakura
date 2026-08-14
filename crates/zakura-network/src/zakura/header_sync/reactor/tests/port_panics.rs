@@ -361,3 +361,377 @@ async fn port_panic_trace_is_bounded_and_request_scope_serializes_null_generatio
     assert!(!encoded.contains("\"locator_hashes\""));
     let _ = capture.finish().await.expect("trace capture finishes");
 }
+
+#[derive(Debug, Default)]
+struct LocatorCounters {
+    started: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Debug)]
+struct StalledLocatorPort {
+    counters: Arc<LocatorCounters>,
+    release: Arc<Notify>,
+    locator: zakura_header_chain::HeaderLocator,
+}
+
+impl port::Port for StalledLocatorPort {
+    fn continuation_locator(
+        &self,
+    ) -> port::HeaderChainFuture<
+        '_,
+        Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,
+    > {
+        let counters = self.counters.clone();
+        let release = self.release.clone();
+        let locator = self.locator.clone();
+        Box::pin(async move {
+            counters
+                .started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            release.notified().await;
+            Ok(Some(locator))
+        })
+    }
+
+    fn vct_repair_context(
+        &self,
+        _owner: zakura_header_chain::BodyWorkOwner,
+        _height: block::Height,
+    ) -> port::HeaderChainFuture<'_, Result<port::VctRepairContextReply, port::PortError>> {
+        Box::pin(async { Err(port::PortError::Unavailable { source: None }) })
+    }
+
+    fn acquire_header_path(
+        &self,
+        _request: port::AcquirePath,
+    ) -> port::HeaderChainFuture<'_, Result<port::AcquirePathReply, port::PortError>> {
+        Box::pin(async { Ok(port::AcquirePathReply::TargetNotRetained) })
+    }
+
+    fn read_header_path(
+        &self,
+        _path: port::RetainedHeaderPath,
+        _request: port::ReadPath,
+    ) -> port::HeaderChainFuture<'_, Result<port::ReadPathReply, port::PortError>> {
+        Box::pin(async { Ok(port::ReadPathReply::Unavailable) })
+    }
+
+    fn release_header_path(
+        &self,
+        _path: port::RetainedHeaderPath,
+    ) -> port::HeaderChainFuture<'_, Result<(), port::PortError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn prepare_header_target(
+        &self,
+        _request: port::PrepareHeaderTarget,
+    ) -> port::HeaderChainFuture<'_, port::PrepareHeaderTargetReply> {
+        Box::pin(async { panic!("the stalled-locator fixture never reaches target preparation") })
+    }
+
+    fn apply_header_target(
+        &self,
+        _target: port::PreparedHeaderTarget,
+    ) -> port::HeaderChainFuture<'_, port::ApplyHeaderTargetReply> {
+        Box::pin(async { panic!("the stalled-locator fixture never reaches target application") })
+    }
+}
+
+fn churn_status(anchor: zakura_header_chain::Frontier, marker: u8) -> Status {
+    let mut target_hash = [0u8; 32];
+    target_hash[0] = 0xA5;
+    target_hash[1] = marker;
+    Status {
+        work_anchor_height: anchor.height,
+        work_anchor_hash: anchor.hash,
+        selected_tip_height: block::Height(u32::from(marker) + 1),
+        selected_tip_hash: block::Hash(target_hash),
+        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(1_u8),
+        oldest_retained_height: anchor.height,
+        max_headers_per_response: 16,
+        max_inflight_requests: 1,
+        max_message_bytes: 1_000_000,
+        tree_aux_schema_mask: 0,
+    }
+}
+
+#[tokio::test]
+async fn status_tip_churn_coalesces_to_one_in_flight_locator_query() {
+    let counters = Arc::new(LocatorCounters::default());
+    let release = Arc::new(Notify::new());
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.header_chain_port = Arc::new(StalledLocatorPort {
+        counters: counters.clone(),
+        release: release.clone(),
+        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
+    });
+    startup.use_direct_port();
+    let (_, _, mut reactor) =
+        build_header_sync_reactor(startup).expect("the direct-port fixture builds");
+
+    let peer = peer();
+    let session_id = 7;
+    let (send, mut outbound) = crate::zakura::framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_connection(
+        peer.clone(),
+        session_id,
+        send,
+        CancellationToken::new(),
+        CancellationToken::new(),
+        crate::zakura::CloseCause::new(),
+    ));
+    let _ = outbound.recv().await;
+
+    const STATUS_CHURN: usize = zakura_header_chain::MAX_STAGED_TARGETS_V1 + 8;
+    for marker in 0..STATUS_CHURN {
+        reactor.handle_wire_message(
+            peer.clone(),
+            session_id,
+            HeaderSyncMessage::Status(churn_status(anchor, marker as u8)),
+        );
+    }
+
+    assert_eq!(reactor.pending_port_operations.len(), 1);
+    assert_eq!(reactor.pending_locator_queries.len(), 1);
+
+    let latest = churn_status(anchor, (STATUS_CHURN - 1) as u8);
+    assert_eq!(
+        reactor
+            .peer_work_queue
+            .awaiting_target(&peer)
+            .map(|target| target.status.selected_tip_hash),
+        Some(latest.selected_tip_hash)
+    );
+
+    release.notify_one();
+    let completion = reactor
+        .pending_port_operations
+        .next()
+        .await
+        .expect("the coalesced locator completes");
+    reactor.handle_port_completion(completion);
+
+    assert!(reactor.pending_locator_queries.is_empty());
+    assert_eq!(
+        counters.started.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "status tip churn must not spawn unbounded locator futures"
+    );
+    let frame = outbound
+        .recv()
+        .await
+        .expect("GetHeaders uses the latest tip");
+    let HeaderSyncMessage::GetHeaders(request) = reactor
+        .codec
+        .decode_frame(frame, None)
+        .expect("GetHeaders decodes")
+    else {
+        panic!("expected GetHeaders for the latest staged tip");
+    };
+    assert_eq!(request.target_tip_hash, latest.selected_tip_hash);
+}
+
+#[tokio::test]
+async fn generation_change_does_not_reuse_a_stale_locator_under_coalescing() {
+    let counters = Arc::new(LocatorCounters::default());
+    let release = Arc::new(Notify::new());
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.header_chain_port = Arc::new(StalledLocatorPort {
+        counters: counters.clone(),
+        release: release.clone(),
+        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
+    });
+    startup.use_direct_port();
+    let (_, _, mut reactor) =
+        build_header_sync_reactor(startup).expect("the direct-port fixture builds");
+
+    let peer = peer();
+    let session_id = 7;
+    let (send, mut outbound) = crate::zakura::framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_connection(
+        peer.clone(),
+        session_id,
+        send,
+        CancellationToken::new(),
+        CancellationToken::new(),
+        crate::zakura::CloseCause::new(),
+    ));
+    let _ = outbound.recv().await;
+
+    let status = churn_status(anchor, 1);
+    reactor.handle_wire_message(
+        peer.clone(),
+        session_id,
+        HeaderSyncMessage::Status(status.clone()),
+    );
+    assert_eq!(reactor.pending_port_operations.len(), 1);
+    assert_eq!(reactor.pending_locator_queries.len(), 1);
+
+    let mut advanced = snapshot;
+    advanced.state_version = advanced
+        .state_version
+        .checked_next()
+        .expect("the fixture state version advances");
+    advanced.header_generation = advanced
+        .header_generation
+        .checked_next()
+        .expect("the fixture header generation advances");
+    reactor
+        .peer_state
+        .get_mut(&peer)
+        .expect("the peer remains admitted")
+        .last_status = Some(status.clone());
+    reactor.observe_latest_committed_snapshot(advanced.clone());
+
+    assert_eq!(
+        reactor.pending_port_operations.len(),
+        1,
+        "reconsider must coalesce onto the in-flight locator read"
+    );
+    assert_eq!(
+        reactor
+            .peer_work_queue
+            .awaiting_target(&peer)
+            .map(|target| target.scope.header_generation),
+        Some(advanced.header_generation)
+    );
+
+    release.notify_one();
+    let completion = reactor
+        .pending_port_operations
+        .next()
+        .await
+        .expect("the stale-generation locator completes");
+    reactor.handle_port_completion(completion);
+
+    assert_eq!(
+        counters.started.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the first locator ran once under the old generation"
+    );
+    assert_eq!(
+        reactor.pending_port_operations.len(),
+        1,
+        "a stale locator must re-dispatch under the new header generation"
+    );
+    assert_eq!(reactor.pending_locator_queries.len(), 1);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), outbound.recv())
+            .await
+            .is_err(),
+        "a stale locator cannot send GetHeaders under the new generation"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn hanging_locator_port_future_is_removed_at_the_request_deadline() {
+    let mut reactor = direct_reactor(Arc::new(StalledLocatorPort {
+        counters: Arc::new(LocatorCounters::default()),
+        release: Arc::new(Notify::new()),
+        locator: zakura_header_chain::HeaderLocator::for_continuation(
+            zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0u8; 32])),
+        ),
+    }));
+    let peer = peer();
+    connected_session(&mut reactor, peer.clone(), 7);
+    let snapshot = reactor
+        .committed_snapshot
+        .clone()
+        .expect("the fixture has a committed snapshot");
+    let target = block::Hash([0x81; 32]);
+    let scope = zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, target);
+    let started = Instant::now();
+
+    assert!(
+        reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
+            peer: peer.clone(),
+            session_id: 7,
+            target_tip_hash: target,
+            scope,
+        })
+    );
+    let completion = reactor
+        .pending_port_operations
+        .next()
+        .await
+        .expect("the direct port timeout completes the hung locator");
+    reactor.handle_port_completion(completion);
+
+    assert!(Instant::now().duration_since(started) >= reactor.startup.request_timeout);
+    assert!(reactor.pending_port_operations.is_empty());
+    assert!(reactor.pending_locator_queries.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn locator_timeout_after_tip_churn_rediscovers_the_latest_target() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.header_chain_port = Arc::new(StalledLocatorPort {
+        counters: Arc::new(LocatorCounters::default()),
+        release: Arc::new(Notify::new()),
+        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
+    });
+    startup.use_direct_port();
+    let (_, _, mut reactor) =
+        build_header_sync_reactor(startup).expect("the direct-port fixture builds");
+
+    let peer = peer();
+    let session_id = 7;
+    let (send, mut outbound) = crate::zakura::framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_connection(
+        peer.clone(),
+        session_id,
+        send,
+        CancellationToken::new(),
+        CancellationToken::new(),
+        crate::zakura::CloseCause::new(),
+    ));
+    let _ = outbound.recv().await;
+
+    reactor.handle_wire_message(
+        peer.clone(),
+        session_id,
+        HeaderSyncMessage::Status(churn_status(anchor, 1)),
+    );
+    reactor.handle_wire_message(
+        peer.clone(),
+        session_id,
+        HeaderSyncMessage::Status(churn_status(anchor, 2)),
+    );
+    assert_eq!(reactor.pending_port_operations.len(), 1);
+
+    let completion = reactor
+        .pending_port_operations
+        .next()
+        .await
+        .expect("the superseded tip's locator times out");
+    reactor.handle_port_completion(completion);
+
+    let latest = churn_status(anchor, 2);
+    assert_eq!(
+        reactor
+            .peer_work_queue
+            .awaiting_target(&peer)
+            .map(|target| target.status.selected_tip_hash),
+        Some(latest.selected_tip_hash),
+        "a timed-out locator for a replaced tip must not drop the latest staged target"
+    );
+    assert_eq!(
+        reactor.pending_port_operations.len(),
+        1,
+        "the reactor must rediscover a locator for the latest tip"
+    );
+    assert_eq!(reactor.pending_locator_queries.len(), 1);
+}

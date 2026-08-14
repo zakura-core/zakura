@@ -78,7 +78,7 @@ fn clean_store_initializes_only_from_finalized_full_state() {
         .expect("the production validation policy is authenticated");
     prepare_headers(
         HeaderBatchInput::new(std::slice::from_ref(&block2.header)),
-        &lease,
+        lease.parent(),
         &rules,
         &SystemClock,
     )

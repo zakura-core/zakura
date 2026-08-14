@@ -2078,7 +2078,7 @@ impl HeaderChainRuntime {
             return Err(error);
         }
 
-        let current = checkpoint.after();
+        let current = checkpoint.snapshot_after_commit();
         let batch = match self
             .store
             .batch_for_combined(checkpoint.change_set(), batch)
@@ -2342,7 +2342,7 @@ impl HeaderChainRuntime {
         let resource_stalled = transition_effect.is_resource_stalled();
         let stall_receipt = resource_stalled.then(|| CommittedStallReceipt {
             state_version: transition.change_set().metadata.state_version,
-            alarm_changed: transition.before().alarms.resource_stalled
+            alarm_changed: transition.snapshot_before_commit().alarms.resource_stalled
                 != transition.change_set().metadata.alarms.resource_stalled,
             attempted_branch: branch,
         });
@@ -2363,7 +2363,7 @@ impl HeaderChainRuntime {
             if transition.is_no_change() {
                 return Ok(ApplyResult::ResourceStalled(receipt));
             }
-            let current = transition.after();
+            let current = transition.snapshot_after_commit();
             let batch = self.store.batch_for(transition.change_set())?;
             #[cfg(test)]
             fault(FaultPoint::BeforeCommit)?;
@@ -2425,12 +2425,12 @@ impl HeaderChainRuntime {
             #[cfg(test)]
             fault(FaultPoint::AfterMemorySwap)?;
             return Ok(ApplyResult::NoChange(NoChangeReceipt {
-                state_version: transition.before().state_version,
+                state_version: transition.snapshot_before_commit().state_version,
                 idempotency_key: event,
             }));
         }
 
-        let current = transition.after();
+        let current = transition.snapshot_after_commit();
         let migrated_pin_refuted = transition.change_set().metadata.alarms.migrated_pin_refuted;
         let batch = self
             .store
@@ -2574,7 +2574,7 @@ impl HeaderChainStore {
         if let Some(pin) = plan.metadata.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
-        let previous = plan.before.clone();
+        let previous = plan.snapshot_before_repair.clone();
         let repairs = plan.repairs.clone();
         if !plan.is_clean() {
             #[cfg(test)]
@@ -2633,7 +2633,7 @@ impl HeaderChainStore {
                 "integrated migration requires full-state verification through the preserved pin",
             ));
         }
-        let previous = source.before.clone();
+        let previous = source.snapshot_before_repair.clone();
         let mut repairs = source.repairs.clone();
         if !source.is_clean() {
             self.db.write(self.recovery_batch(&source)?)?;
@@ -2642,6 +2642,7 @@ impl HeaderChainStore {
         let history = self.finality_history()?;
         let mut metadata = self.metadata()?;
         metadata.mode = EngineMode::Integrated;
+        metadata.headers_only_migration_epoch = Some(metadata.finality_epoch);
         metadata.state_version = metadata.state_version.checked_next()?;
         metadata.header_generation = metadata.header_generation.checked_next()?;
         metadata.verified_generation = metadata.verified_generation.checked_next()?;
@@ -2702,7 +2703,7 @@ impl HeaderChainStore {
         if let Some(pin) = initial.metadata.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
-        let previous = initial.before.clone();
+        let previous = initial.snapshot_before_repair.clone();
         let mut repairs = initial.repairs.clone();
         if !initial.is_clean() {
             self.db.write(self.recovery_batch(&initial)?)?;
@@ -2786,7 +2787,7 @@ impl HeaderChainStore {
         if let Some(pin) = initial.metadata.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
-        let previous = initial.before.clone();
+        let previous = initial.snapshot_before_repair.clone();
         let mut repairs = initial.repairs.clone();
         if !initial.is_clean() {
             self.db.write(self.recovery_batch(&initial)?)?;

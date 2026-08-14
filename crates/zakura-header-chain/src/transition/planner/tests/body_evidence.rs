@@ -2,6 +2,71 @@ use super::*;
 use crate::BodyRuleId;
 
 #[test]
+fn transient_body_evidence_rejects_each_malformed_episode_shape() {
+    let (store, config) = TestStore::new(EngineMode::Integrated);
+    let now = Utc::now();
+    let clock = ManualClock(now);
+    let baseline = crate::BodyUnavailableSummary {
+        started_at: now,
+        attempts: 1,
+        suppliers: 1,
+        supplier_set_digest: [0x21; 32],
+        alarmed: false,
+        next_probe_at: now,
+    };
+    let malformed = [
+        (
+            "zero attempts",
+            crate::BodyUnavailableSummary {
+                attempts: 0,
+                ..baseline
+            },
+        ),
+        (
+            "zero suppliers",
+            crate::BodyUnavailableSummary {
+                suppliers: 0,
+                ..baseline
+            },
+        ),
+        (
+            "probe before episode start",
+            crate::BodyUnavailableSummary {
+                next_probe_at: now - chrono::Duration::seconds(1),
+                ..baseline
+            },
+        ),
+    ];
+
+    for (label, availability) in malformed {
+        let result = apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(
+                    crate::TransientBodyFailure {
+                        hash: store.metadata.frontiers.header_best.hash,
+                        evidence: EvidenceId::from_digest([0x22; 32]),
+                        kind: crate::TransientBodyFailureKind::Timeout,
+                        availability,
+                    },
+                )),
+            },
+            &context(&config, &clock, Some(&Authority)),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(TransitionFailure::InvalidEvidence(
+                    InvalidTransitionEvidence::Body(BodyViolation::InvalidTransientEpisode)
+                ))
+            ),
+            "{label}: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn invalidating_a_losing_body_advances_header_generation_without_a_reason_delta() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());

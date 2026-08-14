@@ -598,6 +598,17 @@ impl PeerWorkQueue {
         self.stage(peer, target, priority)
     }
 
+    /// Return the peer's current unstarted target, if any.
+    pub(in crate::zakura::header_sync) fn awaiting_target(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Option<&AdvertisedHeaderTarget> {
+        match self.work_by_peer.get(peer) {
+            Some(PeerWorkState::AwaitingLocator { target, .. }) => Some(target.as_ref()),
+            _ => None,
+        }
+    }
+
     pub(in crate::zakura::header_sync) fn awaiting(
         &self,
         peer: &ZakuraPeerId,
@@ -676,21 +687,6 @@ impl PeerWorkQueue {
             self.work_by_peer.get(peer),
             Some(PeerWorkState::AwaitingLocator { .. })
         ) {
-            self.remove_all(peer);
-        }
-    }
-
-    pub(in crate::zakura::header_sync) fn remove_awaiting(
-        &mut self,
-        peer: &ZakuraPeerId,
-        session_id: u64,
-        target_tip_hash: zakura_chain::block::Hash,
-        scope: HeaderWorkAuthority,
-    ) {
-        if self
-            .awaiting(peer, session_id, target_tip_hash, scope)
-            .is_some()
-        {
             self.remove_all(peer);
         }
     }

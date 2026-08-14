@@ -615,7 +615,7 @@ where
                 ))
             })?;
         let headers: Vec<_> = entries.iter().map(|entry| entry.header.clone()).collect();
-        let batch = zakura_header_chain::prepare_context_free_headers(
+        let batch = zakura_header_chain::prepare_headers(
             zakura_header_chain::HeaderBatchInput::new(&headers),
             common_ancestor,
             &rules,

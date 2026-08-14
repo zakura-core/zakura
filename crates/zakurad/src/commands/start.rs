@@ -2732,6 +2732,278 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[tokio::test]
+    async fn block_sync_driver_persists_consensus_invalid_body_evidence() {
+        let (action_tx, action_rx) = mpsc::channel(1);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zakura_network::zakura::spawn_block_sync_reactor(startup);
+        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
+            panic!("unexpected read request while persisting invalid-body evidence: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Tip(None))
+        });
+        let verifier = service_fn(|request: zakura_consensus::Request| async move {
+            panic!(
+                "unexpected verifier request while persisting invalid-body evidence: {request:?}"
+            );
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_consensus::BoxError>(block::Hash([0; 32]))
+        });
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let header_chain_write =
+            BoxCloneService::new(service_fn(move |request: zakura_state::Request| {
+                let request_tx = request_tx.clone();
+                async move {
+                    let zakura_state::Request::RecordHeaderChainBodyInvalid { prepared } = request
+                    else {
+                        panic!("unexpected state write while persisting invalid-body evidence")
+                    };
+                    request_tx
+                        .send(prepared)
+                        .await
+                        .expect("invalid-body request receiver stays open");
+                    Ok::<_, zakura_state::BoxError>(
+                        zakura_state::Response::HeaderChainBodyInvalidRecorded(
+                            zakura_header_chain::ApplyResult::Committed,
+                        ),
+                    )
+                }
+            }));
+        let body_evidence_authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zakura_chain::chain_tip::NoChainTip,
+            read_state,
+            Some(header_chain_write),
+            Some(body_evidence_authority.clone()),
+            verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            zakura_network::zakura::ZakuraTrace::noop(),
+            None,
+            super::zakura::SyncCoordinator::new(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let expected_version = zakura_header_chain::StateVersion::new(7);
+        let invalid = zakura_header_chain::ConsensusBodyInvalid {
+            hash: block::Hash([3; 32]),
+            evidence: zakura_header_chain::EvidenceId::from_digest([4; 32]),
+            rule: zakura_header_chain::BodyRuleId::new("test.commitment_matching_invalid"),
+            source: zakura_header_chain::SourceId::from_digest([5; 32]),
+        };
+        action_tx
+            .send(BlockSyncAction::RecordBodyInvalid {
+                expected_version,
+                invalid: invalid.clone(),
+            })
+            .await
+            .expect("invalid-body persistence action queues");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
+                .await
+                .expect("state writer receives invalid-body evidence"),
+            Some(body_evidence_authority.from_full_verifier(expected_version, invalid))
+        );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver exits after shutdown");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_refreshes_stale_consensus_invalid_body_evidence() {
+        let (action_tx, action_rx) = mpsc::channel(1);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zakura_network::zakura::spawn_block_sync_reactor(startup);
+        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
+            panic!("unexpected read request while refreshing invalid-body evidence: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Tip(None))
+        });
+        let verifier = service_fn(|request: zakura_consensus::Request| async move {
+            panic!(
+                "unexpected verifier request while refreshing invalid-body evidence: {request:?}"
+            );
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_consensus::BoxError>(block::Hash([0; 32]))
+        });
+        let (request_tx, mut request_rx) = mpsc::channel(2);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_service = attempts.clone();
+        let current_version = zakura_header_chain::StateVersion::new(11);
+        let header_chain_write =
+            BoxCloneService::new(service_fn(move |request: zakura_state::Request| {
+                let request_tx = request_tx.clone();
+                let attempts = attempts_for_service.clone();
+                async move {
+                    let zakura_state::Request::RecordHeaderChainBodyInvalid { prepared } = request
+                    else {
+                        panic!("unexpected state write while refreshing invalid-body evidence")
+                    };
+                    request_tx
+                        .send(prepared)
+                        .await
+                        .expect("invalid-body request receiver stays open");
+                    let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt == 0 {
+                        return Ok(zakura_state::Response::HeaderChainBodyInvalidRecorded(
+                            zakura_header_chain::ApplyResult::Stale(
+                                zakura_header_chain::StaleReceipt {
+                                    current_version,
+                                    branch: None,
+                                },
+                            ),
+                        ));
+                    }
+                    Ok(zakura_state::Response::HeaderChainBodyInvalidRecorded(
+                        zakura_header_chain::ApplyResult::Committed,
+                    ))
+                }
+            }));
+        let body_evidence_authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zakura_chain::chain_tip::NoChainTip,
+            read_state,
+            Some(header_chain_write),
+            Some(body_evidence_authority.clone()),
+            verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            zakura_network::zakura::ZakuraTrace::noop(),
+            None,
+            super::zakura::SyncCoordinator::new(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let stale_version = zakura_header_chain::StateVersion::new(7);
+        let invalid = zakura_header_chain::ConsensusBodyInvalid {
+            hash: block::Hash([6; 32]),
+            evidence: zakura_header_chain::EvidenceId::from_digest([7; 32]),
+            rule: zakura_header_chain::BodyRuleId::new("test.stale_refresh_invalid"),
+            source: zakura_header_chain::SourceId::from_digest([8; 32]),
+        };
+        action_tx
+            .send(BlockSyncAction::RecordBodyInvalid {
+                expected_version: stale_version,
+                invalid: invalid.clone(),
+            })
+            .await
+            .expect("invalid-body persistence action queues");
+
+        let first = tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
+            .await
+            .expect("state writer receives the stale invalid-body attempt")
+            .expect("stale invalid-body request arrives");
+        assert_eq!(
+            first,
+            body_evidence_authority.from_full_verifier(stale_version, invalid.clone())
+        );
+        let second = tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
+            .await
+            .expect("state writer receives the refreshed invalid-body attempt")
+            .expect("refreshed invalid-body request arrives");
+        assert_eq!(
+            second,
+            body_evidence_authority.from_full_verifier(current_version, invalid)
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver exits after shutdown");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_fail_closes_when_consensus_invalid_body_persistence_errors() {
+        let (action_tx, action_rx) = mpsc::channel(1);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zakura_network::zakura::spawn_block_sync_reactor(startup);
+        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
+            panic!("unexpected read request while fail-closing invalid-body evidence: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Tip(None))
+        });
+        let verifier = service_fn(|request: zakura_consensus::Request| async move {
+            panic!(
+                "unexpected verifier request while fail-closing invalid-body evidence: {request:?}"
+            );
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_consensus::BoxError>(block::Hash([0; 32]))
+        });
+        let header_chain_write =
+            BoxCloneService::new(service_fn(|request: zakura_state::Request| async move {
+                let zakura_state::Request::RecordHeaderChainBodyInvalid { .. } = request else {
+                    panic!("unexpected state write while fail-closing invalid-body evidence")
+                };
+                Err::<zakura_state::Response, zakura_state::BoxError>(
+                    "injected invalid-body persistence failure".into(),
+                )
+            }));
+        let body_evidence_authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zakura_chain::chain_tip::NoChainTip,
+            read_state,
+            Some(header_chain_write),
+            Some(body_evidence_authority),
+            verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            zakura_network::zakura::ZakuraTrace::noop(),
+            None,
+            super::zakura::SyncCoordinator::new(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::RecordBodyInvalid {
+                expected_version: zakura_header_chain::StateVersion::new(7),
+                invalid: zakura_header_chain::ConsensusBodyInvalid {
+                    hash: block::Hash([9; 32]),
+                    evidence: zakura_header_chain::EvidenceId::from_digest([10; 32]),
+                    rule: zakura_header_chain::BodyRuleId::new("test.fail_closed_invalid"),
+                    source: zakura_header_chain::SourceId::from_digest([11; 32]),
+                },
+            })
+            .await
+            .expect("invalid-body persistence action queues");
+
+        tokio::time::timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("driver fail-closes without waiting for external shutdown")
+            .expect("driver task joins after fail-closed shutdown");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
     async fn block_sync_driver_answers_needed_block_queries_from_state() {
         let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);

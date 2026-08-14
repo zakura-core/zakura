@@ -237,6 +237,12 @@ impl EngineConfig {
                 .pin_for_network(&network)
                 .ok_or(EngineConfigError::MissingSettledPin(network.kind()))?;
         }
+        validate_trust_pin_consistency(
+            &settled_manifest,
+            &network,
+            bootstrap_anchor.frontier,
+            &local_checkpoints,
+        )?;
         let trust_anchor_digest =
             trust_anchor_digest(&settled_manifest, &bootstrap_anchor, &local_checkpoints);
         let trust_pins = trust_pins(&settled_manifest, &network, &local_checkpoints);
@@ -315,14 +321,49 @@ fn trust_pins(
     network: &Network,
     local_checkpoints: &CheckpointSet,
 ) -> Arc<[Frontier]> {
-    let mut pins: Vec<_> = local_checkpoints.iter().collect();
+    let mut pins: BTreeMap<_, _> = local_checkpoints
+        .iter()
+        .map(|pin| (pin.height, pin.hash))
+        .collect();
     if let Some(pin) = settled_manifest.pin_for_network(network) {
-        let key = (pin.activation.height, pin.activation.hash.0);
-        if let Err(index) = pins.binary_search_by_key(&key, |pin| (pin.height, pin.hash.0)) {
-            pins.insert(index, pin.activation);
+        pins.entry(pin.activation.height)
+            .or_insert(pin.activation.hash);
+    }
+    pins.into_iter()
+        .map(|(height, hash)| Frontier::new(height, hash))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// Ensure independent trust sources agree whenever they pin the same height.
+///
+/// Exact duplicate frontiers are valid. Different hashes at one height are
+/// rejected because no canonical chain can satisfy both trust requirements.
+fn validate_trust_pin_consistency(
+    settled_manifest: &SettledUpgradeManifest,
+    network: &Network,
+    bootstrap_anchor: Frontier,
+    local_checkpoints: &CheckpointSet,
+) -> Result<(), EngineConfigError> {
+    let settled = settled_manifest
+        .pin_for_network(network)
+        .into_iter()
+        .map(|pin| pin.activation);
+    let mut pins_by_height = BTreeMap::new();
+    // Source order does not express precedence: the bootstrap anchor, applicable
+    // settled pin, and local checkpoints must all agree at overlapping heights.
+    for pin in std::iter::once(bootstrap_anchor)
+        .chain(settled)
+        .chain(local_checkpoints.iter())
+    {
+        if pins_by_height
+            .insert(pin.height, pin.hash)
+            .is_some_and(|expected| expected != pin.hash)
+        {
+            return Err(EngineConfigError::ConflictingTrustPin(pin.height));
         }
     }
-    pins.into()
+    Ok(())
 }
 
 /// Invalid immutable engine or trust-anchor configuration.
@@ -342,6 +383,9 @@ pub enum EngineConfigError {
     /// Two local checkpoints name different hashes at one height.
     #[error("conflicting local checkpoint at {0:?}")]
     ConflictingCheckpoint(block::Height),
+    /// Two independently authenticated trust sources name different hashes at one height.
+    #[error("conflicting trust pin at {0:?}")]
+    ConflictingTrustPin(block::Height),
     /// A compiled settled hash failed canonical parsing.
     #[error("malformed compiled settled pin for {0:?}")]
     MalformedSettledPin(NetworkKind),
@@ -502,6 +546,94 @@ mod tests {
             .expect("the production genesis anchor passes every direct check");
             assert!(config.settled_manifest.pin_for_network(&network).is_some());
         }
+    }
+
+    #[test]
+    fn engine_config_rejects_conflicting_trust_sources() {
+        let regtest_block = regtest_genesis_block();
+        let regtest_network = Network::new_regtest(RegtestParameters::default());
+        let regtest_anchor = TrustedAnchor {
+            frontier: Frontier::new(block::Height(0), regtest_block.hash()),
+            header: regtest_block.header.clone(),
+        };
+        EngineConfig::new(
+            EngineMode::HeadersOnly,
+            regtest_network.clone(),
+            regtest_anchor.clone(),
+            CheckpointSet::new([regtest_anchor.frontier])
+                .expect("the matching bootstrap checkpoint is unique"),
+        )
+        .expect("identical bootstrap and local trust pins agree");
+        assert_eq!(
+            EngineConfig::new(
+                EngineMode::HeadersOnly,
+                regtest_network,
+                regtest_anchor,
+                CheckpointSet::new([Frontier::new(block::Height(0), block::Hash([9; 32]))])
+                    .expect("the conflicting bootstrap checkpoint is unique"),
+            ),
+            Err(EngineConfigError::ConflictingTrustPin(block::Height(0)))
+        );
+
+        let mainnet_block = Arc::<Block>::zcash_deserialize(
+            zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
+        )
+        .expect("the mainnet genesis vector is canonical");
+        let mainnet_anchor = TrustedAnchor {
+            frontier: Frontier::new(block::Height(0), mainnet_block.hash()),
+            header: mainnet_block.header.clone(),
+        };
+        let manifest = SettledUpgradeManifest::for_release().expect("compiled pins are valid");
+        let settled = manifest
+            .pin_for_network(&Network::Mainnet)
+            .expect("mainnet has a settled pin")
+            .activation;
+        let matching = EngineConfig::new(
+            EngineMode::Integrated,
+            Network::Mainnet,
+            mainnet_anchor.clone(),
+            CheckpointSet::new([settled]).expect("the matching settled checkpoint is unique"),
+        )
+        .expect("identical settled and local trust pins agree");
+        assert_eq!(
+            matching
+                .trust_pins()
+                .iter()
+                .filter(|pin| pin.height == settled.height)
+                .count(),
+            1,
+            "the effective trust pins contain one hash per height"
+        );
+
+        let conflicting_hash = block::Hash([0x5c; 32]);
+        assert_ne!(conflicting_hash, settled.hash);
+        assert_eq!(
+            EngineConfig::new(
+                EngineMode::Integrated,
+                Network::Mainnet,
+                mainnet_anchor,
+                CheckpointSet::new([Frontier::new(settled.height, conflicting_hash)])
+                    .expect("the conflicting settled checkpoint is unique"),
+            ),
+            Err(EngineConfigError::ConflictingTrustPin(settled.height))
+        );
+
+        validate_trust_pin_consistency(
+            &manifest,
+            &Network::Mainnet,
+            settled,
+            &CheckpointSet::default(),
+        )
+        .expect("identical bootstrap and settled trust pins agree");
+        assert_eq!(
+            validate_trust_pin_consistency(
+                &manifest,
+                &Network::Mainnet,
+                Frontier::new(settled.height, conflicting_hash),
+                &CheckpointSet::default(),
+            ),
+            Err(EngineConfigError::ConflictingTrustPin(settled.height))
+        );
     }
 
     #[test]

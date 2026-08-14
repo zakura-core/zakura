@@ -17,20 +17,20 @@ For performance and security, every release should carry a current Mainnet check
 - [ ] `make pre-release` verifies the committed pairing and rejects pre-pipeline `legacy-bootstrap` state; for an emergency release with a broken publisher, export `ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=1` locally, check the `allow_bootstrap_release_state` input when dispatching the Create release workflow, and note it in the release PR.
 - [ ] Testnet checkpoints are still updated manually when needed, per [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/crates/zakura-utils/README.md#zakura-checkpoints).
 
-# Missed Dependency Updates
+# Curated Dependency Updates
 
-Sometimes `dependabot` misses some dependency updates, or we accidentally turned them off.
+Routine Cargo version updates are intentionally disabled. Do not run a blanket
+`cargo update` during release preparation: it can introduce a large cargo-vet
+evidence backlog without a release-specific justification.
 
-This step can be skipped if there is a large pending dependency upgrade. (For example, shared ECC crates.)
-
-Here's how we make sure we got everything:
-
-- [ ] Run `cargo update` on the latest `main` branch, and keep the output
-- [ ] Until we bump the workspace MSRV to 1.88 or higher, `home` must be downgraded manually: `cargo update home@0.5.12 --precise 0.5.11`
-- [ ] If needed, add duplicate dependency exceptions to `deny.toml`.
-- [ ] If needed, remove resolved duplicate dependencies from `deny.toml`
-- [ ] Open a separate PR with the changes
-- [ ] Add the output of `cargo update` to that PR as a comment
+- [ ] Review open Dependabot security alerts and focused dependency updates
+      already planned for this release.
+- [ ] If an update is needed, open a separate focused PR from the latest `main`.
+- [ ] Restrict the update to the required crate or dependency family, and include
+      the update command and output in the PR.
+- [ ] Confirm cargo-vet evidence covers the update and run targeted runtime tests.
+- [ ] Update duplicate dependency exceptions in `deny.toml` only as required by
+      the focused resolution change.
 
 # Summarise Release Changes
 

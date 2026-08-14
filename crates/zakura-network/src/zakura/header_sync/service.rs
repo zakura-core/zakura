@@ -26,6 +26,8 @@ use crate::zakura::{
 /// Conservative re-offer delay when header sync publishes no peer backoff deadline.
 const HEADER_SYNC_ADVISORY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
+// The cast is safe because both terms are small protocol constants checked
+// against the local message cap in header_sync::wire.
 const HEADER_SYNC_FRAME_CAP: u32 = (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32;
 
 const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {

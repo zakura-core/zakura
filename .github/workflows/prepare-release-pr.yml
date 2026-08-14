@@ -399,10 +399,6 @@ jobs:
           ]
           lines += ["", "## Verification", ""]
           lines += [f"- [{mark(o)}] `{cmd}`" for cmd, o in checks]
-          lines.append(
-              "- ⏳ `cargo public-api diff latest` for changed published "
-              "libraries runs in the parallel release-PR CI matrix."
-          )
           if any(o != "success" for _, o in checks):
               lines += [
                   "",

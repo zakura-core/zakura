@@ -1,9 +1,9 @@
 //! Transport-owned framed stream handles.
 //!
 //! `FramedRecv` and `FramedSend` are the service-facing handles for application
-//! stream frames. The transport applies the authoritative per-kind cap from
-//! `app_frame_cap_for_stream_kind`, per-kind message-rate buckets, and idle
-//! freshness updates in its stream workers before frames reach these handles.
+//! stream frames. The transport applies each stream's declared `Stream::frame_cap`,
+//! per-kind message-rate buckets, and idle freshness updates in its stream workers
+//! before frames reach these handles.
 
 use tokio::sync::mpsc;
 

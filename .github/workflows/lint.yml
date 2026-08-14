@@ -7,7 +7,12 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      # Crates contain compiled assets, protobufs, snapshots, and test vectors
+      # whose changes must run the Rust checks even though they are not `.rs`.
+      - crates/**
       - .cargo/config.toml
+      - deny.toml
+      - rust-toolchain.toml
       - .github/workflows/lint.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
@@ -25,7 +30,12 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      # Crates contain compiled assets, protobufs, snapshots, and test vectors
+      # whose changes must run the Rust checks even though they are not `.rs`.
+      - crates/**
       - .cargo/config.toml
+      - deny.toml
+      - rust-toolchain.toml
       - .github/workflows/lint.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
@@ -53,7 +63,7 @@ on:
 # already in process, will get cancelled. Only the latest commit will be allowed
 # to run, cancelling any workflows in between
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -77,7 +87,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI lint job; runs clippy and a locked build check, nothing published/released
         with:
           components: clippy
           toolchain: stable
@@ -135,7 +145,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI docs job; builds rustdoc only, nothing published/released
         with:
           toolchain: nightly
           cache-on-failure: true
@@ -245,7 +255,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI unused-deps job; runs cargo-udeps only, nothing published/released
         with:
           toolchain: nightly
           cache-on-failure: true
@@ -336,10 +346,56 @@ jobs:
       - supply-chain
     timeout-minutes: 30
     steps:
+      # Keep the workflow audit inside this long-established check context.
+      # A separate required `zizmor` context would strand pull requests opened
+      # before that context existed, because GitHub does not backfill checks on
+      # their current head commits.
+      - name: Detect workflow-audit changes
+        id: workflow-audit-changes
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TOTAL_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          # The PR files endpoint returns at most 3,000 files. Run the audit
+          # when the count is missing or reaches that limit so a truncated
+          # response cannot hide a relevant path.
+          if ! [[ "$TOTAL_CHANGED_FILES" =~ ^[0-9]+$ ]] || \
+             (( TOTAL_CHANGED_FILES >= 3000 )); then
+            echo "audit=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --jq '.[] | .filename, (.previous_filename // empty)')
+
+          if grep -qE '\.(ya?ml|py)$' <<< "$changed"; then
+            echo "audit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "audit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        if: github.event_name != 'pull_request' || steps.workflow-audit-changes.outputs.audit == 'true'
+        with:
+          persist-credentials: false
+      - name: Run zizmor workflow audit
+        if: github.event_name != 'pull_request' || steps.workflow-audit-changes.outputs.audit == 'true'
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 #v0.6.2
+        with:
+          advanced-security: false
+          annotations: true
+          # Pin the auditor itself: the action defaults to `version: latest`,
+          # so a new release must not unexpectedly turn this gate red.
+          version: "1.29.0"
+          # Catch every finding. Known-safe patterns must be silenced at the
+          # finding with a justified `zizmor: ignore` comment.
+          min-severity: informational
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          # docs and unused-deps run only on the nightly schedule / on demand,
-          # so they are skipped (not failed) on the PR and merge paths.
+          # docs and unused-deps run only on the nightly schedule / on demand.
           allowed-skips: docs, unused-deps

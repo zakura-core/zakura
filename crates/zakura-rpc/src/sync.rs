@@ -1,10 +1,13 @@
 //! Syncer task for maintaining a non-finalized [`ReadStateService`] and updating
 //! [`ChainTipSender`] via RPCs.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use tokio::task::JoinHandle;
-use tonic::{Status, Streaming};
+use tonic::{
+    transport::{Certificate, ClientTlsConfig, Endpoint, Identity},
+    Status, Streaming,
+};
 use tower::BoxError;
 use zakura_chain::{
     block::{self, Block, Height},
@@ -62,6 +65,85 @@ const GET_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait to establish a gRPC subscription stream before assuming
 /// the request is wedged and retrying.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Mutual TLS configuration for an indexer RPC client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexerClientTlsConfig {
+    server_ca_file: PathBuf,
+    cert_file: PathBuf,
+    key_file: PathBuf,
+    server_name: String,
+}
+
+impl IndexerClientTlsConfig {
+    /// Creates indexer RPC client mutual TLS configuration.
+    pub fn new(
+        server_ca_file: PathBuf,
+        cert_file: PathBuf,
+        key_file: PathBuf,
+        server_name: String,
+    ) -> Self {
+        Self {
+            server_ca_file,
+            cert_file,
+            key_file,
+            server_name,
+        }
+    }
+}
+
+/// Connection configuration for a trusted indexer RPC server.
+///
+/// Converting a loopback [`SocketAddr`] creates a plaintext connection, which
+/// trusts every process and user on the local host. Use [`Self::mtls`] on
+/// multi-user or otherwise untrusted hosts, even for loopback addresses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexerClientConfig {
+    address: SocketAddr,
+    tls: Option<IndexerClientTlsConfig>,
+}
+
+impl IndexerClientConfig {
+    /// Creates a mutually authenticated TLS connection configuration.
+    pub fn mtls(address: SocketAddr, tls: IndexerClientTlsConfig) -> Self {
+        Self {
+            address,
+            tls: Some(tls),
+        }
+    }
+
+    /// Builds a tonic endpoint, rejecting remote plaintext connections.
+    pub(crate) fn endpoint(&self) -> Result<Endpoint, BoxError> {
+        let Some(tls) = &self.tls else {
+            if !self.address.ip().is_loopback() {
+                return Err(
+                    "plaintext indexer RPC connections are restricted to loopback addresses".into(),
+                );
+            }
+
+            return Ok(Endpoint::from_shared(format!("http://{}", self.address))?);
+        };
+
+        crate::indexer::server::install_tls_crypto_provider();
+
+        let server_ca =
+            crate::indexer::server::read_tls_file(&tls.server_ca_file, "server CA certificate")?;
+        let cert = crate::indexer::server::read_tls_file(&tls.cert_file, "client certificate")?;
+        let key = crate::indexer::server::read_tls_file(&tls.key_file, "client private key")?;
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(server_ca))
+            .identity(Identity::from_pem(cert, key))
+            .domain_name(tls.server_name.clone());
+
+        Ok(Endpoint::from_shared(format!("https://{}", self.address))?.tls_config(tls)?)
+    }
+}
+
+impl From<SocketAddr> for IndexerClientConfig {
+    fn from(address: SocketAddr) -> Self {
+        Self { address, tls: None }
+    }
+}
 
 /// Syncs non-finalized best-chain blocks from a trusted primary node's RPCs.
 #[derive(Debug)]
@@ -253,20 +335,21 @@ impl TrustedChainSync {
     ///
     /// Returns the [`LatestChainTip`], [`ChainTipChange`], and a [`JoinHandle`] for the sync task.
     pub async fn spawn(
-        indexer_rpc_address: SocketAddr,
+        indexer_rpc: impl Into<IndexerClientConfig>,
         db: ZakuraDb,
         non_finalized_state_sender: tokio::sync::watch::Sender<NonFinalizedState>,
     ) -> Result<(LatestChainTip, ChainTipChange, JoinHandle<()>), BoxError> {
+        let indexer_rpc = indexer_rpc.into();
         let non_finalized_state = NonFinalizedState::new(&db.network());
         let (chain_tip_sender, latest_chain_tip, chain_tip_change) =
             ChainTipSender::new(None, &db.network());
-        let channel =
-            tonic::transport::Endpoint::from_shared(format!("http://{indexer_rpc_address}"))?
-                .keep_alive_while_idle(true)
-                .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
-                .keep_alive_timeout(KEEPALIVE_TIMEOUT)
-                .connect()
-                .await?;
+        let channel = indexer_rpc
+            .endpoint()?
+            .keep_alive_while_idle(true)
+            .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+            .connect()
+            .await?;
         let indexer_rpc_client = IndexerClient::new(channel);
         let finalized_chain_tip_sender = chain_tip_sender.finalized_sender();
 
@@ -693,7 +776,7 @@ impl TrustedChainSync {
 pub fn init_read_state_with_syncer(
     config: zakura_state::Config,
     network: &Network,
-    indexer_rpc_address: SocketAddr,
+    indexer_rpc: impl Into<IndexerClientConfig>,
 ) -> tokio::task::JoinHandle<
     Result<
         (
@@ -706,6 +789,7 @@ pub fn init_read_state_with_syncer(
     >,
 > {
     let network = network.clone();
+    let indexer_rpc = indexer_rpc.into();
     tokio::spawn(async move {
         if config.ephemeral {
             return Err("standalone read state service cannot be used with ephemeral state".into());
@@ -717,7 +801,7 @@ pub fn init_read_state_with_syncer(
         let (read_state, db, non_finalized_state_sender) =
             spawn_init_read_only(config, &network).await??;
         let (latest_chain_tip, chain_tip_change, sync_task) =
-            TrustedChainSync::spawn(indexer_rpc_address, db, non_finalized_state_sender).await?;
+            TrustedChainSync::spawn(indexer_rpc, db, non_finalized_state_sender).await?;
         Ok((read_state, latest_chain_tip, chain_tip_change, sync_task))
     })
 }
@@ -725,6 +809,19 @@ pub fn init_read_state_with_syncer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_non_loopback_plaintext_indexer_connection() {
+        let address: SocketAddr = "192.0.2.1:8230"
+            .parse()
+            .expect("hard-coded socket address should parse");
+
+        let error = IndexerClientConfig::from(address)
+            .endpoint()
+            .expect_err("non-loopback plaintext connections must be rejected");
+
+        assert!(error.to_string().contains("restricted to loopback"));
+    }
 
     #[test]
     fn finalized_height_check_includes_the_tip() {

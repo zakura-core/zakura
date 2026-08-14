@@ -1,20 +1,13 @@
 name: Unit Tests
 
 on:
+  # No `paths:` filter on pull_request: the workflow triggers on every PR and the
+  # `changes` job below gates the heavy build/test jobs so they still skip on PRs
+  # that touch no test-relevant files. This keeps the `test success` required
+  # check reporting on every PR instead of sitting in "Expected" forever.
   pull_request:
     branches: [main, "feat/**", "release/**"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
-      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
-      - .config/nextest.toml
-      - .github/workflows/tests-unit.yml
-      - docs/specs/fork-aware-header-chain-engine.md
-      - crates/zakura-header-chain/conformance.toml
 
   push:
     branches: [main]
@@ -22,10 +15,15 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      # Include non-Rust inputs compiled or exercised by workspace crates.
+      - crates/**
       - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+      - .cargo/config.toml
       - .config/nextest.toml
+      - rust-toolchain.toml
+      - .github/actions/setup-zakura-build/**
       - .github/workflows/tests-unit.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - crates/zakura-header-chain/conformance.toml
@@ -45,7 +43,10 @@ on:
 # already in process, will get cancelled. Only the latest commit will be allowed
 # to run, cancelling any workflows in between
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  # PR numbers are repository-wide, unlike same-named head branches from forks.
+  # Other events use their unique run ID so different event types cannot cancel
+  # each other when they share a ref, such as push and nightly runs on `main`.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -72,6 +73,7 @@ jobs:
       pull-requests: read
     outputs:
       config: ${{ steps.filter.outputs.config }}
+      rust: ${{ steps.filter.outputs.rust }}
     steps:
       - id: filter
         env:
@@ -82,37 +84,54 @@ jobs:
           MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           MERGE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          TOTAL_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
         run: |
+          compare_files_jq='(if (.files | length) >= 300 then ".github/workflows/tests-unit.yml" else empty end), (.files[] | .filename, (.previous_filename // empty))'
+
           case "$EVENT_NAME" in
             pull_request)
+              # The PR files endpoint returns at most 3,000 files. Run the full
+              # build and config suite when the count is missing or reaches that
+              # limit so a truncated response cannot hide a relevant path.
+              if ! [[ "$TOTAL_CHANGED_FILES" =~ ^[0-9]+$ ]] || \
+                 (( TOTAL_CHANGED_FILES >= 3000 )); then
+                echo "config=true" >> "$GITHUB_OUTPUT"
+                echo "rust=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+
               changed=$(gh api --paginate \
-                "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
-                --jq '.[].filename')
+                "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+                --jq '.[] | .filename, (.previous_filename // empty)')
               ;;
             push)
               # The first push of a branch and force-pushes that orphan the old
               # tip have no usable `before` commit. Compare against the default
-              # branch in that case.
+              # branch in that case. The compare endpoint caps its file list at
+              # 300, so the jq expression emits this workflow's own relevant
+              # path at that limit and conservatively runs the config suite.
               if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]] || \
                  ! changed=$(gh api \
                    "repos/${GITHUB_REPOSITORY}/compare/${BEFORE_SHA}...${GITHUB_SHA}" \
-                   --jq '.files[].filename'); then
+                   --jq "$compare_files_jq"); then
                 changed=$(gh api \
                   "repos/${GITHUB_REPOSITORY}/compare/${DEFAULT_BRANCH}...${GITHUB_SHA}" \
-                  --jq '.files[].filename')
+                  --jq "$compare_files_jq")
               fi
               ;;
             merge_group)
               changed=$(gh api \
                 "repos/${GITHUB_REPOSITORY}/compare/${MERGE_BASE_SHA}...${MERGE_HEAD_SHA}" \
-                --jq '.files[].filename')
+                --jq "$compare_files_jq")
               ;;
             workflow_dispatch)
               echo "config=true" >> "$GITHUB_OUTPUT"
+              echo "rust=true" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
             schedule)
               echo "config=false" >> "$GITHUB_OUTPUT"
+              echo "rust=false" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
@@ -142,7 +161,19 @@ jobs:
             esac
           done <<< "$changed"
 
+          # Broad test-relevant filter (the paths that formerly gated the whole
+          # workflow on pull_request). Every config-relevant change also needs
+          # the build archive consumed by zakura-config, so `config` implies
+          # `rust` even for paths outside the old workflow-level filter.
+          if [[ "$config" == "true" ]] || \
+             grep -qE '(^crates/|\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$)' <<< "$changed"; then
+            rust=true
+          else
+            rust=false
+          fi
+
           echo "config=$config" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
 
   # Compile the whole workspace and every test binary ONCE, then hand the result
   # to the shard jobs as a nextest archive. Previously each of the 3 shards ran
@@ -153,6 +184,12 @@ jobs:
   # parallel test execution across the shard jobs.
   build-tests:
     name: build test binaries (${{ github.event_name == 'pull_request' && 'debug' || (github.event_name == 'schedule' && 'release' || 'ci-tests') }})
+    needs: changes
+    # Run for pushes (own paths filter), the merge queue, nightly, and on demand;
+    # on a pull request only when a test-relevant path changed. unit-tests and
+    # zakura-config `need` this job, so they cascade-skip with it on PRs that
+    # touch no test-relevant paths.
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -283,6 +320,10 @@ jobs:
 
   network-dependent:
     name: network-dependent acceptance tests
+    needs: changes
+    # Compiles independently of build-tests, so gate it directly on the same
+    # test-relevant filter; always runs on non-PR events.
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -382,9 +423,13 @@ jobs:
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          # These jobs are skipped outside their event or changed-path scope.
-          # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config
+          # These jobs are skipped outside their event or changed-path scope:
+          # build-tests / unit-tests / network-dependent skip on pull requests
+          # that touch no test-relevant paths (unit-tests and zakura-config
+          # cascade-skip with build-tests), pruned-storage is push-main only,
+          # check-no-git-dependencies is A-release-label only. Failed,
+          # non-skipped jobs still fail this aggregate status.
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent
 
   report-nightly-result:
     name: report nightly release test result

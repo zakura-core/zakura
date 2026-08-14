@@ -17,6 +17,11 @@ listen_addr     = "[::]:8233"
 rpc_listen_addr = ""                        # empty = RPC disabled; e.g. "0.0.0.0:8232"
 storage_mode    = "archive"                 # "archive" serves all history; "pruned" does not
 p2p_stack       = "dual"                     # legacy | zakura | dual | default
+# Observability endpoints. Both are unauthenticated, so keep them on loopback;
+# the status dashboard reads them over its existing ssh probe. Empty = omitted.
+# zakurad panics if either address is already bound, so check the port first.
+# metrics_endpoint   = "127.0.0.1:9999"     # Prometheus /metrics
+# health_listen_addr = "127.0.0.1:8080"     # /healthy and /ready
 # port          = 22                        # optional non-default ssh port
 
 # Optional fleet-wide Zakura settings, rendered into [network.zakura] on every

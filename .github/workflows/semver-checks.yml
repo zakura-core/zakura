@@ -42,19 +42,28 @@ on:
       - .github/workflows/semver-checks.yml
       - .github/workflows/scripts/affected_semver_packages.py
       - .github/workflows/scripts/test_affected_semver_packages.py
+
+  # Run in the merge queue so queued changes are revalidated against the latest
+  # `main`. `merge_group` ignores path filters; select-packages diffs the queued
+  # group and checks only its affected publishable crates.
+  merge_group:
+
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  # PR numbers are repository-wide, unlike same-named head branches from forks.
+  # Other events use their full ref (including each merge-queue ref).
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   select-packages:
     name: Select semver packages
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       baseline_tag: ${{ steps.affected.outputs.baseline_tag }}
       has_packages: ${{ steps.affected.outputs.has_packages }}
@@ -71,25 +80,38 @@ jobs:
       - name: Find crates affected by this change
         id: affected
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           python3 .github/workflows/scripts/test_affected_semver_packages.py
 
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            packages="$(
-              python3 .github/workflows/scripts/affected_semver_packages.py \
-                --base "$BASE_SHA" \
-                --head "$GITHUB_SHA"
-            )"
-          else
-            # Trusted main runs populate reusable rustdoc JSON for both the
-            # stable PR baseline and the exact latest-tag baseline used by
-            # release preparation. Check every publishable crate so one cache
-            # entry can warm any package selected later.
-            packages="$(
-              python3 .github/workflows/scripts/affected_semver_packages.py --all
-            )"
-          fi
+          case "${{ github.event_name }}" in
+            pull_request)
+              packages="$(
+                python3 .github/workflows/scripts/affected_semver_packages.py \
+                  --base "$PR_BASE_SHA" \
+                  --head "$GITHUB_SHA"
+              )"
+              ;;
+            merge_group)
+              packages="$(
+                python3 .github/workflows/scripts/affected_semver_packages.py \
+                  --base "$MERGE_BASE_SHA" \
+                  --head "$MERGE_HEAD_SHA"
+              )"
+              ;;
+            *)
+              # Trusted main and explicitly requested runs populate reusable
+              # rustdoc JSON for both the stable PR baseline and the exact
+              # latest-tag baseline used by release preparation. Check every
+              # publishable crate so one cache entry can warm any package
+              # selected later.
+              packages="$(
+                python3 .github/workflows/scripts/affected_semver_packages.py --all
+              )"
+              ;;
+          esac
 
           packages_json="$(
             printf '%s\n' "$packages" \
@@ -127,7 +149,7 @@ jobs:
   check-package:
     name: semver (${{ matrix.package }})
     if: >-
-      github.event_name == 'pull_request'
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group')
       && needs.select-packages.outputs.has_packages == 'true'
     needs: select-packages
     runs-on: ubuntu-latest
@@ -237,7 +259,7 @@ jobs:
   warm-baselines:
     name: Warm semver baselines
     if: >-
-      github.event_name != 'pull_request'
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && needs.select-packages.outputs.has_packages == 'true'
     needs: select-packages
     runs-on: ubuntu-latest
@@ -349,6 +371,7 @@ jobs:
     if: always()
     needs: [select-packages, check-package, public-api-diff, warm-baselines]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check semver job results
         env:
@@ -366,17 +389,18 @@ jobs:
             exit 1
           fi
 
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+          if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "merge_group" ]]; then
             if [[ "$HAS_PACKAGES" == "true" && "$CHECK_RESULT" != "success" ]]; then
               echo "Package checks failed: $CHECK_RESULT" >&2
               exit 1
             fi
-            if [[ "$RELEASE_PR" == "true" && "$HAS_PUBLIC_API_PACKAGES" == "true" \
+            if [[ "$EVENT_NAME" == "pull_request" && "$RELEASE_PR" == "true" \
+              && "$HAS_PUBLIC_API_PACKAGES" == "true" \
               && "$PUBLIC_API_RESULT" != "success" ]]; then
               echo "Public API diffs failed: $PUBLIC_API_RESULT" >&2
               exit 1
             fi
-          elif [[ "$WARM_RESULT" != "success" ]]; then
+          elif [[ "$HAS_PACKAGES" == "true" && "$WARM_RESULT" != "success" ]]; then
             echo "Baseline warmer failed: $WARM_RESULT" >&2
             exit 1
           fi

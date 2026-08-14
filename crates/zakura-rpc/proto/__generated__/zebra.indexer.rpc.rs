@@ -25,6 +25,17 @@ pub struct BlockAndHash {
     #[prost(bytes = "vec", tag = "2")]
     pub data: ::prost::alloc::vec::Vec<u8>,
 }
+/// An encoded block and its height.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BlockAndHeight {
+    /// The height of the block in the chain.
+    #[prost(uint32, tag = "1")]
+    pub height: u32,
+    /// The encoded block data, in the same encoding as `BlockAndHash.data`.
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
 /// A request for a single block by hash or height from the best chain.
 #[derive(serde::Deserialize, serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -36,6 +47,20 @@ pub struct BlockRequest {
     /// rejected.
     #[prost(bytes = "vec", tag = "1")]
     pub hash_or_height: ::prost::alloc::vec::Vec<u8>,
+}
+/// A request for a range of finalized blocks by height.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BlockRangeRequest {
+    /// The height of the first block in the range.
+    #[prost(uint32, tag = "1")]
+    pub start_height: u32,
+    /// The height of the last block in the range, inclusive.
+    ///
+    /// Must be at least `start_height`; the served range ends at the finalized
+    /// tip if that is lower.
+    #[prost(uint32, tag = "2")]
+    pub end_height: u32,
 }
 /// A request to subscribe to non-finalized state changes.
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -312,6 +337,40 @@ pub mod indexer_client {
                 .insert(GrpcMethod::new("zebra.indexer.rpc.Indexer", "GetBlock"));
             self.inner.unary(req, path, codec).await
         }
+        /// Streams the finalized blocks in the requested height range, in ascending
+        /// height order.
+        ///
+        /// Used by indexers to backfill finalized history without a request round
+        /// trip per block. The stream ends cleanly at the finalized tip, or before
+        /// the first block in the range whose body is not stored, whichever comes
+        /// first; a consumer that stops reading for longer than the server's send
+        /// timeout also ends the stream early, which is indistinguishable on the
+        /// wire from a clean end. Rejects ranges whose end is below their start
+        /// with `INVALID_ARGUMENT`.
+        pub async fn get_block_range(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BlockRangeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::BlockAndHeight>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/zebra.indexer.rpc.Indexer/GetBlockRange",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("zebra.indexer.rpc.Indexer", "GetBlockRange"));
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -381,6 +440,29 @@ pub mod indexer_server {
             &self,
             request: tonic::Request<super::BlockRequest>,
         ) -> std::result::Result<tonic::Response<super::BlockAndHash>, tonic::Status>;
+        /// Server streaming response type for the GetBlockRange method.
+        type GetBlockRangeStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::BlockAndHeight, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Streams the finalized blocks in the requested height range, in ascending
+        /// height order.
+        ///
+        /// Used by indexers to backfill finalized history without a request round
+        /// trip per block. The stream ends cleanly at the finalized tip, or before
+        /// the first block in the range whose body is not stored, whichever comes
+        /// first; a consumer that stops reading for longer than the server's send
+        /// timeout also ends the stream early, which is indistinguishable on the
+        /// wire from a clean end. Rejects ranges whose end is below their start
+        /// with `INVALID_ARGUMENT`.
+        async fn get_block_range(
+            &self,
+            request: tonic::Request<super::BlockRangeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::GetBlockRangeStream>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct IndexerServer<T> {
@@ -635,6 +717,52 @@ pub mod indexer_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/zebra.indexer.rpc.Indexer/GetBlockRange" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetBlockRangeSvc<T: Indexer>(pub Arc<T>);
+                    impl<
+                        T: Indexer,
+                    > tonic::server::ServerStreamingService<super::BlockRangeRequest>
+                    for GetBlockRangeSvc<T> {
+                        type Response = super::BlockAndHeight;
+                        type ResponseStream = T::GetBlockRangeStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::BlockRangeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Indexer>::get_block_range(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetBlockRangeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

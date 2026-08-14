@@ -16,6 +16,7 @@ storage_mode = "{{STORAGE_MODE}}"
 {{RPC_BLOCK}}
 
 {{METRICS_BLOCK}}
+{{HEALTH_BLOCK}}
 [consensus]
 checkpoint_sync = {{CHECKPOINT_SYNC}}
 vct_fast_sync = {{VCT_FAST_SYNC}}

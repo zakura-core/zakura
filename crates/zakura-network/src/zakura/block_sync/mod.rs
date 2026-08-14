@@ -75,7 +75,9 @@ pub use request::BlockSizeEstimate;
 #[cfg(test)]
 pub(crate) use service::block_sync_streams;
 pub use service::BlockSyncPeerSession;
-pub(crate) use service::{BlockSyncService, MAX_BS_FRAME_BYTES};
+pub(crate) use service::BlockSyncService;
+#[cfg(test)]
+pub(crate) use service::MAX_BS_FRAME_BYTES;
 pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
 pub use wire::{
     BlockSyncMessage, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_MESSAGE_BYTES, MSG_BS_BLOCK,

@@ -142,8 +142,6 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
     Stream {
         kind: ZAKURA_STREAM_GOSSIP,
         version: LEGACY_GOSSIP_VERSION,
-        // Advisory until the transport wires Stream::frame_cap end-to-end; the
-        // authoritative inbound cap is app_frame_cap_for_stream_kind.
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
         mode: StreamMode::Ordered,
@@ -151,8 +149,6 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
     Stream {
         kind: ZAKURA_STREAM_LEGACY_REQUESTS,
         version: LEGACY_GOSSIP_VERSION,
-        // Advisory until the transport wires Stream::frame_cap end-to-end; the
-        // authoritative inbound cap is app_frame_cap_for_stream_kind.
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
         mode: StreamMode::RequestResponse,

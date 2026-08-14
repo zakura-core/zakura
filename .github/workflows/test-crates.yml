@@ -7,7 +7,10 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      # Include non-Rust inputs compiled or exercised by workspace crates.
+      - crates/**
       - .cargo/config.toml
+      - .github/actions/setup-zakura-build/**
       - .github/workflows/test-crates.yml
 
   push:
@@ -16,7 +19,10 @@ on:
       - "**/*.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      # Include non-Rust inputs compiled or exercised by workspace crates.
+      - crates/**
       - .cargo/config.toml
+      - .github/actions/setup-zakura-build/**
       - .github/workflows/test-crates.yml
 
   # Run the full crate-build suite when a PR is queued so the merge queue
@@ -30,7 +36,7 @@ on:
 # already in process, will get cancelled. Only the latest commit will be allowed
 # to run, cancelling any workflows in between
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -75,7 +81,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI crate-check job; feature-matrix build check only, nothing published/released
         with:
           toolchain: stable
           cache-key: crate-checks

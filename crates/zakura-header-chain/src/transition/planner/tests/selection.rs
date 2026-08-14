@@ -360,7 +360,7 @@ fn accepted_side_path_does_not_replace_the_verified_winner() {
 }
 
 #[test]
-fn committed_transition_applies_to_a_cloned_source_engine() {
+fn public_transition_api_plans_then_installs_one_verified_dag_change() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let engine = test_engine(&store);
     let clock = ManualClock(Utc::now());

@@ -60,6 +60,8 @@ pub struct HeaderChainEngine {
     verified_projection: Vec<crate::Frontier>,
     /// Auxiliary deliveries keyed by retained header hash.
     aux_deliveries: HashMap<block::Hash, Vec<AuxDelivery>>,
+    /// Retained header hash keyed by globally unique delivery identity.
+    aux_delivery_index: HashMap<crate::EvidenceId, block::Hash>,
 }
 
 impl HeaderChainEngine {
@@ -121,6 +123,7 @@ impl HeaderChainEngine {
 
         let mut aux_deliveries: HashMap<_, Vec<_>> = HashMap::new();
         let mut delivery_ids = HashSet::new();
+        let mut aux_delivery_index = HashMap::new();
         for delivery in deliveries {
             let node =
                 graph
@@ -139,6 +142,7 @@ impl HeaderChainEngine {
                 .entry(delivery.header_hash)
                 .or_default()
                 .push(delivery);
+            aux_delivery_index.insert(delivery.delivery_id, delivery.header_hash);
         }
         for node in graph.header_nodes() {
             if node.aux_delivery_ids.iter().any(|delivery_id| {
@@ -161,6 +165,7 @@ impl HeaderChainEngine {
             selected_projection: selected,
             verified_projection: verified,
             aux_deliveries,
+            aux_delivery_index,
         })
     }
 
@@ -236,7 +241,11 @@ impl HeaderChainEngine {
             &mut self.verified_projection,
             &plan.change_set().verified_projection,
         );
-        merge_auxiliary_delivery_changes(&mut self.aux_deliveries, &plan.change_set().aux_changes);
+        merge_auxiliary_delivery_changes(
+            &mut self.aux_deliveries,
+            &mut self.aux_delivery_index,
+            &plan.change_set().aux_changes,
+        );
         Ok(())
     }
 
@@ -278,9 +287,9 @@ impl HeaderChainEngine {
     }
 
     pub(crate) fn aux_delivery(&self, delivery_id: crate::EvidenceId) -> Option<&AuxDelivery> {
-        self.aux_deliveries
-            .values()
-            .flatten()
+        let header_hash = self.aux_delivery_index.get(&delivery_id)?;
+        self.aux_deliveries(*header_hash)
+            .iter()
             .find(|delivery| delivery.delivery_id == delivery_id)
     }
 }
@@ -296,8 +305,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AlarmSet, AuxAuthentication, BodySizeHint, BodyValidationState, BranchId, EngineMode,
-        EvidenceId, FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderGeneration,
+        AlarmSet, BodySizeHint, BodyValidationState, BranchId, EngineMode, EvidenceId,
+        FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderGeneration,
         HeaderValidationState, HeaderWorkAuthority, InsertResult, SourceId, StateVersion,
         VerifiedGeneration,
     };
@@ -378,15 +387,14 @@ mod tests {
             1,
             NonZeroU64::new(1).expect("the fixture request ID is nonzero"),
         );
-        AuxDelivery {
-            delivery_id: EvidenceId::from_digest([id; 32]),
+        AuxDelivery::new(
+            EvidenceId::from_digest([id; 32]),
             header_hash,
-            source: SourceId::from_digest([id.saturating_add(1); 32]),
-            owner: owner.into(),
-            body_size: BodySizeHint::Unknown,
-            tree_aux: None,
-            authentication: AuxAuthentication::Unauthenticated,
-        }
+            SourceId::from_digest([id.saturating_add(1); 32]),
+            owner.into(),
+            BodySizeHint::Unknown,
+            None,
+        )
     }
 
     fn finality_disagrees(view: &mut AuditedView) {

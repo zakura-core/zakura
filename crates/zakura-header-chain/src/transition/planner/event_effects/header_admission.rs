@@ -215,7 +215,7 @@ pub(super) fn admit_prepared_headers(
         if !delivery_ids.insert(delivery.delivery_id)
             || delivery.owner != event.owner
             || delivery.source != event.source
-            || delivery.authentication != crate::AuxAuthentication::Unauthenticated
+            || delivery.outcome().status() != crate::AuxOutcomeStatus::Unauthenticated
             || expected_height.is_none()
             || delivery
                 .tree_aux

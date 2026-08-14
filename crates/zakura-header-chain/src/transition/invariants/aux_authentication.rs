@@ -59,11 +59,11 @@ pub(crate) fn verify_incremental_aux_authentication(
             .iter()
             .find(|existing| existing.delivery_id == delivery.delivery_id)
             .ok_or(InvariantViolation::Auxiliary(delivery.header_hash))?;
-        let mut expected = *existing;
-        expected.authentication = delivery.authentication;
+        let expected = existing.with_outcome(delivery.outcome());
         if expected != **delivery
-            || existing.authentication != crate::AuxAuthentication::Unauthenticated
-            || delivery.authentication == crate::AuxAuthentication::Unauthenticated
+            || !existing
+                .outcome()
+                .can_refine_to(delivery.outcome().status())
         {
             return Err(InvariantViolation::Auxiliary(delivery.header_hash));
         }

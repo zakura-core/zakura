@@ -11,18 +11,18 @@ mod write_set;
 #[cfg(test)]
 mod tests;
 
-pub use auxiliary::{
-    AuxAuthentication, AuxDelivery, BodySizeHint, PreparedAuxDelivery, TreeAuxRecordV1,
-};
+pub use auxiliary::{AuxDelivery, BodySizeHint, PreparedAuxDelivery, TreeAuxRecordV1};
+pub(crate) use auxiliary::{AuxOutcome, AuxOutcomeStatus};
 pub use error::{StoreError, TransitionTypeError};
+pub(crate) use event::AuxVerificationKindV1;
 pub use event::{
-    AuxEvidence, BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch, BodySupplierDiscovered,
-    BodyVerificationClass, BodyVerificationOutcome, ConsensusBodyInvalid, EventAdmission,
-    FullStateFinalized, InsertHeaders, MigratedPinRefutation, OperatorBodyRetry,
-    OperatorInvalidate, OperatorReconsider, TargetCompletion, TransientBodyFailure,
-    TransientBodyFailureKind, TransitionDomain, TransitionEvent, TransitionFingerprint,
-    TransitionRequest, VerifiedBlockAccepted, VerifiedBodyEvidence, VerifiedChainChanged,
-    VerifiedChangeCause, VerifiedHeaderRef,
+    AuxEvidence, AuxObservationV1, AuxVerificationFactV1, BodyCommitmentKind, BodyEvidence,
+    BodyPayloadMismatch, BodySupplierDiscovered, BodyVerificationClass, BodyVerificationOutcome,
+    ConsensusBodyInvalid, EventAdmission, FullStateFinalized, InsertHeaders, MigratedPinRefutation,
+    OperatorBodyRetry, OperatorInvalidate, OperatorReconsider, TargetCompletion,
+    TransientBodyFailure, TransientBodyFailureKind, TransitionDomain, TransitionEvent,
+    TransitionFingerprint, TransitionRequest, VerifiedBlockAccepted, VerifiedBodyEvidence,
+    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 pub use outcome::{
     ApplyResult, AuxiliaryEffect, CommittedStallReceipt, FinalityEffect, HeaderWorkEffect,

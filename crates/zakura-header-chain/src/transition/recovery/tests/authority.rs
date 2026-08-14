@@ -14,11 +14,11 @@ use super::super::{
 };
 use super::{fixture, injected_store_error, violations, AuditRead};
 use crate::{
-    AuxAuthentication, AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId,
-    ChainScore, CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState,
-    EngineMode, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
-    HeaderGeneration, HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner,
-    SourceId, StoreError, SuffixWork, WorkCoordinate,
+    AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId, ChainScore,
+    CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState, EngineMode,
+    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, HeaderGeneration,
+    HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, SourceId, StoreError,
+    SuffixWork, WorkCoordinate,
 };
 
 #[test]
@@ -505,7 +505,13 @@ fn resource_stall_alarm_does_not_exempt_startup_node_limit() {
     store.metadata.alarms.resource_stalled = true;
     store.snapshot = store.metadata.snapshot();
 
-    assert!(violations(&store, &config).contains(&AuditViolation::Limits));
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
+            collection: "header nodes",
+            limit: 2,
+        }))
+    );
 }
 
 #[test]
@@ -530,11 +536,11 @@ fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
     let (mut store, mut config) = fixture();
     config.limits.max_aux_deliveries_total =
         NonZeroUsize::new(1).expect("one is a valid auxiliary limit");
-    let delivery = AuxDelivery {
-        delivery_id: EvidenceId::from_digest([0x51; 32]),
-        header_hash: store.nodes[1].hash,
-        source: SourceId::from_digest([0x52; 32]),
-        owner: HeaderWorkOwner {
+    let delivery = AuxDelivery::new(
+        EvidenceId::from_digest([0x51; 32]),
+        store.nodes[1].hash,
+        SourceId::from_digest([0x52; 32]),
+        HeaderWorkOwner {
             authority: HeaderWorkAuthority {
                 header_generation: HeaderGeneration::new(1),
                 branch: BranchId::new(store.metadata.work_origin.hash, store.nodes[1].hash),
@@ -543,10 +549,9 @@ fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
             request_id: NonZeroU64::new(1).expect("one is nonzero"),
         }
         .into(),
-        body_size: BodySizeHint::Unknown,
-        tree_aux: None,
-        authentication: AuxAuthentication::Unauthenticated,
-    };
+        BodySizeHint::Unknown,
+        None,
+    );
     store.aux = vec![delivery, delivery];
     store.failed_read = Some(AuditRead::AuxDeliveries);
 
@@ -738,11 +743,11 @@ fn audits_each_normative_invariant() {
 
     let mut store = base.clone();
     let evidence = EvidenceId::from_digest([5; 32]);
-    store.aux.push(AuxDelivery {
-        delivery_id: evidence,
-        header_hash: block::Hash([6; 32]),
-        source: SourceId::from_digest([7; 32]),
-        owner: HeaderWorkOwner {
+    store.aux.push(AuxDelivery::new(
+        evidence,
+        block::Hash([6; 32]),
+        SourceId::from_digest([7; 32]),
+        HeaderWorkOwner {
             authority: HeaderWorkAuthority {
                 header_generation: HeaderGeneration::new(1),
                 branch: BranchId::new(base.metadata.work_origin.hash, child_hash),
@@ -751,10 +756,9 @@ fn audits_each_normative_invariant() {
             request_id: NonZeroU64::new(1).expect("one is nonzero"),
         }
         .into(),
-        body_size: BodySizeHint::Unknown,
-        tree_aux: None,
-        authentication: AuxAuthentication::Unauthenticated,
-    });
+        BodySizeHint::Unknown,
+        None,
+    ));
     assert!(violations(&store, &config)
         .iter()
         .any(|violation| matches!(violation, AuditViolation::Auxiliary(_))));

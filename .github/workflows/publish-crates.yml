@@ -103,7 +103,8 @@ jobs:
       - name: Confirm the tag matches the zakura package
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
-        run: ./release/scripts/check-release-version.sh "$RELEASE_TAG"
+          ZAKURA_REPO_ROOT: ${{ github.workspace }}/release
+        run: ./scripts/check-release-version.sh "$RELEASE_TAG"
 
       - name: Plan and fully dry-run crate publishing
         env:

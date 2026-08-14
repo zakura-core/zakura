@@ -32,7 +32,19 @@ case "$RELEASE_TAG" in
 esac
 tag_version="${RELEASE_TAG#v}"
 
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+# Defaults to this script's own checkout. Callers that inspect a different
+# tree — the crates.io dry run runs a pinned copy of this script against a
+# release-tag checkout — point ZAKURA_REPO_ROOT at the tree to check, so the
+# check's semantics come from the copy being run rather than from the tag.
+tool_root="$(cd "$(dirname "$0")/.." && pwd)"
+repo_root="${ZAKURA_REPO_ROOT:-$tool_root}"
+[ -f "${repo_root}/Cargo.toml" ] || {
+  echo "ZAKURA_REPO_ROOT has no Cargo.toml: ${repo_root}" >&2
+  exit 1
+}
+if [ "$repo_root" != "$tool_root" ]; then
+  echo "Checking the workspace at ${repo_root}."
+fi
 
 # --no-deps only reads the workspace manifests, so this works offline and
 # without a Cargo.lock.

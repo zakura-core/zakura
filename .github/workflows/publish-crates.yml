@@ -84,6 +84,10 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: stable
+          # This job compiles the release tag with a current stable toolchain, so
+          # the action's default `-D warnings` would report new-since-the-tag
+          # warnings as publishing failures.
+          rustflags: ""
           cache-key: publish-crates-poc
           cache-on-failure: true
           cache-save-if: false

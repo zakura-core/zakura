@@ -2,7 +2,7 @@
 
 use zakura_chain::block;
 
-use crate::{BranchId, EvidenceId, HeaderSyncWorkOwner, StateVersion};
+use crate::{BranchId, EvidenceId, HeaderSyncWorkOwner, StateVersion, TransitionDomain};
 
 /// How ordinary header work related to newer monotone finality.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

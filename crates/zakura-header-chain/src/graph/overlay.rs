@@ -393,32 +393,24 @@ impl<'a> GraphOverlay<'a> {
 
         let direct_reasons: BTreeSet<_> = direct_reasons.into_iter().collect();
 
-        let eligible = validation == HeaderValidationState::Valid
-            && direct_reasons.is_empty()
-            && inherited_from.is_none()
-            && !matches!(
-                body_validation_state,
-                BodyValidationState::ConsensusInvalid { .. }
-            );
-
-        self.updated_header_nodes_by_hash.insert(
+        let node = HeaderNode {
+            header,
             hash,
-            HeaderNode {
-                header,
-                hash,
-                parent_hash,
-                height,
-                block_work,
-                work_coordinate,
-                validation,
-                eligibility: EligibilityState {
-                    direct_reasons,
-                    inherited_from,
-                },
-                body_validation_state,
-                aux_delivery_ids: Vec::new(),
+            parent_hash,
+            height,
+            block_work,
+            work_coordinate,
+            validation,
+            eligibility: EligibilityState {
+                direct_reasons,
+                inherited_from,
             },
-        );
+            body_validation_state,
+            aux_delivery_ids: Vec::new(),
+        };
+        let eligible = node.is_eligible();
+
+        self.updated_header_nodes_by_hash.insert(hash, node);
 
         self.deleted_header_hashes.remove(&hash);
 
@@ -699,7 +691,11 @@ impl<'a> GraphOverlay<'a> {
                 .ok_or(GraphError::UnknownHeaderNode(cursor.hash))?
                 .parent_hash;
             finalized_path.push((parent_hash, cursor.hash));
-            cursor = Frontier::new(block::Height(cursor.height.0 - 1), parent_hash);
+            let parent_height = cursor
+                .height
+                .previous()
+                .expect("cursor height has a predecessor because it is above the current height");
+            cursor = Frontier::new(parent_height, parent_hash);
         }
         if cursor != current {
             return Err(GraphError::FinalizedFrontierNotDescendant {

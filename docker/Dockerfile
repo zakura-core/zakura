@@ -152,6 +152,7 @@ RUN --mount=type=bind,source=crates/tower-batch-control,target=crates/tower-batc
     --mount=type=bind,source=deploy/zakura-watchdog,target=deploy/zakura-watchdog \
     --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakura-chain,target=crates/zakura-chain \
+    --mount=type=bind,source=crates/zakura-header-chain,target=crates/zakura-header-chain \
     --mount=type=bind,source=crates/zakura-consensus,target=crates/zakura-consensus \
     --mount=type=bind,source=crates/zakura-jsonl-trace,target=crates/zakura-jsonl-trace \
     --mount=type=bind,source=crates/zakura-network,target=crates/zakura-network \

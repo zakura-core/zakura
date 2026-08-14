@@ -547,15 +547,14 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         ironwood_tx_count: 15,
         auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([16; 32]),
     };
-    let delivery = AuxDelivery {
-        delivery_id: EvidenceId::from_digest([0x91; 32]),
-        header_hash: child.hash,
-        source: SourceId::from_digest([0x92; 32]),
-        owner: owner.into(),
-        body_size: zakura_header_chain::BodySizeHint::Unknown,
-        tree_aux: Some(aux),
-        authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
-    };
+    let delivery = AuxDelivery::new(
+        EvidenceId::from_digest([0x91; 32]),
+        child.hash,
+        SourceId::from_digest([0x92; 32]),
+        owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(aux),
+    );
     let mut child_node = runtime
         .store
         .header_node(child.hash)
@@ -891,15 +890,14 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     ));
 
     let snapshot = runtime.publisher().snapshot();
-    let delivery = AuxDelivery {
-        delivery_id: EvidenceId::from_digest([0xa1; 32]),
-        header_hash: anchor.hash,
-        source: SourceId::from_digest([0xa2; 32]),
-        owner: body_owner(&snapshot, 11, 12).into(),
-        body_size: zakura_header_chain::BodySizeHint::Unknown,
-        tree_aux: None,
-        authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
-    };
+    let delivery = AuxDelivery::new(
+        EvidenceId::from_digest([0xa1; 32]),
+        anchor.hash,
+        SourceId::from_digest([0xa2; 32]),
+        body_owner(&snapshot, 11, 12).into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        None,
+    );
     let mut corrupt = DiskWriteBatch::new();
     runtime
         .store

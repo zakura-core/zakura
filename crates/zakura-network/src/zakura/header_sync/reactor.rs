@@ -456,26 +456,16 @@ fn selected_port_aux_delivery(
         .iter()
         .copied()
         .filter(|delivery| {
-            !matches!(
-                delivery.authentication,
-                zakura_header_chain::AuxAuthentication::Rejected { .. }
-            ) && match schema {
-                AuxSchema::None => matches!(
-                    delivery.body_size,
-                    zakura_header_chain::BodySizeHint::Known(_)
-                ),
-                AuxSchema::V1 => delivery.tree_aux.is_some(),
-            }
+            !delivery.is_rejected()
+                && match schema {
+                    AuxSchema::None => matches!(
+                        delivery.body_size,
+                        zakura_header_chain::BodySizeHint::Known(_)
+                    ),
+                    AuxSchema::V1 => delivery.tree_aux.is_some(),
+                }
         })
-        .min_by_key(|delivery| {
-            (
-                !matches!(
-                    delivery.authentication,
-                    zakura_header_chain::AuxAuthentication::Authenticated { .. }
-                ),
-                delivery.delivery_id,
-            )
-        })
+        .min_by_key(|delivery| (!delivery.is_authenticated(), delivery.delivery_id))
 }
 
 impl HeaderSyncReactor {

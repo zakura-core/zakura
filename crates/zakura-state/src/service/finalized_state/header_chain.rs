@@ -142,20 +142,17 @@ pub use fuzz::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub(crate) fn select_vct_auxiliary_delivery(deliveries: Vec<AuxDelivery>) -> Option<AuxDelivery> {
     deliveries
         .into_iter()
-        .filter(|delivery| {
-            delivery.tree_aux.is_some()
-                && !matches!(
-                    delivery.authentication,
-                    zakura_header_chain::AuxAuthentication::Rejected { .. }
-                )
-        })
+        .filter(|delivery| delivery.tree_aux.is_some() && !delivery.is_rejected())
         .min_by_key(|delivery| {
             (
-                match delivery.authentication {
-                    zakura_header_chain::AuxAuthentication::Authenticated { .. } => 0,
-                    zakura_header_chain::AuxAuthentication::Unauthenticated => 1,
-                    zakura_header_chain::AuxAuthentication::Disputed { .. } => 2,
-                    zakura_header_chain::AuxAuthentication::Rejected { .. } => 3,
+                if delivery.is_authenticated() {
+                    0
+                } else if delivery.is_unauthenticated() {
+                    1
+                } else if delivery.is_disputed() {
+                    2
+                } else {
+                    3
                 },
                 delivery.delivery_id,
             )

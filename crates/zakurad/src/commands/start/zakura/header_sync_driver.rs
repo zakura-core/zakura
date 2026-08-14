@@ -642,15 +642,14 @@ where
             hasher.update(owner.session_id().to_le_bytes());
             hasher.update(owner.request_id().get().to_le_bytes());
             hasher.update(prepared.hash.0);
-            aux.push(zakura_header_chain::AuxDelivery {
-                delivery_id: zakura_header_chain::EvidenceId::from_digest(hasher.finalize().into()),
-                header_hash: prepared.hash,
+            aux.push(zakura_header_chain::AuxDelivery::new(
+                zakura_header_chain::EvidenceId::from_digest(hasher.finalize().into()),
+                prepared.hash,
                 source,
                 owner,
                 body_size,
-                tree_aux: entry.tree_aux,
-                authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
-            });
+                entry.tree_aux,
+            ));
         }
         Ok::<_, Arc<zakura_header_chain::HeaderChainError>>((batch, aux))
     })
@@ -1125,28 +1124,18 @@ fn selected_aux_delivery(
         .iter()
         .copied()
         .filter(|delivery| {
-            !matches!(
-                delivery.authentication,
-                zakura_header_chain::AuxAuthentication::Rejected { .. }
-            ) && match schema {
-                AuxSchema::None => {
-                    matches!(
-                        delivery.body_size,
-                        zakura_header_chain::BodySizeHint::Known(_)
-                    )
+            !delivery.is_rejected()
+                && match schema {
+                    AuxSchema::None => {
+                        matches!(
+                            delivery.body_size,
+                            zakura_header_chain::BodySizeHint::Known(_)
+                        )
+                    }
+                    AuxSchema::V1 => delivery.tree_aux.is_some(),
                 }
-                AuxSchema::V1 => delivery.tree_aux.is_some(),
-            }
         })
-        .min_by_key(|delivery| {
-            (
-                !matches!(
-                    delivery.authentication,
-                    zakura_header_chain::AuxAuthentication::Authenticated { .. }
-                ),
-                delivery.delivery_id,
-            )
-        })
+        .min_by_key(|delivery| (!delivery.is_authenticated(), delivery.delivery_id))
 }
 
 async fn release_header_path<ReadState>(
@@ -1370,24 +1359,32 @@ mod tests {
             ironwood_tx_count: 0,
             auth_data_root: [0; 32].into(),
         };
-        let delivery =
-            |marker, body_size, tree_aux, authentication| zakura_header_chain::AuxDelivery {
-                delivery_id: zakura_header_chain::EvidenceId::from_digest([marker; 32]),
+        let delivery = |marker, body_size, tree_aux, status_code| {
+            let delivery = zakura_header_chain::AuxDelivery::new(
+                zakura_header_chain::EvidenceId::from_digest([marker; 32]),
                 header_hash,
                 source,
                 owner,
                 body_size,
                 tree_aux,
-                authentication,
-            };
+            );
+            if status_code == 0 {
+                delivery
+            } else {
+                delivery
+                    .validate_decoded_outcome(
+                        status_code,
+                        [Some([marker.wrapping_add(6); 32]), None],
+                        Some(block::Hash([9; 32])),
+                    )
+                    .expect("the test outcome is coherent")
+            }
+        };
         let rejected = delivery(
             1,
             zakura_header_chain::BodySizeHint::Known(NonZeroU32::new(10).expect("ten is nonzero")),
             Some(tree_aux),
-            zakura_header_chain::AuxAuthentication::Rejected {
-                evidence: zakura_header_chain::EvidenceId::from_digest([7; 32]),
-                boundary_hash: block::Hash([9; 32]),
-            },
+            2,
         );
         let unauthenticated = delivery(
             2,
@@ -1395,7 +1392,7 @@ mod tests {
                 NonZeroU32::new(20).expect("twenty is nonzero"),
             ),
             Some(tree_aux),
-            zakura_header_chain::AuxAuthentication::Unauthenticated,
+            0,
         );
         let authenticated = delivery(
             3,
@@ -1403,10 +1400,7 @@ mod tests {
                 NonZeroU32::new(30).expect("thirty is nonzero"),
             ),
             Some(tree_aux),
-            zakura_header_chain::AuxAuthentication::Authenticated {
-                evidence: zakura_header_chain::EvidenceId::from_digest([8; 32]),
-                boundary_hash: block::Hash([9; 32]),
-            },
+            1,
         );
         let deliveries = [rejected, unauthenticated, authenticated];
 
@@ -1480,17 +1474,14 @@ mod tests {
         );
         page.finalized_tree_aux[0] = None;
 
-        page.aux_deliveries[0].push(zakura_header_chain::AuxDelivery {
-            delivery_id: zakura_header_chain::EvidenceId::from_digest([10; 32]),
-            header_hash: hash,
-            source: zakura_header_chain::SourceId::from_digest([11; 32]),
-            owner: owner(),
-            body_size: zakura_header_chain::BodySizeHint::Known(
-                NonZeroU32::new(321).expect("321 is nonzero"),
-            ),
-            tree_aux: Some(tree_aux),
-            authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
-        });
+        page.aux_deliveries[0].push(zakura_header_chain::AuxDelivery::new(
+            zakura_header_chain::EvidenceId::from_digest([10; 32]),
+            hash,
+            zakura_header_chain::SourceId::from_digest([11; 32]),
+            owner(),
+            zakura_header_chain::BodySizeHint::Known(NonZeroU32::new(321).expect("321 is nonzero")),
+            Some(tree_aux),
+        ));
         let no_aux = assemble_header_path_page(1, page.clone(), AuxSchema::None)
             .expect("the coherent parallel page assembles");
         assert_eq!(no_aux.tree_aux_schema, AuxSchema::None);

@@ -22,12 +22,12 @@ use zakura_chain::{
     parallel::tree::NoteCommitmentTrees,
 };
 use zakura_header_chain::{
-    ApplyResult, AuxAuthentication, AuxEvidence, BodyWorkAuthority, CheckpointSet, Clock,
-    EngineConfig, EngineConfigError, EngineMode, EngineSnapshot, EvidenceId, Frontier,
-    FullStateEvidenceAuthority, FullStateFinalized, OperatorInvalidate, OperatorInvalidationId,
-    OperatorReconsider, StateVersion, StoreError, SystemClock, TransitionContext, TransitionEvent,
-    TransitionRequest, TrustedAnchor, VerifiedBlockAccepted, VerifiedChainChanged,
-    VerifiedChangeCause, VerifiedHeaderRef,
+    ApplyResult, AuxEvidence, AuxObservationV1, AuxVerificationFactV1, BodyWorkAuthority,
+    CheckpointSet, Clock, EngineConfig, EngineConfigError, EngineMode, EngineSnapshot, EvidenceId,
+    Frontier, FullStateEvidenceAuthority, FullStateFinalized, OperatorInvalidate,
+    OperatorInvalidationId, OperatorReconsider, StateVersion, StoreError, SystemClock,
+    TransitionContext, TransitionEvent, TransitionRequest, TrustedAnchor, VerifiedBlockAccepted,
+    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -712,26 +712,18 @@ impl HeaderChainWriter {
         if deliveries.is_empty() {
             return Ok(None);
         }
-        let Some(boundary_hash) = auxiliary_window
+        let Some(boundary_witness) = auxiliary_window
             .successor
             .as_ref()
-            .map(|successor| successor.hash)
+            .and_then(|successor| successor.auth_data_root)
         else {
             return Ok(None);
         };
 
-        let mut hasher = Sha256::new();
-        hasher.update(b"zakura.vct.aux.rejection.v1");
-        hasher.update([match failure {
+        let failure_code = match failure {
             crate::error::VctCommitFailure::CurrentRoots => 1,
             crate::error::VctCommitFailure::SuccessorBoundary => 2,
-        }]);
-        hasher.update(boundary_hash.0);
-        for delivery in &deliveries {
-            hasher.update(delivery.delivery_id.digest());
-            hasher.update(delivery.header_hash.0);
-        }
-        let evidence = EvidenceId::from_digest(hasher.finalize().into());
+        };
         let first_delivery = deliveries
             .first()
             .expect("the empty auxiliary rejection returned above");
@@ -739,21 +731,26 @@ impl HeaderChainWriter {
             first_delivery.owner.session_id(),
             first_delivery.owner.request_id(),
         );
-        let authentication = if attribution.requires_dispute() {
-            AuxAuthentication::Disputed { evidence }
-        } else {
-            AuxAuthentication::Rejected {
-                evidence,
-                boundary_hash,
+        let verification = match attribution {
+            VctAuxiliaryFailureAttribution::CurrentDelivery => {
+                AuxVerificationFactV1::current_delivery_failed(failure_code)
             }
+            VctAuxiliaryFailureAttribution::SuccessorDelivery => {
+                AuxVerificationFactV1::successor_delivery_failed(failure_code)
+            }
+            VctAuxiliaryFailureAttribution::AmbiguousDeliveries => {
+                AuxVerificationFactV1::ambiguous_deliveries_failed(failure_code)
+            }
+            VctAuxiliaryFailureAttribution::NoDelivery => return Ok(None),
         };
+        let observation =
+            AuxObservationV1::from_vct(owner, deliveries, verification, Some(boundary_witness))
+                .ok_or(HeaderChainStoreError::Incoherent(
+                    "invalid VCT auxiliary observation",
+                ))?;
         let request = TransitionRequest {
             expected_version: auxiliary_window.engine_snapshot.state_version,
-            event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence {
-                owner,
-                deliveries,
-                authentication,
-            })),
+            event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence::observed(observation))),
         };
         let authority = PreparedAuthority::for_event(&request.event)?;
         let mut context = self.context();
@@ -772,7 +769,8 @@ impl HeaderChainWriter {
         auxiliary_window: &VctAuxiliaryWindow,
         proof: VctAuthenticationProof,
     ) -> Result<Option<ApplyResult>, HeaderChainStoreError> {
-        let Some((_evidence, request)) = Self::vct_authentication_request(auxiliary_window, proof)
+        let Some((_observation_id, request)) =
+            Self::vct_authentication_request(auxiliary_window, proof)
         else {
             return Ok(None);
         };
@@ -786,11 +784,10 @@ impl HeaderChainWriter {
     fn vct_authentication_request(
         auxiliary_window: &VctAuxiliaryWindow,
         proof: VctAuthenticationProof,
-    ) -> Option<(EvidenceId, TransitionRequest)> {
-        if !matches!(
-            auxiliary_window.delivery.authentication,
-            AuxAuthentication::Unauthenticated | AuxAuthentication::Disputed { .. }
-        ) {
+    ) -> Option<(zakura_header_chain::AuxObservationId, TransitionRequest)> {
+        if !auxiliary_window.delivery.is_unauthenticated()
+            && !auxiliary_window.delivery.is_disputed()
+        {
             return None;
         }
         let VctAuthenticationProof::Successor {
@@ -804,34 +801,31 @@ impl HeaderChainWriter {
         };
         if delivery_id != auxiliary_window.delivery.delivery_id
             || delivery_header_hash != auxiliary_window.delivery.header_hash
+            || auxiliary_window
+                .successor
+                .as_ref()
+                .is_none_or(|successor| successor.hash != boundary_hash)
         {
             return None;
         }
-
-        let mut hasher = Sha256::new();
-        hasher.update(b"zakura.vct.aux.authentication.v1");
-        hasher.update(delivery_id.digest());
-        hasher.update(delivery_header_hash.0);
-        hasher.update(boundary_hash.0);
-        hasher.update(<[u8; 32]>::from(boundary_auth_data_root));
-        let evidence = EvidenceId::from_digest(hasher.finalize().into());
         let owner = BodyWorkAuthority::for_snapshot(&auxiliary_window.engine_snapshot).bind(
             auxiliary_window.delivery.owner.session_id(),
             auxiliary_window.delivery.owner.request_id(),
         );
 
+        let observation = AuxObservationV1::from_vct(
+            owner,
+            vec![auxiliary_window.delivery],
+            AuxVerificationFactV1::current_delivery_verified(),
+            Some(boundary_auth_data_root),
+        )?;
+        let observation_id = observation.observation_id();
+
         Some((
-            evidence,
+            observation_id,
             TransitionRequest {
                 expected_version: auxiliary_window.engine_snapshot.state_version,
-                event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence {
-                    owner,
-                    deliveries: vec![auxiliary_window.delivery],
-                    authentication: AuxAuthentication::Authenticated {
-                        evidence,
-                        boundary_hash,
-                    },
-                })),
+                event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence::observed(observation))),
             },
         ))
     }

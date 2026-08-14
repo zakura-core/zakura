@@ -7,9 +7,9 @@ use zakura_chain::{
 
 use crate::graph::{GraphDelta, GraphOverlay};
 use crate::{
-    AlarmSet, AuxAuthentication, AuxDelivery, BodySizeHint, BodyValidationState, ChangeSet,
-    CheckpointSet, EngineConfig, EngineLimits, EngineMetadata, EngineMode, EvidenceId,
-    FinalityEffect, FinalityRecord, FinalitySource, Frontier, FrontierSet, HeaderChainDiskVersion,
+    AlarmSet, AuxDelivery, BodySizeHint, BodyValidationState, ChangeSet, CheckpointSet,
+    EngineConfig, EngineLimits, EngineMetadata, EngineMode, EvidenceId, FinalityEffect,
+    FinalityRecord, FinalitySource, Frontier, FrontierSet, HeaderChainDiskVersion,
     HeaderChainEngine, HeaderGeneration, HeaderValidationState, IndexChanges, PlanCandidate,
     ProjectionDelta, SourceId, StateVersion, TransitionDomain, TransitionEffect, TrustedAnchor,
     VerifiedGeneration,
@@ -232,13 +232,12 @@ pub(super) fn delivery(
             NonZeroU64::new(1).expect("the fixture request identifier is nonzero"),
         )
         .into();
-    AuxDelivery {
+    AuxDelivery::new(
         delivery_id,
         header_hash,
-        source: SourceId::from_digest([0x51; 32]),
+        SourceId::from_digest([0x51; 32]),
         owner,
-        body_size: BodySizeHint::Unknown,
-        tree_aux: None,
-        authentication: AuxAuthentication::Unauthenticated,
-    }
+        BodySizeHint::Unknown,
+        None,
+    )
 }

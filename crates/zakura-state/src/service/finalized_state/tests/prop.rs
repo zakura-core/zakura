@@ -89,9 +89,9 @@ fn exact_vct_auxiliary_window(
 ) -> VctAuxiliaryWindow {
     use std::num::NonZeroU64;
     use zakura_header_chain::{
-        AlarmSet, AuxAuthentication, AuxDelivery, BodySizeHint, ChainScore, EngineMode,
-        EngineSnapshot, EvidenceId, Frontier, FrontierSet, HeaderGeneration, SourceId,
-        StateVersion, SuffixWork, TreeAuxRecordV1, VerifiedGeneration,
+        AlarmSet, AuxDelivery, BodySizeHint, ChainScore, EngineMode, EngineSnapshot, EvidenceId,
+        Frontier, FrontierSet, HeaderGeneration, SourceId, StateVersion, SuffixWork,
+        TreeAuxRecordV1, VerifiedGeneration,
     };
 
     let hash = block.hash();
@@ -120,13 +120,13 @@ fn exact_vct_auxiliary_window(
     current_delivery_id[..4].copy_from_slice(&height.0.to_le_bytes());
     let mut successor_delivery_id = current_delivery_id;
     successor_delivery_id[4] = 1;
-    let current = AuxDelivery {
-        delivery_id: EvidenceId::from_digest(current_delivery_id),
-        header_hash: hash,
-        source: SourceId::from_digest([1; 32]),
+    let current = AuxDelivery::new(
+        EvidenceId::from_digest(current_delivery_id),
+        hash,
+        SourceId::from_digest([1; 32]),
         owner,
-        body_size: BodySizeHint::Unknown,
-        tree_aux: Some(TreeAuxRecordV1 {
+        BodySizeHint::Unknown,
+        Some(TreeAuxRecordV1 {
             height,
             sapling_root: roots.0,
             orchard_root: roots.1,
@@ -136,15 +136,14 @@ fn exact_vct_auxiliary_window(
             ironwood_tx_count: 0,
             auth_data_root: block.auth_data_root(),
         }),
-        authentication: AuxAuthentication::Unauthenticated,
-    };
-    let successor_delivery = AuxDelivery {
-        delivery_id: EvidenceId::from_digest(successor_delivery_id),
-        header_hash: successor_hash,
-        source: SourceId::from_digest([2; 32]),
+    );
+    let successor_delivery = AuxDelivery::new(
+        EvidenceId::from_digest(successor_delivery_id),
+        successor_hash,
+        SourceId::from_digest([2; 32]),
         owner,
-        body_size: BodySizeHint::Unknown,
-        tree_aux: Some(TreeAuxRecordV1 {
+        BodySizeHint::Unknown,
+        Some(TreeAuxRecordV1 {
             height: successor_height,
             sapling_root: Default::default(),
             orchard_root: Default::default(),
@@ -154,8 +153,7 @@ fn exact_vct_auxiliary_window(
             ironwood_tx_count: 0,
             auth_data_root: successor.auth_data_root(),
         }),
-        authentication: AuxAuthentication::Unauthenticated,
-    };
+    );
     VctAuxiliaryWindow {
         engine_snapshot: snapshot,
         delivery_header: block.header.clone(),

@@ -19,7 +19,7 @@ use zakura_chain::{
     parameters::{Network, NetworkUpgrade},
     sapling, sprout,
 };
-use zakura_header_chain::{AuxAuthentication, AuxDelivery};
+use zakura_header_chain::AuxDelivery;
 
 /// Positive result proving which exact successor boundary authenticated supplied roots.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -142,11 +142,6 @@ impl VctAuxiliaryFailureAttribution {
         }
     }
 
-    /// Returns whether the writer must dispute both deliveries.
-    pub(crate) fn requires_dispute(self) -> bool {
-        self == Self::AmbiguousDeliveries
-    }
-
     /// Returns the lowest delivery height that repair must replace.
     pub(crate) fn repair_height(
         self,
@@ -200,10 +195,7 @@ fn attribute_vct_auxiliary_failure(
     successor_delivery: Option<AuxDelivery>,
     failure: VctCommitFailure,
 ) -> VctAuxiliaryFailureAttribution {
-    let current_untrusted = matches!(
-        current_delivery.authentication,
-        AuxAuthentication::Unauthenticated | AuxAuthentication::Disputed { .. }
-    );
+    let current_untrusted = current_delivery.is_unauthenticated() || current_delivery.is_disputed();
     if failure == VctCommitFailure::CurrentRoots {
         return if current_untrusted {
             VctAuxiliaryFailureAttribution::CurrentDelivery
@@ -219,10 +211,8 @@ fn attribute_vct_auxiliary_failure(
             VctAuxiliaryFailureAttribution::NoDelivery
         };
     };
-    let successor_untrusted = matches!(
-        successor_delivery.authentication,
-        AuxAuthentication::Unauthenticated | AuxAuthentication::Disputed { .. }
-    );
+    let successor_untrusted =
+        successor_delivery.is_unauthenticated() || successor_delivery.is_disputed();
 
     match (current_untrusted, successor_untrusted) {
         (true, true) => VctAuxiliaryFailureAttribution::AmbiguousDeliveries,
@@ -739,12 +729,12 @@ mod tests {
 
     use super::*;
 
-    fn aux_delivery(byte: u8, authentication: AuxAuthentication) -> AuxDelivery {
-        AuxDelivery {
-            delivery_id: zakura_header_chain::EvidenceId::from_digest([byte; 32]),
-            header_hash: block::Hash([byte; 32]),
-            source: zakura_header_chain::SourceId::from_digest([byte; 32]),
-            owner: zakura_header_chain::BodyWorkOwner {
+    fn aux_delivery(byte: u8, status_code: u8) -> AuxDelivery {
+        let delivery = AuxDelivery::new(
+            zakura_header_chain::EvidenceId::from_digest([byte; 32]),
+            block::Hash([byte; 32]),
+            zakura_header_chain::SourceId::from_digest([byte; 32]),
+            zakura_header_chain::BodyWorkOwner {
                 authority: zakura_header_chain::BodyWorkAuthority {
                     header: zakura_header_chain::HeaderWorkAuthority {
                         header_generation: zakura_header_chain::HeaderGeneration::new(2),
@@ -759,22 +749,26 @@ mod tests {
                 request_id: NonZeroU64::new(7).expect("seven is nonzero"),
             }
             .into(),
-            body_size: zakura_header_chain::BodySizeHint::Unknown,
-            tree_aux: None,
-            authentication,
+            zakura_header_chain::BodySizeHint::Unknown,
+            None,
+        );
+        if status_code == 0 {
+            delivery
+        } else {
+            delivery
+                .validate_decoded_outcome(
+                    status_code,
+                    [Some([3; 32]), None],
+                    Some(block::Hash([4; 32])),
+                )
+                .expect("the test outcome is coherent")
         }
     }
 
     #[test]
     fn vct_boundary_failure_attribution_never_weakens_authenticated_evidence() {
-        let unauthenticated = aux_delivery(1, AuxAuthentication::Unauthenticated);
-        let authenticated = aux_delivery(
-            2,
-            AuxAuthentication::Authenticated {
-                evidence: zakura_header_chain::EvidenceId::from_digest([3; 32]),
-                boundary_hash: block::Hash([4; 32]),
-            },
-        );
+        let unauthenticated = aux_delivery(1, 0);
+        let authenticated = aux_delivery(2, 1);
 
         assert_eq!(
             attribute_vct_auxiliary_failure(

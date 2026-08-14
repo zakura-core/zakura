@@ -14,11 +14,11 @@ use super::super::{
 };
 use super::{fixture, injected_store_error, violations, AuditRead};
 use crate::{
-    AuxAuthentication, AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId,
-    ChainScore, CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState,
-    EngineMode, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
-    HeaderGeneration, HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner,
-    SourceId, SuffixWork, WorkCoordinate,
+    AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId, ChainScore,
+    CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState, EngineMode,
+    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, HeaderGeneration,
+    HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, SourceId, SuffixWork,
+    WorkCoordinate,
 };
 
 #[test]
@@ -541,11 +541,11 @@ fn audits_each_normative_invariant() {
 
     let mut store = base.clone();
     let evidence = EvidenceId::from_digest([5; 32]);
-    store.aux.push(AuxDelivery {
-        delivery_id: evidence,
-        header_hash: block::Hash([6; 32]),
-        source: SourceId::from_digest([7; 32]),
-        owner: HeaderWorkOwner {
+    store.aux.push(AuxDelivery::new(
+        evidence,
+        block::Hash([6; 32]),
+        SourceId::from_digest([7; 32]),
+        HeaderWorkOwner {
             authority: HeaderWorkAuthority {
                 header_generation: HeaderGeneration::new(1),
                 branch: BranchId::new(base.metadata.work_origin.hash, child_hash),
@@ -554,10 +554,9 @@ fn audits_each_normative_invariant() {
             request_id: NonZeroU64::new(1).expect("one is nonzero"),
         }
         .into(),
-        body_size: BodySizeHint::Unknown,
-        tree_aux: None,
-        authentication: AuxAuthentication::Unauthenticated,
-    });
+        BodySizeHint::Unknown,
+        None,
+    ));
     assert!(violations(&store, &config)
         .iter()
         .any(|violation| matches!(violation, AuditViolation::Auxiliary(_))));

@@ -15,14 +15,14 @@ use zakura_chain::{
     work::difficulty::U256,
 };
 use zakura_header_chain::{
-    AlarmSet, AuxAuthentication, AuxDelivery, BodyRuleId, BodySizeHint, BodyUnavailableSummary,
-    BodyValidationState, BodyWorkAuthority, BodyWorkOwner, BranchId, ChainScore,
-    ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState, EngineMetadata, EngineMode,
-    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
-    HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner,
-    HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, OperatorInvalidationId, SourceId,
-    StateVersion, SuffixWork, TransitionDomain, TransitionFingerprint, TreeAuxRecordV1,
-    VerifiedGeneration, WorkCoordinate,
+    AlarmSet, AuxDelivery, BodyRuleId, BodySizeHint, BodyUnavailableSummary, BodyValidationState,
+    BodyWorkAuthority, BodyWorkOwner, BranchId, ChainScore, ConsensusInvalidBodyTombstone,
+    EligibilityReason, EligibilityState, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch,
+    FinalityRecord, FinalitySource, Frontier, FrontierSet, HeaderChainDiskVersion,
+    HeaderContextFact, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner, HeaderValidationState,
+    HeaderWorkAuthority, HeaderWorkOwner, OperatorInvalidationId, SourceId, StateVersion,
+    SuffixWork, TransitionDomain, TransitionFingerprint, TreeAuxRecordV1, VerifiedGeneration,
+    WorkCoordinate,
 };
 
 use super::FallibleDiskValue;
@@ -80,6 +80,9 @@ pub enum HeaderChainValueError {
     /// The decoder found a noncanonical auxiliary commitment-tree root.
     #[error("invalid {0} auxiliary commitment-tree root")]
     TreeAuxRoot(&'static str),
+    /// The decoder found a malformed sealed auxiliary outcome.
+    #[error("invalid auxiliary outcome")]
+    InvalidAuxOutcome,
 }
 
 /// Durable phase of bounded full-state/header reconciliation.
@@ -1017,28 +1020,28 @@ fn put_aux(encoder: &mut Encoder, value: AuxDelivery) {
         encoder.u64(aux.ironwood_tx_count);
         encoder.fixed(&<[u8; 32]>::from(aux.auth_data_root));
     });
-    match value.authentication {
-        AuxAuthentication::Unauthenticated => encoder.u8(0),
-        AuxAuthentication::Authenticated {
-            evidence,
-            boundary_hash,
-        } => {
-            encoder.u8(1);
-            encoder.fixed(&evidence.digest());
-            encoder.fixed(&boundary_hash.0);
+    let status_code = if value.is_unauthenticated() {
+        0
+    } else if value.is_authenticated() {
+        1
+    } else if value.is_rejected() {
+        2
+    } else {
+        3
+    };
+    encoder.u8(status_code);
+    if status_code != 0 {
+        for observation_id in value.observation_ids() {
+            encoder.optional(observation_id, |encoder, observation_id| {
+                encoder.fixed(&observation_id.digest());
+            });
         }
-        AuxAuthentication::Rejected {
-            evidence,
-            boundary_hash,
-        } => {
-            encoder.u8(2);
-            encoder.fixed(&evidence.digest());
-            encoder.fixed(&boundary_hash.0);
-        }
-        AuxAuthentication::Disputed { evidence } => {
-            encoder.u8(3);
-            encoder.fixed(&evidence.digest());
-        }
+        encoder.fixed(
+            &value
+                .outcome_boundary_hash()
+                .expect("derived auxiliary outcomes always retain their boundary")
+                .0,
+        );
     }
 }
 
@@ -1067,19 +1070,8 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueErr
             auth_data_root: AuthDataRoot::from(decoder.array()?),
         })
     })?;
-    let authentication = match decoder.u8()? {
-        0 => AuxAuthentication::Unauthenticated,
-        1 => AuxAuthentication::Authenticated {
-            evidence: EvidenceId::from_digest(decoder.array()?),
-            boundary_hash: block::Hash(decoder.array()?),
-        },
-        2 => AuxAuthentication::Rejected {
-            evidence: EvidenceId::from_digest(decoder.array()?),
-            boundary_hash: block::Hash(decoder.array()?),
-        },
-        3 => AuxAuthentication::Disputed {
-            evidence: EvidenceId::from_digest(decoder.array()?),
-        },
+    let status_code = match decoder.u8()? {
+        value @ 0..=3 => value,
         value => {
             return Err(HeaderChainValueError::UnknownDiscriminant {
                 field: "aux_authentication",
@@ -1087,15 +1079,25 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueErr
             });
         }
     };
-    Ok(AuxDelivery {
+    let (observation_digests, boundary_hash) = if status_code == 0 {
+        ([None, None], None)
+    } else {
+        let first = decoder.optional(|decoder| decoder.array())?;
+        let second = decoder.optional(|decoder| decoder.array())?;
+        ([first, second], Some(block::Hash(decoder.array()?)))
+    };
+    AuxDelivery::validate_decoded(
         delivery_id,
         header_hash,
         source,
         owner,
         body_size,
         tree_aux,
-        authentication,
-    })
+        status_code,
+        observation_digests,
+        boundary_hash,
+    )
+    .ok_or(HeaderChainValueError::InvalidAuxOutcome)
 }
 
 fn put_owner(encoder: &mut Encoder, owner: HeaderSyncWorkOwner) {
@@ -1556,13 +1558,13 @@ mod tests {
             request_id: NonZeroU64::new(5).expect("five is nonzero"),
         }
         .into();
-        let aux = AuxDelivery {
-            delivery_id: EvidenceId::from_digest([6; 32]),
-            header_hash: block::Hash([7; 32]),
-            source: SourceId::from_digest([8; 32]),
+        let base_aux = AuxDelivery::new(
+            EvidenceId::from_digest([6; 32]),
+            block::Hash([7; 32]),
+            SourceId::from_digest([8; 32]),
             owner,
-            body_size: BodySizeHint::Known(NonZeroU32::new(9).expect("nine is nonzero")),
-            tree_aux: Some(TreeAuxRecordV1 {
+            BodySizeHint::Known(NonZeroU32::new(9).expect("nine is nonzero")),
+            Some(TreeAuxRecordV1 {
                 height: block::Height(10),
                 sapling_root: sapling::tree::Root::default(),
                 orchard_root: orchard::tree::Root::default(),
@@ -1572,32 +1574,24 @@ mod tests {
                 ironwood_tx_count: 13,
                 auth_data_root: AuthDataRoot::from([14; 32]),
             }),
-            authentication: AuxAuthentication::Authenticated {
-                evidence: EvidenceId::from_digest([11; 32]),
-                boundary_hash: block::Hash([12; 32]),
-            },
-        };
+        );
+        let aux = base_aux
+            .validate_decoded_outcome(1, [Some([11; 32]), None], Some(block::Hash([12; 32])))
+            .expect("the authenticated outcome is coherent");
         assert_eq!(
             AuxDelivery::decode(&aux.encode().expect("aux encodes")),
             Ok(aux)
         );
-        let rejected_aux = AuxDelivery {
-            authentication: AuxAuthentication::Rejected {
-                evidence: EvidenceId::from_digest([13; 32]),
-                boundary_hash: block::Hash([14; 32]),
-            },
-            ..aux
-        };
+        let rejected_aux = base_aux
+            .validate_decoded_outcome(2, [Some([13; 32]), None], Some(block::Hash([14; 32])))
+            .expect("the rejected outcome is coherent");
         assert_eq!(
             AuxDelivery::decode(&rejected_aux.encode().expect("rejected aux encodes")),
             Ok(rejected_aux)
         );
-        let disputed_aux = AuxDelivery {
-            authentication: AuxAuthentication::Disputed {
-                evidence: EvidenceId::from_digest([15; 32]),
-            },
-            ..aux
-        };
+        let disputed_aux = base_aux
+            .validate_decoded_outcome(3, [Some([15; 32]), None], Some(block::Hash([16; 32])))
+            .expect("the disputed outcome is coherent");
         assert_eq!(
             AuxDelivery::decode(&disputed_aux.encode().expect("disputed aux encodes")),
             Ok(disputed_aux)
@@ -1694,9 +1688,9 @@ mod tests {
                 digest(&bytes),
             ],
             [
-                "ef31b854deb19b68411aabedc15a681405065939be00a691a050a4325df3348e",
+                "c041fc819cc43fcd28dd3ba7fe296271ae0c7225c9bbcdf1dd38152dc313346a",
                 "b887bf384510dfb1a255221a8c97066617cb145eaf3e272ad70dc94cd17a3802",
-                "c96686092fa8c1ee71294336e3d9ec1dde9deddfbdacb6decc53f37fef73904b",
+                "538aaccaf8a97966ec5d3b678c608067e950402ac95995ef7e0eecfecba36066",
             ]
         );
     }

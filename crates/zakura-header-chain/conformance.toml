@@ -63,8 +63,8 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-SCOPE-07"
 name = "Auxiliary-evidence boundary"
 status = "implemented"
-owner = "zakura_header_chain::AuxAuthentication"
-tests = ["IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "IN-06::selected_auxiliary_repair_adds_only_one_exact_provenance_record"]
+owner = "zakura_header_chain::AuxObservationV1"
+tests = ["IN-06::f_225517_auxiliary_outcomes_derive_from_exact_owned_observations", "IN-06::selected_auxiliary_repair_adds_only_one_exact_provenance_record"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

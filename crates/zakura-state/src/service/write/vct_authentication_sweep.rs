@@ -402,22 +402,13 @@ fn deliveries_share_dispute_evidence(
     auxiliary_window: &VctAuxiliaryWindow,
     successor_witness: &VctSuccessorWitness,
 ) -> bool {
-    matches!(
-        (
-            auxiliary_window.delivery.authentication,
-            successor_witness
-                .delivery
-                .map(|delivery| delivery.authentication)
-        ),
-        (
-            zakura_header_chain::AuxAuthentication::Disputed {
-                evidence: current_evidence
-            },
-            Some(zakura_header_chain::AuxAuthentication::Disputed {
-                evidence: successor_evidence
-            })
-        ) if current_evidence == successor_evidence
-    )
+    let current = auxiliary_window.delivery;
+    let Some(successor) = successor_witness.delivery else {
+        return false;
+    };
+    current.is_disputed()
+        && successor.is_disputed()
+        && current.observation_ids() == successor.observation_ids()
 }
 
 /// Records one verified delivery as authenticated by its successor boundary.
@@ -557,13 +548,7 @@ fn successor_delivery_is_untrusted(auxiliary_window: &VctAuxiliaryWindow) -> boo
         .successor
         .as_ref()
         .and_then(|successor| successor.delivery)
-        .is_some_and(|delivery| {
-            matches!(
-                delivery.authentication,
-                zakura_header_chain::AuxAuthentication::Unauthenticated
-                    | zakura_header_chain::AuxAuthentication::Disputed { .. }
-            )
-        })
+        .is_some_and(|delivery| delivery.is_unauthenticated() || delivery.is_disputed())
 }
 
 fn supplied_roots(delivery: &AuxDelivery) -> Option<BlockCommitmentRoots> {

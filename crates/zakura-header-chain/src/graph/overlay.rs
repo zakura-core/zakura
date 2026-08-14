@@ -452,17 +452,10 @@ impl<'a> GraphOverlay<'a> {
         hash: block::Hash,
         reason: EligibilityReason,
     ) -> Result<bool, GraphError> {
-        let reasons = &mut self.stage_header_node(hash)?.eligibility.direct_reasons;
-        if reasons.contains(&reason) {
-            return Ok(false);
-        }
-        if reasons.len() == super::MAX_DIRECT_ELIGIBILITY_REASONS_V1 {
-            return Err(GraphError::DirectEligibilityReasonLimit {
-                header: hash,
-                limit: super::MAX_DIRECT_ELIGIBILITY_REASONS_V1,
-            });
-        }
-        let changed = reasons.insert(reason);
+        let changed = self
+            .stage_header_node(hash)?
+            .eligibility
+            .try_insert_direct_reason(hash, reason)?;
         if changed {
             self.recompute_descendant_eligibility(hash)?;
         }

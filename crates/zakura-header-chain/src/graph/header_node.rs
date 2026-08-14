@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zakura_chain::{block, work::difficulty::Work};
 
-use super::{Frontier, WorkCoordinate};
+use super::{Frontier, GraphError, WorkCoordinate};
 use crate::{EvidenceId, OperatorInvalidationId, SourceId};
 
 /// Maximum direct eligibility reasons retained for one header.
@@ -195,6 +195,26 @@ pub struct EligibilityState {
 }
 
 impl EligibilityState {
+    /// Insert one direct reason without exceeding the durable reason limit.
+    ///
+    /// Returns `false` when the reason already exists.
+    pub(crate) fn try_insert_direct_reason(
+        &mut self,
+        header: block::Hash,
+        reason: EligibilityReason,
+    ) -> Result<bool, GraphError> {
+        if self.direct_reasons.contains(&reason) {
+            return Ok(false);
+        }
+        if self.direct_reasons.len() >= MAX_DIRECT_ELIGIBILITY_REASONS_V1 {
+            return Err(GraphError::DirectEligibilityReasonLimit {
+                header,
+                limit: MAX_DIRECT_ELIGIBILITY_REASONS_V1,
+            });
+        }
+        Ok(self.direct_reasons.insert(reason))
+    }
+
     /// Return true when neither this header nor any ancestor is ineligible.
     pub fn is_eligible(&self, validation: HeaderValidationState) -> bool {
         validation == HeaderValidationState::Valid

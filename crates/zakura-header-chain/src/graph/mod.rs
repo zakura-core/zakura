@@ -590,22 +590,12 @@ impl MemHeaderStore {
         hash: block::Hash,
         reason: EligibilityReason,
     ) -> Result<bool, GraphError> {
-        let reasons = &mut self
+        let changed = self
             .nodes
             .get_mut(&hash)
             .ok_or(GraphError::UnknownHeaderNode(hash))?
             .eligibility
-            .direct_reasons;
-        if reasons.contains(&reason) {
-            return Ok(false);
-        }
-        if reasons.len() == MAX_DIRECT_ELIGIBILITY_REASONS_V1 {
-            return Err(GraphError::DirectEligibilityReasonLimit {
-                header: hash,
-                limit: MAX_DIRECT_ELIGIBILITY_REASONS_V1,
-            });
-        }
-        let changed = reasons.insert(reason);
+            .try_insert_direct_reason(hash, reason)?;
         if changed {
             self.recompute_descendant_eligibility(hash)?;
             self.advance_revision()?;

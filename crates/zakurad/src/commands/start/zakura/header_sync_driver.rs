@@ -1372,7 +1372,7 @@ mod tests {
                 delivery
             } else {
                 delivery
-                    .validate_decoded_outcome(
+                    .test_only_with_outcome(
                         status_code,
                         [Some([marker.wrapping_add(6); 32]), None],
                         Some(block::Hash([9; 32])),

@@ -236,6 +236,7 @@ impl AuxDelivery {
     }
 
     /// Validate a decoded row before recovery treats it as authoritative.
+    #[allow(clippy::too_many_arguments)]
     pub fn validate_decoded(
         delivery_id: EvidenceId,
         header_hash: block::Hash,

@@ -555,7 +555,7 @@ fn mutate_effect_bearing_payload(event: &mut TransitionEvent) {
                 .expect("fingerprinted auxiliary events have an observation");
             let mut deliveries = observation.deliveries().to_vec();
             deliveries[0].delivery_id = EvidenceId::from_digest([40; 32]);
-            *event = Box::new(AuxEvidence::observed(
+            **event = AuxEvidence::observed(
                 AuxObservationV1::from_vct(
                     observation.owner(),
                     deliveries,
@@ -563,7 +563,7 @@ fn mutate_effect_bearing_payload(event: &mut TransitionEvent) {
                     observation.boundary_witness(),
                 )
                 .expect("the mutated auxiliary observation is valid"),
-            ));
+            );
         }
         TransitionEvent::ReevaluateDeferred => {
             panic!("deferred reevaluation has no effect-bearing fingerprint")

@@ -124,6 +124,15 @@ exercise registry upload authorization for every crate. Audit every crate's
 configuration before adding real publication in a later change. Continue to
 use the manual crates.io publishing procedure during this POC.
 
+The `crates-io` environment deliberately carries no required reviewers, because
+nothing this workflow runs can upload. That changes when the POC graduates: the
+plan is to fold trusted publishing into the release CI, at which point the
+environment gains required reviewers like `release` above, and the trusted
+publisher's workflow filename moves to whichever workflow actually publishes.
+Until then the trusted-publisher entries grant only what the POC exercises —
+minting and revoking a token — so remove them if this POC is abandoned rather
+than wired into the release path.
+
 ## Promotion and the "Latest" Release
 
 Both release workflows publish every release with `prerelease: true`, whatever

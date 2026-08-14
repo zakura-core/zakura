@@ -416,8 +416,7 @@ fn event_cases() -> Vec<EventCase> {
 #[test]
 fn auxiliary_outcomes_only_refine_evidence() {
     let unauthenticated = AuxOutcome::unauthenticated();
-    let disputed = AuxOutcome::derived(
-        unauthenticated,
+    let disputed = unauthenticated.refined_by_observation(
         AuxOutcomeStatus::Disputed,
         AuxObservationId::from_digest([1; 32]),
         block::Hash([3; 32]),
@@ -555,7 +554,7 @@ fn mutate_effect_bearing_payload(event: &mut TransitionEvent) {
                 .expect("fingerprinted auxiliary events have an observation");
             let mut deliveries = observation.deliveries().to_vec();
             deliveries[0].delivery_id = EvidenceId::from_digest([40; 32]);
-            *event = Box::new(AuxEvidence::observed(
+            **event = AuxEvidence::observed(
                 AuxObservationV1::from_vct(
                     observation.owner(),
                     deliveries,
@@ -563,7 +562,7 @@ fn mutate_effect_bearing_payload(event: &mut TransitionEvent) {
                     observation.boundary_witness(),
                 )
                 .expect("the mutated auxiliary observation is valid"),
-            ));
+            );
         }
         TransitionEvent::ReevaluateDeferred => {
             panic!("deferred reevaluation has no effect-bearing fingerprint")

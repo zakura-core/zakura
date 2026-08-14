@@ -23,8 +23,8 @@ use zakura_header_chain::{
     HeaderValidationFacts, HeaderWorkAuthority, MemHeaderStore, NoChangeReceipt, RecoveryFailure,
     RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt, StateVersion, StoreAuditRead, StoreError,
     SystemClock, TransitionContext, TransitionEvent, TransitionFailure, TransitionInput,
-    TransitionRequest, ValidationContextRecord, ValidationLease, VerifiedChainChanged,
-    VerifiedChangeCause, VerifiedHeaderRef,
+    TransitionRequest, UntrustedAuxDeliveryRow, ValidationContextRecord, ValidationLease,
+    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -160,10 +160,7 @@ pub(crate) fn select_vct_auxiliary_delivery(deliveries: Vec<AuxDelivery>) -> Opt
         })
 }
 
-fn untrusted_aux_row_matches(
-    authoritative: AuxDelivery,
-    row: &(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>),
-) -> bool {
+fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDeliveryRow) -> bool {
     let expected_base = AuxDelivery::new(
         authoritative.delivery_id,
         authoritative.header_hash,
@@ -184,10 +181,10 @@ fn untrusted_aux_row_matches(
     let expected_observations = authoritative
         .observation_ids()
         .map(|id| id.map(|id| id.digest()));
-    row.0 == expected_base
-        && row.1 == expected_status
-        && row.2 == expected_observations
-        && row.3 == authoritative.outcome_boundary_hash()
+    row.delivery() == expected_base
+        && row.outcome_status_code() == expected_status
+        && row.observation_digests() == expected_observations
+        && row.outcome_boundary_hash() == authoritative.outcome_boundary_hash()
 }
 
 /// Failure at the durable header-chain boundary.
@@ -882,7 +879,10 @@ impl HeaderChainReader {
             .iter()
             .map(|delivery| delivery.delivery_id)
             .collect();
-        let durable_ids: BTreeSet<_> = durable.iter().map(|row| row.0.delivery_id).collect();
+        let durable_ids: BTreeSet<_> = durable
+            .iter()
+            .map(|row| row.delivery().delivery_id)
+            .collect();
         if indexed.len() != aux_delivery_ids.len()
             || stored.len() != deliveries.len()
             || durable_ids.len() != durable.len()
@@ -891,8 +891,8 @@ impl HeaderChainReader {
             || durable.iter().any(|row| {
                 deliveries
                     .iter()
-                    .find(|delivery| delivery.delivery_id == row.0.delivery_id)
-                    .is_none_or(|delivery| !untrusted_aux_row_matches(*delivery, row))
+                    .find(|delivery| delivery.delivery_id == row.delivery().delivery_id)
+                    .is_none_or(|delivery| !untrusted_aux_row_matches(*delivery, *row))
             })
         {
             return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
@@ -4068,8 +4068,7 @@ impl HeaderChainStore {
     fn untrusted_aux_deliveries(
         &self,
         hash: block::Hash,
-    ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>
-    {
+    ) -> Result<Vec<UntrustedAuxDeliveryRow>, StoreError> {
         let mut deliveries = Vec::new();
         for (key, value) in self
             .scan_prefix(HEADER_AUX_DELIVERY, &hash.0)
@@ -4080,12 +4079,14 @@ impl HeaderChainStore {
             }
             let delivery = decode_untrusted_aux_delivery(&value)
                 .map_err(|_| StoreError::Incoherent("invalid auxiliary value"))?;
-            if delivery.0.header_hash != hash || key[32..] != delivery.0.delivery_id.digest() {
+            if delivery.delivery().header_hash != hash
+                || key[32..] != delivery.delivery().delivery_id.digest()
+            {
                 return Err(StoreError::Incoherent("auxiliary key/value mismatch"));
             }
             deliveries.push(delivery);
         }
-        deliveries.sort_unstable_by_key(|delivery| delivery.0.delivery_id);
+        deliveries.sort_unstable_by_key(|delivery| delivery.delivery().delivery_id);
         Ok(deliveries)
     }
 
@@ -4254,10 +4255,7 @@ impl StoreAuditRead for HeaderChainStore {
         self.all_reason_rows()
     }
 
-    fn all_aux_deliveries(
-        &self,
-    ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>
-    {
+    fn all_aux_deliveries(&self) -> Result<Vec<UntrustedAuxDeliveryRow>, StoreError> {
         let mut deliveries = Vec::new();
         for (key, value) in self.scan_raw(HEADER_AUX_DELIVERY).map_err(store_error)? {
             if key.len() != 64 {
@@ -4266,7 +4264,9 @@ impl StoreAuditRead for HeaderChainStore {
             let key = HeaderAuxDeliveryKey::from_bytes(&key);
             let delivery = decode_untrusted_aux_delivery(&value)
                 .map_err(|_| StoreError::Incoherent("invalid auxiliary value"))?;
-            if delivery.0.header_hash != key.header || delivery.0.delivery_id != key.delivery {
+            if delivery.delivery().header_hash != key.header
+                || delivery.delivery().delivery_id != key.delivery
+            {
                 return Err(StoreError::Incoherent("auxiliary key/value mismatch"));
             }
             deliveries.push(delivery);

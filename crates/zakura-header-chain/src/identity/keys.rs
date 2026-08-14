@@ -58,6 +58,7 @@ impl AuxObservationId {
         self.0
     }
 
+    /// Reconstruct an identity from its validated durable digest.
     pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
         Self(digest)
     }

@@ -143,10 +143,7 @@ impl StoreAuditRead for AuditStore {
         Ok(self.reasons.clone())
     }
 
-    fn all_aux_deliveries(
-        &self,
-    ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>
-    {
+    fn all_aux_deliveries(&self) -> Result<Vec<crate::UntrustedAuxDeliveryRow>, StoreError> {
         self.check_read(AuditRead::AuxDeliveries)?;
         Ok(self
             .aux
@@ -169,7 +166,12 @@ impl StoreAuditRead for AuditStore {
                     delivery.body_size,
                     delivery.tree_aux,
                 );
-                (base, status, observations, delivery.outcome_boundary_hash())
+                crate::UntrustedAuxDeliveryRow::new(
+                    base,
+                    status,
+                    observations,
+                    delivery.outcome_boundary_hash(),
+                )
             })
             .collect())
     }

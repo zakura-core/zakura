@@ -493,7 +493,7 @@ fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
 }
 
 #[test]
-fn f_225517_auxiliary_outcomes_derive_from_exact_owned_observations() {
+fn auxiliary_outcomes_derive_from_exact_owned_observations() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let mut insert = insertion(&store, 2, EvidenceId::from_digest([0xb0; 32]));

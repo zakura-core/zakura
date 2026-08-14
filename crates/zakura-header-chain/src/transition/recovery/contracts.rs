@@ -7,9 +7,9 @@ use thiserror::Error;
 use zakura_chain::block;
 
 use crate::{
-    AuxDelivery, BodyValidationState, ConsensusInvalidBodyTombstone, CounterExhausted,
-    EligibilityReason, EngineMetadata, EngineSnapshot, FinalityRecord, Frontier, HeaderNode,
-    StoreError,
+    BodyValidationState, ConsensusInvalidBodyTombstone, CounterExhausted, EligibilityReason,
+    EngineMetadata, EngineSnapshot, FinalityRecord, Frontier, HeaderNode, StoreError,
+    UntrustedAuxDeliveryRow,
 };
 
 /// One immutable predecessor record stored below the selectable finalized anchor.
@@ -63,11 +63,8 @@ pub trait StoreAuditRead {
     fn eligibility_roots(&self) -> Result<Vec<(block::Hash, EligibilityReason)>, StoreError>;
     /// Every untrusted auxiliary delivery row, including dangling rows.
     ///
-    /// The tuple contains an unauthenticated delivery, a status code, two optional observation
-    /// digests, and an optional derived boundary. Recovery must validate and promote each row.
-    fn all_aux_deliveries(
-        &self,
-    ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>;
+    /// Recovery must validate and promote each row against the retained graph.
+    fn all_aux_deliveries(&self) -> Result<Vec<UntrustedAuxDeliveryRow>, StoreError>;
     /// Every immutable below-finalized context row.
     fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError>;
     /// Return the independently authenticated canonical hash at `height`, when available.

@@ -60,6 +60,7 @@ pub(crate) struct AuxOutcome {
 }
 
 impl AuxOutcome {
+    /// Construct the initial outcome before the engine processes an observation.
     pub(crate) const fn unauthenticated() -> Self {
         Self {
             status: AuxOutcomeStatus::Unauthenticated,
@@ -68,13 +69,17 @@ impl AuxOutcome {
         }
     }
 
-    pub(crate) fn derived(
-        previous: Self,
-        status: AuxOutcomeStatus,
+    /// Refine this outcome with one checked observation.
+    ///
+    /// The caller must first verify [`Self::can_refine_to`]. This method retains
+    /// at most two distinct observation identities in refinement order.
+    pub(crate) fn refined_by_observation(
+        self,
+        refined_status: AuxOutcomeStatus,
         observation_id: AuxObservationId,
         boundary_hash: block::Hash,
     ) -> Self {
-        let mut observation_ids = previous.observation_ids;
+        let mut observation_ids = self.observation_ids;
         if !observation_ids.contains(&Some(observation_id)) {
             if observation_ids[0].is_none() {
                 observation_ids[0] = Some(observation_id);
@@ -83,7 +88,7 @@ impl AuxOutcome {
             }
         }
         Self {
-            status,
+            status: refined_status,
             observation_ids,
             boundary_hash: Some(boundary_hash),
         }
@@ -104,17 +109,19 @@ impl AuxOutcome {
         self.observation_ids
     }
 
+    /// Return whether this outcome already includes an observation identity.
     pub(crate) fn contains_observation(self, observation_id: AuxObservationId) -> bool {
         self.observation_ids.contains(&Some(observation_id))
     }
 
-    pub(crate) fn can_refine_to(self, status: AuxOutcomeStatus) -> bool {
+    /// Return whether a checked observation can refine this outcome to `refined_status`.
+    pub(crate) fn can_refine_to(self, refined_status: AuxOutcomeStatus) -> bool {
         matches!(
-            (self.status, status),
+            (self.status, refined_status),
             (AuxOutcomeStatus::Unauthenticated, next)
                 if next != AuxOutcomeStatus::Unauthenticated
         ) || matches!(
-            (self.status, status),
+            (self.status, refined_status),
             (
                 AuxOutcomeStatus::Disputed,
                 AuxOutcomeStatus::Authenticated | AuxOutcomeStatus::Rejected
@@ -196,6 +203,7 @@ impl AuxDelivery {
         }
     }
 
+    /// Return the engine-derived outcome.
     pub(crate) fn outcome(self) -> AuxOutcome {
         self.outcome
     }
@@ -230,11 +238,13 @@ impl AuxDelivery {
         self.outcome().observation_ids()
     }
 
+    /// Replace the outcome after engine derivation or recovery validation.
     pub(crate) fn with_outcome(mut self, outcome: AuxOutcome) -> Self {
         self.outcome = outcome;
         self
     }
 
+    /// Validate and install outcome fields decoded from an untrusted durable row.
     pub(crate) fn promote_recovered_outcome(
         self,
         status_code: u8,
@@ -281,3 +291,64 @@ pub struct TreeAuxRecordV1 {
 
 /// Prepared auxiliary input admitted alongside a header batch.
 pub type PreparedAuxDelivery = AuxDelivery;
+
+/// One auxiliary delivery row decoded from durable state before outcome validation.
+///
+/// The row keeps raw outcome fields separate from [`AuxDelivery`] so decoding
+/// cannot construct an authoritative outcome. Recovery validates the complete
+/// row against the retained graph before it promotes the outcome.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct UntrustedAuxDeliveryRow {
+    delivery: AuxDelivery,
+    outcome_status_code: u8,
+    observation_digests: [Option<[u8; 32]>; 2],
+    outcome_boundary_hash: Option<block::Hash>,
+}
+
+impl UntrustedAuxDeliveryRow {
+    /// Construct one decoded row without promoting its outcome.
+    pub const fn new(
+        delivery: AuxDelivery,
+        outcome_status_code: u8,
+        observation_digests: [Option<[u8; 32]>; 2],
+        outcome_boundary_hash: Option<block::Hash>,
+    ) -> Self {
+        Self {
+            delivery,
+            outcome_status_code,
+            observation_digests,
+            outcome_boundary_hash,
+        }
+    }
+
+    /// Return the unauthenticated delivery fields.
+    pub const fn delivery(self) -> AuxDelivery {
+        self.delivery
+    }
+
+    /// Return the raw durable outcome status code.
+    pub const fn outcome_status_code(self) -> u8 {
+        self.outcome_status_code
+    }
+
+    /// Return the raw durable observation digests.
+    pub const fn observation_digests(self) -> [Option<[u8; 32]>; 2] {
+        self.observation_digests
+    }
+
+    /// Return the raw durable outcome boundary.
+    pub const fn outcome_boundary_hash(self) -> Option<block::Hash> {
+        self.outcome_boundary_hash
+    }
+
+    pub(crate) const fn into_parts(
+        self,
+    ) -> (AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>) {
+        (
+            self.delivery,
+            self.outcome_status_code,
+            self.observation_digests,
+            self.outcome_boundary_hash,
+        )
+    }
+}

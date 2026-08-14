@@ -274,14 +274,7 @@ fn test_engine(store: &TestStore) -> crate::HeaderChainEngine {
     .expect("the planner fixture is coherent before transition")
 }
 
-fn untrusted_aux_rows(
-    store: &TestStore,
-) -> Vec<(
-    crate::AuxDelivery,
-    u8,
-    [Option<[u8; 32]>; 2],
-    Option<block::Hash>,
-)> {
+fn untrusted_aux_rows(store: &TestStore) -> Vec<crate::UntrustedAuxDeliveryRow> {
     store
         .aux
         .iter()
@@ -303,7 +296,12 @@ fn untrusted_aux_rows(
                 delivery.body_size,
                 delivery.tree_aux,
             );
-            (base, status, observations, delivery.outcome_boundary_hash())
+            crate::UntrustedAuxDeliveryRow::new(
+                base,
+                status,
+                observations,
+                delivery.outcome_boundary_hash(),
+            )
         })
         .collect()
 }

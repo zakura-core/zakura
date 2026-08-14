@@ -186,7 +186,7 @@ fn assert_transition_engine_matches_store(runtime: &HeaderChainRuntime) {
         .all_aux_deliveries()
         .expect("the durable auxiliary deliveries are readable")
     {
-        durable_headers.insert(delivery.0.header_hash);
+        durable_headers.insert(delivery.delivery().header_hash);
     }
     for hash in durable_headers {
         assert_eq!(

@@ -40,9 +40,10 @@ use super::{
             HeaderEligibilityRootKey, HeaderFinalityKey, HeaderHeightKey,
         },
         header_chain_values::{
-            FullStateBodyValidationEvidenceAuthorityDisk, HeaderChainValueError,
-            HeaderEligibilityReasonDisk, HeaderNodeDisk, HeaderReconstructionPhaseDisk,
-            HeaderReconstructionProgressDisk, HeaderValidationContextDisk,
+            decode_untrusted_aux_delivery, FullStateBodyValidationEvidenceAuthorityDisk,
+            HeaderChainValueError, HeaderEligibilityReasonDisk, HeaderNodeDisk,
+            HeaderReconstructionPhaseDisk, HeaderReconstructionProgressDisk,
+            HeaderValidationContextDisk,
         },
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
@@ -157,6 +158,36 @@ pub(crate) fn select_vct_auxiliary_delivery(deliveries: Vec<AuxDelivery>) -> Opt
                 delivery.delivery_id,
             )
         })
+}
+
+fn untrusted_aux_row_matches(
+    authoritative: AuxDelivery,
+    row: &(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>),
+) -> bool {
+    let expected_base = AuxDelivery::new(
+        authoritative.delivery_id,
+        authoritative.header_hash,
+        authoritative.source,
+        authoritative.owner,
+        authoritative.body_size,
+        authoritative.tree_aux,
+    );
+    let expected_status = if authoritative.is_unauthenticated() {
+        0
+    } else if authoritative.is_authenticated() {
+        1
+    } else if authoritative.is_rejected() {
+        2
+    } else {
+        3
+    };
+    let expected_observations = authoritative
+        .observation_ids()
+        .map(|id| id.map(|id| id.digest()));
+    row.0 == expected_base
+        && row.1 == expected_status
+        && row.2 == expected_observations
+        && row.3 == authoritative.outcome_boundary_hash()
 }
 
 /// Failure at the durable header-chain boundary.
@@ -397,7 +428,7 @@ fn load_transition_engine(
         store.all_consensus_invalid_body_tombstones()?,
     ))
     .map_err(|_| HeaderChainStoreError::Incoherent("audited node graph is invalid"))?;
-    HeaderChainEngine::from_audited_state(
+    HeaderChainEngine::from_untrusted_durable_state(
         graph,
         metadata,
         store.selected_projection()?,
@@ -839,15 +870,30 @@ impl HeaderChainReader {
         hash: block::Hash,
         aux_delivery_ids: &[EvidenceId],
     ) -> Result<Vec<AuxDelivery>, HeaderChainStoreError> {
-        let deliveries = self.store.aux_deliveries(hash)?;
+        let deliveries = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .aux_deliveries(hash)
+            .to_vec();
+        let durable = self.store.untrusted_aux_deliveries(hash)?;
         let indexed: BTreeSet<_> = aux_delivery_ids.iter().copied().collect();
         let stored: BTreeSet<_> = deliveries
             .iter()
             .map(|delivery| delivery.delivery_id)
             .collect();
+        let durable_ids: BTreeSet<_> = durable.iter().map(|row| row.0.delivery_id).collect();
         if indexed.len() != aux_delivery_ids.len()
             || stored.len() != deliveries.len()
+            || durable_ids.len() != durable.len()
             || indexed != stored
+            || indexed != durable_ids
+            || durable.iter().any(|row| {
+                deliveries
+                    .iter()
+                    .find(|delivery| delivery.delivery_id == row.0.delivery_id)
+                    .is_none_or(|delivery| !untrusted_aux_row_matches(*delivery, row))
+            })
         {
             return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
                 "retained node and auxiliary delivery index disagree",
@@ -3995,6 +4041,13 @@ impl HeaderChainStore {
             .ok_or(StoreError::Unavailable("header-chain metadata is absent"))
     }
 
+    #[cfg(test)]
+    fn aux_deliveries(&self, hash: block::Hash) -> Result<Vec<AuxDelivery>, StoreError> {
+        load_transition_engine(self)
+            .map(|engine| engine.aux_deliveries(hash).to_vec())
+            .map_err(store_error)
+    }
+
     fn header_node(&self, hash: block::Hash) -> Result<Option<HeaderNode>, StoreError> {
         let value = self
             .get_value::<HeaderNodeDisk>(HEADER_NODE_BY_HASH, hash.0)
@@ -4010,6 +4063,30 @@ impl HeaderChainStore {
                     .map_err(|_| StoreError::Incoherent("invalid durable node"))
             })
             .transpose()
+    }
+
+    fn untrusted_aux_deliveries(
+        &self,
+        hash: block::Hash,
+    ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>
+    {
+        let mut deliveries = Vec::new();
+        for (key, value) in self
+            .scan_prefix(HEADER_AUX_DELIVERY, &hash.0)
+            .map_err(store_error)?
+        {
+            if key.len() != 64 {
+                return Err(StoreError::Incoherent("invalid auxiliary key width"));
+            }
+            let delivery = decode_untrusted_aux_delivery(&value)
+                .map_err(|_| StoreError::Incoherent("invalid auxiliary value"))?;
+            if delivery.0.header_hash != hash || key[32..] != delivery.0.delivery_id.digest() {
+                return Err(StoreError::Incoherent("auxiliary key/value mismatch"));
+            }
+            deliveries.push(delivery);
+        }
+        deliveries.sort_unstable_by_key(|delivery| delivery.0.delivery_id);
+        Ok(deliveries)
     }
 
     fn selected_hash(&self, height: block::Height) -> Result<Option<block::Hash>, StoreError> {
@@ -4046,29 +4123,6 @@ impl HeaderChainStore {
             network.clone(),
             metadata.anchor_manifest_digest,
         ))
-    }
-
-    fn aux_deliveries(
-        &self,
-        hash: block::Hash,
-    ) -> Result<Vec<zakura_header_chain::AuxDelivery>, StoreError> {
-        let mut deliveries = Vec::new();
-        for (key, value) in self
-            .scan_prefix(HEADER_AUX_DELIVERY, &hash.0)
-            .map_err(store_error)?
-        {
-            if key.len() != 64 {
-                return Err(StoreError::Incoherent("invalid auxiliary key width"));
-            }
-            let delivery = AuxDelivery::decode(&value)
-                .map_err(|_| StoreError::Incoherent("invalid auxiliary value"))?;
-            if delivery.header_hash != hash || key[32..] != delivery.delivery_id.digest() {
-                return Err(StoreError::Incoherent("auxiliary key/value mismatch"));
-            }
-            deliveries.push(delivery);
-        }
-        deliveries.sort_unstable_by_key(|delivery| delivery.delivery_id);
-        Ok(deliveries)
     }
 
     fn is_migrated_finality_pin(&self, pin: Frontier) -> Result<bool, StoreError> {
@@ -4200,16 +4254,19 @@ impl StoreAuditRead for HeaderChainStore {
         self.all_reason_rows()
     }
 
-    fn all_aux_deliveries(&self) -> Result<Vec<AuxDelivery>, StoreError> {
+    fn all_aux_deliveries(
+        &self,
+    ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>
+    {
         let mut deliveries = Vec::new();
         for (key, value) in self.scan_raw(HEADER_AUX_DELIVERY).map_err(store_error)? {
             if key.len() != 64 {
                 return Err(StoreError::Incoherent("invalid auxiliary key width"));
             }
             let key = HeaderAuxDeliveryKey::from_bytes(&key);
-            let delivery = AuxDelivery::decode(&value)
+            let delivery = decode_untrusted_aux_delivery(&value)
                 .map_err(|_| StoreError::Incoherent("invalid auxiliary value"))?;
-            if delivery.header_hash != key.header || delivery.delivery_id != key.delivery {
+            if delivery.0.header_hash != key.header || delivery.0.delivery_id != key.delivery {
                 return Err(StoreError::Incoherent("auxiliary key/value mismatch"));
             }
             deliveries.push(delivery);

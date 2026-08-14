@@ -122,8 +122,8 @@ impl AuxOutcome {
         )
     }
 
-    /// Validate decoded outcome fields without granting authority to the decoder.
-    pub(crate) fn validate_decoded(
+    /// Validate outcome fields after recovery has classified the row as untrusted input.
+    pub(crate) fn validate_recovered(
         status_code: u8,
         observation_digests: [Option<[u8; 32]>; 2],
         boundary_hash: Option<block::Hash>,
@@ -235,40 +235,26 @@ impl AuxDelivery {
         self
     }
 
-    /// Validate a decoded row before recovery treats it as authoritative.
-    pub fn validate_decoded(
-        delivery_id: EvidenceId,
-        header_hash: block::Hash,
-        source: SourceId,
-        owner: HeaderSyncWorkOwner,
-        body_size: BodySizeHint,
-        tree_aux: Option<TreeAuxRecordV1>,
-        status_code: u8,
-        observation_digests: [Option<[u8; 32]>; 2],
-        boundary_hash: Option<block::Hash>,
-    ) -> Option<Self> {
-        let outcome =
-            AuxOutcome::validate_decoded(status_code, observation_digests, boundary_hash)?;
-        Some(Self {
-            delivery_id,
-            header_hash,
-            source,
-            owner,
-            body_size,
-            tree_aux,
-            outcome,
-        })
-    }
-
-    /// Validate decoded outcome fields and attach them to this decoded row.
-    pub fn validate_decoded_outcome(
+    pub(crate) fn promote_recovered_outcome(
         self,
         status_code: u8,
         observation_digests: [Option<[u8; 32]>; 2],
         boundary_hash: Option<block::Hash>,
     ) -> Option<Self> {
-        AuxOutcome::validate_decoded(status_code, observation_digests, boundary_hash)
+        AuxOutcome::validate_recovered(status_code, observation_digests, boundary_hash)
             .map(|outcome| self.with_outcome(outcome))
+    }
+
+    /// Construct a derived outcome for cross-crate tests only.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_only_with_outcome(
+        self,
+        status_code: u8,
+        observation_digests: [Option<[u8; 32]>; 2],
+        boundary_hash: Option<block::Hash>,
+    ) -> Option<Self> {
+        self.promote_recovered_outcome(status_code, observation_digests, boundary_hash)
     }
 }
 

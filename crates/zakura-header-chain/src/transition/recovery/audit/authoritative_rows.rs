@@ -14,6 +14,7 @@ use super::super::contracts::{AuditViolation, StoreAuditRead, ValidationContextR
 pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
     store: &S,
     nodes: &[HeaderNode],
+    deliveries: &[crate::AuxDelivery],
     validation_contexts: &[ValidationContextRecord],
     metadata: &EngineMetadata,
     config: &EngineConfig,
@@ -49,7 +50,6 @@ pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
     }
 
     let by_hash: HashMap<_, _> = nodes.iter().map(|node| (node.hash, node)).collect();
-    let deliveries = store.all_aux_deliveries()?;
     if deliveries.len() > config.limits.max_aux_deliveries_total.get() {
         violations.push(AuditViolation::Limits);
     }
@@ -57,7 +57,7 @@ pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
     if delivery_ids.len() != deliveries.len() {
         violations.push(AuditViolation::Auxiliary(block::Hash([0; 32])));
     }
-    for delivery in &deliveries {
+    for delivery in deliveries {
         if by_hash
             .get(&delivery.header_hash)
             .is_none_or(|node| !node.aux_delivery_ids.contains(&delivery.delivery_id))

@@ -9,8 +9,8 @@ use thiserror::Error;
 use zakura_chain::block;
 
 use crate::{
-    AuxDelivery, EngineMetadata, EngineSnapshot, EngineTransition, GraphError, MemHeaderStore,
-    TransitionContext, TransitionFailure,
+    AuxDelivery, AuxObservationId, AuxOutcomeStatus, EngineMetadata, EngineSnapshot,
+    EngineTransition, GraphError, MemHeaderStore, TransitionContext, TransitionFailure,
 };
 
 use super::planner::derive_transition_plan;
@@ -84,6 +84,43 @@ impl HeaderChainEngine {
         selected: Vec<crate::Frontier>,
         verified: Vec<crate::Frontier>,
         deliveries: impl IntoIterator<Item = AuxDelivery>,
+    ) -> Result<Self, EngineHydrationError> {
+        let deliveries: Vec<_> = deliveries.into_iter().collect();
+        if deliveries
+            .iter()
+            .any(|delivery| !delivery.is_unauthenticated())
+        {
+            return Err(EngineHydrationError::Incoherent(
+                "authoritative auxiliary outcomes require recovery validation",
+            ));
+        }
+        Self::from_validated_state(graph, metadata, selected, verified, deliveries)
+    }
+
+    /// Validate untrusted durable auxiliary rows and hydrate one recovered engine.
+    ///
+    /// The decoder cannot construct an authoritative auxiliary outcome. This recovery entry point
+    /// checks row structure, global delivery identity, retained-header ownership, replay identity,
+    /// and derived-boundary topology before it promotes any outcome.
+    pub fn from_untrusted_durable_state(
+        graph: MemHeaderStore,
+        metadata: EngineMetadata,
+        selected: Vec<crate::Frontier>,
+        verified: Vec<crate::Frontier>,
+        deliveries: impl IntoIterator<
+            Item = (AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>),
+        >,
+    ) -> Result<Self, EngineHydrationError> {
+        let deliveries = validate_recovered_auxiliary_rows(&graph, deliveries)?;
+        Self::from_validated_state(graph, metadata, selected, verified, deliveries)
+    }
+
+    fn from_validated_state(
+        graph: MemHeaderStore,
+        metadata: EngineMetadata,
+        selected: Vec<crate::Frontier>,
+        verified: Vec<crate::Frontier>,
+        deliveries: Vec<AuxDelivery>,
     ) -> Result<Self, EngineHydrationError> {
         if graph.finalized_frontier() != metadata.frontiers.finalized {
             return Err(EngineHydrationError::Incoherent(
@@ -292,6 +329,106 @@ impl HeaderChainEngine {
             .iter()
             .find(|delivery| delivery.delivery_id == delivery_id)
     }
+}
+
+pub(crate) fn validate_recovered_auxiliary_rows(
+    graph: &MemHeaderStore,
+    rows: impl IntoIterator<Item = (AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>,
+) -> Result<Vec<AuxDelivery>, EngineHydrationError> {
+    let mut delivery_ids = HashSet::new();
+    let mut observation_members: HashMap<AuxObservationId, Vec<(block::Hash, block::Hash)>> =
+        HashMap::new();
+    let mut deliveries = Vec::new();
+    for (delivery, status_code, observation_digests, boundary_hash) in rows {
+        if !delivery.is_unauthenticated() || !delivery_ids.insert(delivery.delivery_id) {
+            return Err(EngineHydrationError::Incoherent(
+                "untrusted auxiliary row has duplicate or authoritative base data",
+            ));
+        }
+        let node =
+            graph
+                .header_node(delivery.header_hash)
+                .ok_or(EngineHydrationError::Incoherent(
+                    "untrusted auxiliary row has no retained header",
+                ))?;
+        if !node.aux_delivery_ids.contains(&delivery.delivery_id) {
+            return Err(EngineHydrationError::Incoherent(
+                "untrusted auxiliary row disagrees with the delivery index",
+            ));
+        }
+        let promoted = delivery
+            .promote_recovered_outcome(status_code, observation_digests, boundary_hash)
+            .ok_or(EngineHydrationError::Incoherent(
+                "untrusted auxiliary outcome is malformed",
+            ))?;
+        match promoted.outcome().status() {
+            AuxOutcomeStatus::Unauthenticated => {}
+            status => {
+                let boundary =
+                    promoted
+                        .outcome()
+                        .boundary_hash()
+                        .ok_or(EngineHydrationError::Incoherent(
+                            "derived auxiliary outcome has no boundary",
+                        ))?;
+                let boundary_node =
+                    graph
+                        .header_node(boundary)
+                        .ok_or(EngineHydrationError::Incoherent(
+                            "derived auxiliary boundary is not retained",
+                        ))?;
+                let direct_successor = boundary_node.parent_hash == delivery.header_hash;
+                let valid_boundary = match status {
+                    AuxOutcomeStatus::Authenticated => direct_successor,
+                    AuxOutcomeStatus::Rejected | AuxOutcomeStatus::Disputed => {
+                        boundary == delivery.header_hash || direct_successor
+                    }
+                    AuxOutcomeStatus::Unauthenticated => true,
+                };
+                if !valid_boundary {
+                    return Err(EngineHydrationError::Incoherent(
+                        "derived auxiliary boundary has invalid topology",
+                    ));
+                }
+                for observation_id in promoted.observation_ids().into_iter().flatten() {
+                    observation_members
+                        .entry(observation_id)
+                        .or_default()
+                        .push((delivery.header_hash, boundary));
+                }
+            }
+        }
+        deliveries.push(promoted);
+    }
+
+    for delivery in deliveries
+        .iter()
+        .filter(|delivery| delivery.outcome().status() == AuxOutcomeStatus::Disputed)
+    {
+        let paired = delivery
+            .observation_ids()
+            .into_iter()
+            .flatten()
+            .any(|observation_id| {
+                let Some(members) = observation_members.get(&observation_id) else {
+                    return false;
+                };
+                members.len() == 2
+                    && members[0].1 == members[1].1
+                    && members
+                        .iter()
+                        .any(|(header, _)| *header == delivery.header_hash)
+                    && members
+                        .iter()
+                        .any(|(header, boundary)| *header == *boundary)
+            });
+        if !paired {
+            return Err(EngineHydrationError::Incoherent(
+                "disputed auxiliary outcome lacks its paired observation",
+            ));
+        }
+    }
+    Ok(deliveries)
 }
 
 #[cfg(test)]
@@ -584,5 +721,47 @@ mod tests {
         .expect("the matching audited views are coherent");
 
         assert_eq!(engine.aux_deliveries(child.hash), &[first, second]);
+    }
+
+    #[test]
+    fn durable_auxiliary_outcomes_require_checked_recovery_promotion() {
+        let mut view = audited_view();
+        let child = view.metadata.frontiers.header_best;
+        let row = delivery(3, child.hash);
+        view.graph
+            .record_auxiliary_evidence_delivery(child.hash, row.delivery_id)
+            .expect("the child is retained");
+        let caller_selected = row
+            .promote_recovered_outcome(
+                1,
+                [Some([4; 32]), None],
+                Some(view.metadata.frontiers.finalized.hash),
+            )
+            .expect("the raw outcome has a structurally valid shape");
+
+        assert!(matches!(
+            HeaderChainEngine::from_audited_state(
+                view.graph.clone(),
+                view.metadata.clone(),
+                view.selected.clone(),
+                view.verified.clone(),
+                [caller_selected],
+            ),
+            Err(EngineHydrationError::Incoherent(
+                "authoritative auxiliary outcomes require recovery validation"
+            ))
+        ));
+        assert!(matches!(
+            HeaderChainEngine::from_untrusted_durable_state(
+                view.graph,
+                view.metadata,
+                view.selected,
+                view.verified,
+                [(row, 1, [Some([4; 32]), None], Some(block::Hash([0xf4; 32])),)],
+            ),
+            Err(EngineHydrationError::Incoherent(
+                "derived auxiliary boundary is not retained"
+            ))
+        ));
     }
 }

@@ -3,5 +3,5 @@ baseline_public_items = 522
 baseline_authority_constructors = 4
 
 # Measured after F-225517 removed caller-selected auxiliary verdicts.
-current_public_items = 520
+current_public_items = 519
 current_authority_constructors = 0

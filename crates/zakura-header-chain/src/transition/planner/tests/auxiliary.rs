@@ -458,7 +458,7 @@ fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
     let mut wrong_source = delivery;
     wrong_source.source = SourceId::from_digest([0x73; 32]);
     let preauthenticated = delivery
-        .validate_decoded_outcome(1, [Some([0x74; 32]), None], Some(block::Hash([0x75; 32])))
+        .promote_recovered_outcome(1, [Some([0x74; 32]), None], Some(block::Hash([0x75; 32])))
         .expect("the test outcome is coherent");
     for (label, deliveries) in [
         ("header outside the admitted batch", vec![unrelated]),

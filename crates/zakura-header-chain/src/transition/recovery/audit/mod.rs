@@ -9,7 +9,10 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::{BodyValidationState, EngineConfig};
+use crate::{
+    transition::engine::validate_recovered_auxiliary_rows, BodyValidationState, EngineConfig,
+    HeaderGraphReconstruction, MemHeaderStore,
+};
 
 use super::contracts::{violation_key, AuditViolation, RecoveryFailure, StoreAuditRead};
 use super::phases::{AuditedSource, PreAuditStoreRows};
@@ -76,9 +79,27 @@ pub(super) fn audit_authoritative<S: StoreAuditRead>(
     }
     check_finalized_connectivity(&source_nodes, finalized, &mut violations);
     check_trust_pins(&source_nodes, finalized, config, &mut violations);
+    let untrusted_deliveries = store.all_aux_deliveries()?;
+    let recovered_deliveries = if untrusted_deliveries.is_empty() {
+        Some(Vec::new())
+    } else {
+        MemHeaderStore::reconstruct(HeaderGraphReconstruction::new(
+            finalized,
+            source_nodes.clone(),
+            tombstones.clone(),
+        ))
+        .ok()
+        .and_then(|graph| validate_recovered_auxiliary_rows(&graph, untrusted_deliveries).ok())
+    };
+    if recovered_deliveries.is_none() {
+        violations.push(AuditViolation::Auxiliary(zakura_chain::block::Hash(
+            [0; 32],
+        )));
+    }
     check_authoritative_rows(
         store,
         &source_nodes,
+        recovered_deliveries.as_deref().unwrap_or_default(),
         &validation_contexts,
         &metadata,
         config,

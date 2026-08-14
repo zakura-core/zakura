@@ -100,7 +100,7 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
             delivery
         } else {
             delivery
-                .validate_decoded_outcome(
+                .test_only_with_outcome(
                     status_code,
                     [Some([byte.wrapping_add(7); 32]), None],
                     Some(block::Hash([10; 32])),

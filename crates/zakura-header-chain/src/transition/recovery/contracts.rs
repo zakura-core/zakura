@@ -61,8 +61,13 @@ pub trait StoreAuditRead {
     fn deferred_entries(&self) -> Result<Vec<(DateTime<Utc>, block::Hash)>, StoreError>;
     /// Every authoritative direct-reason root.
     fn eligibility_roots(&self) -> Result<Vec<(block::Hash, EligibilityReason)>, StoreError>;
-    /// Every auxiliary delivery, including dangling rows.
-    fn all_aux_deliveries(&self) -> Result<Vec<AuxDelivery>, StoreError>;
+    /// Every untrusted auxiliary delivery row, including dangling rows.
+    ///
+    /// The tuple contains an unauthenticated delivery, a status code, two optional observation
+    /// digests, and an optional derived boundary. Recovery must validate and promote each row.
+    fn all_aux_deliveries(
+        &self,
+    ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>;
     /// Every immutable below-finalized context row.
     fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError>;
     /// Return the independently authenticated canonical hash at `height`, when available.

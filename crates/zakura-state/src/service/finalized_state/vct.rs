@@ -756,7 +756,7 @@ mod tests {
             delivery
         } else {
             delivery
-                .validate_decoded_outcome(
+                .test_only_with_outcome(
                     status_code,
                     [Some([3; 32]), None],
                     Some(block::Hash([4; 32])),

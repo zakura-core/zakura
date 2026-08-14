@@ -143,9 +143,35 @@ impl StoreAuditRead for AuditStore {
         Ok(self.reasons.clone())
     }
 
-    fn all_aux_deliveries(&self) -> Result<Vec<AuxDelivery>, StoreError> {
+    fn all_aux_deliveries(
+        &self,
+    ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>
+    {
         self.check_read(AuditRead::AuxDeliveries)?;
-        Ok(self.aux.clone())
+        Ok(self
+            .aux
+            .iter()
+            .map(|delivery| {
+                let status = match delivery.outcome().status() {
+                    crate::AuxOutcomeStatus::Unauthenticated => 0,
+                    crate::AuxOutcomeStatus::Authenticated => 1,
+                    crate::AuxOutcomeStatus::Rejected => 2,
+                    crate::AuxOutcomeStatus::Disputed => 3,
+                };
+                let observations = delivery
+                    .observation_ids()
+                    .map(|id| id.map(|id| id.digest()));
+                let base = AuxDelivery::new(
+                    delivery.delivery_id,
+                    delivery.header_hash,
+                    delivery.source,
+                    delivery.owner,
+                    delivery.body_size,
+                    delivery.tree_aux,
+                );
+                (base, status, observations, delivery.outcome_boundary_hash())
+            })
+            .collect())
     }
 
     fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError> {

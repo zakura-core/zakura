@@ -68,6 +68,8 @@ mod tests {
         let auxiliary = include_str!("transition/types/auxiliary.rs");
         assert!(!auxiliary.contains("pub enum AuxAuthentication"));
         assert!(!auxiliary.contains("pub authentication:"));
+        assert!(!auxiliary.contains("pub fn validate_decoded"));
+        assert!(!auxiliary.contains("pub fn validate_decoded_outcome"));
     }
 
     #[test]

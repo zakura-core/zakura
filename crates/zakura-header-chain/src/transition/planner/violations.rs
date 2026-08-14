@@ -113,6 +113,9 @@ pub enum HeaderPathProblem {
     /// Parent links or heights were discontinuous.
     #[error("is not continuous")]
     Discontinuous,
+    /// A retained or newly admitted header is excluded from fork choice.
+    #[error("contains an ineligible header")]
+    Ineligible,
     /// Completion ancestor disagreed with the retained parent.
     #[error("ancestor does not match the retained parent")]
     AncestorMismatch,

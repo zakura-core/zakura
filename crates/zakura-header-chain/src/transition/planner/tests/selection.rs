@@ -306,6 +306,126 @@ fn full_state_insertion_rejects_a_contextually_invalid_header() {
 }
 
 #[test]
+fn verified_chain_change_rejects_an_operator_invalid_retained_header() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .expect("the finalized anchor exists")
+        .header
+        .difficulty_threshold;
+    let candidate = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x5d);
+    let candidate_header = store
+        .graph
+        .header_node(candidate.hash)
+        .expect("the retained candidate exists")
+        .header
+        .clone();
+    store
+        .graph
+        .add_eligibility_reason(
+            candidate.hash,
+            EligibilityReason::operator_invalid(
+                candidate.hash,
+                crate::OperatorInvalidationId::new([0x5e; 16]),
+                EvidenceId::from_digest([0x5f; 32]),
+            ),
+        )
+        .expect("the fixture marks the retained candidate ineligible");
+    synchronize_fixture(&mut store, anchor);
+
+    let error = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+                full_state_transition_id: EvidenceId::from_digest([0x60; 32]),
+                old_tip: anchor,
+                new_path: vec![crate::VerifiedHeaderRef {
+                    height: candidate.height,
+                    hash: candidate.hash,
+                    header: candidate_header,
+                }],
+                cause: crate::VerifiedChangeCause::Grow,
+            }),
+        },
+        &context(&config, &clock, Some(&authority)),
+    )
+    .expect_err("an operator-invalid header cannot become the verified winner");
+
+    assert_eq!(
+        error,
+        TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::Header(
+            HeaderViolation::Path {
+                kind: HeaderPathKind::Verified,
+                problem: HeaderPathProblem::Ineligible,
+            }
+        ))
+    );
+}
+
+#[test]
+fn verified_chain_change_rejects_a_deferred_retained_header() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .expect("the finalized anchor exists")
+        .header
+        .difficulty_threshold;
+    let candidate = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x61);
+    let candidate_header = store
+        .graph
+        .header_node(candidate.hash)
+        .expect("the retained candidate exists")
+        .header
+        .clone();
+    store
+        .graph
+        .set_header_validation_state(
+            candidate.hash,
+            HeaderValidationState::DeferredUntil(clock.0 + chrono::Duration::seconds(1)),
+        )
+        .expect("the fixture defers the retained candidate");
+    synchronize_fixture(&mut store, anchor);
+
+    let error = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+                full_state_transition_id: EvidenceId::from_digest([0x62; 32]),
+                old_tip: anchor,
+                new_path: vec![crate::VerifiedHeaderRef {
+                    height: candidate.height,
+                    hash: candidate.hash,
+                    header: candidate_header,
+                }],
+                cause: crate::VerifiedChangeCause::Grow,
+            }),
+        },
+        &context(&config, &clock, Some(&authority)),
+    )
+    .expect_err("a deferred header cannot become the verified winner");
+
+    assert_eq!(
+        error,
+        TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::Header(
+            HeaderViolation::Path {
+                kind: HeaderPathKind::Verified,
+                problem: HeaderPathProblem::Ineligible,
+            }
+        ))
+    );
+}
+
+#[test]
 fn accepted_side_path_does_not_replace_the_verified_winner() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());

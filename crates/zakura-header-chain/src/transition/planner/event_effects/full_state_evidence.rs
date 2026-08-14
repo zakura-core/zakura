@@ -68,6 +68,19 @@ pub(super) fn project_verified_chain_change(
                 },
             )?;
         }
+        if projected
+            .graph()
+            .view_header_node(header.hash)
+            .is_none_or(|node| !node.is_eligible())
+        {
+            return Err(
+                InvalidTransitionEvidence::Header(crate::HeaderViolation::Path {
+                    kind: HeaderPathKind::Verified,
+                    problem: HeaderPathProblem::Ineligible,
+                })
+                .into(),
+            );
+        }
         parent = Frontier::new(header.height, header.hash);
         projected.push_verified(parent);
     }

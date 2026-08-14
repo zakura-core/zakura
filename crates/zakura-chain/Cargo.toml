@@ -31,7 +31,7 @@ async-error = [
 ]
 
 # Experimental internal miner support
-internal-miner = ["dep:cpu-equihash-solver"]
+internal-miner = ["equihash/solver"]
 
 # Test-only features
 
@@ -60,7 +60,6 @@ bs58 = { workspace = true, features = ["check"] }
 byteorder = { workspace = true }
 
 equihash = { workspace = true }
-cpu-equihash-solver = { workspace = true, optional = true, features = ["solver"] }
 
 group = { workspace = true }
 incrementalmerkletree.workspace = true

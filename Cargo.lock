@@ -1776,16 +1776,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "306286e8dcc39ab3dfceb74c792ce8baffdab90591321d3ffaae64829734c37f"
 dependencies = [
  "blake2b_simd",
- "corez",
- "document-features",
-]
-
-[[package]]
-name = "cpu-equihash-solver"
-version = "0.3.0"
-source = "git+https://github.com/valargroup/librustzcash?rev=658533c4c604818610657d9699e82102e7379c76#658533c4c604818610657d9699e82102e7379c76"
-dependencies = [
- "blake2b_simd",
  "cc",
  "corez",
  "document-features",
@@ -6679,7 +6669,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -8385,8 +8375,7 @@ dependencies = [
  "derive-getters",
  "dirs",
  "ed25519-zebra",
- "equihash 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "cpu-equihash-solver",
+ "equihash",
  "futures",
  "group",
  "halo2_proofs",
@@ -8885,7 +8874,7 @@ dependencies = [
  "corez",
  "crypto-common 0.2.0-rc.1",
  "document-features",
- "equihash 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "equihash",
  "ff",
  "hex",
  "incrementalmerkletree",

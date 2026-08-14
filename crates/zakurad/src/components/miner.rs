@@ -22,7 +22,7 @@ use zakura_chain::{
     diagnostic::task::WaitForPanics,
     serialization::{AtLeastOne, ZcashSerialize},
     shutdown::is_shutting_down,
-    work::equihash::{Solution, SolverAction, SolverCancelled},
+    work::equihash::{Solution, SolverCancelled},
 };
 use zakura_network::AddressBookPeers;
 use zakura_node_services::mempool;
@@ -63,30 +63,32 @@ fn should_replace_mining_template(
     current_header != Some(new_header) && (current_header.is_none() || submit_old != Some(true))
 }
 
-/// Returns the solver action for a template change or unavailable template.
-fn mining_template_solver_action(
+/// Cancels mining when the current template changes or becomes unavailable.
+fn cancel_if_mining_template_changed(
     template_receiver: &mut WatchReceiver<Option<Arc<Block>>>,
     old_header: block::Header,
-) -> SolverAction {
-    loop {
-        let current_header = template_receiver
-            .cloned_watch_data_and_update()
-            .map(|block| *block.header);
+) -> Result<(), SolverCancelled> {
+    match template_receiver.has_changed() {
+        // Guard against `get_block_template()` providing an identical header.
+        // This could happen if something irrelevant to the block data changes,
+        // the time was within 1 second, or there is a spurious channel change.
+        Ok(has_changed) => {
+            template_receiver.mark_as_seen();
 
-        // We only need to check header equality, because the block data is bound
-        // to the header. An unavailable template has no header, so it also
-        // cancels current work.
-        if current_header != Some(old_header) {
-            return SolverAction::StopNow;
+            // We only need to check header equality, because the block data is
+            // bound to the header. An unavailable template has no header, so it
+            // also cancels current work.
+            if has_changed
+                && Some(old_header) != template_receiver.cloned_watch_data().map(|b| *b.header)
+            {
+                Err(SolverCancelled)
+            } else {
+                Ok(())
+            }
         }
-
-        match template_receiver.has_changed() {
-            // Re-read an update that raced with the acknowledged snapshot.
-            Ok(true) => continue,
-            Ok(false) => return SolverAction::Continue,
-            // If the sender was dropped, we're likely shutting down.
-            Err(_sender_dropped) => return SolverAction::StopNow,
-        }
+        // If the sender was dropped, we're likely shutting down, so cancel the
+        // solver.
+        Err(_sender_dropped) => Err(SolverCancelled),
     }
 }
 
@@ -512,12 +514,11 @@ where
 
         // Set up the cancellation conditions for the miner.
         let mut cancel_receiver = template_receiver.clone();
-        let mut stale_check_receiver = template_receiver.clone();
         let old_header = *template.header;
-        let solver_action = move || mining_template_solver_action(&mut cancel_receiver, old_header);
+        let cancel_fn = move || cancel_if_mining_template_changed(&mut cancel_receiver, old_header);
 
         // Mine at least one block using the equihash solver.
-        let Ok(blocks) = mine_a_block(solver_id, template, solver_action).await else {
+        let Ok(blocks) = mine_a_block(solver_id, template, cancel_fn).await else {
             // If the solver was cancelled, we're either shutting down, or we have a new template.
             if solver_id == 0 {
                 info!(
@@ -547,20 +548,12 @@ where
         };
 
         // Submit the newly mined blocks to the verifiers.
+        //
+        // TODO: if there is a new template (`cancel_fn().is_err()`), and
+        //       GetBlockTemplate.submit_old is false, return immediately, and skip submitting the
+        //       blocks.
         let mut any_success = false;
         for block in blocks {
-            if mining_template_solver_action(&mut stale_check_receiver, old_header)
-                == SolverAction::StopNow
-            {
-                info!(
-                    ?height,
-                    hash = ?block.hash(),
-                    ?solver_id,
-                    "discarding a solution for a stale mining template",
-                );
-                break;
-            }
-
             let data = block
                 .zcash_serialize_to_vec()
                 .expect("serializing to Vec never fails");
@@ -613,16 +606,16 @@ where
 /// and returns as soon as it has at least one block. Uses a different nonce range for each
 /// `solver_id`.
 ///
-/// Returns early with `Err(SolverCancelled)` when `solver_action()` requests a stop.
+/// If `cancel_fn()` returns an error, returns early with `Err(SolverCancelled)`.
 ///
 /// See [`run_mining_solver()`] for more details.
 pub async fn mine_a_block<F>(
     solver_id: u8,
     template: Arc<Block>,
-    solver_action: F,
+    cancel_fn: F,
 ) -> Result<AtLeastOne<Block>, SolverCancelled>
 where
-    F: FnMut() -> SolverAction + Send + Sync + 'static,
+    F: FnMut() -> Result<(), SolverCancelled> + Send + Sync + 'static,
 {
     // TODO: Replace with Arc::unwrap_or_clone() when it stabilises:
     // https://github.com/rust-lang/rust/issues/93610
@@ -643,7 +636,7 @@ where
                     info!(?error, "could not set miner to run at a low priority: running at default priority");
                 }
 
-                Solution::solve_cancellable(header, solver_action)
+                Solution::solve(header, cancel_fn)
             }).expect("unable to spawn miner thread");
 
             miner_thread_handle.wait_for_panics()
@@ -727,48 +720,15 @@ mod tests {
         template_sender
             .send(Some(block))
             .expect("template receiver remains open");
-        assert_eq!(
-            mining_template_solver_action(&mut template_receiver, old_header),
-            SolverAction::Continue
-        );
+        assert!(cancel_if_mining_template_changed(&mut template_receiver, old_header).is_ok());
 
         template_sender
             .send(None)
             .expect("template receiver remains open");
-        assert_eq!(
-            mining_template_solver_action(&mut template_receiver, old_header),
-            SolverAction::StopNow
-        );
-    }
-
-    #[test]
-    fn stale_check_observes_a_change_seen_by_the_solver() {
-        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-            .zcash_deserialize_into::<Arc<Block>>()
-            .expect("block 1 deserializes");
-        let old_header = *block.header;
-        let mut changed_block = (*block).clone();
-        let mut changed_header = old_header;
-        changed_header.nonce.0[0] ^= 1;
-        changed_block.header = Arc::new(changed_header);
-
-        let (template_sender, template_receiver) = watch::channel(Some(block));
-        let mut solver_receiver = WatchReceiver::new(template_receiver.clone());
-        let mut stale_check_receiver = WatchReceiver::new(template_receiver);
-
-        template_sender
-            .send(Some(Arc::new(changed_block)))
-            .expect("template receivers remain open");
-
-        assert_eq!(
-            mining_template_solver_action(&mut solver_receiver, old_header),
-            SolverAction::StopNow
-        );
-        assert_eq!(
-            mining_template_solver_action(&mut stale_check_receiver, old_header),
-            SolverAction::StopNow,
-            "the submission guard must observe an update after the solver consumes it"
-        );
+        assert!(matches!(
+            cancel_if_mining_template_changed(&mut template_receiver, old_header),
+            Err(SolverCancelled)
+        ));
     }
 
     #[tokio::test]

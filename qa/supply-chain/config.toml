@@ -434,11 +434,6 @@ version = "0.1.1"
 criteria = "safe-to-deploy"
 notes = "Replacement for the yanked core2 crate; pulled in transitively by librustzcash 2026-04 release wave."
 
-[[exemptions.cpu-equihash-solver]]
-version = "0.3.0"
-criteria = "safe-to-deploy"
-notes = "Temporary internal-miner fork pinned to a reviewed valargroup/librustzcash commit."
-
 [[exemptions.cpufeatures]]
 version = "0.2.12"
 criteria = "safe-to-deploy"

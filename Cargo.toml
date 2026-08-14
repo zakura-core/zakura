@@ -67,11 +67,6 @@ derive-new = "0.5"
 dirs = "6.0"
 ed25519-zebra = "4.2"
 equihash = "0.3"
-# Temporary fork used only by the `zakura-chain` crate's `internal-miner`
-# feature for interruptible CPU Equihash solving. Consensus verification
-# continues to use registry `equihash`. Replace this dependency with a
-# published upstream release before merging.
-cpu-equihash-solver = { version = "0.3", git = "https://github.com/valargroup/librustzcash", rev = "658533c4c604818610657d9699e82102e7379c76" }
 ff = "0.13"
 futures = "0.3.31"
 futures-core = "0.3.31"

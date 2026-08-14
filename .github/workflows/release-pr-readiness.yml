@@ -31,6 +31,7 @@ jobs:
               "new-crate-versions",
               "release-hold",
           }
+          allowed = required | {"release-state"}
 
           if manual_heading not in body:
               raise SystemExit(
@@ -53,7 +54,7 @@ jobs:
                   + ", ".join(duplicates)
               )
           missing = sorted(required - set(found))
-          unexpected = sorted(set(found) - required)
+          unexpected = sorted(set(found) - allowed)
           if missing or unexpected:
               details = []
               if missing:

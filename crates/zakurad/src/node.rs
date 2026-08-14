@@ -104,7 +104,8 @@ mod tests {
             config,
             vec![CustomService {
                 service: Arc::new(RegistrationProbe(service_registered.clone())),
-                advertised_services: Vec::new(),
+                provides: Vec::new(),
+                seeks: Vec::new(),
             }],
             CancellationToken::new(),
         ));

@@ -109,6 +109,7 @@ impl ZakuraTestNode {
             self.endpoint.clone(),
             self.discovery.clone(),
             self.limits.clone(),
+            Vec::new(),
         ))
     }
 

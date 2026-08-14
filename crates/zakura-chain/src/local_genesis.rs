@@ -399,6 +399,7 @@ fn build_network(options: BuildNetworkOptions<'_>) -> Result<Network, crate::Box
         .with_target_difficulty_limit(target_difficulty)?
         .with_disable_pow(disable_pow)
         .with_slow_start_interval(Height(0))
+        .with_max_block_time_start_height(Height(activation_height))
         .with_activation_heights(activation_heights)?
         .with_halving_interval(144)?
         .with_funding_streams(vec![])
@@ -665,6 +666,34 @@ mod tests {
             .collect();
 
         assert_eq!(deltas, vec![25; generated.blocks.len() - 1]);
+    }
+
+    #[test]
+    fn generated_seed_chain_precedes_max_block_time_rule() {
+        let generated = generate_local_testnet_with_funded_keys(
+            vec!["alice".to_string(), "bob".to_string()],
+            LocalTestnetGenesisOptions {
+                target_spacing_secs: 5_401,
+                seeded_tip_time: Some(20_000),
+                ..Default::default()
+            },
+        )
+        .expect("local testnet should generate");
+
+        let seeded_tip_height = Height(
+            u32::try_from(generated.blocks.len() - 1)
+                .expect("the generated seed chain length fits in a block height"),
+        );
+        let post_seed_height = Height(
+            u32::try_from(generated.blocks.len())
+                .expect("the generated post-seed height fits in a block height"),
+        );
+        assert!(!generated
+            .network
+            .is_max_block_time_enforced(seeded_tip_height));
+        assert!(generated
+            .network
+            .is_max_block_time_enforced(post_seed_height));
     }
 
     #[test]

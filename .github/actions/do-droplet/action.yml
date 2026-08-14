@@ -40,6 +40,9 @@ outputs:
   ip:
     description: "Droplet public IPv4"
     value: ${{ steps.create.outputs.ip }}
+  size:
+    description: "Droplet size selected after checking regional availability"
+    value: ${{ steps.create.outputs.size }}
   image_id:
     description: "Image the droplet was created from"
     value: ${{ steps.image.outputs.image_id }}
@@ -115,6 +118,42 @@ runs:
         set -euo pipefail
         # nyc3 throughout: it must match the region the bake ran in, since the
         # image and volume snapshots only exist there.
+        REGION=nyc3
+        IMAGE_MIN_DISK=$(doctl compute image get "${IMAGE_ID}" --output json | \
+          jq -r '.[0].min_disk_size')
+        if [[ ! "${IMAGE_MIN_DISK}" =~ ^[0-9]+$ ]]; then
+          echo "could not determine minimum disk size for image ${IMAGE_ID}" >&2
+          exit 1
+        fi
+
+        SIZES=$(doctl compute size list --output json)
+        ELIGIBLE_SIZES=()
+        CANDIDATE_SIZES=("${DROPLET_SIZE}")
+        if [ "${DROPLET_SIZE}" = "c-8" ]; then
+          CANDIDATE_SIZES+=("c-8-intel")
+        fi
+        for CANDIDATE in "${CANDIDATE_SIZES[@]}"; do
+          if jq -e \
+            --arg slug "${CANDIDATE}" \
+            --arg region "${REGION}" \
+            --argjson min_disk "${IMAGE_MIN_DISK}" \
+            'any(.[];
+              .slug == $slug
+              and .available == true
+              and (.regions | index($region)) != null
+              and .disk >= $min_disk
+            )' <<< "${SIZES}" > /dev/null
+          then
+            ELIGIBLE_SIZES+=("${CANDIDATE}")
+          else
+            echo "skipping droplet size ${CANDIDATE}: unavailable in ${REGION} or disk is smaller than ${IMAGE_MIN_DISK} GB"
+          fi
+        done
+        if [ "${#ELIGIBLE_SIZES[@]}" -eq 0 ]; then
+          echo "none of the candidate droplet sizes (${CANDIDATE_SIZES[*]}) is usable in ${REGION}" >&2
+          exit 1
+        fi
+
         VOLUME_ARGS=()
         if [ -n "${VOL_SNAP_ID}" ]; then
           # A snapshot restore cannot shrink, so the clone takes the snapshot's
@@ -132,15 +171,41 @@ runs:
             echo "volume_name=${VOLUME_NAME}"
           } >> "$GITHUB_OUTPUT"
         fi
-        doctl compute droplet create "${NAME}" \
-          --region nyc3 \
-          --size "${DROPLET_SIZE}" \
-          --image "${IMAGE_ID}" \
-          --ssh-keys "${SSH_FINGERPRINT}" \
-          "${VOLUME_ARGS[@]}" \
-          --tag-name "${TAG}" \
-          --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
+
+        CREATE_ERROR=$(mktemp)
+        trap 'rm -f "${CREATE_ERROR}"' EXIT
+        CREATED=
+        for RESOLVED_SIZE in "${ELIGIBLE_SIZES[@]}"; do
+          echo "creating ${NAME} with droplet size ${RESOLVED_SIZE} in ${REGION}"
+          if doctl compute droplet create "${NAME}" \
+            --region "${REGION}" \
+            --size "${RESOLVED_SIZE}" \
+            --image "${IMAGE_ID}" \
+            --ssh-keys "${SSH_FINGERPRINT}" \
+            "${VOLUME_ARGS[@]}" \
+            --tag-name "${TAG}" \
+            --wait --format ID,PublicIPv4 --no-header \
+            > /tmp/droplet.txt 2> "${CREATE_ERROR}"
+          then
+            CREATED=1
+            break
+          fi
+
+          ERROR=$(<"${CREATE_ERROR}")
+          printf '%s\n' "${ERROR}" >&2
+          shopt -s nocasematch
+          if [[ "${ERROR}" != *"capacity"* && "${ERROR}" != *"size is not available"* ]]; then
+            exit 1
+          fi
+          shopt -u nocasematch
+          echo "retrying with the next approved droplet size"
+        done
+        if [ -z "${CREATED}" ]; then
+          echo "DigitalOcean could not provision any approved droplet size in ${REGION}" >&2
+          exit 1
+        fi
         {
           echo "id=$(awk '{print $1}' /tmp/droplet.txt)"
           echo "ip=$(awk '{print $2}' /tmp/droplet.txt)"
+          echo "size=${RESOLVED_SIZE}"
         } >> "$GITHUB_OUTPUT"

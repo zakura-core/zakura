@@ -192,6 +192,10 @@ fn header_insert_rebases_and_trims_across_each_monotone_finality_position() {
                 Err(TransitionFailure::Counter(_))
             ));
         }
+        if finalized_count == 3 {
+            // Reproduce an adjacent replay key whose original payload finality fully consumed.
+            store.metadata.last_transition = held.event.fingerprint();
+        }
 
         let plan =
             apply_with_header_rebase_facts(&store, held, &config, &clock, rebased_validation)

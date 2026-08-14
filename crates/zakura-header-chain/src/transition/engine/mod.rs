@@ -11,6 +11,7 @@ use zakura_chain::block;
 use crate::{
     AuxDelivery, AuxObservationId, AuxOutcomeStatus, EngineMetadata, EngineSnapshot,
     EngineTransition, GraphError, MemHeaderStore, TransitionContext, TransitionFailure,
+    UntrustedAuxDeliveryRow,
 };
 
 use super::planner::derive_transition_plan;
@@ -107,9 +108,7 @@ impl HeaderChainEngine {
         metadata: EngineMetadata,
         selected: Vec<crate::Frontier>,
         verified: Vec<crate::Frontier>,
-        deliveries: impl IntoIterator<
-            Item = (AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>),
-        >,
+        deliveries: impl IntoIterator<Item = UntrustedAuxDeliveryRow>,
     ) -> Result<Self, EngineHydrationError> {
         let deliveries = validate_recovered_auxiliary_rows(&graph, deliveries)?;
         Self::from_validated_state(graph, metadata, selected, verified, deliveries)
@@ -333,13 +332,15 @@ impl HeaderChainEngine {
 
 pub(crate) fn validate_recovered_auxiliary_rows(
     graph: &MemHeaderStore,
-    rows: impl IntoIterator<Item = (AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>,
+    rows: impl IntoIterator<Item = UntrustedAuxDeliveryRow>,
 ) -> Result<Vec<AuxDelivery>, EngineHydrationError> {
     let mut delivery_ids = HashSet::new();
     let mut observation_members: HashMap<AuxObservationId, Vec<(block::Hash, block::Hash)>> =
         HashMap::new();
     let mut deliveries = Vec::new();
-    for (delivery, status_code, observation_digests, boundary_hash) in rows {
+    for untrusted_row in rows {
+        let (delivery, status_code, observation_digests, boundary_hash) =
+            untrusted_row.into_parts();
         if !delivery.is_unauthenticated() || !delivery_ids.insert(delivery.delivery_id) {
             return Err(EngineHydrationError::Incoherent(
                 "untrusted auxiliary row has duplicate or authoritative base data",
@@ -757,7 +758,12 @@ mod tests {
                 view.metadata,
                 view.selected,
                 view.verified,
-                [(row, 1, [Some([4; 32]), None], Some(block::Hash([0xf4; 32])),)],
+                [UntrustedAuxDeliveryRow::new(
+                    row,
+                    1,
+                    [Some([4; 32]), None],
+                    Some(block::Hash([0xf4; 32])),
+                )],
             ),
             Err(EngineHydrationError::Incoherent(
                 "derived auxiliary boundary is not retained"

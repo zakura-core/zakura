@@ -32,14 +32,17 @@ pub(super) fn audit_authoritative<S: StoreAuditSnapshot>(
     let PreAuditStoreRows {
         snapshot_before_repair,
         metadata,
-        source_nodes,
-        tombstones,
+        source_header_nodes,
+        consensus_invalid_body_tombstones,
         validation_contexts,
         trust_anchor_changed,
         early_violations,
     } = rows;
     let mut violations = early_violations;
-    let by_hash: HashMap<_, _> = source_nodes.iter().map(|node| (node.hash, node)).collect();
+    let by_hash: HashMap<_, _> = source_header_nodes
+        .iter()
+        .map(|header_node| (header_node.hash, header_node))
+        .collect();
     let archived_contexts: HashMap<_, _> = validation_contexts
         .iter()
         .map(|record| (record.header.hash(), record.header.as_ref()))
@@ -51,12 +54,12 @@ pub(super) fn audit_authoritative<S: StoreAuditSnapshot>(
     {
         violations.push(AuditViolation::ProtectedPath(finalized.hash));
     }
-    let tombstones_by_hash: HashMap<_, _> = tombstones
+    let tombstones_by_hash: HashMap<_, _> = consensus_invalid_body_tombstones
         .iter()
         .map(|tombstone| (tombstone.hash, tombstone))
         .collect();
     check_nodes(
-        &source_nodes,
+        &source_header_nodes,
         &by_hash,
         &archived_contexts,
         &metadata,
@@ -64,7 +67,7 @@ pub(super) fn audit_authoritative<S: StoreAuditSnapshot>(
         now,
         &mut violations,
     );
-    for node in &source_nodes {
+    for node in &source_header_nodes {
         match (
             &node.body_validation_state,
             tombstones_by_hash.get(&node.hash),
@@ -79,17 +82,17 @@ pub(super) fn audit_authoritative<S: StoreAuditSnapshot>(
             (_, None) => {}
         }
     }
-    for tombstone in &tombstones {
+    for tombstone in &consensus_invalid_body_tombstones {
         if tombstone.height <= finalized.height {
             violations.push(AuditViolation::ConsensusInvalidBodyTombstone(
                 tombstone.hash,
             ));
         }
     }
-    check_finalized_connectivity(&source_nodes, finalized, &mut violations);
-    check_trust_pins(&source_nodes, finalized, config, &mut violations);
+    check_finalized_connectivity(&source_header_nodes, finalized, &mut violations);
+    check_trust_pins(&source_header_nodes, finalized, config, &mut violations);
     let maximum_aux = config.limits.max_aux_deliveries_total.get();
-    let mut untrusted_deliveries = Vec::with_capacity(maximum_aux.min(source_nodes.len()));
+    let mut untrusted_deliveries = Vec::with_capacity(maximum_aux.min(source_header_nodes.len()));
     store.visit_aux_deliveries(RowLimit::new(maximum_aux), &mut |delivery| {
         untrusted_deliveries.push(delivery);
         Ok(())
@@ -99,8 +102,8 @@ pub(super) fn audit_authoritative<S: StoreAuditSnapshot>(
     } else {
         MemHeaderStore::reconstruct(HeaderGraphReconstruction::new(
             finalized,
-            source_nodes.clone(),
-            tombstones.clone(),
+            source_header_nodes.clone(),
+            consensus_invalid_body_tombstones.clone(),
         ))
         .ok()
         .and_then(|graph| validate_recovered_auxiliary_rows(&graph, untrusted_deliveries).ok())
@@ -112,14 +115,14 @@ pub(super) fn audit_authoritative<S: StoreAuditSnapshot>(
     }
     check_authoritative_rows(
         store,
-        &source_nodes,
+        &source_header_nodes,
         recovered_deliveries.as_deref().unwrap_or_default(),
         &validation_contexts,
         &metadata,
         config,
         &mut violations,
     )?;
-    if source_nodes.len().saturating_sub(1) > config.limits.max_non_finalized_nodes.get()
+    if source_header_nodes.len().saturating_sub(1) > config.limits.max_non_finalized_nodes.get()
         && !metadata.alarms.resource_stalled
     {
         violations.push(AuditViolation::Limits);
@@ -132,8 +135,8 @@ pub(super) fn audit_authoritative<S: StoreAuditSnapshot>(
     Ok(AuditedSource {
         snapshot_before_repair,
         metadata,
-        source_nodes,
-        tombstones,
+        source_header_nodes,
+        consensus_invalid_body_tombstones,
         trust_anchor_changed,
     })
 }

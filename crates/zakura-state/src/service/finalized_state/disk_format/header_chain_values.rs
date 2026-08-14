@@ -22,7 +22,7 @@ use zakura_header_chain::{
     HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner,
     HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, OperatorInvalidationId, SourceId,
     StateVersion, SuffixWork, TransitionDomain, TransitionFingerprint, TreeAuxRecordV1,
-    VerifiedGeneration, WorkCoordinate,
+    UntrustedAuxDeliveryRow, VerifiedGeneration, WorkCoordinate,
 };
 
 use super::FallibleDiskValue;
@@ -1036,9 +1036,12 @@ impl FallibleDiskValue for AuxDelivery {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
-        let (delivery, status, observations, boundary) = decode_untrusted_aux_delivery(bytes)?;
-        if status == 0 && observations == [None, None] && boundary.is_none() {
-            Ok(delivery)
+        let row = decode_untrusted_aux_delivery(bytes)?;
+        if row.outcome_status_code() == 0
+            && row.observation_digests() == [None, None]
+            && row.outcome_boundary_hash().is_none()
+        {
+            Ok(row.delivery())
         } else {
             Err(HeaderChainValueError::InvalidAuxOutcome)
         }
@@ -1089,9 +1092,7 @@ fn put_aux(encoder: &mut Encoder, value: AuxDelivery) {
     }
 }
 
-fn get_aux(
-    decoder: &mut Decoder<'_>,
-) -> Result<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>), HeaderChainValueError> {
+fn get_aux(decoder: &mut Decoder<'_>) -> Result<UntrustedAuxDeliveryRow, HeaderChainValueError> {
     let delivery_id = EvidenceId::from_digest(decoder.array()?);
     let header_hash = block::Hash(decoder.array()?);
     let source = SourceId::from_digest(decoder.array()?);
@@ -1133,12 +1134,17 @@ fn get_aux(
         ([first, second], Some(block::Hash(decoder.array()?)))
     };
     let delivery = AuxDelivery::new(delivery_id, header_hash, source, owner, body_size, tree_aux);
-    Ok((delivery, status_code, observation_digests, boundary_hash))
+    Ok(UntrustedAuxDeliveryRow::new(
+        delivery,
+        status_code,
+        observation_digests,
+        boundary_hash,
+    ))
 }
 
 pub(crate) fn decode_untrusted_aux_delivery(
     bytes: &[u8],
-) -> Result<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>), HeaderChainValueError> {
+) -> Result<UntrustedAuxDeliveryRow, HeaderChainValueError> {
     let mut decoder = Decoder::new(bytes);
     let row = get_aux(&mut decoder)?;
     decoder.finish()?;
@@ -1656,11 +1662,11 @@ mod tests {
             .expect("the authenticated outcome is coherent");
         assert_eq!(
             decode_untrusted_aux_delivery(&aux.encode().expect("aux encodes")),
-            Ok((
+            Ok(UntrustedAuxDeliveryRow::new(
                 base_aux,
                 1,
                 [Some([11; 32]), None],
-                Some(block::Hash([12; 32]))
+                Some(block::Hash([12; 32])),
             ))
         );
         let rejected_aux = base_aux
@@ -1668,11 +1674,11 @@ mod tests {
             .expect("the rejected outcome is coherent");
         assert_eq!(
             decode_untrusted_aux_delivery(&rejected_aux.encode().expect("rejected aux encodes")),
-            Ok((
+            Ok(UntrustedAuxDeliveryRow::new(
                 base_aux,
                 2,
                 [Some([13; 32]), None],
-                Some(block::Hash([14; 32]))
+                Some(block::Hash([14; 32])),
             ))
         );
         let disputed_aux = base_aux
@@ -1680,11 +1686,11 @@ mod tests {
             .expect("the disputed outcome is coherent");
         assert_eq!(
             decode_untrusted_aux_delivery(&disputed_aux.encode().expect("disputed aux encodes")),
-            Ok((
+            Ok(UntrustedAuxDeliveryRow::new(
                 base_aux,
                 3,
                 [Some([15; 32]), None],
-                Some(block::Hash([16; 32]))
+                Some(block::Hash([16; 32])),
             ))
         );
         let mut legacy_aux = aux.encode().expect("aux encodes");
@@ -1693,11 +1699,11 @@ mod tests {
             .copy_from_slice(&99_u64.to_be_bytes());
         assert_eq!(
             decode_untrusted_aux_delivery(&legacy_aux),
-            Ok((
+            Ok(UntrustedAuxDeliveryRow::new(
                 base_aux,
                 1,
                 [Some([11; 32]), None],
-                Some(block::Hash([12; 32]))
+                Some(block::Hash([12; 32])),
             ))
         );
         let mut malformed_aux = aux.encode().expect("aux encodes");

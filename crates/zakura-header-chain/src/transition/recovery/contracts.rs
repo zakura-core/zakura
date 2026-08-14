@@ -7,9 +7,9 @@ use thiserror::Error;
 use zakura_chain::block;
 
 use crate::{
-    AuxDelivery, BodyValidationState, ConsensusInvalidBodyTombstone, CounterExhausted,
-    EligibilityReason, EngineMetadata, EngineSnapshot, FinalityHistoryCheckpoint, FinalityRecord,
-    Frontier, HeaderNode, RowLimit, StoreError,
+    BodyValidationState, ConsensusInvalidBodyTombstone, CounterExhausted, EligibilityReason,
+    EngineMetadata, EngineSnapshot, FinalityHistoryCheckpoint, FinalityRecord, Frontier,
+    HeaderNode, RowLimit, StoreError, UntrustedAuxDeliveryRow,
 };
 
 /// One immutable predecessor record stored below the selectable finalized anchor.
@@ -50,8 +50,10 @@ pub trait StoreAuditSnapshot {
     fn snapshot(&self) -> Result<EngineSnapshot, StoreError>;
     /// Return complete singleton metadata from the same version as [`Self::snapshot`].
     fn metadata(&self) -> Result<EngineMetadata, StoreError>;
-    /// Count one collection up to `limit + 1` without decoding the extra row.
     /// Visit header-node rows, including disconnected rows.
+    ///
+    /// Stop before decoding row `limit + 1` and return
+    /// [`StoreError::LimitExceeded`] when that row exists.
     fn visit_header_nodes(
         &self,
         limit: RowLimit,
@@ -105,9 +107,7 @@ pub trait StoreAuditSnapshot {
     fn visit_aux_deliveries(
         &self,
         limit: RowLimit,
-        visitor: &mut dyn FnMut(
-            (AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>),
-        ) -> Result<(), StoreError>,
+        visitor: &mut dyn FnMut(UntrustedAuxDeliveryRow) -> Result<(), StoreError>,
     ) -> Result<(), StoreError>;
     /// Visit immutable below-finalized context rows.
     fn visit_validation_context_records(

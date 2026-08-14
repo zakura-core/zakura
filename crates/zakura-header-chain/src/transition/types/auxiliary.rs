@@ -281,3 +281,64 @@ pub struct TreeAuxRecordV1 {
 
 /// Prepared auxiliary input admitted alongside a header batch.
 pub type PreparedAuxDelivery = AuxDelivery;
+
+/// One auxiliary delivery row decoded from durable state before outcome validation.
+///
+/// The row keeps raw outcome fields separate from [`AuxDelivery`] so decoding
+/// cannot construct an authoritative outcome. Recovery validates the complete
+/// row against the retained graph before it promotes the outcome.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct UntrustedAuxDeliveryRow {
+    delivery: AuxDelivery,
+    outcome_status_code: u8,
+    observation_digests: [Option<[u8; 32]>; 2],
+    outcome_boundary_hash: Option<block::Hash>,
+}
+
+impl UntrustedAuxDeliveryRow {
+    /// Construct one decoded row without promoting its outcome.
+    pub const fn new(
+        delivery: AuxDelivery,
+        outcome_status_code: u8,
+        observation_digests: [Option<[u8; 32]>; 2],
+        outcome_boundary_hash: Option<block::Hash>,
+    ) -> Self {
+        Self {
+            delivery,
+            outcome_status_code,
+            observation_digests,
+            outcome_boundary_hash,
+        }
+    }
+
+    /// Return the unauthenticated delivery fields.
+    pub const fn delivery(self) -> AuxDelivery {
+        self.delivery
+    }
+
+    /// Return the raw durable outcome status code.
+    pub const fn outcome_status_code(self) -> u8 {
+        self.outcome_status_code
+    }
+
+    /// Return the raw durable observation digests.
+    pub const fn observation_digests(self) -> [Option<[u8; 32]>; 2] {
+        self.observation_digests
+    }
+
+    /// Return the raw durable outcome boundary.
+    pub const fn outcome_boundary_hash(self) -> Option<block::Hash> {
+        self.outcome_boundary_hash
+    }
+
+    pub(crate) const fn into_parts(
+        self,
+    ) -> (AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>) {
+        (
+            self.delivery,
+            self.outcome_status_code,
+            self.observation_digests,
+            self.outcome_boundary_hash,
+        )
+    }
+}

@@ -19,7 +19,7 @@ pub(super) fn reconstruct_derived_views(
     config: &EngineConfig,
     now: DateTime<Utc>,
 ) -> Result<ReconstructedDerivedViews, RecoveryFailure> {
-    let mut promoted_source_nodes = audited.source_nodes.clone();
+    let mut promoted_source_nodes = audited.source_header_nodes.clone();
     let mut elapsed_deferrals = false;
     for node in &mut promoted_source_nodes {
         if matches!(node.validation, crate::HeaderValidationState::DeferredUntil(until) if until <= now)
@@ -33,7 +33,7 @@ pub(super) fn reconstruct_derived_views(
     let mut graph = MemHeaderStore::reconstruct(crate::HeaderGraphReconstruction::new(
         finalized,
         promoted_source_nodes.clone(),
-        audited.tombstones.clone(),
+        audited.consensus_invalid_body_tombstones.clone(),
     ))
     .map_err(|_| RecoveryFailure::Source {
         violations: vec![AuditViolation::ProtectedPath(finalized.hash)],

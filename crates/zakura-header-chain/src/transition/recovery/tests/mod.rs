@@ -18,7 +18,7 @@ use crate::{
     EngineSnapshot, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
     FrontierSet, HeaderChainDiskVersion, HeaderGeneration, HeaderNode, HeaderValidationState,
     RowLimit, StateVersion, StoreCollection, StoreError, SuffixWork, TrustedAnchor,
-    VerifiedGeneration, WorkCoordinate,
+    UntrustedAuxDeliveryRow, VerifiedGeneration, WorkCoordinate,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -28,7 +28,7 @@ pub(super) enum AuditRead {
     HeaderNodes,
     Tombstones,
     BodyStateAuthority,
-    ChildEdges,
+    HeaderChildEdges,
     SelectedProjection,
     VerifiedProjection,
     DeferredEntries,
@@ -48,7 +48,7 @@ impl AuditRead {
         Self::HeaderNodes,
         Self::Tombstones,
         Self::BodyStateAuthority,
-        Self::ChildEdges,
+        Self::HeaderChildEdges,
         Self::SelectedProjection,
         Self::VerifiedProjection,
         Self::DeferredEntries,
@@ -150,7 +150,7 @@ impl StoreAuditSnapshot for &AuditStore {
     ) -> Result<(), StoreError> {
         self.visit_bounded(
             AuditRead::Tombstones,
-            StoreCollection::ConsensusInvalidTombstones,
+            StoreCollection::ConsensusInvalidBodyTombstones,
             &self.tombstones,
             limit,
             visitor,
@@ -176,8 +176,8 @@ impl StoreAuditSnapshot for &AuditStore {
         visitor: &mut dyn FnMut((block::Hash, block::Hash)) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         self.visit_bounded(
-            AuditRead::ChildEdges,
-            StoreCollection::ChildEdges,
+            AuditRead::HeaderChildEdges,
+            StoreCollection::HeaderChildEdges,
             &self.children,
             limit,
             visitor,
@@ -219,7 +219,7 @@ impl StoreAuditSnapshot for &AuditStore {
     ) -> Result<(), StoreError> {
         self.visit_bounded(
             AuditRead::DeferredEntries,
-            StoreCollection::DeferredRows,
+            StoreCollection::DeferredHeaderEntries,
             &self.deferred,
             limit,
             visitor,
@@ -233,7 +233,7 @@ impl StoreAuditSnapshot for &AuditStore {
     ) -> Result<(), StoreError> {
         self.visit_bounded(
             AuditRead::EligibilityRoots,
-            StoreCollection::EligibilityReasons,
+            StoreCollection::EligibilityReasonRoots,
             &self.reasons,
             limit,
             visitor,
@@ -243,9 +243,7 @@ impl StoreAuditSnapshot for &AuditStore {
     fn visit_aux_deliveries(
         &self,
         limit: RowLimit,
-        visitor: &mut dyn FnMut(
-            (AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>),
-        ) -> Result<(), StoreError>,
+        visitor: &mut dyn FnMut(UntrustedAuxDeliveryRow) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         let rows: Vec<_> = self
             .aux
@@ -268,7 +266,12 @@ impl StoreAuditSnapshot for &AuditStore {
                     delivery.body_size,
                     delivery.tree_aux,
                 );
-                (base, status, observations, delivery.outcome_boundary_hash())
+                UntrustedAuxDeliveryRow::new(
+                    base,
+                    status,
+                    observations,
+                    delivery.outcome_boundary_hash(),
+                )
             })
             .collect();
         self.visit_bounded(

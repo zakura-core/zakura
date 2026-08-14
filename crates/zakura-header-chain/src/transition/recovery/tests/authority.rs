@@ -405,7 +405,7 @@ fn migrated_finality_is_rejected_after_the_migration_boundary() {
 }
 
 #[test]
-fn f_225519_recovery_rejects_an_extra_node_before_decoding_rows() {
+fn recovery_rejects_an_extra_node_before_decoding_rows() {
     let (mut store, mut config) = fixture();
     config.limits.max_non_finalized_nodes =
         NonZeroUsize::new(1).expect("one is a valid node limit");
@@ -422,7 +422,7 @@ fn f_225519_recovery_rejects_an_extra_node_before_decoding_rows() {
 }
 
 #[test]
-fn f_225513_resource_alarm_does_not_exempt_the_startup_node_limit() {
+fn resource_alarm_does_not_exempt_the_startup_node_limit() {
     let (mut store, mut config) = fixture();
     config.limits.max_non_finalized_nodes =
         NonZeroUsize::new(1).expect("one is a valid node limit");

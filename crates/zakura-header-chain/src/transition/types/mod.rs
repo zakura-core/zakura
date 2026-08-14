@@ -11,7 +11,9 @@ mod write_set;
 #[cfg(test)]
 mod tests;
 
-pub use auxiliary::{AuxDelivery, BodySizeHint, PreparedAuxDelivery, TreeAuxRecordV1};
+pub use auxiliary::{
+    AuxDelivery, BodySizeHint, PreparedAuxDelivery, TreeAuxRecordV1, UntrustedAuxDeliveryRow,
+};
 pub(crate) use auxiliary::{AuxOutcome, AuxOutcomeStatus};
 pub use error::{RowLimit, StoreCollection, StoreError, TransitionTypeError};
 pub(crate) use event::AuxVerificationKindV1;

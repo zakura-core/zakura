@@ -18,8 +18,8 @@ use super::contracts::{
 pub(super) struct PreAuditStoreRows {
     pub(super) snapshot_before_repair: EngineSnapshot,
     pub(super) metadata: EngineMetadata,
-    pub(super) source_nodes: Vec<HeaderNode>,
-    pub(super) tombstones: Vec<ConsensusInvalidBodyTombstone>,
+    pub(super) source_header_nodes: Vec<HeaderNode>,
+    pub(super) consensus_invalid_body_tombstones: Vec<ConsensusInvalidBodyTombstone>,
     pub(super) validation_contexts: Vec<ValidationContextRecord>,
     pub(super) trust_anchor_changed: bool,
     pub(super) early_violations: Vec<AuditViolation>,
@@ -29,8 +29,8 @@ pub(super) struct PreAuditStoreRows {
 pub(super) struct AuditedSource {
     pub(super) snapshot_before_repair: EngineSnapshot,
     pub(super) metadata: EngineMetadata,
-    pub(super) source_nodes: Vec<HeaderNode>,
-    pub(super) tombstones: Vec<ConsensusInvalidBodyTombstone>,
+    pub(super) source_header_nodes: Vec<HeaderNode>,
+    pub(super) consensus_invalid_body_tombstones: Vec<ConsensusInvalidBodyTombstone>,
     pub(super) trust_anchor_changed: bool,
 }
 
@@ -81,28 +81,29 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
         .ok_or(StoreError::Incoherent(
             "header-node recovery limit overflow",
         ))?;
-    let mut source_nodes = Vec::with_capacity(maximum_nodes);
-    store.visit_header_nodes(RowLimit::new(maximum_nodes), &mut |node| {
-        source_nodes.push(node);
+    let mut source_header_nodes = Vec::with_capacity(maximum_nodes);
+    store.visit_header_nodes(RowLimit::new(maximum_nodes), &mut |header_node| {
+        source_header_nodes.push(header_node);
         Ok(())
     })?;
-    let mut tombstones = Vec::with_capacity(source_nodes.len().min(65_536));
+    let mut consensus_invalid_body_tombstones =
+        Vec::with_capacity(source_header_nodes.len().min(65_536));
     store.visit_consensus_invalid_body_tombstones(RowLimit::new(65_536), &mut |tombstone| {
-        tombstones.push(tombstone);
+        consensus_invalid_body_tombstones.push(tombstone);
         Ok(())
     })?;
-    if store.consensus_invalid_body_tombstone_count()? != tombstones.len() {
+    if store.consensus_invalid_body_tombstone_count()? != consensus_invalid_body_tombstones.len() {
         return Err(StoreError::Incoherent("consensus-invalid tombstone count mismatch").into());
     }
     let mut tombstone_hashes = HashSet::new();
-    for tombstone in &tombstones {
+    for tombstone in &consensus_invalid_body_tombstones {
         if !tombstone_hashes.insert(tombstone.hash) {
             early_violations.push(AuditViolation::ConsensusInvalidBodyTombstone(
                 tombstone.hash,
             ));
         }
     }
-    for tombstone in &tombstones {
+    for tombstone in &consensus_invalid_body_tombstones {
         let state = BodyValidationState::ConsensusInvalid {
             evidence: tombstone.evidence,
             rule: tombstone.rule.clone(),
@@ -113,9 +114,10 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
             ));
         }
     }
-    source_nodes.sort_unstable_by_key(|node| (node.height, node.hash.0));
+    source_header_nodes
+        .sort_unstable_by_key(|header_node| (header_node.height, header_node.hash.0));
     let mut unique = HashSet::new();
-    for node in &source_nodes {
+    for node in &source_header_nodes {
         if !unique.insert(node.hash) || node.header.hash() != node.hash {
             early_violations.push(AuditViolation::NodeHash(node.hash));
         }
@@ -139,8 +141,8 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
     Ok(PreAuditStoreRows {
         snapshot_before_repair,
         metadata,
-        source_nodes,
-        tombstones,
+        source_header_nodes,
+        consensus_invalid_body_tombstones,
         validation_contexts,
         trust_anchor_changed,
         early_violations,

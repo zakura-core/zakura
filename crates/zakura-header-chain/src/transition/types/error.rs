@@ -8,15 +8,15 @@ pub enum StoreCollection {
     /// Retained header nodes, including the finalized anchor.
     HeaderNodes,
     /// Persisted parent-child edges.
-    ChildEdges,
+    HeaderChildEdges,
     /// Selected-height projection rows.
     SelectedProjection,
     /// Verified-height projection rows.
     VerifiedProjection,
     /// Future-time deferred rows.
-    DeferredRows,
+    DeferredHeaderEntries,
     /// Direct eligibility-reason rows.
-    EligibilityReasons,
+    EligibilityReasonRoots,
     /// Auxiliary delivery rows.
     AuxiliaryDeliveries,
     /// Immutable predecessor validation contexts.
@@ -24,22 +24,22 @@ pub enum StoreCollection {
     /// Finality provenance rows.
     FinalityHistory,
     /// Consensus-invalid body tombstones.
-    ConsensusInvalidTombstones,
+    ConsensusInvalidBodyTombstones,
 }
 
 impl std::fmt::Display for StoreCollection {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::HeaderNodes => "header nodes",
-            Self::ChildEdges => "child edges",
+            Self::HeaderChildEdges => "header child edges",
             Self::SelectedProjection => "selected projection",
             Self::VerifiedProjection => "verified projection",
-            Self::DeferredRows => "deferred rows",
-            Self::EligibilityReasons => "eligibility reasons",
+            Self::DeferredHeaderEntries => "deferred header entries",
+            Self::EligibilityReasonRoots => "eligibility reason roots",
             Self::AuxiliaryDeliveries => "auxiliary deliveries",
             Self::ValidationContexts => "validation contexts",
             Self::FinalityHistory => "finality history",
-            Self::ConsensusInvalidTombstones => "consensus-invalid tombstones",
+            Self::ConsensusInvalidBodyTombstones => "consensus-invalid body tombstones",
         })
     }
 }

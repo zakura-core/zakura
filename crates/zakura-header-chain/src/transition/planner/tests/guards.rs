@@ -289,7 +289,7 @@ fn typed_body_authority_ignores_global_version_but_rejects_stale_generation() {
         let observation = event
             .observation()
             .expect("the cloned fixture has an observation");
-        *event = Box::new(crate::AuxEvidence::observed(
+        **event = crate::AuxEvidence::observed(
             crate::AuxObservationV1::from_vct(
                 crate::BodyWorkOwner { authority, ..owner },
                 observation.deliveries().to_vec(),
@@ -297,7 +297,7 @@ fn typed_body_authority_ignores_global_version_but_rejects_stale_generation() {
                 observation.boundary_witness(),
             )
             .expect("the stale observation fixture is valid"),
-        ));
+        );
         assert!(matches!(
             apply_transition(
                 &store,

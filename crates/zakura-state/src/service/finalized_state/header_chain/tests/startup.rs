@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn f_225519_rocksdb_snapshot_stops_at_the_first_extra_row_without_decoding() {
+fn rocksdb_snapshot_stops_at_the_first_extra_row_without_decoding() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, &engine_config.network));

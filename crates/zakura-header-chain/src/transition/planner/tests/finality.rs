@@ -846,6 +846,30 @@ fn integrated_finality_requires_authority_and_exact_verified_path() {
 }
 
 #[test]
+fn empty_checkpoint_verified_growth_has_no_finality_effect() {
+    let (store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let old_tip = store.metadata.frontiers.verified_best;
+    let request = TransitionRequest {
+        expected_version: store.metadata.state_version,
+        event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+            full_state_transition_id: EvidenceId::from_digest([0x90; 32]),
+            old_tip,
+            new_path: Vec::new(),
+            cause: crate::VerifiedChangeCause::CheckpointFinalizedGrow,
+        }),
+    };
+
+    let plan = apply_transition(&store, request, &context(&config, &clock, Some(&Authority)))
+        .expect("empty checkpoint growth is a valid no-change");
+
+    assert!(plan.is_no_change());
+    assert!(!plan.effect().is_checkpoint_finality());
+    assert!(plan.change_set.finality_append.is_none());
+    assert_eq!(plan.change_set.metadata, store.metadata);
+}
+
+#[test]
 fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());

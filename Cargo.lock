@@ -1124,17 +1124,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4df6f98652d30167eaeea34d77b730e07c8caba6df17bd4551842b9b8da01deb"
 
 [[package]]
-name = "cpu-equihash-solver"
-version = "0.3.0"
-source = "git+https://github.com/valargroup/librustzcash?rev=658533c4c604818610657d9699e82102e7379c76#658533c4c604818610657d9699e82102e7379c76"
-dependencies = [
- "blake2b_simd",
- "cc",
- "corez",
- "document-features",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8382,7 +8371,6 @@ dependencies = [
  "byteorder",
  "chrono",
  "color-eyre",
- "cpu-equihash-solver",
  "criterion",
  "derive-getters",
  "dirs",

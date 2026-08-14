@@ -91,6 +91,10 @@ version = "0.10.1"
 criteria = "safe-to-deploy"
 notes = "Audit hold: the public RNG get_block_pos method subtracts the four-block buffer width without wrapping. After set_block_pos(u64::MAX) followed by one generated word, the internal counter wraps to 3 and get_block_pos panics on 3 - 4 in debug builds. Reproduced with ChaCha20Rng; retain the exemption pending wrapping arithmetic or an upstream fix."
 
+[[exemptions.console]]
+version = "0.15.11"
+criteria = "safe-to-deploy"
+
 [[exemptions.console-subscriber]]
 version = "0.4.1"
 criteria = "safe-to-deploy"
@@ -150,6 +154,10 @@ notes = "Audit held: the generated data package embeds 18 unsafe unchecked zerov
 version = "2.2.0"
 criteria = "safe-to-deploy"
 notes = "Audit held: the generated data package embeds 249 unsafe unchecked zerovec and ICU trie/list constructors across 137 opaque .rs.data files. Compilation checks syntax and types but does not establish the byte-layout invariants required by those constructors; retain the exemption pending generator provenance or independent blob validation."
+
+[[exemptions.indicatif]]
+version = "0.17.11"
+criteria = "safe-to-deploy"
 
 [[exemptions.iroh-metrics]]
 version = "0.35.0"

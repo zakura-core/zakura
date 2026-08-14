@@ -12,9 +12,6 @@ use serde::{Deserialize, Serialize};
 mod component;
 mod endpoint;
 
-#[cfg(feature = "progress-bar")]
-mod progress;
-
 #[cfg(feature = "flamegraph")]
 mod flame;
 

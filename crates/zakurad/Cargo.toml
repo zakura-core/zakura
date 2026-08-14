@@ -266,7 +266,7 @@ metrics-exporter-prometheus = { workspace = true, features = ["http-listener"], 
 log = { workspace = true }
 
 # prod feature progress-bar
-howudoin = { workspace = true, optional = true }
+howudoin = { workspace = true, features = ["term-line"], optional = true }
 indicatif = { workspace = true, optional = true }
 
 # test feature proptest-impl

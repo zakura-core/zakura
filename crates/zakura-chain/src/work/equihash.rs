@@ -15,7 +15,10 @@ use crate::{
 };
 
 #[cfg(feature = "internal-miner")]
-use crate::serialization::AtLeastOne;
+mod internal_miner;
+
+#[cfg(feature = "internal-miner")]
+pub use internal_miner::{SolverAction, SolverCancelled};
 
 /// The error type for Equihash validation.
 #[non_exhaustive]
@@ -35,11 +38,6 @@ pub enum Error {
         network: Network,
     },
 }
-
-/// The error type for Equihash solving.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("solver was cancelled")]
-pub struct SolverCancelled;
 
 /// The size of an Equihash solution in bytes (always 1344).
 pub(crate) const SOLUTION_SIZE: usize = 1344;
@@ -99,27 +97,38 @@ impl Solution {
     /// proof-of-work parameters by choosing the on-wire solution length.
     #[allow(clippy::unwrap_in_result)]
     pub fn check(&self, header: &Header, network: &Network) -> Result<(), Error> {
+        self.validate_shape(network)?;
+
         // TODO:
         // - Add Equihash parameters field to `testnet::Parameters`
         // - Update `Solution::Regtest` variant to hold a `Vec` to support arbitrary parameters - rename to `Other`
-        let (n, k) = match (network.is_regtest(), self) {
+        let (n, k) = if network.is_regtest() {
+            (REGTEST_N, REGTEST_K)
+        } else {
+            (200, 9)
+        };
+
+        self.check_equihash(header, n, k)
+    }
+
+    /// Validate only the solution's encoded shape against the authenticated network parameters.
+    pub fn validate_shape(&self, network: &Network) -> Result<(), Error> {
+        match (network.is_regtest(), self) {
             // Mainnet and Testnet require the memory-hard (200, 9) parameters,
             // encoded as a 1344-byte `Common` solution.
-            (false, Solution::Common(_)) => (200, 9),
+            (false, Solution::Common(_)) => Ok(()),
             // Regtest requires the toy (48, 5) parameters used by zcashd.
-            (true, Solution::Regtest(_)) => (REGTEST_N, REGTEST_K),
+            (true, Solution::Regtest(_)) => Ok(()),
             // Reject a solution variant that does not match the active
             // network before selecting parameters. Otherwise the
             // attacker-controlled solution length could change the PoW
             // parameter set.
             (false, Solution::Regtest(_)) | (true, Solution::Common(_)) => {
-                return Err(Error::InvalidSolutionSize {
+                Err(Error::InvalidSolutionSize {
                     network: network.clone(),
                 })
             }
-        };
-
-        self.check_equihash(header, n, k)
+        }
     }
 
     /// Returns `Ok(())` if this solution is valid for `header` under the given
@@ -180,112 +189,6 @@ impl Solution {
         } else {
             Self::for_proposal()
         }
-    }
-
-    /// Mines and returns one or more [`Solution`]s based on a template `header`.
-    /// The returned header contains a valid `nonce` and `solution`.
-    ///
-    /// If `cancel_fn()` returns an error, returns early with `Err(SolverCancelled)`.
-    ///
-    /// The `nonce` in the header template is taken as the starting nonce. If you are running multiple
-    /// solvers at the same time, start them with different nonces.
-    /// The `solution` in the header template is ignored.
-    ///
-    /// This method is CPU and memory-intensive. It uses 144 MB of RAM and one CPU core while running.
-    /// It can run for minutes or hours if the network difficulty is high.
-    #[cfg(feature = "internal-miner")]
-    #[allow(clippy::unwrap_in_result)]
-    pub fn solve<F>(
-        mut header: Header,
-        mut cancel_fn: F,
-    ) -> Result<AtLeastOne<Header>, SolverCancelled>
-    where
-        F: FnMut() -> Result<(), SolverCancelled>,
-    {
-        use crate::shutdown::is_shutting_down;
-
-        let mut input = Vec::new();
-        header
-            .zcash_serialize(&mut input)
-            .expect("serialization into a vec can't fail");
-        // Take the part of the header before the nonce and solution.
-        // This data is kept constant for this solver run.
-        let input = &input[0..Solution::INPUT_LENGTH];
-
-        while !is_shutting_down() {
-            // Don't run the solver if we'd just cancel it anyway.
-            cancel_fn()?;
-
-            let solutions = equihash::tromp::solve_200_9(input, || {
-                // Cancel the solver if we have a new template.
-                if cancel_fn().is_err() {
-                    return None;
-                }
-
-                // This skips the first nonce, which doesn't matter in practice.
-                Self::next_nonce(&mut header.nonce);
-                Some(*header.nonce)
-            });
-
-            let mut valid_solutions = Vec::new();
-
-            for solution in &solutions {
-                header.solution = Self::from_bytes(solution)
-                    .expect("unexpected invalid solution: incorrect length");
-
-                // TODO: work out why we sometimes get invalid solutions here
-                //
-                // The solver only ever produces (200, 9) `Common` solutions
-                // (see `solve_200_9` above), so verify against those parameters
-                // directly rather than binding to a network.
-                if let Err(error) = header.solution.check_equihash(&header, 200, 9) {
-                    info!(?error, "found invalid solution for header");
-                    continue;
-                }
-
-                if Self::difficulty_is_valid(&header) {
-                    valid_solutions.push(header);
-                }
-            }
-
-            match valid_solutions.try_into() {
-                Ok(at_least_one_solution) => return Ok(at_least_one_solution),
-                Err(_is_empty_error) => debug!(
-                    solutions = ?solutions.len(),
-                    "found valid solutions which did not pass the validity or difficulty checks"
-                ),
-            }
-        }
-
-        Err(SolverCancelled)
-    }
-
-    /// Returns `true` if the `nonce` and `solution` in `header` meet the difficulty threshold.
-    ///
-    /// # Panics
-    ///
-    /// - If `header` contains an invalid difficulty threshold.
-    #[cfg(feature = "internal-miner")]
-    fn difficulty_is_valid(header: &Header) -> bool {
-        // Simplified from zakura_consensus::block::check::difficulty_is_valid().
-        let difficulty_threshold = header
-            .difficulty_threshold
-            .to_expanded()
-            .expect("unexpected invalid header template: invalid difficulty threshold");
-
-        // TODO: avoid calculating this hash multiple times
-        let hash = header.hash();
-
-        // Note: this comparison is a u256 integer comparison, like zcashd and bitcoin. Greater
-        // values represent *less* work.
-        hash <= difficulty_threshold
-    }
-
-    /// Modifies `nonce` to be the next integer in big-endian order.
-    /// Wraps to zero if the next nonce would overflow.
-    #[cfg(feature = "internal-miner")]
-    fn next_nonce(nonce: &mut [u8; 32]) {
-        let _ignore_overflow = crate::primitives::byte_array::increment_big_endian(&mut nonce[..]);
     }
 }
 

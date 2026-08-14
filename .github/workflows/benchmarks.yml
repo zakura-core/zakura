@@ -21,6 +21,7 @@ env:
     criterion -p zakura-chain --bench transaction
     criterion -p zakura-chain --bench block --features bench
     criterion -p zakura-chain --bench redpallas
+    criterion -p zakura-consensus --bench worst_case_tx_verification
 
 jobs:
   # Runs all benchmarks and publishes results to gh-pages for historical

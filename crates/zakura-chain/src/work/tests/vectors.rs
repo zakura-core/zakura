@@ -17,6 +17,36 @@ const EQUIHASH_SOLUTION_BLOCK_OFFSET: usize = equihash::Solution::INPUT_LENGTH +
 const BLOCK_HEADER_LENGTH: usize = EQUIHASH_SOLUTION_BLOCK_OFFSET + 3 + equihash::SOLUTION_SIZE;
 
 #[test]
+fn compact_difficulty_consensus_bytes_round_trip() {
+    let bytes = [0x01, 0x02, 0x03, 0x04];
+    assert_eq!(
+        difficulty::CompactDifficulty::from_le_bytes(bytes).to_le_bytes(),
+        bytes
+    );
+}
+
+#[test]
+fn validate_shape_checks_the_solution_against_the_network() {
+    let regtest = Network::new_regtest(Default::default());
+
+    Solution::for_proposal_for_network(&regtest)
+        .validate_shape(&regtest)
+        .expect("Regtest keeps its own (48, 5) solution shape");
+
+    assert!(Solution::for_proposal().validate_shape(&regtest).is_err());
+
+    let mainnet = Network::Mainnet;
+
+    Solution::for_proposal()
+        .validate_shape(&mainnet)
+        .expect("Mainnet keeps the common (200, 9) solution shape");
+
+    assert!(Solution::for_proposal_for_network(&regtest)
+        .validate_shape(&mainnet)
+        .is_err());
+}
+
+#[test]
 fn equihash_solution_test_vectors() {
     let _init_guard = zakura_test::init();
 

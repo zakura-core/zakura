@@ -2873,6 +2873,53 @@ async fn rpc_getnetworksolps() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rpc_getnetworksolps_saturates_to_response_width() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let request = tokio::spawn(async move { rpc.get_network_sol_ps(None, None).await });
+
+    read_state
+        .expect_request(ReadRequest::SolutionRate {
+            num_blocks: DEFAULT_SOLUTION_RATE_WINDOW_SIZE
+                .try_into()
+                .expect("the positive default window size fits in usize"),
+            height: None,
+        })
+        .await
+        .respond(ReadResponse::SolutionRate(Some(u128::MAX)));
+
+    assert_eq!(
+        request
+            .await
+            .expect("the RPC task should not panic")
+            .expect("the RPC call should succeed"),
+        u64::MAX,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn getblocktemplate() {
     let _init_guard = zakura_test::init();
 

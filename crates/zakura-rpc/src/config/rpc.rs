@@ -40,11 +40,34 @@ pub struct Config {
     /// indexer_listen_addr = '127.0.0.1:8230'
     /// ```
     ///
+    /// A non-loopback listener must configure mutual TLS:
+    /// ```toml
+    /// [rpc]
+    /// indexer_listen_addr = '0.0.0.0:8230'
+    ///
+    /// [rpc.indexer_tls]
+    /// cert_file = '/etc/zakura/indexer-server.pem'
+    /// key_file = '/etc/zakura/indexer-server-key.pem'
+    /// client_ca_file = '/etc/zakura/indexer-client-ca.pem'
+    /// ```
+    ///
     /// # Security
     ///
-    /// If you bind Zebra's indexer RPC port to a public IP address,
-    /// anyone on the internet can query your node's state.
+    /// Plaintext indexer RPC is restricted to loopback addresses. Configuring
+    /// a non-loopback address requires [`Self::indexer_tls`].
+    ///
+    /// Loopback does not authenticate the peer: every process and user on the
+    /// host can connect to the listener or impersonate it after it stops. Only
+    /// use plaintext loopback between trusted processes on a single-tenant
+    /// host. Configure [`Self::indexer_tls`] on multi-user or otherwise
+    /// untrusted hosts, even when using a loopback address.
     pub indexer_listen_addr: Option<SocketAddr>,
+
+    /// Mutual TLS configuration for the indexer RPC listener.
+    ///
+    /// This is required when [`Self::indexer_listen_addr`] is not a loopback
+    /// address. Clients must present a certificate signed by `client_ca_file`.
+    pub indexer_tls: Option<IndexerTlsConfig>,
 
     /// The number of threads used to process RPC requests and responses.
     ///
@@ -88,6 +111,20 @@ pub struct TlsConfig {
     pub key_file: PathBuf,
 }
 
+/// Mutual TLS configuration for the indexer RPC listener.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexerTlsConfig {
+    /// PEM certificate chain served to indexer RPC clients.
+    pub cert_file: PathBuf,
+
+    /// PEM private key for the indexer RPC server certificate.
+    pub key_file: PathBuf,
+
+    /// PEM certificate authority used to authenticate indexer RPC clients.
+    pub client_ca_file: PathBuf,
+}
+
 // This impl isn't derivable because it depends on features.
 #[allow(clippy::derivable_impls)]
 impl Default for Config {
@@ -98,6 +135,7 @@ impl Default for Config {
 
             // Disable indexer RPCs by default.
             indexer_listen_addr: None,
+            indexer_tls: None,
 
             // Use multiple threads, because we pause requests during getblocktemplate long polling
             parallel_cpu_threads: 0,
@@ -127,6 +165,8 @@ fn default_cookie_file_name() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::Config;
 
     #[test]
@@ -142,6 +182,29 @@ mod tests {
             config.cookie_file_name,
             super::default_cookie_file_name(),
             "missing cookie file names should use the default value"
+        );
+    }
+
+    #[test]
+    fn deserializes_indexer_mtls_config() {
+        let config: Config = toml::from_str(
+            r#"
+            indexer_listen_addr = "0.0.0.0:8230"
+
+            [indexer_tls]
+            cert_file = "/etc/zakura/indexer-server.pem"
+            key_file = "/etc/zakura/indexer-server-key.pem"
+            client_ca_file = "/etc/zakura/indexer-client-ca.pem"
+            "#,
+        )
+        .expect("indexer mTLS config should deserialize");
+
+        let tls = config
+            .indexer_tls
+            .expect("the configured indexer mTLS settings should be present");
+        assert_eq!(
+            tls.client_ca_file,
+            PathBuf::from("/etc/zakura/indexer-client-ca.pem")
         );
     }
 }

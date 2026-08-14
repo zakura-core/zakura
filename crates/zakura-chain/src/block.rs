@@ -44,6 +44,14 @@ pub use header::{BlockTimeError, CountedHeader, Header, ZCASH_BLOCK_VERSION};
 pub use height::{Height, HeightDiff, TryIntoHeight};
 pub use serialize::{SerializedBlock, MAX_BLOCK_BYTES};
 
+/// Re-assert the signed Zcash block-header version rule on an in-memory header.
+///
+/// Canonical deserialization already applies this check.
+/// Observable header validators repeat the check for locally constructed headers.
+pub fn validate_header_version(version: u32) -> Result<(), &'static str> {
+    serialize::validate_header_version(version)
+}
+
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use arbitrary::LedgerState;
 

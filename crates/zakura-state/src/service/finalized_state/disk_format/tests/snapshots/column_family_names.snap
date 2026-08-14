@@ -18,6 +18,7 @@ expression: cf_names
   "ironwood_note_commitment_subtree",
   "ironwood_note_commitment_tree",
   "ironwood_nullifiers",
+  "node_software_metadata",
   "orchard_anchors",
   "orchard_note_commitment_subtree",
   "orchard_note_commitment_tree",

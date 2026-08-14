@@ -64,7 +64,7 @@ id = "LC-SCOPE-07"
 name = "Auxiliary-evidence boundary"
 status = "implemented"
 owner = "zakura_header_chain::AuxObservationV1"
-tests = ["IN-06::f_225517_auxiliary_outcomes_derive_from_exact_owned_observations", "IN-06::selected_auxiliary_repair_adds_only_one_exact_provenance_record"]
+tests = ["IN-06::auxiliary_outcomes_derive_from_exact_owned_observations", "IN-06::selected_auxiliary_repair_adds_only_one_exact_provenance_record"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

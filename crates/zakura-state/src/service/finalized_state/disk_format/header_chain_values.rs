@@ -1036,12 +1036,12 @@ impl FallibleDiskValue for AuxDelivery {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
-        let row = decode_untrusted_aux_delivery(bytes)?;
-        if row.outcome_status_code() == 0
-            && row.observation_digests() == [None, None]
-            && row.outcome_boundary_hash().is_none()
+        let untrusted_row = decode_untrusted_aux_delivery(bytes)?;
+        if untrusted_row.outcome_status_code() == 0
+            && untrusted_row.observation_digests() == [None, None]
+            && untrusted_row.outcome_boundary_hash().is_none()
         {
-            Ok(row.delivery())
+            Ok(untrusted_row.delivery())
         } else {
             Err(HeaderChainValueError::InvalidAuxOutcome)
         }

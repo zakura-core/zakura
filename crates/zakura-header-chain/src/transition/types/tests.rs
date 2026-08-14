@@ -416,8 +416,7 @@ fn event_cases() -> Vec<EventCase> {
 #[test]
 fn auxiliary_outcomes_only_refine_evidence() {
     let unauthenticated = AuxOutcome::unauthenticated();
-    let disputed = AuxOutcome::derived(
-        unauthenticated,
+    let disputed = unauthenticated.refined_by_observation(
         AuxOutcomeStatus::Disputed,
         AuxObservationId::from_digest([1; 32]),
         block::Hash([3; 32]),

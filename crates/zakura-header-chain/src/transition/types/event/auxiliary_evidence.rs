@@ -16,9 +16,13 @@ pub struct AuxVerificationFactV1 {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AuxVerificationKindV1 {
+    /// Integrated state verified the current delivery.
     CurrentVerified,
+    /// Integrated state attributed failure to the current delivery.
     CurrentFailed,
+    /// Integrated state attributed failure to the successor delivery.
     SuccessorFailed,
+    /// Integrated state could not attribute failure between two deliveries.
     AmbiguousFailed,
 }
 
@@ -55,10 +59,12 @@ impl AuxVerificationFactV1 {
         }
     }
 
+    /// Return the sealed verification classification.
     pub(crate) const fn kind(self) -> AuxVerificationKindV1 {
         self.kind
     }
 
+    /// Return the state adapter's stable failure classification code.
     pub(crate) const fn failure_code(self) -> u8 {
         self.failure_code
     }
@@ -79,19 +85,23 @@ pub struct AuxObservationV1 {
 
 impl AuxObservationV1 {
     /// Construct one checked VCT observation for the state adapter.
+    ///
+    /// Successful and attributed observations require exactly one delivery.
+    /// Ambiguous failures require exactly two distinct delivery identities.
+    /// This constructor returns `None` when the deliveries violate either rule.
     pub fn from_vct(
         owner: BodyWorkOwner,
         deliveries: Vec<PreparedAuxDelivery>,
         verification: AuxVerificationFactV1,
         boundary_witness: Option<AuthDataRoot>,
     ) -> Option<Self> {
-        let expected = match verification.kind() {
+        let expected_delivery_count = match verification.kind() {
             AuxVerificationKindV1::AmbiguousFailed => 2,
             AuxVerificationKindV1::CurrentVerified
             | AuxVerificationKindV1::CurrentFailed
             | AuxVerificationKindV1::SuccessorFailed => 1,
         };
-        if deliveries.len() != expected {
+        if deliveries.len() != expected_delivery_count {
             return None;
         }
         if deliveries.len() == 2 && deliveries[0].delivery_id == deliveries[1].delivery_id {
@@ -142,14 +152,14 @@ fn derive_observation_id(
 ) -> AuxObservationId {
     let mut hasher = Sha256::new();
     hasher.update(b"zakura.header-chain.aux-observation.v1");
-    hash_owner(&mut hasher, owner);
+    hash_body_work_owner(&mut hasher, owner);
     hasher.update([1]);
     hasher.update([u8::try_from(deliveries.len()).expect("observations contain at most two rows")]);
     for delivery in deliveries {
         hasher.update(delivery.delivery_id.digest());
         hasher.update(delivery.header_hash.0);
         hasher.update(delivery.source.digest());
-        hash_sync_owner(&mut hasher, delivery.owner);
+        hash_header_sync_work_owner(&mut hasher, delivery.owner);
         hasher.update(
             match delivery.body_size {
                 BodySizeHint::Unknown => 0_u32,
@@ -194,7 +204,7 @@ fn derive_observation_id(
     AuxObservationId::from_digest(hasher.finalize().into())
 }
 
-fn hash_owner(hasher: &mut Sha256, owner: BodyWorkOwner) {
+fn hash_body_work_owner(hasher: &mut Sha256, owner: BodyWorkOwner) {
     hasher.update(owner.authority.header.header_generation.get().to_le_bytes());
     hasher.update(owner.authority.header.branch.anchor_hash.0);
     hasher.update(owner.authority.header.branch.target_tip_hash.0);
@@ -203,7 +213,7 @@ fn hash_owner(hasher: &mut Sha256, owner: BodyWorkOwner) {
     hasher.update(owner.request_id.get().to_le_bytes());
 }
 
-fn hash_sync_owner(hasher: &mut Sha256, owner: HeaderSyncWorkOwner) {
+fn hash_header_sync_work_owner(hasher: &mut Sha256, owner: HeaderSyncWorkOwner) {
     match owner {
         HeaderSyncWorkOwner::Header(owner) => {
             hasher.update([0]);
@@ -215,7 +225,7 @@ fn hash_sync_owner(hasher: &mut Sha256, owner: HeaderSyncWorkOwner) {
         }
         HeaderSyncWorkOwner::BodyRepair(owner) => {
             hasher.update([1]);
-            hash_owner(hasher, owner);
+            hash_body_work_owner(hasher, owner);
         }
     }
 }

@@ -127,6 +127,7 @@ Version 1 includes linear download and verification of all headers, a bounded fo
 
 **LC-SCOPE-05 [LS] — FlyClient proofs excluded.** Version 1 MUST NOT claim or implement ZIP 221 FlyClient logarithmic sampling or succinct chain proofs. It validates every retained header on a candidate suffix. ZIP 221 history-tree data is covered only as auxiliary metadata used by the integrated node.
 
+<a id="lc-scope-06"></a>
 **LC-SCOPE-06 [LS] — Block-sync concerns excluded.** Block-sync token-bucket connection eviction and readiness/accounting defects unrelated to header-chain selection are outside this engine and MUST NOT be coupled to its fork-choice state.
 
 **LC-SCOPE-09 [LS] — Single protocol, no compatibility surface.** This engine MUST expose exactly one header-exchange protocol on the Zakura v2 P2P stack: one message set, one codec, one status message, and one supported stream version. It MUST NOT implement version negotiation between header-sync codecs, a frozen predecessor codec, a legacy Zcash `getheaders` request/serve path, or any other fallback header-exchange path. It MUST NOT read, write, serve, or otherwise modify the legacy Zcash P2P stack, which remains outside this specification. Identifiers, modules, metrics, configuration fields, and test names MUST NOT carry protocol-version suffixes, because there is only one of each thing to name.
@@ -185,6 +186,7 @@ The durable metadata contains monotonically increasing unsigned counters. Counte
 
 ### 2.4 Transactions and restart
 
+<a id="lc-txn-01"></a>
 **LC-TXN-01 [LS] — Atomic frontier mutation.** A frontier-affecting mutation MUST atomically update DAG rows, reverse indexes, height/child indexes, selected projections, eligibility, auxiliary provenance, generations, and frontier metadata before any observer is notified.
 
 **LC-TXN-02 [LS] — Uniform transition path.** Invalidation, reconsideration, body feedback, finalization, checkpoint advancement, direct growth, fork replacement, VCT repair, and full-state grow/reset MUST use the same durable transition API. A direct-extension fast path is allowed only if it produces the same transaction and selection result.
@@ -227,6 +229,7 @@ Non-normative implementation advice: run LC-VAL-05 before LC-VAL-04 so the inexp
 
 **LC-TIME-01 [ZW] — Custom-network time rules.** Regtest and configured custom networks MUST apply the same MTP algorithm and the exact height-dependent maximum-time policy returned by their authenticated local network parameters and full state. They MUST NOT inherit Mainnet/Testnet activation heights by name or bypass MTP merely because proof of work is disabled.
 
+<a id="lc-val-08"></a>
 **LC-VAL-08 [LS] — Future-header deferral.** A header more than two hours ahead of the validating node’s local clock MUST enter `DeferredUntil(nTime - 2 hours)`, not permanent invalidity. Deferred nodes and descendants MUST be excluded from selection until reevaluation succeeds, and reevaluation MUST occur without retransmission. This local-clock rule is nondeterministic and is not Zcash consensus.
 
 **LC-VAL-09 [LS] — Checkpoint ancestry.** At every configured local sync-checkpoint height present in a candidate path, the computed hash MUST exactly equal the configured checkpoint hash. The candidate’s ancestry MUST be consistent with genesis, every applicable settled-upgrade pin and local checkpoint, and `finalized`. This is trusted local selection policy, not a context-free Zcash header rule.
@@ -235,6 +238,7 @@ Non-normative implementation advice: run LC-VAL-05 before LC-VAL-04 so the inexp
 
 **LC-WORKCALC-01 [LS] — Checked cumulative work.** Candidate suffix cumulative work MUST use a 256-bit unsigned representation and MUST be the checked sum of exact per-block work from the current work anchor. No per-block or cumulative value may be narrowed to `u128`. Overflow beyond `2^256 - 1` is a fail-closed local representation error under the Zcash ecosystem assumption that total chain work remains below `2^256`; it MUST NOT wrap, produce a selectable candidate, or produce advertised work.
 
+<a id="lc-val-11"></a>
 **LC-VAL-11 [LS] — Validation before admission.** Only after every applicable preceding pipeline rule, including LC-COMMIT-01/02 and LC-POW-01, passes MAY the engine apply resource admission, atomically insert nodes and indexes, recompute eligibility, and evaluate fork choice. `DeferredUntil` is the sole non-passing result admitted by LC-VAL-08; all other deterministic checks MUST still pass before that node is stored as deferred. Response partitioning MUST NOT create intermediate selection semantics different from insertion of the complete validated sequence.
 
 ### 3.2 Trusted anchors and checkpoint context
@@ -270,6 +274,7 @@ Eligibility reasons are a set, not a single overwritable flag. Permanent reasons
 
 **LC-SELECT-03 [ZF] — Raw-hash tie-breaker.** If cumulative work is equal, the engine MUST compare the tips’ raw internal `block::Hash.0` byte arrays lexicographically and select the greater array, exactly as `zakura-state::service::non_finalized_state::Chain::cmp`. Display-order hex, first-seen time, arrival order, peer identity, response range, and response partitioning MUST NOT break the tie.
 
+<a id="lc-select-04"></a>
 **LC-SELECT-04 [LS] — Deterministic selection.** For a fixed finalized anchor, selection MUST be a pure deterministic function of the admitted DAG, eligibility set, and the comparator in LC-SELECT-02/03. Replaying any permutation of equivalent insertions and completions before the same durable finalization event MUST yield the same `header_best`. A headers-only finality event deliberately makes its chosen ancestor a new trust pin under LC-FINAL-03; discovery after that event cannot revise history at or below the pin.
 
 ### 3.4 Reorg boundary, finality, and retention
@@ -284,6 +289,7 @@ Eligibility reasons are a set, not a single overwritable flag. Permanent reasons
 
 **LC-FINAL-04 [LS] — Mode and finality provenance.** The durable store MUST record whether it is integrated or headers-only and the finality source for every advancement. Startup MUST fail closed on a mode mismatch or a finality record without the required full-state evidence or headers-only 1,000-deep ancestor proof. Switching modes requires an explicit migration that preserves existing pins; it MUST NOT roll finality back. A headers-only finality record is local trust, never body-verification evidence: a migration to integrated mode MUST import headers-only pins as header trust anchors only, MUST NOT count them as full-state finalization, and integrated mode MUST still body-verify the imported history from its own last full-state-verified anchor. If deterministic body validation refutes an imported headers-only pin, the node MUST fail closed with an explicit incident naming that pin; the only supported recovery is deleting the migrated header store and its finality records and resynchronizing, which discards a local trust artifact rather than rolling back integrated finality, because integrated finality was never granted to the imported pin.
 
+<a id="lc-retain-01"></a>
 **LC-RETAIN-01 [LS] — Fork and node limits.** The engine MUST retain no more than `MAX_NON_FINALIZED_CHAIN_FORKS` eligible candidate tips—the same shared constant that caps full-state non-finalized chains, currently 10—and 65,536 non-finalized DAG nodes. The tip cap MUST be consumed from the same shared `zakura-chain`-level definition as full state, so the header engine can never retain an eligible fork that integrated full state cannot represent. It MUST protect every node on `header_best` and `verified_best` from resource eviction. If integrated-mode verification/finalization stalls and admitting another node would exceed the node cap after all permitted eviction, the engine MUST refuse or stage that admission, retain the current frontiers, and raise an explicit resource-stalled alarm; it MUST NOT evict either protected path or synthesize finality to make room.
 
 **LC-RETAIN-02 [LS] — Deterministic eviction order.** On pressure, the engine MUST remove permanently ineligible subtrees first. It MUST then evict unprotected candidate tips in ascending order of cumulative work, breaking equal-work eviction ties by the smallest raw tip hash. Shared ancestors MUST be removed only when no retained path or validation-context window references them.
@@ -494,6 +500,7 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 
 **LC-WIRE-14 [ZW] — Auxiliary-schema validation.** Tree-aux negotiation and schema-1 records MUST use the exact mask, selector, length, field order, encoding, height correspondence, and activation-dependent defaults above. An unknown, unadvertised, mismatched, malformed, or wrong-length schema is `MalformedProtocol`: the response MUST be rejected before any of its headers or records are admitted, but no independently obtained header becomes invalid. A structurally valid record that later fails cryptographic authentication invalidates only that metadata delivery under LC-AUX-02.
 
+<a id="lc-wire-15"></a>
 **LC-WIRE-15 [ZW] — Immutable schema evolution.** Auxiliary schema meanings are immutable. NU6.3, NU7, or any later upgrade MUST be handled by the existing schema’s explicitly defined activation semantics or by assigning a new advertised schema bit; an implementation MUST NOT reinterpret schema 1 based on a candidate-upgrade name. Adding, removing, resizing, or reordering fields requires a new schema, and exhausting the 32-bit mask or changing message framing requires a successor stream version.
 
 **LC-WIRE-16 [ZW] — Fixed discriminants and no block relay.** The four discriminants above are the complete message set. There is no `NewBlock` message and no other block-relay message in header sync; a payload claiming one MUST be rejected as an unknown discriminant. A header-sync session MUST use the ordinary Zcash block-announcement/download path or the separately negotiated Zakura block-sync facility for full blocks. No decoder may infer a message type, protocol variant, or version from payload shape.

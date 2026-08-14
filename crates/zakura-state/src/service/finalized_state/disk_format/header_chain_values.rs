@@ -1671,6 +1671,9 @@ mod tests {
             EngineMetadata::decode(&legacy_bytes),
             Err(HeaderChainValueError::Truncated)
         );
+        // These digests pin the on-disk encodings. Regenerate a digest only together with a
+        // deliberate encoding change; an unexplained change means a value's layout drifted.
+        // The metadata digest last moved when `headers_only_migration_epoch` was appended.
         assert_eq!(
             [
                 digest(&aux.encode().expect("aux encodes")),
@@ -1680,7 +1683,7 @@ mod tests {
             [
                 "ef31b854deb19b68411aabedc15a681405065939be00a691a050a4325df3348e",
                 "b887bf384510dfb1a255221a8c97066617cb145eaf3e272ad70dc94cd17a3802",
-                "c96686092fa8c1ee71294336e3d9ec1dde9deddfbdacb6decc53f37fef73904b",
+                "538aaccaf8a97966ec5d3b678c608067e950402ac95995ef7e0eecfecba36066",
             ]
         );
     }

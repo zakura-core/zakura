@@ -157,9 +157,17 @@ impl ServiceRegistry {
     }
 
     /// Lookup a declared stream by kind and version.
+    ///
+    /// One service may declare several versions of the same kind, so this searches every
+    /// declaration rather than filtering [`Self::stream_for_kind`], which only reports the
+    /// first version declared for the kind.
     pub fn stream(&self, kind: u16, version: u16) -> Option<Stream> {
-        self.stream_for_kind(kind)
-            .filter(|stream| stream.version == version)
+        let service = self.service_for_kind(kind)?;
+        service
+            .streams()
+            .iter()
+            .find(|stream| stream.kind == kind && stream.version == version)
+            .copied()
     }
 
     /// Returns true when a registered service owns `kind` at `version`.

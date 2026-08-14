@@ -711,6 +711,14 @@ impl DbFormatChange {
                 .map_err(|error| FormatChangeError::MigrationStorage(error.to_string()))?;
         }
 
+        // Every registered upgrade has run and been marked on disk. Operators and the
+        // `update_state_format` acceptance test rely on this line to observe completion.
+        info!(
+            %newer_running_version,
+            %older_disk_version,
+            "database is fully upgraded"
+        );
+
         Ok(())
     }
 

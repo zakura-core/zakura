@@ -115,7 +115,7 @@ proptest = { workspace = true, optional = true }
 zakura-chain = { path = "../zakura-chain", version = "5.0.0", features = [
     "json-conversion",
 ] }
-zakura-consensus = { path = "../zakura-consensus", version = "6.1.0" }
+zakura-consensus = { path = "../zakura-consensus", version = "7.0.0" }
 zakura-network = { path = "../zakura-network", version = "6.1.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.0", features = [
     "rpc-client",
@@ -145,7 +145,7 @@ tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 zakura-chain = { path = "../zakura-chain", version = "5.0.0", features = [
     "proptest-impl",
 ] }
-zakura-consensus = { path = "../zakura-consensus", version = "6.1.0", features = [
+zakura-consensus = { path = "../zakura-consensus", version = "7.0.0", features = [
     "proptest-impl",
 ] }
 zakura-network = { path = "../zakura-network", version = "6.1.0", features = [

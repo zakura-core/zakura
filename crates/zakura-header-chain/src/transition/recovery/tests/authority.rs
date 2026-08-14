@@ -17,8 +17,8 @@ use crate::{
     AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId, ChainScore,
     CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState, EngineMode,
     EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, HeaderGeneration,
-    HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, SourceId, SuffixWork,
-    StoreError, WorkCoordinate,
+    HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, SourceId, StoreError,
+    SuffixWork, WorkCoordinate,
 };
 
 #[test]
@@ -402,7 +402,7 @@ fn migrated_finality_is_rejected_after_the_migration_boundary() {
 }
 
 #[test]
-fn oversized_node_table_fails_before_node_rows_are_loaded() {
+fn f_225519_recovery_rejects_an_extra_node_before_decoding_rows() {
     let (mut store, mut config) = fixture();
     config.limits.max_non_finalized_nodes =
         NonZeroUsize::new(1).expect("one is a valid node limit");
@@ -412,8 +412,27 @@ fn oversized_node_table_fails_before_node_rows_are_loaded() {
     assert_eq!(
         audit_store(&store, &config),
         Err(RecoveryFailure::Store(StoreError::LimitExceeded {
-            collection: "header nodes",
-            limit: 2,
+            collection: crate::StoreCollection::HeaderNodes,
+            limit: crate::RowLimit::new(2),
+        }))
+    );
+}
+
+#[test]
+fn f_225513_resource_alarm_does_not_exempt_the_startup_node_limit() {
+    let (mut store, mut config) = fixture();
+    config.limits.max_non_finalized_nodes =
+        NonZeroUsize::new(1).expect("one is a valid node limit");
+    store.nodes.push(store.nodes[1].clone());
+    store.metadata.alarms.resource_stalled = true;
+    store.snapshot = store.metadata.snapshot();
+    store.failed_read = Some(AuditRead::HeaderNodes);
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
+            collection: crate::StoreCollection::HeaderNodes,
+            limit: crate::RowLimit::new(2),
         }))
     );
 }
@@ -423,11 +442,11 @@ fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
     let (mut store, mut config) = fixture();
     config.limits.max_aux_deliveries_total =
         NonZeroUsize::new(1).expect("one is a valid auxiliary limit");
-    let delivery = AuxDelivery {
-        delivery_id: EvidenceId::from_digest([0x51; 32]),
-        header_hash: store.nodes[1].hash,
-        source: SourceId::from_digest([0x52; 32]),
-        owner: HeaderWorkOwner {
+    let delivery = AuxDelivery::new(
+        EvidenceId::from_digest([0x51; 32]),
+        store.nodes[1].hash,
+        SourceId::from_digest([0x52; 32]),
+        HeaderWorkOwner {
             authority: HeaderWorkAuthority {
                 header_generation: HeaderGeneration::new(1),
                 branch: BranchId::new(store.metadata.work_origin.hash, store.nodes[1].hash),
@@ -436,18 +455,17 @@ fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
             request_id: NonZeroU64::new(1).expect("one is nonzero"),
         }
         .into(),
-        body_size: BodySizeHint::Unknown,
-        tree_aux: None,
-        authentication: AuxAuthentication::Unauthenticated,
-    };
+        BodySizeHint::Unknown,
+        None,
+    );
     store.aux = vec![delivery, delivery];
     store.failed_read = Some(AuditRead::AuxDeliveries);
 
     assert_eq!(
         audit_store(&store, &config),
         Err(RecoveryFailure::Store(StoreError::LimitExceeded {
-            collection: "auxiliary deliveries",
-            limit: 1,
+            collection: crate::StoreCollection::AuxiliaryDeliveries,
+            limit: crate::RowLimit::new(1),
         }))
     );
 
@@ -464,8 +482,8 @@ fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
     assert_eq!(
         audit_store(&store, &config),
         Err(RecoveryFailure::Store(StoreError::LimitExceeded {
-            collection: "validation contexts",
-            limit: crate::POW_PREDECESSOR_CONTEXT_SPAN,
+            collection: crate::StoreCollection::ValidationContexts,
+            limit: crate::RowLimit::new(crate::POW_PREDECESSOR_CONTEXT_SPAN),
         }))
     );
 }
@@ -475,7 +493,7 @@ fn fatal_configuration_mismatch_fails_before_collection_preflight() {
     let (mut store, config) = fixture();
     store.metadata.mode = EngineMode::HeadersOnly;
     store.snapshot = store.metadata.snapshot();
-    store.failed_read = Some(AuditRead::HeaderNodeCount);
+    store.failed_read = Some(AuditRead::CollectionCount);
 
     assert_eq!(
         audit_store(&store, &config),
@@ -624,8 +642,8 @@ fn audits_each_normative_invariant() {
     assert_eq!(
         audit_store(&oversized, &limited),
         Err(RecoveryFailure::Store(StoreError::LimitExceeded {
-            collection: "header nodes",
-            limit: 2,
+            collection: crate::StoreCollection::HeaderNodes,
+            limit: crate::RowLimit::new(2),
         }))
     );
 

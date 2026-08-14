@@ -21,10 +21,10 @@ use zakura_header_chain::{
     FinalityRecord, FinalitySource, Frontier, FullStateEvidenceAuthority, FullStateFinalized,
     HeaderChainEngine, HeaderInsertionFacts, HeaderLocator, HeaderNode, HeaderSyncWorkOwner,
     HeaderValidationFacts, HeaderWorkAuthority, MemHeaderStore, NoChangeReceipt, RecoveryFailure,
-    RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt, StateVersion, StoreAuditRead, StoreError,
-    SystemClock, TransitionContext, TransitionEvent, TransitionFailure, TransitionInput,
-    TransitionRequest, ValidationContextRecord, ValidationLease, VerifiedChainChanged,
-    VerifiedChangeCause, VerifiedHeaderRef,
+    RecoveryPlan, RecoveryRepair, RowLimit, SourceId, StaleReceipt, StateVersion, StoreAuditRead,
+    StoreCollection, StoreError, SystemClock, TransitionContext, TransitionEvent,
+    TransitionFailure, TransitionInput, TransitionRequest, ValidationContextRecord,
+    ValidationLease, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -4145,10 +4145,26 @@ impl StoreAuditRead for HeaderChainStore {
         HeaderChainStore::metadata(self)
     }
 
-    fn header_node_count_up_to(&self, limit: usize) -> Result<usize, StoreError> {
-        let cf = self.cf(HEADER_NODE_BY_HASH).map_err(store_error)?;
+    fn collection_count_up_to(
+        &self,
+        collection: StoreCollection,
+        limit: RowLimit,
+    ) -> Result<usize, StoreError> {
+        let name = match collection {
+            StoreCollection::HeaderNodes => HEADER_NODE_BY_HASH,
+            StoreCollection::ChildEdges => HEADER_CHILD,
+            StoreCollection::SelectedProjection => HEADER_SELECTED,
+            StoreCollection::VerifiedProjection => HEADER_VERIFIED,
+            StoreCollection::DeferredRows => HEADER_DEFERRED,
+            StoreCollection::EligibilityReasons => HEADER_ELIGIBILITY_ROOT,
+            StoreCollection::AuxiliaryDeliveries => HEADER_AUX_DELIVERY,
+            StoreCollection::ValidationContexts => HEADER_VALIDATION_CONTEXT,
+            StoreCollection::FinalityHistory => HEADER_FINALITY_HISTORY,
+            StoreCollection::ConsensusInvalidTombstones => HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+        };
+        let cf = self.cf(name).map_err(store_error)?;
         self.db
-            .raw_count_cf_up_to(&cf, limit)
+            .raw_count_cf_up_to(&cf, limit.get())
             .map_err(HeaderChainStoreError::from)
             .map_err(store_error)
     }
@@ -4262,14 +4278,6 @@ impl StoreAuditRead for HeaderChainStore {
         self.all_reason_rows()
     }
 
-    fn aux_delivery_count_up_to(&self, limit: usize) -> Result<usize, StoreError> {
-        let cf = self.cf(HEADER_AUX_DELIVERY).map_err(store_error)?;
-        self.db
-            .raw_count_cf_up_to(&cf, limit)
-            .map_err(HeaderChainStoreError::from)
-            .map_err(store_error)
-    }
-
     fn all_aux_deliveries(
         &self,
     ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>
@@ -4288,14 +4296,6 @@ impl StoreAuditRead for HeaderChainStore {
             deliveries.push(delivery);
         }
         Ok(deliveries)
-    }
-
-    fn validation_context_count_up_to(&self, limit: usize) -> Result<usize, StoreError> {
-        let cf = self.cf(HEADER_VALIDATION_CONTEXT).map_err(store_error)?;
-        self.db
-            .raw_count_cf_up_to(&cf, limit)
-            .map_err(HeaderChainStoreError::from)
-            .map_err(store_error)
     }
 
     fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError> {

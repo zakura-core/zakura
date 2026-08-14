@@ -7,7 +7,7 @@ use zakura_chain::block;
 
 use crate::{
     BodyValidationState, ChainScore, ConsensusInvalidBodyTombstone, EngineConfig, EngineMetadata,
-    EngineSnapshot, Frontier, HeaderNode, StoreError,
+    EngineSnapshot, Frontier, HeaderNode, RowLimit, StoreCollection, StoreError,
 };
 
 use super::contracts::{
@@ -81,29 +81,29 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditRead>(
         .ok_or(StoreError::Incoherent(
             "header-node recovery limit overflow",
         ))?;
-    if store.header_node_count_up_to(maximum_nodes)? > maximum_nodes {
-        return Err(StoreError::LimitExceeded {
-            collection: "header nodes",
-            limit: maximum_nodes,
-        }
-        .into());
+    preflight(store, StoreCollection::HeaderNodes, maximum_nodes)?;
+    let accepted_nodes =
+        store.collection_count_up_to(StoreCollection::HeaderNodes, RowLimit::new(maximum_nodes))?;
+    for collection in [
+        StoreCollection::ChildEdges,
+        StoreCollection::SelectedProjection,
+        StoreCollection::VerifiedProjection,
+        StoreCollection::DeferredRows,
+    ] {
+        preflight(store, collection, accepted_nodes)?;
     }
+    let reason_limit = accepted_nodes
+        .checked_mul(16)
+        .ok_or(StoreError::Incoherent(
+            "eligibility-reason recovery limit overflow",
+        ))?;
+    preflight(store, StoreCollection::EligibilityReasons, reason_limit)?;
     let maximum_aux = config.limits.max_aux_deliveries_total.get();
-    if store.aux_delivery_count_up_to(maximum_aux)? > maximum_aux {
-        return Err(StoreError::LimitExceeded {
-            collection: "auxiliary deliveries",
-            limit: maximum_aux,
-        }
-        .into());
-    }
+    preflight(store, StoreCollection::AuxiliaryDeliveries, maximum_aux)?;
     let maximum_contexts = crate::POW_PREDECESSOR_CONTEXT_SPAN;
-    if store.validation_context_count_up_to(maximum_contexts)? > maximum_contexts {
-        return Err(StoreError::LimitExceeded {
-            collection: "validation contexts",
-            limit: maximum_contexts,
-        }
-        .into());
-    }
+    preflight(store, StoreCollection::ValidationContexts, maximum_contexts)?;
+    preflight(store, StoreCollection::FinalityHistory, 65_536)?;
+    preflight(store, StoreCollection::ConsensusInvalidTombstones, 65_536)?;
 
     let mut source_nodes = store.all_header_nodes()?;
     let tombstones = store.all_consensus_invalid_body_tombstones()?;
@@ -151,4 +151,16 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditRead>(
         trust_anchor_changed,
         early_violations,
     })
+}
+
+fn preflight<S: StoreAuditRead>(
+    store: &S,
+    collection: StoreCollection,
+    maximum: usize,
+) -> Result<(), RecoveryFailure> {
+    let limit = RowLimit::new(maximum);
+    if store.collection_count_up_to(collection, limit)? > maximum {
+        return Err(StoreError::LimitExceeded { collection, limit }.into());
+    }
+    Ok(())
 }

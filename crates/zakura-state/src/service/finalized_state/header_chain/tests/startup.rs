@@ -1,6 +1,30 @@
 use super::*;
 
 #[test]
+fn f_225519_rocksdb_count_stops_at_the_first_extra_row_without_decoding() {
+    let db_config = Config::ephemeral();
+    let (engine_config, _, _) = fixture();
+    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let cf = store
+        .cf(HEADER_NODE_BY_HASH)
+        .expect("the node column family exists");
+    for marker in 0_u8..3 {
+        store
+            .db
+            .put_cf(&cf, [marker; 32], b"intentionally malformed")
+            .expect("the malformed fixture row writes");
+    }
+
+    assert_eq!(
+        store
+            .db
+            .raw_count_cf_up_to(&cf, 1)
+            .expect("the bounded raw scan succeeds"),
+        2
+    );
+}
+
+#[test]
 fn startup_atomically_rebinds_an_extended_checkpoint_manifest() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();

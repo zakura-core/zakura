@@ -1,11 +1,11 @@
-# How the fork-aware header chain works
+# Fork-aware header-chain implementation
 
 This guide explains how PR #586 implements the
 [fork-aware header-chain specification](../../specs/fork-aware-header-chain-engine.md).
 Each linked property names the behavior that the code implements. The specification
 remains authoritative.
 
-## Why one planner selects the chain
+## Single-planner fork choice
 
 Four events can change the selected header chain. Peers add headers. Full state reports
 verified blocks and consensus-invalid bodies. A node administrator can exclude or
@@ -21,9 +21,9 @@ It does not delete them. `reconsiderblock` removes that exclusion, so the branch
 become eligible again unless another reason still excludes it. The code represents
 these calls as `OperatorInvalidate` and `OperatorReconsider` events.
 
-## What state the engine keeps
+## Header-chain state
 
-[`MemHeaderStore`](../../../crates/zakura-header-chain/src/graph.rs) holds every retained
+[`MemHeaderStore`](../../../crates/zakura-header-chain/src/graph/mod.rs) holds every retained
 header in a directed acyclic graph (DAG). Each `HeaderNode` is keyed by its consensus
 hash and names its parent. The finalized `Frontier` is the graph root. A `Frontier`
 contains both height and hash, so it identifies one position on one branch.
@@ -42,7 +42,7 @@ Selection takes the maximum score over all eligible tips. This implements
 [deterministic selection (`LC-SELECT-04`)](../../specs/fork-aware-header-chain-engine.md#lc-select-04):
 the same eligible DAG selects the same tip regardless of header arrival order.
 
-## How a header reaches the graph
+## Header admission and validation
 
 The header-sync driver prepares a downloaded batch before it takes the state writer
 lock. It obtains a validation lease for the common ancestor and checks properties that
@@ -66,7 +66,7 @@ staged graph. It admits a header only after every required check passes. This im
 After planning, `verify_plan` independently checks the resulting graph, projections,
 generation changes, and protected nodes before the runtime writes anything.
 
-## How a transition commits
+## Transition commit order
 
 `MemHeaderStore` contains the committed graph.
 [`GraphOverlay`](../../../crates/zakura-header-chain/src/graph/overlay.rs) reads that graph
@@ -115,11 +115,11 @@ the runtime commits the DAG changes, metadata, projections, and related indexes 
 RocksDB batch before it publishes the new snapshot.
 
 Startup uses
-[`audit_store`](../../../crates/zakura-header-chain/src/transition/recovery.rs) while
+[`audit_store`](../../../crates/zakura-header-chain/src/transition/recovery/mod.rs) while
 publication is disabled. The audit checks the stored source rows and rebuilds derived
 indexes and projections. It refuses inconsistencies that it cannot reconstruct.
 
-### The three write paths
+### Write paths
 
 `apply` commits a header-chain change without a block-state change. Header downloads,
 deferred-header reevaluation, and body evidence use this path.
@@ -137,7 +137,7 @@ A no-change plan still commits the caller's block-state batch when one exists, b
 does not install or publish a header-chain change. A `ResourceStalled` result discards
 the caller's block-state rows. It writes a changed header-chain alarm when needed.
 
-## How a fork switch runs
+## Fork switching
 
 A fork switch changes the selected path. It does not roll back the header DAG.
 
@@ -173,7 +173,7 @@ the verified path must move to the other branch. `SyncCoordinator` holds the pro
 apply permit during that handoff, so the native and legacy block-apply paths cannot run
 at the same time.
 
-## How VCT evidence is tracked
+## VCT evidence and authentication
 
 Peers can provide commitment-tree roots before the node downloads the corresponding
 block body. The engine stores each delivery against a header hash instead of a height.
@@ -191,14 +191,14 @@ Unauthenticated evidence does not affect header validity or fork choice. The
 fetches missing evidence separately for each branch and generation. The full tree design
 lives in [Verified commitment trees](../verified-commitment-trees.md).
 
-## How the node rejects late work
+## Stale work rejection
 
 Header requests can finish after the selected branch has changed. `BranchId` identifies
 the anchor and tip that a request belongs to. It deliberately omits height because a
 fork switch can replace a branch without changing its height.
 
 When a result returns, `Gate` in
-[`ownership.rs`](../../../crates/zakura-header-chain/src/ownership.rs) compares its branch
+[`completion.rs`](../../../crates/zakura-header-chain/src/work/completion.rs) compares its branch
 and generation with the current snapshot. It accepts current work and rejects stale
 work. It ignores `state_version` because unrelated transitions increment that counter
 and would cancel valid requests. The scheduler uses the same branch and generation to
@@ -229,7 +229,7 @@ and verifies the result. This boundary implements
 [block-sync concerns excluded (`LC-SCOPE-06`)](../../specs/fork-aware-header-chain-engine.md#lc-scope-06):
 unrelated block-sync policy cannot affect header fork choice.
 
-[`retention.rs`](../../../crates/zakura-header-chain/src/retention.rs) protects the
+[`retention.rs`](../../../crates/zakura-header-chain/src/transition/planner/retention.rs) protects the
 selected and verified paths. When protected state fills the node limit, the engine
 refuses admission instead of deleting either path. This implements
 [fork and node limits (`LC-RETAIN-01`)](../../specs/fork-aware-header-chain-engine.md#lc-retain-01).

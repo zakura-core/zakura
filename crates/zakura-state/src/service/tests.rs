@@ -40,8 +40,8 @@ use crate::{
         setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
         FakeChainHelper,
     },
-    BoxError, CheckpointVerifiedBlock, Config, ReadRequest, ReadResponse, Request, Response,
-    SemanticallyVerifiedBlock, CHAIN_TIP_UPDATE_WAIT_LIMIT,
+    BoxError, CheckpointVerifiedBlock, Config, HashOrHeight, ReadRequest, ReadResponse, Request,
+    Response, SemanticallyVerifiedBlock, CHAIN_TIP_UPDATE_WAIT_LIMIT,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
@@ -1642,4 +1642,319 @@ fn read_only_open_with_ephemeral_config_returns_error() {
             panic!("expected an error when opening a read-only state with an ephemeral config")
         }
     }
+}
+
+/// A delayed read can retain a pre-reorg chain after the winning fork has finalized.
+/// A lookup must keep the header and successor on one lineage.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_header_hash_lookup_does_not_mix_stale_and_finalized_forks() -> Result<()> {
+    use crate::{
+        request::{FinalizedBlock, Treestate},
+        service::{
+            finalized_state::DiskWriteBatch, non_finalized_state::NonFinalizedState,
+            watch_receiver::WatchReceiver, ReadStateService, VctRootRepairStatus,
+        },
+    };
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let winning_block = Arc::new(network.test_block(653599, 583999).unwrap());
+    let config = Config::ephemeral();
+    let finalized_state = FinalizedState::new(&config, &network).unwrap();
+    let mut stale_block = winning_block.clone();
+    // Production inserts blocks only after semantic verification. This state-layer
+    // regression bypasses that boundary and mutates the nonce only to give the
+    // retained fork a distinct block identity.
+    Arc::make_mut(&mut Arc::make_mut(&mut stale_block).header)
+        .nonce
+        .0[0] ^= 1;
+    let stale_hash = stale_block.hash();
+    let stale_child = stale_block.make_fake_child();
+    let stale_child_hash = stale_child.hash();
+    let winning_child = winning_block.make_fake_child();
+    let winning_child_hash = winning_child.hash();
+    let winning_height = winning_block.coinbase_height().unwrap();
+    assert_ne!(stale_hash, winning_block.hash());
+    assert_ne!(stale_child_hash, winning_child_hash);
+    let mut stale_tip_state = NonFinalizedState::new(&network);
+    stale_tip_state
+        .commit_new_chain(stale_block.clone().prepare(), &finalized_state)
+        .unwrap();
+
+    let mut stale_state = NonFinalizedState::new(&network);
+    stale_state
+        .commit_new_chain(stale_block.prepare(), &finalized_state)
+        .unwrap();
+    stale_state
+        .commit_block(stale_child.prepare(), &finalized_state)
+        .unwrap();
+    assert_eq!(
+        stale_state
+            .best_chain()
+            .and_then(|chain| chain.hash_by_height(winning_height)),
+        Some(stale_hash)
+    );
+    assert_eq!(
+        stale_state
+            .best_chain()
+            .and_then(|chain| chain.hash_by_height(winning_height.next().unwrap())),
+        Some(stale_child_hash)
+    );
+    let (stale_sender, stale_receiver) = tokio::sync::watch::channel(stale_state);
+    let (_checkpoint_sender, checkpoint_receiver) = tokio::sync::watch::channel(None);
+    let (_repair_sender, repair_receiver) =
+        tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (_header_root_auth_sender, header_root_auth_receiver) = tokio::sync::watch::channel(None);
+    let read_state = ReadStateService::new(
+        &finalized_state,
+        None,
+        WatchReceiver::new(stale_receiver),
+        checkpoint_receiver,
+        None,
+        repair_receiver,
+        header_root_auth_receiver,
+    );
+    let winning_finalized = FinalizedBlock::from_checkpoint_verified(
+        CheckpointVerifiedBlock::from(winning_block.clone()),
+        Treestate::default(),
+    );
+    let winning_child_finalized = FinalizedBlock::from_checkpoint_verified(
+        CheckpointVerifiedBlock::from(winning_child),
+        Treestate::default(),
+    );
+    // Use the production finalization sub-batch to stage every database row this
+    // handler reads. Ancestor and tip metadata are irrelevant to this request.
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_block_header_and_transaction_data_batch(
+            &finalized_state.db,
+            &winning_finalized,
+            false,
+            None,
+        )
+        .unwrap();
+    finalized_state.db.write_batch(batch).unwrap();
+    let response = read_state
+        .clone()
+        .oneshot(ReadRequest::BlockHeader(winning_block.hash().into()))
+        .await
+        .unwrap();
+    let ReadResponse::BlockHeader {
+        header,
+        hash,
+        height,
+        next_block_hash,
+    } = response
+    else {
+        unreachable!();
+    };
+    assert_eq!(height, winning_height);
+    assert_eq!(hash, winning_block.hash());
+    assert_eq!(block::Hash::from(header.as_ref()), winning_block.hash());
+    assert_eq!(next_block_hash, None);
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_block_header_and_transaction_data_batch(
+            &finalized_state.db,
+            &winning_child_finalized,
+            false,
+            None,
+        )
+        .unwrap();
+    finalized_state.db.write_batch(batch).unwrap();
+
+    let response = read_state
+        .clone()
+        .oneshot(ReadRequest::BlockHeader(winning_block.hash().into()))
+        .await
+        .unwrap();
+    let ReadResponse::BlockHeader {
+        header,
+        hash,
+        height,
+        next_block_hash,
+    } = response
+    else {
+        unreachable!();
+    };
+    assert_eq!(height, winning_height);
+    assert_eq!(hash, winning_block.hash());
+    assert_eq!(block::Hash::from(header.as_ref()), winning_block.hash());
+    assert_eq!(next_block_hash, Some(winning_child_hash));
+
+    let response = read_state
+        .clone()
+        .oneshot(ReadRequest::BlockHeader(winning_height.into()))
+        .await
+        .unwrap();
+    let ReadResponse::BlockHeader {
+        header,
+        hash,
+        height,
+        next_block_hash,
+    } = response
+    else {
+        unreachable!();
+    };
+    assert_eq!(height, winning_height);
+    assert_eq!(hash, stale_hash);
+    assert_eq!(block::Hash::from(header.as_ref()), stale_hash);
+    assert_eq!(next_block_hash, Some(stale_child_hash));
+    stale_sender.send_replace(stale_tip_state);
+    let response = read_state
+        .oneshot(ReadRequest::BlockHeader(stale_hash.into()))
+        .await
+        .unwrap();
+    let ReadResponse::BlockHeader {
+        header,
+        hash,
+        height,
+        next_block_hash,
+    } = response
+    else {
+        unreachable!();
+    };
+    assert_eq!(height, winning_height);
+    assert_eq!(hash, stale_hash);
+    assert_eq!(block::Hash::from(header.as_ref()), stale_hash);
+    assert_eq!(next_block_hash, None);
+    Ok(())
+}
+
+/// A best-chain successor can cross either finalized/non-finalized state boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_header_lookup_preserves_finalized_boundary_successor() -> Result<()> {
+    use crate::{
+        request::{FinalizedBlock, Treestate},
+        service::{
+            finalized_state::DiskWriteBatch, non_finalized_state::NonFinalizedState,
+            watch_receiver::WatchReceiver, ReadStateService, VctRootRepairStatus,
+        },
+    };
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let parent = Arc::new(network.test_block(653599, 583999).unwrap());
+    let parent_hash = parent.hash();
+    let parent_height = parent.coinbase_height().unwrap();
+    let child = parent.make_fake_child();
+    let child_hash = child.hash();
+    assert_eq!(child.header.previous_block_hash, parent_hash);
+
+    let config = Config::ephemeral();
+    let finalized_state = FinalizedState::new(&config, &network).unwrap();
+    let mut retained_tip_state = NonFinalizedState::new(&network);
+    retained_tip_state
+        .commit_new_chain(parent.clone().prepare(), &finalized_state)
+        .unwrap();
+
+    let mut retained_state = NonFinalizedState::new(&network);
+    retained_state
+        .commit_new_chain(parent.clone().prepare(), &finalized_state)
+        .unwrap();
+    retained_state
+        .commit_block(child.clone().prepare(), &finalized_state)
+        .unwrap();
+    drop(retained_state.finalize());
+    assert!(retained_state
+        .best_chain()
+        .and_then(|chain| chain.block(parent_hash.into()))
+        .is_none());
+    assert_eq!(
+        retained_state
+            .best_chain()
+            .and_then(|chain| chain.block(parent_height.next().unwrap().into()))
+            .map(|block| block.hash),
+        Some(child_hash)
+    );
+
+    let (retained_sender, retained_receiver) = tokio::sync::watch::channel(retained_state);
+    let (_checkpoint_sender, checkpoint_receiver) = tokio::sync::watch::channel(None);
+    let (_repair_sender, repair_receiver) =
+        tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (_header_root_auth_sender, header_root_auth_receiver) = tokio::sync::watch::channel(None);
+    let read_state = ReadStateService::new(
+        &finalized_state,
+        None,
+        WatchReceiver::new(retained_receiver),
+        checkpoint_receiver,
+        None,
+        repair_receiver,
+        header_root_auth_receiver,
+    );
+
+    let parent_finalized = FinalizedBlock::from_checkpoint_verified(
+        CheckpointVerifiedBlock::from(parent.clone()),
+        Treestate::default(),
+    );
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_block_header_and_transaction_data_batch(
+            &finalized_state.db,
+            &parent_finalized,
+            false,
+            None,
+        )
+        .unwrap();
+    finalized_state.db.write_batch(batch).unwrap();
+
+    for hash_or_height in [
+        HashOrHeight::from(parent_hash),
+        HashOrHeight::from(parent_height),
+    ] {
+        let response = read_state
+            .clone()
+            .oneshot(ReadRequest::BlockHeader(hash_or_height))
+            .await
+            .unwrap();
+        let ReadResponse::BlockHeader {
+            header,
+            hash,
+            height,
+            next_block_hash,
+        } = response
+        else {
+            unreachable!();
+        };
+        assert_eq!(height, parent_height);
+        assert_eq!(hash, parent_hash);
+        assert_eq!(block::Hash::from(header.as_ref()), parent_hash);
+        assert_eq!(next_block_hash, Some(child_hash));
+    }
+
+    retained_sender.send_replace(retained_tip_state);
+    let child_finalized = FinalizedBlock::from_checkpoint_verified(
+        CheckpointVerifiedBlock::from(child),
+        Treestate::default(),
+    );
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_block_header_and_transaction_data_batch(
+            &finalized_state.db,
+            &child_finalized,
+            false,
+            None,
+        )
+        .unwrap();
+    finalized_state.db.write_batch(batch).unwrap();
+
+    let response = read_state
+        .oneshot(ReadRequest::BlockHeader(parent_hash.into()))
+        .await
+        .unwrap();
+    let ReadResponse::BlockHeader {
+        header,
+        hash,
+        height,
+        next_block_hash,
+    } = response
+    else {
+        unreachable!();
+    };
+    assert_eq!(height, parent_height);
+    assert_eq!(hash, parent_hash);
+    assert_eq!(block::Hash::from(header.as_ref()), parent_hash);
+    assert_eq!(next_block_hash, Some(child_hash));
+
+    Ok(())
 }

@@ -1896,23 +1896,49 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::BlockHeader(hash_or_height) => {
                 let best_chain = state.latest_best_chain();
 
-                let height = hash_or_height
-                    .height_or_else(|hash| {
-                        read::find::height_by_hash(best_chain.clone(), &state.db, hash)
+                let (header, hash, height, next_block_hash) = best_chain
+                    .as_ref()
+                    .and_then(|chain| {
+                        chain.block(hash_or_height).map(|contextual| {
+                            let height = contextual.height;
+                            (
+                                contextual.block.header.clone(),
+                                contextual.hash,
+                                height,
+                                height.next().ok().and_then(|next_height| {
+                                    chain.hash_by_height(next_height).or_else(|| {
+                                        state
+                                            .db
+                                            .block_header(next_height.into())
+                                            .filter(|next_header| {
+                                                next_header.previous_block_hash == contextual.hash
+                                            })
+                                            .map(|next_header| {
+                                                block::Hash::from(next_header.as_ref())
+                                            })
+                                    })
+                                }),
+                            )
+                        })
                     })
-                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
+                    .or_else(|| {
+                        let height = hash_or_height.height_or_else(|hash| state.db.height(hash))?;
+                        let hash = hash_or_height.hash_or_else(|height| state.db.hash(height))?;
+                        let header = state.db.block_header(height.into())?;
+                        let next_block_hash = height.next().ok().and_then(|next_height| {
+                            state.db.hash(next_height).or_else(|| {
+                                best_chain
+                                    .as_ref()
+                                    .and_then(|chain| chain.block(next_height.into()))
+                                    .filter(|next_block| {
+                                        next_block.block.header.previous_block_hash == hash
+                                    })
+                                    .map(|next_block| next_block.hash)
+                            })
+                        });
 
-                let hash = hash_or_height
-                    .hash_or_else(|height| {
-                        read::find::hash_by_height(best_chain.clone(), &state.db, height)
+                        Some((header, hash, height, next_block_hash))
                     })
-                    .ok_or_else(|| BoxError::from("block hash or height not found"))?;
-
-                let next_height = height.next()?;
-                let next_block_hash =
-                    read::find::hash_by_height(best_chain.clone(), &state.db, next_height);
-
-                let header = read::block_header(best_chain, &state.db, height.into())
                     .ok_or_else(|| BoxError::from("block hash or height not found"))?;
 
                 Ok(ReadResponse::BlockHeader {

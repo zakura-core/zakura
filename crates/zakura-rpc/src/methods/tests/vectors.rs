@@ -3047,7 +3047,7 @@ async fn rpc_getnetworksolps_saturates_to_response_width() {
             height: None,
         })
         .await
-        .respond(ReadResponse::SolutionRate(Some(u128::MAX)));
+        .respond(ReadResponse::SolutionRate(Some(U256::MAX)));
 
     assert_eq!(
         request

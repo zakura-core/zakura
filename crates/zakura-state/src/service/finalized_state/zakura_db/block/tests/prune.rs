@@ -1453,12 +1453,14 @@ fn validate_storage_mode_enforces_retention_floor() {
 #[tokio::test]
 async fn raw_block_range_read_stops_at_pruned_gap_before_retained_bodies() {
     use tower::ServiceExt;
+    use zakura_node_services::sync_lifecycle::{
+        HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+    };
 
     use crate::{
         service::{
-            finalized_state::HighestCompletedCheckpointTracker,
             non_finalized_state::NonFinalizedState, watch_receiver::WatchReceiver,
-            ReadStateService, VctRootRepairStatus,
+            HeaderChainSubscriptions, ReadStateService, VctRootRepairStatus,
         },
         ReadRequest, ReadResponse,
     };
@@ -1488,19 +1490,27 @@ async fn raw_block_range_read_stops_at_pruned_gap_before_retained_bodies() {
         tokio::sync::watch::channel(NonFinalizedState::new(&network));
     let (_vct_root_repair_sender, vct_root_repair_receiver) =
         tokio::sync::watch::channel(VctRootRepairStatus::default());
-    let (highest_completed_checkpoint, highest_completed_checkpoint_receiver) =
-        HighestCompletedCheckpointTracker::open(&state.db);
-    let highest_completed_checkpoint_sender = Some(highest_completed_checkpoint.keepalive_sender());
-    let (_header_root_auth_sender, header_root_auth_receiver) = tokio::sync::watch::channel(None);
+    let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+        tokio::sync::watch::channel(None);
+    let (_header_runtime_status_sender, header_runtime_status_receiver) =
+        tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+            epoch: LifecycleEpoch::INITIAL,
+            reason: HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+        });
+    let (_header_chain_reader_sender, header_chain_reader_receiver) =
+        tokio::sync::watch::channel(None);
 
     let read_state = ReadStateService::new(
         &state,
         None,
+        Arc::new(std::sync::OnceLock::new()),
         WatchReceiver::new(non_finalized_state_receiver),
-        highest_completed_checkpoint_receiver,
-        highest_completed_checkpoint_sender,
         vct_root_repair_receiver,
-        header_root_auth_receiver,
+        HeaderChainSubscriptions {
+            snapshots: header_chain_snapshot_receiver,
+            runtime_status: header_runtime_status_receiver,
+            reader: header_chain_reader_receiver,
+        },
     );
 
     let response = read_state

@@ -691,10 +691,12 @@ impl<'a> GraphOverlay<'a> {
                 .ok_or(GraphError::UnknownHeaderNode(cursor.hash))?
                 .parent_hash;
             finalized_path.push((parent_hash, cursor.hash));
-            let parent_height = cursor
-                .height
-                .previous()
-                .expect("cursor height has a predecessor because it is above the current height");
+            let parent_height = cursor.height.previous().map_err(|_| {
+                GraphError::FinalizedFrontierNotDescendant {
+                    current: current.hash,
+                    candidate: finalized_frontier.hash,
+                }
+            })?;
             cursor = Frontier::new(parent_height, parent_hash);
         }
         if cursor != current {

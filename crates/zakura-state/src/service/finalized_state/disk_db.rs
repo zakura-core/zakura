@@ -1241,6 +1241,28 @@ impl DiskDb {
         Ok(())
     }
 
+    /// Count at most `limit + 1` rows without collecting keys or values.
+    pub(crate) fn raw_count_cf_up_to<C>(
+        &self,
+        cf: &C,
+        limit: usize,
+    ) -> Result<usize, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        let stop_after = limit.saturating_add(1);
+        let mut count: usize = 0;
+        for entry in self
+            .db
+            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .take(stop_after)
+        {
+            entry?;
+            count = count.saturating_add(1);
+        }
+        Ok(count)
+    }
+
     /// Collect a raw half-open key range without panicking on iterator failure.
     pub(crate) fn raw_range_cf<C>(
         &self,

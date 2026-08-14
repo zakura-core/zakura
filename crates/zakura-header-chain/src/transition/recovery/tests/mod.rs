@@ -24,6 +24,7 @@ use crate::{
 pub(super) enum AuditRead {
     Snapshot,
     Metadata,
+    HeaderNodeCount,
     HeaderNodes,
     Tombstones,
     BodyStateAuthority,
@@ -32,16 +33,19 @@ pub(super) enum AuditRead {
     VerifiedProjection,
     DeferredEntries,
     EligibilityRoots,
+    AuxDeliveryCount,
     AuxDeliveries,
+    ValidationContextCount,
     ValidationContexts,
     CanonicalHash,
     FinalityHistory,
 }
 
 impl AuditRead {
-    pub(super) const ALL: [Self; 14] = [
+    pub(super) const ALL: [Self; 17] = [
         Self::Snapshot,
         Self::Metadata,
+        Self::HeaderNodeCount,
         Self::HeaderNodes,
         Self::Tombstones,
         Self::BodyStateAuthority,
@@ -50,7 +54,9 @@ impl AuditRead {
         Self::VerifiedProjection,
         Self::DeferredEntries,
         Self::EligibilityRoots,
+        Self::AuxDeliveryCount,
         Self::AuxDeliveries,
+        Self::ValidationContextCount,
         Self::ValidationContexts,
         Self::CanonicalHash,
         Self::FinalityHistory,
@@ -95,6 +101,11 @@ impl StoreAuditRead for AuditStore {
     fn metadata(&self) -> Result<EngineMetadata, StoreError> {
         self.check_read(AuditRead::Metadata)?;
         Ok(self.metadata.clone())
+    }
+
+    fn header_node_count_up_to(&self, limit: usize) -> Result<usize, StoreError> {
+        self.check_read(AuditRead::HeaderNodeCount)?;
+        Ok(self.nodes.len().min(limit.saturating_add(1)))
     }
 
     fn all_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
@@ -143,6 +154,11 @@ impl StoreAuditRead for AuditStore {
         Ok(self.reasons.clone())
     }
 
+    fn aux_delivery_count_up_to(&self, limit: usize) -> Result<usize, StoreError> {
+        self.check_read(AuditRead::AuxDeliveryCount)?;
+        Ok(self.aux.len().min(limit.saturating_add(1)))
+    }
+
     fn all_aux_deliveries(
         &self,
     ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>
@@ -172,6 +188,11 @@ impl StoreAuditRead for AuditStore {
                 (base, status, observations, delivery.outcome_boundary_hash())
             })
             .collect())
+    }
+
+    fn validation_context_count_up_to(&self, limit: usize) -> Result<usize, StoreError> {
+        self.check_read(AuditRead::ValidationContextCount)?;
+        Ok(self.contexts.len().min(limit.saturating_add(1)))
     }
 
     fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError> {

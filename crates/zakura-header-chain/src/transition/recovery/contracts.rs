@@ -39,6 +39,8 @@ pub trait StoreAuditRead {
     fn snapshot(&self) -> Result<EngineSnapshot, StoreError>;
     /// Return complete singleton metadata from the same version as [`Self::snapshot`].
     fn metadata(&self) -> Result<EngineMetadata, StoreError>;
+    /// Count header-node rows up to `limit + 1` without decoding their values.
+    fn header_node_count_up_to(&self, limit: usize) -> Result<usize, StoreError>;
     /// Return every header-node row, including disconnected rows.
     fn all_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError>;
     /// Return every append-only consensus-invalid body tombstone, including pruned hashes.
@@ -61,6 +63,8 @@ pub trait StoreAuditRead {
     fn deferred_entries(&self) -> Result<Vec<(DateTime<Utc>, block::Hash)>, StoreError>;
     /// Every authoritative direct-reason root.
     fn eligibility_roots(&self) -> Result<Vec<(block::Hash, EligibilityReason)>, StoreError>;
+    /// Count auxiliary rows up to `limit + 1` without decoding their values.
+    fn aux_delivery_count_up_to(&self, limit: usize) -> Result<usize, StoreError>;
     /// Every untrusted auxiliary delivery row, including dangling rows.
     ///
     /// The tuple contains an unauthenticated delivery, a status code, two optional observation
@@ -68,6 +72,8 @@ pub trait StoreAuditRead {
     fn all_aux_deliveries(
         &self,
     ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>;
+    /// Count validation-context rows up to `limit + 1` without decoding their values.
+    fn validation_context_count_up_to(&self, limit: usize) -> Result<usize, StoreError>;
     /// Every immutable below-finalized context row.
     fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError>;
     /// Return the independently authenticated canonical hash at `height`, when available.

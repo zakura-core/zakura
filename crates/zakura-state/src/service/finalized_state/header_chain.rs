@@ -4145,6 +4145,14 @@ impl StoreAuditRead for HeaderChainStore {
         HeaderChainStore::metadata(self)
     }
 
+    fn header_node_count_up_to(&self, limit: usize) -> Result<usize, StoreError> {
+        let cf = self.cf(HEADER_NODE_BY_HASH).map_err(store_error)?;
+        self.db
+            .raw_count_cf_up_to(&cf, limit)
+            .map_err(HeaderChainStoreError::from)
+            .map_err(store_error)
+    }
+
     fn all_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
         let mut reasons_by_hash: HashMap<block::Hash, Vec<EligibilityReason>> = HashMap::new();
         for (hash, reason) in self.all_reason_rows()? {
@@ -4254,6 +4262,14 @@ impl StoreAuditRead for HeaderChainStore {
         self.all_reason_rows()
     }
 
+    fn aux_delivery_count_up_to(&self, limit: usize) -> Result<usize, StoreError> {
+        let cf = self.cf(HEADER_AUX_DELIVERY).map_err(store_error)?;
+        self.db
+            .raw_count_cf_up_to(&cf, limit)
+            .map_err(HeaderChainStoreError::from)
+            .map_err(store_error)
+    }
+
     fn all_aux_deliveries(
         &self,
     ) -> Result<Vec<(AuxDelivery, u8, [Option<[u8; 32]>; 2], Option<block::Hash>)>, StoreError>
@@ -4272,6 +4288,14 @@ impl StoreAuditRead for HeaderChainStore {
             deliveries.push(delivery);
         }
         Ok(deliveries)
+    }
+
+    fn validation_context_count_up_to(&self, limit: usize) -> Result<usize, StoreError> {
+        let cf = self.cf(HEADER_VALIDATION_CONTEXT).map_err(store_error)?;
+        self.db
+            .raw_count_cf_up_to(&cf, limit)
+            .map_err(HeaderChainStoreError::from)
+            .map_err(store_error)
     }
 
     fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError> {

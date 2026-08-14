@@ -46,7 +46,7 @@ use crate::{
 use super::super::{
     commitment_aux, serve_block_roots, vct::validate_final_frontiers_bytes,
     verify_subtrees_against_stored, CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState,
-    NextVctBlock, VctAuxWindow,
+    VctAuxiliaryWindow, VctSuccessorWitness,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -63,8 +63,8 @@ type SaplingTree = Arc<zakura_chain::sapling::tree::NoteCommitmentTree>;
 type OrchardTree = Arc<zakura_chain::orchard::tree::NoteCommitmentTree>;
 type SproutTree = Arc<zakura_chain::sprout::tree::NoteCommitmentTree>;
 
-fn vct_successor_header(block: Arc<Block>) -> NextVctBlock {
-    NextVctBlock::from_header(
+fn vct_successor_witness(block: Arc<Block>) -> VctSuccessorWitness {
+    VctSuccessorWitness::from_header(
         block.header.clone(),
         block
             .coinbase_height()
@@ -73,11 +73,11 @@ fn vct_successor_header(block: Arc<Block>) -> NextVctBlock {
     )
 }
 
-fn next_vct_block(block: Arc<Block>) -> Option<NextVctBlock> {
-    Some(vct_successor_header(block))
+fn next_vct_block(block: Arc<Block>) -> Option<VctSuccessorWitness> {
+    Some(vct_successor_witness(block))
 }
 
-fn exact_vct_aux_window(
+fn exact_vct_auxiliary_window(
     block: &Arc<Block>,
     height: Height,
     roots: (
@@ -86,7 +86,7 @@ fn exact_vct_aux_window(
         zakura_chain::ironwood::tree::Root,
     ),
     successor: &Arc<Block>,
-) -> VctAuxWindow {
+) -> VctAuxiliaryWindow {
     use std::num::NonZeroU64;
     use zakura_header_chain::{
         AlarmSet, AuxAuthentication, AuxDelivery, BodySizeHint, ChainScore, EngineMode,
@@ -156,11 +156,12 @@ fn exact_vct_aux_window(
         }),
         authentication: AuxAuthentication::Unauthenticated,
     };
-    VctAuxWindow {
-        snapshot,
-        current,
+    VctAuxiliaryWindow {
+        engine_snapshot: snapshot,
+        delivery_header: block.header.clone(),
+        delivery: current,
         successor_height: Some(successor_height),
-        successor: NextVctBlock::from_delivery(
+        successor: VctSuccessorWitness::from_delivery(
             successor.header.clone(),
             successor_height,
             successor_delivery,
@@ -648,7 +649,7 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
                     .get(&height_u32)
                     .copied()
                     .expect("the exact fast range has roots");
-                let window = exact_vct_aux_window(
+                let window = exact_vct_auxiliary_window(
                     &blocks[i].block,
                     Height(height_u32),
                     roots,
@@ -825,7 +826,7 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < last)
-                    .then(|| vct_successor_header(blocks[i + 1].block.clone()));
+                    .then(|| vct_successor_witness(blocks[i + 1].block.clone()));
                 match fast.commit_finalized_direct(cv.into(), None, next, "vct hole fast") {
                     Ok(_) => {}
                     Err(error) => {
@@ -1637,7 +1638,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < last)
-                    .then(|| vct_successor_header(blocks[i + 1].block.clone()));
+                    .then(|| vct_successor_witness(blocks[i + 1].block.clone()));
                 fast.commit_finalized_direct(cv.into(), None, next, "vct fast handoff")
                     .expect("verified fast commit succeeds");
             }
@@ -1716,7 +1717,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             );
             for i in 0..last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = Some(vct_successor_header(blocks[i + 1].block.clone()));
+                let next = Some(vct_successor_witness(blocks[i + 1].block.clone()));
                 corrupt_handoff
                     .commit_finalized_direct(cv.into(), None, next, "vct corrupt Sprout handoff prefix")
                     .expect("the prefix before the corrupt handoff commits");
@@ -1879,7 +1880,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < last)
-                    .then(|| vct_successor_header(blocks[i + 1].block.clone()));
+                    .then(|| vct_successor_witness(blocks[i + 1].block.clone()));
                 match bad_handoff.commit_finalized_direct(cv.into(), None, next, "vct bad handoff") {
                     Ok(_) => {}
                     Err(error) => {
@@ -1936,7 +1937,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < last)
-                    .then(|| vct_successor_header(blocks[i + 1].block.clone()));
+                    .then(|| vct_successor_witness(blocks[i + 1].block.clone()));
                 match bad_ironwood_handoff.commit_finalized_direct(cv.into(), None, next, "vct bad ironwood handoff") {
                     Ok(_) => {}
                     Err(error) => {
@@ -2120,7 +2121,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 for i in 0..=handoff_index {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                     let next = (i < handoff_index)
-                        .then(|| vct_successor_header(blocks[i + 1].block.clone()));
+                        .then(|| vct_successor_witness(blocks[i + 1].block.clone()));
                     fast.commit_finalized_direct(cv.into(), None, next, "vct switch fast prefix")
                         .expect("verified fast prefix commits");
                 }
@@ -2197,7 +2198,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             for i in (seed + 1)..=post_handoff_tip {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < post_handoff_tip)
-                    .then(|| vct_successor_header(blocks[i + 1].block.clone()));
+                    .then(|| vct_successor_witness(blocks[i + 1].block.clone()));
                 fast_suffix
                     .commit_finalized_direct(cv.into(), None, next, "vct switch fast suffix")
                     .expect("fast suffix commits after manual prefix");
@@ -2357,7 +2358,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             );
 
             let cv = CheckpointVerifiedBlock::from(blocks[seed + 2].block.clone());
-            let successor = vct_successor_header(blocks[seed + 3].block.clone());
+            let successor = vct_successor_witness(blocks[seed + 3].block.clone());
             fast.commit_finalized_direct(
                 cv.into(),
                 None,

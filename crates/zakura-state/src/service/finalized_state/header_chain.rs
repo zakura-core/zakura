@@ -3,6 +3,7 @@
 #![allow(dead_code)] // Constructed by the full-state migration and service wiring in PR-9.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
@@ -106,6 +107,24 @@ impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
     }
 }
 
+fn combined_retention_references<'a>(
+    context_references: &'a [block::Hash],
+    active_lease_references: Option<&'a [block::Hash]>,
+) -> Cow<'a, [block::Hash]> {
+    let Some(active_lease_references) = active_lease_references else {
+        return Cow::Borrowed(context_references);
+    };
+    if context_references.is_empty() {
+        return Cow::Borrowed(active_lease_references);
+    }
+
+    let mut references = context_references.to_vec();
+    references.extend(active_lease_references.iter().copied());
+    references.sort_unstable_by_key(|hash| hash.0);
+    references.dedup();
+    Cow::Owned(references)
+}
+
 #[cfg(test)]
 #[path = "header_chain/coherence.rs"]
 mod coherence;
@@ -115,7 +134,12 @@ pub(in crate::service) mod migration;
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use fuzz::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 
-pub(crate) fn select_vct_aux_delivery(deliveries: Vec<AuxDelivery>) -> Option<AuxDelivery> {
+/// Selects one usable VCT auxiliary delivery for a retained header.
+///
+/// The selector excludes deliveries without tree data and rejected deliveries. It prefers
+/// authenticated, unauthenticated, and disputed deliveries in that order. The delivery ID breaks
+/// ties deterministically.
+pub(crate) fn select_vct_auxiliary_delivery(deliveries: Vec<AuxDelivery>) -> Option<AuxDelivery> {
     deliveries
         .into_iter()
         .filter(|delivery| {
@@ -127,10 +151,12 @@ pub(crate) fn select_vct_aux_delivery(deliveries: Vec<AuxDelivery>) -> Option<Au
         })
         .min_by_key(|delivery| {
             (
-                !matches!(
-                    delivery.authentication,
-                    zakura_header_chain::AuxAuthentication::Authenticated { .. }
-                ),
+                match delivery.authentication {
+                    zakura_header_chain::AuxAuthentication::Authenticated { .. } => 0,
+                    zakura_header_chain::AuxAuthentication::Unauthenticated => 1,
+                    zakura_header_chain::AuxAuthentication::Disputed { .. } => 2,
+                    zakura_header_chain::AuxAuthentication::Rejected { .. } => 3,
+                },
                 delivery.delivery_id,
             )
         })
@@ -414,13 +440,33 @@ pub(crate) struct HeaderChainReader {
     transition_engine: Arc<Mutex<HeaderChainEngine>>,
 }
 
-/// One atomically read selected-path window with exact auxiliary provenance.
+/// One selected header and every auxiliary delivery attached to it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SelectedAuxWindow {
-    pub(crate) snapshot: EngineSnapshot,
-    pub(crate) current: HeaderNode,
-    pub(crate) current_deliveries: Vec<AuxDelivery>,
-    pub(crate) successor: Option<(HeaderNode, Vec<AuxDelivery>)>,
+pub(crate) struct SelectedHeaderWithAuxiliaryDeliveries {
+    /// Header node from the selected projection.
+    pub(crate) header_node: HeaderNode,
+    /// Auxiliary deliveries attached to `header_node`.
+    pub(crate) auxiliary_deliveries: Vec<AuxDelivery>,
+}
+
+/// One atomically read selected header and its direct selected successor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedAuxiliaryWindow {
+    /// Engine snapshot that identifies the selected projection generation.
+    pub(crate) engine_snapshot: EngineSnapshot,
+    /// Selected header whose auxiliary delivery the caller will verify.
+    pub(crate) delivery_header: SelectedHeaderWithAuxiliaryDeliveries,
+    /// Direct selected successor that supplies the authentication boundary.
+    pub(crate) successor_header: Option<SelectedHeaderWithAuxiliaryDeliveries>,
+}
+
+/// One selected projection captured with the engine snapshot that produced it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CapturedSelectedProjection {
+    /// Engine snapshot that identifies the projection generation and bounds.
+    pub(crate) engine_snapshot: EngineSnapshot,
+    /// Complete selected projection in ascending height order.
+    pub(crate) frontiers: Vec<Frontier>,
 }
 
 #[derive(Debug, Default)]
@@ -876,7 +922,9 @@ impl HeaderChainReader {
         &self,
         node: &HeaderNode,
     ) -> Result<Option<AuxDelivery>, HeaderChainStoreError> {
-        Ok(select_vct_aux_delivery(self.coherent_aux_deliveries(node)?))
+        Ok(select_vct_auxiliary_delivery(
+            self.coherent_aux_deliveries(node)?,
+        ))
     }
 
     /// Return the contiguous selected-path auxiliary roots starting at `start`.
@@ -1110,49 +1158,57 @@ impl HeaderChainReader {
         Ok(Some(successor))
     }
 
-    /// Read one exact selected header and its optional direct successor without
-    /// allowing a concurrent transition to mix branches or auxiliary records.
-    pub(crate) fn selected_aux_window(
+    /// Reads one selected header and its direct successor under the writer lock.
+    ///
+    /// The writer lock prevents a concurrent transition from mixing projection entries with
+    /// auxiliary deliveries from different engine versions.
+    pub(crate) fn selected_auxiliary_window(
         &self,
         height: block::Height,
         hash: block::Hash,
-    ) -> Result<Option<SelectedAuxWindow>, HeaderChainStoreError> {
+    ) -> Result<Option<SelectedAuxiliaryWindow>, HeaderChainStoreError> {
         let _writer = self
             .store
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let Some(current) = self.coherent_selected_node(height)? else {
+        let Some(delivery_header_node) = self.coherent_selected_node(height)? else {
             return Ok(None);
         };
-        if current.hash != hash {
+        if delivery_header_node.hash != hash {
             return Ok(None);
         }
-        let current_deliveries = self.coherent_aux_deliveries(&current)?;
-        let successor = match height.next() {
+        let delivery_auxiliary_deliveries = self.coherent_aux_deliveries(&delivery_header_node)?;
+        let successor_header = match height.next() {
             Ok(successor_height) => match self.coherent_selected_node(successor_height)? {
-                Some(successor) => {
-                    if successor.parent_hash != hash {
+                Some(successor_header_node) => {
+                    if successor_header_node.parent_hash != hash {
                         return Err(StoreError::Incoherent(
                             "selected auxiliary successor does not extend the requested header",
                         )
                         .into());
                     }
-                    let deliveries = self.coherent_aux_deliveries(&successor)?;
-                    Some((successor, deliveries))
+                    let successor_auxiliary_deliveries =
+                        self.coherent_aux_deliveries(&successor_header_node)?;
+                    Some(SelectedHeaderWithAuxiliaryDeliveries {
+                        header_node: successor_header_node,
+                        auxiliary_deliveries: successor_auxiliary_deliveries,
+                    })
                 }
                 None => None,
             },
             Err(_) => None,
         };
-        Ok(Some(SelectedAuxWindow {
-            snapshot: self
+        Ok(Some(SelectedAuxiliaryWindow {
+            engine_snapshot: self
                 .store
                 .snapshot()
                 .map_err(HeaderChainStoreError::Store)?,
-            current,
-            current_deliveries,
-            successor,
+            delivery_header: SelectedHeaderWithAuxiliaryDeliveries {
+                header_node: delivery_header_node,
+                auxiliary_deliveries: delivery_auxiliary_deliveries,
+            },
+            successor_header,
         }))
     }
 
@@ -1580,11 +1636,40 @@ impl HeaderChainReader {
 }
 
 impl HeaderChainRuntime {
-    pub(crate) fn selected_aux_window(
+    /// Captures the complete selected projection and the engine snapshot that produced it.
+    ///
+    /// The method rejects an engine whose projection bounds disagree with its snapshot.
+    pub(crate) fn capture_selected_projection(
+        &self,
+    ) -> Result<CapturedSelectedProjection, HeaderChainStoreError> {
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let engine_snapshot = engine.snapshot();
+        let frontiers = engine.selected_projection().to_vec();
+        if frontiers.first().copied() != Some(engine_snapshot.frontiers.finalized)
+            || frontiers.last().copied() != Some(engine_snapshot.frontiers.header_best)
+        {
+            return Err(HeaderChainStoreError::Incoherent(
+                "selected projection disagrees with its published bounds",
+            ));
+        }
+        Ok(CapturedSelectedProjection {
+            engine_snapshot,
+            frontiers,
+        })
+    }
+
+    /// Reads one auxiliary window from the current in-memory selected projection.
+    ///
+    /// The method returns `None` when the selected projection does not contain the requested
+    /// height and hash.
+    pub(crate) fn selected_auxiliary_window(
         &self,
         height: block::Height,
         hash: block::Hash,
-    ) -> Result<Option<SelectedAuxWindow>, HeaderChainStoreError> {
+    ) -> Result<Option<SelectedAuxiliaryWindow>, HeaderChainStoreError> {
         let engine = self
             .transition_engine
             .lock()
@@ -1595,52 +1680,100 @@ impl HeaderChainRuntime {
         else {
             return Ok(None);
         };
-        let current_frontier = engine.selected_projection()[index];
-        if current_frontier.hash != hash {
+        Self::selected_auxiliary_window_at_projection_index_locked(
+            &engine,
+            index,
+            Frontier::new(height, hash),
+        )
+    }
+
+    /// Reads one auxiliary window at an index from a previously captured selected projection.
+    ///
+    /// The method returns `None` when the live projection no longer contains the expected
+    /// frontier at `projection_index`. The returned window carries a new engine snapshot so the
+    /// caller can detect any generation change.
+    pub(crate) fn selected_auxiliary_window_at_projection_index(
+        &self,
+        projection_index: usize,
+        expected_frontier: Frontier,
+    ) -> Result<Option<SelectedAuxiliaryWindow>, HeaderChainStoreError> {
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        Self::selected_auxiliary_window_at_projection_index_locked(
+            &engine,
+            projection_index,
+            expected_frontier,
+        )
+    }
+
+    fn selected_auxiliary_window_at_projection_index_locked(
+        engine: &HeaderChainEngine,
+        projection_index: usize,
+        expected_frontier: Frontier,
+    ) -> Result<Option<SelectedAuxiliaryWindow>, HeaderChainStoreError> {
+        let Some(current_frontier) = engine.selected_projection().get(projection_index).copied()
+        else {
+            return Ok(None);
+        };
+        if current_frontier != expected_frontier {
             return Ok(None);
         }
-        let current =
-            engine
-                .graph()
-                .header_node(hash)
-                .cloned()
-                .ok_or(HeaderChainStoreError::Incoherent(
-                    "selected projection references a missing in-memory node",
-                ))?;
-        if current.height != height || current.hash != hash {
+        let delivery_header_node = engine
+            .graph()
+            .header_node(expected_frontier.hash)
+            .cloned()
+            .ok_or(HeaderChainStoreError::Incoherent(
+                "selected projection references a missing in-memory node",
+            ))?;
+        if delivery_header_node.height != expected_frontier.height
+            || delivery_header_node.hash != expected_frontier.hash
+        {
             return Err(HeaderChainStoreError::Incoherent(
                 "selected projection disagrees with its in-memory node",
             ));
         }
-        let current_deliveries = coherent_engine_aux_deliveries(&engine, &current)?;
-        let successor = if let Some(frontier) = engine.selected_projection().get(index + 1) {
-            let expected_height = height.next().map_err(|_| {
+        let delivery_auxiliary_deliveries =
+            coherent_engine_aux_deliveries(engine, &delivery_header_node)?;
+        let successor_header = if let Some(successor_frontier) =
+            engine.selected_projection().get(projection_index + 1)
+        {
+            let expected_successor_height = expected_frontier.height.next().map_err(|_| {
                 HeaderChainStoreError::Incoherent("selected auxiliary successor height overflowed")
             })?;
-            let node = engine.graph().header_node(frontier.hash).cloned().ok_or(
-                HeaderChainStoreError::Incoherent(
+            let successor_header_node = engine
+                .graph()
+                .header_node(successor_frontier.hash)
+                .cloned()
+                .ok_or(HeaderChainStoreError::Incoherent(
                     "selected successor references a missing in-memory node",
-                ),
-            )?;
-            if frontier.height != expected_height
-                || node.height != expected_height
-                || node.hash != frontier.hash
-                || node.parent_hash != hash
+                ))?;
+            if successor_frontier.height != expected_successor_height
+                || successor_header_node.height != expected_successor_height
+                || successor_header_node.hash != successor_frontier.hash
+                || successor_header_node.parent_hash != expected_frontier.hash
             {
                 return Err(HeaderChainStoreError::Incoherent(
                     "selected in-memory successor is not contiguous",
                 ));
             }
-            let deliveries = coherent_engine_aux_deliveries(&engine, &node)?;
-            Some((node, deliveries))
+            let successor_auxiliary_deliveries =
+                coherent_engine_aux_deliveries(engine, &successor_header_node)?;
+            Some(SelectedHeaderWithAuxiliaryDeliveries {
+                header_node: successor_header_node,
+                auxiliary_deliveries: successor_auxiliary_deliveries,
+            })
         } else {
             None
         };
-        Ok(Some(SelectedAuxWindow {
-            snapshot: engine.snapshot(),
-            current,
-            current_deliveries,
-            successor,
+        Ok(Some(SelectedAuxiliaryWindow {
+            engine_snapshot: engine.snapshot(),
+            delivery_header: SelectedHeaderWithAuxiliaryDeliveries {
+                header_node: delivery_header_node,
+                auxiliary_deliveries: delivery_auxiliary_deliveries,
+            },
+            successor_header,
         }))
     }
 
@@ -2137,22 +2270,26 @@ impl HeaderChainRuntime {
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let lease_references = self
-            .leases
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .active_references(Instant::now());
-        let merged_references;
-        let retention_references = if context.retention_references.is_empty() {
-            lease_references.as_ref()
+        let authoritative_full_state_fork_set = matches!(
+            &request.event,
+            TransitionEvent::VerifiedChainChanged(_) | TransitionEvent::VerifiedBlockAccepted(_)
+        ) && context
+            .full_state_authority
+            .is_some_and(|authority| authority.authorizes_full_state(&request.event));
+        let lease_references = if authoritative_full_state_fork_set {
+            None
         } else {
-            let mut references = context.retention_references.to_vec();
-            references.extend(lease_references.iter().copied());
-            references.sort_unstable_by_key(|hash| hash.0);
-            references.dedup();
-            merged_references = references;
-            merged_references.as_slice()
+            Some(
+                self.leases
+                    .lock()
+                    .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+                    .active_references(Instant::now()),
+            )
         };
+        let retention_references = combined_retention_references(
+            context.retention_references,
+            lease_references.as_deref(),
+        );
         #[cfg(test)]
         let test_header_authority = TestHeaderCompletionAuthority(context.full_state_authority);
         #[cfg(test)]
@@ -2163,7 +2300,7 @@ impl HeaderChainRuntime {
             config: context.config,
             clock: context.clock,
             full_state_authority,
-            retention_references,
+            retention_references: retention_references.as_ref(),
         };
         let before = transition_engine.snapshot();
         if let Some(pin) = before.alarms.migrated_pin_refuted {
@@ -4231,8 +4368,8 @@ impl HeaderChainStore {
             let key = HeaderEligibilityRootKey::try_from_bytes(&key)
                 .map_err(|_| StoreError::Incoherent("invalid eligibility-root key"))?;
             let reason = HeaderEligibilityReasonDisk::decode(&value)
-                .map_err(|_| StoreError::Incoherent("invalid eligibility-root value"))?
-                .into_domain();
+                .map_err(|_| StoreError::Incoherent("invalid eligibility-root value"))?;
+            let reason = reason.into_domain();
             if reason_kind(&reason) != key.kind || reason_evidence(&reason) != key.evidence {
                 return Err(StoreError::Incoherent(
                     "eligibility-root key/value mismatch",

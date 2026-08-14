@@ -455,28 +455,54 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         None
     );
     let durable_window = reader
-        .selected_aux_window(child.height, child.hash)
+        .selected_auxiliary_window(child.height, child.hash)
         .expect("the exact selected auxiliary window is coherent")
         .expect("the selected child is retained");
     let window = runtime
-        .selected_aux_window(child.height, child.hash)
+        .selected_auxiliary_window(child.height, child.hash)
         .expect("the in-memory selected auxiliary window is coherent")
         .expect("the selected child is retained in the committed engine");
     assert_eq!(window, durable_window);
+    let captured_projection = runtime
+        .capture_selected_projection()
+        .expect("the in-memory selected projection is coherent");
+    let child_index = captured_projection
+        .frontiers
+        .binary_search_by_key(&child.height, |frontier| frontier.height)
+        .expect("the selected projection contains the child");
     assert_eq!(
-        window.snapshot,
+        runtime
+            .selected_auxiliary_window_at_projection_index(
+                child_index,
+                Frontier::new(child.height, child.hash),
+            )
+            .expect("the captured projection index is coherent"),
+        Some(window.clone())
+    );
+    assert_eq!(
+        runtime
+            .selected_auxiliary_window_at_projection_index(
+                child_index + 1,
+                Frontier::new(child.height, child.hash),
+            )
+            .expect("a stale projection index is a normal read outcome"),
+        None
+    );
+    assert_eq!(
+        window.engine_snapshot,
         runtime.publisher().snapshot(),
         "the auxiliary window carries the snapshot read under the same transition lock"
     );
-    assert_eq!(window.current.hash, child.hash);
-    assert!(window.current_deliveries.is_empty());
-    let (window_successor, successor_deliveries) =
-        window.successor.expect("the selected grandchild follows");
-    assert_eq!(window_successor.hash, grandchild.hash);
-    assert!(successor_deliveries.is_empty());
+    assert_eq!(window.delivery_header.header_node.hash, child.hash);
+    assert!(window.delivery_header.auxiliary_deliveries.is_empty());
+    let successor_header = window
+        .successor_header
+        .expect("the selected grandchild follows");
+    assert_eq!(successor_header.header_node.hash, grandchild.hash);
+    assert!(successor_header.auxiliary_deliveries.is_empty());
     assert_eq!(
         reader
-            .selected_aux_window(child.height, block::Hash([0xfe; 32]))
+            .selected_auxiliary_window(child.height, block::Hash([0xfe; 32]))
             .expect("a stale branch hash is a normal read outcome"),
         None
     );
@@ -579,9 +605,9 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     assert_eq!(roots[0].orchard_tx, aux.orchard_tx_count);
     assert_eq!(roots[0].ironwood_tx, aux.ironwood_tx_count);
     assert_eq!(roots[0].auth_data_root, aux.auth_data_root);
-    let crate::service::write::VctAuxWindowRead::Ready(window) =
+    let crate::service::write::VctAuxiliaryWindowRead::Ready(window) =
         crate::service::write::HeaderChainWriter::new(runtime.clone(), engine_config.clone())
-            .vct_aux_window(child.height, child.hash)
+            .vct_auxiliary_window(child.height, child.hash)
             .expect("the selected auxiliary window is coherent")
     else {
         panic!("the current delivery remains usable without successor auxiliary data");
@@ -894,7 +920,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         .write(corrupt)
         .expect("the contradictory auxiliary row commits");
     assert!(matches!(
-        reader.selected_aux_window(anchor.height, anchor.hash),
+        reader.selected_auxiliary_window(anchor.height, anchor.hash),
         Err(HeaderChainStoreError::Store(StoreError::Incoherent(
             "retained node and auxiliary delivery index disagree"
         )))

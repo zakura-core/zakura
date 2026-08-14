@@ -36,7 +36,8 @@ use crate::{
     service::{
         finalized_state::{
             header_chain::{HeaderChainStore, HeaderChainStoreError},
-            FinalizedState, NextVctBlock, VctAuxRejection, VctAuxWindow,
+            FinalizedState, VctAuxiliaryFailureAttribution, VctAuxiliaryWindow,
+            VctSuccessorWitness,
         },
         non_finalized_state::NonFinalizedState,
         write::{

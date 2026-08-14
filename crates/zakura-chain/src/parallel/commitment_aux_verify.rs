@@ -1,4 +1,9 @@
 //! Verification for supplied per-block commitment roots.
+//!
+//! Roman Akhtariev wrote this module for the ahead-of-body header-root authentication lane
+//! in zakura#346, #351, #352, and #455. That lane is gone, but the verification it relied on
+//! is unchanged: [`verify_supplied_roots_from_parts`] is still the single place a supplied
+//! root is proven against the successor header that commits to it.
 
 use std::sync::Arc;
 

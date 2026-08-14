@@ -114,7 +114,8 @@ impl TransitionEvent {
             Self::AuxEvidence(event) => match event.authentication {
                 AuxAuthentication::Unauthenticated => None,
                 AuxAuthentication::Authenticated { evidence, .. }
-                | AuxAuthentication::Rejected { evidence } => Some(evidence),
+                | AuxAuthentication::Rejected { evidence }
+                | AuxAuthentication::Disputed { evidence } => Some(evidence),
             },
             Self::ReevaluateDeferred => None,
         }

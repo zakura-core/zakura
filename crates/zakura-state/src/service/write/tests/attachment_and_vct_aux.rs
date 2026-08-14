@@ -128,16 +128,21 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
     );
 
     assert_eq!(
-        super::select_vct_aux_delivery(vec![rejected, unauthenticated, authenticated, incomplete,]),
+        super::select_vct_auxiliary_delivery(vec![
+            rejected,
+            unauthenticated,
+            authenticated,
+            incomplete,
+        ]),
         Some(authenticated)
     );
     assert_eq!(
-        super::select_vct_aux_delivery(vec![rejected, incomplete]),
+        super::select_vct_auxiliary_delivery(vec![rejected, incomplete]),
         None
     );
 
-    let window = VctAuxWindow {
-        snapshot: EngineSnapshot {
+    let window = VctAuxiliaryWindow {
+        engine_snapshot: EngineSnapshot {
             mode: EngineMode::Integrated,
             state_version: StateVersion::new(1),
             header_generation: HeaderGeneration::new(2),
@@ -151,7 +156,8 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
             oldest_retained_height: block::Height(0),
             alarms: AlarmSet::default(),
         },
-        current: authenticated,
+        delivery_header: regtest_genesis_block().header.clone(),
+        delivery: authenticated,
         successor_height: None,
         successor: None,
     };
@@ -160,16 +166,16 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
         .map(|aux| (aux.sapling_root, aux.orchard_root, aux.ironwood_root))
         .expect("the authenticated fixture contains tree auxiliary data");
     assert_eq!(
-        window.current_roots(block::Height(1), block::Hash([1; 32])),
+        window.delivery_roots(block::Height(1), block::Hash([1; 32])),
         Some(expected_roots)
     );
     assert_eq!(
-        window.current_roots(block::Height(2), block::Hash([1; 32])),
+        window.delivery_roots(block::Height(2), block::Hash([1; 32])),
         None,
         "height-mismatched provenance fails closed"
     );
     assert_eq!(
-        window.current_roots(block::Height(1), block::Hash([2; 32])),
+        window.delivery_roots(block::Height(1), block::Hash([2; 32])),
         None,
         "hash-mismatched provenance fails closed"
     );
@@ -199,15 +205,16 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
         }),
         ..unauthenticated
     };
-    let successor = NextVctBlock::from_delivery(
+    let successor = VctSuccessorWitness::from_delivery(
         successor_block.header.clone(),
         successor_height,
         successor_delivery,
     )
     .expect("the exact successor delivery constructs a witness");
-    let auth_window = VctAuxWindow {
-        snapshot: window.snapshot,
-        current: unauthenticated,
+    let auth_window = VctAuxiliaryWindow {
+        engine_snapshot: window.engine_snapshot,
+        delivery_header: window.delivery_header.clone(),
+        delivery: unauthenticated,
         successor_height: Some(successor_height),
         successor: Some(successor.clone()),
     };
@@ -217,16 +224,16 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
     )
     .is_none());
     let proof = VctAuthenticationProof::Successor {
-        current_delivery_id: unauthenticated.delivery_id,
-        current_header_hash: unauthenticated.header_hash,
+        delivery_id: unauthenticated.delivery_id,
+        delivery_header_hash: unauthenticated.header_hash,
         boundary_hash: successor.hash,
         boundary_auth_data_root: successor
             .auth_data_root
             .expect("the successor fixture has an auth-data root"),
     };
     let wrong_proof = VctAuthenticationProof::Successor {
-        current_delivery_id: unauthenticated.delivery_id,
-        current_header_hash: block::Hash([0xff; 32]),
+        delivery_id: unauthenticated.delivery_id,
+        delivery_header_hash: block::Hash([0xff; 32]),
         boundary_hash: successor.hash,
         boundary_auth_data_root: successor
             .auth_data_root
@@ -249,7 +256,7 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
 }
 
 #[test]
-fn stale_vct_aux_rejection_has_zero_durable_effects() {
+fn stale_vct_auxiliary_failure_evidence_has_zero_durable_effects() {
     let _init_guard = zakura_test::init();
     let network = Network::new_regtest(Default::default());
     let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
@@ -274,14 +281,15 @@ fn stale_vct_aux_rejection_has_zero_durable_effects() {
         authentication: AuxAuthentication::Unauthenticated,
     };
     let result = writer
-        .reject_vct_aux(
-            &VctAuxWindow {
-                snapshot: stale,
-                current,
+        .record_vct_auxiliary_failure(
+            &VctAuxiliaryWindow {
+                engine_snapshot: stale,
+                delivery_header: anchor.header.clone(),
+                delivery: current,
                 successor_height: None,
                 successor: None,
             },
-            VctAuxRejection::Current,
+            VctAuxiliaryFailureAttribution::CurrentDelivery,
             crate::error::VctCommitFailure::CurrentRoots,
         )
         .expect("stale auxiliary evidence returns a typed receipt");

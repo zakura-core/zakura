@@ -18,7 +18,7 @@ use zakura_chain::{
 };
 
 use crate::service::finalized_state::{
-    disk_format::upgrade::{CancelFormatChange, DiskFormatUpgrade},
+    disk_format::upgrade::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError},
     DiskWriteBatch, ZakuraDb,
 };
 
@@ -36,15 +36,18 @@ impl DiskFormatUpgrade for AddSubtrees {
 
     fn prepare(
         &self,
-        initial_tip_height: Height,
+        initial_finalized_tip_height: Option<Height>,
         upgrade_db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
         older_disk_version: &Version,
-    ) -> Result<(), CancelFormatChange> {
+    ) -> Result<(), FormatChangeError> {
+        let Some(initial_finalized_tip_height) = initial_finalized_tip_height else {
+            return Ok(());
+        };
         let first_version_for_adding_subtrees = Version::new(25, 2, 0);
         if older_disk_version >= &first_version_for_adding_subtrees {
             // Clear previous upgrade data, because it was incorrect.
-            reset(initial_tip_height, upgrade_db, cancel_receiver)?;
+            reset(initial_finalized_tip_height, upgrade_db, cancel_receiver)?;
         }
 
         Ok(())
@@ -58,10 +61,13 @@ impl DiskFormatUpgrade for AddSubtrees {
     /// Returns `Ok` if the upgrade completed, and `Err` if it was cancelled.
     fn run(
         &self,
-        initial_tip_height: Height,
+        initial_finalized_tip_height: Option<Height>,
         upgrade_db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<(), CancelFormatChange> {
+    ) -> Result<(), FormatChangeError> {
+        let Some(initial_finalized_tip_height) = initial_finalized_tip_height else {
+            return Ok(());
+        };
         // # Consensus
         //
         // Zebra stores exactly one note commitment tree for every block with sapling notes.
@@ -81,7 +87,7 @@ impl DiskFormatUpgrade for AddSubtrees {
 
         // Generate a list of sapling subtree inputs: previous and current trees, and their end heights.
         let subtrees = upgrade_db
-            .sapling_tree_by_reversed_height_range(..=initial_tip_height)
+            .sapling_tree_by_reversed_height_range(..=initial_finalized_tip_height)
             // We need both the tree and its previous tree for each shielded block.
             .tuple_windows()
             // Because the iterator is reversed, the larger tree is first.
@@ -96,7 +102,7 @@ impl DiskFormatUpgrade for AddSubtrees {
         for (prev_end_height, prev_tree, end_height, tree) in subtrees {
             // Return early if the upgrade is cancelled.
             if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-                return Err(CancelFormatChange);
+                return Err(CancelFormatChange.into());
             }
 
             let subtree =
@@ -106,7 +112,7 @@ impl DiskFormatUpgrade for AddSubtrees {
 
         // Generate a list of orchard subtree inputs: previous and current trees, and their end heights.
         let subtrees = upgrade_db
-            .orchard_tree_by_reversed_height_range(..=initial_tip_height)
+            .orchard_tree_by_reversed_height_range(..=initial_finalized_tip_height)
             // We need both the tree and its previous tree for each shielded block.
             .tuple_windows()
             // Because the iterator is reversed, the larger tree is first.
@@ -121,7 +127,7 @@ impl DiskFormatUpgrade for AddSubtrees {
         for (prev_end_height, prev_tree, end_height, tree) in subtrees {
             // Return early if the upgrade is cancelled.
             if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-                return Err(CancelFormatChange);
+                return Err(CancelFormatChange.into());
             }
 
             let subtree =
@@ -137,7 +143,7 @@ impl DiskFormatUpgrade for AddSubtrees {
         &self,
         db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<Result<(), String>, CancelFormatChange> {
+    ) -> Result<Result<(), String>, FormatChangeError> {
         // Fast-synced databases deliberately have no per-height note-commitment
         // trees or subtrees below the checkpoint handoff height, so the subtree
         // scans below do not apply to them.
@@ -171,7 +177,7 @@ impl DiskFormatUpgrade for AddSubtrees {
 #[allow(clippy::unwrap_in_result)]
 #[instrument(skip(upgrade_db, cancel_receiver))]
 pub fn reset(
-    _initial_tip_height: Height,
+    _initial_finalized_tip_height: Height,
     upgrade_db: &ZakuraDb,
     cancel_receiver: &Receiver<CancelFormatChange>,
 ) -> Result<(), CancelFormatChange> {

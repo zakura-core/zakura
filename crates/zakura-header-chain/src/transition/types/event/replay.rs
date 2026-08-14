@@ -414,5 +414,9 @@ fn hash_aux_authentication(hasher: &mut Sha256, authentication: AuxAuthenticatio
             hasher.update([2]);
             hasher.update(evidence.digest());
         }
+        AuxAuthentication::Disputed { evidence } => {
+            hasher.update([3]);
+            hasher.update(evidence.digest());
+        }
     }
 }

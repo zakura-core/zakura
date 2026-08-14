@@ -23,6 +23,7 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
     store: &mut G,
     header_best: Frontier,
     verified_best: Frontier,
+    protect_all_verified_body_paths: bool,
     validation_context_references: impl IntoIterator<Item = block::Hash>,
     limits: EngineLimits,
 ) -> Result<RetentionPlan, GraphError> {
@@ -36,19 +37,21 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
     let mut protected = HashSet::new();
     protect_path(store, header_best.hash, &mut protected)?;
     protect_path(store, verified_best.hash, &mut protected)?;
-    let verified_body_hashes = store
-        .view_header_nodes()
-        .into_iter()
-        .filter_map(|node| {
-            matches!(
-                node.body_validation_state,
-                BodyValidationState::Verified { .. }
-            )
-            .then_some(node.hash)
-        })
-        .collect::<Vec<_>>();
-    for hash in verified_body_hashes {
-        protect_path(store, hash, &mut protected)?;
+    if protect_all_verified_body_paths {
+        let verified_body_hashes = store
+            .view_header_nodes()
+            .into_iter()
+            .filter_map(|node| {
+                matches!(
+                    node.body_validation_state,
+                    BodyValidationState::Verified { .. }
+                )
+                .then_some(node.hash)
+            })
+            .collect::<Vec<_>>();
+        for hash in verified_body_hashes {
+            protect_path(store, hash, &mut protected)?;
+        }
     }
     for reference in validation_context_references {
         if !protected.contains(&reference) && store.view_header_node(reference).is_some() {
@@ -324,7 +327,7 @@ mod tests {
                 .0
         });
 
-        let plan = enforce_retention(&mut store, header_best, anchor, [], limits(10, 100))
+        let plan = enforce_retention(&mut store, header_best, anchor, true, [], limits(10, 100))
             .expect("retention succeeds");
         assert!(store.header_node(expected[0].hash).is_none());
         assert!(store.header_node(expected[1].hash).is_none());
@@ -384,7 +387,7 @@ mod tests {
             .expect("the deferred child is retained")
             .is_eligible());
 
-        let plan = enforce_retention(&mut store, header_best, anchor, [], limits(10, 100))
+        let plan = enforce_retention(&mut store, header_best, anchor, true, [], limits(10, 100))
             .expect("retention evicts the ineligible descendant subtree");
 
         assert!(store.header_node(deferred.hash).is_none());
@@ -409,7 +412,7 @@ mod tests {
         let selected = insert(&mut store, anchor.hash, 2, []);
         let spare = insert(&mut store, anchor.hash, 3, []);
 
-        enforce_retention(&mut store, selected, anchor, [], limits(10, 2))
+        enforce_retention(&mut store, selected, anchor, true, [], limits(10, 2))
             .expect("permanent subtree frees capacity");
         assert!(store.header_node(permanent.hash).is_none());
         assert!(store.header_node(selected.hash).is_some());
@@ -435,7 +438,7 @@ mod tests {
         let before_permanent = store.header_node(permanent.hash).cloned();
         let before_selected = store.header_node(selected.hash).cloned();
 
-        let plan = enforce_retention(&mut store, selected, anchor, [], limits(10, 10))
+        let plan = enforce_retention(&mut store, selected, anchor, true, [], limits(10, 10))
             .expect("a graph below both limits needs no eviction planning");
 
         assert_eq!(plan, RetentionPlan::default());
@@ -452,8 +455,15 @@ mod tests {
         let first = insert(&mut store, anchor.hash, 1, []);
         let selected = insert(&mut store, first.hash, 2, []);
 
-        let plan = enforce_retention(&mut store, selected, anchor, [first.hash], limits(10, 1))
-            .expect("retention returns a typed refusal");
+        let plan = enforce_retention(
+            &mut store,
+            selected,
+            anchor,
+            true,
+            [first.hash],
+            limits(10, 1),
+        )
+        .expect("retention returns a typed refusal");
         assert!(plan.admission_refused);
         assert!(plan.resource_stalled);
         assert!(store.header_node(selected.hash).is_some());
@@ -476,7 +486,7 @@ mod tests {
         let selected = insert(&mut store, selected_parent.hash, 3, []);
         let header_only = insert(&mut store, anchor.hash, 4, []);
 
-        let plan = enforce_retention(&mut store, selected, selected, [], limits(2, 100))
+        let plan = enforce_retention(&mut store, selected, selected, true, [], limits(2, 100))
             .expect("retention evicts an unowned header-only branch");
 
         assert!(!plan.admission_refused);
@@ -502,7 +512,7 @@ mod tests {
             .expect("the full-state branch becomes verified");
         let selected = insert(&mut store, anchor.hash, 3, []);
 
-        let plan = enforce_retention(&mut store, selected, selected, [], limits(1, 1))
+        let plan = enforce_retention(&mut store, selected, selected, true, [], limits(1, 1))
             .expect("retention reports pressure without deleting full-state-owned nodes");
 
         assert!(plan.admission_refused);
@@ -510,6 +520,58 @@ mod tests {
         assert!(store.header_node(first.hash).is_some());
         assert!(store.header_node(verified_body.hash).is_some());
         assert!(store.header_node(selected.hash).is_some());
+    }
+
+    #[test]
+    fn authoritative_full_state_replacement_evicts_the_dropped_verified_branch() {
+        let mut store = store();
+        let anchor = store.finalized_frontier();
+        let retained_tips = (1..=10)
+            .map(|seed| insert(&mut store, anchor.hash, seed, []))
+            .collect::<Vec<_>>();
+        for tip in &retained_tips {
+            store
+                .set_body_validation_state(
+                    tip.hash,
+                    BodyValidationState::Verified {
+                        evidence: crate::EvidenceId::from_digest(tip.hash.0),
+                    },
+                )
+                .expect("the full-state branch becomes verified");
+        }
+
+        let replacement = insert(&mut store, anchor.hash, 11, []);
+        store
+            .set_body_validation_state(
+                replacement.hash,
+                BodyValidationState::Verified {
+                    evidence: crate::EvidenceId::from_digest(replacement.hash.0),
+                },
+            )
+            .expect("the replacement full-state branch becomes verified");
+        let dropped = retained_tips[0];
+        let staged_tips = retained_tips
+            .iter()
+            .copied()
+            .skip(1)
+            .map(|tip| tip.hash)
+            .chain(std::iter::once(replacement.hash))
+            .collect::<Vec<_>>();
+
+        let plan = enforce_retention(
+            &mut store,
+            replacement,
+            replacement,
+            false,
+            staged_tips,
+            limits(10, 100),
+        )
+        .expect("the authoritative full-state fork set permits replacement");
+
+        assert!(!plan.admission_refused);
+        assert!(store.header_node(dropped.hash).is_none());
+        assert!(store.header_node(replacement.hash).is_some());
+        assert_eq!(store.eligible_header_tips().len(), 10);
     }
 
     #[test]
@@ -551,6 +613,7 @@ mod tests {
             &mut store,
             anchor,
             anchor,
+            true,
             [block::Hash([0x91; 32])],
             limits(10, 100),
         )
@@ -573,7 +636,7 @@ mod tests {
             crate::MAX_NON_FINALIZED_NODES_V1 + 1
         );
 
-        let plan = enforce_retention(&mut store, selected, anchor, [], EngineLimits::v1())
+        let plan = enforce_retention(&mut store, selected, anchor, true, [], EngineLimits::v1())
             .expect("the exact boundary produces a typed refusal");
         assert!(plan.admission_refused);
         assert!(plan.resource_stalled);

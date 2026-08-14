@@ -207,9 +207,9 @@ pub enum AuxiliaryViolation {
     /// Delivery changes stored provenance.
     #[error("auxiliary evidence changes delivery provenance")]
     ProvenanceMismatch,
-    /// Authenticated or rejected delivery is immutable.
-    #[error("an authenticated or rejected auxiliary delivery is immutable")]
-    ImmutableAuthentication,
+    /// Evidence would weaken or replace the existing authentication state.
+    #[error("auxiliary authentication evidence would weaken or replace existing evidence")]
+    NonRefiningAuthentication,
     /// Authentication boundary header is unknown.
     #[error("auxiliary authentication boundary is unknown")]
     UnknownBoundary,

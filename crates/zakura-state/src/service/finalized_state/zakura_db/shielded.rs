@@ -801,7 +801,6 @@ impl DiskWriteBatch {
     ) -> Result<(), ValidateContextError> {
         let FinalizedBlock {
             height,
-            hash,
             treestate:
                 Treestate {
                     note_commitment_trees,
@@ -809,11 +808,6 @@ impl DiskWriteBatch {
                 },
             ..
         } = finalized;
-
-        self.advance_header_root_auth_frontier_from_body(zakura_db, *height, *hash, history_tree)
-            .map_err(|error| ValidateContextError::HeaderRootAuthFrontier {
-                reason: format!("advancing body frontier: {error}"),
-            })?;
 
         // The ZIP-244 auth-data root of this block, stored in the serving index so this
         // node can hand it to a peer as the co-input needed to authenticate the

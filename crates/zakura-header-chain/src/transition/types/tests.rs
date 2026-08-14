@@ -427,6 +427,33 @@ fn event_cases() -> Vec<EventCase> {
 }
 
 #[test]
+fn auxiliary_authentication_transitions_only_refine_evidence() {
+    let evidence = EvidenceId::from_digest([1; 32]);
+    let other_evidence = EvidenceId::from_digest([2; 32]);
+    let disputed = AuxAuthentication::Disputed { evidence };
+    let authenticated = AuxAuthentication::Authenticated {
+        evidence: other_evidence,
+        boundary_hash: block::Hash([3; 32]),
+    };
+    let rejected = AuxAuthentication::Rejected {
+        evidence: other_evidence,
+    };
+
+    for next_state in [disputed, authenticated, rejected] {
+        assert!(AuxAuthentication::Unauthenticated.can_refine_to(next_state));
+    }
+    for next_state in [authenticated, rejected] {
+        assert!(disputed.can_refine_to(next_state));
+    }
+    for current_state in [disputed, authenticated, rejected] {
+        assert!(!current_state.can_refine_to(AuxAuthentication::Unauthenticated));
+        assert!(!current_state.can_refine_to(disputed));
+    }
+    assert!(!authenticated.can_refine_to(rejected));
+    assert!(!rejected.can_refine_to(authenticated));
+}
+
+#[test]
 fn body_size_hints_enforce_zero_sentinel_and_canonical_limit() {
     assert_eq!(BodySizeHint::new(0), Ok(BodySizeHint::Unknown));
     assert!(matches!(BodySizeHint::new(1), Ok(BodySizeHint::Known(_))));

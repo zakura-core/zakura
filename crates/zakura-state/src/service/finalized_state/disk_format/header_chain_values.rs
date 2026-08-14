@@ -1031,6 +1031,10 @@ fn put_aux(encoder: &mut Encoder, value: AuxDelivery) {
             encoder.u8(2);
             encoder.fixed(&evidence.digest());
         }
+        AuxAuthentication::Disputed { evidence } => {
+            encoder.u8(3);
+            encoder.fixed(&evidence.digest());
+        }
     }
 }
 
@@ -1066,6 +1070,9 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueErr
             boundary_hash: block::Hash(decoder.array()?),
         },
         2 => AuxAuthentication::Rejected {
+            evidence: EvidenceId::from_digest(decoder.array()?),
+        },
+        3 => AuxAuthentication::Disputed {
             evidence: EvidenceId::from_digest(decoder.array()?),
         },
         value => {
@@ -1568,6 +1575,16 @@ mod tests {
         assert_eq!(
             AuxDelivery::decode(&aux.encode().expect("aux encodes")),
             Ok(aux)
+        );
+        let disputed_aux = AuxDelivery {
+            authentication: AuxAuthentication::Disputed {
+                evidence: EvidenceId::from_digest([15; 32]),
+            },
+            ..aux
+        };
+        assert_eq!(
+            AuxDelivery::decode(&disputed_aux.encode().expect("disputed aux encodes")),
+            Ok(disputed_aux)
         );
         let mut legacy_aux = aux.encode().expect("aux encodes");
         const OWNER_STATE_VERSION_OFFSET: usize = 32 + 32 + 32;

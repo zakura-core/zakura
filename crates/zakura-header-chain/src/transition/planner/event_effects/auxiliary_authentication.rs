@@ -62,9 +62,9 @@ pub(super) fn authenticate_auxiliary_deliveries(
         if existing.authentication == event.authentication {
             continue;
         }
-        if existing.authentication != crate::AuxAuthentication::Unauthenticated {
+        if !existing.authentication.can_refine_to(event.authentication) {
             return Err(InvalidTransitionEvidence::Auxiliary(
-                AuxiliaryViolation::ImmutableAuthentication,
+                AuxiliaryViolation::NonRefiningAuthentication,
             )
             .into());
         }

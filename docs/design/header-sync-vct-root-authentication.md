@@ -1,6 +1,22 @@
 # Header-sync VCT root authentication
 
-Status: implemented (PRs #346, #351, #352; Phase 7 cleanup landed separately)
+Status: removed (specified by Roman Akhtariev in PRs #346, #351, #352; removed on the fork-aware
+header chain)
+
+> **Removed — historical reference only.** This document specifies the height-keyed
+> ascending-frontier lane (`AuthenticateHeaderRoots`), which authenticated peer roots against a
+> single canonical chain and wrote the verified prefix into `commitment_roots_by_height` ahead
+> of bodies. Keying by height cannot express a root on a competing fork, so the fork-aware
+> header chain instead attaches each root to its header's DAG node as a hash-keyed auxiliary
+> delivery and authenticates it there.
+>
+> The request, the durable ascending frontier, and the `header_root_auth_frontier` column
+> family no longer exist. What survives is the verification kernel
+> (`verify_supplied_roots_from_parts`). The replacement reuses that kernel in
+> `service/write/vct_authentication_sweep.rs`. The replacement also preserves the invariants
+> below. See
+> [verified-commitment-trees.md §6.0](verified-commitment-trees.md) for the current design.
+> Read this document for the rationale behind those invariants, never for the live call graph.
 
 ## 1. Summary
 

@@ -111,20 +111,15 @@ pub use disk_format::{
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use header_chain::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
-pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, NextVctBlock};
-pub(crate) use vct::{VctAuthenticationProof, VctAuxRejection, VctAuxWindow};
+pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, VctSuccessorWitness};
+pub(crate) use vct::{VctAuthenticationProof, VctAuxiliaryFailureAttribution, VctAuxiliaryWindow};
 pub use vct_treestate_audit::{
     derived_roots_in_display_order, inventory, inventory_with_scans, measure_derivations,
     replay_inputs, verify_subtrees_against_stored, DerivationSample, ReplayInputs,
     SubtreeVerification, VctTreestateInventory,
 };
 #[allow(unused_imports)]
-pub use zakura_db::commitment_roots_db::{
-    AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
-    CommitmentRootIndexIssue, HeaderRootAuthFrontier, HeaderRootAuthFrontierError,
-    HeaderRootAuthState, HeaderRootAuthUpdate, HeaderWitnessState, COMMITMENT_ROOTS_BY_HEIGHT,
-    HEADER_ROOT_AUTH_FRONTIER,
-};
+pub use zakura_db::commitment_roots_db::{CommitmentRootIndexIssue, COMMITMENT_ROOTS_BY_HEIGHT};
 #[allow(unused_imports)]
 pub use zakura_db::highest_completed_checkpoint::*;
 pub use zakura_db::ZakuraDb;
@@ -203,7 +198,6 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     BLOCK_INFO,
     // Verified-commitment-trees serving index
     COMMITMENT_ROOTS_BY_HEIGHT,
-    HEADER_ROOT_AUTH_FRONTIER,
     // Storage policy
     PRUNING_METADATA,
     VCT_SYNC_METADATA,
@@ -601,7 +595,7 @@ impl FinalizedState {
         &mut self,
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        next_vct_block: Option<NextVctBlock>,
+        vct_successor_witness: Option<VctSuccessorWitness>,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
@@ -609,7 +603,7 @@ impl FinalizedState {
         self.commit_finalized_inner(
             ordered_block,
             prev_note_commitment_trees,
-            next_vct_block,
+            vct_successor_witness,
             None,
         )
     }
@@ -619,7 +613,7 @@ impl FinalizedState {
         &mut self,
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        vct_aux_window: Option<VctAuxWindow>,
+        vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         commit: C,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
@@ -632,14 +626,14 @@ impl FinalizedState {
             VctAuthenticationProof,
         ) -> Result<(), CommitCheckpointVerifiedError>,
     {
-        let next_vct_block = vct_aux_window
+        let vct_successor_witness = vct_auxiliary_window
             .as_ref()
-            .and_then(|window| window.successor.clone());
+            .and_then(|auxiliary_window| auxiliary_window.successor.clone());
         self.commit_finalized_inner_with(
             ordered_block,
             prev_note_commitment_trees,
-            next_vct_block,
-            vct_aux_window,
+            vct_successor_witness,
+            vct_auxiliary_window,
             commit,
         )
     }
@@ -648,8 +642,8 @@ impl FinalizedState {
         &mut self,
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        next_vct_block: Option<NextVctBlock>,
-        vct_aux_window: Option<VctAuxWindow>,
+        vct_successor_witness: Option<VctSuccessorWitness>,
+        vct_auxiliary_window: Option<VctAuxiliaryWindow>,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
@@ -657,8 +651,8 @@ impl FinalizedState {
         self.commit_finalized_inner_with(
             ordered_block,
             prev_note_commitment_trees,
-            next_vct_block,
-            vct_aux_window,
+            vct_successor_witness,
+            vct_auxiliary_window,
             |db, batch, _proof| {
                 db.header_chain_disk_db()
                     .write(batch)
@@ -672,8 +666,8 @@ impl FinalizedState {
         &mut self,
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        next_vct_block: Option<NextVctBlock>,
-        vct_aux_window: Option<VctAuxWindow>,
+        vct_successor_witness: Option<VctSuccessorWitness>,
+        vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         commit: C,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
@@ -690,8 +684,8 @@ impl FinalizedState {
         let result = self.commit_finalized_direct_with_aux(
             checkpoint_verified.clone().into(),
             prev_note_commitment_trees,
-            next_vct_block,
-            vct_aux_window,
+            vct_successor_witness,
+            vct_auxiliary_window,
             "commit checkpoint-verified request",
             commit,
         );
@@ -740,13 +734,13 @@ impl FinalizedState {
         &mut self,
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        next_vct_block: Option<NextVctBlock>,
+        vct_successor_witness: Option<VctSuccessorWitness>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         self.commit_finalized_direct_with(
             finalizable_block,
             prev_note_commitment_trees,
-            next_vct_block,
+            vct_successor_witness,
             source,
             |db, batch, _proof| {
                 db.header_chain_disk_db()
@@ -761,15 +755,15 @@ impl FinalizedState {
     pub(super) fn commit_finalized_direct_with_exact_aux_for_test(
         &mut self,
         finalizable_block: FinalizableBlock,
-        vct_aux_window: VctAuxWindow,
+        vct_auxiliary_window: VctAuxiliaryWindow,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
-        let next_vct_block = vct_aux_window.successor.clone();
+        let vct_successor_witness = vct_auxiliary_window.successor.clone();
         self.commit_finalized_direct_with_aux(
             finalizable_block,
             None,
-            next_vct_block,
-            Some(vct_aux_window),
+            vct_successor_witness,
+            Some(vct_auxiliary_window),
             source,
             |db, batch, _proof| {
                 db.header_chain_disk_db()
@@ -785,7 +779,7 @@ impl FinalizedState {
         &mut self,
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        next_vct_block: Option<NextVctBlock>,
+        vct_successor_witness: Option<VctSuccessorWitness>,
         source: &str,
         commit: C,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError>
@@ -799,7 +793,7 @@ impl FinalizedState {
         self.commit_finalized_direct_with_aux(
             finalizable_block,
             prev_note_commitment_trees,
-            next_vct_block,
+            vct_successor_witness,
             None,
             source,
             commit,
@@ -811,8 +805,8 @@ impl FinalizedState {
         &mut self,
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        next_vct_block: Option<NextVctBlock>,
-        vct_aux_window: Option<VctAuxWindow>,
+        vct_successor_witness: Option<VctSuccessorWitness>,
+        vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         source: &str,
         commit: C,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError>
@@ -860,12 +854,13 @@ impl FinalizedState {
                     // Exact hash-scoped roots below the handoff skip per-block note-commitment
                     // frontier recomputation. Tests can inject an equivalent local fixture through
                     // the source seam.
-                    let exact_vct_roots = vct_aux_window
-                        .as_ref()
-                        .and_then(|window| window.current_roots(height, block.hash()));
+                    let exact_vct_roots =
+                        vct_auxiliary_window.as_ref().and_then(|auxiliary_window| {
+                            auxiliary_window.delivery_roots(height, block.hash())
+                        });
                     let vct_roots = exact_vct_roots;
                     #[cfg(test)]
-                    let vct_roots = match vct_aux_window.as_ref() {
+                    let vct_roots = match vct_auxiliary_window.as_ref() {
                         Some(_) => vct_roots,
                         None => self.vct.source().and_then(|v| {
                             if vct_last_checkpoint_height.is_some_and(|last_checkpoint_height| {
@@ -896,25 +891,24 @@ impl FinalizedState {
 
                         // Defense in depth: only a witness that links to this block can
                         // authenticate its roots. A non-successor commitment binds a different
-                        // parent tree. Verification against that commitment would fail and evict
-                        // a valid supplied root. Treat a non-linking witness as absent. The
-                        // await-successor deferral below handles an absent witness. The header
-                        // store returns only direct successors, so production should not reach
-                        // this case.
-                        let next_vct_block = next_vct_block.filter(|next_vct_block| {
-                            let links = next_vct_block.header.previous_block_hash == block_hash;
-                            let delivery_matches = next_vct_block.delivery.is_none_or(|delivery| {
-                                delivery.header_hash == next_vct_block.hash
-                                    && delivery.tree_aux.is_some_and(|aux| {
-                                        aux.height == next_vct_block.height
-                                            && Some(aux.auth_data_root)
-                                                == next_vct_block.auth_data_root
+                        // parent tree. Verification against that commitment would fail and reject
+                        // a valid supplied root. The writer treats a non-linking witness as absent.
+                        // The header store returns only direct successors, so production should not
+                        // reach this case.
+                        let vct_successor_witness = vct_successor_witness.filter(|witness| {
+                            let links = witness.header.previous_block_hash == block_hash;
+                            let delivery_matches = witness.delivery.is_none_or(|delivery| {
+                                delivery.header_hash == witness.hash
+                                    && delivery.tree_aux.is_some_and(|auxiliary_data| {
+                                        auxiliary_data.height == witness.height
+                                            && Some(auxiliary_data.auth_data_root)
+                                                == witness.auth_data_root
                                     })
                             });
                             if !links || !delivery_matches {
                                 tracing::warn!(
                                     ?height,
-                                    witness_parent = ?next_vct_block.header.previous_block_hash,
+                                    witness_parent = ?witness.header.previous_block_hash,
                                     expected_parent = ?block_hash,
                                     "VCT: ignoring an incoherent successor witness"
                                 );
@@ -992,12 +986,12 @@ impl FinalizedState {
 
                         // If a buffered VCT successor block is available, we verify the current block's
                         // supplied roots against the successor block's header/MMR.
-                        if let Some(next_vct_block) = &next_vct_block {
+                        if let Some(successor_witness) = &vct_successor_witness {
                             verification_items.push(
                                 commitment_aux_verify::CommitmentRootVerification::header_only(
-                                    next_vct_block.header.clone(),
-                                    next_vct_block.height,
-                                    next_vct_block.auth_data_root,
+                                    successor_witness.header.clone(),
+                                    successor_witness.height,
+                                    successor_witness.auth_data_root,
                                 ),
                             );
                         }
@@ -1039,9 +1033,10 @@ impl FinalizedState {
                                 }
                             })?;
 
-                        if let (Some(window), Some(successor)) =
-                            (vct_aux_window.as_ref(), next_vct_block.as_ref())
-                        {
+                        if let (Some(window), Some(successor)) = (
+                            vct_auxiliary_window.as_ref(),
+                            vct_successor_witness.as_ref(),
+                        ) {
                             let authenticates_history = matches!(
                                 successor.header.commitment(&network, successor.height),
                                 Ok(block::Commitment::ChainHistoryRoot(_)
@@ -1050,8 +1045,8 @@ impl FinalizedState {
                             if authenticates_history {
                                 if let Some(boundary_auth_data_root) = successor.auth_data_root {
                                     vct_authentication = VctAuthenticationProof::Successor {
-                                        current_delivery_id: window.current.delivery_id,
-                                        current_header_hash: block_hash,
+                                        delivery_id: window.delivery.delivery_id,
+                                        delivery_header_hash: block_hash,
                                         boundary_hash: successor.hash,
                                         boundary_auth_data_root,
                                     };
@@ -1059,15 +1054,15 @@ impl FinalizedState {
                             }
                         }
 
-                        if let Some(next_vct_block) = &next_vct_block {
+                        if let Some(successor_witness) = &vct_successor_witness {
                             let next_auth_data_root =
-                                (NetworkUpgrade::current(&network, next_vct_block.height)
+                                (NetworkUpgrade::current(&network, successor_witness.height)
                                     >= NetworkUpgrade::Nu5)
-                                    .then_some(next_vct_block.auth_data_root)
+                                    .then_some(successor_witness.auth_data_root)
                                     .flatten();
                             self.vct.mark_prevalidated(
-                                next_vct_block.height,
-                                next_vct_block.hash,
+                                successor_witness.height,
+                                successor_witness.hash,
                                 next_auth_data_root,
                             );
                         } else if self
@@ -1483,6 +1478,30 @@ impl FinalizedState {
     ) {
         self.vct
             .install_test_source(source, requires_verified_successor);
+    }
+
+    /// Test-only: enable the production VCT source, whose per-header roots come only from
+    /// hash-scoped auxiliary deliveries, with the handoff placed above `last_exact_height`.
+    ///
+    /// This is what the header-time authentication sweep runs against: it needs
+    /// [`Self::vct_requires_exact_roots`] to hold over the swept range and nothing else.
+    #[cfg(test)]
+    pub(in crate::service) fn enable_vct_exact_root_source_for_test(
+        &mut self,
+        last_exact_height: block::Height,
+    ) {
+        self.vct.install_test_source(
+            Box::new(commitment_aux::EmbeddedFrontierSource::new(
+                commitment_aux::FinalFrontiers {
+                    height: last_exact_height,
+                    sapling: Arc::new(Default::default()),
+                    orchard: Arc::new(Default::default()),
+                    sprout: Arc::new(Default::default()),
+                    ironwood: Arc::new(Default::default()),
+                },
+            )),
+            true,
+        );
     }
 
     /// Test-only: the fast-sync handoff height recorded in the database marker, if any.

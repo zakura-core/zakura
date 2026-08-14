@@ -1076,9 +1076,8 @@ impl Parameters {
 
         // Regtest's local default is Height(2), matching zcashd-style private chains.
         // Do not inherit the public Testnet soft-fork height from ParametersBuilder::finish().
-        parameters = parameters.with_max_block_time_start_height(
-            max_block_time_start_height.unwrap_or(Height(2)),
-        );
+        parameters = parameters
+            .with_max_block_time_start_height(max_block_time_start_height.unwrap_or(Height(2)));
 
         if Some(true) == extend_funding_stream_addresses_as_required {
             parameters = parameters.extend_funding_streams();

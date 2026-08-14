@@ -18,7 +18,6 @@ expression: empty_column_families
   "header_engine_meta_v1: no entries",
   "header_finality_history_v1: no entries",
   "header_node_by_hash_v1: no entries",
-  "header_root_auth_frontier: no entries",
   "header_selected_v1: no entries",
   "header_validation_context_v1: no entries",
   "header_verified_v1: no entries",

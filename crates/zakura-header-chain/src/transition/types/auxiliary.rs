@@ -53,6 +53,32 @@ pub enum AuxAuthentication {
         /// Stable rejection evidence.
         evidence: EvidenceId,
     },
+    /// Verification failed at a boundary that combines two untrusted deliveries.
+    ///
+    /// The evidence does not identify which delivery is invalid. Later evidence can refine this
+    /// state to [`AuxAuthentication::Authenticated`] or [`AuxAuthentication::Rejected`].
+    Disputed {
+        /// Stable evidence that binds both deliveries to the failed boundary.
+        evidence: EvidenceId,
+    },
+}
+
+impl AuxAuthentication {
+    /// Return whether new evidence can refine this authentication state to `next_state`.
+    ///
+    /// Evidence cannot restore an unauthenticated state or replace a terminal state.
+    pub(crate) fn can_refine_to(self, next_state: Self) -> bool {
+        matches!(
+            (self, next_state),
+            (Self::Unauthenticated, next_state) if next_state != Self::Unauthenticated
+        ) || matches!(
+            (self, next_state),
+            (
+                Self::Disputed { .. },
+                Self::Authenticated { .. } | Self::Rejected { .. }
+            )
+        )
+    }
 }
 
 /// Hash-keyed auxiliary delivery with complete provenance.

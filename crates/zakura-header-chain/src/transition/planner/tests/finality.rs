@@ -3,6 +3,7 @@ use super::super::{
 };
 use super::*;
 use crate::InvariantViolation;
+use std::num::NonZeroUsize;
 
 #[test]
 fn finalization_projection_delta_removes_only_the_retired_prefix() {
@@ -949,6 +950,82 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
         verify_plan(&test_engine(&store), &pin_conflict),
         Err(InvariantViolation::TrustPin(checkpoint.height))
     );
+}
+
+#[test]
+fn authenticated_verified_reset_replaces_a_full_retention_fork_set() {
+    let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
+    config.limits.max_candidate_tips =
+        NonZeroUsize::new(10).expect("the retention limit is nonzero");
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .expect("the anchor exists")
+        .header
+        .difficulty_threshold;
+    let retained_tips = (1..=10)
+        .map(|seed| insert_verified_branch(&mut store.graph, anchor, 1, difficulty, seed))
+        .collect::<Vec<_>>();
+    synchronize_fixture(&mut store, retained_tips[0]);
+    let dropped = retained_tips
+        .iter()
+        .copied()
+        .find(|tip| *tip != store.metadata.frontiers.header_best)
+        .expect("one verified side branch is not header-best");
+    synchronize_fixture(&mut store, dropped);
+
+    let replacement = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 11);
+    store
+        .graph
+        .set_body_validation_state(replacement.hash, BodyValidationState::Unknown)
+        .expect("the replacement starts without body evidence");
+    let replacement_header = store
+        .graph
+        .header_node(replacement.hash)
+        .expect("the replacement is retained")
+        .header
+        .clone();
+    store.lease = validation_lease_for(&store, anchor);
+    let staged_tips = retained_tips
+        .iter()
+        .copied()
+        .filter(|tip| *tip != dropped)
+        .map(|tip| tip.hash)
+        .chain(std::iter::once(replacement.hash))
+        .collect::<Vec<_>>();
+    let context = TransitionContext {
+        config: &config,
+        clock: &clock,
+        full_state_authority: Some(&authority),
+        retention_references: &staged_tips,
+    };
+    let request = TransitionRequest {
+        expected_version: store.metadata.state_version,
+        event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+            full_state_transition_id: EvidenceId::from_digest([0xd1; 32]),
+            old_tip: dropped,
+            new_path: vec![crate::VerifiedHeaderRef {
+                height: replacement.height,
+                hash: replacement.hash,
+                header: replacement_header,
+            }],
+            cause: crate::VerifiedChangeCause::Reset,
+        }),
+    };
+
+    let plan = apply_transition(&store, request, &context)
+        .expect("the authenticated full-state fork set replaces one retained branch");
+
+    assert!(plan.change_set.delete_nodes.contains(&dropped.hash));
+    assert!(!plan.change_set.delete_nodes.contains(&replacement.hash));
+    assert_eq!(
+        plan.change_set.metadata.frontiers.verified_best,
+        replacement
+    );
+    assert!(!plan.change_set.metadata.alarms.resource_stalled);
 }
 
 #[test]

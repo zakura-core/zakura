@@ -706,7 +706,7 @@ id = "LC-AUX-04"
 name = "Cryptographic metadata authentication"
 status = "implemented"
 owner = "zakura_state::service::write::HeaderChainWriter::vct_authentication_request"
-tests = ["IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "IN-06::vct_untrusted_source_defers_unverifiable_tip_root_until_successor", "IN-06::vct_untrusted_source_bad_root_replacement_commits_same_height", "IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+tests = ["IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "IN-06::vct_untrusted_source_defers_unverifiable_tip_root_until_successor", "IN-06::vct_untrusted_source_bad_root_replacement_commits_same_height", "IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence", "IN-06::authenticates_every_supplied_delivery_ahead_of_its_body", "IN-06::never_authenticates_or_over_evicts_a_corrupted_delivery", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

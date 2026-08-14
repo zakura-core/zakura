@@ -154,6 +154,17 @@ pub enum StateInitError {
         source: rocksdb::Error,
     },
 
+    /// A migration failure prevents the state database from opening.
+    #[error(
+        "cannot upgrade state database format at {path:?}. The database version remains unchanged, so Zakura can retry the migration: {source}"
+    )]
+    DatabaseFormatUpgrade {
+        /// The path identifies the database that failed migration.
+        path: PathBuf,
+        /// The source describes the migration failure.
+        source: BoxError,
+    },
+
     /// A read-only state was requested, but the configured cache directory is
     /// missing or unreadable.
     ///
@@ -495,9 +506,6 @@ pub enum ValidateContextError {
     #[error(transparent)]
     MissingSproutTipTree(#[from] MissingSproutTipTree),
 
-    #[error("header-root authentication frontier is incoherent: {reason}")]
-    HeaderRootAuthFrontier { reason: String },
-
     #[error("block hash {block_hash} was previously invalidated")]
     #[non_exhaustive]
     BlockPreviouslyInvalidated { block_hash: block::Hash },
@@ -811,7 +819,6 @@ impl ValidateContextError {
                 BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
             }
             Self::VctSproutHandoffRootMismatch { .. }
-            | Self::HeaderRootAuthFrontier { .. }
             | Self::CumulativeWorkOverflow { .. }
             | Self::NoteCommitmentTreeError(_)
             | Self::HistoryTreeError(_) => {
@@ -954,7 +961,6 @@ impl ValidateContextError {
             // out-of-order arrival, retryable stalls, and auxiliary roots that
             // may have come from a different peer.
             | ValidateContextError::MissingSproutTipTree(_)
-            | ValidateContextError::HeaderRootAuthFrontier { .. }
             | ValidateContextError::BlockPreviouslyInvalidated { .. }
             | ValidateContextError::NotReadyToBeCommitted
             | ValidateContextError::InvalidAncestorBlock(_)
@@ -1337,13 +1343,6 @@ mod tests {
         ));
         assert_eq!(transient_context_error.misbehavior_score(), 0);
 
-        let local_frontier_error = CommitBlockError::ValidateContextError(Box::new(
-            ValidateContextError::HeaderRootAuthFrontier {
-                reason: "test local storage fault".to_string(),
-            },
-        ));
-        assert_eq!(local_frontier_error.misbehavior_score(), 0);
-
         let invalid_ancestor_error = CommitBlockError::ValidateContextError(Box::new(
             ValidateContextError::InvalidAncestorBlock(block::Hash([1; 32])),
         ));
@@ -1355,13 +1354,6 @@ mod tests {
                 finalized_tip_height: height,
             }));
         assert_eq!(stale_fork_error.misbehavior_score(), 0);
-
-        let local_frontier_error = CommitBlockError::ValidateContextError(Box::new(
-            ValidateContextError::HeaderRootAuthFrontier {
-                reason: "test frontier failure".to_string(),
-            },
-        ));
-        assert_eq!(local_frontier_error.misbehavior_score(), 0);
 
         let dup_err = CommitBlockError::Duplicate {
             hash_or_height: None,

@@ -84,9 +84,7 @@ pub(super) fn audit_authoritative<S: StoreAuditRead>(
         config,
         &mut violations,
     )?;
-    if source_nodes.len().saturating_sub(1) > config.limits.max_non_finalized_nodes.get()
-        && !metadata.alarms.resource_stalled
-    {
+    if source_nodes.len().saturating_sub(1) > config.limits.max_non_finalized_nodes.get() {
         violations.push(AuditViolation::Limits);
     }
     violations.sort_by_key(violation_key);

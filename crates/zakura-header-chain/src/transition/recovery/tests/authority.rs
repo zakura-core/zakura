@@ -402,6 +402,44 @@ fn migrated_finality_is_rejected_after_the_migration_boundary() {
 }
 
 #[test]
+fn resource_stall_alarm_does_not_exempt_startup_node_limit() {
+    let (mut store, mut config) = fixture();
+    config.limits.max_non_finalized_nodes =
+        NonZeroUsize::new(1).expect("one is a valid node limit");
+    let anchor = store.metadata.frontiers.finalized;
+    let mut sibling_header = *store.nodes[1].header;
+    sibling_header.nonce = [2; 32].into();
+    let sibling_header = Arc::new(sibling_header);
+    let sibling_hash = sibling_header.hash();
+    let sibling_work = sibling_header
+        .difficulty_threshold
+        .to_work()
+        .expect("the fixture sibling target has work");
+    store.nodes.push(
+        HeaderNode::from_durable_parts(
+            sibling_header,
+            sibling_hash,
+            anchor.hash,
+            block::Height(1),
+            sibling_work,
+            store.nodes[0]
+                .work_coordinate()
+                .checked_add(sibling_work)
+                .expect("the sibling work fits"),
+            HeaderValidationState::Valid,
+            EligibilityState::default(),
+            BodyValidationState::Unknown,
+            Vec::new(),
+        )
+        .expect("the canonical sibling fields agree"),
+    );
+    store.metadata.alarms.resource_stalled = true;
+    store.snapshot = store.metadata.snapshot();
+
+    assert!(violations(&store, &config).contains(&AuditViolation::Limits));
+}
+
+#[test]
 fn audits_each_normative_invariant() {
     let (base, config) = fixture();
     let child_hash = base.metadata.frontiers.header_best.hash;

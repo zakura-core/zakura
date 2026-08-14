@@ -18,7 +18,7 @@ use crate::{
     ChainScore, CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState,
     EngineMode, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
     HeaderGeneration, HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner,
-    SourceId, SuffixWork, WorkCoordinate,
+    SourceId, StoreError, SuffixWork, WorkCoordinate,
 };
 
 #[test]
@@ -509,6 +509,90 @@ fn resource_stall_alarm_does_not_exempt_startup_node_limit() {
 }
 
 #[test]
+fn oversized_node_table_fails_before_node_rows_are_loaded() {
+    let (mut store, mut config) = fixture();
+    config.limits.max_non_finalized_nodes =
+        NonZeroUsize::new(1).expect("one is a valid node limit");
+    store.nodes.push(store.nodes[1].clone());
+    store.failed_read = Some(AuditRead::HeaderNodes);
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
+            collection: "header nodes",
+            limit: 2,
+        }))
+    );
+}
+
+#[test]
+fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
+    let (mut store, mut config) = fixture();
+    config.limits.max_aux_deliveries_total =
+        NonZeroUsize::new(1).expect("one is a valid auxiliary limit");
+    let delivery = AuxDelivery {
+        delivery_id: EvidenceId::from_digest([0x51; 32]),
+        header_hash: store.nodes[1].hash,
+        source: SourceId::from_digest([0x52; 32]),
+        owner: HeaderWorkOwner {
+            authority: HeaderWorkAuthority {
+                header_generation: HeaderGeneration::new(1),
+                branch: BranchId::new(store.metadata.work_origin.hash, store.nodes[1].hash),
+            },
+            session_id: 1,
+            request_id: NonZeroU64::new(1).expect("one is nonzero"),
+        }
+        .into(),
+        body_size: BodySizeHint::Unknown,
+        tree_aux: None,
+        authentication: AuxAuthentication::Unauthenticated,
+    };
+    store.aux = vec![delivery, delivery];
+    store.failed_read = Some(AuditRead::AuxDeliveries);
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
+            collection: "auxiliary deliveries",
+            limit: 1,
+        }))
+    );
+
+    let (mut store, config) = fixture();
+    store.contexts = vec![
+        ValidationContextRecord {
+            header: store.nodes[0].header.clone(),
+            height: block::Height(0),
+        };
+        crate::POW_PREDECESSOR_CONTEXT_SPAN + 1
+    ];
+    store.failed_read = Some(AuditRead::ValidationContexts);
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
+            collection: "validation contexts",
+            limit: crate::POW_PREDECESSOR_CONTEXT_SPAN,
+        }))
+    );
+}
+
+#[test]
+fn fatal_configuration_mismatch_fails_before_collection_preflight() {
+    let (mut store, config) = fixture();
+    store.metadata.mode = EngineMode::HeadersOnly;
+    store.snapshot = store.metadata.snapshot();
+    store.failed_read = Some(AuditRead::HeaderNodeCount);
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Source {
+            violations: vec![AuditViolation::Configuration],
+        })
+    );
+}
+
+#[test]
 fn audits_each_normative_invariant() {
     let (base, config) = fixture();
     let child_hash = base.metadata.frontiers.header_best.hash;
@@ -644,7 +728,13 @@ fn audits_each_normative_invariant() {
     limited.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("one is nonzero");
     let mut oversized = base.clone();
     oversized.nodes.push(oversized.nodes[1].clone());
-    assert!(violations(&oversized, &limited).contains(&AuditViolation::Limits));
+    assert_eq!(
+        audit_store(&oversized, &limited),
+        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
+            collection: "header nodes",
+            limit: 2,
+        }))
+    );
 
     let mut store = base.clone();
     let evidence = EvidenceId::from_digest([5; 32]);

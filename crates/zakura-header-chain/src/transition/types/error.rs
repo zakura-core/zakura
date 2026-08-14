@@ -5,6 +5,14 @@ use thiserror::Error;
 /// Failure to read one coherent store view.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum StoreError {
+    /// A durable collection exceeded its configured recovery bound.
+    #[error("header-chain {collection} exceeds recovery limit {limit}")]
+    LimitExceeded {
+        /// Stable collection name.
+        collection: &'static str,
+        /// Maximum rows recovery accepts.
+        limit: usize,
+    },
     /// The store contains internally incoherent rows or indexes.
     #[error("incoherent header-chain store: {0}")]
     Incoherent(&'static str),

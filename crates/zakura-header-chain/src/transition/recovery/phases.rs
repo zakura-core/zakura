@@ -10,7 +10,9 @@ use crate::{
     EngineSnapshot, Frontier, HeaderNode, StoreError,
 };
 
-use super::contracts::{AuditViolation, StoreAuditRead, ValidationContextRecord};
+use super::contracts::{
+    source_failure, AuditViolation, RecoveryFailure, StoreAuditRead, ValidationContextRecord,
+};
 
 /// Exhaustive durable rows loaded before any authoritative audit.
 pub(super) struct PreAuditStoreRows {
@@ -55,10 +57,9 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditRead>(
     store: &S,
     config: &EngineConfig,
     allow_trust_anchor_update: bool,
-) -> Result<PreAuditStoreRows, StoreError> {
+) -> Result<PreAuditStoreRows, RecoveryFailure> {
     let snapshot_before_repair = store.snapshot()?;
     let metadata = store.metadata()?;
-    let mut early_violations = Vec::new();
     let trust_anchor_changed = metadata.anchor_manifest_digest != config.trust_anchor_digest();
     if snapshot_before_repair != metadata.snapshot()
         || metadata.disk_format.0 != 1
@@ -66,7 +67,41 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditRead>(
         || metadata.network_id != config.network.kind()
         || trust_anchor_changed && !allow_trust_anchor_update
     {
-        early_violations.push(AuditViolation::Configuration);
+        return Err(source_failure(AuditViolation::Configuration));
+    }
+
+    let mut early_violations = Vec::new();
+
+    let maximum_nodes = config
+        .limits
+        .max_non_finalized_nodes
+        .get()
+        .checked_add(1)
+        .ok_or(StoreError::Incoherent(
+            "header-node recovery limit overflow",
+        ))?;
+    if store.header_node_count_up_to(maximum_nodes)? > maximum_nodes {
+        return Err(StoreError::LimitExceeded {
+            collection: "header nodes",
+            limit: maximum_nodes,
+        }
+        .into());
+    }
+    let maximum_aux = config.limits.max_aux_deliveries_total.get();
+    if store.aux_delivery_count_up_to(maximum_aux)? > maximum_aux {
+        return Err(StoreError::LimitExceeded {
+            collection: "auxiliary deliveries",
+            limit: maximum_aux,
+        }
+        .into());
+    }
+    let maximum_contexts = crate::POW_PREDECESSOR_CONTEXT_SPAN;
+    if store.validation_context_count_up_to(maximum_contexts)? > maximum_contexts {
+        return Err(StoreError::LimitExceeded {
+            collection: "validation contexts",
+            limit: maximum_contexts,
+        }
+        .into());
     }
 
     let mut source_nodes = store.all_header_nodes()?;

@@ -112,7 +112,7 @@ zcash_transparent = { workspace = true }
 # Test-only feature proptest-impl
 proptest = { workspace = true, optional = true }
 
-zakura-chain = { path = "../zakura-chain", version = "5.0.0", features = [
+zakura-chain = { path = "../zakura-chain", version = "6.0.0", features = [
     "json-conversion",
 ] }
 zakura-consensus = { path = "../zakura-consensus", version = "7.0.0" }
@@ -142,7 +142,7 @@ proptest = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-chain = { path = "../zakura-chain", version = "5.0.0", features = [
+zakura-chain = { path = "../zakura-chain", version = "6.0.0", features = [
     "proptest-impl",
 ] }
 zakura-consensus = { path = "../zakura-consensus", version = "7.0.0", features = [

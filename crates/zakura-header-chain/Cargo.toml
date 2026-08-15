@@ -19,7 +19,7 @@ chrono = { workspace = true }
 rayon = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-zakura-chain = { path = "../zakura-chain", version = "5.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "6.0.0" }
 
 [dev-dependencies]
 proptest = { workspace = true }

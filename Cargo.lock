@@ -8365,7 +8365,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "bech32",
  "bitflags",

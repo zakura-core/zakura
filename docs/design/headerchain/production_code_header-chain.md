@@ -22,7 +22,7 @@ these calls as `OperatorInvalidate` and `OperatorReconsider` events.
 
 ## Header-chain state
 
-[`MemHeaderStore`](https://github.com/zakura-core/zakura/blob/37aaf0ddcc5d45ad21aebadc6ccadd6c4a58ef79/crates/zakura-header-chain/src/graph.rs) holds every retained
+[`MemHeaderStore`](https://github.com/zakura-core/zakura/blob/722f615550cb29637f3f5ed95f71e4522decd1cd/crates/zakura-header-chain/src/graph/mod.rs) holds every retained
 header in a directed acyclic graph (DAG). Each `HeaderNode` is keyed by its consensus
 hash and names its parent. The finalized `Frontier` is the graph root. A `Frontier`
 contains both height and hash, so it identifies one position on one branch.
@@ -31,6 +31,9 @@ The engine keeps two paths through the DAG. The selected path ends at the best e
 header tip. The verified path ends at the tip whose blocks full state has accepted.
 Each path is stored as an ordered list of frontiers, so readers can answer height queries
 without walking the graph.
+
+Integrated mode advances the verified path only when full state accepts blocks. In
+headers-only mode, the verified path contains only the finalized frontier.
 
 A node is eligible when its header is valid, it has no direct exclusion reason, and its
 ancestors are eligible. The graph stores exclusion reasons instead of one boolean flag.
@@ -41,12 +44,21 @@ Selection takes the maximum score over all eligible tips. This implements
 [deterministic selection (`LC-SELECT-04`)](../../specs/fork-aware-header-chain-engine.md#lc-select-04):
 the same eligible DAG selects the same tip regardless of header arrival order.
 
+Integrated mode advances finality only from authenticated full-state evidence.
+Headers-only mode advances finality with a 1,000-block local depth rule. This local rule
+does not verify block bodies. When finality advances, the engine removes old ancestors
+and competing sibling subtrees. It rebases retained work onto the new root.
+
 ## Header admission and validation
 
 The header-sync driver prepares a downloaded batch before it takes the state writer
 lock. It obtains a validation lease for the common ancestor and checks properties that
 need no candidate ancestry, including encoding, proof of work, and commitment format.
 CPU-heavy checks run on a blocking thread.
+
+The full-block and checkpoint verifiers call the same context-free checks. This prevents
+an in-memory or locally constructed block from bypassing header-version and timestamp
+checks. Only an authenticated custom network can disable proof-of-work verification.
 
 A header whose time is more than two hours ahead of the local clock waits until that
 time becomes valid. It does not become permanently invalid. This implements
@@ -62,8 +74,13 @@ parent context.
 The planner then checks parent linkage, height, work, difficulty, and time against the
 staged graph. It admits a header only after every required check passes. This implements
 [validation before admission (`LC-VAL-11`)](../../specs/fork-aware-header-chain-engine.md#lc-val-11).
+The engine calculates cumulative work with full 256-bit values and rejects cumulative
+overflow. Its difficulty calculation requires the complete predecessor window. It caps
+target scaling before multiplication can overflow. It reads Testnet's maximum-time
+activation height from network parameters.
+
 After planning,
-[`verify_plan`](https://github.com/zakura-core/zakura/blob/37aaf0ddcc5d45ad21aebadc6ccadd6c4a58ef79/crates/zakura-header-chain/src/transition/invariants.rs)
+[`verify_plan`](https://github.com/zakura-core/zakura/blob/722f615550cb29637f3f5ed95f71e4522decd1cd/crates/zakura-header-chain/src/transition/invariants/mod.rs)
 independently checks the resulting graph, projections, generation changes, and protected
 nodes before the runtime writes anything.
 
@@ -72,7 +89,7 @@ nodes before the runtime writes anything.
 `MemHeaderStore` contains the committed graph.
 [`GraphOverlay`](../../../crates/zakura-header-chain/src/graph/overlay.rs) reads that graph
 and records staged changes without mutating it.
-[`HeaderChainEngine`](https://github.com/zakura-core/zakura/blob/37aaf0ddcc5d45ad21aebadc6ccadd6c4a58ef79/crates/zakura-header-chain/src/transition/engine.rs)
+[`HeaderChainEngine`](https://github.com/zakura-core/zakura/blob/722f615550cb29637f3f5ed95f71e4522decd1cd/crates/zakura-header-chain/src/transition/engine/mod.rs)
 extracts those changes as a `GraphDelta`. The runtime applies the delta to
 `MemHeaderStore` only after the durable write succeeds.
 
@@ -131,9 +148,14 @@ the runtime commits the DAG changes, metadata, projections, and related indexes 
 RocksDB batch before it publishes the new snapshot.
 
 Startup uses
-[`audit_store`](https://github.com/zakura-core/zakura/blob/37aaf0ddcc5d45ad21aebadc6ccadd6c4a58ef79/crates/zakura-header-chain/src/transition/recovery.rs) while
-publication is disabled. The audit checks the stored source rows and rebuilds derived
-indexes and projections. It refuses inconsistencies that it cannot reconstruct.
+[`audit_store`](https://github.com/zakura-core/zakura/blob/722f615550cb29637f3f5ed95f71e4522decd1cd/crates/zakura-header-chain/src/transition/recovery/mod.rs) while
+publication is disabled. The audit rejects contradictions in authoritative rows. It
+repairs only indexes, projections, alarms, and other values that it can derive from those
+rows.
+
+During a live transition, the graph reuses header hashes that admission already verified.
+Recovery recomputes canonical hashes from durable rows. This avoids repeated hashing
+without weakening the startup audit.
 
 ### Write paths
 
@@ -150,8 +172,12 @@ authentication, a dependent checkpoint advance, and the block-state change in on
 batch.
 
 A no-change plan still commits the caller's block-state batch when one exists, but it
-does not install or publish a header-chain change. A `ResourceStalled` result discards
-the caller's block-state rows. It writes a changed header-chain alarm when needed.
+does not install or publish a header-chain change. A `ResourceStalled` result means that
+retention cannot make room without deleting protected state. It discards the caller's
+block-state rows and writes a changed header-chain alarm when needed.
+
+An auxiliary-evidence limit rejects the event before any change and does not raise the
+resource alarm. A limit failure from the independent invariant check returns no plan.
 
 ## Fork switching
 
@@ -192,6 +218,11 @@ the verified path must move to the other branch. `SyncCoordinator` holds the pro
 apply permit during that handoff, so the native and legacy block-apply paths cannot run
 at the same time.
 
+When full state rejects a body as consensus-invalid, the block-sync driver waits for
+state to commit that evidence. It refreshes a stale state version and retries a bounded
+number of times. If state cannot persist the evidence, the driver shuts down instead of
+continuing while the branch remains eligible.
+
 ## VCT evidence and authentication
 
 Peers can provide commitment-tree roots before the node downloads the corresponding
@@ -205,6 +236,11 @@ only when that next header directly follows the target on the same owned branch 
 delivery provenance has not changed. The exact transition checks live in
 [`auxiliary_authentication.rs`](../../../crates/zakura-header-chain/src/transition/planner/event_effects/auxiliary_authentication.rs).
 
+The DAG can retain an unauthenticated delivery while the check is pending. State exposes
+a peer-supplied root through the authoritative commitment-root index only after that root
+passes authentication. A root derived from an accepted block body can also enter that
+index. This replaces the former height-keyed authentication frontier.
+
 Unauthenticated evidence does not affect header validity or fork choice. The
 [repair scheduler](../../../crates/zakura-network/src/zakura/header_sync/scheduler/repair.rs)
 fetches missing evidence separately for each branch and generation. The full tree design
@@ -212,16 +248,33 @@ lives in [Verified commitment trees](../verified-commitment-trees.md).
 
 ## Stale work rejection
 
+Serialized events require an exact `state_version`. The planner rejects an event as stale
+when that version does not match.
+
 Header requests can finish after the selected branch has changed. `BranchId` identifies
 the anchor and tip that a request belongs to. It deliberately omits height because a
 fork switch can replace a branch without changing its height.
 
 When a result returns, `Gate` in
-[`ownership.rs`](https://github.com/zakura-core/zakura/blob/37aaf0ddcc5d45ad21aebadc6ccadd6c4a58ef79/crates/zakura-header-chain/src/ownership.rs) compares its branch
+[`completion.rs`](https://github.com/zakura-core/zakura/blob/722f615550cb29637f3f5ed95f71e4522decd1cd/crates/zakura-header-chain/src/work/completion.rs) compares its branch
 and generation with the current snapshot. It accepts current work and rejects stale
 work. It ignores `state_version` because unrelated transitions increment that counter
 and would cancel valid requests. The scheduler uses the same branch and generation to
 retire stale work.
+
+The engine advances `header_generation` when a change makes header work stale. It
+advances `verified_generation` when a verified-path or finality change makes body-forward
+work stale. Prepared headers have a separate stale result when their durable validation
+context changes. The caller must prepare and validate those headers again.
+
+Finality can advance while a header request is active. The planner can remove an
+already-finalized prefix and bind the remaining headers to the new root. It rejects the
+result when durable finality history cannot prove that rebase.
+
+For replay-protected events, the engine saves the fingerprint of the latest state change.
+An exact repeat produces a verified no-change plan even if its serialized version is old.
+Normal authority and ownership checks still apply. Reusing the same evidence key with
+different content fails as a conflicting replay.
 
 ## Component boundaries
 
@@ -248,10 +301,12 @@ and verifies the result. This boundary implements
 [block-sync concerns excluded (`LC-SCOPE-06`)](../../specs/fork-aware-header-chain-engine.md#lc-scope-06):
 unrelated block-sync policy cannot affect header fork choice.
 
-[`retention.rs`](https://github.com/zakura-core/zakura/blob/37aaf0ddcc5d45ad21aebadc6ccadd6c4a58ef79/crates/zakura-header-chain/src/retention.rs) protects the
-selected and verified paths. When protected state fills the node limit, the engine
-refuses admission instead of deleting either path. This implements
-[fork and node limits (`LC-RETAIN-01`)](../../specs/fork-aware-header-chain-engine.md#lc-retain-01).
+[`retention.rs`](https://github.com/zakura-core/zakura/blob/722f615550cb29637f3f5ed95f71e4522decd1cd/crates/zakura-header-chain/src/transition/planner/retention.rs) protects the
+selected path, the verified path, the path to every retained body that full state has
+verified, and nodes that active work still references. When protected state fills the
+node limit, the engine refuses admission. The
+[fork and node limits rule (`LC-RETAIN-01`)](../../specs/fork-aware-header-chain-engine.md#lc-retain-01)
+requires the engine to preserve protected state.
 
 [`conformance.toml`](../../../crates/zakura-header-chain/conformance.toml) lists the
 machine-checked rules. The
@@ -275,7 +330,12 @@ The [header-chain schema](../../../crates/zakura-state/src/service/finalized_sta
 uses a `_v1` suffix for each header-chain column family. A future incompatible encoding
 can use a new family instead of reinterpreting existing data. The
 [`migration`](../../../crates/zakura-state/src/service/finalized_state/header_chain/migration.rs)
-builds an initial DAG when an existing database stores only one chain.
+builds an initial DAG from authenticated full-state facts when the database contains no
+predecessor header-overlay rows. It downloads headers above the verified block tip again.
+Startup rejects a database that contains predecessor header-overlay rows before it
+publishes the new DAG. That cutover requires a fresh state database and resynchronization.
+The [migration guide](../../header-chain-v1.4-migration.md) also covers removed
+configuration and the status interface.
 
 ### `zakura-network`: protocol timing and branch-owned work
 

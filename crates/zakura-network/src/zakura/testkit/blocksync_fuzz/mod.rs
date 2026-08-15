@@ -65,8 +65,17 @@ pub(crate) async fn run_scenario(
     // header tip is a full checkpoint gap ahead of height 0. These scenarios
     // start with a fully known, static header chain, so that wait would stall
     // every ≥400-block run and fire before timing-sensitive peer degradations.
-    // Starting one block past genesis keeps the quiet period from arming.
-    let initial_verified = target.min(block::Height(1)).min(initial_header);
+    // Leave genesis only when that quiet period would otherwise arm, so shorter
+    // scenarios still download from height 1.
+    //
+    // Keep in lockstep with `EMPTY_STATE_HEADER_QUIET_MIN_LAG` in
+    // `block_sync/reactor.rs`.
+    const EMPTY_STATE_HEADER_QUIET_MIN_LAG: u32 = 400;
+    let initial_verified = if initial_header.0 >= EMPTY_STATE_HEADER_QUIET_MIN_LAG {
+        target.min(block::Height(1)).min(initial_header)
+    } else {
+        block::Height(0)
+    };
     let initial_verified_hash = corpus_hash(&corpus, initial_verified);
 
     // The commit driver advances one shared mock frontier as bodies apply.

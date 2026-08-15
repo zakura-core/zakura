@@ -144,9 +144,13 @@ proptest! {
                 // Adjust the transaction expiry height based on the new chain
                 // tip height so that the mempool does not evict the transaction
                 // when there is a chain growth.
-                if let Some(expiry_height) = transaction.transaction.transaction.expiry_height() {
+                if let Some(expiry_height) = transaction.transaction.transaction().expiry_height() {
                     if chain_tip.height >= expiry_height {
-                        let mut tmp_tx = (*transaction.transaction.transaction).clone();
+                        let mut tmp_tx = transaction
+                            .transaction
+                            .transaction()
+                            .as_ref()
+                            .clone();
 
                         // Set a new expiry height that is greater than the
                         // height of the current chain tip.

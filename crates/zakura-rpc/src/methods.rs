@@ -1797,13 +1797,13 @@ where
                 if verbose {
                     let transactions_by_id = transactions
                         .iter()
-                        .map(|unmined_tx| (unmined_tx.transaction.id.mined_id(), unmined_tx))
+                        .map(|unmined_tx| (unmined_tx.transaction.id().mined_id(), unmined_tx))
                         .collect::<HashMap<_, _>>();
                     let map = transactions
                         .iter()
                         .map(|unmined_tx| {
                             (
-                                unmined_tx.transaction.id.mined_id().encode_hex(),
+                                unmined_tx.transaction.id().mined_id().encode_hex(),
                                 get_raw_mempool::MempoolObject::from_verified_unmined_tx(
                                     unmined_tx,
                                     &transactions_by_id,
@@ -1823,14 +1823,14 @@ where
                         // support prioritizing transactions
                         cmp::Reverse((
                             i64::from(tx.miner_fee) as u128 * MAX_BLOCK_BYTES as u128
-                                / tx.transaction.size as u128,
+                                / tx.transaction.size() as u128,
                             // transaction hashes are compared in their serialized byte-order.
-                            tx.transaction.id.mined_id(),
+                            tx.transaction.id().mined_id(),
                         ))
                     });
                     let tx_ids: Vec<String> = transactions
                         .iter()
-                        .map(|unmined_tx| unmined_tx.transaction.id.mined_id().encode_hex())
+                        .map(|unmined_tx| unmined_tx.transaction.id().mined_id().encode_hex())
                         .collect();
 
                     Ok(GetRawMempoolResponse::TxIds(tx_ids))
@@ -1882,7 +1882,7 @@ where
                         return Ok(if verbose {
                             GetRawTransactionResponse::Object(Box::new(
                                 TransactionObject::from_transaction(
-                                    tx.transaction.clone(),
+                                    tx.transaction().clone(),
                                     None,
                                     None,
                                     &self.network,
@@ -1893,7 +1893,7 @@ where
                                 ),
                             ))
                         } else {
-                            let hex = tx.transaction.clone().into();
+                            let hex = tx.transaction().clone().into();
                             GetRawTransactionResponse::Raw(hex)
                         });
                     }
@@ -2529,7 +2529,7 @@ where
                 tip_height,
                 tip_hash,
                 max_time,
-                mempool_txs.iter().map(|tx| tx.transaction.id),
+                mempool_txs.iter().map(|tx| tx.transaction.id()),
             )
             .generate_id();
 
@@ -2709,7 +2709,7 @@ where
         tracing::debug!(
             mempool_tx_hashes = ?mempool_txs
                 .iter()
-                .map(|tx| tx.transaction.id.mined_id())
+                .map(|tx| tx.transaction.id().mined_id())
                 .collect::<Vec<_>>(),
             "selecting transactions for the template from the mempool"
         );
@@ -2728,7 +2728,7 @@ where
         tracing::debug!(
             selected_mempool_tx_hashes = ?mempool_txs
                 .iter()
-                .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id.mined_id())
+                .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id().mined_id())
                 .collect::<Vec<_>>(),
             "selected transactions for the template from the mempool"
         );

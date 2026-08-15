@@ -80,7 +80,8 @@ async fn mempool_requests_for_transactions() {
         .iter()
         .map(|t| t.transaction.clone())
         .collect();
-    let added_transaction_ids: Vec<UnminedTxId> = added_transactions.iter().map(|t| t.id).collect();
+    let added_transaction_ids: Vec<UnminedTxId> =
+        added_transactions.iter().map(UnminedTx::id).collect();
 
     // Test `Request::MempoolTransactionIds`
     let response = inbound_service

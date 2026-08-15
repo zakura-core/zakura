@@ -264,7 +264,7 @@ impl Request {
     pub fn transaction(&self) -> Arc<Transaction> {
         match self {
             Request::Block { transaction, .. } => transaction.clone(),
-            Request::Mempool { transaction, .. } => transaction.transaction.clone(),
+            Request::Mempool { transaction, .. } => transaction.transaction().clone(),
         }
     }
 
@@ -281,7 +281,7 @@ impl Request {
         match self {
             // TODO: get the precalculated ID from the block verifier
             Request::Block { transaction, .. } => transaction.unmined_id(),
-            Request::Mempool { transaction, .. } => transaction.id,
+            Request::Mempool { transaction, .. } => transaction.id(),
         }
     }
 
@@ -291,7 +291,7 @@ impl Request {
             Request::Block {
                 transaction_hash, ..
             } => *transaction_hash,
-            Request::Mempool { transaction, .. } => transaction.id.mined_id(),
+            Request::Mempool { transaction, .. } => transaction.id().mined_id(),
         }
     }
 
@@ -360,7 +360,7 @@ impl Response {
     pub fn tx_id(&self) -> UnminedTxId {
         match self {
             Response::Block { tx_id, .. } => *tx_id,
-            Response::Mempool { transaction, .. } => transaction.transaction.id,
+            Response::Mempool { transaction, .. } => transaction.transaction.id(),
         }
     }
 
@@ -565,7 +565,7 @@ where
                 let fee = Self::miner_fee(tx.as_ref(), &spent_utxos)?;
                 let unpaid_actions = transaction::zip317::unpaid_actions(unmined_tx, fee);
 
-                transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size)?;
+                transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size())?;
                 miner_fee = Some(fee);
             }
 

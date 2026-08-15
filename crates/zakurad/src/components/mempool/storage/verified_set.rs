@@ -174,12 +174,12 @@ impl VerifiedSet {
             }
         }
 
-        let tx_id = transaction.transaction.id.mined_id();
+        let tx_id = transaction.transaction.id().mined_id();
         self.transaction_dependencies
             .add(tx_id, spent_mempool_outpoints);
 
         // Inserts the transaction's outputs into the internal caches and responds to pending output requests.
-        let tx = &transaction.transaction.transaction;
+        let tx = &transaction.transaction.transaction();
         for (index, output) in tx.outputs().iter().cloned().enumerate() {
             let outpoint = transparent::OutPoint::from_usize(tx_id, index);
             self.created_outputs.insert(outpoint, output.clone());
@@ -191,7 +191,7 @@ impl VerifiedSet {
         self.orchard_nullifiers.extend(tx.orchard_nullifiers());
         self.ironwood_nullifiers.extend(tx.ironwood_nullifiers());
 
-        self.transactions_serialized_size += transaction.transaction.size;
+        self.transactions_serialized_size += transaction.transaction.size();
         self.total_cost += transaction.cost();
         transaction.time = Some(chrono::Utc::now());
         transaction.height = height;
@@ -278,7 +278,7 @@ impl VerifiedSet {
             removed_transactions.extend(
                 self.remove(&key_to_remove)
                     .into_iter()
-                    .map(|tx| tx.transaction.id),
+                    .map(|tx| tx.transaction.id()),
             );
         }
 
@@ -306,7 +306,7 @@ impl VerifiedSet {
                     return None;
                 };
 
-                self.transactions_serialized_size -= removed_tx.transaction.size;
+                self.transactions_serialized_size -= removed_tx.transaction.size();
                 self.total_cost -= removed_tx.cost();
                 self.metrics.remove_transaction(&removed_tx);
                 self.remove_outputs(&removed_tx.transaction);
@@ -325,7 +325,7 @@ impl VerifiedSet {
     /// Two transactions have a spend conflict if they spend the same UTXO or if they reveal the
     /// same nullifier.
     fn has_spend_conflicts(&self, unmined_tx: &UnminedTx) -> bool {
-        let tx = &unmined_tx.transaction;
+        let tx = unmined_tx.transaction();
 
         Self::has_conflicts(&self.spent_outpoints, tx.spent_outpoints())
             || Self::has_conflicts(&self.sprout_nullifiers, tx.sprout_nullifiers().copied())
@@ -336,12 +336,12 @@ impl VerifiedSet {
 
     /// Removes the tracked transaction outputs from the mempool.
     fn remove_outputs(&mut self, unmined_tx: &UnminedTx) {
-        let tx = &unmined_tx.transaction;
+        let tx = unmined_tx.transaction();
 
         for index in 0..tx.outputs().len() {
             self.created_outputs
                 .remove(&transparent::OutPoint::from_usize(
-                    unmined_tx.id.mined_id(),
+                    unmined_tx.id().mined_id(),
                     index,
                 ));
         }
@@ -472,7 +472,7 @@ impl MempoolMetrics {
             transaction.fee_weight_ratio,
             transaction.conventional_actions,
             transaction.unpaid_actions,
-            transaction.transaction.size,
+            transaction.transaction.size(),
         )
     }
 

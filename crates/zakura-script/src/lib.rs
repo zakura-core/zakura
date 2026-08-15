@@ -319,7 +319,7 @@ impl Sigops for zakura_chain::transaction::Transaction {
 
 impl Sigops for zakura_chain::transaction::UnminedTx {
     fn scripts(&self) -> impl Iterator<Item = Vec<u8>> {
-        self.transaction.scripts()
+        self.transaction().scripts()
     }
 }
 

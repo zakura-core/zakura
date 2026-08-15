@@ -23,7 +23,7 @@ use zakura_chain::{
         NetworkKind, POST_BLOSSOM_POW_TARGET_SPACING,
     },
     serialization::{DateTime32, ZcashDeserializeInto, ZcashSerialize},
-    transaction::{zip317, UnminedTxId, VerifiedUnminedTx},
+    transaction::{zip317, VerifiedUnminedTx},
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty, U256},
 };
 use zakura_consensus::MAX_BLOCK_SIGOPS;
@@ -2083,12 +2083,7 @@ async fn rpc_getrawtransaction() {
                     }
                 })
                 .map(|responder| {
-                    responder.respond(mempool::Response::Transactions(vec![UnminedTx {
-                        id: UnminedTxId::Legacy(tx.hash()),
-                        transaction: tx.clone(),
-                        size: 0,
-                        conventional_fee: Amount::zero(),
-                    }]));
+                    responder.respond(mempool::Response::Transactions(vec![tx.clone().into()]));
                 });
 
             let rpc_req = rpc.get_raw_transaction(tx.hash().encode_hex(), Some(0u8), None);
@@ -3325,14 +3320,9 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
         lock_time: transaction::LockTime::unlocked(),
     });
 
-    let unmined_tx = UnminedTx {
-        transaction: tx.clone(),
-        id: tx.unmined_id(),
-        size: tx.zcash_serialized_size(),
-        conventional_fee: 0.try_into().unwrap(),
-    };
+    let unmined_tx: UnminedTx = tx.clone().into();
 
-    let conventional_actions = zip317::conventional_actions(&unmined_tx.transaction);
+    let conventional_actions = zip317::conventional_actions(unmined_tx.transaction());
 
     let verified_unmined_tx = VerifiedUnminedTx {
         transaction: unmined_tx,

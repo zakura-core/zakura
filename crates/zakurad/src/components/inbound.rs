@@ -672,7 +672,8 @@ impl Service<zn::Request> for Inbound {
                     };
 
                     // Work out which transaction IDs were missing.
-                    let available_tx_ids: HashSet<UnminedTxId> = transactions.iter().map(|tx| tx.id).collect();
+                    let available_tx_ids: HashSet<UnminedTxId> =
+                        transactions.iter().map(|tx| tx.id()).collect();
                     // We don't need to limit the size of the missing transaction IDs list,
                     // because it is already limited to the size of the getdata request
                     // sent by the peer. (Their content and encodings are the same.)
@@ -687,7 +688,7 @@ impl Service<zn::Request> for Inbound {
                         // (but only one at a time)
                         let within_limit = total_size < GETDATA_SENT_BYTES_LIMIT;
 
-                        total_size += tx.size;
+                        total_size += tx.size();
 
                         within_limit
                     }).map(|tx| Available((tx, None)));

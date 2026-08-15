@@ -259,14 +259,14 @@ proptest! {
                 let (expected_response, mempool_query) = {
                     let transactions_by_id = transactions
                         .iter()
-                        .map(|unmined_tx| (unmined_tx.transaction.id.mined_id(), unmined_tx))
+                        .map(|unmined_tx| (unmined_tx.transaction.id().mined_id(), unmined_tx))
                         .collect::<HashMap<_, _>>();
                     let transaction_dependencies = Default::default();
                     let txs = transactions
                         .iter()
                         .map(|unmined_tx| {
                             (
-                                unmined_tx.transaction.id.mined_id().encode_hex(),
+                                unmined_tx.transaction.id().mined_id().encode_hex(),
                                 MempoolObject::from_verified_unmined_tx(
                                     unmined_tx,
                                     &transactions_by_id,
@@ -292,14 +292,14 @@ proptest! {
                 let (expected_rsp, mempool_query) = {
                     let mut tx_ids = transactions
                         .iter()
-                        .map(|tx| tx.transaction.id.mined_id().encode_hex::<String>())
+                        .map(|tx| tx.transaction.id().mined_id().encode_hex::<String>())
                         .collect::<Vec<_>>();
 
                     tx_ids.sort();
 
                     let mempool_rsp = transactions
                         .iter()
-                        .map(|tx| tx.transaction.id)
+                        .map(|tx| tx.transaction.id())
                         .collect::<HashSet<_>>();
 
                     let mempool_query = mempool.expect_request(mempool::Request::TransactionIds)
@@ -841,7 +841,7 @@ proptest! {
 
             // the runner will made a new call to TransactionsById
             let mut transactions_hash_set = HashSet::new();
-            transactions_hash_set.insert(tx_unmined.id);
+            transactions_hash_set.insert(tx_unmined.id());
             let expected_request = mempool::Request::TransactionsById(transactions_hash_set);
             let response = mempool::Response::Transactions(vec![]);
 
@@ -907,7 +907,7 @@ proptest! {
                 let expected_request = mempool::Request::Queue(vec![tx_unmined.clone().into()]);
 
                 // insert to hs we will use later
-                transactions_hash_set.insert(tx_unmined.id);
+                transactions_hash_set.insert(tx_unmined.id());
 
                 // fail the mempool insertion
                 mempool

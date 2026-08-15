@@ -9,14 +9,51 @@ use zakura_chain::{
     amount::Amount,
     block::{Height, MAX_BLOCK_BYTES},
     parameters::Network,
+    serialization::ZcashSerialize,
     transaction,
-    transparent::OutPoint,
+    transparent::{OutPoint, Output, Script},
 };
 use zakura_node_services::mempool::TransactionDependencies;
 
 use crate::methods::types::{get_block_template::MinerParams, transaction::TransactionTemplate};
 
 use super::{block_template_overhead_bytes, max_coinbase_bytes, select_mempool_transactions};
+
+/// Replaces `transaction`'s inner transaction with one that has exactly
+/// `target_size` serialized bytes.
+fn with_serialized_size(
+    mut transaction: transaction::VerifiedUnminedTx,
+    target_size: usize,
+) -> transaction::VerifiedUnminedTx {
+    let mut inner = transaction.transaction.transaction().as_ref().clone();
+    inner
+        .outputs_mut()
+        .push(Output::new(Amount::zero(), Script::new(&[])));
+
+    let base_size = inner.zcash_serialized_size();
+    let mut script_size = target_size
+        .checked_sub(base_size)
+        .expect("the target size is larger than the test transaction");
+
+    loop {
+        inner
+            .outputs_mut()
+            .last_mut()
+            .expect("the test added an output")
+            .lock_script = Script::new(&vec![0; script_size]);
+
+        let actual_size = inner.zcash_serialized_size();
+        match actual_size.cmp(&target_size) {
+            std::cmp::Ordering::Less => script_size += target_size - actual_size,
+            std::cmp::Ordering::Greater => script_size -= actual_size - target_size,
+            std::cmp::Ordering::Equal => break,
+        }
+    }
+
+    transaction.transaction = inner.into();
+    assert_eq!(transaction.transaction.size(), target_size);
+    transaction
+}
 
 #[test]
 fn reserves_network_specific_header_and_transaction_count_sizes() {
@@ -45,11 +82,11 @@ fn reserves_serialized_block_and_pool_tag_overhead() {
         - max_coinbase_bytes(&fake_coinbase);
 
     let template_transactions = |transaction_size| {
-        let mut transaction = network
+        let transaction = network
             .unmined_transactions_in_blocks(..)
             .next()
             .expect("test network has an unmined transaction");
-        transaction.transaction.size = transaction_size;
+        let transaction = with_serialized_size(transaction, transaction_size);
 
         select_mempool_transactions(
             &network,
@@ -82,7 +119,7 @@ fn excludes_tx_with_unselected_dependencies() {
         .expect("should not be empty");
 
     mempool_tx_deps.add(
-        unmined_tx.transaction.id.mined_id(),
+        unmined_tx.transaction.id().mined_id(),
         vec![OutPoint::from_usize(transaction::Hash([0; 32]), 0)],
     );
 
@@ -110,16 +147,16 @@ fn includes_tx_with_selected_dependencies() {
         .get(2)
         .expect("should have 3 txns")
         .transaction
-        .id
+        .id()
         .mined_id();
 
     let mut mempool_tx_deps = TransactionDependencies::default();
     mempool_tx_deps.add(
-        dependent_tx1.transaction.id.mined_id(),
+        dependent_tx1.transaction.id().mined_id(),
         vec![OutPoint::from_usize(independent_tx_id, 0)],
     );
     mempool_tx_deps.add(
-        dependent_tx2.transaction.id.mined_id(),
+        dependent_tx2.transaction.id().mined_id(),
         vec![
             OutPoint::from_usize(independent_tx_id, 0),
             OutPoint::from_usize(transaction::Hash([0; 32]), 0),
@@ -143,7 +180,7 @@ fn includes_tx_with_selected_dependencies() {
     let selected_tx_by_id = |id| {
         selected_txs
             .iter()
-            .find(|(_, tx)| tx.transaction.id.mined_id() == id)
+            .find(|(_, tx)| tx.transaction.id().mined_id() == id)
     };
 
     let (dependency_depth, _) =
@@ -154,7 +191,7 @@ fn includes_tx_with_selected_dependencies() {
         "should return a dependency depth of 0 for the independent tx"
     );
 
-    let (dependency_depth, _) = selected_tx_by_id(dependent_tx1.transaction.id.mined_id())
+    let (dependency_depth, _) = selected_tx_by_id(dependent_tx1.transaction.id().mined_id())
         .expect("should select dependent_tx1");
 
     assert_eq!(

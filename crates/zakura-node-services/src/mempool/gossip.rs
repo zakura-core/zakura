@@ -17,7 +17,7 @@ impl Gossip {
     pub fn id(&self) -> UnminedTxId {
         match self {
             Gossip::Id(txid) => *txid,
-            Gossip::Tx(tx) => tx.id,
+            Gossip::Tx(tx) => tx.id(),
         }
     }
 

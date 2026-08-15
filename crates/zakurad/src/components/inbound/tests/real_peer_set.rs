@@ -806,7 +806,7 @@ async fn outbound_tx_partial_response_notfound() -> Result<(), crate::BoxError> 
 
     let missing_tx_id = UnminedTxId::from_legacy_id(TxHash([0x22; 32]));
 
-    let txs = [missing_tx_id, repeated_tx.id];
+    let txs = [missing_tx_id, repeated_tx.id()];
 
     // Send a request via the peer set, via a local TCP connection,
     // to the isolated peer's `repeated_response` inbound service

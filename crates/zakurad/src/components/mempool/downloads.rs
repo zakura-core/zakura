@@ -274,7 +274,7 @@ where
             let result = join_result.expect("transaction download and verify tasks must not panic");
             let (result, completed_txid) = match result {
                 Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))) => {
-                    let hash = tx.transaction.id;
+                    let hash = tx.transaction.id();
                     (
                         Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))),
                         Some(hash),
@@ -492,7 +492,7 @@ where
 
                     metrics::counter!(
                         "mempool.downloaded.transactions.total",
-                        "version" => format!("{}",tx.transaction.version()),
+                        "version" => format!("{}",tx.transaction().version()),
                     ).increment(1);
                     Self::check_transaction_size(&tx, max_transaction_bytes)?;
                     (tx, advertiser_addr)
@@ -500,7 +500,7 @@ where
                 Gossip::Tx(tx) => {
                     metrics::counter!(
                         "mempool.pushed.transactions.total",
-                        "version" => format!("{}",tx.transaction.version()),
+                        "version" => format!("{}",tx.transaction().version()),
                     ).increment(1);
                     (tx, pushed_advertiser_addr)
                 }
@@ -530,7 +530,7 @@ where
         .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
             metrics::counter!(
                 "mempool.verified.transactions.total",
-                "version" => format!("{}", tx.transaction.transaction.version()),
+                "version" => format!("{}", tx.transaction.transaction().version()),
             ).increment(1);
             (tx, spent_mempool_outpoints, tip_height)
         })
@@ -683,11 +683,11 @@ where
         max_transaction_bytes: u64,
     ) -> Result<(), TransactionDownloadVerifyError> {
         if usize::try_from(max_transaction_bytes)
-            .is_ok_and(|max_transaction_bytes| transaction.size > max_transaction_bytes)
+            .is_ok_and(|max_transaction_bytes| transaction.size() > max_transaction_bytes)
         {
             return Err(TransactionDownloadVerifyError::PolicyRejected(
                 NonStandardTransactionError::TransactionTooLarge {
-                    actual_bytes: transaction.size,
+                    actual_bytes: transaction.size(),
                     max_bytes: max_transaction_bytes,
                 },
             ));
@@ -932,7 +932,7 @@ mod tests {
     #[tokio::test]
     async fn pushed_transaction_at_size_limit_is_verified() {
         let transaction = empty_v5_transaction(1);
-        let max_transaction_bytes = u64::try_from(transaction.size)
+        let max_transaction_bytes = u64::try_from(transaction.size())
             .expect("serialized transaction sizes fit in u64 on supported platforms");
         let verifier_calls = Arc::new(AtomicUsize::new(0));
         let verifier_calls_for_service = verifier_calls.clone();
@@ -948,7 +948,7 @@ mod tests {
                     let tx::Request::Mempool { transaction, .. } = request else {
                         panic!("unexpected transaction verifier request: {request:?}");
                     };
-                    let miner_fee = transaction.conventional_fee;
+                    let miner_fee = transaction.conventional_fee();
                     let transaction =
                         VerifiedUnminedTx::new(transaction, miner_fee, 0, 0, Arc::new(Vec::new()))
                             .expect("test transaction pays its conventional fee");
@@ -987,7 +987,7 @@ mod tests {
     #[tokio::test]
     async fn pushed_transaction_over_size_limit_skips_state_and_verifier() {
         let transaction = empty_v5_transaction(1);
-        let actual_bytes = transaction.size;
+        let actual_bytes = transaction.size();
         let max_bytes = u64::try_from(
             actual_bytes
                 .checked_sub(1)
@@ -1067,8 +1067,8 @@ mod tests {
     #[tokio::test]
     async fn downloaded_transaction_over_size_limit_skips_verifier() {
         let transaction = empty_v5_transaction(1);
-        let txid = transaction.id;
-        let actual_bytes = transaction.size;
+        let txid = transaction.id();
+        let actual_bytes = transaction.size();
         let max_bytes = u64::try_from(
             actual_bytes
                 .checked_sub(1)

@@ -202,7 +202,7 @@ impl Handler {
                 //   - the transaction messages are sent in a single continuous batch
                 //   - missing transactions are silently skipped
                 //     (there is no `notfound` message at the end of the batch)
-                if pending_ids.remove(&transaction.id) {
+                if pending_ids.remove(&transaction.id()) {
                     // we are in the middle of the continuous transaction messages
                     transactions.push(transaction);
                 } else {

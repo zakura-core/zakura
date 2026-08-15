@@ -365,7 +365,7 @@ impl LegacyRequestFrame {
             Self::PushTransaction(transaction) => Ok(Frame {
                 message_type: MSG_REQUEST_PUSH_TRANSACTION,
                 flags: 0,
-                payload: transaction.transaction.zcash_serialize_to_vec()?,
+                payload: transaction.transaction().zcash_serialize_to_vec()?,
             }),
         }
     }
@@ -548,7 +548,7 @@ impl LegacyResponseCodec {
                                 request_id,
                                 max_frame_bytes,
                                 max_message_bytes,
-                                transaction.transaction.zcash_serialize_to_vec()?,
+                                transaction.transaction().zcash_serialize_to_vec()?,
                             )?;
                         }
                         InventoryResponse::Missing(id) => missing.push(id),
@@ -3234,7 +3234,7 @@ mod tests {
                     Response::Transactions(
                         ids.into_iter()
                             .map(|id| {
-                                if id == self.transaction.id {
+                                if id == self.transaction.id() {
                                     InventoryResponse::Available((self.transaction.clone(), None))
                                 } else {
                                     InventoryResponse::Missing(id)
@@ -3410,7 +3410,7 @@ mod tests {
                     Response::Transactions(
                         ids.into_iter()
                             .map(|id| match &self.transaction {
-                                Some(transaction) if id == transaction.id => {
+                                Some(transaction) if id == transaction.id() => {
                                     InventoryResponse::Available((transaction.clone(), None))
                                 }
                                 _ => InventoryResponse::Missing(id),
@@ -3458,7 +3458,7 @@ mod tests {
                 Request::FindBlocks { .. } => Response::BlockHashes(vec![self.block.hash()]),
                 Request::FindHeaders { .. } => Response::BlockHeaders(vec![self.header()]),
                 Request::MempoolTransactionIds => {
-                    Response::TransactionIds(vec![self.transaction.id])
+                    Response::TransactionIds(vec![self.transaction.id()])
                 }
                 Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
                     Response::Blocks(
@@ -3475,7 +3475,7 @@ mod tests {
                     )
                 }
                 Request::PushTransaction(transaction, _) => {
-                    if let Err(error) = self.pushed_tx.send(transaction.id) {
+                    if let Err(error) = self.pushed_tx.send(transaction.id()) {
                         return std::future::ready(Err(Box::new(error)));
                     }
                     Response::Nil
@@ -3890,7 +3890,7 @@ mod tests {
     async fn request_adapter_fetches_available_and_missing_transactions() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let transaction = UnminedTx::from(empty_v5_transaction(2));
-        let available_id = transaction.id;
+        let available_id = transaction.id();
         let missing_id = witnessed_tx_id(99);
         let node_a = inventory_node(63, transaction.clone()).await?;
         let node_b = ZakuraTestNode::builder(64).spawn().await?;
@@ -3911,7 +3911,7 @@ mod tests {
         assert!(transactions.iter().any(|response| {
             matches!(
                 response,
-                InventoryResponse::Available((tx, None)) if tx.id == transaction.id
+                InventoryResponse::Available((tx, None)) if tx.id() == transaction.id()
             )
         }));
         assert!(transactions.iter().any(
@@ -4105,7 +4105,7 @@ mod tests {
         )?);
         let transaction = UnminedTx::from(empty_v5_transaction(5));
         let pushed_transaction = UnminedTx::from(empty_v5_transaction(6));
-        let pushed_id = pushed_transaction.id;
+        let pushed_id = pushed_transaction.id();
         let (node_a, mut pushed_rx) = normal_network_node(83, block, transaction.clone()).await?;
         let node_b = ZakuraTestNode::builder(84).spawn().await?;
         node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
@@ -4118,7 +4118,7 @@ mod tests {
                 Some(PeerSource::Zakura(a_peer_id.clone())),
             )
             .await?;
-        assert_eq!(mempool, Response::TransactionIds(vec![transaction.id]));
+        assert_eq!(mempool, Response::TransactionIds(vec![transaction.id()]));
 
         let ping = adapter
             .request_from_source(
@@ -4250,7 +4250,7 @@ mod tests {
     ) -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let transaction = UnminedTx::from(empty_v5_transaction(3));
-        let txid = transaction.id;
+        let txid = transaction.id();
         let (advertiser, mut advertiser_rx) = recording_inventory_node(65, None).await?;
         let (fallback, mut fallback_rx) =
             recording_inventory_node(66, Some(transaction.clone())).await?;
@@ -4294,7 +4294,7 @@ mod tests {
         };
         assert!(matches!(
             transactions.as_slice(),
-            [InventoryResponse::Available((tx, None))] if tx.id == transaction.id
+            [InventoryResponse::Available((tx, None))] if tx.id() == transaction.id()
         ));
 
         advertiser.shutdown().await;
@@ -5878,7 +5878,7 @@ mod tests {
                         StubInventory::Available(tx) => Response::Transactions(
                             ids.into_iter()
                                 .map(|id| {
-                                    if id == tx.id {
+                                    if id == tx.id() {
                                         InventoryResponse::Available((tx.clone(), None))
                                     } else {
                                         InventoryResponse::Missing(id)
@@ -5969,7 +5969,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::TransactionsById(HashSet::from([transaction.id])))
+            .call(Request::TransactionsById(HashSet::from([transaction.id()])))
             .await?;
         match response {
             Response::Transactions(items) => {
@@ -6005,7 +6005,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::TransactionsById(HashSet::from([transaction.id])))
+            .call(Request::TransactionsById(HashSet::from([transaction.id()])))
             .await?;
         match response {
             Response::Transactions(items) => {
@@ -6042,7 +6042,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::TransactionsById(HashSet::from([transaction.id])))
+            .call(Request::TransactionsById(HashSet::from([transaction.id()])))
             .await?;
         match response {
             Response::Transactions(items) => {
@@ -6119,7 +6119,7 @@ mod tests {
             .call(Request::MempoolTransactionIds)
             .await?;
         assert!(
-            matches!(mempool_ids, Response::TransactionIds(ref ids) if *ids == vec![transaction.id]),
+            matches!(mempool_ids, Response::TransactionIds(ref ids) if *ids == vec![transaction.id()]),
             "MempoolTransactionIds should be served over Zakura, got {mempool_ids:?}",
         );
 
@@ -6132,7 +6132,7 @@ mod tests {
             .recv()
             .await
             .expect("transaction pushed over Zakura");
-        assert_eq!(pushed, transaction.id);
+        assert_eq!(pushed, transaction.id());
 
         // None of these requests consulted the legacy peer set.
         assert!(

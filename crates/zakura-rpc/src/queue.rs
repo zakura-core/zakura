@@ -84,8 +84,10 @@ impl Queue {
 
     /// Insert a transaction to the queue.
     pub fn insert(&mut self, unmined_tx: UnminedTx) {
-        self.transactions
-            .insert(unmined_tx.id, (unmined_tx.transaction, Instant::now()));
+        let id = unmined_tx.id();
+        let transaction = unmined_tx.into_transaction();
+
+        self.transactions.insert(id, (transaction, Instant::now()));
 
         // remove if queue is over capacity
         if self.transactions.len() > CHANNEL_AND_QUEUE_CAPACITY {
@@ -262,7 +264,7 @@ impl Runner {
             let mempool_response = mempool.oneshot(request).await;
             if let Ok(Response::Transactions(txs)) = mempool_response {
                 for tx in txs {
-                    response.insert(tx.id);
+                    response.insert(tx.id());
                 }
             }
         }
@@ -321,7 +323,7 @@ impl Runner {
 
             // return what we retried but don't delete from the queue,
             // we might retry again in a next call.
-            retried.insert(unmined.id);
+            retried.insert(unmined.id());
         }
         retried
     }

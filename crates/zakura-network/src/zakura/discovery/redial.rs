@@ -1,11 +1,16 @@
 //! Supervised native Zakura dialing and redial policy.
 
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use iroh::NodeAddr;
 use tokio::time::Instant;
 
-use crate::zakura::{ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId};
+use crate::zakura::{PendingUpgrade, ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId};
 
 /// A connection that served at least this long is treated as healthy, so the
 /// next re-dial after it drops starts from the initial (fast) backoff again
@@ -91,6 +96,28 @@ pub(crate) async fn native_dial_supervised(
     limits: ZakuraLocalLimits,
     policy: RedialPolicy,
 ) {
+    native_dial_supervised_inner(endpoint, node_addr, limits, policy, None).await;
+}
+
+/// Maintain a dial whose first successful control handshake must match a
+/// legacy upgrade transcript.
+pub(crate) async fn native_upgrade_dial_supervised(
+    endpoint: ZakuraEndpoint,
+    node_addr: NodeAddr,
+    limits: ZakuraLocalLimits,
+    policy: RedialPolicy,
+    pending: PendingUpgrade,
+) {
+    native_dial_supervised_inner(endpoint, node_addr, limits, policy, Some(pending)).await;
+}
+
+async fn native_dial_supervised_inner(
+    endpoint: ZakuraEndpoint,
+    node_addr: NodeAddr,
+    limits: ZakuraLocalLimits,
+    policy: RedialPolicy,
+    pending: Option<PendingUpgrade>,
+) {
     let Ok(peer_id) = ZakuraPeerId::new(node_addr.node_id.as_bytes().to_vec()) else {
         tracing::warn!(?node_addr, "invalid Zakura bootstrap node id; not dialing");
         return;
@@ -98,13 +125,33 @@ pub(crate) async fn native_dial_supervised(
 
     let shutdown = endpoint.background_shutdown_token();
     let registered = endpoint.supervisor().subscribe();
+    let pending = Arc::new(Mutex::new(pending));
     let supervised = run_dial_supervisor(peer_id, registered, policy, move || {
         let endpoint = endpoint.clone();
         let node_addr = node_addr.clone();
         let limits = limits.clone();
+        let pending_state = pending.clone();
+        let pending = pending_state
+            .lock()
+            .expect("pending upgrade mutex is never poisoned")
+            .clone();
         Box::pin(async move {
             let started = Instant::now();
-            match super::dialer::native_bootstrap_dial(&endpoint, node_addr, &limits).await {
+            let result = if let Some(pending) = pending {
+                crate::zakura::handler::serve_upgrade_dial_connection(
+                    &endpoint, node_addr, &limits, pending,
+                )
+                .await
+            } else {
+                super::dialer::native_bootstrap_dial(&endpoint, node_addr, &limits).await
+            };
+            if result.is_ok() {
+                pending_state
+                    .lock()
+                    .expect("pending upgrade mutex is never poisoned")
+                    .take();
+            }
+            match result {
                 Ok(()) if started.elapsed() >= ZAKURA_REDIAL_HEALTHY_CONNECTION => {
                     DialResult::Healthy
                 }

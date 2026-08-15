@@ -46,6 +46,28 @@ fn peer_addr(port: u16) -> PeerSocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port)).into()
 }
 
+fn upgrade_connection_info(nonces: ZakuraLegacyNonces) -> ConnectionInfo {
+    let addr = peer_addr(18233);
+    let version = |nonce| VersionMessage {
+        version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        services: PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2,
+        timestamp: Utc::now(),
+        address_recv: AddrInVersion::new(addr, PeerServices::NODE_NETWORK),
+        address_from: AddrInVersion::new(addr, PeerServices::NODE_NETWORK),
+        nonce,
+        user_agent: "/Zebra:test/".to_string(),
+        start_height: block::Height(0),
+        relay: true,
+    };
+    ConnectionInfo {
+        connected_addr: ConnectedAddr::new_outbound_direct(addr),
+        local: version(nonces.local_zebra_nonce),
+        remote: version(nonces.remote_zebra_nonce),
+        negotiated_version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        is_protected_peer: false,
+    }
+}
+
 #[test]
 fn connected_addr_labels_require_explicit_opt_in() {
     let peer = ConnectedAddr::new_outbound_direct(
@@ -368,6 +390,7 @@ async fn responder_upgrade_keeps_legacy_when_native_dial_never_registers() {
         local_zebra_nonce: Nonce(0x1111_1111_1111_1111),
         remote_zebra_nonce: Nonce(0x2222_2222_2222_2222),
     };
+    let connection_info = upgrade_connection_info(nonces);
 
     // The responder advertises its own live Zakura hints in the `Accept`.
     let (local_node_id, local_direct_addresses) = connector
@@ -439,7 +462,7 @@ async fn responder_upgrade_keeps_legacy_when_native_dial_never_registers() {
         &mut responder_conn,
         &connector,
         &config,
-        nonces,
+        &connection_info,
         local_node_id,
         local_direct_addresses,
         ResponderRegistrationWait::TestTimeout(std::time::Duration::from_millis(50)),
@@ -485,6 +508,7 @@ async fn responder_upgrade_disconnects_on_malformed_prelude() {
         local_zebra_nonce: Nonce(0x1111_1111_1111_1111),
         remote_zebra_nonce: Nonce(0x2222_2222_2222_2222),
     };
+    let connection_info = upgrade_connection_info(nonces);
     // The malformed-prelude branch returns before any endpoint use, so a
     // connector without a live endpoint is enough to exercise the responder
     // path.
@@ -512,7 +536,7 @@ async fn responder_upgrade_disconnects_on_malformed_prelude() {
         &mut responder_conn,
         &connector,
         &config,
-        nonces,
+        &connection_info,
         vec![1u8; 32],
         vec![b"127.0.0.1:1".to_vec()],
         ResponderRegistrationWait::Production,
@@ -575,6 +599,7 @@ async fn initiator_upgrade_disconnects_on_malformed_prelude() {
         local_zebra_nonce: Nonce(0x3333_3333_3333_3333),
         remote_zebra_nonce: Nonce(0x4444_4444_4444_4444),
     };
+    let connection_info = upgrade_connection_info(nonces);
     let connector = crate::zakura::ZakuraHandshakeConnector::unavailable();
 
     let (initiator_stream, peer_stream) = duplex(16 * 1024);
@@ -608,7 +633,7 @@ async fn initiator_upgrade_disconnects_on_malformed_prelude() {
         &mut initiator_conn,
         &connector,
         &config,
-        nonces,
+        &connection_info,
         vec![1u8; 32],
         vec![b"127.0.0.1:1".to_vec()],
     );

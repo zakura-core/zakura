@@ -50,11 +50,15 @@ use crate::{
     },
     types::MetaAddr,
     zakura::{
+        legacy_upgrade_transcript, PendingUpgrade, ZakuraHandshakeConnector,
+        ZakuraRegistrationWait, ZakuraRejectReason, ZakuraUpgradeOutcome,
+        ZakuraUpgradeRegistration,
+    },
+    zakura::{
         P2pV2Upgrade, P2pV2UpgradeAccept, P2pV2UpgradeInit, P2pV2UpgradeReject,
         ZakuraHandshakeConfig, ZakuraLegacyNonces, ZakuraPeerId, ZakuraProtocolError,
         P2P_V2_UPGRADE_COMMAND, PRELUDE_MAGIC,
     },
-    zakura::{ZakuraHandshakeConnector, ZakuraRejectReason, ZakuraUpgradeOutcome},
     BoxError, Config, PeerSocketAddr, VersionMessage,
 };
 
@@ -1053,11 +1057,6 @@ where
         &node_config.network,
         node_config.zakura.dev_network.as_deref(),
     );
-    let nonces = ZakuraLegacyNonces {
-        local_zebra_nonce: connection_info.local.nonce,
-        remote_zebra_nonce: connection_info.remote.nonce,
-    };
-
     // The side that opened the legacy TCP connection initiates the prelude and
     // dials over QUIC; the accepting side responds and is dialed.
     let outcome = if connected_addr.is_inbound() {
@@ -1065,7 +1064,7 @@ where
             peer_conn,
             &connector,
             &upgrade_config,
-            nonces,
+            connection_info,
             local_node_id,
             local_direct_addresses,
             ResponderRegistrationWait::Production,
@@ -1076,7 +1075,7 @@ where
             peer_conn,
             &connector,
             &upgrade_config,
-            nonces,
+            connection_info,
             local_node_id,
             local_direct_addresses,
         )
@@ -1188,13 +1187,17 @@ async fn run_initiator_upgrade<PeerTransport>(
     peer_conn: &mut Framed<PeerTransport, Codec>,
     connector: &ZakuraHandshakeConnector,
     config: &ZakuraHandshakeConfig,
-    nonces: ZakuraLegacyNonces,
+    connection_info: &ConnectionInfo,
     local_node_id: Vec<u8>,
     local_direct_addresses: Vec<Vec<u8>>,
 ) -> Result<ZakuraUpgradeOutcome, HandshakeError>
 where
     PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let nonces = ZakuraLegacyNonces {
+        local_zebra_nonce: connection_info.local.nonce,
+        remote_zebra_nonce: connection_info.remote.nonce,
+    };
     let mut upgrade_nonce = [0u8; 32];
     OsRng.fill_bytes(&mut upgrade_nonce);
 
@@ -1236,22 +1239,38 @@ where
     let Ok(peer_id) = ZakuraPeerId::new(accept.iroh_node_id.clone()) else {
         return Ok(neutral_upgrade_fallback());
     };
+    let Ok(transcript) = legacy_upgrade_transcript(
+        &connection_info.local,
+        &connection_info.remote,
+        &init,
+        &accept,
+    ) else {
+        return Ok(neutral_upgrade_fallback());
+    };
+    let pending = PendingUpgrade::new(
+        peer_id.clone(),
+        accept.selected_zakura_protocol,
+        init.upgrade_nonce,
+        accept.responder_upgrade_nonce,
+        transcript,
+    );
 
     // Dial the responder's Zakura endpoint over QUIC and wait for the local
     // supervisor to register a usable outbound handle before dropping the
     // legacy connection.
-    if !connector
+    match connector
         .spawn_zakura_dial_to_hints_and_wait(
             &peer_id,
             &accept.iroh_node_id,
             &accept.iroh_direct_addresses,
+            pending,
         )
         .await
     {
-        return Ok(neutral_upgrade_fallback());
+        ZakuraUpgradeRegistration::Fresh { .. } => Ok(ZakuraUpgradeOutcome::Upgraded { peer_id }),
+        ZakuraUpgradeRegistration::Duplicate => Ok(ZakuraUpgradeOutcome::Duplicate { peer_id }),
+        ZakuraUpgradeRegistration::Unavailable => Ok(neutral_upgrade_fallback()),
     }
-
-    Ok(ZakuraUpgradeOutcome::Upgraded { peer_id })
 }
 
 /// Selects the registration wait used by the responder upgrade path.
@@ -1262,15 +1281,13 @@ enum ResponderRegistrationWait {
 }
 
 impl ResponderRegistrationWait {
-    async fn wait(self, connector: &ZakuraHandshakeConnector, peer_id: &ZakuraPeerId) -> bool {
+    async fn wait(self, registration_wait: ZakuraRegistrationWait) -> bool {
         match self {
-            Self::Production => connector.wait_for_zakura_registration(peer_id).await,
+            Self::Production => registration_wait.wait().await.is_some(),
             #[cfg(test)]
-            Self::TestTimeout(timeout) => {
-                tokio::time::timeout(timeout, connector.wait_for_zakura_registration(peer_id))
-                    .await
-                    .unwrap_or(false)
-            }
+            Self::TestTimeout(timeout) => tokio::time::timeout(timeout, registration_wait.wait())
+                .await
+                .is_ok_and(|conn_id| conn_id.is_some()),
         }
     }
 }
@@ -1284,7 +1301,7 @@ async fn run_responder_upgrade<PeerTransport>(
     peer_conn: &mut Framed<PeerTransport, Codec>,
     connector: &ZakuraHandshakeConnector,
     config: &ZakuraHandshakeConfig,
-    nonces: ZakuraLegacyNonces,
+    connection_info: &ConnectionInfo,
     local_node_id: Vec<u8>,
     local_direct_addresses: Vec<Vec<u8>>,
     registration_wait: ResponderRegistrationWait,
@@ -1292,6 +1309,10 @@ async fn run_responder_upgrade<PeerTransport>(
 where
     PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let nonces = ZakuraLegacyNonces {
+        local_zebra_nonce: connection_info.local.nonce,
+        remote_zebra_nonce: connection_info.remote.nonce,
+    };
     // A well-formed unexpected variant or no prelude within the skip window: send
     // a neutral reject and keep legacy. A malformed prelude is not reached here;
     // `read_upgrade_prelude` disconnects on the first malformed upgrade message
@@ -1309,6 +1330,10 @@ where
         }
     };
 
+    let Ok(peer_id) = ZakuraPeerId::new(init.iroh_node_id.clone()) else {
+        send_upgrade_reject(peer_conn, config).await?;
+        return Ok(neutral_upgrade_fallback());
+    };
     let mut responder_upgrade_nonce = [0u8; 32];
     OsRng.fill_bytes(&mut responder_upgrade_nonce);
 
@@ -1330,14 +1355,42 @@ where
         max_open_streams: config.max_open_streams,
     };
 
-    let Ok(accept_bytes) = P2pV2Upgrade::Accept(accept).encode() else {
+    let Ok(transcript) = legacy_upgrade_transcript(
+        &connection_info.remote,
+        &connection_info.local,
+        &init,
+        &accept,
+    ) else {
+        send_upgrade_reject(peer_conn, config).await?;
         return Ok(neutral_upgrade_fallback());
     };
-    peer_conn.send(Message::P2pV2Upgrade(accept_bytes)).await?;
+    let pending = PendingUpgrade::new(
+        peer_id.clone(),
+        selected_zakura_protocol,
+        init.upgrade_nonce,
+        responder_upgrade_nonce,
+        transcript,
+    );
+    let Some(native_registration) = connector
+        .prepare_zakura_registration_wait(&peer_id, pending)
+        .await
+    else {
+        send_upgrade_reject(peer_conn, config).await?;
+        return Ok(neutral_upgrade_fallback());
+    };
 
-    let Ok(peer_id) = ZakuraPeerId::new(init.iroh_node_id.clone()) else {
+    let Ok(accept_bytes) = P2pV2Upgrade::Accept(accept).encode() else {
+        connector.cancel_pending_inbound_upgrade(&peer_id).await;
         return Ok(neutral_upgrade_fallback());
     };
+    if let Err(error) = peer_conn.send(Message::P2pV2Upgrade(accept_bytes)).await {
+        connector.cancel_pending_inbound_upgrade(&peer_id).await;
+        return Err(error.into());
+    }
+
+    if native_registration.is_duplicate() {
+        return Ok(ZakuraUpgradeOutcome::Duplicate { peer_id });
+    }
 
     // The peer dials our advertised Zakura endpoint over QUIC after receiving
     // `Accept`, and our iroh router registers that inbound connection
@@ -1347,7 +1400,8 @@ where
     // and then never completes the native dial would make us discard a working
     // legacy connection with no Zakura replacement. This mirrors the initiator's
     // `spawn_zakura_dial_to_hints_and_wait` hand-off wait.
-    if !registration_wait.wait(connector, &peer_id).await {
+    if !registration_wait.wait(native_registration).await {
+        connector.cancel_pending_inbound_upgrade(&peer_id).await;
         return Ok(neutral_upgrade_fallback());
     }
 

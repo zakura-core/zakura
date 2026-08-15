@@ -16,6 +16,6 @@ pub(crate) use candidate_dialer::{
 };
 pub(crate) use dialer::{parse_bootstrap_peer, spawn_native_bootstrap_dialer};
 pub use protocol::*;
-pub(crate) use redial::{native_dial_supervised, RedialPolicy};
+pub(crate) use redial::{native_dial_supervised, native_upgrade_dial_supervised, RedialPolicy};
 pub(crate) use runtime::{build_discovery_handle, default_advertised_services};
 pub use service::{DiscoveryPeerSession, DiscoveryService};

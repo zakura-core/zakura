@@ -55,16 +55,18 @@ use crate::{
         BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle, BlockSyncService, BlockSyncStartup,
         BoxRunFuture, Clock, CloseCause, Frame, FramedRecv, FramedSend, FullStateFrontiers,
         HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, OrderedSessionDemand,
-        OrderedStreamOpening, OrderedStreamPolicy, Peer, RealClock, Service, ServicePeerDirection,
-        ServiceRegistry, ServiceStream, SinkReject, Stream, StreamMode, StreamPrelude,
-        ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraControlAck,
-        ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig,
-        ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits,
-        ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
-        ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
-        FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
-        TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        OrderedStreamOpening, OrderedStreamPolicy, Peer, PendingUpgrade, PendingUpgradeRegistry,
+        RealClock, Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject,
+        Stream, StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
+        ZakuraConnId, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole,
+        ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
+        ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
+        ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRegistrationSnapshot, ZakuraRejectReason,
+        ZakuraUpgradeOutcome, ZakuraValidationError, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC,
+        CONTROL_VERSION, FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN,
+        STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC,
+        ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
@@ -530,7 +532,8 @@ pub struct ZakuraEndpoint {
     /// Maintained native dials started by the legacy->Zakura upgrade hand-off,
     /// keyed by the advertised peer id. The [`AbortHandle`] lets a failed
     /// hand-off cancel its maintain-forever dial instead of leaking it; see
-    /// [`Self::ensure_upgrade_native_dial`] and [`Self::cancel_upgrade_native_dial`].
+    /// [`Self::ensure_transcript_bound_upgrade_dial`] and
+    /// [`Self::cancel_upgrade_native_dial`].
     upgrade_dials: Arc<StdMutex<HashMap<ZakuraPeerId, AbortHandle>>>,
 }
 
@@ -711,7 +714,12 @@ impl ZakuraEndpoint {
     /// connection is still settling. Deduplicate those retries so repeated
     /// legacy upgrades do not create a swarm of independent maintained QUIC
     /// dial loops to the same peer.
-    pub(crate) fn ensure_upgrade_native_dial(&self, node_addr: NodeAddr) -> bool {
+    /// Ensure there is one maintained transcript-bound upgrade dial.
+    pub(crate) fn ensure_transcript_bound_upgrade_dial(
+        &self,
+        node_addr: NodeAddr,
+        pending: PendingUpgrade,
+    ) -> bool {
         let Ok(peer_id) = ZakuraPeerId::new(node_addr.node_id.as_bytes().to_vec()) else {
             return false;
         };
@@ -737,7 +745,14 @@ impl ZakuraEndpoint {
         );
         let task_peer_id = peer_id.clone();
         let dial = tokio::spawn(async move {
-            native_dial_supervised(endpoint.clone(), node_addr, limits, policy).await;
+            super::discovery::native_upgrade_dial_supervised(
+                endpoint.clone(),
+                node_addr,
+                limits,
+                policy,
+                pending,
+            )
+            .await;
             endpoint
                 .upgrade_dials
                 .lock()
@@ -746,6 +761,20 @@ impl ZakuraEndpoint {
         });
         upgrade_dials.insert(peer_id, dial.abort_handle());
         true
+    }
+
+    /// Register the exact legacy transcript expected on the next inbound QUIC
+    /// control handshake for this peer.
+    pub(crate) async fn insert_pending_inbound_upgrade(
+        &self,
+        pending: PendingUpgrade,
+    ) -> Result<(), ZakuraRejectReason> {
+        self.handler.insert_pending_inbound_upgrade(pending).await
+    }
+
+    /// Remove a pending inbound upgrade after its legacy handoff fails.
+    pub(crate) async fn cancel_pending_inbound_upgrade(&self, peer_id: &ZakuraPeerId) {
+        self.handler.cancel_pending_inbound_upgrade(peer_id).await;
     }
 
     /// Cancel and forget the maintained native dial started by the legacy
@@ -879,6 +908,7 @@ pub struct ZakuraSupervisorHandle {
     inner: Arc<Mutex<ZakuraSupervisorState>>,
     shutdown: CancellationToken,
     peer_set_tx: watch::Sender<Vec<ZakuraPeerId>>,
+    registration_set_tx: watch::Sender<HashMap<ZakuraPeerId, ZakuraRegistrationSnapshot>>,
 }
 
 static NEXT_SUPERVISOR_ID: AtomicU64 = AtomicU64::new(1);
@@ -897,6 +927,7 @@ struct ZakuraPeerConnectionEntry {
     /// Monotonic supervisor registration generation used by services to ignore
     /// stale add/remove work from a superseded connection.
     conn_id: ZakuraConnId,
+    transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
     outbound_handle: ZakuraPeerHandle,
     disconnect_token: CancellationToken,
     registered_at: Instant,
@@ -904,6 +935,21 @@ struct ZakuraPeerConnectionEntry {
 }
 
 impl ZakuraSupervisorState {
+    fn registration_snapshot(&self) -> HashMap<ZakuraPeerId, ZakuraRegistrationSnapshot> {
+        self.active_by_peer
+            .iter()
+            .map(|(peer_id, entry)| {
+                (
+                    peer_id.clone(),
+                    ZakuraRegistrationSnapshot {
+                        conn_id: entry.conn_id,
+                        transcript_hash: entry.transcript_hash,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn increment_ip(&mut self, remote_ip: Option<IpAddr>) {
         if let Some(remote_ip) = remote_ip {
             *self.active_by_ip.entry(remote_ip).or_default() += 1;
@@ -1025,6 +1071,7 @@ impl ZakuraSupervisorHandle {
             })),
             shutdown: CancellationToken::new(),
             peer_set_tx: watch::channel(Vec::new()).0,
+            registration_set_tx: watch::channel(HashMap::new()).0,
         }
     }
 
@@ -1053,6 +1100,13 @@ impl ZakuraSupervisorHandle {
     /// Subscribe to peer-set changes for event-driven tests and diagnostics.
     pub fn subscribe(&self) -> watch::Receiver<Vec<ZakuraPeerId>> {
         self.peer_set_tx.subscribe()
+    }
+
+    /// Subscribe to connection-generation changes for legacy upgrade handoffs.
+    pub(crate) fn subscribe_registrations(
+        &self,
+    ) -> watch::Receiver<HashMap<ZakuraPeerId, ZakuraRegistrationSnapshot>> {
+        self.registration_set_tx.subscribe()
     }
 
     /// Disconnect one active Zakura peer.
@@ -1125,6 +1179,7 @@ impl ZakuraSupervisorHandle {
                 state.next_registration_id += 1;
                 let entry = ZakuraPeerConnectionEntry {
                     conn_id,
+                    transcript_hash,
                     outbound_handle,
                     disconnect_token,
                     registered_at: Instant::now(),
@@ -1138,8 +1193,10 @@ impl ZakuraSupervisorHandle {
                 state.increment_ip(remote_ip);
                 state.debug_assert_accounting();
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
+                let registrations = state.registration_snapshot();
                 set_active_connection_gauge(registered_ids.len());
                 self.peer_set_tx.send_replace(registered_ids);
+                self.registration_set_tx.send_replace(registrations);
                 let disconnect_token = state
                     .active_by_peer
                     .get(&peer_id)
@@ -1207,8 +1264,10 @@ impl ZakuraSupervisorHandle {
         state.supervisor.deregister_authenticated(peer_id);
         state.debug_assert_accounting();
         let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
+        let registrations = state.registration_snapshot();
         set_active_connection_gauge(registered_ids.len());
         self.peer_set_tx.send_replace(registered_ids);
+        self.registration_set_tx.send_replace(registrations);
     }
 
     fn shutdown(&self) {
@@ -1671,6 +1730,7 @@ fn admit_inbound_message(
 pub(crate) struct NativeHandshakeNegotiated {
     pub(crate) limits: ZakuraAcceptedLimits,
     pub(crate) accepted_capabilities: u64,
+    pub(crate) transcript_hash: Option<[u8; TRANSCRIPT_HASH_BYTES]>,
 }
 
 pub(crate) fn service_registry(
@@ -1730,6 +1790,7 @@ pub struct ZakuraProtocolHandler {
     next_stream_id: Arc<AtomicU64>,
     admission: Arc<Semaphore>,
     pending_handshakes: Arc<Semaphore>,
+    pending_inbound_upgrades: Arc<Mutex<PendingUpgradeRegistry>>,
     shutdown: CancellationToken,
     // Bound iroh endpoint, used to recover the inbound peer's UDP source IP so
     // the per-IP admission cap applies to Router-accepted connections. Iroh's
@@ -1867,6 +1928,10 @@ impl ZakuraProtocolHandler {
             next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
+            pending_inbound_upgrades: Arc::new(Mutex::new(PendingUpgradeRegistry::new(
+                limits.max_pending_handshakes,
+                super::ZAKURA_LIVENESS_APPEAR_TIMEOUT,
+            ))),
             shutdown: CancellationToken::new(),
             limits,
             endpoint: None,
@@ -1908,6 +1973,30 @@ impl ZakuraProtocolHandler {
     pub fn with_endpoint(mut self, endpoint: Endpoint) -> Self {
         self.endpoint = Some(endpoint);
         self
+    }
+
+    async fn insert_pending_inbound_upgrade(
+        &self,
+        pending: PendingUpgrade,
+    ) -> Result<(), ZakuraRejectReason> {
+        self.pending_inbound_upgrades
+            .lock()
+            .await
+            .insert(std::time::Instant::now(), pending)
+    }
+
+    async fn cancel_pending_inbound_upgrade(&self, peer_id: &ZakuraPeerId) {
+        self.pending_inbound_upgrades
+            .lock()
+            .await
+            .take(std::time::Instant::now(), peer_id);
+    }
+
+    async fn take_pending_inbound_upgrade(&self, peer_id: &ZakuraPeerId) -> Option<PendingUpgrade> {
+        self.pending_inbound_upgrades
+            .lock()
+            .await
+            .take(std::time::Instant::now(), peer_id)
     }
 
     async fn accept_connection(&self, connection: Connection) -> Result<(), AcceptError> {
@@ -1971,11 +2060,9 @@ impl ZakuraProtocolHandler {
                 accepted_capabilities: negotiated.accepted_capabilities,
                 role: "responder",
                 direction,
-                transcript_hash: native_connection_transcript_hash(
-                    direction,
-                    &local_node_id,
-                    &remote_node_id,
-                ),
+                transcript_hash: negotiated.transcript_hash.unwrap_or_else(|| {
+                    native_connection_transcript_hash(direction, &local_node_id, &remote_node_id)
+                }),
                 i_open_collision_winner: i_open_collision_winner(&local_node_id, &remote_node_id),
                 conn,
             },
@@ -2033,15 +2120,33 @@ impl ZakuraProtocolHandler {
         )
         .await?;
         let hello = ZakuraControlHello::decode(&hello_bytes)?;
+        let pending = self.take_pending_inbound_upgrade(remote_peer_id).await;
+        let pending = match (hello.handshake_path, pending) {
+            (ZakuraHandshakePath::Upgraded, Some(pending)) => Some(pending),
+            (ZakuraHandshakePath::Native, None) => None,
+            (ZakuraHandshakePath::Upgraded, None) | (ZakuraHandshakePath::Native, Some(_)) => {
+                return Err(ZakuraValidationError::TranscriptMismatch.into())
+            }
+        };
         let expected = ZakuraControlValidation {
             local: &handshake_config,
             authenticated_remote_id: remote_peer_id.as_bytes(),
-            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_1,
-            handshake_path: ZakuraHandshakePath::Native,
+            selected_zakura_protocol: pending
+                .as_ref()
+                .map_or(ZAKURA_PROTOCOL_VERSION_1, |pending| {
+                    pending.selected_zakura_protocol
+                }),
+            handshake_path: hello.handshake_path,
             remote_role: ZakuraControlRole::Initiator,
-            initiator_upgrade_nonce: [0; 32],
-            responder_upgrade_nonce: [0; 32],
-            legacy_upgrade_transcript: [0; 32],
+            initiator_upgrade_nonce: pending
+                .as_ref()
+                .map_or([0; 32], |pending| pending.initiator_upgrade_nonce),
+            responder_upgrade_nonce: pending
+                .as_ref()
+                .map_or([0; 32], |pending| pending.responder_upgrade_nonce),
+            legacy_upgrade_transcript: pending
+                .as_ref()
+                .map_or([0; 32], |pending| pending.legacy_upgrade_transcript),
         };
         hello.validate(&expected)?;
 
@@ -2069,6 +2174,7 @@ impl ZakuraProtocolHandler {
         Ok(NativeHandshakeNegotiated {
             limits: accepted_limits,
             accepted_capabilities: ack.accepted_capabilities,
+            transcript_hash: pending.map(|pending| pending.legacy_upgrade_transcript),
         })
     }
 
@@ -3509,6 +3615,24 @@ pub(crate) async fn serve_native_dial_connection(
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
 ) -> Result<(), ZakuraHandlerError> {
+    serve_dial_connection(endpoint, node_addr, limits, None).await
+}
+
+pub(crate) async fn serve_upgrade_dial_connection(
+    endpoint: &ZakuraEndpoint,
+    node_addr: NodeAddr,
+    limits: &ZakuraLocalLimits,
+    pending: PendingUpgrade,
+) -> Result<(), ZakuraHandlerError> {
+    serve_dial_connection(endpoint, node_addr, limits, Some(pending)).await
+}
+
+async fn serve_dial_connection(
+    endpoint: &ZakuraEndpoint,
+    node_addr: NodeAddr,
+    limits: &ZakuraLocalLimits,
+    pending: Option<PendingUpgrade>,
+) -> Result<(), ZakuraHandlerError> {
     let conn_id = endpoint
         .handler
         .next_conn_id
@@ -3543,6 +3667,7 @@ pub(crate) async fn serve_native_dial_connection(
             limits,
             &handshake_config,
             &local_peer_id,
+            pending.as_ref(),
             &endpoint.handler.trace,
             &conn,
         )
@@ -3567,11 +3692,9 @@ pub(crate) async fn serve_native_dial_connection(
                 accepted_capabilities: negotiated.accepted_capabilities,
                 role: "initiator",
                 direction,
-                transcript_hash: native_connection_transcript_hash(
-                    direction,
-                    &local_node_id,
-                    &remote_node_id,
-                ),
+                transcript_hash: negotiated.transcript_hash.unwrap_or_else(|| {
+                    native_connection_transcript_hash(direction, &local_node_id, &remote_node_id)
+                }),
                 i_open_collision_winner: i_open_collision_winner(&local_node_id, &remote_node_id),
                 conn,
             },
@@ -3591,6 +3714,7 @@ pub(crate) async fn run_native_initiator_handshake_without_trace(
         limits,
         handshake_config,
         local_peer_id,
+        None,
         &ZakuraTrace::noop(),
         &ZakuraConnTrace::placeholder(),
     )
@@ -3602,6 +3726,7 @@ async fn run_native_initiator_handshake(
     limits: &ZakuraLocalLimits,
     handshake_config: &ZakuraHandshakeConfig,
     local_peer_id: &ZakuraPeerId,
+    pending: Option<&PendingUpgrade>,
     _trace: &ZakuraTrace,
     conn: &ZakuraConnTrace,
 ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
@@ -3620,16 +3745,23 @@ async fn run_native_initiator_handshake(
     let hello = ZakuraControlHello {
         magic: CONTROL_HELLO_MAGIC,
         control_version: CONTROL_VERSION,
-        selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_1,
-        handshake_path: ZakuraHandshakePath::Native,
+        selected_zakura_protocol: pending.map_or(ZAKURA_PROTOCOL_VERSION_1, |pending| {
+            pending.selected_zakura_protocol
+        }),
+        handshake_path: if pending.is_some() {
+            ZakuraHandshakePath::Upgraded
+        } else {
+            ZakuraHandshakePath::Native
+        },
         role: ZakuraControlRole::Initiator,
         network_id: handshake_config.network_id,
         chain_id: handshake_config.chain_id,
         iroh_node_id: local_peer_id.as_bytes().to_vec(),
         peer_nonce: local_nonce,
-        initiator_upgrade_nonce: [0; 32],
-        responder_upgrade_nonce: [0; 32],
-        legacy_upgrade_transcript: [0; 32],
+        initiator_upgrade_nonce: pending.map_or([0; 32], |pending| pending.initiator_upgrade_nonce),
+        responder_upgrade_nonce: pending.map_or([0; 32], |pending| pending.responder_upgrade_nonce),
+        legacy_upgrade_transcript: pending
+            .map_or([0; 32], |pending| pending.legacy_upgrade_transcript),
         capabilities: handshake_config.supported_capabilities,
         required_channels: 0,
         initial_limits: limits.initial_limits(),
@@ -3644,7 +3776,7 @@ async fn run_native_initiator_handshake(
     .await?;
     let ack = ZakuraControlAck::decode(&ack_bytes)?;
     ack.validate(
-        ZAKURA_PROTOCOL_VERSION_1,
+        hello.selected_zakura_protocol,
         local_nonce,
         ack.peer_nonce,
         &limits.initial_limits(),
@@ -3659,6 +3791,7 @@ async fn run_native_initiator_handshake(
     Ok(NativeHandshakeNegotiated {
         limits: ack.accepted_limits,
         accepted_capabilities: ack.accepted_capabilities,
+        transcript_hash: pending.map(|pending| pending.legacy_upgrade_transcript),
     })
 }
 
@@ -6381,12 +6514,16 @@ mod tests {
 
         let connector =
             crate::zakura::ZakuraHandshakeConnector::new_with_endpoint(endpoint.clone());
-        let upgraded = connector
-            .spawn_zakura_dial_to_hints_and_wait(&peer_id, &node_id, &direct_addresses)
+        let pending = PendingUpgrade::new(peer_id.clone(), 1, [1; 32], [2; 32], [3; 32]);
+        let registration = connector
+            .spawn_zakura_dial_to_hints_and_wait(&peer_id, &node_id, &direct_addresses, pending)
             .await;
 
         assert!(
-            !upgraded,
+            matches!(
+                registration,
+                crate::zakura::ZakuraUpgradeRegistration::Unavailable
+            ),
             "an unreachable upgrade peer must not report a completed hand-off",
         );
         assert!(

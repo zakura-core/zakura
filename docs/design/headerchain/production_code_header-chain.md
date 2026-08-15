@@ -131,7 +131,7 @@ the runtime commits the DAG changes, metadata, projections, and related indexes 
 RocksDB batch before it publishes the new snapshot.
 
 Startup uses
-[`audit_store`](../../../crates/zakura-header-chain/src/transition/recovery.rs) while
+[`audit_store`](../../../crates/zakura-header-chain/src/transition/recovery/mod.rs) while
 publication is disabled. The audit checks the stored source rows and rebuilds derived
 indexes and projections. It refuses inconsistencies that it cannot reconstruct.
 

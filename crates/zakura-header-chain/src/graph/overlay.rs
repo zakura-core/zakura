@@ -5,7 +5,7 @@ use zakura_chain::block;
 
 use super::{
     ConsensusInvalidBodyTombstone, GraphError, GraphRevision, HeaderGraphEdit, HeaderGraphView,
-    InsertResult, MemHeaderStore,
+    HeaderNodeInvariant, InsertResult, MemHeaderStore,
 };
 use crate::{
     BodyValidationState, ChainScore, EligibilityReason, EligibilityState, EvidenceId, Frontier,
@@ -36,6 +36,23 @@ pub(crate) struct GraphDelta {
     pub(super) updated_header_nodes: Vec<HeaderNode>,
     pub(super) deleted_header_hashes: Vec<block::Hash>,
     pub(super) new_consensus_invalid_body_tombstones: Vec<ConsensusInvalidBodyTombstone>,
+}
+
+/// A revision-bound sparse graph update that has passed live-delta validation.
+///
+/// Keeping this application separate from [`GraphDelta`] leaves room for a future transition to
+/// carry the validated application across the durable commit boundary without changing the delta
+/// or the public transition API.
+pub(super) struct GraphDeltaApplication {
+    pub(super) base_revision: GraphRevision,
+    pub(super) finalized_frontier: Frontier,
+    pub(super) updated_header_nodes_by_hash: HashMap<block::Hash, HeaderNode>,
+    pub(super) deleted_header_hashes: HashSet<block::Hash>,
+    pub(super) added_header_children: HashMap<block::Hash, HashSet<block::Hash>>,
+    pub(super) removed_header_children: HashMap<block::Hash, HashSet<block::Hash>>,
+    pub(super) eligible_header_tips: HashSet<block::Hash>,
+    pub(super) new_consensus_invalid_body_tombstones_by_hash:
+        HashMap<block::Hash, ConsensusInvalidBodyTombstone>,
 }
 
 impl GraphDelta {
@@ -136,64 +153,407 @@ impl<'a> GraphOverlay<'a> {
         base_graph: &'a MemHeaderStore,
         delta: &GraphDelta,
     ) -> Result<Self, GraphError> {
-        let indexes = base_graph.derive_index_changes(delta)?;
+        if delta.base_revision != base_graph.graph_revision {
+            return Err(GraphError::StaleDelta {
+                current_revision: base_graph.graph_revision,
+                delta_base_revision: delta.base_revision,
+            });
+        }
         let updated_header_nodes_by_hash = delta
             .updated_header_nodes
             .iter()
             .cloned()
             .map(|node| (node.hash, node))
-            .collect();
-        let deleted_header_hashes = delta.deleted_header_hashes.iter().copied().collect();
+            .collect::<HashMap<_, _>>();
+        if updated_header_nodes_by_hash.len() != delta.updated_header_nodes.len() {
+            let mut seen = HashSet::new();
+            let duplicate = delta
+                .updated_header_nodes
+                .iter()
+                .find_map(|node| (!seen.insert(node.hash)).then_some(node.hash))
+                .expect("different map and sequence lengths imply a duplicate hash");
+            return Err(GraphError::DuplicateHeaderNode(duplicate));
+        }
+        let deleted_header_hashes: HashSet<_> =
+            delta.deleted_header_hashes.iter().copied().collect();
+        if deleted_header_hashes.len() != delta.deleted_header_hashes.len() {
+            let mut seen = HashSet::new();
+            let duplicate = delta
+                .deleted_header_hashes
+                .iter()
+                .find_map(|hash| (!seen.insert(*hash)).then_some(*hash))
+                .expect("different set and sequence lengths imply a duplicate hash");
+            return Err(GraphError::DuplicateHeaderNode(duplicate));
+        }
+        for hash in &deleted_header_hashes {
+            if updated_header_nodes_by_hash.contains_key(hash) {
+                return Err(GraphError::DuplicateHeaderNode(*hash));
+            }
+            if !base_graph.nodes.contains_key(hash) {
+                return Err(GraphError::UnknownHeaderNode(*hash));
+            }
+        }
+        let new_consensus_invalid_body_tombstones_by_hash = delta
+            .new_consensus_invalid_body_tombstones
+            .iter()
+            .cloned()
+            .map(|tombstone| (tombstone.hash, tombstone))
+            .collect::<HashMap<_, _>>();
+        if new_consensus_invalid_body_tombstones_by_hash.len()
+            != delta.new_consensus_invalid_body_tombstones.len()
+        {
+            let mut seen = HashSet::new();
+            let duplicate = delta
+                .new_consensus_invalid_body_tombstones
+                .iter()
+                .find_map(|tombstone| (!seen.insert(tombstone.hash)).then_some(tombstone.hash))
+                .expect("different map and sequence lengths imply a duplicate hash");
+            return Err(GraphError::DuplicateHeaderNode(duplicate));
+        }
         let mut added_header_children: HashMap<_, HashSet<_>> = HashMap::new();
         let mut removed_header_children: HashMap<_, HashSet<_>> = HashMap::new();
-        for (parent, child) in &indexes.added_header_children {
-            added_header_children
-                .entry(*parent)
-                .or_default()
-                .insert(*child);
+        for node in updated_header_nodes_by_hash.values() {
+            if !base_graph.nodes.contains_key(&node.hash) {
+                added_header_children
+                    .entry(node.parent_hash)
+                    .or_default()
+                    .insert(node.hash);
+            }
         }
-        for (parent, child) in &indexes.removed_header_children {
-            removed_header_children
-                .entry(*parent)
-                .or_default()
-                .insert(*child);
+        for hash in &deleted_header_hashes {
+            let node = base_graph
+                .nodes
+                .get(hash)
+                .expect("deleted hashes were checked against the base graph");
+            if node.hash != base_graph.finalized_frontier.hash {
+                removed_header_children
+                    .entry(node.parent_hash)
+                    .or_default()
+                    .insert(node.hash);
+            }
         }
-        let mut eligible_header_tips = base_graph.eligible_header_tips.clone();
-        for hash in &indexes.remove_eligible_header_tips {
-            eligible_header_tips.remove(hash);
-        }
-        eligible_header_tips.extend(indexes.add_eligible_header_tips.iter().copied());
-        Ok(Self {
+        let finalized_frontier = delta
+            .finalized_frontier
+            .unwrap_or(base_graph.finalized_frontier);
+        let header_node_count = base_graph
+            .nodes
+            .len()
+            .saturating_add(
+                updated_header_nodes_by_hash
+                    .keys()
+                    .filter(|hash| !base_graph.nodes.contains_key(*hash))
+                    .count(),
+            )
+            .saturating_sub(deleted_header_hashes.len());
+        let mut overlay = Self {
             base_graph,
             base_revision: delta.base_revision,
-            finalized_frontier: delta
-                .finalized_frontier
-                .unwrap_or(base_graph.finalized_frontier),
+            finalized_frontier,
             updated_header_nodes_by_hash,
             deleted_header_hashes,
             added_header_children,
             removed_header_children,
-            eligible_header_tips,
-            new_consensus_invalid_body_tombstones_by_hash: delta
-                .new_consensus_invalid_body_tombstones
-                .iter()
-                .cloned()
-                .map(|tombstone| (tombstone.hash, tombstone))
-                .collect(),
+            eligible_header_tips: base_graph.eligible_header_tips.clone(),
+            new_consensus_invalid_body_tombstones_by_hash,
             work_coordinates_rebased: delta.work_coordinate_transition
                 == WorkCoordinateTransition::RebaseToFinalizedFrontier,
-            header_node_count: base_graph
-                .nodes
-                .len()
-                .saturating_add(
-                    delta
-                        .updated_header_nodes
-                        .iter()
-                        .filter(|node| !base_graph.nodes.contains_key(&node.hash))
-                        .count(),
-                )
-                .saturating_sub(delta.deleted_header_hashes.len()),
-        })
+            header_node_count,
+        };
+        overlay.validate_delta_nodes()?;
+        overlay.refresh_delta_eligible_header_tips();
+        Ok(overlay)
+    }
+
+    /// Consume this validated projection into the exact owned mutations required by the live
+    /// graph. The returned application remains bound to this overlay's base revision.
+    pub(super) fn into_delta_application(self) -> GraphDeltaApplication {
+        GraphDeltaApplication {
+            base_revision: self.base_revision,
+            finalized_frontier: self.finalized_frontier,
+            updated_header_nodes_by_hash: self.updated_header_nodes_by_hash,
+            deleted_header_hashes: self.deleted_header_hashes,
+            added_header_children: self.added_header_children,
+            removed_header_children: self.removed_header_children,
+            eligible_header_tips: self.eligible_header_tips,
+            new_consensus_invalid_body_tombstones_by_hash: self
+                .new_consensus_invalid_body_tombstones_by_hash,
+        }
+    }
+
+    /// Validate every graph invariant whose truth can change in this sparse delta.
+    ///
+    /// Unchanged nodes inherit the base graph's audit; validation follows only changed boundaries.
+    fn validate_delta_nodes(&self) -> Result<(), GraphError> {
+        let finalized_node = self
+            .header_node(self.finalized_frontier.hash)
+            .ok_or(GraphError::UnknownHeaderNode(self.finalized_frontier.hash))?;
+        if finalized_node.height != self.finalized_frontier.height {
+            return Err(GraphError::InvalidHeaderNode {
+                header: self.finalized_frontier.hash,
+                invariant: HeaderNodeInvariant::FinalizedFrontierHeight,
+            });
+        }
+        if !finalized_node.is_eligible() {
+            return Err(GraphError::IneligibleFinalizedFrontier(
+                self.finalized_frontier.hash,
+            ));
+        }
+        self.validate_finalized_descendant()?;
+        self.validate_updated_nodes()?;
+        self.validate_deleted_nodes()?;
+        self.validate_tombstones()?;
+        self.validate_updated_eligibility()?;
+        Ok(())
+    }
+
+    /// Require the projected finalized frontier to be an exact descendant of the base frontier.
+    ///
+    /// The ancestry walk may cross nodes deleted by the same finality transition.
+    fn validate_finalized_descendant(&self) -> Result<(), GraphError> {
+        if self.finalized_frontier == self.base_graph.finalized_frontier {
+            return Ok(());
+        }
+        let mut cursor = self.finalized_frontier;
+        while cursor.height > self.base_graph.finalized_frontier.height {
+            let node = self
+                .updated_header_nodes_by_hash
+                .get(&cursor.hash)
+                .or_else(|| self.base_graph.nodes.get(&cursor.hash))
+                .ok_or(GraphError::UnknownHeaderNode(cursor.hash))?;
+            if node.height != cursor.height {
+                return Err(GraphError::UnknownHeaderNode(cursor.hash));
+            }
+            cursor = Frontier::new(block::Height(cursor.height.0 - 1), node.parent_hash);
+        }
+        if cursor != self.base_graph.finalized_frontier {
+            return Err(GraphError::FinalizedFrontierNotDescendant {
+                current: self.base_graph.finalized_frontier.hash,
+                candidate: self.finalized_frontier.hash,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate canonical fields, immutable replacements, parent continuity, and work coordinates
+    /// for updated nodes. A graph-wide scan occurs only for an explicitly global work rebase.
+    fn validate_updated_nodes(&self) -> Result<(), GraphError> {
+        let current_anchor = self
+            .base_graph
+            .nodes
+            .get(&self.base_graph.finalized_frontier.hash)
+            .expect("the live graph retains its finalized frontier")
+            .work_coordinate();
+        for node in self.updated_header_nodes_by_hash.values() {
+            if node.header.previous_block_hash != node.parent_hash {
+                return Err(GraphError::InvalidHeaderNode {
+                    header: node.hash,
+                    invariant: HeaderNodeInvariant::CanonicalParentHash,
+                });
+            }
+            if node.header.difficulty_threshold.to_work() != Some(node.block_work) {
+                return Err(GraphError::InvalidHeaderNode {
+                    header: node.hash,
+                    invariant: HeaderNodeInvariant::CanonicalBlockWork,
+                });
+            }
+            if let Some(old) = self.base_graph.nodes.get(&node.hash) {
+                let immutable_changed = old.header != node.header
+                    || old.hash != node.hash
+                    || old.parent_hash != node.parent_hash
+                    || old.height != node.height
+                    || old.block_work != node.block_work;
+                let coordinate_changed = old.work_coordinate() != node.work_coordinate();
+                let invalidity_changed = matches!(
+                    old.body_validation_state,
+                    BodyValidationState::ConsensusInvalid { .. }
+                ) && old.body_validation_state
+                    != node.body_validation_state;
+                if immutable_changed
+                    || invalidity_changed
+                    || (!self.work_coordinates_rebased && coordinate_changed)
+                {
+                    return Err(GraphError::InvalidHeaderNode {
+                        header: node.hash,
+                        invariant: HeaderNodeInvariant::ImmutableFields,
+                    });
+                }
+            }
+            if node.hash == self.finalized_frontier.hash {
+                if node.eligibility.inherited_from.is_some() {
+                    return Err(GraphError::InvalidHeaderNode {
+                        header: node.hash,
+                        invariant: HeaderNodeInvariant::DerivedHeaderState,
+                    });
+                }
+                continue;
+            }
+            let parent = self
+                .header_node(node.parent_hash)
+                .ok_or(GraphError::UnknownParent {
+                    header: node.hash,
+                    parent: node.parent_hash,
+                })?;
+            if parent.height.next().ok() != Some(node.height) {
+                return Err(GraphError::InvalidHeaderNode {
+                    header: node.hash,
+                    invariant: HeaderNodeInvariant::ParentHeight,
+                });
+            }
+            if parent.work_coordinate().checked_add(node.block_work)? != node.work_coordinate() {
+                return Err(GraphError::InvalidHeaderNode {
+                    header: node.hash,
+                    invariant: HeaderNodeInvariant::CumulativeWork,
+                });
+            }
+        }
+        if self.work_coordinates_rebased {
+            for node in self.header_nodes() {
+                if node.work_coordinate().origin_hash() != self.base_graph.finalized_frontier.hash {
+                    return Err(GraphError::InvalidHeaderNode {
+                        header: node.hash,
+                        invariant: HeaderNodeInvariant::WorkRebaseOrigin,
+                    });
+                }
+                if let Some(old) = self.base_graph.nodes.get(&node.hash) {
+                    let expected = WorkCoordinate::new(
+                        self.base_graph.finalized_frontier.hash,
+                        old.work_coordinate()
+                            .suffix_after(current_anchor)?
+                            .as_u256(),
+                    );
+                    if node.work_coordinate() != expected {
+                        return Err(GraphError::InvalidHeaderNode {
+                            header: node.hash,
+                            invariant: HeaderNodeInvariant::WorkRebaseCoordinate,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject a deletion that leaves a retained child without its parent.
+    ///
+    /// The projected finalized root is the sole valid retained child of a deleted parent.
+    fn validate_deleted_nodes(&self) -> Result<(), GraphError> {
+        for hash in &self.deleted_header_hashes {
+            if let Some(children) = self.base_graph.children.get(hash) {
+                for child in children {
+                    if self.header_node(*child).is_some() && *child != self.finalized_frontier.hash
+                    {
+                        return Err(GraphError::UnknownParent {
+                            header: *child,
+                            parent: *hash,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce append-only tombstones and exact agreement with retained consensus-invalid nodes.
+    fn validate_tombstones(&self) -> Result<(), GraphError> {
+        for (hash, tombstone) in &self.new_consensus_invalid_body_tombstones_by_hash {
+            if let Some(existing) = self.base_graph.consensus_invalid_body_tombstones.get(hash) {
+                if existing != tombstone {
+                    return Err(GraphError::PermanentBodyInvalidity(*hash));
+                }
+            }
+            if let Some(node) = self.header_node(*hash) {
+                if !matches!(
+                    &node.body_validation_state,
+                    BodyValidationState::ConsensusInvalid { evidence, rule }
+                        if *evidence == tombstone.evidence && *rule == tombstone.rule
+                ) {
+                    return Err(GraphError::InvalidHeaderNode {
+                        header: *hash,
+                        invariant: HeaderNodeInvariant::DerivedHeaderState,
+                    });
+                }
+            }
+        }
+        for node in self.updated_header_nodes_by_hash.values() {
+            let expected = match &node.body_validation_state {
+                BodyValidationState::ConsensusInvalid { evidence, rule } => Some((*evidence, rule)),
+                _ => None,
+            };
+            let tombstone = self
+                .new_consensus_invalid_body_tombstones_by_hash
+                .get(&node.hash)
+                .or_else(|| {
+                    self.base_graph
+                        .consensus_invalid_body_tombstones
+                        .get(&node.hash)
+                });
+            match (expected, tombstone) {
+                (Some((evidence, rule)), Some(tombstone))
+                    if evidence == tombstone.evidence && *rule == tombstone.rule => {}
+                (Some(_), _) => return Err(GraphError::PermanentBodyInvalidity(node.hash)),
+                (None, Some(_)) => return Err(GraphError::PermanentBodyInvalidity(node.hash)),
+                (None, None) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Require updated nodes and their immediate children to carry the exact inherited
+    /// eligibility derived from their projected parents.
+    fn validate_updated_eligibility(&self) -> Result<(), GraphError> {
+        for node in self.updated_header_nodes_by_hash.values() {
+            if node.hash != self.finalized_frontier.hash {
+                let parent =
+                    self.header_node(node.parent_hash)
+                        .ok_or(GraphError::UnknownParent {
+                            header: node.hash,
+                            parent: node.parent_hash,
+                        })?;
+                let expected = (!parent.is_eligible()).then_some(parent.hash);
+                if node.eligibility.inherited_from != expected {
+                    return Err(GraphError::InvalidHeaderNode {
+                        header: node.hash,
+                        invariant: HeaderNodeInvariant::DerivedHeaderState,
+                    });
+                }
+            }
+            for child in self.header_children(node.hash) {
+                let child_node = self
+                    .header_node(child)
+                    .expect("projected children are retained projected nodes");
+                let expected = (!node.is_eligible()).then_some(node.hash);
+                if child_node.eligibility.inherited_from != expected {
+                    return Err(GraphError::InvalidHeaderNode {
+                        header: child,
+                        invariant: HeaderNodeInvariant::DerivedHeaderState,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Recompute eligible-tip membership only for changed nodes and their affected parents.
+    fn refresh_delta_eligible_header_tips(&mut self) {
+        let mut affected = HashSet::new();
+        for node in self.updated_header_nodes_by_hash.values() {
+            affected.insert(node.hash);
+            affected.insert(node.parent_hash);
+        }
+        for hash in &self.deleted_header_hashes {
+            affected.insert(*hash);
+            affected.insert(
+                self.base_graph
+                    .nodes
+                    .get(hash)
+                    .expect("deleted hashes were checked against the base graph")
+                    .parent_hash,
+            );
+        }
+        affected.insert(self.finalized_frontier.hash);
+        for hash in affected {
+            self.refresh_eligible_header_tip(hash);
+        }
     }
 
     pub(crate) const fn finalized_frontier(&self) -> Frontier {
@@ -1084,6 +1444,116 @@ mod tests {
             overlay.header_node_count(),
             base_graph.header_node_count().saturating_add(1)
         );
+    }
+
+    #[test]
+    fn validated_application_contains_exact_sparse_node_edge_and_tip_changes() {
+        let base_graph = store();
+        let anchor = base_graph.finalized_frontier();
+        let mut overlay = GraphOverlay::new(&base_graph);
+        let child = overlay
+            .insert(
+                header(anchor.hash, 1),
+                HeaderValidationState::Valid,
+                [],
+                BodyValidationState::Unknown,
+            )
+            .expect("the sparse child inserts");
+        let child = match child {
+            InsertResult::Inserted(frontier) | InsertResult::AlreadyPresent(frontier) => frontier,
+        };
+
+        let application = GraphOverlay::from_delta(&base_graph, &overlay.delta())
+            .expect("the sparse delta validates")
+            .into_delta_application();
+
+        assert_eq!(application.base_revision, base_graph.graph_revision);
+        assert_eq!(application.finalized_frontier, anchor);
+        assert_eq!(
+            application
+                .updated_header_nodes_by_hash
+                .get(&child.hash)
+                .map(|node| node.height),
+            Some(child.height)
+        );
+        assert!(application
+            .added_header_children
+            .get(&anchor.hash)
+            .is_some_and(|children| children.contains(&child.hash)));
+        assert!(!application.eligible_header_tips.contains(&anchor.hash));
+        assert!(application.eligible_header_tips.contains(&child.hash));
+    }
+
+    #[test]
+    fn sparse_deletion_rejects_a_retained_child() {
+        let mut base_graph = store();
+        let anchor = base_graph.finalized_frontier();
+        let parent = insert_child(&mut base_graph, anchor.hash, 1);
+        let child = insert_child(&mut base_graph, parent.hash, 2);
+        let mut delta = GraphDelta::empty(&base_graph);
+        delta.deleted_header_hashes.push(parent.hash);
+
+        assert_eq!(
+            GraphOverlay::from_delta(&base_graph, &delta).map(drop),
+            Err(GraphError::UnknownParent {
+                header: child.hash,
+                parent: parent.hash,
+            })
+        );
+    }
+
+    #[test]
+    fn sparse_tombstone_requires_matching_retained_body_state() {
+        let mut base_graph = store();
+        let anchor = base_graph.finalized_frontier();
+        let child = insert_child(&mut base_graph, anchor.hash, 1);
+        let mut delta = GraphDelta::empty(&base_graph);
+        delta
+            .new_consensus_invalid_body_tombstones
+            .push(ConsensusInvalidBodyTombstone {
+                hash: child.hash,
+                evidence: EvidenceId::from_digest([9; 32]),
+                rule: crate::BodyRuleId::new("test.sparse-tombstone"),
+            });
+
+        assert!(matches!(
+            GraphOverlay::from_delta(&base_graph, &delta),
+            Err(GraphError::InvalidHeaderNode {
+                header,
+                invariant: HeaderNodeInvariant::DerivedHeaderState,
+            }) if header == child.hash
+        ));
+    }
+
+    #[test]
+    fn sparse_eligibility_rejects_an_omitted_descendant_update() {
+        let mut base_graph = store();
+        let anchor = base_graph.finalized_frontier();
+        let parent = insert_child(&mut base_graph, anchor.hash, 1);
+        let child = insert_child(&mut base_graph, parent.hash, 2);
+        let mut overlay = GraphOverlay::new(&base_graph);
+        overlay
+            .add_eligibility_reason(
+                parent.hash,
+                EligibilityReason::OperatorInvalid {
+                    id: OperatorInvalidationId::new([7; 16]),
+                    reason_digest: [8; 32],
+                    evidence: EvidenceId::from_digest([9; 32]),
+                },
+            )
+            .expect("the parent invalidation propagates to its child");
+        let mut incomplete = overlay.delta();
+        incomplete
+            .updated_header_nodes
+            .retain(|node| node.hash != child.hash);
+
+        assert!(matches!(
+            GraphOverlay::from_delta(&base_graph, &incomplete),
+            Err(GraphError::InvalidHeaderNode {
+                header,
+                invariant: HeaderNodeInvariant::DerivedHeaderState,
+            }) if header == child.hash
+        ));
     }
 
     #[test]

@@ -71,10 +71,6 @@ pub(crate) fn verify_incremental_checkpoint_finality(
     if source != plan.snapshot_before_commit {
         return Err(InvariantViolation::SnapshotBeforeCommit);
     }
-    engine_before_commit
-        .graph()
-        .validate_delta(plan.graph_delta())
-        .map_err(|error| super::graph_error_violation(error, plan))?;
     let delta_graph = GraphOverlay::from_delta(engine_before_commit.graph(), plan.graph_delta())
         .map_err(|error| super::graph_error_violation(error, plan))?;
     let delta_finalized = delta_graph.view_finalized_frontier();

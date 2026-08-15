@@ -178,10 +178,6 @@ fn verify_plan_exhaustive(
     if source != plan.snapshot_before_commit {
         return Err(InvariantViolation::SnapshotBeforeCommit);
     }
-    engine_before_commit
-        .graph()
-        .validate_delta(plan.graph_delta())
-        .map_err(|error| graph_error_violation(error, plan))?;
     let source_metadata = engine_before_commit.metadata();
     let delta_graph = GraphOverlay::from_delta(engine_before_commit.graph(), plan.graph_delta())
         .map_err(|error| graph_error_violation(error, plan))?;

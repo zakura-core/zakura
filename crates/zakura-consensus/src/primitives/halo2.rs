@@ -53,11 +53,12 @@ const HALO2_MAX_BATCH_SIZE: usize = super::MAX_BATCH_SIZE;
 ///
 /// Sized to hold several blocks of history plus a full mempool, so that a
 /// transaction gossiped well before the block that mines it is still
-/// remembered. The witnessed transaction ID and pool tag use about 1.3 MB per
-/// era before collection overhead.
+/// remembered. The witnessed transaction ID, sighash, and pool tag use about
+/// 2 MB per era before collection overhead.
 const CACHE_CAPACITY: usize = 20_000;
 
-/// A witnessed transaction and value pool whose Halo2 bundle has verified.
+/// A witnessed transaction, sighash, and value pool whose Halo2 bundle has
+/// verified.
 ///
 /// [`WtxId`] contains both the transaction ID, which commits to the bundle's
 /// effecting data, and the authorizing-data digest, which commits to its proof
@@ -68,6 +69,9 @@ struct CacheKey {
     /// The witnessed transaction ID containing the txid and authorizing-data
     /// digest.
     wtx_id: WtxId,
+
+    /// The signature digest used to verify the bundle's signatures.
+    sighash: [u8; 32],
 
     /// The bundle slot verified for this transaction.
     pool: ValuePool,
@@ -143,7 +147,8 @@ lazy_static::lazy_static! {
 /// The verifying key (pre- vs post-NU6.2) is supplied by whichever [`Verifier`]
 /// processes the item, so an item is always validated against exactly one key
 /// and eras are never mixed within a batch. Production items also carry a
-/// cache key derived from their transaction's [`WtxId`] and bundle pool.
+/// cache key derived from their transaction's [`WtxId`], sighash, and bundle
+/// pool.
 #[derive(Clone, Debug)]
 pub struct Item {
     // `Arc`-wrapped so cloning an `Item` — which `tower-fallback` does eagerly for every request —
@@ -182,8 +187,9 @@ impl Item {
     /// transaction ID.
     ///
     /// `wtx_id` must identify the transaction containing `bundle`. The
-    /// transaction verifier preserves this invariant by passing the ID it
-    /// computed from the same [`Request`](crate::transaction::Request).
+    /// transaction verifier passes the precomputed ID from its
+    /// [`Request`](crate::transaction::Request), whose caller must preserve
+    /// this invariant.
     pub(crate) fn new_with_wtx_id(
         bundle: orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>,
         sighash: SigHash,
@@ -194,7 +200,11 @@ impl Item {
         Self {
             bundle: Arc::new(bundle),
             sighash,
-            cache_key: Some(CacheKey { wtx_id, pool }),
+            cache_key: Some(CacheKey {
+                wtx_id,
+                sighash: sighash.0,
+                pool,
+            }),
         }
     }
 
@@ -215,10 +225,12 @@ impl Item {
     /// transaction ID.
     ///
     /// [`WtxId`] commits to the transaction's effecting and authorizing data.
-    /// The pool selects one of the two possible v6 bundles. The verifying key is
-    /// absent on purpose: each Orchard circuit era has its own cache, so an
-    /// entry is only read back under the key it was written against (see
-    /// [`verifier_for`]).
+    /// The sighash additionally commits to the amounts and scripts of spent
+    /// transparent outputs, which are supplied by the verification context and
+    /// are not part of the `WtxId`. The pool selects one of the two possible v6
+    /// bundles. The verifying key is absent on purpose: each Orchard circuit
+    /// era has its own cache, so an entry is only read back under the key it was
+    /// written against (see [`verifier_for`]).
     ///
     /// The txid alone is insufficient because it excludes authorizing data
     /// under ZIP 244 (CVE-2026-34377). The pool is also required because both

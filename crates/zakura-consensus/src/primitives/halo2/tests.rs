@@ -293,7 +293,7 @@ fn cacheable_item(
     Item::new_with_wtx_id(bundle.clone(), sighash, wtx_id)
 }
 
-/// Returns the cache key for `bundle`'s pool in `wtx_id`.
+/// Returns the cache key for `bundle`'s pool, `sighash`, and `wtx_id`.
 fn cache_key(bundle: &Bundle<Authorized, ZatBalance>, sighash: SigHash, wtx_id: WtxId) -> CacheKey {
     cacheable_item(bundle, sighash, wtx_id)
         .cache_key()
@@ -333,7 +333,7 @@ fn cache_key_is_deterministic() {
     assert_eq!(
         cache_key(&bundle, sighash, wtx_id),
         cache_key(&bundle, sighash, wtx_id),
-        "the same wtxid and pool must always produce the same key"
+        "the same wtxid, sighash, and pool must always produce the same key"
     );
 }
 
@@ -357,6 +357,22 @@ fn cache_key_commits_to_the_txid_and_authorizing_data() {
         original,
         cache_key(&bundle, sighash, different_authorizing_data),
         "the authorizing-data digest must be part of the cache key"
+    );
+}
+
+#[test]
+fn cache_key_commits_to_the_sighash() {
+    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+    let wtx_id = test_wtx_id(1);
+    let original = cache_key(&bundle, sighash, wtx_id);
+
+    let mut different_sighash = sighash;
+    different_sighash.0[0] ^= 1;
+
+    assert_ne!(
+        original,
+        cache_key(&bundle, different_sighash, wtx_id),
+        "different verification contexts must get different cache keys"
     );
 }
 

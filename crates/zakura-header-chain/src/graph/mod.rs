@@ -375,6 +375,14 @@ struct DerivedIndexChanges {
     remove_eligible_header_tips: Vec<block::Hash>,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum CanonicalHeaderHashAudit {
+    /// Recompute each canonical header hash from the complete serialized header.
+    Verify,
+    /// Trust hashes established by admission into an already-validated live graph.
+    TrustEstablished,
+}
+
 impl MemHeaderStore {
     /// Construct a store rooted at one trusted, already-validated work origin.
     pub fn new(
@@ -846,6 +854,18 @@ impl MemHeaderStore {
     /// finalized frontier. The constructor computes inherited eligibility and
     /// eligible header tips only after every source row passes validation.
     pub fn reconstruct(reconstruction: HeaderGraphReconstruction) -> Result<Self, GraphError> {
+        Self::reconstruct_with(reconstruction, CanonicalHeaderHashAudit::Verify)
+    }
+
+    /// Reconstruct derived graph indexes using the specified canonical-hash trust boundary.
+    ///
+    /// Live transition projection uses hashes already established at header admission. Durable
+    /// and recovery reconstruction must use [`CanonicalHeaderHashAudit::Verify`] because their
+    /// rows do not inherit that in-memory validation.
+    fn reconstruct_with(
+        reconstruction: HeaderGraphReconstruction,
+        canonical_header_hash_audit: CanonicalHeaderHashAudit,
+    ) -> Result<Self, GraphError> {
         let HeaderGraphReconstruction {
             finalized_frontier,
             header_nodes,
@@ -881,7 +901,9 @@ impl MemHeaderStore {
         }
         let anchor_coordinate = finalized_node.work_coordinate();
         for node in node_map.values() {
-            if node.header.hash() != node.hash {
+            if canonical_header_hash_audit == CanonicalHeaderHashAudit::Verify
+                && node.header.hash() != node.hash
+            {
                 return Err(GraphError::InvalidHeaderNode {
                     header: node.hash,
                     invariant: HeaderNodeInvariant::CanonicalHeaderHash,
@@ -1456,11 +1478,10 @@ impl MemHeaderStore {
         }
         let expected_nodes: HashMap<_, _> =
             nodes.iter().map(|node| (node.hash, node.clone())).collect();
-        let mut projected = Self::reconstruct(HeaderGraphReconstruction::new(
-            finalized,
-            nodes,
-            tombstones.into_values(),
-        ))?;
+        let mut projected = Self::reconstruct_with(
+            HeaderGraphReconstruction::new(finalized, nodes, tombstones.into_values()),
+            CanonicalHeaderHashAudit::TrustEstablished,
+        )?;
         if projected.nodes != expected_nodes {
             let hash = expected_nodes
                 .iter()
@@ -1674,11 +1695,10 @@ mod tests {
             .consensus_invalid_body_tombstones()
             .cloned()
             .collect::<Vec<_>>();
-        *store = MemHeaderStore::reconstruct(HeaderGraphReconstruction::new(
-            finalized,
-            finalized_header_nodes,
-            tombstones,
-        ))?;
+        *store = MemHeaderStore::reconstruct_with(
+            HeaderGraphReconstruction::new(finalized, finalized_header_nodes, tombstones),
+            CanonicalHeaderHashAudit::TrustEstablished,
+        )?;
         store.recompute_all_header_eligibility()?;
         Ok(deleted)
     }
@@ -2190,6 +2210,59 @@ mod tests {
             Err(GraphError::InvalidHeaderNode { header, invariant: HeaderNodeInvariant::CumulativeWork })
                 if header == child.hash
         ));
+    }
+
+    #[test]
+    fn reconstruction_rejects_forged_canonical_header_hash() {
+        let mut store = anchor_store();
+        let anchor = store.finalized_frontier();
+        let child = insert_child(&mut store, anchor.hash, 1);
+        let mut nodes: Vec<_> = store.header_nodes().cloned().collect();
+        let forged = nodes
+            .iter_mut()
+            .find(|node| node.hash == child.hash)
+            .expect("the child row is present");
+
+        Arc::make_mut(&mut forged.header).nonce = [9; 32].into();
+        assert_ne!(forged.header.hash(), forged.hash);
+
+        assert!(matches!(
+            MemHeaderStore::reconstruct(HeaderGraphReconstruction::new(anchor, nodes, [])),
+            Err(GraphError::InvalidHeaderNode {
+                header,
+                invariant: HeaderNodeInvariant::CanonicalHeaderHash,
+            }) if header == child.hash
+        ));
+    }
+
+    #[test]
+    fn project_delta_trusts_established_header_hashes() {
+        let mut store = anchor_store();
+        let anchor = store.finalized_frontier();
+        let child = insert_child(&mut store, anchor.hash, 1);
+        let child_node = store
+            .nodes
+            .get_mut(&child.hash)
+            .expect("the inserted child is retained");
+
+        Arc::make_mut(&mut child_node.header).nonce = [9; 32].into();
+        assert_ne!(child_node.header.hash(), child_node.hash);
+
+        let mut updated_child = child_node.clone();
+        updated_child.body_validation_state = BodyValidationState::CommitmentMatched;
+        let mut delta = GraphDelta::empty(&store);
+        delta.updated_header_nodes.push(updated_child);
+
+        store
+            .apply_delta(&delta)
+            .expect("live graph projection trusts hashes established at admission");
+        assert_eq!(
+            store
+                .header_node(child.hash)
+                .expect("the projected child remains retained")
+                .body_validation_state,
+            BodyValidationState::CommitmentMatched
+        );
     }
 
     #[test]

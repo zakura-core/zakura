@@ -413,7 +413,7 @@ fn graph_boundary_and_transition_invariants_reject_corruption() {
     );
     assert!(matches!(
         verify_plan(&test_engine(&store), &corrupt),
-        Err(InvariantViolation::Index(_))
+        Err(InvariantViolation::NodeHash(_))
     ));
 
     let mut corrupt = plan.clone();

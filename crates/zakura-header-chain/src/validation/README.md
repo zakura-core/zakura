@@ -348,3 +348,20 @@ Relevant specification:
 - [Zcash nBits encoding](https://zips.z.cash/protocol/protocol.pdf#nbits)
 - [ZIP-208: Shorter Block Target Spacing](https://zips.z.cash/zip-0208)
 - [ZIP-218: 25-second Block Target Spacing](https://github.com/zcash/zips/blob/main/zips/zip-0218.md)
+
+### Explore the difficulty adjustment
+
+The ignored
+[`table_driven_difficulty_simulator`](contextual/tests/validation.rs)
+prints the mean target, median-based actual timespan, damped and bounded
+timespans, expanded target, and expected `nBits` for representative timing,
+timestamp-manipulation, target-sample, and Testnet minimum-difficulty cases.
+Its current 17/11-window cases are checked against the production
+`AdjustedDifficulty` calculation; alternative windows such as 34 targets are
+simulation-only.
+
+Run it with:
+
+```sh
+cargo test -p zakura-header-chain table_driven_difficulty_simulator -- --ignored --nocapture
+```

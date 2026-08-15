@@ -7,14 +7,13 @@ remains authoritative.
 
 ## Single-planner fork choice
 
-Four events can change the selected header chain. Peers add headers. Full state reports
-verified blocks and consensus-invalid bodies. A node administrator can exclude or
-restore a block through `invalidateblock` and `reconsiderblock`. Finalization moves the
-point below which the node will not reorganize.
+Several inputs can change the selected header chain. New headers extend the DAG.
+Validation results and explicit block exclusions change which headers are eligible.
+Finalization changes the root from which the engine selects a chain.
 
-Separate code paths must not update fork choice independently. They could choose
-different tips, or a late result could overwrite a newer result. Each path now reports
-what it observed to one planner. The planner alone selects the best eligible tip.
+The engine sends every input through one planner. Independent fork-choice updates could
+select different tips. A late result could also overwrite a newer result. Each path
+reports what it observed to the planner. The planner selects the best eligible tip.
 
 `invalidateblock` makes the named block and its descendants ineligible for selection.
 It does not delete them. `reconsiderblock` removes that exclusion, so the branch can
@@ -23,7 +22,7 @@ these calls as `OperatorInvalidate` and `OperatorReconsider` events.
 
 ## Header-chain state
 
-[`MemHeaderStore`](../../../crates/zakura-header-chain/src/graph/mod.rs) holds every retained
+[`MemHeaderStore`](../../../crates/zakura-header-chain/src/graph.rs) holds every retained
 header in a directed acyclic graph (DAG). Each `HeaderNode` is keyed by its consensus
 hash and names its parent. The finalized `Frontier` is the graph root. A `Frontier`
 contains both height and hash, so it identifies one position on one branch.
@@ -63,16 +62,19 @@ parent context.
 The planner then checks parent linkage, height, work, difficulty, and time against the
 staged graph. It admits a header only after every required check passes. This implements
 [validation before admission (`LC-VAL-11`)](../../specs/fork-aware-header-chain-engine.md#lc-val-11).
-After planning, `verify_plan` independently checks the resulting graph, projections,
-generation changes, and protected nodes before the runtime writes anything.
+After planning,
+[`verify_plan`](../../../crates/zakura-header-chain/src/transition/invariants.rs)
+independently checks the resulting graph, projections, generation changes, and protected
+nodes before the runtime writes anything.
 
 ## Transition commit order
 
 `MemHeaderStore` contains the committed graph.
 [`GraphOverlay`](../../../crates/zakura-header-chain/src/graph/overlay.rs) reads that graph
-and records staged changes without mutating it. Planning extracts those changes as a
-`GraphDelta`. The runtime applies the delta to `MemHeaderStore` only after the durable
-write succeeds.
+and records staged changes without mutating it.
+[`HeaderChainEngine`](../../../crates/zakura-header-chain/src/transition/engine.rs)
+extracts those changes as a `GraphDelta`. The runtime applies the delta to
+`MemHeaderStore` only after the durable write succeeds.
 
 ```mermaid
 sequenceDiagram
@@ -82,7 +84,6 @@ sequenceDiagram
   participant O as GraphOverlay
   participant M as MemHeaderStore
   participant D as Durable store
-  participant P as Observers
 
   W->>R: apply(request)
   R->>E: plan_transition(request)
@@ -93,16 +94,31 @@ sequenceDiagram
   E-->>R: TransitionPlan
   R->>D: write change set atomically
 
-  alt write succeeds
-    D-->>R: success
-    R->>E: install_committed_transition(plan)
-    E->>M: apply GraphDelta
-    R->>P: publish snapshot
-    R-->>W: success
-  else write fails
+  alt write fails
     D-->>R: error
-    R-->>W: error; memory and observers stay unchanged
+    R-->>W: error, memory and observers remain unchanged
+  else write succeeds
+    D-->>R: success
   end
+```
+
+After the durable write succeeds, the runtime installs the same plan in memory. It then
+publishes the resulting snapshot:
+
+```mermaid
+sequenceDiagram
+  participant W as State writer
+  participant R as HeaderChainRuntime
+  participant E as HeaderChainEngine
+  participant M as MemHeaderStore
+  participant P as Observers
+
+  R->>E: install_committed_transition(plan)
+  E->>M: apply GraphDelta
+  M-->>E: updated
+  E-->>R: installed
+  R-)P: publish snapshot
+  R-->>W: success
 ```
 
 The runtime updates disk first, memory second, and observers last. After a crash,
@@ -115,7 +131,7 @@ the runtime commits the DAG changes, metadata, projections, and related indexes 
 RocksDB batch before it publishes the new snapshot.
 
 Startup uses
-[`audit_store`](../../../crates/zakura-header-chain/src/transition/recovery/mod.rs) while
+[`audit_store`](../../../crates/zakura-header-chain/src/transition/recovery.rs) while
 publication is disabled. The audit checks the stored source rows and rebuilds derived
 indexes and projections. It refuses inconsistencies that it cannot reconstruct.
 
@@ -152,9 +168,12 @@ sequenceDiagram
 
   P-->>N: headers on an alternate branch
   N->>D: prepare_header_target
-  D->>S: read validation context
-  S-->>D: prepared target
-  N->>D: apply_header_target
+  D->>S: request validation lease
+  S-->>D: validation lease
+  D->>D: validate and seal target
+  D-->>N: PreparedHeaderTarget
+  N->>N: confirm request and authority are current
+  N->>D: apply_header_target(PreparedHeaderTarget)
   D->>S: apply prepared headers
   S->>E: plan InsertHeaders
   E->>E: validate and score eligible tips
@@ -198,7 +217,7 @@ the anchor and tip that a request belongs to. It deliberately omits height becau
 fork switch can replace a branch without changing its height.
 
 When a result returns, `Gate` in
-[`completion.rs`](../../../crates/zakura-header-chain/src/work/completion.rs) compares its branch
+[`ownership.rs`](../../../crates/zakura-header-chain/src/ownership.rs) compares its branch
 and generation with the current snapshot. It accepts current work and rejects stale
 work. It ignores `state_version` because unrelated transitions increment that counter
 and would cancel valid requests. The scheduler uses the same branch and generation to
@@ -229,7 +248,7 @@ and verifies the result. This boundary implements
 [block-sync concerns excluded (`LC-SCOPE-06`)](../../specs/fork-aware-header-chain-engine.md#lc-scope-06):
 unrelated block-sync policy cannot affect header fork choice.
 
-[`retention.rs`](../../../crates/zakura-header-chain/src/transition/planner/retention.rs) protects the
+[`retention.rs`](../../../crates/zakura-header-chain/src/retention.rs) protects the
 selected and verified paths. When protected state fills the node limit, the engine
 refuses admission instead of deleting either path. This implements
 [fork and node limits (`LC-RETAIN-01`)](../../specs/fork-aware-header-chain-engine.md#lc-retain-01).
@@ -252,7 +271,8 @@ it between preparation and application.
 is the sole header-chain writer and publisher. The runtime builds one durable batch,
 installs the committed transition, and publishes the new snapshot in that order.
 
-The header-chain column families use a `_v1` suffix, so a future incompatible encoding
+The [header-chain schema](../../../crates/zakura-state/src/service/finalized_state.rs)
+uses a `_v1` suffix for each header-chain column family. A future incompatible encoding
 can use a new family instead of reinterpreting existing data. The
 [`migration`](../../../crates/zakura-state/src/service/finalized_state/header_chain/migration.rs)
 builds an initial DAG when an existing database stores only one chain.

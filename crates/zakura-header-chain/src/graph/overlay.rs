@@ -153,12 +153,16 @@ impl<'a> GraphOverlay<'a> {
         base_graph: &'a MemHeaderStore,
         delta: &GraphDelta,
     ) -> Result<Self, GraphError> {
+        // A delta is valid only for the exact graph revision from which it was derived.
         if delta.base_revision != base_graph.graph_revision {
             return Err(GraphError::StaleDelta {
                 current_revision: base_graph.graph_revision,
                 delta_base_revision: delta.base_revision,
             });
         }
+
+        // Index the sparse changes for overlay lookups, rejecting input that would be silently
+        // overwritten while collecting into maps or sets.
         let updated_header_nodes_by_hash = delta
             .updated_header_nodes
             .iter()
@@ -186,6 +190,7 @@ impl<'a> GraphOverlay<'a> {
             return Err(GraphError::DuplicateHeaderNode(duplicate));
         }
         for hash in &deleted_header_hashes {
+            // A node cannot be both updated and deleted, and deletions must refer to live nodes.
             if updated_header_nodes_by_hash.contains_key(hash) {
                 return Err(GraphError::DuplicateHeaderNode(*hash));
             }
@@ -210,6 +215,9 @@ impl<'a> GraphOverlay<'a> {
                 .expect("different map and sequence lengths imply a duplicate hash");
             return Err(GraphError::DuplicateHeaderNode(duplicate));
         }
+
+        // Derive only the child-index changes caused by added and deleted nodes. Existing updated
+        // nodes retain their parent relationship from the audited base graph.
         let mut added_header_children: HashMap<_, HashSet<_>> = HashMap::new();
         let mut removed_header_children: HashMap<_, HashSet<_>> = HashMap::new();
         for node in updated_header_nodes_by_hash.values() {
@@ -232,6 +240,9 @@ impl<'a> GraphOverlay<'a> {
                     .insert(node.hash);
             }
         }
+
+        // Project optional scalar changes and the resulting node count without materializing the
+        // complete graph.
         let finalized_frontier = delta
             .finalized_frontier
             .unwrap_or(base_graph.finalized_frontier);
@@ -259,6 +270,9 @@ impl<'a> GraphOverlay<'a> {
                 == WorkCoordinateTransition::RebaseToFinalizedFrontier,
             header_node_count,
         };
+
+        // Validate only invariants that can change at the sparse overlay boundary, then derive the
+        // eligible-tip index for the projected graph.
         overlay.validate_delta_nodes()?;
         overlay.refresh_delta_eligible_header_tips();
         Ok(overlay)

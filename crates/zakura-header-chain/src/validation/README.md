@@ -75,9 +75,11 @@ For the atomic transition and commit model around admission, see
 `nBits` is a compact encoding of a 256-bit target number, `T`.
 
 A mined header is valid only when:
+
 ```
 header hash ≤ T
 ```
+
 - Smaller target -> fewer acceptable hashes -> harder mining.
 - Larger target -> more acceptable hashes -> easier mining.
 
@@ -86,11 +88,13 @@ header hash ≤ T
 ### The basic adjustment idea
 
 The intended formula is conceptually:
+
 ```
 new target ≈ recent average target × actual mining time / desired mining time
 ```
 
 If blocks arrived too quickly:
+
 ```
 actual time < desired time
 -> target becomes smaller
@@ -98,6 +102,7 @@ actual time < desired time
 ```
 
 If blocks arrived too slowly:
+
 ```
 actual time > desired time
 -> target becomes larger
@@ -118,18 +123,21 @@ desired 17-block timespan = 17 × 75 = 1,275 seconds (21 minutes and 15 seconds)
 **2. Average the previous 17 targets**
 
 Zakura expands the nBits values from blocks:
+
 ```
 h-17 ... h-1
 ```
 
 and calculates their exact arithmetic mean:
+
 ```
 MeanTarget = average(previous 17 targets)
 ```
 
 Why average targets?
+
 - Because the previous block alone could be unusually easy or hard. A 17-block average provides a smoother baseline and reduces oscillation
-- Not mediuan becasue Targets are validated consensus values, not arbitrary measurements. The arithmetic mean answers: "How hard, on average, were the last 17 blocks expected to be?".
+- Not median because Targets are validated consensus values, not arbitrary measurements. The arithmetic mean answers: "How hard, on average, were the last 17 blocks expected to be?".
 
 **3. Estimate how long those blocks took**
 
@@ -147,6 +155,7 @@ This is why up to 28 predecessor headers are required.
 The timestamps from `h-17` through `h-12` are deliberately not part of either median. The two 11-block groups provide robust estimates of time near opposite ends of a roughly 17-block interval.
 
 Why medians?
+
 - A median tolerates individual dishonest or inaccurate timestamps. Moving it substantially requires manipulating several timestamps, not just one.
 
 **4. Damp the difference**
@@ -154,6 +163,7 @@ Why medians?
 Suppose the desired timespan is 1,275 seconds, but the measured timespan is 1,700 seconds.
 
 Without damping, the algorithm would react to the entire 425-second difference. Instead:
+
 ```
 difference = 1,700 − 1,275 = 425
 damped difference = trunc(425 / 4) = 106
@@ -161,18 +171,21 @@ damped timespan = 1,275 + 106 = 1,381 seconds
 ```
 
 Only one quarter of the observed deviation is applied. Why?
+
 - Proof-of-work block arrival is naturally random. Reacting fully after every block would cause difficulty to overcorrect and oscillate.
 - Division truncates toward zero, including for negative values.
 
-5. Bound the adjustment
+**5. Bound the adjustment**
 
 The damped timespan is restricted to:
+
 ```
 minimum = 84% of desired timespan
 maximum = 132% of desired timespan
 ```
 
 For a 1,275-second desired timespan:
+
 ```
 minimum = 1,071 seconds
 maximum = 1,683 seconds
@@ -183,6 +196,7 @@ Therefore, even an extreme timestamp interval cannot make the target scale by le
 These are called `PoWMaxAdjustUp` = 16% and `PoWMaxAdjustDown` = 32% in the specification. Strictly speaking, these percentages bound the timespan/target adjustment. Percentage changes in reciprocal human-readable “difficulty” are not exactly symmetrical.
 
 Why bound it?
+
 - Prevent abrupt changes caused by random block timing.
 - Reduce the effect of timestamp manipulation.
 - Prevent one unusual window from catastrophically changing difficulty.
@@ -191,12 +205,14 @@ Why bound it?
 **6. Scale the average target**
 
 Conceptually:
+
 ```
 new target =
     MeanTarget × bounded timespan / desired timespan
 ```
 
 Using the earlier example:
+
 ```
 bounded timespan = 1,381
 desired timespan = 1,275
@@ -209,6 +225,7 @@ The target becomes about 8.3% larger, so the next block is somewhat easier.
 **7. Apply the proof-of-work limit**
 
 The result is capped:
+
 ```
 new target = min(new target, PoWLimit)
 ```
@@ -220,6 +237,7 @@ Without this cap, prolonged slow mining or manipulated timestamps could eventual
 **8. Convert the target to nBits**
 
 Finally:
+
 ```
 expected nBits = ToCompact(new target)
 ```
@@ -245,16 +263,19 @@ times from h-28 through h-18        = 11 blocks
 ```
 
 The actual timespan is:
+
 ```
 MedianTime(h) − MedianTime(h − 17)
 ```
 
 Each `MedianTime(x)` looks backward 11 blocks. Therefore the older median reaches back:
+
 ```
 (h − 17) − 11 = h − 28
 ```
 
 Diagram:
+
 ```
 h-28 ........ h-18 | h-17 ...... h-12 | h-11 ........ h-1 | h
  older median       target-only         newer median      candidate
@@ -270,21 +291,24 @@ Why this arrangement?
 - Some data overlaps: the newest 11 blocks contribute both targets and the newer timestamp median.
 
 So 28 is not an arbitrary smoothing period. It follows directly from:
+
 ```
 17-block measured interval + 11-block endpoint median = 28 predecessors
 ```
 
 **What about 17 and 11?**
 
-These are protocol desing parameters, not mathematically inevitable values.
+These are protocol design parameters, not mathematically inevitable values.
 
 - Why 17 targets?
 
 Zcash inherited a DigiShield-style per-block adjustment. A 17-block average balances:
+
 - **Responsiveness**: a smaller window reacts quickly to hash-rate changes.
 - **Stability**: a larger window smooths random block-arrival variance.
 
 At Zcash’s original 150-second spacing:
+
 ```
 17 × 150 seconds = 2,550 seconds = 42.5 minutes
 ```
@@ -303,6 +327,7 @@ The value 11 comes from Bitcoin-style median-time-past handling. Its useful prop
 - It smooths timestamp noise without introducing an excessively long delay.
 
 Conceptually:
+
 ```
 11 timestamps → sorted → choose the 6th
 ```
@@ -318,7 +343,8 @@ The calculation uses up to 28 predecessors:
 - The result can never become easier than the network proof-of-work limit.
 
 Relevant specification:
-- https://zips.z.cash/protocol/protocol.pdf#difficulty
-- https://zips.z.cash/protocol/protocol.pdf#nbits
+
+- [Zcash §7.7.2](https://zips.z.cash/protocol/protocol.pdf#difficulty)
+- [Zcash nBits encoding](https://zips.z.cash/protocol/protocol.pdf#nbits)
 - [ZIP-208: Shorter Block Target Spacing](https://zips.z.cash/zip-0208)
 - [ZIP-218: 25-second Block Target Spacing](https://github.com/zcash/zips/blob/main/zips/zip-0218.md)

@@ -61,16 +61,23 @@ pub(crate) async fn run_scenario(
 
     let initial_header = scenario.initial_best_header.min(target);
     let initial_header_hash = corpus_hash(&corpus, initial_header);
+    // Production genesis sync waits 30s before downloading bodies when the
+    // header tip is a full checkpoint gap ahead of height 0. These scenarios
+    // start with a fully known, static header chain, so that wait would stall
+    // every ≥400-block run and fire before timing-sensitive peer degradations.
+    // Starting one block past genesis keeps the quiet period from arming.
+    let initial_verified = target.min(block::Height(1)).min(initial_header);
+    let initial_verified_hash = corpus_hash(&corpus, initial_verified);
 
     // The commit driver advances one shared mock frontier as bodies apply.
     // The timeline driver rolls it back after a verified reset.
-    let apply = MockApplyFrontier::new(corpus.clone());
+    let apply = MockApplyFrontier::with_committed_height(corpus.clone(), initial_verified);
     let initial = fuzz_snapshot(
         1,
         1,
         1,
         zakura_header_chain::Frontier::new(block::Height(0), genesis_hash),
-        zakura_header_chain::Frontier::new(block::Height(0), genesis_hash),
+        zakura_header_chain::Frontier::new(initial_verified, initial_verified_hash),
         zakura_header_chain::Frontier::new(initial_header, initial_header_hash),
     );
     let (snapshots, committed_snapshots) = watch::channel(Some(initial));
@@ -79,8 +86,8 @@ pub(crate) async fn run_scenario(
     let mut startup = crate::zakura::BlockSyncStartup::new_with_committed_snapshots(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: genesis_hash,
+            verified_block_tip: initial_verified,
+            verified_block_hash: initial_verified_hash,
         },
         (initial_header, initial_header_hash),
         committed_snapshots,
@@ -91,7 +98,7 @@ pub(crate) async fn run_scenario(
 
     let (handle, actions, reactor_task) = crate::zakura::spawn_block_sync_reactor(startup);
 
-    let (committed_tx, mut committed_rx) = watch::channel(block::Height(0));
+    let (committed_tx, mut committed_rx) = watch::channel(initial_verified);
 
     let mut tasks = Vec::new();
     tasks.push(spawn_action_driver(

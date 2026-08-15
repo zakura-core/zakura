@@ -190,10 +190,29 @@ pub(crate) struct MockApplyOutcome {
 
 impl MockApplyFrontier {
     pub(crate) fn new(corpus: SyntheticBlockCorpus) -> Self {
+        Self::with_committed_height(corpus, block::Height(0))
+    }
+
+    /// Start with `height` already on the mock commit frontier.
+    ///
+    /// The block-sync fuzzer uses this to begin one block past genesis so the
+    /// production empty-state header quiet period does not delay body download.
+    pub(crate) fn with_committed_height(
+        corpus: SyntheticBlockCorpus,
+        height: block::Height,
+    ) -> Self {
+        let frontier_hash = if height == block::Height(0) {
+            mainnet_genesis_hash()
+        } else {
+            corpus
+                .block_at(height)
+                .map(|block| block.hash())
+                .unwrap_or_else(mainnet_genesis_hash)
+        };
         Self {
             inner: Arc::new(StdMutex::new(MockApplyFrontierState {
-                frontier: block::Height(0),
-                frontier_hash: mainnet_genesis_hash(),
+                frontier: height,
+                frontier_hash,
             })),
             corpus,
         }
@@ -1000,6 +1019,18 @@ fn mock_apply_frontier_commits_duplicates_and_rejects_gaps() {
     let third = apply.apply(&block_3);
     assert_eq!(third.result, BlockApplyResult::Committed);
     assert_eq!(third.frontiers.verified_block_tip, block::Height(3));
+}
+
+#[test]
+fn mock_apply_frontier_can_start_past_genesis() {
+    let corpus =
+        SyntheticBlockCorpus::generate(3, SYNTHETIC_CORPUS_SEED, SyntheticBlockShape::default());
+    let apply = MockApplyFrontier::with_committed_height(corpus.clone(), block::Height(1));
+    let block_2 = corpus.block_at(block::Height(2)).expect("height 2 exists");
+
+    let outcome = apply.apply(&block_2);
+    assert_eq!(outcome.result, BlockApplyResult::Committed);
+    assert_eq!(outcome.frontiers.verified_block_tip, block::Height(2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

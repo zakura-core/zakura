@@ -527,6 +527,45 @@ async fn empty_state_body_queries_wait_for_the_latest_header_quiet_period() {
     reactor_task.abort();
 }
 
+#[tokio::test]
+async fn past_genesis_body_queries_ignore_far_ahead_header_quiet_period() {
+    let finalized = zakura_header_chain::Frontier::new(block::Height(0), block::Hash([1; 32]));
+    let verified = zakura_header_chain::Frontier::new(block::Height(1), block::Hash([2; 32]));
+    let header = zakura_header_chain::Frontier::new(
+        block::Height(EMPTY_STATE_HEADER_QUIET_MIN_LAG + 100),
+        block::Hash([3; 32]),
+    );
+    let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_snapshot(
+        1, 1, 1, finalized, verified, header,
+    )));
+    let startup = BlockSyncStartup::new_with_committed_snapshots(
+        BlockSyncFrontiers {
+            finalized_height: finalized.height,
+            verified_block_tip: verified.height,
+            verified_block_hash: verified.hash,
+        },
+        (header.height, header.hash),
+        snapshot_rx,
+        ZakuraBlockSyncConfig::default(),
+    );
+    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    let action = next_action(&mut actions).await;
+    assert!(
+        matches!(
+            action,
+            BlockSyncAction::QueryNeededBlocks {
+                from: block::Height(2),
+                best_header_tip,
+                ..
+            } if best_header_tip == header.height
+        ),
+        "body work past genesis must start immediately even with a far-ahead header tip, got {action:?}",
+    );
+
+    reactor_task.abort();
+}
+
 #[test]
 fn state_is_only_frontier_publisher() {
     const BLOCK_DRIVER: &str =

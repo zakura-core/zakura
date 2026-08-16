@@ -459,8 +459,12 @@ fn load_transition_engine(
 fn settle_deferred_before_publication(
     store: &HeaderChainStore,
     config: &EngineConfig,
+    has_due_deferred: bool,
 ) -> Result<HeaderChainEngine, HeaderChainStoreError> {
     let mut engine = load_transition_engine(store)?;
+    if !has_due_deferred {
+        return Ok(engine);
+    }
     let before = engine.snapshot();
     let context = TransitionContext {
         config,
@@ -2682,7 +2686,12 @@ impl HeaderChainStore {
             #[cfg(test)]
             fault(FaultPoint::AfterCommit)?;
         }
-        let transition_engine = settle_deferred_before_publication(&self, config)?;
+        let has_due_deferred = plan
+            .deferred_entries
+            .iter()
+            .any(|(until, _)| *until <= Utc::now());
+        let transition_engine =
+            settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
@@ -2765,7 +2774,12 @@ impl HeaderChainStore {
         if !target.is_clean() {
             self.db.write(self.recovery_batch(&target)?)?;
         }
-        let transition_engine = settle_deferred_before_publication(&self, integrated_config)?;
+        let has_due_deferred = target
+            .deferred_entries
+            .iter()
+            .any(|(until, _)| *until <= Utc::now());
+        let transition_engine =
+            settle_deferred_before_publication(&self, integrated_config, has_due_deferred)?;
         let current = transition_engine.snapshot();
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
@@ -2841,7 +2855,12 @@ impl HeaderChainStore {
         if !final_audit.is_clean() {
             self.db.write(self.recovery_batch(&final_audit)?)?;
         }
-        let transition_engine = settle_deferred_before_publication(&self, config)?;
+        let has_due_deferred = final_audit
+            .deferred_entries
+            .iter()
+            .any(|(until, _)| *until <= Utc::now());
+        let transition_engine =
+            settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
@@ -3055,7 +3074,12 @@ impl HeaderChainStore {
             self.db.write(self.recovery_batch(&final_audit)?)?;
         }
         self.clear_reconstruction_progress()?;
-        let transition_engine = settle_deferred_before_publication(&self, config)?;
+        let has_due_deferred = final_audit
+            .deferred_entries
+            .iter()
+            .any(|(until, _)| *until <= Utc::now());
+        let transition_engine =
+            settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {

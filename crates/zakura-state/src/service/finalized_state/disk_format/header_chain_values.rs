@@ -1885,13 +1885,13 @@ mod tests {
                 ..
             })
         ));
-        let mut metadata = vec![0, 0, 0, 3];
+        let mut metadata = vec![0, 0, 0, 4];
         metadata.resize(512, 0);
         assert_eq!(
             EngineMetadata::decode(&metadata),
-            Err(HeaderChainValueError::UnsupportedDiskFormat(3))
+            Err(HeaderChainValueError::UnsupportedDiskFormat(4))
         );
-        metadata[3] = 2;
+        metadata[3] = 3;
         metadata[4] = 9;
         assert!(matches!(
             EngineMetadata::decode(&metadata),

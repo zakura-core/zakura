@@ -328,7 +328,7 @@ fn full_state_insertion_rejects_a_contextually_invalid_header() {
 }
 
 #[test]
-fn verified_chain_change_rejects_an_operator_invalid_retained_header() {
+fn f_225511_verified_chain_change_rejects_an_operator_invalid_retained_header() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
@@ -390,7 +390,7 @@ fn verified_chain_change_rejects_an_operator_invalid_retained_header() {
 }
 
 #[test]
-fn verified_chain_change_rejects_a_deferred_retained_header() {
+fn f_225511_verified_chain_change_rejects_a_deferred_retained_header() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
@@ -436,6 +436,85 @@ fn verified_chain_change_rejects_a_deferred_retained_header() {
     )
     .expect_err("a deferred header cannot become the verified winner");
 
+    assert_eq!(
+        error,
+        TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::Header(
+            HeaderViolation::Path {
+                kind: HeaderPathKind::Verified,
+                problem: HeaderPathProblem::Ineligible,
+            }
+        ))
+    );
+}
+
+#[test]
+fn f_225511_verified_chain_change_rejects_inherited_ineligibility() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .expect("the finalized anchor exists")
+        .header
+        .difficulty_threshold;
+    let tip = insert_verified_branch(&mut store.graph, anchor, 2, difficulty, 0x63);
+    let intermediate = store
+        .graph
+        .header_ancestor(tip.hash, block::Height(1))
+        .expect("the retained path is coherent")
+        .expect("the two-header path has an intermediate");
+    store
+        .graph
+        .add_eligibility_reason(
+            intermediate.hash,
+            EligibilityReason::operator_invalid(
+                intermediate.hash,
+                crate::OperatorInvalidationId::new([0x64; 16]),
+                EvidenceId::from_digest([0x65; 32]),
+            ),
+        )
+        .expect("the fixture marks the intermediate ineligible");
+    assert_eq!(
+        store
+            .graph
+            .header_node(tip.hash)
+            .expect("the descendant remains retained")
+            .eligibility
+            .inherited_from,
+        Some(intermediate.hash)
+    );
+    synchronize_fixture(&mut store, anchor);
+    let path = [intermediate, tip]
+        .into_iter()
+        .map(|frontier| {
+            let node = store
+                .graph
+                .header_node(frontier.hash)
+                .expect("each path member remains retained");
+            crate::VerifiedHeaderRef {
+                height: node.height,
+                hash: node.hash,
+                header: node.header.clone(),
+            }
+        })
+        .collect();
+
+    let error = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+                full_state_transition_id: EvidenceId::from_digest([0x66; 32]),
+                old_tip: anchor,
+                new_path: path,
+                cause: crate::VerifiedChangeCause::Grow,
+            }),
+        },
+        &context(&config, &clock, Some(&authority)),
+    )
+    .expect_err("an inherited-ineligible header cannot enter the verified projection");
     assert_eq!(
         error,
         TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::Header(
@@ -585,6 +664,10 @@ fn f_225516_invalid_intermediate_rejects_the_complete_path_before_mutation() {
             .body_validation_state,
         BodyValidationState::Verified { .. }
     ));
+    let mut after_refusal = store.graph.clone();
+    after_refusal
+        .remove_header_leaf(descendant)
+        .expect("the rejected invalid side-branch leaf remains evictable");
 }
 
 #[test]

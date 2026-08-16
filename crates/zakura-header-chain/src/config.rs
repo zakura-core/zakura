@@ -665,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_config_rejects_conflicting_trust_sources() {
+    fn f_225510_engine_config_rejects_conflicting_trust_sources() {
         let regtest_block = regtest_genesis_block();
         let regtest_network = Network::new_regtest(RegtestParameters::default());
         let regtest_anchor = TrustedAnchor {
@@ -761,6 +761,34 @@ mod tests {
                 first_source: "bootstrap anchor",
                 second_source: "release pin",
             })
+        );
+
+        let first = Frontier::new(block::Height(2), block::Hash([0x21; 32]));
+        let second = Frontier::new(block::Height(3), block::Hash([0x22; 32]));
+        let ordered = EngineConfig::new(
+            EngineMode::HeadersOnly,
+            Network::new_regtest(RegtestParameters::default()),
+            TrustedAnchor {
+                frontier: Frontier::new(block::Height(0), regtest_block.hash()),
+                header: regtest_block.header.clone(),
+            },
+            CheckpointSet::new([first, second]).expect("the ordered checkpoints are unique"),
+        )
+        .expect("the ordered trust pins agree");
+        let reversed = EngineConfig::new(
+            EngineMode::HeadersOnly,
+            Network::new_regtest(RegtestParameters::default()),
+            TrustedAnchor {
+                frontier: Frontier::new(block::Height(0), regtest_block.hash()),
+                header: regtest_block.header.clone(),
+            },
+            CheckpointSet::new([second, first]).expect("the reversed checkpoints are unique"),
+        )
+        .expect("the reversed trust pins agree");
+        assert_eq!(ordered.trust_pins(), reversed.trust_pins());
+        assert_eq!(
+            ordered.trust_anchor_digest(),
+            reversed.trust_anchor_digest()
         );
     }
 

@@ -1,8 +1,6 @@
-# Targeted V12 security closure
+# V12 security fixes
 
-This record covers the nine V12 findings that remain outside the auxiliary-authority, bounded-recovery, and
-protected-state pull requests. The change set fixes each reachable failure without importing the deferred H4 through
-H7 architecture.
+This document maps nine V12 security findings to their corrections and primary regression tests.
 
 | Finding | Correction | Primary regression |
 | --- | --- | --- |
@@ -20,10 +18,9 @@ H7 architecture.
 
 The network-policy field changes the provisional header-chain format from version 2 to version 3.
 
-The format gate found no released or recorded persistent consumer of the format that merged through PR #586. Release
-v1.2.0 predates the PR #586 merge. No repository tag contains the merge commit. The recorded persistent test runs use
-older source commits. The change therefore updates the provisional schema directly and requires older provisional
-stores to rebuild instead of inferring policy from a network identifier.
+Release v1.2.0 predates the header-chain durable format. No release tag contains version 2 of this provisional format.
+The change therefore updates the schema directly. A version 2 store must rebuild because recovery cannot infer its
+complete network policy from a network identifier.
 
 ## Performance contracts
 
@@ -39,9 +36,3 @@ The corrections preserve these path-specific budgets:
 
 Ordinary header admission adds no finding-related graph scan. These corrections do not clone the complete graph or
 sort all retained nodes or candidate tips.
-
-## Deferred architecture
-
-This closure does not import the H4 policy-identity model, the H5 canonical commit boundary, the H6 maintained
-deferred-deadline index, or the H7 public-surface cleanup. Those changes remain separate future refactors. Human review
-and a cumulative V12 rerun remain required before the team claims release closure.

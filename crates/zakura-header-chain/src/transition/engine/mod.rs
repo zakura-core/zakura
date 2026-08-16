@@ -78,12 +78,12 @@ pub struct HeaderChainEngine {
 
 /// Private identity of one exact in-memory transition source.
 #[derive(Clone, Debug)]
-pub(crate) struct EngineSource {
+pub(crate) struct EngineTransitionSource {
     instance_capability: Arc<()>,
     revision: u64,
 }
 
-impl EngineSource {
+impl EngineTransitionSource {
     fn matches(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.instance_capability, &other.instance_capability)
             && self.revision == other.revision
@@ -282,7 +282,9 @@ impl HeaderChainEngine {
         &mut self,
         transition: EngineTransition,
     ) -> Result<(), CommittedTransitionError> {
-        if !self.source().matches(transition.source())
+        if !self
+            .transition_source()
+            .matches(transition.transition_source())
             || self.snapshot() != *transition.snapshot_before_commit()
         {
             return Err(CommittedTransitionError::StaleSource);
@@ -297,8 +299,8 @@ impl HeaderChainEngine {
     }
 
     /// Return the private identity of this exact in-memory source revision.
-    pub(crate) fn source(&self) -> EngineSource {
-        EngineSource {
+    pub(crate) fn transition_source(&self) -> EngineTransitionSource {
+        EngineTransitionSource {
             instance_capability: self.instance_capability.clone(),
             revision: self.source_revision,
         }

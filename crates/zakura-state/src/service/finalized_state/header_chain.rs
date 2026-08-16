@@ -455,7 +455,11 @@ fn load_transition_engine(
     .map_err(|_| HeaderChainStoreError::Incoherent("audited engine state is invalid"))
 }
 
-/// Apply the one time-dependent startup transition before constructing a publisher.
+/// Reevaluate due recovered deferrals before constructing a publisher.
+///
+/// The function uses the normal planner and durable commit path. It leaves the recovered engine
+/// unchanged when no deferral is due or the planner derives no change. On success, the returned
+/// engine matches the durable state that the caller may publish.
 fn settle_deferred_before_publication(
     store: &HeaderChainStore,
     config: &EngineConfig,

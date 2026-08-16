@@ -116,7 +116,7 @@ pub(super) fn candidate_with_delta(
         .map(|node| Frontier::new(node.height, node.hash))
         .collect();
     PlanCandidate {
-        source: engine.source(),
+        transition_source: engine.transition_source(),
         snapshot_before_commit: engine.snapshot(),
         change_set: ChangeSet {
             put_nodes,

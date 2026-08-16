@@ -20,7 +20,7 @@ use super::{
 
 /// Inputs required to derive the atomic write set from settled projections.
 pub(super) struct DerivePlanInputs<'a> {
-    pub(super) source: crate::transition::engine::EngineSource,
+    pub(super) transition_source: crate::transition::engine::EngineTransitionSource,
     pub(super) snapshot_before_commit: EngineSnapshot,
     pub(super) metadata: EngineMetadata,
     pub(super) base_graph: &'a MemHeaderStore,
@@ -42,7 +42,7 @@ pub(super) fn derive_plan(
     inputs: DerivePlanInputs<'_>,
 ) -> Result<PlanCandidate, TransitionFailure> {
     let DerivePlanInputs {
-        source,
+        transition_source,
         snapshot_before_commit,
         mut metadata,
         base_graph,
@@ -181,7 +181,7 @@ pub(super) fn derive_plan(
         metadata,
     };
     Ok(PlanCandidate {
-        source,
+        transition_source,
         snapshot_before_commit,
         change_set,
         graph_delta,
@@ -204,7 +204,7 @@ pub(super) fn no_change(
 ) -> Result<PlanCandidate, TransitionFailure> {
     validate_authority(&event, context)?;
     Ok(PlanCandidate {
-        source: engine.source(),
+        transition_source: engine.transition_source(),
         snapshot_before_commit,
         change_set: ChangeSet {
             put_nodes: Vec::new(),
@@ -239,7 +239,7 @@ pub(super) fn resource_stalled(
         metadata.state_version = metadata.state_version.checked_next()?;
     }
     Ok(PlanCandidate {
-        source: engine.source(),
+        transition_source: engine.transition_source(),
         snapshot_before_commit,
         change_set: ChangeSet {
             put_nodes: Vec::new(),

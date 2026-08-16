@@ -10,7 +10,7 @@ use crate::{
 /// A complete projected write set awaiting independent invariant verification.
 #[derive(Clone, Debug)]
 pub struct PlanCandidate {
-    pub(crate) source: crate::transition::engine::EngineSource,
+    pub(crate) transition_source: crate::transition::engine::EngineTransitionSource,
     pub(crate) snapshot_before_commit: EngineSnapshot,
     pub(crate) change_set: ChangeSet,
     pub(crate) graph_delta: GraphDelta,
@@ -45,8 +45,10 @@ impl EngineTransition {
         Self { candidate }
     }
 
-    pub(crate) const fn source(&self) -> &crate::transition::engine::EngineSource {
-        &self.candidate.source
+    pub(crate) const fn transition_source(
+        &self,
+    ) -> &crate::transition::engine::EngineTransitionSource {
+        &self.candidate.transition_source
     }
 
     /// Borrow the verified inner candidate (tests and fuzzing only).

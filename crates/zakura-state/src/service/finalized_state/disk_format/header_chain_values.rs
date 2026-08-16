@@ -1369,6 +1369,7 @@ impl FallibleDiskValue for EngineMetadata {
             NetworkKind::Testnet => 1,
             NetworkKind::Regtest => 2,
         });
+        encoder.fixed(&value.network_policy_digest);
         encoder.fixed(&value.anchor_manifest_digest);
         put_frontier(&mut encoder, value.work_origin);
         encoder.u64(value.state_version.get());
@@ -1429,6 +1430,7 @@ impl FallibleDiskValue for EngineMetadata {
                 })
             }
         };
+        let network_policy_digest = decoder.array()?;
         let anchor_manifest_digest = decoder.array()?;
         let work_origin = get_frontier(&mut decoder)?;
         let state_version = StateVersion::new(decoder.u64()?);
@@ -1469,6 +1471,7 @@ impl FallibleDiskValue for EngineMetadata {
             disk_format,
             mode,
             network_id,
+            network_policy_digest,
             anchor_manifest_digest,
             work_origin,
             state_version,
@@ -1731,6 +1734,7 @@ mod tests {
             disk_format: HeaderChainDiskVersion::CURRENT,
             mode: EngineMode::HeadersOnly,
             network_id: NetworkKind::Regtest,
+            network_policy_digest: [12; 32],
             anchor_manifest_digest: [13; 32],
             work_origin: frontier(0, 1),
             state_version: StateVersion::new(2),
@@ -1773,7 +1777,7 @@ mod tests {
             )),
         };
         let bytes = metadata.encode().expect("metadata encodes");
-        assert_eq!(&bytes[..6], &[0, 0, 0, 2, 1, 2]);
+        assert_eq!(&bytes[..6], &[0, 0, 0, 3, 1, 2]);
         assert_eq!(EngineMetadata::decode(&bytes), Ok(metadata.clone()));
         let mut version_one_bytes = bytes.clone();
         version_one_bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
@@ -1804,7 +1808,7 @@ mod tests {
             [
                 "c041fc819cc43fcd28dd3ba7fe296271ae0c7225c9bbcdf1dd38152dc313346a",
                 "b887bf384510dfb1a255221a8c97066617cb145eaf3e272ad70dc94cd17a3802",
-                "3f4965a634583e651b4904de0601c44e934719dbcb4e22a783bf052b7c21e9eb",
+                "a57d37f3cadf2a983019c448ab61b130b1a2230af1e8206b6020c759d37984dc",
             ]
         );
     }

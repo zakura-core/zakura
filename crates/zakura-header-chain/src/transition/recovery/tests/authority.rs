@@ -507,6 +507,21 @@ fn fatal_configuration_mismatch_fails_before_collection_visit() {
 }
 
 #[test]
+fn f_225509_policy_mismatch_fails_before_collection_visit() {
+    let (mut store, config) = fixture();
+    store.metadata.network_policy_digest[0] ^= 1;
+    store.snapshot = store.metadata.snapshot();
+    store.failed_read = Some(AuditRead::HeaderNodes);
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Source {
+            violations: vec![AuditViolation::Configuration],
+        })
+    );
+}
+
+#[test]
 fn bounded_finality_history_continues_from_an_authenticated_checkpoint() {
     let (mut store, config) = fixture();
     let anchor = store.metadata.frontiers.finalized;

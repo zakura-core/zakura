@@ -394,6 +394,7 @@ mod tests {
                 disk_format: HeaderChainDiskVersion::CURRENT,
                 mode: EngineMode::Integrated,
                 network_id: NetworkKind::Testnet,
+                network_policy_digest: [2; 32],
                 anchor_manifest_digest: [1; 32],
                 work_origin: anchor,
                 state_version: StateVersion::new(0),

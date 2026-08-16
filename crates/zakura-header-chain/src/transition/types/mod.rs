@@ -31,6 +31,7 @@ pub use outcome::{
     NoChangeReceipt, RetiredWork, StaleReceipt, TransitionEffect, VctRootRepairState,
     VctRootRepairStatus,
 };
+pub(crate) use preparation::hash_network_policy;
 pub use preparation::{
     ContextFreePreparationReceipt, HeaderContextFact, PreparedHeader, PreparedHeaderBatch,
     ValidationLease,

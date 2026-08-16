@@ -276,7 +276,7 @@ impl PreparedHeaderBatch {
 }
 
 /// Hash the authenticated network policy into a replay or lease digest.
-pub(super) fn hash_network_policy(
+pub(crate) fn hash_network_policy(
     hasher: &mut Sha256,
     network: &zakura_chain::parameters::Network,
 ) {

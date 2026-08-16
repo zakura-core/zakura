@@ -99,8 +99,10 @@ For crates.io publishing:
    `./scripts/check-crate-publish-graph.sh` dry-run-publishes the publish
    set against the live index, then asserts that the Cargo.lock cargo
    writes into each packaged archive resolves every workspace crate at its
-   workspace version — a duplicated major passes the dry-run itself. It is
-   step 5 of `make pre-release`.
+   workspace version — a duplicated major passes the dry-run itself. PR CI
+   runs the same script as the `crates.io publish graph` job in
+   `tests-unit.yml` (part of `test success`), so a missing cascade bump
+   cannot merge. It is also step 5 of `make pre-release`.
 
 Partial version graphs are allowed, but all tooling must handle them. Do not
 assume every publishable crate has the `zakura` package version.
@@ -162,7 +164,9 @@ make pre-release RELEASE_TAG=<tag> BASE_TAG=<previous-tag>
 `check-crate-publish-graph.sh` needs network access and is the only check
 that resolves the publish set against the live index — packaging checks
 resolve every crate locally and cannot see that a published crate would be
-skipped. For a deliberately GitHub-only release candidate the documented
+skipped. PR CI runs it on every Cargo.toml change and in the merge queue
+so `main` stays publishable; `make pre-release` runs it again at release
+time. For a deliberately GitHub-only release candidate the documented
 override is `ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH=1` (workflow input
 `allow_unpublishable_crate_graph`); crates must not be published under it.
 

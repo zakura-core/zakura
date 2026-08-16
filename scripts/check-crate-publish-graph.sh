@@ -30,16 +30,25 @@
 #     archive: every workspace crate appearing in any packaged lock must
 #     resolve at its workspace version.
 #
-# Fix either by republishing the pinning crates with updated requirements
-# (scripts/prepare-release.sh plans these as "cascade" rows) or by making
-# the release candidate GitHub-only.
+# Fix either by patch-bumping the pinning dependents in the same PR
+# (scripts/prepare-release.sh plans these as "cascade" rows at release
+# time) or, for a GitHub-only release candidate, by using the override
+# below.
 #
 # Requires network access (sparse index queries plus a registry-backed
 # dry-run publish). No crates.io token is needed; nothing is uploaded.
 #
+# PR CI runs this as the `crates.io publish graph` job in tests-unit.yml
+# (part of the required `test success` check) so a missing cascade bump
+# cannot merge. Semver-checks cannot see this failure: it compares rustdoc
+# APIs, and a dependent whose type names are unchanged looks like "no
+# semver update required" even when its index copy still pins the old
+# major. It is also step 5 of `make pre-release`.
+#
 # Emergency override for a deliberately GitHub-only release: export
 # ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH=1 to downgrade either failure to a
-# warning, and note the override in the release PR.
+# warning, and note the override in the release PR. Do not set this in
+# ordinary PR CI.
 #
 # Usage:
 #   ./scripts/check-crate-publish-graph.sh
@@ -68,14 +77,18 @@ allow_unpublishable="${ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH:-0}"
 finish_unpublishable() {
   cat >&2 <<'EOF'
 
-Fix one of these ways:
-  - Republish the pinning crates: bump each one (patch + the release's
-    prerelease suffix) so its rewritten requirements ship to the index.
-    scripts/prepare-release.sh plans these automatically as "cascade" rows.
-  - Make the release candidate GitHub-only (no crates.io publishing) and
-    export ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH=1 (or check the
+Fix:
+  - Patch-bump each pinning dependent so its rewritten requirements
+    actually publish. A crate already at its published version is skipped,
+    and dependents resolve the index copy — local-only requirement edits
+    never ship. Between releases, that bump belongs in the same PR that
+    moved the requirement. At release time, scripts/prepare-release.sh
+    plans these as "cascade" rows.
+  - For a deliberately GitHub-only release candidate, export
+    ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH=1 (or check the
     allow_unpublishable_crate_graph input when dispatching the Create
-    release workflow). Note the override in the release PR.
+    release workflow). Note the override in the release PR and do not
+    publish crates.
 EOF
   if [ "$allow_unpublishable" = 1 ]; then
     echo >&2

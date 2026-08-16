@@ -22,7 +22,7 @@ these calls as `OperatorInvalidate` and `OperatorReconsider` events.
 
 ## Header-chain state
 
-[`MemHeaderStore`](https://github.com/zakura-core/zakura/blob/722f615550cb29637f3f5ed95f71e4522decd1cd/crates/zakura-header-chain/src/graph/mod.rs) holds every retained
+[`MemHeaderStore`](../../../crates/zakura-header-chain/src/graph/mod.rs) holds every retained
 header in a directed acyclic graph (DAG). Each `HeaderNode` is keyed by its consensus
 hash and names its parent. The finalized `Frontier` is the graph root. A `Frontier`
 contains both height and hash, so it identifies one position on one branch.
@@ -80,7 +80,7 @@ target scaling before multiplication can overflow. It reads Testnet's maximum-ti
 activation height from network parameters.
 
 After planning,
-[`verify_plan`](https://github.com/zakura-core/zakura/blob/722f615550cb29637f3f5ed95f71e4522decd1cd/crates/zakura-header-chain/src/transition/invariants/mod.rs)
+[`verify_candidate`](../../../crates/zakura-header-chain/src/transition/invariants/mod.rs)
 independently checks the resulting graph, projections, generation changes, and protected
 nodes before the runtime writes anything.
 
@@ -89,7 +89,7 @@ nodes before the runtime writes anything.
 `MemHeaderStore` contains the committed graph.
 [`GraphOverlay`](../../../crates/zakura-header-chain/src/graph/overlay.rs) reads that graph
 and records staged changes without mutating it.
-[`HeaderChainEngine`](https://github.com/zakura-core/zakura/blob/722f615550cb29637f3f5ed95f71e4522decd1cd/crates/zakura-header-chain/src/transition/engine/mod.rs)
+[`HeaderChainEngine`](../../../crates/zakura-header-chain/src/transition/engine/mod.rs)
 extracts those changes as a `GraphDelta`. The runtime applies the delta to
 `MemHeaderStore` only after the durable write succeeds.
 
@@ -108,7 +108,7 @@ sequenceDiagram
   O->>M: read committed nodes
   M-->>O: committed state
   O-->>E: GraphDelta
-  E-->>R: TransitionPlan
+  E-->>R: EngineTransition
   R->>D: write change set atomically
 
   alt write fails
@@ -148,7 +148,7 @@ the runtime commits the DAG changes, metadata, projections, and related indexes 
 RocksDB batch before it publishes the new snapshot.
 
 Startup uses
-[`audit_store`](https://github.com/zakura-core/zakura/blob/722f615550cb29637f3f5ed95f71e4522decd1cd/crates/zakura-header-chain/src/transition/recovery/mod.rs) while
+[`audit_store`](../../../crates/zakura-header-chain/src/transition/recovery/mod.rs) while
 publication is disabled. The audit rejects contradictions in authoritative rows. It
 repairs only indexes, projections, alarms, and other values that it can derive from those
 rows.
@@ -256,7 +256,7 @@ the anchor and tip that a request belongs to. It deliberately omits height becau
 fork switch can replace a branch without changing its height.
 
 When a result returns, `Gate` in
-[`completion.rs`](https://github.com/zakura-core/zakura/blob/722f615550cb29637f3f5ed95f71e4522decd1cd/crates/zakura-header-chain/src/work/completion.rs) compares its branch
+[`completion.rs`](../../../crates/zakura-header-chain/src/work/completion.rs) compares its branch
 and generation with the current snapshot. It accepts current work and rejects stale
 work. It ignores `state_version` because unrelated transitions increment that counter
 and would cancel valid requests. The scheduler uses the same branch and generation to
@@ -301,7 +301,7 @@ and verifies the result. This boundary implements
 [block-sync concerns excluded (`LC-SCOPE-06`)](../../specs/fork-aware-header-chain-engine.md#lc-scope-06):
 unrelated block-sync policy cannot affect header fork choice.
 
-[`retention.rs`](https://github.com/zakura-core/zakura/blob/722f615550cb29637f3f5ed95f71e4522decd1cd/crates/zakura-header-chain/src/transition/planner/retention.rs) protects the
+[`retention.rs`](../../../crates/zakura-header-chain/src/transition/planner/retention.rs) protects the
 selected path, the verified path, the path to every retained body that full state has
 verified, and nodes that active work still references. When protected state fills the
 node limit, the engine refuses admission. The

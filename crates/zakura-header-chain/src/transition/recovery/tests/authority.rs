@@ -41,21 +41,95 @@ fn canonical_work_and_recovery_time_are_authoritative() {
         Err(RecoveryFailure::Source { violations })
             if violations.contains(&AuditViolation::HeaderValidation(child_hash))
     ));
+}
 
+#[test]
+fn f_225512_recovery_preserves_elapsed_deferrals_for_normal_reevaluation() {
+    let (base, config) = fixture();
+    let child_hash = base.nodes[1].hash;
     let mut elapsed = base.clone();
+    let anchor = elapsed.metadata.frontiers.finalized;
     let until = elapsed.nodes[1].header.time - Duration::hours(2);
     elapsed.nodes[1].validation = crate::HeaderValidationState::DeferredUntil(until);
+    elapsed.metadata.frontiers.header_best = anchor;
+    elapsed.metadata.header_best_score = ChainScore::new(SuffixWork::zero(), anchor.hash);
+    elapsed.snapshot = elapsed.metadata.snapshot();
+    elapsed.selected = vec![anchor];
     elapsed.deferred = vec![(until, child_hash)];
     let plan = audit_store_at(&elapsed, &config, elapsed.nodes[1].header.time)
-        .expect("an exact elapsed deferral is a reconstructible startup transition");
-    assert!(plan.repairs.contains(&RecoveryRepair::ElapsedDeferrals));
+        .expect("an elapsed deferral remains authoritative until normal reevaluation");
+    assert!(plan.is_clean());
+    assert_eq!(plan.metadata, elapsed.metadata);
+    assert_eq!(plan.deferred_entries, elapsed.deferred);
     assert_eq!(
         plan.header_nodes
             .iter()
             .find(|node| node.hash == child_hash)
             .expect("the child remains retained")
             .validation,
-        crate::HeaderValidationState::Valid
+        crate::HeaderValidationState::DeferredUntil(until)
+    );
+}
+
+#[test]
+fn headers_only_recovery_rejects_an_unsettled_selected_suffix() {
+    let (mut store, mut config) = fixture();
+    let anchor = store.metadata.frontiers.finalized;
+    let child = store.metadata.frontiers.header_best;
+    let child_node = store.nodes[1].clone();
+    let mut grandchild_header = *child_node.header;
+    grandchild_header.previous_block_hash = child.hash;
+    grandchild_header.time += Duration::seconds(1);
+    grandchild_header.nonce = [2; 32].into();
+    let grandchild_header = Arc::new(grandchild_header);
+    let grandchild_hash = grandchild_header.hash();
+    let grandchild_work = grandchild_header
+        .difficulty_threshold
+        .to_work()
+        .expect("the fixture grandchild target has work");
+    let grandchild = Frontier::new(block::Height(2), grandchild_hash);
+    let grandchild_node = HeaderNode::from_durable_parts(
+        grandchild_header,
+        grandchild_hash,
+        child.hash,
+        grandchild.height,
+        grandchild_work,
+        child_node
+            .work_coordinate()
+            .checked_add(grandchild_work)
+            .expect("the fixture grandchild work fits"),
+        HeaderValidationState::Valid,
+        EligibilityState::default(),
+        BodyValidationState::Unknown,
+        Vec::new(),
+    )
+    .expect("the fixture grandchild fields agree");
+
+    config.mode = EngineMode::HeadersOnly;
+    config.limits.local_finality_depth = std::num::NonZeroU32::new(1).expect("one is nonzero");
+    store.metadata.mode = EngineMode::HeadersOnly;
+    store.metadata.frontiers.header_best = grandchild;
+    store.metadata.header_best_score = ChainScore::new(
+        SuffixWork::new(
+            child_node
+                .block_work
+                .as_u256()
+                .checked_add(grandchild_work.as_u256())
+                .expect("the two-block suffix work fits"),
+        ),
+        grandchild.hash,
+    );
+    store.snapshot = store.metadata.snapshot();
+    store.nodes.push(grandchild_node);
+    store.children.push((child.hash, grandchild.hash));
+    store.selected = vec![anchor, child, grandchild];
+    store.finality[0].source = FinalitySource::MigratedHeadersOnly;
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Source {
+            violations: vec![AuditViolation::Finality],
+        })
     );
 }
 

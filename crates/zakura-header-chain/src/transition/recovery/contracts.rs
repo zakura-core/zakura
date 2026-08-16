@@ -177,8 +177,6 @@ pub enum RecoveryRepair {
     ChildIndex,
     /// Recovery rebuilds the future-time index from node states.
     DeferredIndex,
-    /// Recovery promotes elapsed future-time deferrals before publication.
-    ElapsedDeferrals,
     /// Recovery replaces the selected projection and frontier with recomputed values.
     SelectedProjection,
     /// Recovery rebuilds the verified projection from its authoritative frontier.

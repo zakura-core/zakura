@@ -1,6 +1,113 @@
 use super::*;
 
 #[test]
+fn f_225512_startup_commits_deferred_reevaluation_before_publication() {
+    #[derive(Copy, Clone)]
+    struct FixedClock(DateTime<Utc>);
+
+    impl zakura_header_chain::Clock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
+
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let db = open(&db_config, &engine_config.network);
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the valid anchor initializes the fixture");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("the initial store audits");
+    let before = runtime.publisher().snapshot();
+    let insertion_clock = FixedClock(Utc::now() - chrono::Duration::hours(3));
+    let mut child_header = *anchor.header;
+    child_header.previous_block_hash = anchor.hash;
+    child_header.time = insertion_clock.0 + chrono::Duration::hours(3);
+    child_header.nonce.0[0] = 0x51;
+    let child_header = Arc::new(child_header);
+    let child = Frontier::new(
+        anchor
+            .height
+            .next()
+            .expect("the anchor has a successor height"),
+        child_header.hash(),
+    );
+    let lease = runtime
+        .reader()
+        .validation_context(anchor.hash)
+        .expect("the anchor validation context is coherent")
+        .expect("the anchor is retained");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the authenticated network policy is valid");
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&child_header)),
+        lease.parent(),
+        &rules,
+        &insertion_clock,
+    )
+    .expect("the future header prepares as deferred");
+    assert!(matches!(
+        batch.headers()[0].validation,
+        HeaderValidationState::DeferredUntil(until) if until <= Utc::now()
+    ));
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner: header_owner(&before, child.hash, 0x51, 0x52),
+                    source: SourceId::from_digest([0x51; 32]),
+                    parent_hash: anchor.hash,
+                    target_tip_hash: child.hash,
+                    completion: TargetCompletion::TargetComplete {
+                        common_ancestor: Frontier::new(anchor.height, anchor.hash),
+                    },
+                    batch,
+                    aux: Vec::new(),
+                })),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &insertion_clock,
+                full_state_authority: None,
+                retention_references: &[],
+            },
+        )
+        .expect("the deferred header insertion commits");
+    assert_eq!(
+        runtime.publisher().snapshot().frontiers.header_best,
+        Frontier::new(anchor.height, anchor.hash)
+    );
+    drop(runtime);
+
+    let (reopened, report) = HeaderChainStore::new(db)
+        .startup(&engine_config)
+        .expect("startup reevaluates the elapsed deferral before publication");
+    assert!(report.repairs.is_empty());
+    assert_eq!(report.current.frontiers.header_best, child);
+    assert_eq!(reopened.publisher().snapshot(), report.current);
+    assert_eq!(
+        reopened
+            .store
+            .header_node(child.hash)
+            .expect("the child row is readable")
+            .expect("the child remains retained")
+            .validation,
+        HeaderValidationState::Valid
+    );
+    assert_eq!(
+        reopened
+            .store
+            .deferred_entries()
+            .expect("the deferred index is readable"),
+        Vec::new()
+    );
+}
+
+#[test]
 fn rocksdb_snapshot_stops_at_the_first_extra_row_without_decoding() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();

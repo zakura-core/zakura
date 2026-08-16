@@ -65,7 +65,7 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
     // Phase 2: fail closed on authoritative contradictions
     let audited = audit_authoritative(&snapshot, rows, config, now)?;
     // Phase 3: reconstruct derived views from audited source
-    let derived = reconstruct_derived_views(&audited, config, now)?;
+    let derived = reconstruct_derived_views(&audited, config)?;
     // Phase 4: classify reconstructible repairs and assemble the plan
     classify_and_plan(&snapshot, audited, derived, config)
 }

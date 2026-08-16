@@ -164,7 +164,6 @@ pub(super) fn crash_fixture_deferred_header_reevaluation_reopens_complete_before
 
         let allowed_startup_repairs = BTreeSet::from([
             RecoveryRepair::DeferredIndex,
-            RecoveryRepair::ElapsedDeferrals,
             RecoveryRepair::SelectedProjection,
         ]);
         let observation = observe_transition_crash_with_allowed_startup_repairs(

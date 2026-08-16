@@ -455,6 +455,39 @@ fn load_transition_engine(
     .map_err(|_| HeaderChainStoreError::Incoherent("audited engine state is invalid"))
 }
 
+/// Apply the one time-dependent startup transition before constructing a publisher.
+fn settle_deferred_before_publication(
+    store: &HeaderChainStore,
+    config: &EngineConfig,
+) -> Result<HeaderChainEngine, HeaderChainStoreError> {
+    let mut engine = load_transition_engine(store)?;
+    let before = engine.snapshot();
+    let context = TransitionContext {
+        config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    let transition = engine.plan_transition(
+        TransitionInput::ReevaluateDeferred {
+            expected_version: before.state_version,
+        },
+        &context,
+    )?;
+    if transition.is_no_change() {
+        return Ok(engine);
+    }
+
+    let migrated_pin_refuted = transition.change_set().metadata.alarms.migrated_pin_refuted;
+    let batch = store.batch_for(transition.change_set())?;
+    store.db.write(batch)?;
+    engine.install_committed_transition(transition)?;
+    if let Some(pin) = migrated_pin_refuted {
+        return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
+    }
+    Ok(engine)
+}
+
 fn restore_transition_engine_after_staging_error(
     store: &HeaderChainStore,
     engine: &mut HeaderChainEngine,
@@ -2649,8 +2682,9 @@ impl HeaderChainStore {
             #[cfg(test)]
             fault(FaultPoint::AfterCommit)?;
         }
-        let transition_engine = Arc::new(Mutex::new(load_transition_engine(&self)?));
-        let current = plan.metadata.snapshot();
+        let transition_engine = settle_deferred_before_publication(&self, config)?;
+        let current = transition_engine.snapshot();
+        let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
             current: current.clone(),
@@ -2731,8 +2765,9 @@ impl HeaderChainStore {
         if !target.is_clean() {
             self.db.write(self.recovery_batch(&target)?)?;
         }
-        let transition_engine = Arc::new(Mutex::new(load_transition_engine(&self)?));
-        let current = target.metadata.snapshot();
+        let transition_engine = settle_deferred_before_publication(&self, integrated_config)?;
+        let current = transition_engine.snapshot();
+        let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
             current: current.clone(),
@@ -2806,8 +2841,9 @@ impl HeaderChainStore {
         if !final_audit.is_clean() {
             self.db.write(self.recovery_batch(&final_audit)?)?;
         }
-        let transition_engine = Arc::new(Mutex::new(load_transition_engine(&self)?));
-        let current = final_audit.metadata.snapshot();
+        let transition_engine = settle_deferred_before_publication(&self, config)?;
+        let current = transition_engine.snapshot();
+        let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
             current: current.clone(),
@@ -3019,8 +3055,9 @@ impl HeaderChainStore {
             self.db.write(self.recovery_batch(&final_audit)?)?;
         }
         self.clear_reconstruction_progress()?;
-        let transition_engine = Arc::new(Mutex::new(load_transition_engine(&self)?));
-        let current = final_audit.metadata.snapshot();
+        let transition_engine = settle_deferred_before_publication(&self, config)?;
+        let current = transition_engine.snapshot();
+        let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
             current: current.clone(),
@@ -3841,9 +3878,7 @@ impl HeaderChainStore {
 
     fn recovery_batch(&self, plan: &RecoveryPlan) -> Result<DiskWriteBatch, HeaderChainStoreError> {
         let mut batch = DiskWriteBatch::new();
-        if plan.repairs.contains(&RecoveryRepair::InheritedEligibility)
-            || plan.repairs.contains(&RecoveryRepair::ElapsedDeferrals)
-        {
+        if plan.repairs.contains(&RecoveryRepair::InheritedEligibility) {
             for node in &plan.header_nodes {
                 self.put_value(
                     &mut batch,

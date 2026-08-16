@@ -280,21 +280,22 @@ jobs:
           name: crates-publish-plan
           path: ${{ runner.temp }}/plan
 
-      # crates.io records the repository, run ID, and commit behind every
-      # Trusted Publishing upload and serves them publicly. Asserting they name
-      # this run proves the release pipeline published these versions, rather
-      # than only that something with the right version number exists.
+      # crates.io records the repository, run ID, and OIDC commit claim behind
+      # every Trusted Publishing upload and serves them publicly. Asserting
+      # they name this run proves the release pipeline published these
+      # versions, rather than only that something with the right version number
+      # exists.
       - name: Confirm every selected version came from this run
         env:
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
-          TARGET_SHA: ${{ needs.plan-verify.outputs.target_sha }}
+          OIDC_SHA: ${{ github.sha }}
         run: |
           ./scripts/verify-published-crates.sh \
             --plan "$RUNNER_TEMP/plan/publish-plan.json" \
             --repository "$REPOSITORY" \
             --run-id "$RUN_ID" \
-            --sha "$TARGET_SHA"
+            --sha "$OIDC_SHA"
 
   install-check:
     name: Install zakurad from crates.io

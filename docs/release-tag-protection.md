@@ -170,8 +170,8 @@ permission:
    from a stale tag.
 4. Confirm every job passes. After a `publish` run, `Verify the published
    versions` asserts that each new version's crates.io record names this
-   workflow run and the tag's commit, and `Install zakurad from crates.io`
-   installs and runs the published binary.
+   workflow run and the dispatch commit on `main` (the OIDC `sha` claim),
+   and `Install zakurad from crates.io` installs and runs the published binary.
 
 Publishing to crates.io has historically been a separate decision from
 tagging — `v1.0.3-rc1`, `v1.1.0-rc0`, and `v1.2.0-rc0` were tagged but

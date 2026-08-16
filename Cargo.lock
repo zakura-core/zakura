@@ -8565,7 +8565,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "3.2.0"
+version = "3.2.1"
 dependencies = [
  "color-eyre",
  "jsonrpsee-types",
@@ -8580,7 +8580,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "7.0.0"
+version = "7.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8649,7 +8649,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "3.2.0"
+version = "3.2.1"
 dependencies = [
  "hex",
  "lazy_static",
@@ -8781,7 +8781,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "clap",
  "color-eyre",

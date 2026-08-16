@@ -236,20 +236,32 @@ fn production_incremental_verifier_accepts_exact_auxiliary_evidence() {
         panic!("fixture constructs AuxEvidence");
     };
     let transition = engine
-        .plan_transition(TransitionInput::AuxEvidence { event }, &context)
+        .plan_transition(
+            TransitionInput::AuxEvidence {
+                event: event.clone(),
+            },
+            &context,
+        )
         .expect("the production incremental verifier accepts exact evidence");
+    let stale_after_auxiliary = engine
+        .plan_transition(TransitionInput::AuxEvidence { event }, &context)
+        .expect("the unchanged source can plan an equivalent auxiliary transition");
     assert!(transition.effect().is_aux_authentication());
     assert_eq!(
         transition.domain(),
         zakura_header_chain::TransitionDomain::AuxEvidence
     );
-    let mut projected = engine.clone();
-    projected
+    engine
         .install_committed_transition(transition)
-        .expect("the verified transition applies to a cloned source engine");
-    assert!(projected.aux_deliveries(header_hash)[0].is_authenticated());
+        .expect("the verified transition applies to its exact source engine");
+    assert!(engine.aux_deliveries(header_hash)[0].is_authenticated());
     assert_eq!(
-        projected.aux_deliveries(header_hash)[0].outcome_boundary_hash(),
+        engine.aux_deliveries(header_hash)[0].outcome_boundary_hash(),
         Some(boundary_hash)
+    );
+    assert_eq!(
+        engine.install_committed_transition(stale_after_auxiliary),
+        Err(zakura_header_chain::CommittedTransitionError::StaleSource),
+        "an auxiliary-only install consumes the exact source revision",
     );
 }

@@ -4,7 +4,10 @@ mod input;
 mod install;
 mod recovery;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use thiserror::Error;
 use zakura_chain::block;
@@ -34,9 +37,12 @@ pub enum EngineHydrationError {
 /// The engine could not install a verified transition on its original in-memory source.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CommittedTransitionError {
-    /// Another transition changed the engine after the planner created this transition.
-    #[error("committed header transition no longer matches its snapshot before commit")]
+    /// The transition does not belong to this exact engine source revision.
+    #[error("committed header transition no longer matches its source engine revision")]
     StaleSource,
+    /// The process-local source revision cannot advance.
+    #[error("header-chain engine source revision is exhausted")]
+    RevisionExhausted,
     /// The graph rejected the verified delta.
     #[error(transparent)]
     Graph(#[from] GraphError),
@@ -51,8 +57,12 @@ pub enum CommittedTransitionError {
 ///
 /// It performs no durable writes or publication; the runtime commits, installs,
 /// and publishes each verified transition.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct HeaderChainEngine {
+    /// Process-local capability that distinguishes equal public snapshots.
+    instance_capability: Arc<()>,
+    /// Process-local revision that consumes each installed transition once.
+    source_revision: u64,
     /// Complete retained header graph.
     graph: MemHeaderStore,
     metadata: EngineMetadata,
@@ -64,6 +74,20 @@ pub struct HeaderChainEngine {
     aux_deliveries: HashMap<block::Hash, Vec<AuxDelivery>>,
     /// Retained header hash keyed by globally unique delivery identity.
     aux_delivery_index: HashMap<crate::EvidenceId, block::Hash>,
+}
+
+/// Private identity of one exact in-memory transition source.
+#[derive(Clone, Debug)]
+pub(crate) struct EngineSource {
+    instance_capability: Arc<()>,
+    revision: u64,
+}
+
+impl EngineSource {
+    fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.instance_capability, &other.instance_capability)
+            && self.revision == other.revision
+    }
 }
 
 impl HeaderChainEngine {
@@ -197,6 +221,8 @@ impl HeaderChainEngine {
         }
 
         Ok(Self {
+            instance_capability: Arc::new(()),
+            source_revision: 0,
             graph,
             metadata,
             selected_projection: selected,
@@ -256,11 +282,31 @@ impl HeaderChainEngine {
         &mut self,
         transition: EngineTransition,
     ) -> Result<(), CommittedTransitionError> {
-        if self.snapshot() != *transition.snapshot_before_commit() {
+        if !self.source().matches(transition.source())
+            || self.snapshot() != *transition.snapshot_before_commit()
+        {
             return Err(CommittedTransitionError::StaleSource);
         }
+        let next_revision = self
+            .source_revision
+            .checked_add(1)
+            .ok_or(CommittedTransitionError::RevisionExhausted)?;
         self.install_verified_plan(&transition)?;
+        self.source_revision = next_revision;
         Ok(())
+    }
+
+    /// Return the private identity of this exact in-memory source revision.
+    pub(crate) fn source(&self) -> EngineSource {
+        EngineSource {
+            instance_capability: self.instance_capability.clone(),
+            revision: self.source_revision,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_source_revision_for_test(&mut self) {
+        self.source_revision = u64::MAX;
     }
 
     /// Install a verified plan's write set into this engine's in-memory state.

@@ -219,6 +219,7 @@ fn assemble_writes<'a>(
         metadata,
     } = settled;
     derive_plan(DerivePlanInputs {
+        source: engine.source(),
         snapshot_before_commit,
         metadata,
         base_graph: engine.graph(),

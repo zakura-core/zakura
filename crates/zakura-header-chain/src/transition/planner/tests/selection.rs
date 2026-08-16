@@ -159,6 +159,28 @@ fn committed_transition_reports_a_stale_source_without_panicking() {
 }
 
 #[test]
+fn f_225514_source_revision_exhaustion_is_typed_and_atomic() {
+    let (store, config) = TestStore::new(EngineMode::HeadersOnly);
+    let clock = ManualClock(Utc::now());
+    let request = insertion(&store, 1, EvidenceId::from_digest([0xe1; 32]));
+    let mut engine = test_engine(&store);
+    engine.exhaust_source_revision_for_test();
+    let transition = engine
+        .plan_transition(
+            fixture_transition_input(&store, request),
+            &context(&config, &clock, None),
+        )
+        .expect("the exhausted source can still produce a read-only plan");
+    let before = engine.snapshot();
+
+    assert_eq!(
+        engine.install_committed_transition(transition),
+        Err(crate::CommittedTransitionError::RevisionExhausted),
+    );
+    assert_eq!(engine.snapshot(), before);
+}
+
+#[test]
 fn full_commit_ensures_exact_node_body_and_independent_selection() {
     use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
 
@@ -566,18 +588,24 @@ fn f_225516_invalid_intermediate_rejects_the_complete_path_before_mutation() {
 }
 
 #[test]
-fn public_transition_api_plans_then_installs_one_verified_dag_change() {
+fn f_225514_transition_installs_only_on_its_exact_source_engine() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
-    let engine = test_engine(&store);
+    let mut engine = test_engine(&store);
     let clock = ManualClock(Utc::now());
     let request = insertion(&store, 3, EvidenceId::from_digest([0x92; 32]));
     let before = engine.snapshot();
     let transition = engine
         .plan_transition(
-            fixture_transition_input(&store, request),
+            fixture_transition_input(&store, request.clone()),
             &context(&config, &clock, None),
         )
         .expect("the stateful engine plans the insertion");
+    let foreign_transition = engine
+        .plan_transition(
+            fixture_transition_input(&store, request),
+            &context(&config, &clock, None),
+        )
+        .expect("the same source can plan an equivalent transition");
 
     assert_eq!(transition.snapshot_before_commit(), &before);
     assert_ne!(
@@ -591,13 +619,20 @@ fn public_transition_api_plans_then_installs_one_verified_dag_change() {
         "planning must leave the source engine unchanged"
     );
     let expected = transition.snapshot_after_commit();
-    let mut projected = engine.clone();
-    projected
+    let mut other_engine = test_engine(&store);
+    let other_before = other_engine.snapshot();
+    assert_eq!(
+        other_engine.install_committed_transition(foreign_transition),
+        Err(crate::CommittedTransitionError::StaleSource),
+        "an equal public snapshot does not grant source-engine authority",
+    );
+    assert_eq!(other_engine.snapshot(), other_before);
+    engine
         .install_committed_transition(transition)
         .expect("the transition still has its exact source");
-    assert_eq!(projected.snapshot(), expected);
+    assert_eq!(engine.snapshot(), expected);
     assert_eq!(
-        projected.selected_projection().last().copied(),
+        engine.selected_projection().last().copied(),
         Some(expected.frontiers.header_best)
     );
 }

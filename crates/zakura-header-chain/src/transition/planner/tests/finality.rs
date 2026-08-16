@@ -953,6 +953,61 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
 }
 
 #[test]
+fn f_225514_finality_install_consumes_the_source_revision() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let insert = insertion(&store, 2, EvidenceId::from_digest([0xa1; 32]));
+    let insert_plan = apply_transition(&store, insert, &context(&config, &clock, None))
+        .expect("network insertion retains the checkpoint header");
+    store.commit(&insert_plan);
+
+    let old_tip = store.metadata.frontiers.verified_best;
+    let checkpoint = store.selected[1];
+    let header = store
+        .graph
+        .header_node(checkpoint.hash)
+        .expect("the checkpoint header is retained")
+        .header
+        .clone();
+    let request = TransitionRequest {
+        expected_version: store.metadata.state_version,
+        event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+            full_state_transition_id: EvidenceId::from_digest([0xa2; 32]),
+            old_tip,
+            new_path: vec![crate::VerifiedHeaderRef {
+                height: checkpoint.height,
+                hash: checkpoint.hash,
+                header,
+            }],
+            cause: crate::VerifiedChangeCause::CheckpointFinalizedGrow,
+        }),
+    };
+    let mut engine = test_engine(&store);
+    let first = engine
+        .plan_transition(
+            fixture_transition_input(&store, request.clone()),
+            &context(&config, &clock, Some(&authority)),
+        )
+        .expect("the first checkpoint transition plans");
+    let stale = engine
+        .plan_transition(
+            fixture_transition_input(&store, request),
+            &context(&config, &clock, Some(&authority)),
+        )
+        .expect("the unchanged source can plan the same checkpoint transition");
+
+    engine
+        .install_committed_transition(first)
+        .expect("the checkpoint transition installs on its source");
+    assert_eq!(engine.snapshot().frontiers.finalized, checkpoint);
+    assert_eq!(
+        engine.install_committed_transition(stale),
+        Err(crate::CommittedTransitionError::StaleSource),
+    );
+}
+
+#[test]
 fn authenticated_verified_reset_replaces_a_full_retention_fork_set() {
     let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
     config.limits.max_candidate_tips =

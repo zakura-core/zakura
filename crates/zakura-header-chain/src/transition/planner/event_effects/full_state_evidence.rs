@@ -50,7 +50,26 @@ pub(super) fn project_verified_chain_change(
                 .into(),
             );
         }
-        if projected.graph().view_header_node(header.hash).is_none() {
+        if let Some(retained) = projected.graph().view_header_node(header.hash) {
+            if retained.header != header.header
+                || retained.parent_hash != parent.hash
+                || retained.height != header.height
+            {
+                return Err(
+                    InvalidTransitionEvidence::Header(crate::HeaderViolation::Path {
+                        kind: HeaderPathKind::Verified,
+                        problem: HeaderPathProblem::RetainedMismatch,
+                    })
+                    .into(),
+                );
+            }
+            projected.set_body_validation_state(
+                header.hash,
+                BodyValidationState::Verified {
+                    evidence: event.full_state_transition_id,
+                },
+            )?;
+        } else {
             validate_full_state_header(projected.graph(), parent, header, facts, context)?;
             projected.insert_header(
                 header.header.clone(),
@@ -60,13 +79,19 @@ pub(super) fn project_verified_chain_change(
                     evidence: event.full_state_transition_id,
                 },
             )?;
-        } else {
-            projected.set_body_validation_state(
-                header.hash,
-                BodyValidationState::Verified {
-                    evidence: event.full_state_transition_id,
-                },
-            )?;
+        }
+        if projected
+            .graph()
+            .view_header_node(header.hash)
+            .is_none_or(|node| !node.is_eligible())
+        {
+            return Err(
+                InvalidTransitionEvidence::Header(crate::HeaderViolation::Path {
+                    kind: HeaderPathKind::Verified,
+                    problem: HeaderPathProblem::Ineligible,
+                })
+                .into(),
+            );
         }
         parent = Frontier::new(header.height, header.hash);
         projected.push_verified(parent);
@@ -92,8 +117,7 @@ pub(super) fn project_verified_block_acceptance(
         );
     }
     let mut parent = projected.graph().view_finalized_frontier();
-    let last_index = event.path.len().saturating_sub(1);
-    for (index, header) in event.path.iter().enumerate() {
+    for header in &event.path {
         if header.header.hash() != header.hash
             || header.header.previous_block_hash != parent.hash
             || header.height
@@ -112,7 +136,26 @@ pub(super) fn project_verified_block_acceptance(
                 .into(),
             );
         }
-        if projected.graph().view_header_node(header.hash).is_none() {
+        if let Some(retained) = projected.graph().view_header_node(header.hash) {
+            if retained.header != header.header
+                || retained.parent_hash != parent.hash
+                || retained.height != header.height
+            {
+                return Err(
+                    InvalidTransitionEvidence::Header(crate::HeaderViolation::Path {
+                        kind: HeaderPathKind::AcceptedSide,
+                        problem: HeaderPathProblem::RetainedMismatch,
+                    })
+                    .into(),
+                );
+            }
+            projected.set_body_validation_state(
+                header.hash,
+                BodyValidationState::Verified {
+                    evidence: event.full_state_transition_id,
+                },
+            )?;
+        } else {
             validate_full_state_header(projected.graph(), parent, header, facts, context)?;
             projected.insert_header(
                 header.header.clone(),
@@ -122,13 +165,19 @@ pub(super) fn project_verified_block_acceptance(
                     evidence: event.full_state_transition_id,
                 },
             )?;
-        } else if index == last_index {
-            projected.set_body_validation_state(
-                header.hash,
-                BodyValidationState::Verified {
-                    evidence: event.full_state_transition_id,
-                },
-            )?;
+        }
+        if projected
+            .graph()
+            .view_header_node(header.hash)
+            .is_none_or(|node| !node.is_eligible())
+        {
+            return Err(
+                InvalidTransitionEvidence::Header(crate::HeaderViolation::Path {
+                    kind: HeaderPathKind::AcceptedSide,
+                    problem: HeaderPathProblem::Ineligible,
+                })
+                .into(),
+            );
         }
         parent = Frontier::new(header.height, header.hash);
     }

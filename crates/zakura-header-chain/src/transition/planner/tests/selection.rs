@@ -306,12 +306,132 @@ fn full_state_insertion_rejects_a_contextually_invalid_header() {
 }
 
 #[test]
-fn accepted_side_path_does_not_replace_the_verified_winner() {
-    let (store, config) = TestStore::new(EngineMode::Integrated);
+fn verified_chain_change_rejects_an_operator_invalid_retained_header() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .expect("the finalized anchor exists")
+        .header
+        .difficulty_threshold;
+    let candidate = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x5d);
+    let candidate_header = store
+        .graph
+        .header_node(candidate.hash)
+        .expect("the retained candidate exists")
+        .header
+        .clone();
+    store
+        .graph
+        .add_eligibility_reason(
+            candidate.hash,
+            EligibilityReason::operator_invalid(
+                candidate.hash,
+                crate::OperatorInvalidationId::new([0x5e; 16]),
+                EvidenceId::from_digest([0x5f; 32]),
+            ),
+        )
+        .expect("the fixture marks the retained candidate ineligible");
+    synchronize_fixture(&mut store, anchor);
+
+    let error = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+                full_state_transition_id: EvidenceId::from_digest([0x60; 32]),
+                old_tip: anchor,
+                new_path: vec![crate::VerifiedHeaderRef {
+                    height: candidate.height,
+                    hash: candidate.hash,
+                    header: candidate_header,
+                }],
+                cause: crate::VerifiedChangeCause::Grow,
+            }),
+        },
+        &context(&config, &clock, Some(&authority)),
+    )
+    .expect_err("an operator-invalid header cannot become the verified winner");
+
+    assert_eq!(
+        error,
+        TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::Header(
+            HeaderViolation::Path {
+                kind: HeaderPathKind::Verified,
+                problem: HeaderPathProblem::Ineligible,
+            }
+        ))
+    );
+}
+
+#[test]
+fn verified_chain_change_rejects_a_deferred_retained_header() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .expect("the finalized anchor exists")
+        .header
+        .difficulty_threshold;
+    let candidate = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x61);
+    let candidate_header = store
+        .graph
+        .header_node(candidate.hash)
+        .expect("the retained candidate exists")
+        .header
+        .clone();
+    store
+        .graph
+        .set_header_validation_state(
+            candidate.hash,
+            HeaderValidationState::DeferredUntil(clock.0 + chrono::Duration::seconds(1)),
+        )
+        .expect("the fixture defers the retained candidate");
+    synchronize_fixture(&mut store, anchor);
+
+    let error = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+                full_state_transition_id: EvidenceId::from_digest([0x62; 32]),
+                old_tip: anchor,
+                new_path: vec![crate::VerifiedHeaderRef {
+                    height: candidate.height,
+                    hash: candidate.hash,
+                    header: candidate_header,
+                }],
+                cause: crate::VerifiedChangeCause::Grow,
+            }),
+        },
+        &context(&config, &clock, Some(&authority)),
+    )
+    .expect_err("a deferred header cannot become the verified winner");
+
+    assert_eq!(
+        error,
+        TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::Header(
+            HeaderViolation::Path {
+                kind: HeaderPathKind::Verified,
+                problem: HeaderPathProblem::Ineligible,
+            }
+        ))
+    );
+}
+
+#[test]
+fn f_225516_accepted_side_path_verifies_every_retained_member() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
     let request = insertion(&store, 2, EvidenceId::from_digest([0x56; 32]));
-    let TransitionEvent::InsertHeaders(insert) = request.event else {
+    let TransitionEvent::InsertHeaders(insert) = &request.event else {
         unreachable!("the fixture constructs a header insertion")
     };
     let path: Vec<_> = insert
@@ -325,7 +445,11 @@ fn accepted_side_path_does_not_replace_the_verified_winner() {
         })
         .collect();
     let accepted = path.last().expect("the side path is nonempty").hash;
+    let accepted_path: Vec<_> = path.iter().map(|header| header.hash).collect();
     let evidence = EvidenceId::from_digest([0x57; 32]);
+    let insertion = apply_transition(&store, request, &context(&config, &clock, Some(&authority)))
+        .expect("the fixture retains the side path before full-state acceptance");
+    store.commit(&insertion);
 
     let plan = apply_transition(
         &store,
@@ -349,13 +473,95 @@ fn accepted_side_path_does_not_replace_the_verified_winner() {
         plan.change_set.verified_projection,
         ProjectionDelta::default()
     );
+    for hash in accepted_path {
+        assert!(matches!(
+            projected_graph
+                .header_node(hash)
+                .map(|node| &node.body_validation_state),
+            Some(BodyValidationState::Verified {
+                evidence: actual
+            }) if *actual == evidence
+        ));
+    }
+    assert!(projected_graph.header_node(accepted).is_some());
+}
+
+#[test]
+fn f_225516_invalid_intermediate_rejects_the_complete_path_before_mutation() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let request = insertion(&store, 2, EvidenceId::from_digest([0x58; 32]));
+    let TransitionEvent::InsertHeaders(insert) = &request.event else {
+        unreachable!("the fixture constructs a header insertion")
+    };
+    let path: Vec<_> = insert
+        .batch
+        .headers()
+        .iter()
+        .map(|header| crate::VerifiedHeaderRef {
+            height: header.height,
+            hash: header.hash,
+            header: header.header.clone(),
+        })
+        .collect();
+    let intermediate = path[0].hash;
+    let descendant = path[1].hash;
+    let insertion = apply_transition(&store, request, &context(&config, &clock, Some(&authority)))
+        .expect("the fixture retains the path");
+    store.commit(&insertion);
+    let invalid = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(
+                crate::ConsensusBodyInvalid {
+                    hash: intermediate,
+                    evidence: EvidenceId::from_digest([0x59; 32]),
+                    rule: crate::BodyRuleId::new("test.invalid-intermediate"),
+                    source: SourceId::from_digest([0x5a; 32]),
+                },
+            )),
+        },
+        &context(&config, &clock, Some(&authority)),
+    )
+    .expect("authenticated invalidity marks the intermediate node");
+    store.commit(&invalid);
+    let before = store.snapshot();
+
     assert!(matches!(
-        projected_graph
-            .header_node(accepted)
-            .map(|node| &node.body_validation_state),
-        Some(BodyValidationState::Verified {
-            evidence: actual
-        }) if *actual == evidence
+        apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::VerifiedBlockAccepted(
+                    crate::VerifiedBlockAccepted {
+                        full_state_transition_id: EvidenceId::from_digest([0x5b; 32]),
+                        path,
+                    },
+                ),
+            },
+            &context(&config, &clock, Some(&authority)),
+        ),
+        Err(TransitionFailure::Graph(GraphError::PermanentBodyInvalidity(hash)))
+            if hash == intermediate
+    ));
+    assert_eq!(store.snapshot(), before);
+    assert!(matches!(
+        &store
+            .graph
+            .header_node(intermediate)
+            .expect("the invalid intermediate remains retained")
+            .body_validation_state,
+        BodyValidationState::ConsensusInvalid { .. }
+    ));
+    assert!(!matches!(
+        &store
+            .graph
+            .header_node(descendant)
+            .expect("the descendant remains retained and evictable")
+            .body_validation_state,
+        BodyValidationState::Verified { .. }
     ));
 }
 

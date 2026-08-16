@@ -120,7 +120,7 @@ pub fn select_mempool_transactions(
     let (independent_mempool_txs, mut dependent_mempool_txs): (HashMap<_, _>, HashMap<_, _>) =
         mempool_txs
             .into_iter()
-            .map(|tx| (tx.transaction.id.mined_id(), tx))
+            .map(|tx| (tx.transaction.id().mined_id(), tx))
             .partition(|(tx_id, _tx)| !tx_dependencies.contains_key(tx_id));
 
     // Setup the transaction lists.
@@ -215,7 +215,7 @@ fn has_direct_dependencies(
     for tx in selected_txs {
         #[cfg(test)]
         let (_, tx) = tx;
-        if deps.contains(&tx.transaction.id.mined_id()) {
+        if deps.contains(&tx.transaction.id().mined_id()) {
             num_available_deps += 1;
         } else {
             continue;
@@ -285,7 +285,7 @@ fn checked_add_transaction_weighted_random(
     }
 
     let tx_dependencies = mempool_tx_deps.dependencies();
-    let selected_tx_id = &candidate_tx.transaction.id.mined_id();
+    let selected_tx_id = &candidate_tx.transaction.id().mined_id();
     debug_assert!(
         !tx_dependencies.contains_key(selected_tx_id),
         "all candidate transactions should be independent"
@@ -379,11 +379,11 @@ impl TryUpdateBlockLimits for VerifiedUnminedTx {
         // count (legacy + P2SH) so template selection cannot produce blocks that the block verifier
         // would reject for exceeding `MAX_BLOCK_SIGOPS`.
         let tx_block_sigops = self.block_sigop_count();
-        if self.transaction.size <= *remaining_block_bytes
+        if self.transaction.size() <= *remaining_block_bytes
             && tx_block_sigops <= *remaining_block_sigops
             && self.unpaid_actions <= *remaining_block_unpaid_actions
         {
-            *remaining_block_bytes -= self.transaction.size;
+            *remaining_block_bytes -= self.transaction.size();
             *remaining_block_sigops -= tx_block_sigops;
 
             // Unpaid actions are always zero for transactions that pay the conventional fee,

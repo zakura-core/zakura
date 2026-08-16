@@ -29,6 +29,12 @@ pub const SLOW_START_SHIFT: Height = Height(SLOW_START_INTERVAL.0 / 2);
 // TODO: change to HeightDiff
 pub const MAX_BLOCK_REORG_HEIGHT: u32 = 1000;
 
+/// The maximum number of non-finalized chain forks Zakura will track.
+///
+/// The header-chain engine inherits this cap from full-state fork policy. Zakura
+/// drops the chain with the lowest work when the fork count reaches this cap.
+pub const MAX_NON_FINALIZED_CHAIN_FORKS: usize = 10;
+
 /// Magic numbers used to identify different Zcash networks.
 pub mod magics {
     use crate::parameters::network::magic::Magic;

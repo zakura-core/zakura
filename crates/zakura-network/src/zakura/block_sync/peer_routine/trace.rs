@@ -86,12 +86,16 @@ impl PeerRoutine {
     /// The reason plus the live slot/budget/work snapshot let a trace tell a legitimate
     /// idle (`no_work` with an empty queue, `cwnd_saturated`) from a recoverable one
     /// (slots + budget + work all free yet stopped — a wakeup gap to fix).
-    pub(super) fn trace_fill_stop(&self, reason: &'static str) {
+    pub(super) fn trace_fill_stop(&mut self, reason: &'static str) {
+        let now = Instant::now();
+        if !fill_stop_trace_due(self.fill_stop_trace_at.get(reason).copied(), now) {
+            return;
+        }
+        self.fill_stop_trace_at.insert(reason, now);
         self.emit(bs_trace::BLOCK_FILL_STOP, |row| {
             // Mirror the effective (reliability-scaled) bypass the fill loop used.
             let base_floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
             let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
-            let now = Instant::now();
             row.peer = Some(trace_peer(&self.peer));
             row.fill_stop_reason = Some(reason);
             row.fill_sent = Some(0);

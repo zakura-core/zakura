@@ -916,6 +916,21 @@ where
         self.pending.len()
     }
 
+    /// Returns the hashes and known heights of all pending tasks.
+    ///
+    /// The downloader learns a task's height after it downloads the block body.
+    pub(super) fn pending_hash_heights(&self) -> HashMap<block::Hash, Option<Height>> {
+        let states = self
+            .task_states
+            .lock()
+            .expect("legacy task state lock is only held for synchronous updates");
+
+        self.cancel_handles
+            .keys()
+            .map(|hash| (*hash, states.get(hash).and_then(|state| state.height)))
+            .collect()
+    }
+
     /// Returns true if there are no in-flight download and verify tasks.
     #[allow(dead_code)]
     pub fn is_empty(&mut self) -> bool {

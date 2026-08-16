@@ -15,7 +15,7 @@ use zakura_chain::{block::Height, ironwood};
 
 use crate::service::finalized_state::{DiskWriteBatch, ZakuraDb};
 
-use super::{CancelFormatChange, DiskFormatUpgrade};
+use super::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError};
 
 /// Implements [`DiskFormatUpgrade`] for backfilling the genesis Ironwood tree and anchor.
 pub struct Upgrade;
@@ -32,10 +32,10 @@ impl DiskFormatUpgrade for Upgrade {
     #[allow(clippy::unwrap_in_result)]
     fn run(
         &self,
-        _initial_tip_height: Height,
+        _initial_finalized_tip_height: Option<Height>,
         db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<(), CancelFormatChange> {
+    ) -> Result<(), FormatChangeError> {
         check_cancelled(cancel_receiver)?;
 
         // Nothing to do for empty databases, or databases that already have the genesis tree
@@ -62,7 +62,7 @@ impl DiskFormatUpgrade for Upgrade {
         &self,
         db: &ZakuraDb,
         _cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<Result<(), String>, CancelFormatChange> {
+    ) -> Result<Result<(), String>, FormatChangeError> {
         if db.finalized_tip_height().is_none() {
             return Ok(Ok(()));
         }

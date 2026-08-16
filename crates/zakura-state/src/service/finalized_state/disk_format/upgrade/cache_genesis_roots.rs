@@ -20,7 +20,7 @@ use super::CancelFormatChange;
 #[allow(clippy::unwrap_in_result)]
 #[instrument(skip(upgrade_db, cancel_receiver))]
 pub fn run(
-    _initial_tip_height: Height,
+    _initial_finalized_tip_height: Height,
     upgrade_db: &ZakuraDb,
     cancel_receiver: &Receiver<CancelFormatChange>,
 ) -> Result<(), CancelFormatChange> {

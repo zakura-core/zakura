@@ -9,7 +9,7 @@ use crate::{
         CompactSize64, CompactSizeMessage, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
         MAX_PROTOCOL_MESSAGE_LEN,
     },
-    transaction::UnminedTx,
+    transaction::{zip317, UnminedTx},
 };
 
 proptest! {
@@ -110,6 +110,14 @@ proptest! {
     fn transaction_serialized_size(transaction in any::<UnminedTx>()) {
         let _init_guard = zakura_test::init();
 
-        prop_assert_eq!(transaction.transaction.zcash_serialized_size(), transaction.size);
+        prop_assert_eq!(
+            transaction.transaction().zcash_serialized_size(),
+            transaction.size()
+        );
+        prop_assert_eq!(transaction.transaction().unmined_id(), transaction.id());
+        prop_assert_eq!(
+            zip317::conventional_fee(transaction.transaction()),
+            transaction.conventional_fee()
+        );
     }
 }

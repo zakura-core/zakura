@@ -23,7 +23,7 @@ use crate::{
     DiskWriteBatch, HashOrHeight, TransactionLocation, WriteDisk,
 };
 
-use super::{CancelFormatChange, DiskFormatUpgrade};
+use super::DiskFormatUpgrade;
 
 /// Implements [`DiskFormatUpgrade`] for adding additionl block info to the
 /// database.
@@ -54,16 +54,19 @@ impl DiskFormatUpgrade for Upgrade {
     #[allow(clippy::unwrap_in_result)]
     fn run(
         &self,
-        initial_tip_height: zakura_chain::block::Height,
+        initial_finalized_tip_height: Option<zakura_chain::block::Height>,
         db: &crate::ZakuraDb,
         cancel_receiver: &crossbeam_channel::Receiver<super::CancelFormatChange>,
-    ) -> Result<(), super::CancelFormatChange> {
+    ) -> Result<(), super::FormatChangeError> {
+        let Some(initial_finalized_tip_height) = initial_finalized_tip_height else {
+            return Ok(());
+        };
         let network = db.network();
         let balance_by_transparent_addr = db.address_balance_cf();
         let chunk_size = rayon::current_num_threads();
         tracing::info!(chunk_size = ?chunk_size, "adding block info data");
 
-        let chunks = (0..=initial_tip_height.0).chunks(chunk_size);
+        let chunks = (0..=initial_finalized_tip_height.0).chunks(chunk_size);
         // Since transaction parsing is slow, we want to parallelize it.
         // Get chunks of block heights and load them in parallel.
         let seq_iter = chunks.into_iter().flat_map(|height_span| {
@@ -73,7 +76,7 @@ impl DiskFormatUpgrade for Upgrade {
                 .map(|h| {
                     // Return early if the upgrade is cancelled.
                     if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-                        return Err(super::CancelFormatChange);
+                        return Err(super::FormatChangeError::Cancelled);
                     }
 
                     let height = Height(h);
@@ -237,12 +240,12 @@ impl DiskFormatUpgrade for Upgrade {
         &self,
         db: &crate::ZakuraDb,
         cancel_receiver: &crossbeam_channel::Receiver<super::CancelFormatChange>,
-    ) -> Result<Result<(), String>, super::CancelFormatChange> {
+    ) -> Result<Result<(), String>, super::FormatChangeError> {
         let network = db.network();
 
         // Return early before the next disk read if the upgrade was cancelled.
         if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-            return Err(super::CancelFormatChange);
+            return Err(super::CancelFormatChange.into());
         }
 
         // Read the finalized tip height or return early if the database is empty.
@@ -254,7 +257,7 @@ impl DiskFormatUpgrade for Upgrade {
         let start_height = (tip_height - 1_000).unwrap_or(Height::MIN);
 
         if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-            return Err(CancelFormatChange);
+            return Err(super::FormatChangeError::Cancelled);
         }
 
         // Check that all blocks in the range have a BlockInfo.
@@ -270,7 +273,7 @@ impl DiskFormatUpgrade for Upgrade {
         }
 
         if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-            return Err(CancelFormatChange);
+            return Err(super::FormatChangeError::Cancelled);
         }
 
         // Check that all recipient addresses of transparent transfers in the range have a non-zero received balance.
@@ -292,7 +295,7 @@ impl DiskFormatUpgrade for Upgrade {
         // Check that no address balances for that set of addresses have a received field of `0`.
         for address in addresses {
             if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-                return Err(CancelFormatChange);
+                return Err(super::FormatChangeError::Cancelled);
             }
 
             let balance = db

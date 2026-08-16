@@ -88,7 +88,7 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
         .unmined_transactions_in_blocks(2..)
         .map(|transaction| transaction.transaction.clone())
         .collect::<Vec<_>>();
-    transactions.sort_by_key(|transaction| transaction.size);
+    transactions.sort_by_key(|transaction| transaction.size());
 
     let at_limit_transaction = transactions
         .first()
@@ -99,11 +99,11 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
         .expect("mainnet test vectors contain an unmined transaction")
         .clone();
     assert!(
-        at_limit_transaction.size < oversized_transaction.size,
+        at_limit_transaction.size() < oversized_transaction.size(),
         "test transactions must have different serialized sizes"
     );
 
-    let max_transaction_bytes = u64::try_from(at_limit_transaction.size)
+    let max_transaction_bytes = u64::try_from(at_limit_transaction.size())
         .expect("serialized transaction sizes fit in u64 on supported platforms");
     let mempool_config = mempool::Config {
         max_transaction_bytes,
@@ -130,7 +130,7 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
     .await;
     mempool.enable(&mut recent_syncs).await;
 
-    let oversized_id = oversized_transaction.id;
+    let oversized_id = oversized_transaction.id();
     let response = mempool
         .ready()
         .await
@@ -170,7 +170,7 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
                     max_bytes,
                 }
             )
-        )) if actual_bytes == oversized_transaction.size && max_bytes == max_transaction_bytes
+        )) if actual_bytes == oversized_transaction.size() && max_bytes == max_transaction_bytes
     ));
     assert_eq!(mempool.storage().transaction_count(), 0);
     tx_verifier.expect_no_requests().await;
@@ -179,7 +179,7 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
 
-    let at_limit_id = at_limit_transaction.id;
+    let at_limit_id = at_limit_transaction.id();
     let response = mempool
         .ready()
         .await
@@ -204,7 +204,7 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
         .expect_request_that(|request| {
             matches!(
                 request,
-                tx::Request::Mempool { transaction, .. } if transaction.id == at_limit_id
+                tx::Request::Mempool { transaction, .. } if transaction.id() == at_limit_id
             )
         })
         .await
@@ -238,7 +238,7 @@ async fn cached_size_policy_rejection_is_a_transaction_result() -> Result<(), Re
         .expect("mainnet test vectors contain an unmined transaction")
         .transaction
         .clone();
-    let transaction_id = transaction.id;
+    let transaction_id = transaction.id();
     let mempool_config = mempool::Config {
         max_transaction_bytes: 1,
         ..Default::default()
@@ -349,7 +349,7 @@ async fn mempool_service_basic_single() -> Result<(), Report> {
     service
         .storage()
         .insert(genesis_transaction.clone(), Vec::new(), None)?;
-    inserted_ids.insert(genesis_transaction.transaction.id);
+    inserted_ids.insert(genesis_transaction.transaction.id());
 
     // Test `Request::TransactionIds`
     let response = service
@@ -415,7 +415,7 @@ async fn mempool_service_basic_single() -> Result<(), Report> {
     // This will cause the genesis transaction to be moved into rejected.
     // Skip the last (will be used later)
     for tx in more_transactions {
-        inserted_ids.insert(tx.transaction.id);
+        inserted_ids.insert(tx.transaction.id());
         // Error must be ignored because a insert can trigger an eviction and
         // an error is returned if the transaction being inserted in chosen.
         let _ = service.storage().insert(tx.clone(), Vec::new(), None);
@@ -444,7 +444,10 @@ async fn mempool_service_basic_single() -> Result<(), Report> {
         .ready()
         .await
         .unwrap()
-        .call(Request::Queue(vec![last_transaction.transaction.id.into()]))
+        .call(Request::Queue(vec![last_transaction
+            .transaction
+            .id()
+            .into()]))
         .await
         .unwrap();
     let queued_responses = match response {
@@ -480,7 +483,7 @@ async fn mempool_service_basic_single() -> Result<(), Report> {
         .storage()
         .transactions()
         .values()
-        .map(|tx| tx.transaction.size)
+        .map(|tx| tx.transaction.size())
         .sum();
 
     // TODO: Derive memory usage when available
@@ -549,7 +552,7 @@ async fn mempool_queue_single() -> Result<(), Report> {
         .ready()
         .await
         .unwrap()
-        .call(Request::Queue(vec![new_tx.transaction.id.into()]))
+        .call(Request::Queue(vec![new_tx.transaction.id().into()]))
         .await
         .unwrap();
     let queued_responses = match response {
@@ -569,7 +572,7 @@ async fn mempool_queue_single() -> Result<(), Report> {
         .call(Request::Queue(
             transactions
                 .iter()
-                .map(|tx| tx.transaction.id.into())
+                .map(|tx| tx.transaction.id().into())
                 .collect(),
         ))
         .await
@@ -649,7 +652,7 @@ async fn mempool_service_stays_enabled_when_legacy_sync_status_falls_behind() ->
 
     // Queue a transaction for download
     // Use the ID of the last transaction in the list
-    let txid = more_transactions.last().unwrap().transaction.id;
+    let txid = more_transactions.last().unwrap().transaction.id();
     let response = service
         .ready()
         .await
@@ -1194,7 +1197,7 @@ async fn mempool_failed_verification_is_rejected() -> Result<(), Report> {
         .ready()
         .await
         .unwrap()
-        .call(Request::Queue(vec![rejected_tx.transaction.id.into()]))
+        .call(Request::Queue(vec![rejected_tx.transaction.id().into()]))
         .await
         .unwrap();
     let queued_responses = match response {
@@ -1218,7 +1221,7 @@ async fn mempool_failed_verification_is_rejected() -> Result<(), Report> {
 
     assert_eq!(
         mempool_change,
-        MempoolChange::invalidated([rejected_tx.transaction.id].into_iter().collect())
+        MempoolChange::invalidated([rejected_tx.transaction.id()].into_iter().collect())
     );
 
     Ok(())
@@ -1254,7 +1257,7 @@ async fn mempool_failed_download_is_not_rejected() -> Result<(), Report> {
         .unwrap()
         .call(Request::Queue(vec![rejected_valid_tx
             .transaction
-            .id
+            .id()
             .into()]));
     // Make the mock peer set return that the download failed.
     let verification = peer_set
@@ -1286,7 +1289,7 @@ async fn mempool_failed_download_is_not_rejected() -> Result<(), Report> {
         .unwrap()
         .call(Request::Queue(vec![rejected_valid_tx
             .transaction
-            .id
+            .id()
             .into()]))
         .await
         .unwrap();
@@ -1304,7 +1307,7 @@ async fn mempool_failed_download_is_not_rejected() -> Result<(), Report> {
 
     assert_eq!(
         mempool_change,
-        MempoolChange::invalidated([rejected_valid_tx.transaction.id].into_iter().collect())
+        MempoolChange::invalidated([rejected_valid_tx.transaction.id()].into_iter().collect())
     );
 
     Ok(())
@@ -1515,15 +1518,15 @@ async fn mempool_responds_to_await_output() -> Result<(), Report> {
 
     let verified_unmined_tx = network
         .unmined_transactions_in_blocks(1..=10)
-        .find(|tx| !tx.transaction.transaction.outputs().is_empty())
+        .find(|tx| !tx.transaction.transaction().outputs().is_empty())
         .expect("should have at least 1 tx with transparent outputs");
 
     let unmined_tx = verified_unmined_tx.transaction.clone();
-    let unmined_tx_id = unmined_tx.id;
+    let unmined_tx_id = unmined_tx.id();
     let output_index = 0;
-    let outpoint = OutPoint::from_usize(unmined_tx.id.mined_id(), output_index);
+    let outpoint = OutPoint::from_usize(unmined_tx.id().mined_id(), output_index);
     let expected_output = unmined_tx
-        .transaction
+        .transaction()
         .outputs()
         .get(output_index)
         .expect("already checked that tx has outputs")
@@ -1781,8 +1784,8 @@ async fn evicted_transaction_ids_are_removed_from_pending_gossip() -> Result<(),
     let second_tx = transactions
         .next()
         .expect("at least two unmined transactions");
-    let first_tx_id = first_tx.transaction.id;
-    let second_tx_id = second_tx.transaction.id;
+    let first_tx_id = first_tx.transaction.id();
+    let second_tx_id = second_tx.transaction.id();
     let tx_cost_limit = first_tx.cost().max(second_tx.cost());
 
     let (
@@ -1816,7 +1819,7 @@ async fn evicted_transaction_ids_are_removed_from_pending_gossip() -> Result<(),
                         .expect("unexpected non-mempool request");
                     let verified_tx = verified_txs
                         .iter()
-                        .find(|tx| tx.transaction.id == requested_tx.id)
+                        .find(|tx| tx.transaction.id() == requested_tx.id())
                         .expect("unexpected transaction verification request")
                         .clone();
 
@@ -1958,13 +1961,13 @@ async fn mempool_reject_non_standard() -> Result<(), Report> {
 
     // Modify the transaction to make it non-standard.
     // This is done by replacing its outputs with a dust output.
-    let mut tx = last_transaction.transaction.transaction.clone();
+    let mut tx = last_transaction.transaction.transaction().clone();
     let tx_mut = Arc::make_mut(&mut tx);
     *tx_mut.outputs_mut() = vec![transparent::Output {
         value: Amount::new(10), // this is below the dust threshold
         lock_script: p2pkh_script([0u8; 20]),
     }];
-    last_transaction.transaction.transaction = tx;
+    last_transaction.transaction = tx.into();
 
     // Set cost limit to the cost of the transaction we will try to insert.
     let cost_limit = last_transaction.cost();
@@ -2009,13 +2012,13 @@ async fn mempool_accept_standard_op_return() -> Result<(), Report> {
 
     last_transaction.height = Some(Height(100_000));
 
-    let mut tx = last_transaction.transaction.transaction.clone();
+    let mut tx = last_transaction.transaction.transaction().clone();
     let tx_mut = Arc::make_mut(&mut tx);
     *tx_mut.outputs_mut() = vec![transparent::Output {
         value: Amount::new(0),
         lock_script: op_return_script(&[0x01]),
     }];
-    last_transaction.transaction.transaction = tx;
+    last_transaction.transaction = tx.into();
 
     let cost_limit = last_transaction.cost();
 
@@ -2050,13 +2053,13 @@ async fn mempool_reject_op_return_too_large() -> Result<(), Report> {
 
     last_transaction.height = Some(Height(100_000));
 
-    let mut tx = last_transaction.transaction.transaction.clone();
+    let mut tx = last_transaction.transaction.transaction().clone();
     let tx_mut = Arc::make_mut(&mut tx);
     *tx_mut.outputs_mut() = vec![transparent::Output {
         value: Amount::new(0),
         lock_script: op_return_script(&[0x03]),
     }];
-    last_transaction.transaction.transaction = tx;
+    last_transaction.transaction = tx.into();
 
     let cost_limit = last_transaction.cost();
     // Shrink the OP_RETURN size limit to trigger the oversized rejection path.
@@ -2105,7 +2108,7 @@ async fn mempool_reject_multi_op_return() -> Result<(), Report> {
 
     last_transaction.height = Some(Height(100_000));
 
-    let mut tx = last_transaction.transaction.transaction.clone();
+    let mut tx = last_transaction.transaction.transaction().clone();
     let tx_mut = Arc::make_mut(&mut tx);
     *tx_mut.outputs_mut() = vec![
         transparent::Output {
@@ -2117,7 +2120,7 @@ async fn mempool_reject_multi_op_return() -> Result<(), Report> {
             lock_script: op_return_script(&[0x05]),
         },
     ];
-    last_transaction.transaction.transaction = tx;
+    last_transaction.transaction = tx.into();
 
     let cost_limit = last_transaction.cost();
 
@@ -2158,13 +2161,13 @@ async fn mempool_reject_non_standard_scriptpubkey() -> Result<(), Report> {
 
     last_transaction.height = Some(Height(100_000));
 
-    let mut tx = last_transaction.transaction.transaction.clone();
+    let mut tx = last_transaction.transaction.transaction().clone();
     let tx_mut = Arc::make_mut(&mut tx);
     *tx_mut.outputs_mut() = vec![transparent::Output {
         value: Amount::new(1000),
         lock_script: transparent::Script::new(&[0x00]),
     }];
-    last_transaction.transaction.transaction = tx;
+    last_transaction.transaction = tx.into();
 
     let cost_limit = last_transaction.cost();
 
@@ -2207,13 +2210,13 @@ async fn mempool_reject_bare_multisig() -> Result<(), Report> {
 
     last_transaction.height = Some(Height(100_000));
 
-    let mut tx = last_transaction.transaction.transaction.clone();
+    let mut tx = last_transaction.transaction.transaction().clone();
     let tx_mut = Arc::make_mut(&mut tx);
     *tx_mut.outputs_mut() = vec![transparent::Output {
         value: Amount::new(1000),
         lock_script: multisig_script(1, 1),
     }];
-    last_transaction.transaction.transaction = tx;
+    last_transaction.transaction = tx.into();
 
     let cost_limit = last_transaction.cost();
 
@@ -2254,13 +2257,13 @@ async fn mempool_reject_large_multisig() -> Result<(), Report> {
 
     last_transaction.height = Some(Height(100_000));
 
-    let mut tx = last_transaction.transaction.transaction.clone();
+    let mut tx = last_transaction.transaction.transaction().clone();
     let tx_mut = Arc::make_mut(&mut tx);
     *tx_mut.outputs_mut() = vec![transparent::Output {
         value: Amount::new(1000),
         lock_script: multisig_script(1, 4),
     }];
-    last_transaction.transaction.transaction = tx;
+    last_transaction.transaction = tx.into();
 
     let cost_limit = last_transaction.cost();
 
@@ -2300,10 +2303,10 @@ async fn mempool_reject_large_scriptsig() -> Result<(), Report> {
 
     last_transaction.height = Some(Height(100_000));
 
-    let mut tx = last_transaction.transaction.transaction.clone();
+    let mut tx = last_transaction.transaction.transaction().clone();
     let tx_mut = Arc::make_mut(&mut tx);
     set_first_prevout_unlock_script(tx_mut, transparent::Script::new(&vec![0u8; 1651]));
-    last_transaction.transaction.transaction = tx;
+    last_transaction.transaction = tx.into();
 
     let cost_limit = last_transaction.cost();
 
@@ -2343,10 +2346,10 @@ async fn mempool_reject_non_push_only_scriptsig() -> Result<(), Report> {
 
     last_transaction.height = Some(Height(100_000));
 
-    let mut tx = last_transaction.transaction.transaction.clone();
+    let mut tx = last_transaction.transaction.transaction().clone();
     let tx_mut = Arc::make_mut(&mut tx);
     set_first_prevout_unlock_script(tx_mut, transparent::Script::new(&[0xac]));
-    last_transaction.transaction.transaction = tx;
+    last_transaction.transaction = tx.into();
 
     let cost_limit = last_transaction.cost();
 
@@ -2439,7 +2442,7 @@ async fn mempool_reject_non_standard_inputs() -> Result<(), Report> {
     };
     // Provide one spent output per transparent input (including coinbase inputs in the count,
     // since are_inputs_standard expects spent_outputs.len() == tx.inputs().len()).
-    let input_count = last_transaction.transaction.transaction.inputs().len();
+    let input_count = last_transaction.transaction.transaction().inputs().len();
     last_transaction.spent_outputs = std::sync::Arc::new(vec![non_standard_output; input_count]);
 
     let cost_limit = last_transaction.cost();
@@ -2540,7 +2543,7 @@ fn pick_transaction_with_prevout(network: &Network) -> VerifiedUnminedTx {
         .find(|transaction| {
             transaction
                 .transaction
-                .transaction
+                .transaction()
                 .inputs()
                 .iter()
                 .any(|input| matches!(input, transparent::Input::PrevOut { .. }))

@@ -44,7 +44,7 @@ proptest! {
         prop_assert_eq!(1, queue_transactions.len());
 
         // remove transaction from the queue
-        runner.queue.remove(transaction.id);
+        runner.queue.remove(transaction.id());
 
         // transaction was removed from queue
         prop_assert_eq!(runner.queue.transactions().len(), 0);

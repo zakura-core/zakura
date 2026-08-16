@@ -440,6 +440,7 @@ where
                 supervisor,
                 config.legacy_p2p(),
                 trace,
+                config.zakura.stream_open_rate_per_second,
             );
             Buffer::new(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE)
         }
@@ -1190,6 +1191,9 @@ where
                 // not invent local budget on failure.
                 let restore_replenishment_demand =
                     remaining_replenishment_demand.load(Ordering::Relaxed) > 0;
+                // Rust 1.97 replaces this API with `try_update`.
+                // Zakura supports Rust 1.91.
+                #[allow(deprecated)]
                 let _ = remaining_replenishment_demand.fetch_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,

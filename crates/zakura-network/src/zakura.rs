@@ -17,7 +17,6 @@ use crate::{
 
 mod block_sync;
 mod discovery;
-mod exchange;
 mod handler;
 mod handshake;
 mod header_sync;
@@ -30,7 +29,6 @@ pub mod transport;
 
 pub use block_sync::*;
 pub use discovery::*;
-pub use exchange::*;
 pub use handler::*;
 pub use handshake::*;
 pub use header_sync::*;
@@ -63,11 +61,14 @@ pub const ZAKURA_CAP_LEGACY_GOSSIP: u64 = 1 << 0;
 pub const ZAKURA_CAP_DISCOVERY: u64 = 1 << 2;
 
 /// Capability bit for the native header-sync service.
-pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 4;
+///
+/// Bit `1 << 4` belonged to the retired predecessor protocol and remains unused.
+pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 5;
 
-// Bit `1 << 1` is retired: it advertised the pre-request-id header-sync stream, which
-// correlated responses by arrival order and is no longer spoken. Do not lease it to a new
-// service. (`1 << 3` is block sync, declared in `block_sync::wire`.)
+// Bit `1 << 1` advertised the retired header-sync stream that correlated responses by order.
+// Do not assign it to another service.
+// Bit `1 << 3` identifies block sync in `block_sync::wire`.
+// Bit `1 << 4` identifies the retired predecessor header-sync protocol.
 
 /// Production default for per-service peer caps.
 pub const DEFAULT_SERVICE_MAX_PEERS: usize = 256;

@@ -1,6 +1,5 @@
 ---
-source: zakura-state/src/service/finalized_state/disk_format/tests/snapshot.rs
-assertion_line: 78
+source: crates/zakura-state/src/service/finalized_state/disk_format/tests/snapshot.rs
 expression: cf_names
 ---
 [
@@ -11,7 +10,18 @@ expression: cf_names
   "default",
   "hash_by_height",
   "hash_by_tx_loc",
-  "header_root_auth_frontier",
+  "header_aux_delivery_v1",
+  "header_body_evidence_authority_v1",
+  "header_child_v1",
+  "header_consensus_invalid_tombstone_v1",
+  "header_deferred_v1",
+  "header_eligibility_root_v1",
+  "header_engine_meta_v1",
+  "header_finality_history_v1",
+  "header_node_by_hash_v1",
+  "header_selected_v1",
+  "header_validation_context_v1",
+  "header_verified_v1",
   "height_by_hash",
   "history_tree",
   "ironwood_anchors",

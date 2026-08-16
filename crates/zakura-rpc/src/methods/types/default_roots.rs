@@ -76,7 +76,7 @@ impl DefaultRoots {
         let auth_data_root = iter::once(coinbase.auth_digest)
             .chain(mempool_txs.iter().map(|tx| {
                 tx.transaction
-                    .id
+                    .id()
                     .auth_digest()
                     .unwrap_or(AUTH_DIGEST_PLACEHOLDER)
             }))
@@ -84,7 +84,7 @@ impl DefaultRoots {
 
         Self {
             merkle_root: iter::once(coinbase.hash)
-                .chain(mempool_txs.iter().map(|tx| tx.transaction.id.mined_id()))
+                .chain(mempool_txs.iter().map(|tx| tx.transaction.id().mined_id()))
                 .collect(),
             chain_history_root,
             auth_data_root,

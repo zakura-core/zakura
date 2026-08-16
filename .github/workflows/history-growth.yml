@@ -30,6 +30,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Select revision range
         id: range
@@ -49,4 +50,7 @@ jobs:
           fi
 
       - name: Check history growth
-        run: ./scripts/check-history-growth.sh "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"
+        env:
+          BASE_SHA: ${{ steps.range.outputs.base }}
+          HEAD_SHA: ${{ steps.range.outputs.head }}
+        run: ./scripts/check-history-growth.sh "${BASE_SHA}" "${HEAD_SHA}"

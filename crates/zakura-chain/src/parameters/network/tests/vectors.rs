@@ -16,6 +16,7 @@ use crate::{
         ConsensusBranchId, Network, NetworkKind, NetworkUpgrade, MAINNET_ACTIVATION_HEIGHTS,
         TESTNET_ACTIVATION_HEIGHTS,
     },
+    work::equihash::Solution,
 };
 
 /// Checks that every method in the `Parameters` impl for `zakura_chain::Network` has the same output
@@ -348,6 +349,57 @@ fn configured_nu6_3_activation_preserves_upgrade_order() {
         .expect_err("NU6.3 must not activate before NU6.2");
 
     assert_eq!(out_of_order, ParametersBuilderError::OutOfOrderUpgrades);
+}
+
+#[test]
+fn configured_max_block_time_policy_is_local() {
+    let public_testnet = Network::new_default_testnet();
+    assert!(!public_testnet.is_max_block_time_enforced(Height(653_605)));
+    assert!(public_testnet.is_max_block_time_enforced(Height(653_606)));
+
+    // Unset activation height inherits public Testnet's soft-fork height so a
+    // configured Testnet that otherwise matches public consensus does not reject
+    // historically valid pre-653,606 blocks.
+    let custom = testnet::Parameters::build()
+        .to_network()
+        .expect("the default custom-network builder is valid");
+    assert!(!custom.is_max_block_time_enforced(Height(653_605)));
+    assert!(custom.is_max_block_time_enforced(Height(653_606)));
+
+    let named = testnet::Parameters::build()
+        .with_network_name("NamedPublicCompatible")
+        .expect("the custom network name is valid")
+        .to_network()
+        .expect("a named public-compatible Testnet is valid");
+    assert!(!named.is_max_block_time_enforced(Height(653_605)));
+    assert!(named.is_max_block_time_enforced(Height(653_606)));
+
+    let configured_height = Height(42);
+    let configured = testnet::Parameters::build()
+        .with_max_block_time_start_height(configured_height)
+        .to_network()
+        .expect("the configured max-time policy is valid");
+    assert!(!configured.is_max_block_time_enforced(Height(41)));
+    assert!(configured.is_max_block_time_enforced(configured_height));
+
+    let default_regtest = Network::new_regtest(RegtestParameters::default());
+    assert!(!default_regtest.is_max_block_time_enforced(Height(1)));
+    assert!(default_regtest.is_max_block_time_enforced(Height(2)));
+
+    let regtest_height = Height(42);
+    let configured_regtest = Network::new_regtest(RegtestParameters {
+        max_block_time_start_height: Some(regtest_height),
+        ..Default::default()
+    });
+    assert_eq!(configured_regtest.kind(), NetworkKind::Regtest);
+    assert!(!configured_regtest.is_max_block_time_enforced(Height(41)));
+    assert!(configured_regtest.is_max_block_time_enforced(regtest_height));
+    Solution::for_proposal_for_network(&configured_regtest)
+        .validate_shape(&configured_regtest)
+        .expect("a configured Regtest keeps the authenticated (48, 5) solution shape");
+    assert!(Solution::for_proposal()
+        .validate_shape(&configured_regtest)
+        .is_err());
 }
 
 /// Regtest must not activate NU6.3 unless it is explicitly configured, and

@@ -16,6 +16,9 @@ use zakura_chain::{
     transparent,
 };
 
+#[cfg(feature = "indexer")]
+use zakura_chain::serialization::ZcashSerialize;
+
 use crate::{
     config::StorageMode,
     constants::{MAX_BLOCK_REORG_HEIGHT, MAX_PRUNE_HEIGHTS_PER_COMMIT, MIN_PRUNING_RETENTION},
@@ -611,6 +614,15 @@ fn chain_identity_uses_retained_hashes_when_checkpoint_bodies_are_skipped() {
     assert_eq!(state.db.hash(tip_height), Some(tip_hash));
     assert_eq!(state.db.height(tip_hash), Some(tip_height));
 
+    let initial_tip = crate::service::finalized_chain_tip(&state.db)
+        .expect("a bodyless pruned finalized tip still initializes chain sync");
+    assert_eq!(
+        (initial_tip.height, initial_tip.hash),
+        (tip_height, tip_hash)
+    );
+    assert!(initial_tip.transactions.is_empty());
+    assert!(initial_tip.transaction_hashes.is_empty());
+
     let no_chain = Option::<Arc<Chain>>::None;
     assert_eq!(
         hash_by_height(no_chain.clone(), &state.db, tip_height),
@@ -964,6 +976,20 @@ fn initial_online_prune_preserves_pre_boundary_history() {
             .is_some(),
         "preserved block and size below the pruning marker is still available"
     );
+    #[cfg(feature = "indexer")]
+    assert_eq!(
+        state
+            .db
+            .raw_block_bytes(Height(prune_from - 1).into())
+            .expect("preserved raw block below the pruning marker is still assembled"),
+        state
+            .db
+            .block(Height(prune_from - 1).into())
+            .expect("preserved block below the pruning marker is still reconstructed")
+            .zcash_serialize_to_vec()
+            .expect("serialization works for a previously committed block"),
+        "assembled raw block bytes match the block's consensus serialization"
+    );
     assert!(
         state.db.transaction(pruned_tx_hash).is_none(),
         "raw transaction at the online pruning boundary is pruned"
@@ -975,6 +1001,14 @@ fn initial_online_prune_preserves_pre_boundary_history() {
     assert!(
         state.db.block_and_size(Height(prune_from).into()).is_none(),
         "pruned block and size at the online pruning boundary is unavailable"
+    );
+    #[cfg(feature = "indexer")]
+    assert!(
+        state
+            .db
+            .raw_block_bytes(Height(prune_from).into())
+            .is_none(),
+        "pruned raw block at the online pruning boundary is unavailable"
     );
     assert_eq!(
         state.db.lowest_retained_height(),
@@ -1405,5 +1439,95 @@ fn validate_storage_mode_enforces_retention_floor() {
             .validate_storage_mode(&regtest)
             .is_ok(),
         "Regtest accepts a retention below the Mainnet floor"
+    );
+}
+
+/// The raw range read through the read state service stops before a pruned
+/// body and must not skip over the gap, even though every later height up to
+/// the tip retains its body.
+///
+/// This pins the stop-before-first-missing contract of
+/// `ReadRequest::RawBlocksByHeightRange`: a response that resumed after the
+/// gap would look complete to a caller that only checks the returned count.
+#[cfg(feature = "indexer")]
+#[tokio::test]
+async fn raw_block_range_read_stops_at_pruned_gap_before_retained_bodies() {
+    use tower::ServiceExt;
+    use zakura_node_services::sync_lifecycle::{
+        HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+    };
+
+    use crate::{
+        service::{
+            non_finalized_state::NonFinalizedState, watch_receiver::WatchReceiver,
+            HeaderChainSubscriptions, ReadStateService, VctRootRepairStatus,
+        },
+        ReadRequest, ReadResponse,
+    };
+
+    let _init_guard = zakura_test::init();
+    let network = Mainnet;
+
+    let state = new_state_with_blocks(&Config::ephemeral(), &network);
+    let (prune_from, prune_until) =
+        prune_height_range_inner(TEST_BLOCKS, 5, None).expect("initial prune range exists");
+
+    let mut batch = DiskWriteBatch::new();
+    batch.prepare_prune_batch(&state.db, Height(prune_from), Height(prune_until));
+    state.db.write_batch(batch).expect("prune batch writes");
+
+    // The pruned height is a one-height gap: bodies are retained both below
+    // and above it.
+    assert!(
+        state
+            .db
+            .raw_block_bytes(Height(prune_until).into())
+            .is_some(),
+        "the body above the pruned height is retained"
+    );
+
+    let (_non_finalized_state_sender, non_finalized_state_receiver) =
+        tokio::sync::watch::channel(NonFinalizedState::new(&network));
+    let (_vct_root_repair_sender, vct_root_repair_receiver) =
+        tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+        tokio::sync::watch::channel(None);
+    let (_header_runtime_status_sender, header_runtime_status_receiver) =
+        tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+            epoch: LifecycleEpoch::INITIAL,
+            reason: HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+        });
+    let (_header_chain_reader_sender, header_chain_reader_receiver) =
+        tokio::sync::watch::channel(None);
+
+    let read_state = ReadStateService::new(
+        &state,
+        None,
+        Arc::new(std::sync::OnceLock::new()),
+        WatchReceiver::new(non_finalized_state_receiver),
+        vct_root_repair_receiver,
+        HeaderChainSubscriptions {
+            snapshots: header_chain_snapshot_receiver,
+            runtime_status: header_runtime_status_receiver,
+            reader: header_chain_reader_receiver,
+        },
+    );
+
+    let response = read_state
+        .oneshot(ReadRequest::RawBlocksByHeightRange {
+            start: Height(0),
+            count: TEST_BLOCKS + 1,
+        })
+        .await
+        .expect("raw range read succeeds");
+    let ReadResponse::RawBlocks(blocks) = response else {
+        panic!("unexpected response type for RawBlocksByHeightRange");
+    };
+
+    let heights: Vec<u32> = blocks.iter().map(|(height, _)| height.0).collect();
+    assert_eq!(
+        heights,
+        (0..prune_from).collect::<Vec<_>>(),
+        "the response stops before the pruned body and must not resume above the gap"
     );
 }

@@ -203,6 +203,8 @@ impl BlockSyncPeerSession {
 #[derive(Debug)]
 pub(crate) struct BlockSyncService {
     inner: Arc<BlockSyncServiceInner>,
+    service_demand:
+        Option<watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>>,
     _held_events: Option<Arc<StdMutex<mpsc::Receiver<BlockSyncEvent>>>>,
     _reactor_task: Option<JoinHandle<()>>,
 }
@@ -215,11 +217,8 @@ struct BlockSyncServiceInner {
     /// `add_peer` (per-peer routines). `None` for the inert/handle-less constructors that never
     /// spawn routines (they only observe `events`/`lifecycle`).
     routine_wiring: Option<super::state::RoutineWiring>,
-    /// Reactor notification used to wake demand waiting on an active-session slot.
     peer_snapshot: watch::Receiver<ServicePeerSnapshot>,
-    /// Reactor-owned body work used to wake a parked session once it is useful again.
     candidates: watch::Receiver<ZakuraBlockSyncCandidateState>,
-    /// Authoritative active session for each peer's current transport connection.
     active_peers: StdMutex<HashMap<ZakuraPeerId, BlockSyncPeerRecord>>,
     /// Connections whose block-sync session exited while the connection stayed
     /// up. A claim bridges the transport's reopen backoff so a discovery
@@ -296,6 +295,7 @@ impl BlockSyncService {
                 session_gap_claims: StdMutex::new(HashMap::new()),
                 next_session_id: AtomicU64::new(1),
             }),
+            service_demand: None,
             _held_events: None,
             _reactor_task: None,
         }
@@ -333,6 +333,7 @@ impl BlockSyncService {
                 session_gap_claims: StdMutex::new(HashMap::new()),
                 next_session_id: AtomicU64::new(1),
             }),
+            service_demand: None,
             _held_events: None,
             _reactor_task: Some(reactor_task),
         }
@@ -365,6 +366,7 @@ impl BlockSyncService {
                     session_gap_claims: StdMutex::new(HashMap::new()),
                     next_session_id: AtomicU64::new(1),
                 }),
+                service_demand: None,
                 _held_events: None,
                 _reactor_task: None,
             },
@@ -380,22 +382,32 @@ impl BlockSyncService {
         Self::new_with_handle(config, handle)
     }
 
+    pub(crate) fn with_service_demand(
+        mut self,
+        service_demand: Option<
+            watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
+        >,
+    ) -> Self {
+        self.service_demand = service_demand;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn peer_count(&self) -> usize {
         self.inner
             .active_peers
             .lock()
-            .expect("block-sync peer-state mutex is never poisoned")
+            .expect("block-sync peer map mutex is never poisoned")
             .len()
     }
 
     fn peer_slots_free(&self, direction: ServicePeerDirection) -> bool {
-        let active_peers = self
+        let peers = self
             .inner
             .active_peers
             .lock()
-            .expect("block-sync peer-state mutex is never poisoned");
-        let count = active_peers
+            .expect("block-sync peer map mutex is never poisoned");
+        let count = peers
             .values()
             .filter(|record| record.direction == direction)
             .count();
@@ -471,15 +483,33 @@ impl Service for BlockSyncService {
         // exchange status and serve the remote. This gate applies only after a
         // local park: if another peer filled the body gap during the cooldown,
         // keep this session absent until block sync publishes useful work again.
-        if self.session_needs_body_work(peer, conn_id) {
+        let native_applying = self
+            .service_demand
+            .as_ref()
+            .is_none_or(|demand| demand.borrow().block.is_applying());
+        if native_applying && self.session_needs_body_work(peer, conn_id) {
             let mut candidates = self.inner.candidates.clone();
             if candidates
                 .borrow_and_update()
                 .missing_block_bodies
                 .is_empty()
             {
+                let mut service_demand = self.service_demand.clone();
                 return OrderedSessionDemand::WaitForChange(Box::pin(async move {
-                    if candidates.changed().await.is_err() {
+                    if let Some(demand) = service_demand.as_mut() {
+                        tokio::select! {
+                            changed = candidates.changed() => {
+                                if changed.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                            changed = demand.changed() => {
+                                if changed.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                        }
+                    } else if candidates.changed().await.is_err() {
                         std::future::pending::<()>().await;
                     }
                 }));
@@ -487,39 +517,6 @@ impl Service for BlockSyncService {
         }
 
         OrderedSessionDemand::OpenNow
-    }
-
-    fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
-        let session_is_active = self
-            .inner
-            .active_peers
-            .lock()
-            .expect("block-sync peer map mutex is never poisoned")
-            .get(peer)
-            .is_some_and(|record| record.conn_id == conn_id);
-        if session_is_active {
-            return true;
-        }
-
-        // A transiently exited session leaves a gap claim while the transport
-        // backs off before reopening the stream. Honor it only while this
-        // service would re-admit the peer right now: a park, full slots, or the
-        // useless-work gate releases the connection exactly like a rejected
-        // stream, preserving the discovery-only close semantics.
-        let Some(direction) = self
-            .inner
-            .session_gap_claims
-            .lock()
-            .expect("block-sync gap-claim mutex is never poisoned")
-            .get(peer)
-            .and_then(|claim| (claim.conn_id == conn_id).then_some(claim.direction))
-        else {
-            return false;
-        };
-        matches!(
-            self.ordered_session_demand(conn_id, peer, ZAKURA_CAP_BLOCK_SYNC, direction),
-            OrderedSessionDemand::OpenNow
-        )
     }
 
     fn wants_peer(
@@ -545,6 +542,7 @@ impl Service for BlockSyncService {
         let session = PeerStreamSession::new(
             peer_id.clone(),
             ZAKURA_STREAM_BLOCK_SYNC,
+            ZAKURA_BLOCK_SYNC_STREAM_VERSION,
             recv,
             send,
             peer.service_cancel_token(),
@@ -555,7 +553,8 @@ impl Service for BlockSyncService {
         let block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
         let session_id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
         let conn_id = peer.conn_id;
-        let (_session_peer, _stream_kind, recv, send, _session_cancel) = session.into_parts();
+        let (_session_peer, _stream_kind, _stream_version, recv, send, _session_cancel) =
+            session.into_parts();
 
         // Production outbound block-sync frames go directly through
         // `BlockSyncPeerSession` (the per-peer routine's `try_send_get_blocks` /
@@ -570,7 +569,7 @@ impl Service for BlockSyncService {
                 .inner
                 .active_peers
                 .lock()
-                .expect("block-sync peer-state mutex is never poisoned");
+                .expect("block-sync peer map mutex is never poisoned");
             if active_peers
                 .get(&peer_id)
                 .is_some_and(|record| record.conn_id > conn_id)
@@ -579,6 +578,9 @@ impl Service for BlockSyncService {
                 return;
             }
 
+            // A peer registered for this direction may replace its session.
+            // A connection-symmetry collision replaces the losing session with the winning stream.
+            // Apply the per-direction cap only to a new peer.
             let already_counted = active_peers
                 .get(&peer_id)
                 .is_some_and(|record| record.direction == peer.direction);
@@ -626,7 +628,7 @@ impl Service for BlockSyncService {
             let old_record = active_peers.insert(
                 peer_id.clone(),
                 BlockSyncPeerRecord {
-                    conn_id: peer.conn_id,
+                    conn_id,
                     session_id,
                     direction: peer.direction,
                     cancel_token: service_cancel_token.clone(),
@@ -733,13 +735,44 @@ impl Service for BlockSyncService {
             .send(BlockSyncEvent::PeerConnected(block_sync_session));
     }
 
+    fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        let session_is_active = self
+            .inner
+            .active_peers
+            .lock()
+            .expect("block-sync peer map mutex is never poisoned")
+            .get(peer)
+            .is_some_and(|record| record.conn_id == conn_id);
+        if session_is_active {
+            return true;
+        }
+
+        // A transient session exit leaves a gap claim during transport backoff.
+        // Honor the claim only while this service would admit the peer.
+        // A park, full slots, or useless-work gate releases the connection like a rejected stream.
+        let Some(direction) = self
+            .inner
+            .session_gap_claims
+            .lock()
+            .expect("block-sync gap-claim mutex is never poisoned")
+            .get(peer)
+            .and_then(|claim| (claim.conn_id == conn_id).then_some(claim.direction))
+        else {
+            return false;
+        };
+        matches!(
+            self.ordered_session_demand(conn_id, peer, ZAKURA_CAP_BLOCK_SYNC, direction),
+            OrderedSessionDemand::OpenNow
+        )
+    }
+
     fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
         let removed_record = {
             let mut active_peers = self
                 .inner
                 .active_peers
                 .lock()
-                .expect("block-sync peer-state mutex is never poisoned");
+                .expect("block-sync peer map mutex is never poisoned");
             let removed = match active_peers.get(peer) {
                 Some(record) if record.conn_id == conn_id => active_peers.remove(peer),
                 Some(_) | None => None,

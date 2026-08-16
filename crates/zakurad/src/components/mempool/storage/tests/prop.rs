@@ -140,7 +140,7 @@ proptest! {
         ];
 
         for (transaction_to_accept, transaction_to_reject) in input_permutations {
-            let id_to_accept = transaction_to_accept.transaction.id;
+            let id_to_accept = transaction_to_accept.transaction.id();
 
             prop_assert_eq!(storage.insert(transaction_to_accept, Vec::new(), None), Ok(id_to_accept));
 
@@ -212,7 +212,7 @@ proptest! {
         );
 
         for (i, transaction) in transactions.iter().enumerate() {
-            let tx_id = transaction.transaction.id;
+            let tx_id = transaction.transaction.id();
 
             if i < transactions.len() - 1 {
                 // The initial transactions should be successful
@@ -356,8 +356,8 @@ proptest! {
         ];
 
         for (transaction_to_accept, transaction_to_reject) in input_permutations {
-            let id_to_accept = transaction_to_accept.transaction.id;
-            let id_to_reject = transaction_to_reject.transaction.id;
+            let id_to_accept = transaction_to_accept.transaction.id();
+            let id_to_reject = transaction_to_reject.transaction.id();
 
             prop_assert_eq!(storage.insert(transaction_to_accept, Vec::new(), None), Ok(id_to_accept));
 
@@ -405,9 +405,9 @@ proptest! {
         for (first_transaction_to_accept, transaction_to_reject, second_transaction_to_accept) in
             input_permutations
         {
-            let first_id_to_accept = first_transaction_to_accept.transaction.id;
-            let second_id_to_accept = second_transaction_to_accept.transaction.id;
-            let id_to_reject = transaction_to_reject.transaction.id;
+            let first_id_to_accept = first_transaction_to_accept.transaction.id();
+            let second_id_to_accept = second_transaction_to_accept.transaction.id();
+            let id_to_reject = transaction_to_reject.transaction.id();
 
             prop_assert_eq!(
                 storage.insert(first_transaction_to_accept, Vec::new(), None),
@@ -447,7 +447,7 @@ proptest! {
         let inserted_transactions: HashSet<_> = input
             .transactions()
             .filter_map(|transaction| {
-                let id = transaction.transaction.id;
+                let id = transaction.transaction.id();
 
                 storage.insert(transaction.clone(), Vec::new(), None).ok().map(|_| id)
             })
@@ -1092,7 +1092,7 @@ impl Arbitrary for MultipleTransactionRemovalTestInput {
             .prop_flat_map(|(transactions, indices_to_remove)| {
                 let wtx_ids_to_remove: HashSet<_> = indices_to_remove
                     .iter()
-                    .map(|&index| transactions[index].transaction.id)
+                    .map(|&index| transactions[index].transaction.id())
                     .collect();
 
                 let mined_ids_to_remove: HashSet<transaction::Hash> = wtx_ids_to_remove
@@ -1139,7 +1139,7 @@ impl MultipleTransactionRemovalTestInput {
                 mined_ids_to_remove,
             } => transactions
                 .iter()
-                .map(|transaction| transaction.transaction.id)
+                .map(|transaction| transaction.transaction.id())
                 .filter(|id| mined_ids_to_remove.contains(&id.mined_id()))
                 .collect(),
         }

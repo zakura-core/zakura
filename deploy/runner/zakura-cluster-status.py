@@ -34,8 +34,6 @@ IRONWOOD_ACTIVATION_HEIGHTS = {
     "mainnet": 3_428_143,
     "testnet": 4_134_000,
 }
-DEFAULT_UPGRADE_HEIGHT = IRONWOOD_ACTIVATION_HEIGHTS["testnet"]
-DEFAULT_TARGET_SPACING = 7.5
 RPC_CHAIN_NAMES = {
     "mainnet": "main",
     "testnet": "test",
@@ -54,11 +52,39 @@ PUBLIC_ORIGINS = {
         "http://localhost:1111",
     }),
 }
-HEIGHT_HISTORY_WINDOW = 60 * 60
-MIN_OBSERVED_BLOCKS = 3
-MIN_OBSERVED_SECONDS = 120
-MIN_SECONDS_PER_BLOCK = 1.0
-MAX_SECONDS_PER_BLOCK = 10 * 60.0
+# Per-node sparkline retention. Kept in memory only: --state-file carries the
+# durable orphan-pair and stall history, and losing sparklines across a
+# dashboard restart is acceptable.
+DEFAULT_NODE_HISTORY_WINDOW = 3 * 60 * 60
+# Rendering the exposition costs the node real CPU, and that cost grows with
+# peer-labelled counter cardinality: ~0.03s on a freshly restarted node, ~0.6s
+# after several days. Rather than a fixed cadence, back off in proportion to
+# what the last scrape actually cost, so a cheap endpoint refreshes every poll
+# and an expensive one cannot burn more than about 1/COST_FACTOR of a core.
+METRICS_COST_FACTOR = 30
+MAX_METRICS_INTERVAL = 120.0
+# Deep per-node fields. Carried on every row so the node view can read them, but
+# stripped from the fleet-wide /data payload, which the Slack watchdog polls.
+NODE_DETAIL_KEYS = (
+    "host",
+    "metrics",
+    "metrics_error",
+    "metrics_version",
+    "metrics_bytes",
+    "metrics_series",
+    "metrics_scrape_seconds",
+    "metrics_at",
+    "health_endpoint",
+    "health_endpoint_error",
+    "log_errors",
+    "peer_subversions",
+    "peer_user_agents",
+    "peer_info_error",
+    "mempool_size",
+    "mempool_bytes",
+    "node_errors",
+    "node_errors_at",
+)
 RECENT_REORG_LIMIT = 40
 # Sampled best-chain ancestor offsets used to estimate fork depth between tips.
 ANCESTOR_DEPTHS = (1, 2, 5, 10, 32)
@@ -87,6 +113,10 @@ DEFAULTS = {
     "process_pattern": "",
     "container_name": "",
     "port": None,
+    # Node-local observability endpoints, both loopback-bound and unauthenticated.
+    # The probe reads them from inside the node, so they never need exposing.
+    "metrics_endpoint": "",
+    "health_listen_addr": "",
 }
 
 
@@ -106,6 +136,9 @@ class Node:
     process_pattern: str
     container_name: str
     node_id: str
+    metrics_endpoint: str = ""
+    health_listen_addr: str = ""
+    state_cache_dir: str = ""
     port: object = None
 
     def ssh_cmd(self, *remote: str) -> list[str]:
@@ -152,6 +185,9 @@ def load_nodes(config_path: Path) -> list[Node]:
                 process_pattern=merged["process_pattern"],
                 container_name=merged["container_name"],
                 node_id=node_ids_by_host.get(ssh_host(merged["ssh_string"]), ""),
+                metrics_endpoint=merged["metrics_endpoint"],
+                health_listen_addr=merged["health_listen_addr"],
+                state_cache_dir=merged["state_cache_dir"],
                 port=merged["port"],
             )
         )
@@ -205,10 +241,14 @@ def rpc_url_for(listen_addr: str) -> str:
 REMOTE_PROBE = r"""
 import base64
 import json
+import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 
 (
@@ -223,7 +263,11 @@ import urllib.request
     rpc_password,
     rpc_config_path,
     container_name,
-) = sys.argv[1:12]
+    metrics_endpoint,
+    health_listen_addr,
+    state_cache_dir,
+    want_metrics,
+) = sys.argv[1:16]
 
 out = {
     "service": service,
@@ -232,6 +276,88 @@ out = {
     "rpc_url": rpc_url,
     "probe_kind": probe_kind,
 }
+
+# Prometheus series the per-node view actually renders. The exporter emits the
+# full ~350-name surface, so filtering here keeps the ssh response a few KB
+# instead of a few hundred. Names are the exporter's sanitized form ('.' -> '_').
+WANTED_METRICS = frozenset((
+    "sync_estimated_distance_to_tip",
+    "sync_estimated_network_tip_height",
+    "sync_downloads_in_flight",
+    "sync_downloaded_block_count",
+    "sync_verified_block_count",
+    "sync_header_verification_lag",
+    "sync_header_headers_per_second",
+    "sync_header_headers_received_total",
+    "sync_header_failure_total",
+    # The header-sync work-queue family, as emitted by the deployed 1.1 binaries.
+    # Both families are listed so the allowlist spans a rolling upgrade; names
+    # that a given build does not emit simply never match.
+    "sync_header_work_last_progress_age_seconds",
+    "sync_header_work_oldest_missing_age_seconds",
+    "sync_header_work_oldest_missing_height",
+    "sync_header_work_in_flight_count",
+    "sync_header_work_pending_count",
+    "sync_header_work_buffered_count",
+    "sync_header_work_buffered_headers",
+    "sync_header_work_committing_count",
+    "sync_header_work_epoch",
+    "sync_header_root_auth_lead_blocks",
+    "sync_header_root_auth_work_in_flight_batches",
+    "sync_header_root_auth_work_pending_batches",
+    "sync_header_peer_violation",
+    "sync_header_fill_stop",
+    "sync_block_applying",
+    "sync_block_outstanding",
+    "sync_block_backlog_at_cap",
+    "sync_block_missing_bodies",
+    "sync_block_best_header_tip_height",
+    "sync_block_verified_tip_height",
+    "sync_block_fill_stop",
+    "sync_block_budget_reserved_bytes",
+    "sync_block_reorder_buffered_bytes",
+    "state_memory_best_chain_length",
+    "state_memory_chain_count",
+    "sync_header_chain_dag_nodes",
+    "sync_header_chain_dag_leaf_tips",
+    "sync_header_chain_dag_eligible_tips",
+    "sync_header_chain_frontier_header_best_height",
+    "sync_header_chain_frontier_verified_best_height",
+    "sync_header_chain_frontier_finalized_height",
+    "sync_header_chain_frontier_divergence",
+    "sync_header_chain_reorg_depth",
+    "sync_zakura_apply_phase",
+    "sync_zakura_apply_epoch",
+    "sync_zakura_legacy_fallback_active",
+    "zcash_net_peers",
+    "zcash_net_in_bytes_total",
+    "zcash_net_out_bytes_total",
+    "zcash_net_peer_handshake_failures_total",
+    "zakura_p2p_conn_active",
+    "zakura_p2p_connected_peers",
+    "zakura_p2p_healthy_peers",
+    "zakura_p2p_reactor_active_connections",
+    "zakura_p2p_handshake_upgrade_error",
+    "pool_num_ready",
+    "pool_num_unready",
+    "crawler_in_flight_handshakes",
+    "candidate_set_recently_live",
+    "candidate_set_responded",
+    "candidate_set_gossiped",
+    "candidate_set_pending",
+    "candidate_set_failed",
+    "candidate_set_disconnected",
+    "state_finalized_block_height",
+    "zakura_state_rocksdb_total_disk_size_bytes",
+    "zcash_chain_verified_block_total",
+    "zcash_mempool_size_transactions",
+))
+# A live mainnet/testnet exposition runs to ~12 MB because several net counters
+# are labelled per peer address. This is only a runaway guard, not a budget.
+MAX_METRICS_BYTES = 64 * 1024 * 1024
+# Carries the peer version breakdown in a user_agent label.
+PEER_AGENT_METRIC = "zcash_net_peers_connected"
+IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 
 def run(cmd, timeout=6):
     return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
@@ -271,6 +397,110 @@ def container_logs(name):
         return ""
     proc = run(["docker", "logs", "--tail", "1000", name])
     return (proc.stdout or "") + (proc.stderr or "")
+
+def http_get(url, timeout=4, limit=4096):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return response.status, response.read(limit).decode("utf-8", "replace").strip()
+    except urllib.error.HTTPError as error:
+        try:
+            body = error.read(limit).decode("utf-8", "replace").strip()
+        except Exception:
+            body = ""
+        return error.code, body
+
+def scrape_metrics(endpoint):
+    with urllib.request.urlopen("http://" + endpoint + "/metrics", timeout=5) as response:
+        raw = response.read(MAX_METRICS_BYTES).decode("utf-8", "replace")
+
+    values = {}
+    agents = {}
+    version = ""
+    series = 0
+    for line in raw.splitlines():
+        series += 1
+        if not line or line.startswith("#"):
+            continue
+        name, brace, rest = line.partition("{")
+        if brace:
+            labels, _, value = rest.rpartition("}")
+        else:
+            name, _, value = line.partition(" ")
+            labels = ""
+        name = name.strip()
+        if name == "zakura_build_info" and 'version="' in labels:
+            version = labels.split('version="', 1)[1].split('"', 1)[0]
+            continue
+        if name == PEER_AGENT_METRIC and 'user_agent="' in labels:
+            # zakurad's getpeerinfo has no subver field, so the peer version
+            # breakdown has to come from this label instead of the RPC.
+            agent = labels.split('user_agent="', 1)[1].split('"', 1)[0]
+            try:
+                agents[agent] = agents.get(agent, 0.0) + float(value)
+            except ValueError:
+                pass
+            continue
+        if name not in WANTED_METRICS:
+            continue
+        try:
+            number = float(value)
+        except ValueError:
+            continue
+        # A few wanted series carry labels; summing collapses them to one number.
+        values[name] = values.get(name, 0.0) + number
+    top_agents = sorted(
+        ((agent, int(count)) for agent, count in agents.items() if count > 0),
+        key=lambda item: (-item[1], item[0]),
+    )[:8]
+    return values, version, len(raw), series, top_agents
+
+def read_meminfo():
+    fields = {}
+    with open("/proc/meminfo", encoding="utf-8") as fh:
+        for line in fh:
+            key, _, rest = line.partition(":")
+            if key in ("MemTotal", "MemAvailable"):
+                fields[key] = int(rest.split()[0]) * 1024
+    return fields
+
+def process_rss_bytes(pid):
+    with open("/proc/{}/status".format(pid), encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    return None
+
+def oom_kill_count():
+    proc = run([
+        "journalctl", "-k", "--since", "-24 hours", "--no-pager",
+        "-o", "cat", "-n", "200", "-g", "Out of memory|oom-kill|oom_reaper",
+    ], timeout=12)
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    if lines:
+        return len(lines)
+    # journalctl exits 1 when nothing matched, which is exactly the zero case.
+    # Only a real failure (missing journal, bad pattern) writes to stderr.
+    if proc.returncode not in (0, 1) or proc.stderr.strip():
+        return None
+    return 0
+
+def log_error_tail(path, limit=5):
+    if not path:
+        return []
+    command = "tail -c 2000000 {} 2>/dev/null | grep -aE '(ERROR|WARN)' | tail -{}".format(
+        shlex.quote(path), limit
+    )
+    proc = run(["bash", "-lc", command], timeout=12)
+    lines = []
+    for raw_line in proc.stdout.splitlines():
+        # Redact here rather than at the dashboard: these lines are served on a
+        # public page, and peer addresses must not leave the node.
+        line = IPV4.sub("x.x.x.x", raw_line.strip())
+        if len(line) > 300:
+            line = line[:300] + "..."
+        if line:
+            lines.append(line)
+    return lines
 
 def parse_zcash_conf(path):
     values = {}
@@ -346,7 +576,9 @@ try:
         proc = run(["systemctl", "show", service, "--no-pager",
                     "-p", "ActiveState",
                     "-p", "ActiveEnterTimestamp",
-                    "-p", "ExecMainStartTimestamp"])
+                    "-p", "ExecMainStartTimestamp",
+                    "-p", "MainPID",
+                    "-p", "NRestarts"])
         props = {}
         for line in proc.stdout.splitlines():
             if "=" in line:
@@ -358,6 +590,10 @@ try:
             or props.get("ActiveEnterTimestamp")
             or ""
         )
+        if (props.get("MainPID") or "0").isdigit() and props["MainPID"] != "0":
+            out["main_pid"] = int(props["MainPID"])
+        if (props.get("NRestarts") or "").isdigit():
+            out["restart_count"] = int(props["NRestarts"])
     elif out.get("process_running") is True:
         out["active_state"] = "active"
         out["last_restarted"] = process_start_time(process_pattern)
@@ -436,6 +672,113 @@ try:
 except Exception as error:
     out["node_id_error"] = str(error)
 
+try:
+    pid = out.get("main_pid")
+    if pid is None and container_name:
+        proc = run(["docker", "inspect", "--format", "{{.State.Pid}}", container_name])
+        candidate = proc.stdout.strip()
+        if proc.returncode == 0 and candidate.isdigit() and candidate != "0":
+            pid = int(candidate)
+    if pid is None and process_pattern:
+        proc = run(["pgrep", "-f", process_pattern])
+        if proc.returncode == 0 and proc.stdout.strip():
+            candidate = proc.stdout.strip().splitlines()[0].strip()
+            if candidate.isdigit():
+                pid = int(candidate)
+
+    host = {}
+    if pid is not None:
+        host["pid"] = pid
+        try:
+            host["rss_bytes"] = process_rss_bytes(pid)
+        except Exception as error:
+            host["rss_error"] = str(error)
+
+    disk_path = state_cache_dir or "/"
+    host["disk_path"] = disk_path
+    try:
+        usage = shutil.disk_usage(disk_path)
+        host["disk_total_bytes"] = usage.total
+        host["disk_free_bytes"] = usage.free
+    except Exception as error:
+        # Surface rather than silently falling back: a wrong state_cache_dir
+        # would otherwise report the root filesystem's free space as the node's.
+        host["disk_error"] = str(error)
+
+    try:
+        memory = read_meminfo()
+        host["mem_total_bytes"] = memory.get("MemTotal")
+        host["mem_available_bytes"] = memory.get("MemAvailable")
+    except Exception as error:
+        host["mem_error"] = str(error)
+
+    try:
+        load1, load5, load15 = os.getloadavg()
+        host["load1"] = load1
+        host["load5"] = load5
+        host["load15"] = load15
+    except Exception as error:
+        host["load_error"] = str(error)
+
+    try:
+        with open("/proc/uptime", encoding="utf-8") as fh:
+            host["uptime_seconds"] = float(fh.read().split()[0])
+    except Exception as error:
+        host["uptime_error"] = str(error)
+
+    try:
+        host["oom_kills_24h"] = oom_kill_count()
+    except Exception as error:
+        host["oom_error"] = str(error)
+
+    if "restart_count" in out:
+        host["restart_count"] = out["restart_count"]
+    out["host"] = host
+except Exception as error:
+    out["host_error"] = str(error)
+
+try:
+    out["log_errors"] = log_error_tail(log_file)
+except Exception as error:
+    out["log_errors_error"] = str(error)
+
+if metrics_endpoint and want_metrics:
+    try:
+        started = time.monotonic()
+        metric_values, metric_version, raw_bytes, series, agents = scrape_metrics(
+            metrics_endpoint
+        )
+        out["metrics"] = metric_values
+        out["metrics_bytes"] = raw_bytes
+        out["metrics_series"] = series
+        if agents:
+            out["peer_user_agents"] = agents
+        out["metrics_scrape_seconds"] = round(time.monotonic() - started, 3)
+        if metric_version:
+            out["metrics_version"] = metric_version
+    except Exception as error:
+        out["metrics_error"] = str(error)
+elif metrics_endpoint:
+    # Throttled: rendering the exposition costs the node real CPU, so the
+    # dashboard reuses its previous scrape between refreshes.
+    out["metrics_skipped"] = True
+else:
+    out["metrics_error"] = "metrics endpoint not configured"
+
+if health_listen_addr:
+    health = {}
+    for probe_path in ("healthy", "ready"):
+        try:
+            status, body = http_get(
+                "http://" + health_listen_addr + "/" + probe_path
+            )
+            health[probe_path] = {"status": status, "body": body[:200]}
+        except Exception as error:
+            health[probe_path] = {"error": str(error)}
+    out["health"] = health
+else:
+    out["health_error"] = "health endpoint not configured"
+
 if rpc_url:
     try:
         blockchain_info = rpc_call("getblockchaininfo")
@@ -508,8 +851,48 @@ if rpc_url:
         out["client_version"] = str(
             info.get("build") or info.get("version") or ""
         )
+        # Not a curated health field: LastWarnErrorLayer publishes the most
+        # recent WARN/ERROR log message from anywhere in the process, and
+        # getinfo returns it verbatim. Keep the timestamp so the page can say
+        # how old it is rather than implying it is a current verdict.
+        out["node_errors"] = str(info.get("errors") or "")
+        out["node_errors_at"] = info.get("errorstimestamp")
     except Exception as error:
         out["rpc_metadata_error"] = str(error)
+
+    try:
+        peers = rpc_call("getpeerinfo")
+        if not isinstance(peers, list):
+            raise RuntimeError("getpeerinfo returned a non-array result")
+
+        # Reduce on the node: a mainnet peer set runs to hundreds of entries and
+        # the dashboard only needs counts.
+        subversions = {}
+        inbound = 0
+        for peer in peers:
+            if not isinstance(peer, dict):
+                continue
+            if peer.get("inbound"):
+                inbound += 1
+            key = str(peer.get("subver") or "unknown")[:48]
+            subversions[key] = subversions.get(key, 0) + 1
+        out["peer_count"] = len(peers)
+        out["peer_inbound"] = inbound
+        # zakurad omits subver, so this is only meaningful for the zcashd probe.
+        if set(subversions) != {"unknown"}:
+            out["peer_subversions"] = sorted(
+                subversions.items(), key=lambda item: (-item[1], item[0])
+            )[:8]
+    except Exception as error:
+        out["peer_info_error"] = str(error)
+
+    try:
+        mempool = rpc_call("getmempoolinfo")
+        if isinstance(mempool, dict):
+            out["mempool_size"] = mempool.get("size")
+            out["mempool_bytes"] = mempool.get("bytes")
+    except Exception as error:
+        out["mempool_error"] = str(error)
 else:
     out["rpc_error"] = "RPC disabled in deployer config"
 
@@ -521,7 +904,7 @@ def ssh_capture_script(node: Node, script: str) -> subprocess.CompletedProcess:
     return subprocess.run(node.ssh_cmd("bash", "-s"), input=script, text=True, capture_output=True)
 
 
-def probe_node(node: Node) -> dict:
+def probe_node(node: Node, want_metrics: bool = True) -> dict:
     rpc_url = rpc_url_for(node.rpc_listen_addr)
     script = (
         "python3 - "
@@ -535,7 +918,11 @@ def probe_node(node: Node) -> dict:
         f"{shlex.quote(node.rpc_user)} "
         f"{shlex.quote(node.rpc_password)} "
         f"{shlex.quote(node.rpc_config_path)} "
-        f"{shlex.quote(node.container_name)} <<'PY'\n"
+        f"{shlex.quote(node.container_name)} "
+        f"{shlex.quote(node.metrics_endpoint)} "
+        f"{shlex.quote(node.health_listen_addr)} "
+        f"{shlex.quote(node.state_cache_dir)} "
+        f"{shlex.quote('1' if want_metrics else '')} <<'PY'\n"
         f"{REMOTE_PROBE}\n"
         "PY\n"
     )
@@ -593,18 +980,25 @@ class ClusterCollector:
         nodes: list[Node],
         interval: float,
         stale_after: float,
-        upgrade_height: int,
-        target_spacing: float,
         network: str,
         state_file: Path | None = None,
+        history_window: float = DEFAULT_NODE_HISTORY_WINDOW,
+        expose_logs: bool = False,
+        metrics_min_interval: float | None = None,
     ):
         self.nodes = nodes
         self.interval = interval
         self.stale_after = stale_after
-        self.upgrade_height = upgrade_height
-        self.target_spacing = target_spacing
         self.network = network
         self.state_file = state_file
+        self.history_window = history_window
+        self.expose_logs = expose_logs
+        # None selects the adaptive interval; a number pins it.
+        self.metrics_min_interval = metrics_min_interval
+        self.nodes_by_name = {node.name: node for node in nodes}
+        self.history: dict[str, deque[dict]] = {node.name: deque() for node in nodes}
+        # Last successful scrape per node, reused on the polls that skip it.
+        self.last_metrics: dict[str, dict] = {}
         self.ironwood_activation_height = IRONWOOD_ACTIVATION_HEIGHTS[network]
         self.lock = threading.Lock()
         restored_progress = load_progress(state_file)
@@ -619,7 +1013,6 @@ class ClusterCollector:
             node.name: restored_progress.get(node.name, {}).get("last_advanced_at")
             for node in nodes
         }
-        self.height_history: list[tuple[float, int]] = []
         self.recent_reorgs: deque[dict] = deque(
             load_orphan_pairs(state_file),
             maxlen=RECENT_REORG_LIMIT,
@@ -644,8 +1037,12 @@ class ClusterCollector:
 
     def poll_once(self) -> None:
         rows = []
+        started = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(self.nodes))) as pool:
-            futures = {pool.submit(probe_node, node): node for node in self.nodes}
+            futures = {
+                pool.submit(probe_node, node, self.should_scrape_metrics(node.name, started)): node
+                for node in self.nodes
+            }
             for future in concurrent.futures.as_completed(futures):
                 node = futures[future]
                 try:
@@ -663,7 +1060,7 @@ class ClusterCollector:
             self.rows = rows
             self.chain = chain
             self.last_poll = now
-            self.record_height_sample(now, rows)
+            self.record_node_history(now, rows)
             snapshot = self.progress_snapshot()
         # Snapshot under the lock, write outside it: the stall timers must
         # survive a restart or every node reports as freshly advanced on the
@@ -690,22 +1087,78 @@ class ClusterCollector:
         self.recent_reorgs.appendleft(event)
         self.persist_state()
 
-    def record_height_sample(self, now: float, rows: list[dict]) -> None:
-        heights = [row["height"] for row in rows if row.get("height") is not None]
-        if not heights:
-            return
+    def should_scrape_metrics(self, name: str, now: float) -> bool:
+        """Decide per node, from what its last scrape cost."""
+        snapshot = self.last_metrics.get(name)
+        scraped_at = (snapshot or {}).get("metrics_at")
+        if scraped_at is None:
+            return True
+        if self.metrics_min_interval is not None:
+            interval = self.metrics_min_interval
+        else:
+            cost = (snapshot or {}).get("metrics_scrape_seconds") or 0.0
+            interval = min(cost * METRICS_COST_FACTOR, MAX_METRICS_INTERVAL)
+        return now - scraped_at >= interval
 
-        best_height = max(heights)
-        if self.height_history and best_height < self.height_history[-1][1]:
-            best_height = self.height_history[-1][1]
-        self.height_history.append((now, best_height))
+    def record_node_history(self, now: float, rows: list[dict]) -> None:
+        cutoff = now - self.history_window
+        for row in rows:
+            samples = self.history.get(row["name"])
+            if samples is None:
+                continue
+            host = row.get("host") or {}
+            metrics = row.get("metrics") or {}
+            samples.append({
+                "t": round(now, 1),
+                "height": row.get("height"),
+                "header_lag": row.get("header_lag"),
+                "peers": row.get("peer_count"),
+                "disk_free_bytes": host.get("disk_free_bytes"),
+                "rss_bytes": host.get("rss_bytes"),
+                "load1": host.get("load1"),
+                "sync_lag": metrics.get("sync_estimated_distance_to_tip"),
+            })
+            while samples and samples[0]["t"] < cutoff:
+                samples.popleft()
 
-        cutoff = now - HEIGHT_HISTORY_WINDOW
-        self.height_history = [
-            (sample_time, height)
-            for sample_time, height in self.height_history
-            if sample_time >= cutoff
-        ]
+    def node_snapshot(self, name: str) -> dict | None:
+        with self.lock:
+            row = next((row for row in self.rows if row["name"] == name), None)
+            if row is None:
+                return None
+            row = dict(row)
+            samples = [dict(sample) for sample in self.history.get(name, ())]
+            reorgs = [
+                dict(event) for event in self.recent_reorgs if event.get("node") == name
+            ]
+            chain = dict(self.chain)
+            last_poll = self.last_poll
+
+        if not self.expose_logs:
+            # Off by default: the dashboard is public and log lines can carry
+            # operational detail even after the probe redacts addresses.
+            row["log_errors"] = []
+            row["log_errors_suppressed"] = True
+
+        node = self.nodes_by_name.get(name)
+        return {
+            "generated_at": time.time(),
+            "last_poll": last_poll,
+            "stale_after": self.stale_after,
+            "network": self.network,
+            "history_window": self.history_window,
+            "majority_height": chain.get("majority_height"),
+            "majority_hash": chain.get("majority_hash"),
+            "config": {
+                "metrics_endpoint": node.metrics_endpoint if node else "",
+                "health_listen_addr": node.health_listen_addr if node else "",
+                "state_cache_dir": node.state_cache_dir if node else "",
+                "probe_kind": node.probe_kind if node else "",
+            },
+            "node": row,
+            "history": samples,
+            "reorgs": reorgs,
+        }
 
     def row_for(self, node: Node, probe: dict, now: float) -> dict:
         previous_height = self.last_height.get(node.name)
@@ -810,6 +1263,32 @@ class ClusterCollector:
         if headers is not None and height is not None:
             header_lag = headers - height
 
+        # Metrics are scraped on a slower cadence than the poll, so a skipped
+        # poll reuses the last successful scrape instead of blanking the panels.
+        if probe.get("metrics_skipped"):
+            metrics_snapshot = self.last_metrics.get(node.name, {})
+        else:
+            metrics_snapshot = {
+                "metrics": probe.get("metrics") or {},
+                "metrics_error": probe.get("metrics_error"),
+                "metrics_version": probe.get("metrics_version") or "",
+                "metrics_bytes": coerce_int(probe.get("metrics_bytes")),
+                "metrics_series": coerce_int(probe.get("metrics_series")),
+                "metrics_scrape_seconds": probe.get("metrics_scrape_seconds"),
+                "peer_user_agents": probe.get("peer_user_agents") or [],
+                "metrics_at": now,
+            }
+            self.last_metrics[node.name] = metrics_snapshot
+
+        host = probe.get("host") or {}
+        vitals = {
+            "disk_free_pct": disk_free_pct(host),
+            "disk_free_bytes": host.get("disk_free_bytes"),
+            "restart_count": host.get("restart_count"),
+            "oom_kills_24h": host.get("oom_kills_24h"),
+            "peer_count": coerce_int(probe.get("peer_count")),
+        }
+
         return {
             "name": node.name,
             "ssh": node.ssh_string,
@@ -842,13 +1321,44 @@ class ClusterCollector:
             "client_name": probe.get("client_name") or "",
             "client_version": probe.get("client_version") or "",
             "rpc_metadata_error": probe.get("rpc_metadata_error"),
+            "peer_count": coerce_int(probe.get("peer_count")),
+            "peer_inbound": coerce_int(probe.get("peer_inbound")),
+            "vitals": vitals,
+            # Deep fields; see NODE_DETAIL_KEYS. Served from /data/node/<name>.
+            "host": host,
+            "metrics": metrics_snapshot.get("metrics") or {},
+            "metrics_error": metrics_snapshot.get("metrics_error"),
+            "metrics_version": metrics_snapshot.get("metrics_version") or "",
+            "metrics_bytes": metrics_snapshot.get("metrics_bytes"),
+            "metrics_series": metrics_snapshot.get("metrics_series"),
+            "metrics_scrape_seconds": metrics_snapshot.get("metrics_scrape_seconds"),
+            "metrics_at": metrics_snapshot.get("metrics_at"),
+            "peer_user_agents": metrics_snapshot.get("peer_user_agents") or [],
+            # Distinct from "health" above, which is this dashboard's own
+            # classification; this is what the node's /healthy and /ready say.
+            "health_endpoint": probe.get("health") or {},
+            "health_endpoint_error": probe.get("health_error"),
+            "log_errors": probe.get("log_errors") or [],
+            "peer_subversions": probe.get("peer_subversions") or [],
+            "peer_info_error": probe.get("peer_info_error"),
+            "mempool_size": coerce_int(probe.get("mempool_size")),
+            "mempool_bytes": coerce_int(probe.get("mempool_bytes")),
+            "node_errors": probe.get("node_errors") or "",
+            "node_errors_at": coerce_int(probe.get("node_errors_at")),
         }
 
     def snapshot(self) -> dict:
+        """Fleet-wide payload for the table and the Slack watchdog.
+
+        Deep per-node fields are dropped here so this stays small at a 10s poll;
+        the node view reads them from /data/node/<name> instead.
+        """
         with self.lock:
-            rows = [dict(row) for row in self.rows]
+            rows = [
+                {key: value for key, value in row.items() if key not in NODE_DETAIL_KEYS}
+                for row in self.rows
+            ]
             last_poll = self.last_poll
-            upgrade = self.upgrade_estimate(time.time())
             chain = dict(self.chain)
             chain["tip_groups"] = [dict(group) for group in chain.get("tip_groups", [])]
             chain["recent_reorgs"] = [
@@ -862,7 +1372,6 @@ class ClusterCollector:
             "network": self.network,
             "healthy": healthy,
             "total": len(rows),
-            "upgrade": upgrade,
             "chain": chain,
             "rows": rows,
         }
@@ -991,60 +1500,14 @@ class ClusterCollector:
             "client_version": client_version,
         }, None
 
-    def upgrade_estimate(self, now: float) -> dict:
-        # A non-positive upgrade height means there is no pending activation to
-        # count down to; the dashboard hides the upgrade cards.
-        if self.upgrade_height <= 0:
-            return {"enabled": False}
-
-        current_height = self.height_history[-1][1] if self.height_history else None
-        blocks_remaining = (
-            max(self.upgrade_height - current_height, 0)
-            if current_height is not None
-            else None
-        )
-        activated = blocks_remaining == 0 if blocks_remaining is not None else False
-
-        seconds_per_block = self.observed_seconds_per_block()
-        source = "observed"
-        if seconds_per_block is None:
-            seconds_per_block = self.target_spacing
-            source = "fallback"
-
-        eta_seconds = None
-        eta_at = None
-        if blocks_remaining is not None:
-            eta_seconds = blocks_remaining * seconds_per_block
-            eta_at = now + eta_seconds
-
-        return {
-            "enabled": True,
-            "height": self.upgrade_height,
-            "current_height": current_height,
-            "blocks_remaining": blocks_remaining,
-            "seconds_per_block": seconds_per_block,
-            "eta_seconds": eta_seconds,
-            "eta_at": eta_at,
-            "source": source,
-            "activated": activated,
-        }
-
-    def observed_seconds_per_block(self) -> float | None:
-        if len(self.height_history) < 2:
-            return None
-
-        newest_time, newest_height = self.height_history[-1]
-        for oldest_time, oldest_height in self.height_history:
-            blocks = newest_height - oldest_height
-            seconds = newest_time - oldest_time
-            if blocks < MIN_OBSERVED_BLOCKS or seconds < MIN_OBSERVED_SECONDS:
-                continue
-
-            seconds_per_block = seconds / blocks
-            if MIN_SECONDS_PER_BLOCK <= seconds_per_block <= MAX_SECONDS_PER_BLOCK:
-                return seconds_per_block
-
+def disk_free_pct(host: dict) -> float | None:
+    total = host.get("disk_total_bytes")
+    free = host.get("disk_free_bytes")
+    if not isinstance(total, (int, float)) or not total:
         return None
+    if not isinstance(free, (int, float)):
+        return None
+    return round(100.0 * free / total, 1)
 
 
 def coerce_int(value) -> int | None:
@@ -1058,7 +1521,6 @@ def empty_chain_summary() -> dict:
     return {
         "status": "unknown",
         "split": False,
-        "compat_split": False,
         "majority_height": None,
         "majority_hash": "",
         "max_height": None,
@@ -1239,20 +1701,6 @@ def tipped_rows(rows: list[dict]) -> list[dict]:
     ]
 
 
-def best_tip_row(rows: list[dict], client_name: str | None = None) -> dict | None:
-    candidates = tipped_rows(rows)
-    if client_name is not None:
-        candidates = [
-            row for row in candidates if row.get("client_name") == client_name
-        ]
-    if not candidates:
-        return None
-    return max(
-        candidates,
-        key=lambda row: (row["height"], row.get("block_hash") or ""),
-    )
-
-
 def compute_chain_summary(
     rows: list[dict],
     recent_reorgs: list[dict] | None = None,
@@ -1319,21 +1767,9 @@ def compute_chain_summary(
                 group["fork_depth"] = behind
                 group["fork_depth_label"] = f"{behind} behind"
 
-    zakurad_tip = best_tip_row(rows, "zakurad")
-    zcashd_tip = best_tip_row(rows, "zcashd")
-    compat_split = bool(
-        zakurad_tip
-        and zcashd_tip
-        and (
-            zakurad_tip["height"] != zcashd_tip["height"]
-            or zakurad_tip["block_hash"] != zcashd_tip["block_hash"]
-        )
-    )
-
     return {
         "status": status,
         "split": split,
-        "compat_split": compat_split,
         "majority_height": majority["height"] if majority else None,
         "majority_hash": majority["block_hash"] if majority else "",
         "max_height": max_height,
@@ -1421,6 +1857,10 @@ PAGE = r"""<!doctype html>
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }
 * { box-sizing: border-box; }
+/* The view switcher toggles [hidden]; without this any class that sets a
+   display value (.stats is grid, .view is flex) silently overrides the UA
+   stylesheet and leaves an unrendered section on screen. */
+[hidden] { display: none !important; }
 body {
   margin: 0;
   min-height: 100vh;
@@ -1571,14 +2011,8 @@ button { font: inherit; }
 .freshness { font-size: 0.76rem; color: var(--muted); white-space: nowrap; }
 .freshness b { color: var(--ink-2); font-weight: 600; }
 
-/* ---------- hero ---------- */
-.hero {
-  display: grid;
-  grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
-  gap: 16px;
-}
-.hero.is-single { grid-template-columns: minmax(0, 1fr); }
-.hero-head {
+/* ---------- fleet health card ---------- */
+.card-head {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -1594,29 +2028,6 @@ button { font: inherit; }
   font-variant-numeric: tabular-nums;
 }
 .big-sub { margin-top: 7px; color: var(--muted); font-size: 0.86rem; }
-.progress {
-  margin-top: 18px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--base);
-  border: 1px solid var(--line);
-  overflow: hidden;
-}
-.progress-fill {
-  height: 100%;
-  width: 0;
-  border-radius: 999px;
-  background: linear-gradient(90deg, #8b3f8f, var(--pink-hi));
-  transition: width 0.6s ease;
-}
-.progress-legend {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  margin-top: 7px;
-  font-size: 0.72rem;
-  color: var(--dim);
-}
 .facts {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
@@ -1945,7 +2356,6 @@ tbody tr.drawer > td { padding: 0; border-bottom: 1px solid var(--line); backgro
   color: var(--bad);
   font-size: 0.84rem;
 }
-.banner[hidden] { display: none; }
 footer {
   color: var(--muted);
   font-size: 0.8rem;
@@ -1953,9 +2363,79 @@ footer {
   padding-top: 6px;
 }
 
-@media (max-width: 1100px) {
-  .hero { grid-template-columns: 1fr; }
+/* ---------- node view ---------- */
+.view { display: flex; flex-direction: column; gap: 16px; }
+.node-link { color: inherit; text-decoration: none; border-radius: 4px; }
+.node-link:hover { color: var(--pink-hi); text-decoration: underline; }
+.node-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; flex-wrap: wrap; }
+.node-head h2 { font-size: clamp(1.1rem, 2.4vw, 1.45rem); font-weight: 680; letter-spacing: -0.02em; }
+.node-head .eyebrow { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+.node-badges { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.vitals { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 11px; margin-top: 14px; }
+.vital {
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 11px 13px;
+  min-width: 0;
 }
+.vital.is-ok { border-color: var(--ok-line); background: var(--ok-soft); }
+.vital.is-warn { border-color: var(--warn-line); background: var(--warn-soft); }
+.vital.is-bad { border-color: var(--bad-line); background: var(--bad-soft); }
+.vital.is-neutral { border-color: var(--line-hi); }
+.vital strong {
+  display: block;
+  margin-top: 5px;
+  font-size: 1.12rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.vital small { display: block; margin-top: 3px; color: var(--dim); font-size: 0.71rem; }
+.meter { height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 8px; }
+.meter i { display: block; height: 100%; background: var(--ok); }
+.meter.is-warn i { background: var(--warn); }
+.meter.is-bad i { background: var(--bad); }
+.sparks { display: grid; grid-template-columns: repeat(auto-fit, minmax(216px, 1fr)); gap: 12px; margin-top: 14px; }
+.spark {
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 10px 12px 8px;
+  min-width: 0;
+}
+.spark-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.spark-head b { font-size: 0.9rem; font-weight: 640; font-variant-numeric: tabular-nums; }
+.spark svg { display: block; width: 100%; height: 42px; margin-top: 7px; overflow: visible; }
+.spark-empty { margin-top: 12px; color: var(--dim); font-size: 0.74rem; }
+.node-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(316px, 1fr)); gap: 16px; }
+.kv { display: grid; gap: 7px; margin-top: 13px; }
+.kv-row { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; font-size: 0.83rem; }
+.kv-row > span { color: var(--muted); white-space: nowrap; }
+.kv-row > b {
+  font-weight: 620;
+  text-align: right;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+.kv-row.is-bad > b { color: var(--bad); }
+.kv-row.is-warn > b { color: var(--warn); }
+.note-off { margin-top: 12px; color: var(--dim); font-size: 0.79rem; }
+.log-lines { display: grid; gap: 6px; margin-top: 12px; }
+.log-lines code {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: var(--ink-2);
+  background: var(--base);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 7px 9px;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 720px) {
   .shell { width: calc(100% - 22px); padding-top: 16px; }
   .pad { padding: 16px; }
@@ -1982,76 +2462,38 @@ footer {
 
   <div class="banner" id="banner" hidden></div>
 
-  <section class="hero">
-    <article class="panel pad" id="activation-panel">
-      <div class="hero-head">
-        <div>
-          <p class="eyebrow">Network upgrade</p>
-          <h2 id="activation-title">Ironwood activation</h2>
-        </div>
-        <span class="badge" id="activation-badge">pending</span>
+  <section class="panel pad" data-view="fleet">
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">Fleet health</p>
+        <h2>Nodes reporting</h2>
       </div>
-      <div class="big-value" id="activation-countdown">...</div>
-      <p class="big-sub" id="activation-eta">waiting for the first poll</p>
-      <div class="progress"><div class="progress-fill" id="activation-progress"></div></div>
-      <div class="progress-legend">
-        <span id="progress-from">...</span>
-        <span id="progress-to">...</span>
+      <span class="badge" id="client-mix">...</span>
+    </div>
+    <div class="big-value" id="healthy-count">...</div>
+    <p class="big-sub" id="healthy-sub">waiting for the first poll</p>
+    <div class="health-bar" id="health-bar"></div>
+    <div class="legend" id="health-legend"></div>
+    <div class="facts">
+      <div class="fact">
+        <span class="label">Leading height</span>
+        <strong id="fleet-max-height">...</strong>
+        <small id="fleet-spread">...</small>
       </div>
-      <div class="facts">
-        <div class="fact">
-          <span class="label">Current height</span>
-          <strong id="current-height">...</strong>
-        </div>
-        <div class="fact">
-          <span class="label">Target height</span>
-          <strong id="upgrade-height">...</strong>
-        </div>
-        <div class="fact">
-          <span class="label">Blocks left</span>
-          <strong id="blocks-remaining">...</strong>
-        </div>
-        <div class="fact">
-          <span class="label">Block time</span>
-          <strong id="block-time">...</strong>
-          <small id="block-time-source">...</small>
-        </div>
+      <div class="fact">
+        <span class="label">Slowest advance</span>
+        <strong id="fleet-slowest">...</strong>
+        <small id="fleet-slowest-node">...</small>
       </div>
-    </article>
-
-    <article class="panel pad">
-      <div class="hero-head">
-        <div>
-          <p class="eyebrow">Fleet health</p>
-          <h2>Nodes reporting</h2>
-        </div>
-        <span class="badge" id="client-mix">...</span>
+      <div class="fact">
+        <span class="label">Max header lag</span>
+        <strong id="fleet-max-lag">...</strong>
+        <small id="fleet-max-lag-node">...</small>
       </div>
-      <div class="big-value" id="healthy-count">...</div>
-      <p class="big-sub" id="healthy-sub">waiting for the first poll</p>
-      <div class="health-bar" id="health-bar"></div>
-      <div class="legend" id="health-legend"></div>
-      <div class="facts">
-        <div class="fact">
-          <span class="label">Leading height</span>
-          <strong id="fleet-max-height">...</strong>
-          <small id="fleet-spread">...</small>
-        </div>
-        <div class="fact">
-          <span class="label">Slowest advance</span>
-          <strong id="fleet-slowest">...</strong>
-          <small id="fleet-slowest-node">...</small>
-        </div>
-        <div class="fact">
-          <span class="label">Max header lag</span>
-          <strong id="fleet-max-lag">...</strong>
-          <small id="fleet-max-lag-node">...</small>
-        </div>
-      </div>
-    </article>
+    </div>
   </section>
 
-  <section class="stats">
+  <section class="stats" data-view="fleet">
     <div class="stat">
       <span class="label">Tip agreement</span>
       <div class="stat-value" id="tip-agreement">...</div>
@@ -2068,18 +2510,13 @@ footer {
       <small id="reorg-latest">...</small>
     </div>
     <div class="stat">
-      <span class="label">zakurad vs zcashd</span>
-      <div class="stat-value" id="compat-split">...</div>
-      <small id="compat-detail">...</small>
-    </div>
-    <div class="stat">
       <span class="label">Last poll</span>
       <div class="stat-value" id="last-poll">...</div>
       <small id="stale-window">...</small>
     </div>
   </section>
 
-  <section class="panel pad">
+  <section class="panel pad" data-view="fleet">
     <div class="section-head">
       <div>
         <p class="eyebrow">Chain tips</p>
@@ -2092,7 +2529,7 @@ footer {
     <div class="reorg-list" id="reorg-list"></div>
   </section>
 
-  <section class="panel pad">
+  <section class="panel pad" data-view="fleet">
     <div class="section-head">
       <div>
         <p class="eyebrow">Live node status</p>
@@ -2128,14 +2565,78 @@ footer {
     </div>
   </section>
 
+  <div class="view" id="node-view" data-view="node" hidden>
+    <section class="panel pad">
+      <div class="node-head">
+        <div>
+          <p class="eyebrow"><a class="node-link" href="/">&#8592; Fleet</a>
+            <span class="chip" id="node-network-chip">mainnet</span></p>
+          <h2 id="node-title">node</h2>
+          <p class="section-note" id="node-subtitle">Loading node detail...</p>
+        </div>
+        <div class="node-badges" id="node-badges"></div>
+      </div>
+    </section>
+
+    <section class="panel pad">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Host</p>
+          <h2>Vitals</h2>
+        </div>
+        <p class="section-note" id="node-vitals-note"></p>
+      </div>
+      <div class="vitals" id="node-vitals"></div>
+    </section>
+
+    <section class="panel pad">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Trend</p>
+          <h2 id="node-sparks-title">Recent history</h2>
+        </div>
+        <p class="section-note" id="node-sparks-note"></p>
+      </div>
+      <div class="sparks" id="node-sparks"></div>
+    </section>
+
+    <div class="node-grid">
+      <article class="panel pad">
+        <div class="section-head"><div><p class="eyebrow">Consensus</p><h2>Chain</h2></div></div>
+        <div class="kv" id="node-chain"></div>
+      </article>
+      <article class="panel pad">
+        <div class="section-head"><div><p class="eyebrow">Pipeline</p><h2>Sync</h2></div></div>
+        <div id="node-sync"></div>
+      </article>
+      <article class="panel pad">
+        <div class="section-head"><div><p class="eyebrow">Connectivity</p><h2>Peers and network</h2></div></div>
+        <div id="node-peers"></div>
+      </article>
+    </div>
+
+    <section class="panel pad">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Recent</p>
+          <h2>Events</h2>
+        </div>
+      </div>
+      <div class="subhead"><p class="eyebrow">Orphan pairs seen on this node</p></div>
+      <div class="reorg-list" id="node-reorgs"></div>
+      <div class="subhead"><p class="eyebrow">Last warning or error log line</p></div>
+      <div id="node-last-log"></div>
+      <div class="subhead"><p class="eyebrow">Recent log errors</p></div>
+      <div id="node-logs"></div>
+    </section>
+  </div>
+
   <footer>For snapshots and install instructions, see
     <a href="https://zakura.com/snapshots/" target="_blank" rel="noopener">https://zakura.com/snapshots/</a>
   </footer>
 </main>
 <script>
 const REFRESH_MS = 10000;
-// The progress bar shows the run-in to activation, not all of chain history.
-const PROGRESS_WINDOW = 10000;
 
 const state = {
   data: null,
@@ -2150,6 +2651,15 @@ const state = {
 };
 
 const el = (id) => document.getElementById(id);
+
+/* ---------- routing ---------- */
+// One template serves both routes: / renders the fleet, /node/<name> renders one
+// node. Keeping a single PAGE means the CSS and formatters are shared verbatim.
+const NODE_ROUTE = /^\/node\/(.+)$/.exec(location.pathname);
+const NODE_NAME = NODE_ROUTE ? decodeURIComponent(NODE_ROUTE[1]) : null;
+for (const section of document.querySelectorAll('[data-view]')) {
+  section.hidden = (section.dataset.view === 'node') !== Boolean(NODE_NAME);
+}
 
 /* ---------- formatting ---------- */
 function esc(value) {
@@ -2167,19 +2677,35 @@ function age(seconds) {
   if (seconds < 86400) return Math.round(seconds / 3600) + 'h';
   return Math.round(seconds / 86400) + 'd';
 }
-function countdown(seconds) {
-  if (seconds == null) return 'waiting for height';
-  if (seconds <= 0) return 'activated';
+function bytes(value) {
+  if (value == null || !isFinite(value)) return '—';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let scaled = Number(value);
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  return (unit > 0 && scaled < 100 ? scaled.toFixed(1) : Math.round(scaled)) + ' ' + units[unit];
+}
+function pctText(value) {
+  return value == null || !isFinite(value) ? '—' : Number(value).toFixed(1) + '%';
+}
+function duration(seconds) {
+  if (seconds == null || !isFinite(seconds)) return '—';
   const days = Math.floor(seconds / 86400);
   const hours = Math.floor((seconds % 86400) / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   if (days > 0) return days + 'd ' + hours + 'h';
   if (hours > 0) return hours + 'h ' + minutes + 'm';
-  return Math.max(1, minutes) + 'm';
+  return minutes + 'm';
 }
-function blockTime(seconds) {
-  if (seconds == null) return '—';
-  return (seconds < 10 ? Number(seconds).toFixed(1) : Math.round(seconds)) + 's';
+function decimal(value, places) {
+  return value == null || !isFinite(value) ? '—' : Number(value).toFixed(places == null ? 2 : places);
+}
+function metric(metrics, name) {
+  const value = (metrics || {})[name];
+  return typeof value === 'number' && isFinite(value) ? value : null;
 }
 function clockTime(epochSeconds) {
   if (!epochSeconds) return '—';
@@ -2316,49 +2842,6 @@ function renderFreshness() {
   const next = Math.max(0, Math.ceil(REFRESH_MS / 1000) - seconds);
   node.innerHTML = 'updated <b>' + seconds + 's</b> ago &middot; next in ' + next + 's';
 }
-function renderActivation(data) {
-  const upgrade = data.upgrade || {};
-  const panel = el('activation-panel');
-  const enabled = upgrade.enabled !== false;
-  panel.hidden = !enabled;
-  document.querySelector('.hero').classList.toggle('is-single', !enabled);
-  if (!enabled) return;
-
-  const badgeNode = el('activation-badge');
-  if (upgrade.activated) {
-    badgeNode.textContent = 'activated';
-    badgeNode.className = 'badge tone-ok';
-  } else {
-    badgeNode.textContent = 'pending';
-    badgeNode.className = 'badge tone-info';
-  }
-  el('activation-countdown').textContent = upgrade.activated
-    ? 'Activated'
-    : countdown(upgrade.eta_seconds);
-  el('activation-eta').textContent = upgrade.activated
-    ? 'The upgrade height has been reached.'
-    : (upgrade.eta_at
-      ? 'estimated ' + new Date(upgrade.eta_at * 1000).toLocaleString()
-      : 'waiting for block movement');
-
-  const remaining = upgrade.blocks_remaining;
-  const done = remaining == null
-    ? 0
-    : Math.min(1, Math.max(0, (PROGRESS_WINDOW - remaining) / PROGRESS_WINDOW));
-  el('activation-progress').style.width = (done * 100).toFixed(2) + '%';
-  el('progress-from').textContent = 'final ' + num(PROGRESS_WINDOW) + ' blocks';
-  el('progress-to').textContent = remaining == null
-    ? '—'
-    : (done * 100).toFixed(1) + '% complete';
-
-  el('current-height').textContent = num(upgrade.current_height);
-  el('upgrade-height').textContent = num(upgrade.height);
-  el('blocks-remaining').textContent = upgrade.activated ? '0' : num(remaining);
-  el('block-time').textContent = blockTime(upgrade.seconds_per_block);
-  el('block-time-source').textContent = upgrade.source === 'observed'
-    ? 'observed average'
-    : 'target spacing fallback';
-}
 function renderFleet(data) {
   const rows = data.rows || [];
   const counts = {};
@@ -2440,13 +2923,6 @@ function renderStats(data) {
   el('reorg-latest').textContent = reorgs.length
     ? 'latest ' + clockTime(reorgs[0].at)
     : 'none recorded';
-
-  el('compat-split').innerHTML = chain.compat_split
-    ? badge('diverged', 'bad')
-    : badge('aligned', 'ok');
-  el('compat-detail').textContent = chain.compat_split
-    ? 'best zakurad and zcashd tips differ'
-    : 'best zakurad and zcashd tips match';
 
   el('last-poll').textContent = data.last_poll
     ? new Date(data.last_poll * 1000).toLocaleTimeString()
@@ -2580,6 +3056,20 @@ function drawerHtml(row) {
     + fieldHtml('RPC metadata error', row.rpc_metadata_error, { bad: true, full: true })
     + '</div>';
 }
+// Silent-failure classes that the fleet table had no way to show before: a node
+// filling its disk, or one the kernel has been killing.
+function vitalBadges(row) {
+  const vitals = row.vitals || {};
+  const badges = [];
+  const diskPct = vitals.disk_free_pct;
+  if (diskPct != null && diskPct < 20) {
+    badges.push(badge('disk ' + pctText(diskPct), diskPct < 10 ? 'bad' : 'warn'));
+  }
+  if (vitals.oom_kills_24h) {
+    badges.push(badge('oom ' + vitals.oom_kills_24h, 'bad'));
+  }
+  return badges.join('');
+}
 function renderTable(data) {
   const chain = data.chain || {};
   const majorityHeight = chain.majority_height;
@@ -2626,10 +3116,12 @@ function renderTable(data) {
     return '<tr class="node-row ' + rowTone + (open ? ' is-open' : '') + '"'
       + ' data-node="' + esc(row.name) + '">'
       + '<td class="col-node"><div class="node-cell"><span class="twisty">&#9654;</span>'
-      + '<div class="stack"><span class="node-name">' + esc(row.name) + '</span>'
+      + '<div class="stack"><a class="node-link node-name" href="/node/'
+      + encodeURIComponent(row.name) + '" title="Open node detail">' + esc(row.name) + '</a>'
       + '<span class="node-sub" title="' + esc(row.node_id || '') + '">'
       + esc(row.node_id ? tinyHash(row.node_id) : 'node id unknown') + '</span></div></div></td>'
-      + '<td class="col-health">' + badge(HEALTH_LABEL[row.health] || row.health, healthTone) + '</td>'
+      + '<td class="col-health"><div class="stack">'
+      + badge(HEALTH_LABEL[row.health] || row.health, healthTone) + vitalBadges(row) + '</div></td>'
       + '<td class="col-chain"><div class="stack">'
       + badge(row.chain_role || 'unknown', chainTone)
       + (tipLabel ? badge(tipLabel, 'bad') : '') + '</div></td>'
@@ -2653,10 +3145,377 @@ function renderTable(data) {
         : '');
   }).join('');
 }
+/* ---------- node view ---------- */
+function kvRow(label, text, toneName) {
+  return kvRowHtml(label, esc(text), toneName);
+}
+function kvRowHtml(label, html, toneName) {
+  return '<div class="kv-row' + (toneName ? ' is-' + toneName : '') + '">'
+    + '<span>' + esc(label) + '</span><b>' + html + '</b></div>';
+}
+function vitalTile(label, value, options) {
+  const settings = options || {};
+  const toneClass = settings.tone ? ' is-' + settings.tone : '';
+  const meter = settings.fill == null
+    ? ''
+    : '<div class="meter' + toneClass + '"><i style="width:'
+      + Math.max(0, Math.min(100, settings.fill)).toFixed(1) + '%"></i></div>';
+  return '<div class="vital' + toneClass + '">'
+    + '<span class="label">' + esc(label) + '</span>'
+    + '<strong>' + esc(value) + '</strong>'
+    + (settings.sub ? '<small>' + esc(settings.sub) + '</small>' : '')
+    + meter + '</div>';
+}
+function sparkline(values, stroke) {
+  const points = values.filter((value) => value != null && isFinite(value));
+  if (points.length < 2) return '<div class="spark-empty">not enough samples yet</div>';
+  let min = Infinity;
+  let max = -Infinity;
+  for (const value of points) {
+    if (value < min) min = value;
+    if (value > max) max = value;
+  }
+  const span = (max - min) || 1;
+  const width = 100;
+  const height = 30;
+  const step = width / (points.length - 1);
+  const coords = points.map((value, index) =>
+    (index * step).toFixed(2) + ',' + (height - ((value - min) / span) * height).toFixed(2));
+  return '<svg viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none" aria-hidden="true">'
+    + '<polyline points="' + coords.join(' ') + '" fill="none" stroke="' + stroke + '"'
+    + ' stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"'
+    + ' vector-effect="non-scaling-stroke"></polyline></svg>';
+}
+function sparkCard(title, current, values, stroke) {
+  return '<div class="spark"><div class="spark-head"><span class="label">' + esc(title) + '</span>'
+    + '<b>' + esc(current) + '</b></div>' + sparkline(values, stroke) + '</div>';
+}
+function advanceRate(history) {
+  const points = history.filter((sample) => sample.height != null);
+  if (points.length < 2) return null;
+  const first = points[0];
+  const last = points[points.length - 1];
+  const elapsed = last.t - first.t;
+  if (elapsed <= 0) return null;
+  return ((last.height - first.height) / elapsed) * 60;
+}
+function endpointState(entry) {
+  if (!entry) return { tone: 'neutral', text: 'unknown' };
+  if (entry.error) return { tone: 'bad', text: 'unreachable' };
+  if (entry.status === 200) return { tone: 'ok', text: entry.body || 'ok' };
+  return { tone: 'warn', text: String(entry.status || '?') + ' ' + (entry.body || '') };
+}
+function renderNodeHeader(data) {
+  const row = data.node || {};
+  const network = data.network || 'mainnet';
+  const name = row.name || NODE_NAME;
+  el('node-network-chip').textContent = network;
+  document.title = name + ' - Zakura ' + network + ' node';
+  el('node-title').textContent = name;
+  const polledAge = data.last_poll == null ? null : (Date.now() / 1000) - data.last_poll;
+  el('node-subtitle').textContent = [
+    (row.client_name || 'node') + ' ' + (row.client_version || row.version || ''),
+    row.commit ? 'commit ' + shortCommit(row.commit) : '',
+    // Ticks on every refresh, so a frozen page is obvious at a glance.
+    data.last_poll == null ? 'waiting for the first poll' : 'probed ' + age(polledAge) + ' ago',
+  ].filter(Boolean).join(' · ');
+
+  const healthTone = tone(HEALTH_TONE, row.health);
+  el('node-badges').innerHTML = badge(HEALTH_LABEL[row.health] || row.health || 'unknown', healthTone)
+    + badge(row.chain_role || 'unknown', tone(CHAIN_TONE, row.chain_role))
+    + badge('service ' + (row.active_state || 'unknown'),
+      row.active_state === 'active' ? 'ok' : 'bad')
+    + (row.tip_event ? badge(tipEventLabel(row.tip_event) || row.tip_event, 'bad') : '');
+
+  const pill = el('state-pill');
+  pill.textContent = { healthy: 'Healthy', stale: 'Stale', rpc_error: 'RPC error', down: 'Down' }[row.health]
+    || 'Starting';
+  pill.className = 'state-pill is-' + (healthTone === 'neutral' ? 'warn' : healthTone);
+}
+function renderNodeVitals(data) {
+  const row = data.node || {};
+  const host = row.host || {};
+  const health = row.health_endpoint || {};
+  const tiles = [];
+
+  const diskPct = (row.vitals || {}).disk_free_pct;
+  const diskTone = diskPct == null ? null : (diskPct < 10 ? 'bad' : (diskPct < 20 ? 'warn' : null));
+  tiles.push(vitalTile('Disk free', pctText(diskPct), {
+    tone: diskTone,
+    fill: diskPct,
+    sub: host.disk_error
+      ? 'error: ' + host.disk_error
+      : bytes(host.disk_free_bytes) + ' of ' + bytes(host.disk_total_bytes)
+        + (host.disk_path ? ' on ' + host.disk_path : ''),
+  }));
+
+  const memTotal = host.mem_total_bytes;
+  const memFree = host.mem_available_bytes;
+  const memPct = memTotal && memFree != null ? (100 * memFree) / memTotal : null;
+  tiles.push(vitalTile('Memory available', pctText(memPct), {
+    tone: memPct == null ? null : (memPct < 8 ? 'bad' : (memPct < 15 ? 'warn' : null)),
+    fill: memPct,
+    sub: bytes(memFree) + ' of ' + bytes(memTotal),
+  }));
+
+  tiles.push(vitalTile('Process RSS', bytes(host.rss_bytes), {
+    sub: host.pid ? 'pid ' + host.pid : (host.rss_error || 'pid unknown'),
+  }));
+  tiles.push(vitalTile('Load (1m)', decimal(host.load1), {
+    sub: '5m ' + decimal(host.load5) + ' · 15m ' + decimal(host.load15),
+  }));
+  tiles.push(vitalTile('Host uptime', duration(host.uptime_seconds), {
+    sub: 'since boot',
+  }));
+  tiles.push(vitalTile('Service restarts', host.restart_count == null ? '—' : num(host.restart_count), {
+    tone: host.restart_count ? 'warn' : null,
+    // systemd NRestarts counts Restart= policy restarts, so this is a crash
+    // counter rather than a deploy counter.
+    sub: row.last_restarted ? 'last start ' + formatRestarted(row.last_restarted) : 'automatic restarts',
+  }));
+  tiles.push(vitalTile('OOM kills (24h)', host.oom_kills_24h == null ? '—' : num(host.oom_kills_24h), {
+    tone: host.oom_kills_24h ? 'bad' : null,
+    sub: host.oom_error ? 'error: ' + host.oom_error : 'kernel log',
+  }));
+
+  if (row.health_endpoint_error) {
+    tiles.push(vitalTile('Readiness', 'not enabled', { sub: row.health_endpoint_error }));
+  } else {
+    const healthy = endpointState(health.healthy);
+    const ready = endpointState(health.ready);
+    tiles.push(vitalTile('/healthy', healthy.text, { tone: healthy.tone, sub: 'peer threshold' }));
+    tiles.push(vitalTile('/ready', ready.text, { tone: ready.tone, sub: 'close to tip' }));
+  }
+
+  el('node-vitals').innerHTML = tiles.join('');
+  el('node-vitals-note').textContent = host.disk_path
+    ? 'State directory ' + host.disk_path
+    : 'Collected over the dashboard ssh probe';
+}
+function renderNodeSparks(data) {
+  const history = data.history || [];
+  const row = data.node || {};
+  const host = row.host || {};
+  const rate = advanceRate(history);
+
+  el('node-sparks-title').textContent = 'Last ' + duration(data.history_window);
+  el('node-sparks-note').textContent = history.length
+    ? history.length + ' samples · ' + (rate == null ? 'rate unknown' : decimal(rate, 1) + ' blocks/min')
+    : 'no samples yet';
+
+  el('node-sparks').innerHTML = [
+    sparkCard('Height', num(row.height), history.map((s) => s.height), 'var(--ok)'),
+    sparkCard('Header lag', row.header_lag == null ? '—' : num(row.header_lag),
+      history.map((s) => s.header_lag), 'var(--warn)'),
+    sparkCard('Distance to tip', row.metrics_error ? 'n/a' : num(metric(row.metrics, 'sync_estimated_distance_to_tip')),
+      history.map((s) => s.sync_lag), 'var(--pink-hi)'),
+    sparkCard('Peers', row.peer_count == null ? '—' : num(row.peer_count),
+      history.map((s) => s.peers), 'var(--ok)'),
+    sparkCard('Disk free', bytes(host.disk_free_bytes),
+      history.map((s) => s.disk_free_bytes), 'var(--warn)'),
+    sparkCard('Process RSS', bytes(host.rss_bytes),
+      history.map((s) => s.rss_bytes), 'var(--pink-hi)'),
+    sparkCard('Load (1m)', decimal(host.load1), history.map((s) => s.load1), 'var(--ink-2)'),
+  ].join('');
+}
+function renderNodeChain(data) {
+  const row = data.node || {};
+  const majority = data.majority_height;
+  const delta = (majority != null && row.height != null) ? row.height - majority : null;
+  const rate = advanceRate(data.history || []);
+  const rows = [
+    kvRow('Height', num(row.height)),
+    kvRow('Headers', num(row.headers)),
+    kvRow('Header lag', row.header_lag == null ? '—' : num(row.header_lag),
+      row.header_lag ? 'warn' : null),
+    kvRow('vs fleet majority', delta == null ? '—' : (delta > 0 ? '+' : '') + num(delta),
+      delta ? 'warn' : null),
+    kvRow('Advance rate', rate == null ? '—' : decimal(rate, 1) + ' blocks/min'),
+    kvRow('Tip last advanced', age(row.seconds_since_advanced) + ' ago'),
+    kvRowHtml('Tip hash', copyCell(row.block_hash, shortHash(row.block_hash), 'Copy tip hash')),
+    kvRowHtml('Parent hash', copyCell(row.previous_hash, shortHash(row.previous_hash), 'Copy parent hash')),
+    kvRow('RPC chain', String(row.rpc_chain || 'unknown')),
+    kvRow('Ironwood pool (zat)', row.ironwood_chain_balance_zat || '—'),
+    kvRow('Mempool', row.mempool_size == null ? '—' : num(row.mempool_size) + ' tx / ' + bytes(row.mempool_bytes)),
+  ];
+  if (row.detail) rows.push(kvRow('Detail', row.detail));
+  el('node-chain').innerHTML = rows.join('');
+}
+function metricsUnavailable(row) {
+  return '<p class="note-off">' + esc(row.metrics_error || 'metrics endpoint not enabled')
+    + '. Set <code>[metrics] endpoint_addr</code> on this node to populate this panel.</p>';
+}
+// Builds only the rows whose series this build actually emits. The header-sync
+// metric family was renamed between releases, so a fixed row list would leave a
+// column of em-dashes on one build or the other.
+function metricRows(metrics, spec) {
+  return spec
+    .filter((entry) => metric(metrics, entry[1]) != null)
+    .map((entry) => {
+      const value = metric(metrics, entry[1]);
+      const format = entry[2];
+      return kvRow(entry[0], format ? format(value) : num(Math.round(value)), entry[3]);
+    })
+    .join('');
+}
+const SYNC_ROWS = [
+  ['Distance to tip', 'sync_estimated_distance_to_tip'],
+  ['Network tip height', 'sync_estimated_network_tip_height'],
+  ['Finalized height', 'state_finalized_block_height'],
+  ['Header sync last progress', 'sync_header_work_last_progress_age_seconds', (v) => age(v)],
+  ['Oldest missing header age', 'sync_header_work_oldest_missing_age_seconds', (v) => age(v)],
+  ['Oldest missing height', 'sync_header_work_oldest_missing_height'],
+  ['Header work in flight', 'sync_header_work_in_flight_count'],
+  ['Header work pending', 'sync_header_work_pending_count'],
+  ['Header work buffered', 'sync_header_work_buffered_count'],
+  ['Header work committing', 'sync_header_work_committing_count'],
+  ['Header work epoch', 'sync_header_work_epoch'],
+  ['Root auth lead', 'sync_header_root_auth_lead_blocks'],
+  ['Root auth batches in flight', 'sync_header_root_auth_work_in_flight_batches'],
+  ['Header verification lag', 'sync_header_verification_lag'],
+  ['Headers/sec', 'sync_header_headers_per_second', (v) => decimal(v, 1)],
+  ['Headers received', 'sync_header_headers_received_total'],
+  ['Header failures', 'sync_header_failure_total'],
+  ['Header peer violations', 'sync_header_peer_violation'],
+  ['Best header tip', 'sync_block_best_header_tip_height'],
+  ['Verified tip', 'sync_block_verified_tip_height'],
+  ['Blocks applying', 'sync_block_applying'],
+  ['Blocks outstanding', 'sync_block_outstanding'],
+  ['Backlog at cap', 'sync_block_backlog_at_cap'],
+  ['Missing bodies', 'sync_block_missing_bodies'],
+  ['Reorder buffered', 'sync_block_reorder_buffered_bytes', (v) => bytes(v)],
+  ['Block budget reserved', 'sync_block_budget_reserved_bytes', (v) => bytes(v)],
+  ['DAG nodes', 'sync_header_chain_dag_nodes'],
+  ['DAG leaf tips', 'sync_header_chain_dag_leaf_tips'],
+  ['DAG eligible tips', 'sync_header_chain_dag_eligible_tips'],
+  ['Frontier divergence', 'sync_header_chain_frontier_divergence'],
+  ['Reorg depth', 'sync_header_chain_reorg_depth'],
+  ['Non-finalized chains', 'state_memory_chain_count'],
+  ['Best chain length', 'state_memory_best_chain_length'],
+  ['Apply phase', 'sync_zakura_apply_phase'],
+  ['Legacy fallback', 'sync_zakura_legacy_fallback_active',
+    (v) => (v ? 'engaged' : 'inactive')],
+];
+function renderNodeSync(data) {
+  const row = data.node || {};
+  if (row.metrics_error) {
+    el('node-sync').innerHTML = metricsUnavailable(row);
+    return;
+  }
+  const m = row.metrics || {};
+  el('node-sync').innerHTML = '<div class="kv">' + metricRows(m, SYNC_ROWS) + '</div>'
+    + '<p class="note-off">'
+    + (row.metrics_version ? 'exporter ' + esc(row.metrics_version) + ' · ' : '')
+    + 'scraped ' + age(row.metrics_at == null ? null : (Date.now() / 1000) - row.metrics_at) + ' ago'
+    + (row.metrics_series ? ' · ' + num(row.metrics_series) + ' series, ' + bytes(row.metrics_bytes) : '')
+    + (row.metrics_scrape_seconds ? ' in ' + decimal(row.metrics_scrape_seconds) + 's' : '')
+    + '</p>';
+}
+const PEER_ROWS = [
+  ['Legacy peer set', 'zcash_net_peers'],
+  ['Native connections', 'zakura_p2p_conn_active'],
+  ['Native connected peers', 'zakura_p2p_connected_peers'],
+  ['Native healthy peers', 'zakura_p2p_healthy_peers'],
+  ['Reactor connections', 'zakura_p2p_reactor_active_connections'],
+  ['Pool ready', 'pool_num_ready'],
+  ['Pool unready', 'pool_num_unready'],
+  ['Candidates responded', 'candidate_set_responded'],
+  ['Candidates recently live', 'candidate_set_recently_live'],
+  ['Candidates gossiped', 'candidate_set_gossiped'],
+  ['Candidates failed', 'candidate_set_failed'],
+  ['Handshakes in flight', 'crawler_in_flight_handshakes'],
+  ['Handshake failures', 'zcash_net_peer_handshake_failures_total'],
+  ['Mempool transactions', 'zcash_mempool_size_transactions'],
+];
+function renderNodePeers(data) {
+  const row = data.node || {};
+  const m = row.metrics || {};
+  // zakurad's getpeerinfo has no subver, so prefer the exporter's user_agent
+  // label and fall back to the RPC breakdown for the zcashd probe.
+  const subversions = (row.peer_user_agents || []).length
+    ? row.peer_user_agents
+    : (row.peer_subversions || []);
+  let html = '<div class="kv">'
+    + kvRow('Peers (RPC)', row.peer_count == null ? '—' : num(row.peer_count))
+    + kvRow('Inbound', row.peer_inbound == null ? '—' : num(row.peer_inbound));
+  if (!row.metrics_error) {
+    html += metricRows(m, PEER_ROWS)
+      + kvRow('Bytes in / out', bytes(metric(m, 'zcash_net_in_bytes_total'))
+        + ' / ' + bytes(metric(m, 'zcash_net_out_bytes_total')));
+  }
+  html += '</div>';
+  if (row.metrics_error) html += metricsUnavailable(row);
+  if (subversions.length) {
+    html += '<div class="subhead"><p class="eyebrow">Peer versions</p></div><div class="kv">'
+      + subversions.map((entry) => kvRow(String(entry[0]), num(entry[1]))).join('')
+      + '</div>';
+  } else if (row.peer_info_error) {
+    html += '<p class="note-off">getpeerinfo unavailable: ' + esc(row.peer_info_error) + '</p>';
+  }
+  el('node-peers').innerHTML = html;
+}
+function renderNodeEvents(data) {
+  const row = data.node || {};
+  const reorgs = data.reorgs || [];
+  el('node-reorgs').innerHTML = reorgs.length
+    ? reorgs.slice(0, 12).map((event) => {
+      const depth = event.depth_label
+        || (event.depth != null ? 'depth ' + event.depth : 'depth unknown');
+      return '<div class="reorg-item"><div class="reorg-top">'
+        + badge(tipEventLabel(event.kind) || event.kind, 'warn')
+        + badge(depth, 'neutral')
+        + '<span class="muted num" style="font-size:0.78rem">' + num(event.from_height)
+        + ' → ' + num(event.to_height) + '</span>'
+        + '<span class="muted" style="font-size:0.78rem">' + esc(clockTime(event.at)) + '</span>'
+        + '</div><div class="reorg-detail mono">' + esc(tinyHash(event.discarded_hash))
+        + ' → ' + esc(tinyHash(event.canonical_hash)) + '</div></div>';
+    }).join('')
+    : '<div class="empty">No tip switches recorded for this node.</div>';
+
+  // getinfo.errors is the node's most recent WARN/ERROR log line, not a health
+  // verdict, so label it as such and show its age: a routine per-peer warning
+  // overwrites this field continuously (see issue #655).
+  const lastLog = row.node_errors || '';
+  const lastLogAge = row.node_errors_at == null
+    ? null
+    : Math.max(0, (Date.now() / 1000) - row.node_errors_at);
+  el('node-last-log').innerHTML = lastLog
+    ? '<div class="kv">'
+      + kvRow('Logged', age(lastLogAge) + ' ago', lastLogAge != null && lastLogAge < 300 ? 'warn' : null)
+      + '</div><div class="log-lines"><code>' + esc(lastLog) + '</code></div>'
+      + '<p class="note-off">The node\'s most recent warning or error log line, as reported by'
+      + ' <code>getinfo.errors</code>. It is whatever logged last, not a health verdict.</p>'
+    : '<div class="empty">No warning or error reported by getinfo.</div>';
+
+  const logs = row.log_errors || [];
+  if (logs.length) {
+    el('node-logs').innerHTML = '<div class="log-lines">'
+      + logs.map((line) => '<code>' + esc(line) + '</code>').join('') + '</div>';
+  } else if (row.log_errors_suppressed) {
+    el('node-logs').innerHTML = '<p class="note-off">Log lines are not served on this public page.'
+      + ' Start the dashboard with <code>--expose-logs</code> to show the redacted tail.</p>';
+  } else {
+    el('node-logs').innerHTML = '<div class="empty">No recent errors or warnings in the node log.</div>';
+  }
+}
+function renderNode(data) {
+  renderNodeHeader(data);
+  renderNodeVitals(data);
+  renderNodeSparks(data);
+  renderNodeChain(data);
+  renderNodeSync(data);
+  renderNodePeers(data);
+  renderNodeEvents(data);
+  renderFreshness();
+}
+
 function render() {
   if (!state.data) return;
+  if (NODE_NAME) {
+    renderNode(state.data);
+    return;
+  }
   renderHeader(state.data);
-  renderActivation(state.data);
   renderFleet(state.data);
   renderStats(state.data);
   renderChain(state.data);
@@ -2666,8 +3525,9 @@ function render() {
 
 /* ---------- data ---------- */
 async function tick() {
+  const endpoint = NODE_NAME ? '/data/node/' + encodeURIComponent(NODE_NAME) : '/data';
   try {
-    const response = await fetch('/data', { cache: 'no-store' });
+    const response = await fetch(endpoint, { cache: 'no-store' });
     if (!response.ok) throw new Error('HTTP ' + response.status);
     state.data = await response.json();
     state.fetchedAt = Date.now();
@@ -2696,6 +3556,8 @@ document.addEventListener('click', (event) => {
     copyValue(copy);
     return;
   }
+  // Let the node link navigate instead of toggling the row's drawer.
+  if (event.target.closest('a.node-link')) return;
   const header = event.target.closest('thead th[data-sort]');
   if (header) {
     const key = header.dataset.sort;
@@ -2752,6 +3614,13 @@ setInterval(renderFreshness, 1000);
 
 COLLECTOR: ClusterCollector | None = None
 RATE_LIMITER = RateLimiter()
+# The page and its data both change every poll, and the HTML carries no
+# fingerprint. Without this a browser heuristically caches the page and keeps
+# serving a stale build after a dashboard deploy.
+NO_STORE = {
+    "Cache-Control": "no-store, must-revalidate",
+    "X-Content-Type-Options": "nosniff",
+}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2825,7 +3694,32 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/data":
             assert COLLECTOR is not None
             body = json.dumps(COLLECTOR.snapshot()).encode()
-            return self.send_body(200, body, "application/json")
+            return self.send_body(200, body, "application/json", NO_STORE)
+        if parsed.path.startswith("/data/node/"):
+            assert COLLECTOR is not None
+            name = urllib.parse.unquote(parsed.path[len("/data/node/"):])
+            snapshot = COLLECTOR.node_snapshot(name)
+            if snapshot is None:
+                return self.send_json(
+                    404, {"error": "unknown node", "node": name}, NO_STORE
+                )
+            return self.send_body(
+                200, json.dumps(snapshot).encode(), "application/json", NO_STORE
+            )
+        if parsed.path.startswith("/node/"):
+            assert COLLECTOR is not None
+            name = urllib.parse.unquote(parsed.path[len("/node/"):])
+            if name not in COLLECTOR.nodes_by_name:
+                return self.send_body(
+                    404,
+                    b'not found\n\nUnknown node. Return to the fleet: <a href="/">/</a>\n',
+                    "text/html; charset=utf-8",
+                    {"X-Content-Type-Options": "nosniff"},
+                )
+            # Same bytes as the fleet page; the client branches on the path.
+            return self.send_body(
+                200, PAGE.encode(), "text/html; charset=utf-8", NO_STORE
+            )
         if parsed.path == "/ironwood-status.json":
             assert COLLECTOR is not None
             headers = self.public_headers()
@@ -2860,6 +3754,7 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 PAGE.encode(),
                 "text/html; charset=utf-8",
+                NO_STORE,
             )
         return self.send_body(
             404,
@@ -2906,21 +3801,26 @@ def main() -> None:
         help="mark a node stale if height has not advanced in this many seconds",
     )
     parser.add_argument(
-        "--upgrade-height",
-        type=int,
-        default=DEFAULT_UPGRADE_HEIGHT,
-        help="upgrade activation height to estimate; 0 hides the upgrade cards",
-    )
-    parser.add_argument(
-        "--target-spacing",
-        type=float,
-        default=DEFAULT_TARGET_SPACING,
-        help="fallback seconds per block before enough live samples are observed",
-    )
-    parser.add_argument(
         "--state-file",
         default="",
         help="optional JSON path for durable orphan-pair history",
+    )
+    parser.add_argument(
+        "--history-window",
+        type=float,
+        default=DEFAULT_NODE_HISTORY_WINDOW,
+        help="seconds of per-node sparkline history to retain in memory",
+    )
+    parser.add_argument(
+        "--expose-logs",
+        action="store_true",
+        help="serve each node's redacted log error tail on the public node page",
+    )
+    parser.add_argument(
+        "--metrics-min-interval",
+        type=float,
+        default=None,
+        help="seconds between metric scrapes; omit to adapt to the last scrape's cost",
     )
     args = parser.parse_args()
 
@@ -2930,10 +3830,11 @@ def main() -> None:
         nodes,
         args.interval,
         args.stale_after,
-        args.upgrade_height,
-        args.target_spacing,
         args.network,
         state_file=state_file,
+        history_window=args.history_window,
+        expose_logs=args.expose_logs,
+        metrics_min_interval=args.metrics_min_interval,
     )
     threading.Thread(target=COLLECTOR.loop, daemon=True).start()
 

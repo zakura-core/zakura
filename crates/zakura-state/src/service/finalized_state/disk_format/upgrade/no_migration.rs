@@ -7,7 +7,7 @@ use zakura_chain::block::Height;
 
 use crate::service::finalized_state::ZakuraDb;
 
-use super::{CancelFormatChange, DiskFormatUpgrade};
+use super::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError};
 
 /// Implements [`DiskFormatUpgrade`] for in-place upgrades that do not involve any migration
 /// of existing data into the new format.
@@ -38,10 +38,10 @@ impl DiskFormatUpgrade for NoMigration {
     #[allow(clippy::unwrap_in_result)]
     fn run(
         &self,
-        _initial_tip_height: Height,
+        _initial_finalized_tip_height: Option<Height>,
         _db: &ZakuraDb,
         _cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<(), CancelFormatChange> {
+    ) -> Result<(), FormatChangeError> {
         Ok(())
     }
 

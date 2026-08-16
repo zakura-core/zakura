@@ -283,7 +283,7 @@ impl Storage {
     fn reject_if_non_standard_tx(&mut self, tx: &VerifiedUnminedTx) -> Result<(), MempoolError> {
         use zcash_script::script::{self, Evaluable as _};
 
-        let transaction = tx.transaction.transaction.as_ref();
+        let transaction = tx.transaction.transaction().as_ref();
         let spent_outputs = &tx.spent_outputs;
 
         for input in transaction.inputs() {
@@ -410,7 +410,7 @@ impl Storage {
         tx: &VerifiedUnminedTx,
         rejection_error: NonStandardTransactionError,
     ) -> Result<(), MempoolError> {
-        self.reject(tx.transaction.id, rejection_error.clone().into());
+        self.reject(tx.transaction.id(), rejection_error.clone().into());
         Err(MempoolError::NonStandardTransaction(rejection_error))
     }
 
@@ -452,7 +452,7 @@ impl Storage {
         // # Security
         //
         // This method must call `reject`, rather than modifying the rejection lists directly.
-        let unmined_tx_id = tx.transaction.id;
+        let unmined_tx_id = tx.transaction.id();
         let tx_id = unmined_tx_id.mined_id();
 
         // First, check if we have a cached rejection for this transaction.
@@ -535,7 +535,7 @@ impl Storage {
                 .last()
                 .expect("eviction removes at least the selected transaction")
                 .transaction
-                .id;
+                .id();
 
             self.reject(
                 victim_tx_id,
@@ -547,7 +547,7 @@ impl Storage {
                 result = Err(SameEffectsChainRejectionError::RandomlyEvicted.into());
             }
 
-            evicted_ids.extend(victim_txs.into_iter().map(|tx| tx.transaction.id));
+            evicted_ids.extend(victim_txs.into_iter().map(|tx| tx.transaction.id()));
         }
 
         (result, evicted_ids)
@@ -570,7 +570,7 @@ impl Storage {
     #[allow(dead_code)]
     pub fn remove_exact(&mut self, exact_wtxids: &HashSet<UnminedTxId>) -> usize {
         self.verified
-            .remove_all_that(|tx| exact_wtxids.contains(&tx.transaction.id))
+            .remove_all_that(|tx| exact_wtxids.contains(&tx.transaction.id()))
             .len()
     }
 
@@ -600,7 +600,7 @@ impl Storage {
     ) -> RemovedTransactionIds {
         let removed_mined = self
             .verified
-            .remove_all_that(|tx| mined_ids.contains(&tx.transaction.id.mined_id()));
+            .remove_all_that(|tx| mined_ids.contains(&tx.transaction.id().mined_id()));
 
         let spent_outpoints: HashSet<_> = transactions
             .iter()
@@ -627,7 +627,7 @@ impl Storage {
             .verified
             .transactions()
             .values()
-            .map(|tx| (tx.transaction.id, &tx.transaction.transaction))
+            .map(|tx| (tx.transaction.id(), tx.transaction.transaction()))
             .filter_map(|(tx_id, tx)| {
                 (tx.spent_outpoints()
                     .any(|outpoint| spent_outpoints.contains(&outpoint))
@@ -649,7 +649,7 @@ impl Storage {
 
         let removed_duplicate_spend = self
             .verified
-            .remove_all_that(|tx| duplicate_spend_ids.contains(&tx.transaction.id));
+            .remove_all_that(|tx| duplicate_spend_ids.contains(&tx.transaction.id()));
 
         for &mined_id in mined_ids {
             self.reject(
@@ -713,7 +713,7 @@ impl Storage {
 
     /// Returns the set of [`UnminedTxId`]s in the mempool.
     pub fn tx_ids(&self) -> impl Iterator<Item = UnminedTxId> + '_ {
-        self.transactions().values().map(|tx| tx.transaction.id)
+        self.transactions().values().map(|tx| tx.transaction.id())
     }
 
     /// Returns a reference to the [`HashMap`] of [`VerifiedUnminedTx`]s in the verified set.
@@ -955,7 +955,7 @@ impl Storage {
         let mut tx_ids = HashSet::new();
 
         for (&tx_id, tx) in self.transactions() {
-            if let Some(expiry_height) = tx.transaction.transaction.expiry_height() {
+            if let Some(expiry_height) = tx.transaction.transaction().expiry_height() {
                 if tip_height >= expiry_height {
                     tx_ids.insert(tx_id);
                 }
@@ -965,7 +965,7 @@ impl Storage {
         // expiry height is effecting data, so we match by non-malleable TXID
         let removed_tx_ids = self
             .verified
-            .remove_all_that(|tx| tx_ids.contains(&tx.transaction.id.mined_id()));
+            .remove_all_that(|tx| tx_ids.contains(&tx.transaction.id().mined_id()));
 
         // also reject it
         for id in tx_ids {

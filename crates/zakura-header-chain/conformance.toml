@@ -1,0 +1,929 @@
+spec_version = "1.4"
+
+# Phase 0 registers the complete rule catalog without implementation claims.
+# Later checkpoints change a status after the manifest can name its owner and tests.
+
+[[rule]]
+id = "LC-SCOPE-01"
+name = "Best-header semantics"
+status = "implemented"
+owner = "zakura_rpc::HeaderChainInfo"
+tests = ["DF-02::header_chain_info_exposes_mode_frontiers_and_persistent_alarms"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-SCOPE-02"
+name = "Correctness assumptions"
+status = "implemented"
+owner = "zakura_header_chain::EngineConfig"
+tests = ["architecture::engine_config_binds_and_validates_every_trust_anchor", "architecture::production_config_always_installs_the_release_manifest", "PW-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-SCOPE-03"
+name = "Header-validity boundary"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
+tests = ["DF-02::header_acceptance_cannot_construct_body_or_state_validity", "DF-02::body_verification_outcomes_preserve_distinct_transition_effects"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-SCOPE-08"
+name = "Headers-only finality disclosure"
+status = "implemented"
+owner = "zakura_rpc::HeaderChainInfo"
+tests = ["DG-07::headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication", "DG-07::migrated_headers_only_pin_refutation_is_durable_and_fail_closed", "DF-02::header_chain_info_exposes_mode_frontiers_and_persistent_alarms"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-SCOPE-04"
+name = "Wallet features excluded"
+status = "implemented"
+owner = "zakura_header_chain"
+tests = ["architecture::architecture_excludes_wallet_flyclient_and_block_sync_surfaces"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-SCOPE-05"
+name = "FlyClient proofs excluded"
+status = "implemented"
+owner = "zakura_header_chain"
+tests = ["architecture::architecture_excludes_wallet_flyclient_and_block_sync_surfaces"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-SCOPE-06"
+name = "Block-sync concerns excluded"
+status = "implemented"
+owner = "zakura_header_chain::EngineConfig"
+tests = ["architecture::architecture_excludes_wallet_flyclient_and_block_sync_surfaces", "architecture::architecture_dependencies_stay_sync_only_and_layered"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-SCOPE-07"
+name = "Auxiliary-evidence boundary"
+status = "implemented"
+owner = "zakura_header_chain::AuxAuthentication"
+tests = ["IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "IN-06::selected_auxiliary_repair_adds_only_one_exact_provenance_record"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-SCOPE-09"
+name = "Single protocol, no compatibility surface"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::header_sync_streams"
+tests = ["PW-08::declares_only_capability_bit_five_at_stream_version_eight", "PW-08::stale_accept_new_blocks_setting_is_rejected"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-DAG-01"
+name = "Durable node record"
+status = "implemented"
+owner = "zakura_state::service::finalized_state::disk_format::header_chain_values::HeaderNodeDisk"
+tests = ["DG-01::node_round_trip_contains_all_normative_fields"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-DAG-02"
+name = "Fork-aware indexes"
+status = "implemented"
+owner = "zakura_state::HeaderChainStore"
+tests = ["DG-04::fork_indexes_selection_and_inherited_reason_sets_are_exact", "DG-04::startup_repairs_every_reconstructible_index_atomically_before_publication", "DG-04::graph_boundary_and_transition_invariants_reject_corruption"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-DAG-03"
+name = "Bounded orphan staging"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::PeerWorkQueue"
+tests = ["DG-06::aggregate_owned_header_budget_spans_all_peers_and_releases_on_retirement", "DG-06::fair_reservations_fill_the_aggregate_budget_without_overcommit", "PW-03::requester_stages_all_pages_before_one_exact_admission"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-FRONTIER-01"
+name = "Shared finalized ancestry"
+status = "implemented"
+owner = "zakura_header_chain::verify_plan"
+tests = ["DG-02::invalidating_verified_path_preserves_independent_header_best", "DG-02::graph_boundary_and_transition_invariants_reject_corruption", "AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-FRONTIER-02"
+name = "Independent frontier selection"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
+tests = ["DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies", "DG-02::invalidating_verified_path_preserves_independent_header_best", "DG-07::finalization_and_replacement_match_serial_histories"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-FRONTIER-03"
+name = "Selection is not verification"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::select_best_header_chain"
+tests = ["DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-FRONTIER-04"
+name = "Durable frontier publication"
+status = "implemented"
+owner = "zakura_state::HeaderChainRuntime"
+tests = ["DG-03::every_crash_boundary_reopens_to_complete_transition", "AUD-15::committed_snapshots_are_the_sole_production_frontier_source", "DF-02::get_blockchain_info_response_with_an_arbitrary_chain_tip"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-GEN-01"
+name = "State-version advancement"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
+tests = ["IN-05::structured_replay_is_bounded_and_deterministic", "IN-05::bounded_transition_examples_replay_deterministically", "IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-GEN-02"
+name = "Frontier-generation advancement"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
+tests = ["IN-05::structured_replay_is_bounded_and_deterministic", "IN-05::bounded_transition_examples_replay_deterministically", "DG-07::finalization_and_replacement_match_serial_histories"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-GEN-03"
+name = "Branch-scoped work identity"
+status = "implemented"
+owner = "zakura_header_chain::HeaderSyncWorkOwner"
+tests = [
+    "IN-05::response_completion_requires_the_reserved_branch_scope",
+    "IN-05::stale_locator_completion_cannot_rebase_onto_a_new_generation",
+    "IN-05::generation_change_retires_served_path_before_late_page_completion",
+    "IN-05::completed_target_is_scoped_to_exact_generation_and_branch",
+    "IN-05::generation_or_anchor_change_retires_retry_work_before_reuse",
+    "IN-06::generation_change_retires_every_repair_state",
+]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-GEN-04"
+name = "Stale-result rejection"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
+tests = ["IN-02::all_owner_mismatches_have_zero_effects"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-GEN-05"
+name = "Single frontier publisher"
+status = "implemented"
+owner = "zakura_state::Publisher"
+tests = [
+    "IN-05::state_is_only_frontier_publisher",
+    "AUD-15::committed_snapshots_are_the_sole_production_frontier_source",
+]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-TXN-01"
+name = "Atomic frontier mutation"
+status = "implemented"
+owner = "zakura_state::HeaderChainRuntime::apply"
+tests = ["DG-03::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-TXN-02"
+name = "Uniform transition path"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
+tests = [
+    "IN-02::public_transition_api_plans_then_installs_one_verified_dag_change",
+    "DF-02::transition_event_contract_matrix_is_exhaustive",
+]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-RECOVER-01"
+name = "Startup integrity audit"
+status = "implemented"
+owner = "zakura_header_chain::audit_store"
+tests = ["DG-04::audits_each_normative_invariant"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-RECOVER-02"
+name = "Deterministic startup reconstruction"
+status = "implemented"
+owner = "zakura_header_chain::audit_store"
+tests = ["DG-04::recompute_not_cached_projection"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-RECOVER-03"
+name = "Projection repair or fail-close"
+status = "implemented"
+owner = "zakura_state::HeaderChainStore::startup"
+tests = ["DG-04::startup_repairs_every_reconstructible_index_atomically_before_publication"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-VAL-01"
+name = "Bounded response decoding"
+status = "implemented"
+owner = "zakura_network::HeaderSyncCodec::decode"
+tests = ["HV-01::declares_only_capability_bit_five_at_stream_version_eight", "HV-01::unsolicited_and_mismatched_responses_are_protocol_rejected", "HV-01::bounded_decode_rejects_discriminants_ids_bools_heights_and_trailing_bytes", "HV-01::payload_and_response_count_caps_apply_before_vector_decode", "HV-01::decode_rejects_each_vector_hint_schema_and_byte_boundary"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-VAL-02"
+name = "Canonical header and version"
+status = "implemented"
+owner = "zakura_header_chain::validate_encoding_version_hash"
+tests = ["HV-02::canonical_version_hash_link_and_height_boundaries"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-VAL-03"
+name = "Parent-link continuity"
+status = "implemented"
+owner = "zakura_header_chain::validate_link"
+tests = ["HV-02::canonical_version_hash_link_and_height_boundaries"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-HEIGHT-01"
+name = "Authenticated height inference"
+status = "implemented"
+owner = "zakura_header_chain::infer_height"
+tests = ["HV-02::canonical_version_hash_link_and_height_boundaries"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-COMMIT-01"
+name = "Production commitment parsing"
+status = "implemented"
+owner = "zakura_header_chain::validate_commitment_structure"
+tests = ["HV-08::production_activation_headers_pass_shared_rules"]
+networks = ["mainnet", "testnet"]
+
+[[rule]]
+id = "LC-COMMIT-02"
+name = "Custom-schedule commitment parsing"
+status = "implemented"
+owner = "zakura_header_chain::validate_commitment_structure"
+tests = ["HV-08::custom_overlapping_activations_select_the_configured_commitment_variant"]
+networks = ["custom"]
+
+[[rule]]
+id = "LC-VAL-05"
+name = "Target and hash validation"
+status = "implemented"
+owner = "zakura_header_chain::validate_compact_target"
+tests = ["HV-03::difficulty_validation_failure", "HV-03::hash_filter_accepts_equality_and_rejects_one_above"]
+networks = ["mainnet", "testnet"]
+
+[[rule]]
+id = "LC-VAL-04"
+name = "Equihash verification"
+status = "implemented"
+owner = "zakura_header_chain::PowPolicy::validate_solution"
+tests = ["HV-03::equihash_is_valid_for_historical_blocks", "HV-03::pow_policy_waiver_is_derived_only_from_custom_network_identity"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-VAL-06"
+name = "Contextual difficulty validation"
+status = "implemented"
+owner = "zakura_header_chain::AdjustedDifficulty"
+tests = ["HV-04::difficulty_windows_upgrades_testnet_minimum_and_partitions_match", "HV-04::difficulty_damping_bounds_are_exact", "DF-01::header_daa_accepts_valid_threshold_with_full_context", "DF-01::header_daa_rejects_bad_threshold_with_full_context"]
+networks = ["mainnet", "testnet"]
+
+[[rule]]
+id = "LC-POW-01"
+name = "Configured proof-of-work waiver"
+status = "implemented"
+owner = "zakura_header_chain::PowPolicy::for_network"
+tests = ["HV-03::pow_policy_waiver_is_derived_only_from_custom_network_identity", "DF-01::difficulty_is_valid_for_historical_blocks"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-VAL-07"
+name = "Median and maximum time"
+status = "implemented"
+owner = "zakura_header_chain::validate_contextual_difficulty_and_time"
+tests = ["HV-05::median_and_production_max_time_boundaries_are_exact", "HV-05::height_one_header_skips_max_time_limit_but_later_mainnet_headers_do_not"]
+networks = ["mainnet", "testnet"]
+
+[[rule]]
+id = "LC-TIME-01"
+name = "Custom-network time rules"
+status = "implemented"
+owner = "zakura_header_chain::validate_contextual_difficulty_and_time"
+tests = ["HV-05::custom_mtp_and_max_time_use_local_parameters_with_pow_on_or_off"]
+networks = ["custom"]
+
+[[rule]]
+id = "LC-VAL-08"
+name = "Future-header deferral"
+status = "implemented"
+owner = "zakura_header_chain::prepare_headers"
+tests = ["HV-05::future_time_accepts_two_hour_equality_and_rejects_one_second_above", "HV-05::future_time_is_deferred_but_deterministic_failures_are_rejected"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-VAL-09"
+name = "Checkpoint ancestry"
+status = "implemented"
+owner = "zakura_header_chain::transition::planner::anchor_reasons"
+tests = ["HV-06::insertion_enforces_every_immutable_configured_checkpoint", "HV-06::production_settled_pins_create_exact_permanent_conflict_reasons", "HV-06::fixed_anchor_boundary_matrix_replays_through_transitions"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-VAL-10"
+name = "Per-block work calculation"
+status = "implemented"
+owner = "zakura_chain::work::difficulty::Work::try_from"
+tests = ["HV-07::per_block_work_preserves_values_above_u128"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WORKCALC-01"
+name = "Checked cumulative work"
+status = "implemented"
+owner = "zakura_chain::work::difficulty::PartialCumulativeWork::checked_add"
+tests = ["HV-07::cumulative_work_checks_u256_boundary"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-VAL-11"
+name = "Validation before admission"
+status = "implemented"
+owner = "zakura_header_chain::prepare_headers + zakura_state::Request::ApplyHeaderChainInsert"
+tests = ["DG-01::requester_stages_all_pages_before_one_exact_admission", "DG-01::complete_batch_is_sealed_to_lease_and_uses_internal_context", "IN-01::all_owner_mismatches_have_zero_effects"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-ANCHOR-01"
+name = "Absolute trust anchors"
+status = "implemented"
+owner = "zakura_header_chain::transition::planner::anchor_reasons"
+tests = ["HV-06::engine_config_binds_and_validates_every_trust_anchor", "HV-06::insertion_enforces_every_immutable_configured_checkpoint", "HV-06::production_settled_pins_create_exact_permanent_conflict_reasons", "DG-05::fixed_anchor_replacements_cover_finalization_boundary_in_both_orders"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-ANCHOR-02"
+name = "Trusted-anchor validation"
+status = "implemented"
+owner = "zakura_header_chain::EngineConfig::new"
+tests = ["HV-06::production_config_always_installs_the_release_manifest", "HV-06::trusted_anchor_still_runs_every_directly_observable_check"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-ANCHOR-03"
+name = "Post-anchor validation context"
+status = "implemented"
+owner = "zakura_state::HeaderChainStore::validation_context"
+tests = ["HV-06::later_anchor_predecessor_context_has_exact_one_to_twenty_eight_boundary", "HV-06::later_anchor_predecessor_context_rejects_gap_hash_and_link_corruption", "HV-06::clean_store_initializes_only_from_finalized_full_state", "HV-06::atomic_finality_context_can_use_a_newly_staged_anchor_path", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-ANCHOR-04"
+name = "Mode-independent release-authenticated settled pin"
+status = "implemented"
+owner = "zakura_header_chain::EngineConfig::new"
+tests = ["HV-09::release_manifest_pins_exact_v1_3_production_tuples", "HV-09::production_config_always_installs_the_release_manifest"]
+networks = ["mainnet", "testnet"]
+
+[[rule]]
+id = "LC-ANCHOR-05"
+name = "Atomic settled-pin updates"
+status = "implemented"
+owner = "zakura_header_chain::SettledUpgradeManifest::for_release"
+tests = ["HV-09::release_manifest_pins_exact_v1_3_production_tuples"]
+networks = ["mainnet", "testnet"]
+
+[[rule]]
+id = "LC-SELECT-01"
+name = "Eligible-path filtering"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::eligible_header_tips"
+tests = ["DG-01::fork_indexes_selection_and_inherited_reason_sets_are_exact", "DG-01::arbitrary_graph_operations_match_an_independent_uncached_model"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-SELECT-02"
+name = "Greatest-work selection"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::select_best_header_chain"
+tests = ["DG-01::insertion_permutations_match_an_independent_greatest_work_model", "DG-01::arbitrary_graph_operations_match_an_independent_uncached_model"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-SELECT-03"
+name = "Raw-hash tie-breaker"
+status = "implemented"
+owner = "zakura_header_chain::ChainScore::cmp"
+tests = ["DF-01::chain_score_breaks_equal_work_ties_using_raw_hash_bytes"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-SELECT-04"
+name = "Deterministic selection"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::select_best_header_chain"
+tests = ["DG-01::insertion_permutations_match_an_independent_greatest_work_model", "DG-01::arbitrary_graph_operations_match_an_independent_uncached_model"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-REORG-01"
+name = "Finalized-anchor reorganization"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::select_best_header_chain"
+tests = ["DG-05::fixed_anchor_replacements_cover_finalization_boundary_in_both_orders"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-FINAL-01"
+name = "Atomic finalization transition"
+status = "implemented"
+owner = "zakura_state::HeaderChainRuntime::apply_combined"
+tests = ["DG-05::finality_atomic_prune_rebase_projection_generation", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-FINAL-02"
+name = "Full-state finality"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
+tests = ["DG-07::integrated_finality_requires_authority_and_exact_verified_path"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-FINAL-03"
+name = "Headers-only depth finality"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
+tests = ["DG-07::headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-FINAL-04"
+name = "Mode and finality provenance"
+status = "implemented"
+owner = "zakura_state::HeaderChainStore::migrate_headers_only_to_integrated"
+tests = ["DG-07::migrated_pin_refutation_requires_full_state_authority_and_exact_pin", "DG-07::migrated_headers_only_pin_refutation_is_durable_and_fail_closed"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-RETAIN-01"
+name = "Fork and node limits"
+status = "implemented"
+owner = "zakura_header_chain::enforce_retention"
+tests = ["DG-06::candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash", "DG-06::exact_v1_node_boundary_refuses_to_evict_the_selected_path", "DG-06::protected_paths_and_context_references_fail_closed_under_node_pressure"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-RETAIN-02"
+name = "Deterministic eviction order"
+status = "implemented"
+owner = "zakura_header_chain::enforce_retention"
+tests = ["DG-06::permanent_subtrees_are_evicted_first_only_under_pressure", "DG-06::candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-RETAIN-03"
+name = "Eviction is not invalidity"
+status = "implemented"
+owner = "zakura_header_chain::RetentionPlan"
+tests = ["DG-06::candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-RETAIN-04"
+name = "Staged-target limits"
+status = "implemented"
+owner = "zakura_network::AdvertisedHeaderTarget"
+tests = ["PW-05::peer_work_queue_caps_targets_and_only_supersedes_unstarted_work"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-INT-01"
+name = "Unified transition events"
+status = "implemented"
+owner = "zakura_state::HeaderChainRuntime"
+tests = ["IN-01::transition_input_accessors_match_each_variant", "IN-01::insertion_enforces_every_immutable_configured_checkpoint", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-INT-02"
+name = "Branch-aware resets"
+status = "implemented"
+owner = "zakura_state::service::write::classify_verified_change"
+tests = ["IN-01::same_lower_forward_resets_use_identical_branch_path", "AUD-04::consecutive_resets_use_exact_branch_identity"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-INT-03"
+name = "Full-block integration"
+status = "implemented"
+owner = "zakura_state::service::write::PreparedFullStateTransition"
+tests = ["IN-01::full_commit_ensures_exact_node_body_and_independent_selection", "DF-01::generated_nu5_graph_matches_full_state_before_finalization", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-INT-04"
+name = "Atomic invalidate and reconsider"
+status = "implemented"
+owner = "zakura_state::service::write::commit_operator_change"
+tests = ["IN-01::generated_nu5_graph_matches_full_state_before_finalization", "AUD-10::operator_invalidation_promotes_alternate_and_preserves_nested_reasons", "AUD-11::invalidating_verified_path_preserves_independent_header_best", "AUD-12::operator_reconsider_restores_shorter_higher_work_verified_branch", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-INT-05"
+name = "Owner-qualified freshness"
+status = "implemented"
+owner = "zakura_header_chain::transition::planner::derive_transition_plan"
+tests = ["DF-02::typed_header_authority_ignores_global_version_but_binds_branch_freshness", "DF-02::typed_body_authority_ignores_global_version_but_rejects_stale_generation", "IN-01::all_owner_mismatches_have_zero_effects"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-INT-06"
+name = "Adjacent replay scope"
+status = "implemented"
+owner = "zakura_header_chain::EngineMetadata::last_transition"
+tests = ["IN-04::replay_identity_is_domain_payload_and_authority_bound", "IN-04::replay_protection_covers_only_the_adjacent_state_changing_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-INT-07"
+name = "Durable-fact provenance"
+status = "implemented"
+owner = "zakura_state::HeaderChainRuntime"
+tests = ["DG-05::finality_atomic_prune_rebase_projection_generation", "DG-01::complete_batch_is_sealed_to_lease_and_uses_internal_context", "IN-07::stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or_score"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-INT-08"
+name = "Distinct admission-pressure outcomes"
+status = "implemented"
+owner = "zakura_header_chain::transition::planner::derive_transition_plan"
+tests = ["DG-06::protected_paths_and_context_references_fail_closed_under_node_pressure", "DG-06::exact_v1_node_boundary_refuses_to_evict_the_selected_path", "IN-06::auxiliary_resource_limits_reject_equal_plus_one_without_effects"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-BODY-01"
+name = "Body-payload mismatch"
+status = "implemented"
+owner = "zakura_header_chain::BodyPayloadMismatch"
+tests = ["IN-02::each_commitment_mismatch_scores_only_body_delivery", "IN-02::reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch", "DF-02::full_state_failure_classes_match_header_engine_contract", "AUD-03::body_evidence_matrix_preserves_typed_effect_boundaries", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-BODY-02"
+name = "Consensus-invalid body feedback"
+status = "implemented"
+owner = "zakura_state::service::write::HeaderChainWriter::record_body_invalid"
+tests = ["IN-02::consensus_invalidity_persists_and_scores_only_exact_supplier", "IN-02::header_valid_body_invalidity_reselects_after_authenticated_evidence", "IN-02::reactor_scores_exact_supplier_for_commitment_matching_consensus_invalidity", "IN-02::body_apply_evidence_is_canonical_or_attempt_scoped_by_outcome_kind", "DF-02::full_state_failure_classes_match_header_engine_contract", "AUD-03::body_evidence_matrix_preserves_typed_effect_boundaries", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-BODY-03"
+name = "Transient body failures"
+status = "implemented"
+owner = "zakura_header_chain::TransientBodyFailure"
+tests = ["IN-02::reactor_retries_unavailable_body_without_scoring_its_supplier", "IN-02::unexpected_verifier_hash_is_retryable_without_supplier_blame", "IN-02::abandoned_pending_apply_events_drain_queued_blocks", "IN-02::production_body_unavailability_writer_authenticates_exact_evidence", "IN-02::transient_body_evidence_cannot_regress_a_verified_body", "DF-02::full_state_failure_classes_match_header_engine_contract", "AUD-03::body_evidence_matrix_preserves_typed_effect_boundaries"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-BODY-04"
+name = "Evidence-bound peer scoring"
+status = "implemented"
+owner = "zakura_header_chain::Attribution"
+tests = ["IN-02::supplier_evidence_attribution_matrix_distinguishes_header_body_and_advertiser", "IN-02::each_commitment_mismatch_scores_only_body_delivery", "IN-02::consensus_invalidity_persists_and_scores_only_exact_supplier", "IN-02::reactor_scores_exact_supplier_for_commitment_matching_consensus_invalidity", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "IN-02::unexpected_verifier_hash_is_retryable_without_supplier_blame"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-OP-01"
+name = "Durable operator invalidation"
+status = "implemented"
+owner = "zakura_state::service::write::commit_operator_change"
+tests = ["IN-04::generated_nu5_graph_matches_full_state_before_finalization", "AUD-10::operator_invalidation_promotes_alternate_and_preserves_nested_reasons", "AUD-11::invalidating_verified_path_preserves_independent_header_best", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-OP-02"
+name = "Reason-scoped reconsideration"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::remove_operator_invalidation"
+tests = ["IN-04::operator_reconsider_preserves_every_unnamed_reason", "IN-04::insertion_enforces_every_immutable_configured_checkpoint", "AUD-10::operator_invalidation_promotes_alternate_and_preserves_nested_reasons", "AUD-12::operator_reconsider_restores_shorter_higher_work_verified_branch", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-AVAIL-01"
+name = "Body acquisition retries"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::BodyRetryEpisode::record_failure"
+tests = ["IN-03::exact_backoff_caps_then_alarms_and_probes_every_ten_minutes", "IN-03::jitter_and_final_delay_are_clamped_and_only_restart_resets_an_episode", "IN-03::supplier_churn_cannot_suppress_a_persistent_alarm", "IN-03::seeded_jitter_is_reproducible_and_within_the_normative_bound", "IN-03::body_retry_backoff_is_exact_and_supplier_local", "IN-03::refreshing_retry_suppliers_removes_only_departed_supplier_deferrals", "IN-03::reactor_retries_unavailable_body_without_scoring_its_supplier", "DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-AVAIL-02"
+name = "Persistent body-unavailable alarm"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::BodyRetryEpisode::record_failure"
+tests = ["IN-03::exact_backoff_caps_then_alarms_and_probes_every_ten_minutes", "IN-03::elapsed_alarm_waits_until_every_known_supplier_was_tried", "IN-03::restored_alarm_preserves_episode_age_attempts_and_probe_cadence", "IN-03::persisted_body_alarm_is_exact_global_and_survives_reconnect", "IN-03::newly_eligible_supplier_preserves_persistent_body_alarm_once", "IN-03::operator_body_retry_is_exact_deduplicated_and_requires_a_supplier", "IN-03::new_body_supplier_preserves_only_the_selected_persistent_alarm", "IN-03::operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers", "IN-03::serialized_apply_commits_before_receipt_and_reopens_exactly", "IN-03::persistent_body_alarm_metrics_expose_every_required_dimension", "DF-02::header_chain_info_exposes_mode_frontiers_and_persistent_alarms", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-AVAIL-03"
+name = "Availability-neutral fork choice"
+status = "implemented"
+owner = "zakura_header_chain::MemHeaderStore::select_best_header_chain"
+tests = ["DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WORK-01"
+name = "Generation-scoped forward work"
+status = "implemented"
+owner = "zakura_header_chain::HeaderWorkAuthority + zakura_header_chain::BodyWorkAuthority"
+tests = ["AUD-08::completed_target_is_scoped_to_exact_generation_and_branch", "IN-05::generation_or_anchor_change_retires_retry_work_before_reuse", "IN-05::generation_change_retires_unstarted_targets_before_new_scheduling", "AUD-06::committed_snapshot_retires_in_flight_state_results", "AUD-09::generation_change_retires_every_repair_state", "IN-05::generation_change_retires_served_path_before_late_page_completion", "IN-05::work_queue_separates_scopes_and_retires_obsolete_reservations", "IN-05::reactor_reset_mid_download_drops_stale_anchors_and_releases_budget", "IN-05::committed_reanchor_releases_stale_submitted_bodies", "IN-05::stale_retry_completion_releases_only_exact_infrastructure"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WORK-02"
+name = "Safe finalized-coverage reuse"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::scheduler::completed_targets::CompletedHeaderTargets::retain_current"
+tests = ["AUD-08::generation_change_conservatively_reuses_no_completed_targets", "AUD-08::completed_target_is_scoped_to_exact_generation_and_branch"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WORK-03"
+name = "Stale-anchor recovery"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::HeaderSyncReactor::observe_latest_committed_snapshot"
+tests = ["IN-07::stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or_score", "IN-07::serialized_apply_commits_before_receipt_and_reopens_exactly", "IN-05::all_owner_mismatches_have_zero_effects", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "PW-04::only_malformed_protocol_and_invalid_header_default_to_header_peer_fault"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-ERR-01"
+name = "Error-category preservation"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::HeaderSyncReactor::handle_typed_failure"
+tests = ["PW-04::driver_preserves_every_header_preparation_failure_category", "PW-04::oversized_body_hint_is_malformed_metadata_not_an_invalid_header", "PW-04::taxonomy_has_stable_exhaustive_metric_and_attribution_labels", "PW-04::typed_taxonomy_scores_only_exact_attributed_header_peer_faults", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "PW-04::unsolicited_and_mismatched_responses_are_protocol_rejected"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-ERR-02"
+name = "Peer-fault boundary"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainError::is_automatic_header_peer_fault"
+tests = ["PW-04::only_malformed_protocol_and_invalid_header_default_to_header_peer_fault", "PW-04::typed_taxonomy_scores_only_exact_attributed_header_peer_faults", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "PW-04::oversized_body_hint_is_malformed_metadata_not_an_invalid_header", "IN-07::stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or_score"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-AUX-01"
+name = "Hash-scoped metadata provenance"
+status = "implemented"
+owner = "zakura_header_chain::AuxDelivery"
+tests = ["IN-06::auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral", "IN-06::selected_auxiliary_repair_adds_only_one_exact_provenance_record", "DG-01::aux_finality_and_metadata_values_round_trip_exactly"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-AUX-02"
+name = "Unauthenticated metadata isolation"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
+tests = ["IN-06::auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral", "IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "PW-06::oversized_body_hint_is_malformed_metadata_not_an_invalid_header", "IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-AUX-03"
+name = "Branch-scoped VCT repair"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::ActiveHeaderRequest + HeaderTargetPurpose::SelectedAuxiliaryRepair"
+tests = ["AUD-09::generation_change_retires_every_repair_state", "IN-06::vct_repair_uses_one_exact_canonical_auxiliary_request", "IN-06::retired_vct_request_response_has_no_actions_or_peer_score", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-AUX-04"
+name = "Cryptographic metadata authentication"
+status = "implemented"
+owner = "zakura_state::service::write::HeaderChainWriter::vct_authentication_request"
+tests = ["IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "IN-06::vct_untrusted_source_defers_unverifiable_tip_root_until_successor", "IN-06::vct_untrusted_source_bad_root_replacement_commits_same_height", "IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence", "IN-06::authenticates_every_supplied_delivery_ahead_of_its_body", "IN-06::never_authenticates_or_over_rejects_a_corrupted_delivery", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-01"
+name = "Bounded decoding"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::HeaderSyncCodec::decode"
+tests = ["PW-01::bounded_decode_rejects_discriminants_ids_bools_heights_and_trailing_bytes", "PW-01::decode_rejects_each_vector_hint_schema_and_byte_boundary"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-02"
+name = "Atomic status snapshot"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::Status::from_snapshot"
+tests = ["PW-01::peer_admission_catches_up_snapshot_before_initial_status"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-17"
+name = "Status publication cadence"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::scheduler::status::StatusPublisher"
+tests = ["PW-07::initial_refresh_and_coalesced_change_deadlines_are_bounded"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-03"
+name = "Locator construction"
+status = "implemented"
+owner = "zakura_header_chain::HeaderLocator::for_selected_path"
+tests = ["PW-02::selected_path_locators_match_every_offset_and_cap_boundary", "PW-02::selected_path_locator_appends_a_non_genesis_finalized_frontier", "PW-02::selected_path_locator_fails_closed_on_a_projection_gap", "PW-02::coherent_reader_builds_locator_from_the_durable_selected_projection"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-04"
+name = "Advertised-target scheduling"
+status = "implemented"
+owner = "zakura_network::ActiveHeaderRequest"
+tests = ["PW-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape", "PW-05::peer_work_queue_caps_targets_and_only_supersedes_unstarted_work"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-13"
+name = "Body-size hint safety"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::HeaderSyncCodec::decode_headers"
+tests = ["PW-06::body_hints_completion_and_aux_defaults_are_enforced", "PW-06::decode_rejects_each_vector_hint_schema_and_byte_boundary", "PW-06::headers_golden_vector_uses_parallel_wire_sections"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-14"
+name = "Auxiliary-schema validation"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::TreeAuxRecordV1::validate_for"
+tests = ["PW-06::request_bounds_and_schema_advertisement_are_enforced", "PW-06::headers_golden_vector_uses_parallel_wire_sections", "PW-06::body_hints_completion_and_aux_defaults_are_enforced", "PW-06::decode_rejects_each_vector_hint_schema_and_byte_boundary"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-15"
+name = "Immutable schema evolution"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::AuxSchema"
+tests = ["PW-01::request_bounds_and_schema_advertisement_are_enforced", "PW-01::body_hints_completion_and_aux_defaults_are_enforced"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-16"
+name = "Fixed discriminants and no block relay"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::run_peer"
+tests = ["PW-01::discriminant_four_is_decoded_only_as_headers_outcome", "PW-01::discriminator_four_never_guesses_block_relay_payload", "PW-01::discriminator_four_is_always_headers_outcome"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-05"
+name = "Snapshot-bound path serving"
+status = "implemented"
+owner = "zakura_state::RetainedPathLease"
+tests = ["PW-03::retained_path_leases_are_exact_bounded_session_scoped_and_expiring", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-06"
+name = "No target substitution"
+status = "implemented"
+owner = "zakura_network::HeaderPathLease"
+tests = ["PW-03::retained_path_leases_are_exact_bounded_session_scoped_and_expiring", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-07"
+name = "Explicit response outcomes"
+status = "implemented"
+owner = "zakura_network::HeaderPathLeaseResult"
+tests = ["PW-04::every_unservable_path_result_is_a_correlated_explicit_outcome"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-08"
+name = "Correlated response validation"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::ActiveHeaderRequest::accepts_response_page"
+tests = ["PW-03::unsolicited_and_mismatched_responses_are_protocol_rejected", "PW-03::requester_stages_all_pages_before_one_exact_admission", "PW-03::only_exact_prepared_current_targets_reach_state"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-09"
+name = "Continuation target integrity"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::ActiveHeaderRequest::continuation_locator"
+tests = ["PW-03::requester_stages_all_pages_before_one_exact_admission", "PW-03::complete_target_is_independent_of_page_partition", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-10"
+name = "Non-punitive retry outcomes"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::HeaderSyncReactor::handle_headers_outcome"
+tests = ["PW-04::explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh", "PW-04::every_unservable_path_result_is_a_correlated_explicit_outcome", "PW-07::initial_refresh_and_coalesced_change_deadlines_are_bounded"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-11"
+name = "Peer-attributable violations"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::pipe::run_peer"
+tests = ["PW-04::unsolicited_and_mismatched_responses_are_protocol_rejected", "PW-04::broken_ancestry_and_completed_target_are_rejected", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "PW-04::decode_rejects_each_vector_hint_schema_and_byte_boundary"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-WIRE-12"
+name = "Unknown-fork discovery"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::AdvertisedHeaderTarget::is_discovery_eligible"
+tests = ["PW-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape", "PW-05::corrupted_advisory_fields_never_change_local_authority"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-PARITY-01"
+name = "Observable-header consensus parity"
+status = "implemented"
+owner = "zakura_header_chain::prepare_headers + zakura_state::HeaderChainWriter"
+tests = ["DF-01::production_activation_headers_pass_shared_rules", "DF-01::generated_nu5_graph_matches_full_state_before_finalization"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-PARITY-02"
+name = "Typed intentional differences"
+status = "implemented"
+owner = "zakura_header_chain::BodyVerificationClass + zakura_header_chain::BodyEvidence"
+tests = ["DF-02::full_state_failure_classes_match_header_engine_contract", "DF-02::contextual_body_failure_classes_match_header_engine_contract", "IN-02::header_valid_body_invalidity_reselects_after_authenticated_evidence"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-PARITY-03"
+name = "Tie-break policy isolation"
+status = "implemented"
+owner = "zakura_header_chain::ChainScore::cmp"
+tests = ["DF-01::chain_score_breaks_equal_work_ties_using_raw_hash_bytes"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-TEST-01"
+name = "Cross-network conformance coverage"
+status = "implemented"
+owner = ".github/workflows/tests-unit.yml"
+tests = ["conformance::network_matrix_complete", "conformance::implemented_test_symbols_exist"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-TEST-02"
+name = "Rule-to-test completeness"
+status = "implemented"
+owner = "xtask::header_conformance::parse_rule_matrix_ids"
+tests = ["conformance::rule_to_test_matrix_must_cover_every_exact_rule_once_as_a_set", "conformance::checked_in_documents_validate"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-ACCEPT-01"
+name = "Complete regression coverage"
+status = "implemented"
+owner = "xtask::header_conformance::validate_acceptance_claims"
+tests = ["AUD-01::named_losing_branch_can_be_extended_past_the_incumbent", "AUD-02::shorter_higher_work_branch_replaces_a_taller_incumbent", "AUD-03::same_height_forks_are_insertion_order_independent", "AUD-04::consecutive_resets_use_exact_branch_identity", "AUD-05::retired_network_completion_has_no_effects", "AUD-06::retired_state_success_has_no_downstream_effects", "AUD-07::retired_state_failure_has_no_retry_or_peer_effects", "AUD-08::completed_target_is_scoped_to_exact_generation_and_branch", "AUD-09::generation_change_retires_every_repair_state", "AUD-10::operator_invalidation_promotes_alternate_and_preserves_nested_reasons", "AUD-11::invalidating_verified_path_preserves_independent_header_best", "AUD-12::operator_reconsider_restores_shorter_higher_work_verified_branch", "AUD-13::finalization_and_replacement_match_serial_histories", "AUD-14::every_crash_boundary_reopens_to_complete_transition", "AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child", "AUD-INCIDENT::late_completion_cannot_break_promoted_branch"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-ACCEPT-02"
+name = "Durable deterministic frontiers"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition + zakura_state::HeaderChainRuntime::apply_combined"
+tests = ["AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child", "DG-03::every_crash_boundary_reopens_to_complete_transition", "DG-01::same_height_forks_are_insertion_order_independent", "PW-03::complete_target_is_independent_of_page_partition", "DG-07::finalization_and_replacement_match_serial_histories", "DG-07::headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication", "DG-07::migrated_headers_only_pin_refutation_is_durable_and_fail_closed"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-ACCEPT-03"
+name = "Zero stale-generation effects"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::NoEffectsProbe"
+tests = ["AUD-05::retired_network_completion_has_no_effects", "AUD-06::retired_state_success_has_no_downstream_effects", "AUD-07::retired_state_failure_has_no_retry_or_peer_effects", "AUD-08::generation_change_conservatively_reuses_no_completed_targets", "AUD-09::generation_change_retires_every_repair_state", "IN-05::committed_reanchor_releases_stale_submitted_bodies", "IN-05::committed_snapshot_retires_in_flight_state_results"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-ACCEPT-04"
+name = "Terminating body-failure handling"
+status = "implemented"
+owner = "zakura_network::zakura::header_sync::BodyRetryEpisode"
+tests = ["IN-02::header_valid_body_invalidity_reselects_after_authenticated_evidence", "IN-03::exact_backoff_caps_then_alarms_and_probes_every_ten_minutes", "IN-03::elapsed_alarm_waits_until_every_known_supplier_was_tried", "IN-03::persisted_body_alarm_is_exact_global_and_survives_reconnect", "DG-02::body_availability_does_not_override_header_work_or_mark_other_bodies", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-ACCEPT-05"
+name = "Explained parity differences"
+status = "implemented"
+owner = "zakura_header_chain::BodyVerificationClass + xtask::header_conformance::validate_acceptance_claims"
+tests = ["DF-01::generated_nu5_graph_matches_full_state_before_finalization", "DF-02::full_state_failure_classes_match_header_engine_contract", "DF-02::contextual_body_failure_classes_match_header_engine_contract", "conformance::acceptance_is_all_or_nothing_and_requires_every_named_audit", "conformance::implementation_claims_require_real_owner_tests_and_networks"]
+networks = ["mainnet", "testnet", "custom"]

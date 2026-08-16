@@ -1,74 +1,49 @@
-//! Native Zakura header-sync stream messages and stateless guards.
+//! Native Zakura fork-aware header sync.
 
-use std::{
-    cmp::min,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    io::{self, Cursor, Read, Write},
-    sync::Arc,
-    time::Duration,
-};
-
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use chrono::{DateTime, Utc};
-use iroh::NodeId;
 use thiserror::Error;
-use tokio::{
-    sync::{mpsc, watch},
-    task::{JoinError, JoinHandle},
-    time::{self, Instant},
-};
-use tokio_util::sync::CancellationToken;
-use zakura_chain::{
-    block::{self, BlockTimeError},
-    parallel::commitment_aux::BlockCommitmentRoots,
-    parameters::Network,
-    serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
-    work::{difficulty::CompactDifficulty, difficulty::ExpandedDifficulty, equihash},
-};
+use zakura_chain::block;
 
-use super::{Frame, ZakuraPeerId, ZakuraTrace, FRAME_HEADER_BYTES, LOCAL_MAX_MESSAGE_BYTES};
+use super::{Frame, ZakuraPeerId, FRAME_HEADER_BYTES};
 
 mod config;
 mod error;
 mod events;
-mod header_root_auth;
+#[cfg(any(test, feature = "header-fuzz"))]
+mod fuzz;
 mod pipe;
-mod range;
 mod reactor;
-mod requester;
+mod scheduler;
 mod service;
-mod state;
 #[cfg(test)]
 mod tests;
-mod validation;
 mod wire;
-mod work_queue;
 
-pub use config::{
-    clamp_header_sync_request_count, header_sync_count_by_byte_budget,
-    header_sync_header_bytes_for_network, inbound_get_headers_count_limit, HeaderSyncStatus,
-    ZakuraHeaderSyncConfig,
-};
-pub use error::{HeaderSyncStartError, HeaderSyncWireError};
+pub use config::{header_sync_header_bytes_for_network, ZakuraHeaderSyncConfig};
+pub use error::HeaderSyncStartError;
+#[cfg(any(test, feature = "zakura-testkit"))]
+pub use events::HeaderSyncAction;
 pub use events::{
-    ExpectedHeadersResponse, HeaderRootAuthState, HeaderRootAuthUpdate,
-    HeaderRootAuthenticationFailureKind, HeaderSyncAction, HeaderSyncCommitFailureKind,
-    HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior,
-    HeaderSyncOperationIdentity, HeaderSyncOperationKind, HeaderSyncRequestId, HeaderSyncStartup,
-    HeaderSyncWireRequestIdentity, HeaderWitnessState,
+    Event, FullStateFrontiers, HeaderPathLease, HeaderPathLeaseResult, HeaderPathPage,
+    HeaderPathPageResult, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncRequestId,
+    HeaderSyncStartup, HeaderTargetAdmissionResult, HeaderTargetPreparationResult,
+    VctRepairContextResult,
 };
-pub use range::{CheckedHeaderRange, HeaderRangeEntry, HeaderRangePayload};
+#[cfg(any(test, feature = "header-fuzz"))]
+pub use fuzz::{replay_header_pursuit_bytes, HeaderPursuitReplaySummary, NoEffectsProbe};
 pub use reactor::spawn_header_sync_reactor;
-pub use service::HeaderSyncPeerSession;
-pub(crate) use service::{
-    drive_header_sync_actions, HeaderSyncPassthroughService, HeaderSyncService,
+pub use scheduler::peer_work::{ActiveHeaderRequest, AdvertisedHeaderTarget, HeaderTargetPurpose};
+pub use scheduler::retry::{
+    BodyRetryEpisode, BodyRetryQueue, RetryJitter, RetryUpdate, SeededRetryJitter,
 };
-pub use validation::{
-    validate_header_range_links, validate_headers_stateless, validate_new_block_stateless,
-    HeaderSyncDecodeContext, HeaderSyncValidationContext,
-};
+#[cfg(any(test, feature = "zakura-testkit"))]
+pub(crate) use service::drive_header_sync_actions;
+pub use service::PeerSession;
+pub(crate) use service::{HeaderSyncPassthroughService, HeaderSyncService};
+pub(crate) use wire::{headers_response_bytes, headers_response_capacity};
 pub use wire::{
-    HeaderSyncMessage, DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, MAX_HS_MESSAGE_BYTES,
-    MAX_HS_RANGE, MSG_HS_GET_HEADERS, MSG_HS_HEADERS, MSG_HS_NEW_BLOCK, MSG_HS_STATUS,
-    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
+    AuxSchema, GetHeaders, HeaderEntry, HeaderServingLimits, HeaderSyncCodec,
+    HeaderSyncDecodeContext, HeaderSyncMessage, HeaderSyncWireError, Headers, HeadersOutcome,
+    HeadersOutcomeCode, Status, TreeAuxRecordV1, DEFAULT_HS_RANGE, MAX_HS_MESSAGE_BYTES,
+    MAX_HS_RANGE, MSG_HS_GET_HEADERS, MSG_HS_HEADERS, MSG_HS_HEADERS_OUTCOME, MSG_HS_STATUS,
+    TREE_AUX_SCHEMA_V1_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };

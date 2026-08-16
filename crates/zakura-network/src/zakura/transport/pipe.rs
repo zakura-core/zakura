@@ -78,10 +78,12 @@ pub(crate) enum Flow<T> {
 /// Local state is owned here (`S`); shared state is reached through `env`.
 pub(crate) struct PipeCx<'a, S, Env> {
     /// Authenticated identity of the peer this pipe drives.
+    #[allow(dead_code)]
     pub(crate) peer_id: &'a ZakuraPeerId,
     /// The per-peer state machine — no locking.
     pub(crate) local: &'a mut S,
     /// Arc-cloneable shared environment handle.
+    #[allow(dead_code)]
     pub(crate) env: &'a Env,
 }
 
@@ -90,11 +92,9 @@ pub(crate) type PipeEntry<S, Env> = fn(&mut PipeCx<'_, S, Env>, Frame) -> Flow<(
 
 /// A node kind in a [`PipeShape`] DAG.
 ///
-/// `Validate`/`Outcome`-style effect nodes and the `Stage`/`branch!`/`Outcome`
-/// scaffolding for them are deliberately absent: today every service forwards a
-/// decoded `WireMessage` to its compatibility reactor, so the live shapes only
-/// use these variants. The effect-returning `Core` migration (see the pipelines
-/// plan) reintroduces exactly what it needs when it lands.
+/// Current services forward each decoded `WireMessage` to their reactor.
+/// The live shapes therefore omit `Validate`, `Stage`, `branch!`, and `Outcome` effects.
+/// The effect-returning `Core` migration will add the variants that it needs.
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum NodeKind {
     /// The shared protection stage.
@@ -104,6 +104,7 @@ pub(crate) enum NodeKind {
     /// The single `match` on the typed message.
     Branch,
     /// Local/shared state mutation producing an effect.
+    #[allow(dead_code)]
     Mutate,
     /// Effect execution (the async sends/actions/fanout).
     Emit,

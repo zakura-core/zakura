@@ -2803,8 +2803,8 @@ fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() 
 
         let unmined = UnminedTx::from(parsed.clone());
         let (txid, auth_digest) = parsed.txid_and_auth_digest();
-        assert_eq!(unmined.id.mined_id(), txid);
-        assert_eq!(unmined.id.auth_digest(), auth_digest);
+        assert_eq!(unmined.id().mined_id(), txid);
+        assert_eq!(unmined.id().auth_digest(), auth_digest);
         assert_ne!(
             txid,
             changed_parsed.hash(),

@@ -86,6 +86,25 @@ impl fmt::Display for ChainTipBlock {
     }
 }
 
+impl ChainTipBlock {
+    /// Construct the initial tip from a retained finalized identity when checkpoint pruning
+    /// intentionally skipped its raw transactions.
+    pub(crate) fn from_pruned_finalized_header(
+        hash: block::Hash,
+        height: block::Height,
+        header: Arc<block::Header>,
+    ) -> Self {
+        Self {
+            hash,
+            height,
+            time: header.time,
+            transactions: Vec::new(),
+            transaction_hashes: Arc::from([]),
+            previous_block_hash: header.previous_block_hash,
+        }
+    }
+}
+
 impl From<ContextuallyVerifiedBlock> for ChainTipBlock {
     fn from(contextually_valid: ContextuallyVerifiedBlock) -> Self {
         let ContextuallyVerifiedBlock {
@@ -214,12 +233,22 @@ impl ChainTipSender {
         let new_tip = new_tip.into();
         self.record_fields(&new_tip);
 
-        // once the non-finalized state becomes active, it is always populated
-        // but ignoring `None`s makes the tests easier
+        // Ignore `None`.
+        // A transition back to finalized publication must provide the exact finalized tip through
+        // `clear_best_non_finalized_tip`.
         if new_tip.is_some() {
             self.use_non_finalized_tip = true;
             self.update(new_tip)
         }
+    }
+
+    /// Return publication to the finalized tip after the non-finalized state becomes empty.
+    pub(crate) fn clear_best_non_finalized_tip(
+        &mut self,
+        finalized_tip: impl Into<Option<ChainTipBlock>>,
+    ) {
+        self.use_non_finalized_tip = false;
+        self.update(finalized_tip.into());
     }
 
     /// Possibly send an update to listeners.

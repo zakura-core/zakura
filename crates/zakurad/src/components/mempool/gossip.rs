@@ -38,9 +38,9 @@ const MAX_TX_INV_IN_SENT_MESSAGE_USIZE: usize = MAX_TX_INV_IN_SENT_MESSAGE as us
 /// up a large backlog of stale notifications.
 pub(super) const MEMPOOL_CHANGE_CHANNEL_CAPACITY: usize = MAX_CHANGES_BEFORE_SEND * 4;
 
-/// Runs continuously, gossiping new [`UnminedTxId`](zakura_chain::transaction::UnminedTxId) to peers.
+/// Runs continuously, gossiping new [`UnminedTxId`] to peers.
 ///
-/// Broadcasts any new [`UnminedTxId`](zakura_chain::transaction::UnminedTxId)s that
+/// Broadcasts any new [`UnminedTxId`]s that
 /// are stored in the mempool to multiple ready peers.
 pub(crate) async fn run_mempool_transaction_id_gossip<ZN, ZM>(
     mut receiver: broadcast::Receiver<MempoolChange>,

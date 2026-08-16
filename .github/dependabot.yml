@@ -2,56 +2,46 @@ version: 2
 updates:
   # Rust section
   - package-ecosystem: cargo
-    directory: '/'
-    # Update only the lockfile. We shouldn't update Cargo.toml unless it's for
-    # a security issue, or if we need a new feature of the dependency.
-    versioning-strategy: lockfile-only
-    # serde, clap, and other dependencies sometimes have multiple updates in a week
+    directory: "/"
+    # Routine version updates are disabled below. Use the automatic strategy for
+    # security updates so Dependabot can change Cargo.toml when a patched version
+    # falls outside the existing requirement.
+    versioning-strategy: auto
+    # Keep this entry to customize security updates, but do not open routine Cargo
+    # version updates. Routine dependency upgrades need matching cargo-vet evidence
+    # and otherwise fail the supply-chain gate, so maintainers curate them
+    # explicitly.
     schedule:
       interval: monthly
       timezone: America/New_York
-    # Limit dependabot to 1 PR per reviewer
-    open-pull-requests-limit: 6
+    # Defense in depth if routine version updates are re-enabled later.
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+    # Keep the repository's Dependabot security updates setting enabled;
+    # security pull requests use a separate limit and are unaffected by this.
+    # Re-enabling routine updates also requires restoring lockfile-only and
+    # replacing C-security with C-exclude-from-changelog before raising the
+    # pull request limit.
+    open-pull-requests-limit: 0
     labels:
-      - 'C-exclude-from-changelog'
-      - 'A-rust'
-      - 'A-dependencies'
-      - 'P-Low :snowflake:'
-    groups:
-        ecc:
-          patterns:
-            # deliberately include zcash_script (even though it is maintained by ZF)
-            - "zcash_*"
-            - "orchard"
-            - "halo2*"
-            - "incrementalmerkletree"
-            - "bridgetree"
-            - "equihash"
-        prod:
-          dependency-type: "production"
-          exclude-patterns:
-            - "zcash_*"
-            - "orchard"
-            - "halo2*"
-            - "incrementalmerkletree"
-            - "bridgetree"
-            - "equihash"
-        dev:
-          dependency-type: "development"
+      - "C-security"
   # Devops section
   - package-ecosystem: github-actions
-    directory: '/'
+    directory: "/"
     schedule:
       # tj-actions/changed-files often updates daily, which is too much for us
       interval: weekly
       day: wednesday
       timezone: America/New_York
+    # Cooldown delays adoption of fresh releases — the window when a
+    # compromised dependency is most likely to slip through. See:
+    # https://astral.sh/blog/open-source-security-at-astral#dependency-security
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 4
     labels:
-      - 'C-exclude-from-changelog'
-      - 'A-devops'
-      - 'A-dependencies'
-      - 'P-Low :snowflake:'
+      - "C-exclude-from-changelog"
     groups:
       devops:
         patterns:

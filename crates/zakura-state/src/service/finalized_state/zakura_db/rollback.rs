@@ -29,20 +29,23 @@ use crate::{
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     service::{
         finalized_state::{
-            disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
+            disk_db::{DiskWriteBatch, WriteDisk},
             disk_format::{
                 transparent::{
                     AddressBalanceLocation, AddressTransaction, AddressUnspentOutput,
                     OutputLocation,
                 },
-                TransactionLocation,
+                RawBytes, TransactionLocation,
             },
             zakura_db::{
                 chain::BLOCK_INFO,
                 transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
                 ZakuraDb,
             },
-            STATE_COLUMN_FAMILIES_IN_CODE,
+            HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD,
+            HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT,
+            HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_NODE_BY_HASH, HEADER_SELECTED,
+            HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED, STATE_COLUMN_FAMILIES_IN_CODE,
         },
         non_finalized_state::write_semantically_verified_backup_block,
     },
@@ -233,13 +236,6 @@ pub enum RollbackFinalizedStateError {
     /// Rebuilding the history tree failed.
     #[error("failed to rebuild history tree")]
     HistoryTree(#[from] HistoryTreeError),
-
-    /// Rebuilding the authenticated header-root frontier failed.
-    #[error("failed to rebuild header-root authentication frontier: {reason}")]
-    HeaderRootAuthFrontier {
-        /// The local frontier coherence failure.
-        reason: String,
-    },
 
     /// Computing a block subsidy failed.
     #[error("failed to compute block subsidy")]
@@ -493,12 +489,6 @@ fn prepare_rollback(
         removed_blocks.push(semantically_verified);
     }
 
-    // The Zakura header store races ahead of the body chain and is keyed independently of the
-    // block CFs above, so roll it back too: otherwise the rolled-back database keeps a Zakura
-    // header tip far above the new body tip, which starves Zakura block-sync (the floor body
-    // becomes un-requestable; see BUG_SUMMARY.md / `delete_zakura_headers_above`).
-    delete_zakura_headers_above(db, &mut batch, options.target_height);
-
     let target_treestate = prepare_target_treestate(
         db,
         network,
@@ -508,18 +498,6 @@ fn prepare_rollback(
 
     write_address_balances(db, &mut batch, address_balances);
     reset_tip_trees(db, &mut batch, &target_treestate);
-    batch
-        .rebase_header_root_auth_frontier_for_rollback(
-            db,
-            bounds.new_tip.0,
-            bounds.new_tip.1,
-            &target_treestate.history_tree,
-        )
-        .map_err(
-            |error| RollbackFinalizedStateError::HeaderRootAuthFrontier {
-                reason: error.to_string(),
-            },
-        )?;
     reset_value_pool(db, &mut batch, &target_value_pool);
     prune_tree_indexes(
         db,
@@ -527,12 +505,42 @@ fn prepare_rollback(
         options.target_height,
         &target_treestate.retained_sprout_roots,
     );
+    clear_header_chain_engine(db, &mut batch)?;
 
     Ok(PreparedRollback {
         bounds,
         batch,
         removed_blocks,
     })
+}
+
+fn clear_header_chain_engine(
+    db: &ZakuraDb,
+    batch: &mut DiskWriteBatch,
+) -> Result<(), RollbackFinalizedStateError> {
+    for family in [
+        HEADER_NODE_BY_HASH,
+        HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+        HEADER_BODY_EVIDENCE_AUTHORITY,
+        HEADER_CHILD,
+        HEADER_SELECTED,
+        HEADER_VERIFIED,
+        HEADER_ELIGIBILITY_ROOT,
+        HEADER_AUX_DELIVERY,
+        HEADER_DEFERRED,
+        HEADER_FINALITY_HISTORY,
+        HEADER_VALIDATION_CONTEXT,
+        HEADER_ENGINE_META,
+    ] {
+        let cf = db
+            .db
+            .cf_handle(family)
+            .expect("every header-chain family is opened from the running schema");
+        for (key, _) in db.db.raw_range_cf(&cf, &[], None)? {
+            batch.zs_delete(&cf, RawBytes::new_raw_bytes(key));
+        }
+    }
+    Ok(())
 }
 
 struct RebuiltTreestate {
@@ -914,45 +922,6 @@ fn delete_shielded_block(db: &ZakuraDb, batch: &mut DiskWriteBatch, block: &Bloc
     }
 }
 
-/// Roll the Zakura header store back so it is consistent with `target_height`.
-///
-/// The block CFs rolled back above are keyed by the body chain, but the Zakura header store
-/// (`zakura_header_*`) is maintained independently and races ahead of bodies. Rollback otherwise
-/// leaves it untouched, so a rolled-back database keeps header rows — and a `BestHeaderTip` — far
-/// above the new body tip. That inconsistency starves Zakura block-sync: `missing_block_bodies`
-/// only offers heights that already have a stored header, so the contiguous floor body
-/// (`target_height + 1`) is never requestable and body-sync stalls until it times out and falls
-/// back to legacy ChainSync. Delete every Zakura header entry above `target_height`, scanning from
-/// the (possibly higher) Zakura header tip down.
-fn delete_zakura_headers_above(db: &ZakuraDb, batch: &mut DiskWriteBatch, target_height: Height) {
-    let hash_by_height = db.db.cf_handle("zakura_header_hash_by_height").unwrap();
-    let height_by_hash = db.db.cf_handle("zakura_header_height_by_hash").unwrap();
-    let header_by_height = db.db.cf_handle("zakura_header_by_height").unwrap();
-    let body_size_by_height = db
-        .db
-        .cf_handle("zakura_header_body_size_by_height")
-        .unwrap();
-    let Some((tip_height, _tip_hash)) = db
-        .db
-        .zs_last_key_value::<_, Height, block::Hash>(&hash_by_height)
-    else {
-        return;
-    };
-
-    for height in ((target_height.0 + 1)..=tip_height.0).map(Height) {
-        if let Some(hash) = db.db.zs_get::<_, _, block::Hash>(&hash_by_height, &height) {
-            batch.zs_delete(&height_by_hash, hash);
-        }
-        batch.zs_delete(&hash_by_height, height);
-        batch.zs_delete(&header_by_height, height);
-        batch.zs_delete(&body_size_by_height, height);
-    }
-
-    if let Ok(first_deleted) = target_height.next() {
-        batch.delete_header_reorg_commitment_roots(db, first_deleted, tip_height);
-    }
-}
-
 fn delete_block_and_transaction_data(
     db: &ZakuraDb,
     batch: &mut DiskWriteBatch,
@@ -1177,10 +1146,6 @@ fn clear_backup_dir(path: &PathBuf) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use zakura_chain::serialization::ZcashDeserializeInto;
-
-    use crate::service::finalized_state::disk_format::RawBytes;
-
     use super::*;
 
     fn ephemeral_mainnet_db() -> ZakuraDb {
@@ -1228,6 +1193,60 @@ mod tests {
         tree.append(halo2::pasta::pallas::Base::from(value))
             .expect("single-note Ironwood tree is not full");
         tree.root()
+    }
+
+    #[test]
+    fn offline_rollback_clears_every_header_chain_family() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+        let families = [
+            HEADER_NODE_BY_HASH,
+            HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+            HEADER_BODY_EVIDENCE_AUTHORITY,
+            HEADER_CHILD,
+            HEADER_SELECTED,
+            HEADER_VERIFIED,
+            HEADER_ELIGIBILITY_ROOT,
+            HEADER_AUX_DELIVERY,
+            HEADER_DEFERRED,
+            HEADER_FINALITY_HISTORY,
+            HEADER_VALIDATION_CONTEXT,
+            HEADER_ENGINE_META,
+        ];
+        let mut seed = DiskWriteBatch::new();
+        for family in families {
+            let cf = db
+                .db
+                .cf_handle(family)
+                .expect("the test database opens every header-chain family");
+            seed.zs_insert(
+                &cf,
+                RawBytes::new_raw_bytes(vec![1]),
+                RawBytes::new_raw_bytes(vec![2]),
+            );
+        }
+        db.write_batch(seed)
+            .expect("seeding header-chain rows succeeds");
+
+        let mut rollback = DiskWriteBatch::new();
+        clear_header_chain_engine(&db, &mut rollback)
+            .expect("the rollback stages every header-chain deletion");
+        db.write_batch(rollback)
+            .expect("the header-chain deletions commit atomically");
+
+        for family in families {
+            let cf = db
+                .db
+                .cf_handle(family)
+                .expect("the test database keeps the family open");
+            assert!(
+                db.db
+                    .raw_range_cf(&cf, &[], None)
+                    .expect("the cleared family is readable")
+                    .is_empty(),
+                "{family} is empty after rollback"
+            );
+        }
     }
 
     /// Fast-path VCT commits write Sapling/Orchard/Ironwood anchors and the compact
@@ -1484,145 +1503,5 @@ mod tests {
             vec![Height(4), Height(5), Height(6)],
             "a request at or above U is served from the index"
         );
-    }
-
-    /// `delete_zakura_headers_above` must truncate every Zakura header CF above the target,
-    /// including the hash→height index, while leaving rows at or below the target intact. This
-    /// is the consistency guarantee that lets a rolled-back snapshot re-sync bodies from its tip
-    /// instead of stalling on an un-requestable floor (see the function doc).
-    #[test]
-    fn delete_zakura_headers_above_truncates_the_header_store() {
-        let _init_guard = zakura_test::init();
-
-        let db = ephemeral_mainnet_db();
-
-        // A real header value for `zakura_header_by_height`; the height math is what matters, so
-        // every seeded height can reuse the same header.
-        let header = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into::<Block>()
-            .expect("mainnet genesis test vector deserializes")
-            .header;
-
-        let hash_by_height = db.db.cf_handle("zakura_header_hash_by_height").unwrap();
-        let height_by_hash = db.db.cf_handle("zakura_header_height_by_hash").unwrap();
-        let header_by_height = db.db.cf_handle("zakura_header_by_height").unwrap();
-        let body_size_by_height = db
-            .db
-            .cf_handle("zakura_header_body_size_by_height")
-            .unwrap();
-
-        // Distinct hash per height so the hash→height index entries are independent.
-        let hash_at = |h: u32| block::Hash([h as u8; 32]);
-
-        // Seed heights 1..=5 across all four Zakura header CFs.
-        let mut batch = DiskWriteBatch::new();
-        for h in 1..=5u32 {
-            let height = Height(h);
-            let hash = hash_at(h);
-            batch.zs_insert(&hash_by_height, height, hash);
-            batch.zs_insert(&height_by_hash, hash, height);
-            batch.zs_insert(&header_by_height, height, &header);
-            // The value type is irrelevant to deletion-by-key; reuse `Height` as a stand-in.
-            batch.zs_insert(&body_size_by_height, height, height);
-            batch.insert_commitment_roots_by_height(
-                &db,
-                height,
-                &sapling_root(h.into()),
-                &orchard_root(h.into()),
-                &ironwood_root(h.into()),
-                0,
-                0,
-                0,
-                &zakura_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
-            );
-        }
-        db.write_batch(batch)
-            .expect("seeding the header store succeeds");
-
-        // Roll the Zakura header store back to height 3.
-        let mut batch = DiskWriteBatch::new();
-        delete_zakura_headers_above(&db, &mut batch, Height(3));
-        db.write_batch(batch)
-            .expect("truncating the header store succeeds");
-
-        // Heights 1..=3 (<= target) are retained across every CF, including the index.
-        for h in 1..=3u32 {
-            let height = Height(h);
-            assert!(
-                db.db
-                    .zs_get::<_, _, block::Hash>(&hash_by_height, &height)
-                    .is_some(),
-                "hash_by_height retains height {h}",
-            );
-            assert!(
-                db.db
-                    .zs_get::<_, _, RawBytes>(&header_by_height, &height)
-                    .is_some(),
-                "header_by_height retains height {h}",
-            );
-            assert!(
-                db.db
-                    .zs_get::<_, _, Height>(&body_size_by_height, &height)
-                    .is_some(),
-                "body_size_by_height retains height {h}",
-            );
-            assert!(
-                db.db
-                    .zs_get::<_, _, Height>(&height_by_hash, &hash_at(h))
-                    .is_some(),
-                "height_by_hash retains the index for height {h}",
-            );
-            assert!(
-                db.commitment_roots(height).is_some(),
-                "commitment roots retain height {h}",
-            );
-        }
-
-        // Heights 4..=5 (> target) are gone from every CF, including the hash→height index.
-        for h in 4..=5u32 {
-            let height = Height(h);
-            assert!(
-                db.db
-                    .zs_get::<_, _, block::Hash>(&hash_by_height, &height)
-                    .is_none(),
-                "hash_by_height drops height {h}",
-            );
-            assert!(
-                db.db
-                    .zs_get::<_, _, RawBytes>(&header_by_height, &height)
-                    .is_none(),
-                "header_by_height drops height {h}",
-            );
-            assert!(
-                db.db
-                    .zs_get::<_, _, Height>(&body_size_by_height, &height)
-                    .is_none(),
-                "body_size_by_height drops height {h}",
-            );
-            assert!(
-                db.db
-                    .zs_get::<_, _, Height>(&height_by_hash, &hash_at(h))
-                    .is_none(),
-                "height_by_hash drops the index for height {h}",
-            );
-            assert!(
-                db.commitment_roots(height).is_none(),
-                "commitment roots drop height {h}",
-            );
-        }
-    }
-
-    /// On a database with no Zakura header rows, truncation is a no-op (and must not panic on the
-    /// empty-tip lookup).
-    #[test]
-    fn delete_zakura_headers_above_is_a_noop_on_an_empty_store() {
-        let _init_guard = zakura_test::init();
-
-        let db = ephemeral_mainnet_db();
-
-        let mut batch = DiskWriteBatch::new();
-        delete_zakura_headers_above(&db, &mut batch, Height(3));
-        db.write_batch(batch)
-            .expect("an empty truncate batch writes cleanly");
     }
 }

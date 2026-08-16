@@ -143,7 +143,7 @@ pub fn standard_verified_unmined_tx_strategy() -> BoxedStrategy<VerifiedUnminedT
             standardize_transaction(&mut transaction);
 
             let unmined_tx = UnminedTx::from(transaction);
-            let miner_fee = unmined_tx.conventional_fee;
+            let miner_fee = unmined_tx.conventional_fee();
 
             VerifiedUnminedTx::new(unmined_tx, miner_fee, 0, 0, std::sync::Arc::new(vec![]))
                 .expect("standardized transaction should pass ZIP-317 checks")

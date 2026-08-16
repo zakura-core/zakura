@@ -1,4 +1,7 @@
-use super::{request::*, state::*, *};
+#[cfg(any(test, feature = "proptest-impl"))]
+use super::state::BlockSyncFrontiers;
+use super::{request::*, *};
+use std::num::NonZeroU64;
 
 /// Committed header metadata used by block sync to schedule and validate a body.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -13,45 +16,67 @@ pub struct BlockSyncBlockMeta {
 
 /// Facts accepted by the block-sync scaffold and later reactor.
 ///
-/// The inbound data flow is inverted: a peer's stream-6 frames are decoded and
-/// the download logic runs in the per-peer pipe-routine
-/// ([`PeerRoutine`](super::peer_routine)). Inbound messages no longer flow
-/// through the reactor as a `WireMessage`; the routine forwards only shared
-/// concerns to the reactor over [`RoutineToReactor`].
+/// [`PeerRoutine`](super::peer_routine) decodes each peer's stream-6 frames.
+/// It also runs the download logic.
+/// The routine forwards only shared concerns to the reactor through [`RoutineToReactor`].
 #[derive(Clone, Debug)]
 pub enum BlockSyncEvent {
     /// A peer became available for stream-6 block sync.
     PeerConnected(BlockSyncPeerSession),
-    /// A peer disconnected; all of its outstanding work is dropped.
+    /// A peer disconnected.
+    /// The routine drops all work owned by that peer.
     PeerDisconnected(ZakuraPeerId),
-    /// Header sync advanced the committed header target.
+    /// An authenticated local operator requested a fresh retry of one persistent alarm.
+    RetryBodyAvailability {
+        /// Exact selected header with an alarm.
+        /// The state layer rejects stale requests.
+        hash: block::Hash,
+    },
+    /// Test-only direct header-target injection.
+    #[cfg(any(test, feature = "proptest-impl"))]
     HeaderTipChanged {
         /// Current best header height.
         height: block::Height,
         /// Current best header hash.
         hash: block::Hash,
     },
-    /// Locally observed finalized or verified-body frontiers changed.
+    /// Test-only direct frontier injection.
+    #[cfg(any(test, feature = "proptest-impl"))]
     StateFrontiersChanged(BlockSyncFrontiers),
-    /// State grew the verified body chain tip.
+    /// Test-only direct growth injection.
+    #[cfg(any(test, feature = "proptest-impl"))]
     ChainTipGrow(BlockSyncFrontiers),
-    /// State reset the verified body chain tip after a rollback, best-chain switch,
-    /// activation boundary, or coalesced multi-block tip update.
+    /// Test-only direct reset injection.
+    #[cfg(any(test, feature = "proptest-impl"))]
     ChainTipReset(BlockSyncFrontiers),
-    /// Driver returned the current body-missing, header-known heights with committed hashes.
+    /// Driver returned body-missing metadata bound to the exact queried snapshot.
+    ScopedNeededBlocks {
+        /// Reactor-local query identifier echoed by the driver.
+        query_id: NonZeroU64,
+        /// Durable generation and branch coordinates echoed from the query.
+        scope: zakura_header_chain::BodyWorkAuthority,
+        /// Highest full-state block shared with the selected header chain.
+        body_anchor: zakura_header_chain::Frontier,
+        /// Header-known bodies missing under `scope`.
+        blocks: Vec<BlockSyncBlockMeta>,
+    },
+    /// Ownerless unit-test fixture for the pre-ownership scheduling surface.
+    #[cfg(test)]
     NeededBlocks(Vec<BlockSyncBlockMeta>),
     /// Node wiring finished applying a submitted block body.
     BlockApplyFinished {
+        /// Exact network request that owned the submission.
+        owner: zakura_header_chain::BodyWorkOwner,
+        /// Authenticated body supplier.
+        source: zakura_header_chain::SourceId,
         /// Submission token from the matching [`BlockSyncAction::SubmitBlock`].
         token: BlockApplyToken,
         /// Submitted block height.
         height: block::Height,
         /// Submitted block hash.
         hash: block::Hash,
-        /// Apply result from the verifier driver.
-        result: BlockApplyResult,
-        /// Locally observed chain frontier after the apply attempt completed.
-        local_frontier: Option<BlockSyncFrontiers>,
+        /// Typed, evidence-bearing verifier outcome.
+        outcome: BlockApplyOutcome,
     },
     /// Node wiring finished or abandoned a `Block` response to an inbound `GetBlocks`.
     BlockRangeResponseFinished {
@@ -84,10 +109,141 @@ pub enum BlockApplyResult {
     Committed,
     /// The verifier reported the block was already committed.
     Duplicate,
-    /// The verifier rejected the block.
+    /// The verifier produced a deterministic peer-attributable rejection.
     Rejected,
+    /// Verification failed without a durable peer-attributable conclusion.
+    Unavailable,
     /// The verifier did not answer before the driver timeout.
     TimedOut,
+}
+
+/// Typed body-verification outcome retained across the driver boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockApplyOutcome {
+    verification: Box<zakura_header_chain::BodyVerificationOutcome>,
+    duplicate: bool,
+}
+
+impl BlockApplyOutcome {
+    /// A body newly accepted by full state.
+    pub fn committed(evidence: zakura_header_chain::VerifiedBodyEvidence) -> Self {
+        Self {
+            verification: Box::new(zakura_header_chain::BodyVerificationOutcome::Verified(
+                evidence,
+            )),
+            duplicate: false,
+        }
+    }
+
+    /// A body already accepted by full state.
+    pub fn duplicate(evidence: zakura_header_chain::VerifiedBodyEvidence) -> Self {
+        Self {
+            verification: Box::new(zakura_header_chain::BodyVerificationOutcome::Verified(
+                evidence,
+            )),
+            duplicate: true,
+        }
+    }
+
+    /// A supplier-attributed body/header commitment mismatch.
+    pub fn payload_mismatch(evidence: zakura_header_chain::BodyPayloadMismatch) -> Self {
+        Self {
+            verification: Box::new(
+                zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(evidence),
+            ),
+            duplicate: false,
+        }
+    }
+
+    /// A commitment-matching deterministic consensus failure.
+    pub fn consensus_invalid(evidence: zakura_header_chain::ConsensusBodyInvalid) -> Self {
+        Self {
+            verification: Box::new(
+                zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(evidence),
+            ),
+            duplicate: false,
+        }
+    }
+
+    /// A verification attempt that did not reach a durable conclusion.
+    pub fn retryable(evidence: zakura_header_chain::TransientBodyFailure) -> Self {
+        Self {
+            verification: Box::new(zakura_header_chain::BodyVerificationOutcome::Retryable(
+                evidence,
+            )),
+            duplicate: false,
+        }
+    }
+
+    /// Canonical typed verification evidence.
+    pub fn verification(&self) -> &zakura_header_chain::BodyVerificationOutcome {
+        self.verification.as_ref()
+    }
+
+    /// Consume this wrapper and return canonical typed verification evidence.
+    pub fn into_verification(self) -> zakura_header_chain::BodyVerificationOutcome {
+        *self.verification
+    }
+
+    pub(crate) fn attributed_source(&self) -> Option<zakura_header_chain::SourceId> {
+        match self.verification.as_ref() {
+            zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(evidence) => {
+                Some(evidence.source)
+            }
+            zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(evidence) => {
+                Some(evidence.source)
+            }
+            zakura_header_chain::BodyVerificationOutcome::Verified(_)
+            | zakura_header_chain::BodyVerificationOutcome::Retryable(_) => None,
+        }
+    }
+
+    pub(crate) fn retryable_mut(
+        &mut self,
+    ) -> Option<&mut zakura_header_chain::TransientBodyFailure> {
+        match self.verification.as_mut() {
+            zakura_header_chain::BodyVerificationOutcome::Retryable(failure) => Some(failure),
+            _ => None,
+        }
+    }
+
+    /// Stable evidence identity for this exact outcome.
+    pub fn evidence(&self) -> zakura_header_chain::EvidenceId {
+        match self.verification.as_ref() {
+            zakura_header_chain::BodyVerificationOutcome::Verified(evidence) => evidence.evidence,
+            zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(evidence) => {
+                evidence.evidence
+            }
+            zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(evidence) => {
+                evidence.evidence
+            }
+            zakura_header_chain::BodyVerificationOutcome::Retryable(evidence) => evidence.evidence,
+        }
+    }
+
+    /// Coarse scheduling disposition derived without losing the typed outcome.
+    pub fn result(&self) -> BlockApplyResult {
+        match self.verification.as_ref() {
+            zakura_header_chain::BodyVerificationOutcome::Verified(_) if self.duplicate => {
+                BlockApplyResult::Duplicate
+            }
+            zakura_header_chain::BodyVerificationOutcome::Verified(_) => {
+                BlockApplyResult::Committed
+            }
+            zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(_)
+            | zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(_) => {
+                BlockApplyResult::Rejected
+            }
+            zakura_header_chain::BodyVerificationOutcome::Retryable(evidence)
+                if evidence.kind == zakura_header_chain::TransientBodyFailureKind::Timeout =>
+            {
+                BlockApplyResult::TimedOut
+            }
+            zakura_header_chain::BodyVerificationOutcome::Retryable(_) => {
+                BlockApplyResult::Unavailable
+            }
+        }
+    }
 }
 
 /// Monotonic token assigned by the reactor to each verifier submission.
@@ -102,12 +258,16 @@ pub type BlockApplyToken = u64;
 pub enum BlockSyncAction {
     /// Ask node wiring to read `missing_block_bodies`, header hashes, and size hints.
     QueryNeededBlocks {
+        /// Reactor-local query identifier the driver must echo with the result.
+        query_id: NonZeroU64,
         /// First height to consider for the next local work-buffer refill.
         from: block::Height,
         /// Maximum number of heights to scan for this refill.
         limit: u32,
         /// Current best header target, used for diagnostics and coalescing.
         best_header_tip: block::Height,
+        /// Atomic durable coordinates that own this state query and its result.
+        scope: zakura_header_chain::BodyWorkAuthority,
     },
     /// Ask node wiring to read committed bodies for an inbound `GetBlocks`.
     QueryBlocksByHeightRange {
@@ -120,10 +280,42 @@ pub enum BlockSyncAction {
     },
     /// Parent-first body ready for B3's verifier/commit driver.
     SubmitBlock {
+        /// Exact network request that owns this verifier submission.
+        owner: zakura_header_chain::BodyWorkOwner,
+        /// Authenticated peer source that supplied the body.
+        source: zakura_header_chain::SourceId,
         /// Submission token to echo in [`BlockSyncEvent::BlockApplyFinished`].
         token: BlockApplyToken,
         /// Block body that is contiguous above `verified_block_tip`.
         block: Arc<block::Block>,
+    },
+    /// Persist one completion-gated transient body result.
+    RecordBodyUnavailable {
+        /// Durable version that owned the attempt.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Typed retry result with its bounded episode summary.
+        failure: zakura_header_chain::TransientBodyFailure,
+    },
+    /// Persist one exact commitment-matching deterministic body rejection.
+    RecordBodyInvalid {
+        /// Durable version that owned the verification attempt.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Exact invalid body conclusion and its authenticated supplier.
+        invalid: zakura_header_chain::ConsensusBodyInvalid,
+    },
+    /// Persist changed supplier evidence without clearing the current alarm episode.
+    RestartBodyAvailability {
+        /// Durable version that owns the selected alarm restart.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Authenticated supplier-set evidence preserving the alarm's age and attempts.
+        discovery: zakura_header_chain::BodySupplierDiscovered,
+    },
+    /// Persist a fresh episode after an authenticated operator request.
+    RetryBodyAvailability {
+        /// Durable version that owns the selected alarm retry.
+        expected_version: zakura_header_chain::StateVersion,
+        /// Authenticated operator evidence and fresh summary.
+        retry: zakura_header_chain::OperatorBodyRetry,
     },
     /// Report peer misbehavior to the supervisor.
     Misbehavior {
@@ -141,13 +333,17 @@ impl BlockSyncAction {
             Self::QueryNeededBlocks { .. } => "query_needed_blocks",
             Self::QueryBlocksByHeightRange { .. } => "query_blocks_by_height_range",
             Self::SubmitBlock { .. } => "submit_block",
+            Self::RecordBodyUnavailable { .. } => "record_body_unavailable",
+            Self::RecordBodyInvalid { .. } => "record_body_invalid",
+            Self::RestartBodyAvailability { .. } => "restart_body_availability",
+            Self::RetryBodyAvailability { .. } => "retry_body_availability",
             Self::Misbehavior { .. } => "misbehavior",
         }
     }
 }
 
 /// Block-sync peer-accounting violations.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlockSyncMisbehavior {
     /// A stream-6 payload was malformed before semantic handling.
     MalformedMessage,
@@ -157,7 +353,11 @@ pub enum BlockSyncMisbehavior {
     GetBlocksTooLong,
     /// A peer exceeded this node's inbound `GetBlocks` serving budget.
     GetBlocksSpam,
-    /// A peer supplied a body whose hash or size does not match committed metadata.
+    /// A peer supplied a body whose payload does not match its requested header.
+    BodyPayloadMismatch(zakura_header_chain::BodyPayloadMismatch),
+    /// A commitment-matching body deterministically failed consensus.
+    ConsensusBodyInvalid(zakura_header_chain::ConsensusBodyInvalid),
+    /// A peer supplied another invalid block payload.
     InvalidBlock,
     /// A peer supplied a body outside the tolerated scheduling-size deviation.
     SizeMismatch,

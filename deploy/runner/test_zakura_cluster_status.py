@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
+import os
+import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -11,7 +15,9 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT_PATH = Path(__file__).with_name("zakura-cluster-status.py")
@@ -46,8 +52,6 @@ def collector(network: str = "testnet"):
         [node()],
         interval=10,
         stale_after=300,
-        upgrade_height=0,
-        target_spacing=7.5,
         network=network,
     )
 
@@ -77,6 +81,215 @@ def public_row(
         "last_seen_at": observed_at,
         "rpc_metadata_error": None,
     }
+
+
+class RemoteProbeTests(unittest.TestCase):
+    """Run the probe the way a node does: as a standalone script over stdin.
+
+    The probe is a string executed on the far side of ssh, so the only faithful
+    way to exercise it is to run it as its own process against stub endpoints.
+    """
+
+    EXPOSITION = b"""# a comment the exporter never actually emits
+zakura_build_info{version="1.1.0-rc1"} 1
+zcash_net_peers 74
+zakura_p2p_conn_active 12
+sync_header_verification_lag 3
+zcash_net_in_messages{command="inv",addr="redacted"} 5
+zcash_net_in_bytes_total 12345
+not_an_allowlisted_metric 999
+sync_stage_duration_seconds{quantile="0.5"} 0.02
+zcash_net_peers_connected{user_agent="/Zakura:1.1.0/",remote_version="170160"} 40
+zcash_net_peers_connected{user_agent="/Zakura:1.1.0/",remote_version="170140"} 2
+zcash_net_peers_connected{user_agent="/MagicBean:6.2.0/",remote_version="170160"} 33
+zcash_net_peers_connected{user_agent="/Gone:1.0/",remote_version="170160"} 0
+"""
+
+    def setUp(self):
+        exposition = self.EXPOSITION
+
+        class StubHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def reply(self, code, body):
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == "/metrics":
+                    return self.reply(200, exposition)
+                if self.path == "/healthy":
+                    return self.reply(200, b"ok")
+                if self.path == "/ready":
+                    return self.reply(503, b"lag=47 blocks")
+                return self.reply(404, b"nope")
+
+        self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), StubHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.endpoint = f"127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def stub_journalctl(self, stack, *, exit_code: int, stdout: str = "") -> dict:
+        """Put a fake journalctl first on PATH so OOM counting is hermetic."""
+        directory = stack.enter_context(tempfile.TemporaryDirectory())
+        script = Path(directory) / "journalctl"
+        script.write_text(
+            "#!/bin/sh\n"
+            + ("printf '%s'\n" % stdout.replace("'", "") if stdout else "")
+            + f"exit {exit_code}\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return {"PATH": f"{directory}:{os.environ.get('PATH', '')}"}
+
+    def run_probe(self, env: dict | None = None, **overrides) -> dict:
+        args = {
+            "service": "",
+            "bin_path": "/bin/true",
+            "log_file": "",
+            "rpc_url": "",
+            "probe_kind": "zebra",
+            "process_pattern": "",
+            "rpc_auth": "",
+            "rpc_user": "",
+            "rpc_password": "",
+            "rpc_config_path": "",
+            "container_name": "",
+            "metrics_endpoint": "",
+            "health_listen_addr": "",
+            "state_cache_dir": tempfile.gettempdir(),
+            "want_metrics": "1",
+        }
+        args.update(overrides)
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as handle:
+            handle.write(status.REMOTE_PROBE)
+            script = handle.name
+        try:
+            completed = subprocess.run(
+                [sys.executable, script, *args.values()],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env={**os.environ, **(env or {})},
+            )
+        finally:
+            Path(script).unlink()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def test_metrics_scrape_keeps_only_allowlisted_series(self):
+        probe = self.run_probe(metrics_endpoint=self.endpoint)
+
+        self.assertNotIn("metrics_error", probe)
+        self.assertEqual(probe["metrics_version"], "1.1.0-rc1")
+        self.assertEqual(
+            probe["metrics"],
+            {
+                "zcash_net_peers": 74.0,
+                "zakura_p2p_conn_active": 12.0,
+                "sync_header_verification_lag": 3.0,
+                "zcash_net_in_bytes_total": 12345.0,
+            },
+        )
+
+    def test_peer_versions_come_from_the_user_agent_label(self):
+        # zakurad's getpeerinfo omits subver, so the exporter label is the only
+        # source for a peer version breakdown.
+        probe = self.run_probe(metrics_endpoint=self.endpoint)
+
+        self.assertEqual(
+            probe["peer_user_agents"],
+            [["/Zakura:1.1.0/", 42], ["/MagicBean:6.2.0/", 33]],
+        )
+        self.assertNotIn("zcash_net_peers_connected", probe["metrics"])
+
+    def test_metrics_scrape_can_be_skipped(self):
+        probe = self.run_probe(metrics_endpoint=self.endpoint, want_metrics="")
+
+        self.assertTrue(probe["metrics_skipped"])
+        self.assertNotIn("metrics", probe)
+        self.assertNotIn("metrics_error", probe)
+
+    def test_no_oom_kills_reports_zero_rather_than_unknown(self):
+        # journalctl exits 1 when its grep matches nothing, which is the common
+        # case on a healthy node and must not read as "unknown".
+        with contextlib.ExitStack() as stack:
+            env = self.stub_journalctl(stack, exit_code=1)
+            probe = self.run_probe(env=env)
+
+        self.assertEqual(probe["host"]["oom_kills_24h"], 0)
+
+    def test_oom_kills_are_counted_by_line(self):
+        with contextlib.ExitStack() as stack:
+            env = self.stub_journalctl(
+                stack,
+                exit_code=0,
+                stdout="oom-kill: one\\noom-kill: two\\n",
+            )
+            probe = self.run_probe(env=env)
+
+        self.assertEqual(probe["host"]["oom_kills_24h"], 2)
+
+    def test_health_probe_keeps_status_and_body(self):
+        probe = self.run_probe(health_listen_addr=self.endpoint)
+
+        self.assertEqual(probe["health"]["healthy"], {"status": 200, "body": "ok"})
+        # The body is the diagnostic: /ready explains *why* it is not ready.
+        self.assertEqual(
+            probe["health"]["ready"],
+            {"status": 503, "body": "lag=47 blocks"},
+        )
+
+    def test_unconfigured_endpoints_report_rather_than_fail(self):
+        probe = self.run_probe()
+
+        self.assertEqual(probe["metrics_error"], "metrics endpoint not configured")
+        self.assertEqual(probe["health_error"], "health endpoint not configured")
+        self.assertNotIn("host_error", probe)
+
+    def test_host_vitals_are_collected_without_any_endpoint(self):
+        probe = self.run_probe()
+
+        host = probe["host"]
+        self.assertEqual(host["disk_path"], tempfile.gettempdir())
+        self.assertGreater(host["disk_total_bytes"], 0)
+        self.assertIn("mem_total_bytes", host)
+        self.assertIn("load1", host)
+        self.assertIn("uptime_seconds", host)
+
+    def test_log_tail_redacts_addresses_and_bounds_line_length(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "zakura.log"
+            log.write_text(
+                "INFO fine\n"
+                "ERROR peer 203.0.113.10 timed out\n"
+                "WARN " + ("x" * 500) + "\n",
+                encoding="utf-8",
+            )
+
+            probe = self.run_probe(log_file=str(log))
+
+        lines = probe["log_errors"]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("x.x.x.x", lines[0])
+        self.assertNotIn("203.0.113.10", lines[0])
+        self.assertLessEqual(len(lines[1]), 303)
+
+    def test_unreachable_metrics_endpoint_is_reported_not_raised(self):
+        # Port 1 is reserved and never listening, so the scrape must fail.
+        probe = self.run_probe(metrics_endpoint="127.0.0.1:1")
+
+        self.assertIn("metrics_error", probe)
+        self.assertNotIn("metrics", probe)
+        self.assertIn("host", probe)
 
 
 class IronwoodStatusTests(unittest.TestCase):
@@ -241,7 +454,6 @@ class TipAgreementTests(unittest.TestCase):
         )
         self.assertEqual(split["status"], "split")
         self.assertTrue(split["split"])
-        self.assertTrue(split["compat_split"])
 
     def test_enrich_chain_roles(self):
         rows = [
@@ -323,8 +535,6 @@ class TipAgreementTests(unittest.TestCase):
                 [node()],
                 interval=10,
                 stale_after=300,
-                upgrade_height=0,
-                target_spacing=7.5,
                 network="testnet",
                 state_file=state_file,
             )
@@ -349,8 +559,6 @@ class TipAgreementTests(unittest.TestCase):
                 [node()],
                 interval=10,
                 stale_after=300,
-                upgrade_height=0,
-                target_spacing=7.5,
                 network="testnet",
                 state_file=state_file,
             )
@@ -370,8 +578,6 @@ class TipAgreementTests(unittest.TestCase):
                 [node()],
                 interval=10,
                 stale_after=300,
-                upgrade_height=0,
-                target_spacing=7.5,
                 network="testnet",
                 state_file=state_file,
             )
@@ -383,8 +589,6 @@ class TipAgreementTests(unittest.TestCase):
                 [node()],
                 interval=10,
                 stale_after=300,
-                upgrade_height=0,
-                target_spacing=7.5,
                 network="testnet",
                 state_file=state_file,
             )
@@ -453,6 +657,204 @@ class TipAgreementTests(unittest.TestCase):
         )
         self.assertEqual(other["fork_depth"], 2)
         self.assertEqual(other["fork_depth_label"], "depth 2")
+
+
+class ViewSwitchingTests(unittest.TestCase):
+    """The fleet and node views share one page and are toggled with [hidden].
+
+    A class that sets its own `display` beats the UA stylesheet's `[hidden]`
+    rule, so without an authoritative override a hidden section stays on screen
+    showing its unrendered `...` placeholders.
+    """
+
+    def setUp(self):
+        self.page = status.PAGE
+        self.markup = self.page[: self.page.index("<script>")]
+
+    def test_page_forces_hidden_elements_to_stay_hidden(self):
+        self.assertIn("[hidden] { display: none !important; }", self.page)
+
+    def test_every_toggled_section_is_covered_by_the_override(self):
+        toggled = re.findall(
+            r'<(?:section|div) class="([^"]+)"[^>]*data-view="[^"]+"', self.markup
+        )
+        self.assertTrue(toggled, "expected the view switcher to tag some sections")
+
+        override = self.page.index("[hidden] { display: none !important; }")
+        for classes in toggled:
+            primary = classes.split()[0]
+            rule = re.search(
+                r"\n\.%s \{(.*?)\}" % re.escape(primary), self.page, re.S
+            )
+            if rule is None or "display:" not in rule.group(1):
+                continue
+            # !important wins regardless of order, but keep the override early
+            # so the intent stays readable.
+            self.assertLess(
+                override,
+                rule.start(),
+                f".{primary} sets display and must be covered by the override",
+            )
+
+    def test_both_views_are_present_in_one_template(self):
+        self.assertIn('data-view="fleet"', self.markup)
+        self.assertIn('data-view="node"', self.markup)
+
+
+class NodeDetailTests(unittest.TestCase):
+    def probe(self, **overrides) -> dict:
+        base = {
+            "height": 4_200_000,
+            "headers": 4_200_000,
+            "block_hash": "a" * 64,
+            "active_state": "active",
+            "process_running": True,
+            "peer_count": 74,
+            "metrics": {"zcash_net_peers": 74.0},
+            "health": {"healthy": {"status": 200, "body": "ok"}},
+            "log_errors": ["ERROR something"],
+            "host": {
+                "disk_total_bytes": 1000,
+                "disk_free_bytes": 250,
+                "rss_bytes": 4096,
+                "restart_count": 2,
+            },
+        }
+        base.update(overrides)
+        return base
+
+    def test_disk_free_pct_needs_both_totals(self):
+        self.assertEqual(
+            status.disk_free_pct({"disk_total_bytes": 1000, "disk_free_bytes": 250}),
+            25.0,
+        )
+        self.assertIsNone(status.disk_free_pct({"disk_free_bytes": 250}))
+        self.assertIsNone(status.disk_free_pct({"disk_total_bytes": 0, "disk_free_bytes": 0}))
+
+    def test_fleet_payload_drops_deep_fields_but_keeps_vitals(self):
+        collected = collector()
+        collected.rows = [collected.row_for(node(), self.probe(), now=1_000.0)]
+
+        row = collected.snapshot()["rows"][0]
+
+        for key in status.NODE_DETAIL_KEYS:
+            self.assertNotIn(key, row)
+        self.assertEqual(row["vitals"]["disk_free_pct"], 25.0)
+        self.assertEqual(row["vitals"]["restart_count"], 2)
+        self.assertEqual(row["peer_count"], 74)
+
+    def test_node_payload_carries_the_deep_fields(self):
+        collected = collector()
+        collected.rows = [collected.row_for(node(), self.probe(), now=1_000.0)]
+
+        payload = collected.node_snapshot("node-a")
+
+        self.assertEqual(payload["node"]["metrics"], {"zcash_net_peers": 74.0})
+        self.assertEqual(payload["node"]["health_endpoint"]["healthy"]["status"], 200)
+        self.assertEqual(payload["config"]["metrics_endpoint"], "")
+        self.assertIsNone(collected.node_snapshot("does-not-exist"))
+
+    def test_log_lines_are_withheld_unless_expose_logs_is_set(self):
+        guarded = collector()
+        guarded.rows = [guarded.row_for(node(), self.probe(), now=1_000.0)]
+        self.assertEqual(guarded.node_snapshot("node-a")["node"]["log_errors"], [])
+        self.assertTrue(guarded.node_snapshot("node-a")["node"]["log_errors_suppressed"])
+
+        exposed = status.ClusterCollector(
+            [node()],
+            interval=10,
+            stale_after=300,
+            network="testnet",
+            expose_logs=True,
+        )
+        exposed.rows = [exposed.row_for(node(), self.probe(), now=1_000.0)]
+
+        self.assertEqual(
+            exposed.node_snapshot("node-a")["node"]["log_errors"],
+            ["ERROR something"],
+        )
+
+    def test_skipped_scrape_reuses_the_last_metrics(self):
+        collected = collector()
+        collected.rows = [collected.row_for(node(), self.probe(), now=1_000.0)]
+
+        # A poll that skipped the scrape must not blank the panels.
+        skipped = collected.row_for(
+            node(),
+            self.probe(metrics=None, metrics_skipped=True),
+            now=1_010.0,
+        )
+
+        self.assertEqual(skipped["metrics"], {"zcash_net_peers": 74.0})
+        self.assertEqual(skipped["metrics_at"], 1_000.0)
+
+    def test_first_poll_always_scrapes(self):
+        collected = collector()
+
+        self.assertTrue(collected.should_scrape_metrics("node-a", 1_000.0))
+
+    def test_scrape_interval_scales_with_the_last_scrape_cost(self):
+        collected = collector()
+        collected.last_metrics["node-a"] = {
+            "metrics_at": 1_000.0,
+            "metrics_scrape_seconds": 0.03,
+        }
+
+        # A cheap endpoint (0.03s * 30 = 0.9s) refreshes on every poll.
+        self.assertTrue(collected.should_scrape_metrics("node-a", 1_010.0))
+
+        # An expensive one (0.6s * 30 = 18s) backs off instead.
+        collected.last_metrics["node-a"]["metrics_scrape_seconds"] = 0.6
+        self.assertFalse(collected.should_scrape_metrics("node-a", 1_010.0))
+        self.assertTrue(collected.should_scrape_metrics("node-a", 1_019.0))
+
+    def test_scrape_backoff_is_capped(self):
+        collected = collector()
+        collected.last_metrics["node-a"] = {
+            "metrics_at": 1_000.0,
+            "metrics_scrape_seconds": 60.0,
+        }
+
+        self.assertFalse(collected.should_scrape_metrics("node-a", 1_100.0))
+        self.assertTrue(
+            collected.should_scrape_metrics("node-a", 1_000.0 + status.MAX_METRICS_INTERVAL)
+        )
+
+    def test_explicit_interval_overrides_the_adaptive_one(self):
+        collected = status.ClusterCollector(
+            [node()],
+            interval=10,
+            stale_after=300,
+            network="testnet",
+            metrics_min_interval=60.0,
+        )
+        collected.last_metrics["node-a"] = {
+            "metrics_at": 1_000.0,
+            "metrics_scrape_seconds": 0.01,
+        }
+
+        self.assertFalse(collected.should_scrape_metrics("node-a", 1_030.0))
+        self.assertTrue(collected.should_scrape_metrics("node-a", 1_060.0))
+
+    def test_history_drops_samples_older_than_the_window(self):
+        collected = status.ClusterCollector(
+            [node()],
+            interval=10,
+            stale_after=300,
+            network="testnet",
+            history_window=100,
+        )
+        for offset in range(0, 30):
+            rows = [collected.row_for(node(), self.probe(height=4_200_000 + offset), now=1_000.0 + offset * 10)]
+            collected.rows = rows
+            collected.record_node_history(1_000.0 + offset * 10, rows)
+
+        samples = list(collected.history["node-a"])
+
+        # 100s of retention at a 10s cadence keeps the newest 11 samples.
+        self.assertEqual(len(samples), 11)
+        self.assertEqual(samples[-1]["height"], 4_200_029)
+        self.assertGreaterEqual(samples[0]["t"], samples[-1]["t"] - 100)
 
 
 class RateLimiterTests(unittest.TestCase):
@@ -567,6 +969,57 @@ class HttpHandlerTests(unittest.TestCase):
     def test_unknown_route_returns_404(self):
         with self.assertRaises(urllib.error.HTTPError) as context:
             urllib.request.urlopen(f"{self.base_url}/unknown")
+
+        self.assertEqual(context.exception.code, 404)
+        context.exception.close()
+
+    def test_node_route_serves_the_same_page_as_the_fleet(self):
+        with urllib.request.urlopen(f"{self.base_url}/") as response:
+            fleet = response.read()
+        with urllib.request.urlopen(f"{self.base_url}/node/node-a") as response:
+            detail = response.read()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            response.headers["Content-Type"],
+            "text/html; charset=utf-8",
+        )
+        # One template, two routes: the client branches on location.pathname.
+        self.assertEqual(fleet, detail)
+
+    def test_page_and_data_are_never_cached(self):
+        # The HTML has no fingerprint, so a cached copy keeps showing an old
+        # build after a dashboard deploy.
+        for path in ("/", "/node/node-a", "/data", "/data/node/node-a"):
+            with self.subTest(path=path):
+                with urllib.request.urlopen(f"{self.base_url}{path}") as response:
+                    response.read()
+
+                self.assertEqual(
+                    response.headers["Cache-Control"],
+                    "no-store, must-revalidate",
+                )
+
+    def test_node_route_rejects_an_unknown_name(self):
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(f"{self.base_url}/node/not-a-node")
+
+        self.assertEqual(context.exception.code, 404)
+        context.exception.close()
+
+    def test_node_data_route_returns_the_detail_payload(self):
+        with urllib.request.urlopen(f"{self.base_url}/data/node/node-a") as response:
+            payload = json.load(response)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["node"]["name"], "node-a")
+        self.assertEqual(payload["network"], "testnet")
+        self.assertIn("history", payload)
+        self.assertIn("config", payload)
+
+    def test_node_data_route_404s_for_an_unknown_name(self):
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(f"{self.base_url}/data/node/not-a-node")
 
         self.assertEqual(context.exception.code, 404)
         context.exception.close()

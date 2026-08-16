@@ -1,65 +1,71 @@
-use std::{
-    future::Future,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
-};
+use std::{future::Future, sync::Arc};
 
 use color_eyre::eyre::{eyre, Report};
-use tokio::{pin, select, sync::mpsc, task::JoinSet};
+use sha2::{Digest, Sha256};
 use tower::{Service, ServiceExt};
-use tracing::{debug, warn};
 
-use zakura_chain::{
-    block::{self},
-    chain_tip::ChainTip,
-    parallel::commitment_aux::BlockCommitmentRoots,
-};
-use zakura_network::zakura::{
-    Frontier, FrontierChange, HeaderRootAuthState, HeaderRootAuthUpdate,
-    HeaderRootAuthenticationFailureKind, HeaderSyncAction, HeaderSyncCommitFailureKind,
-    HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncOperationIdentity, HeaderWitnessState,
-    ZakuraEndpoint, ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
-};
-use zakura_state::MappedRequest;
-
+use zakura_chain::block::{self};
+use zakura_chain::parallel::commitment_aux::BlockCommitmentRoots;
 #[cfg(test)]
-use zakura_network::zakura::{BlockSyncEvent, BlockSyncFrontiers, BlockSyncHandle};
+use zakura_network::zakura::{AuxSchema, HeaderEntry, HeaderPathPage, ZakuraPeerId};
+use zakura_network::zakura::{FullStateFrontiers, ZakuraHeaderSyncDriverStartup};
+use zakura_node_services::header_chain::{self as port, HeaderChainFuture, Port, PortError};
 
-use super::trace::chain_tip_mirror::ChainTipMirrorTraceExt;
-use super::trace::header_driver::HeaderDriverTraceExt;
-use super::{block_verify_error_is_duplicate, verified_block_tip_from_state};
+use super::{verified_block_tip_from_state, ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT};
 
-const ROOT_AUTH_STATE_TIMEOUT: Duration = Duration::from_secs(30);
-const DURABLE_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_ROOT_AUTH_STATE_TASKS: usize = 1;
-
-pub(crate) async fn zakura_header_sync_driver_startup(
+pub(crate) async fn zakura_header_sync_driver_startup<State>(
+    state: State,
     read_state: zakura_state::ReadStateService,
+    header_chain_authority: zakura_state::HeaderChainBodyEvidenceAuthority,
     network: &zakura_chain::parameters::Network,
-) -> Result<ZakuraHeaderSyncDriverStartup, Report> {
-    let header_root_auth = read_state
-        .subscribe_header_root_auth()
-        .borrow()
-        .map(header_root_auth_state);
-    let best_header_tip = best_durable_header_tip(read_state.clone())
-        .await
-        .map_err(|error| eyre!("{error}"))?;
+    coordinator: &std::sync::Arc<super::SyncCoordinator>,
+) -> Result<ZakuraHeaderSyncDriverStartup, Report>
+where
+    State: Service<
+            zakura_state::Request,
+            Response = zakura_state::Response,
+            Error = zakura_state::BoxError,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    State::Future: Send + 'static,
+{
+    let best_header_tip = match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::BestHeaderTip),
+    )
+    .await
+    .map_err(|_| eyre!("timed out reading BestHeaderTip"))?
+    .map_err(|error| eyre!("{error}"))?
+    {
+        zakura_state::ReadResponse::BestHeaderTip(tip) => tip,
+        response => Err(eyre!("unexpected BestHeaderTip response: {response:?}"))?,
+    };
 
-    let finalized_tip = match read_state
-        .clone()
-        .oneshot(zakura_state::ReadRequest::FinalizedTip)
-        .await
-        .map_err(|error| eyre!("{error}"))?
+    let finalized_tip = match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::FinalizedTip),
+    )
+    .await
+    .map_err(|_| eyre!("timed out reading FinalizedTip"))?
+    .map_err(|error| eyre!("{error}"))?
     {
         zakura_state::ReadResponse::FinalizedTip(tip) => tip,
         response => Err(eyre!("unexpected FinalizedTip response: {response:?}"))?,
     };
 
-    let verified_block_tip = match read_state
-        .clone()
-        .oneshot(zakura_state::ReadRequest::Tip)
-        .await
-        .map_err(|error| eyre!("{error}"))?
+    let verified_block_tip = match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state.clone().oneshot(zakura_state::ReadRequest::Tip),
+    )
+    .await
+    .map_err(|_| eyre!("timed out reading Tip"))?
+    .map_err(|error| eyre!("{error}"))?
     {
         zakura_state::ReadResponse::Tip(tip) => tip,
         response => Err(eyre!("unexpected Tip response: {response:?}"))?,
@@ -69,728 +75,267 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
-    let best_header_tip = best_header_tip.unwrap_or(empty_state_tip);
+    let committed_snapshots = read_state.subscribe_header_chain_snapshots();
+    let mut header_runtime_status = read_state.subscribe_header_runtime_status();
+    wait_for_header_runtime(&mut header_runtime_status).await?;
+    coordinator
+        .observe_header_runtime(&header_runtime_status.borrow())
+        .map_err(|error| eyre!("coordinator rejected header runtime status: {error}"))?;
+    if header_runtime_status.borrow().is_ready() && committed_snapshots.borrow().is_none() {
+        return Err(eyre!(
+            "header runtime reported ready before publishing its committed snapshot"
+        ));
+    }
+    let vct_root_repairs = read_state.subscribe_vct_root_repairs();
+    let best_header_tip = committed_snapshots
+        .borrow()
+        .as_ref()
+        .map(|snapshot| {
+            (
+                snapshot.frontiers.header_best.height,
+                snapshot.frontiers.header_best.hash,
+            )
+        })
+        .or(best_header_tip)
+        .unwrap_or(empty_state_tip);
 
     Ok(ZakuraHeaderSyncDriverStartup {
-        frontiers: HeaderSyncFrontiers {
+        frontiers: FullStateFrontiers {
             finalized_height,
             verified_block_tip: verified_block_tip.0,
             verified_block_hash: verified_block_tip.1,
         },
         best_header_tip: Some(best_header_tip),
         verified_block_tip_hash: verified_block_tip.1,
-        header_root_auth,
+        committed_snapshots,
+        service_demand: coordinator.subscribe_service_demand(),
+        vct_root_repairs: Some(vct_root_repairs),
+        header_chain_port: Arc::new(HeaderChainServicePort::new(
+            state,
+            read_state,
+            header_chain_authority,
+            network.clone(),
+        )),
     })
 }
 
-fn header_root_auth_state(state: zakura_state::HeaderRootAuthState) -> HeaderRootAuthState {
-    HeaderRootAuthState {
-        authenticated_height: state.authenticated_height,
-        authenticated_hash: state.authenticated_hash,
-        completed_checkpoint_height: state.completed_checkpoint_height,
-        completed_checkpoint_hash: state.completed_checkpoint_hash,
-        header_witness: state.header_witness.map(header_witness_state),
-    }
-}
+async fn wait_for_header_runtime(
+    status: &mut tokio::sync::watch::Receiver<
+        zakura_node_services::sync_lifecycle::HeaderRuntimeStatus,
+    >,
+) -> Result<(), Report> {
+    use zakura_node_services::sync_lifecycle::HeaderRuntimeStatus;
 
-fn header_witness_state(state: zakura_state::HeaderWitnessState) -> HeaderWitnessState {
-    HeaderWitnessState {
-        height: state.height,
-        hash: state.hash,
-    }
-}
+    const RECONSTRUCTION_DIAGNOSTIC_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(30);
 
-fn state_header_root_auth_state(state: HeaderRootAuthState) -> zakura_state::HeaderRootAuthState {
-    zakura_state::HeaderRootAuthState {
-        authenticated_height: state.authenticated_height,
-        authenticated_hash: state.authenticated_hash,
-        completed_checkpoint_height: state.completed_checkpoint_height,
-        completed_checkpoint_hash: state.completed_checkpoint_hash,
-        header_witness: state
-            .header_witness
-            .map(|witness| zakura_state::HeaderWitnessState {
-                height: witness.height,
-                hash: witness.hash,
-            }),
-    }
-}
-
-fn header_root_auth_update(update: zakura_state::HeaderRootAuthUpdate) -> HeaderRootAuthUpdate {
-    match update {
-        zakura_state::HeaderRootAuthUpdate::Advanced { authenticated } => {
-            HeaderRootAuthUpdate::Advanced { authenticated }
-        }
-        zakura_state::HeaderRootAuthUpdate::WitnessRecovered { witness } => {
-            HeaderRootAuthUpdate::WitnessRecovered {
-                witness: header_witness_state(witness),
+    let mut latest_progress = None;
+    let mut last_progress_at = tokio::time::Instant::now();
+    let mut attachment_pending_since = None;
+    loop {
+        let current = status.borrow().clone();
+        match current {
+            HeaderRuntimeStatus::Detached {
+                reason:
+                    zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+                ..
             }
-        }
-    }
-}
-
-pub(crate) async fn drive_header_root_auth_updates(
-    read_state: zakura_state::ReadStateService,
-    header_sync: zakura_network::zakura::HeaderSyncHandle,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) {
-    let updates = read_state.subscribe_header_root_auth();
-    drive_header_root_auth_watch_updates(updates, shutdown, move |state| {
-        let header_sync = header_sync.clone();
-        async move {
-            header_sync
-                .send(HeaderSyncEvent::HeaderRootAuthStateChanged(state))
+            | HeaderRuntimeStatus::Ready { .. } => return Ok(()),
+            HeaderRuntimeStatus::Detached {
+                epoch,
+                reason:
+                    zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AttachmentPending,
+                ..
+            } => {
+                let pending_since = attachment_pending_since.get_or_insert_with(tokio::time::Instant::now);
+                match tokio::time::timeout(
+                    RECONSTRUCTION_DIAGNOSTIC_INTERVAL,
+                    status.changed(),
+                )
                 .await
-                .is_ok()
-        }
-    })
-    .await;
-}
-
-async fn drive_header_root_auth_watch_updates<Deliver, Delivery>(
-    mut updates: tokio::sync::watch::Receiver<Option<zakura_state::HeaderRootAuthState>>,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-    mut deliver: Deliver,
-) where
-    Deliver: FnMut(Option<HeaderRootAuthState>) -> Delivery,
-    Delivery: Future<Output = bool>,
-{
-    pin!(shutdown);
-    let initial = updates.borrow_and_update().map(header_root_auth_state);
-    if !deliver(initial).await {
-        return;
-    }
-    loop {
-        select! {
-            _ = &mut shutdown => return,
-            changed = updates.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                let state = updates.borrow_and_update().map(header_root_auth_state);
-                if !deliver(state).await {
-                    return;
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        return Err(eyre!(
+                            "header-runtime lifecycle publisher closed before attachment started"
+                        ))
+                    }
+                    Err(_) => tracing::warn!(
+                        header_runtime_epoch = epoch.get(),
+                        attachment_pending_for = ?pending_since.elapsed(),
+                        "header runtime attachment is still pending"
+                    ),
                 }
             }
-        }
-    }
-}
-
-fn header_range_committed(
-    operation: HeaderSyncOperationIdentity,
-    tip_hash: block::Hash,
-) -> HeaderSyncEvent {
-    HeaderSyncEvent::HeaderRangeOperationCompleted {
-        operation,
-        tip_hash,
-    }
-}
-
-fn header_range_commit_failed(
-    operation: HeaderSyncOperationIdentity,
-    kind: HeaderSyncCommitFailureKind,
-) -> HeaderSyncEvent {
-    HeaderSyncEvent::HeaderRangeOperationFailed { operation, kind }
-}
-
-fn header_root_authentication_completed(
-    operation: HeaderSyncOperationIdentity,
-    update: HeaderRootAuthUpdate,
-) -> HeaderSyncEvent {
-    HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation, update }
-}
-
-fn header_root_authentication_failed(
-    operation: HeaderSyncOperationIdentity,
-    kind: HeaderRootAuthenticationFailureKind,
-) -> HeaderSyncEvent {
-    HeaderSyncEvent::HeaderRootAuthenticationFailed { operation, kind }
-}
-
-/// Convert a finished root-auth JoinSet entry into the reactor settlement event.
-///
-/// A panicked (non-cancelled) task must still settle the reactor's pending
-/// `AuthenticateRoots` op; otherwise both admission gates stay blocked forever.
-fn settle_root_auth_task_join(
-    joined: Option<Result<HeaderSyncEvent, tokio::task::JoinError>>,
-    in_flight: &mut Option<HeaderSyncOperationIdentity>,
-) -> Option<HeaderSyncEvent> {
-    match joined {
-        Some(Ok(event)) => {
-            let _ = in_flight.take();
-            Some(event)
-        }
-        Some(Err(error)) if !error.is_cancelled() => {
-            let Some(operation) = in_flight.take() else {
-                warn!(
-                    ?error,
-                    "header-root authentication task failed without a tracked operation"
-                );
-                return None;
-            };
-            warn!(
-                ?error,
-                ?operation,
-                "header-root authentication task failed; synthesizing local failure"
-            );
-            Some(header_root_authentication_failed(
-                operation,
-                HeaderRootAuthenticationFailureKind::Local,
-            ))
-        }
-        Some(Err(_)) | None => {
-            let _ = in_flight.take();
-            None
-        }
-    }
-}
-
-/// Failure kind when a new root-auth action arrives while the driver's JoinSet
-/// slot is still occupied.
-///
-/// This is a local capacity condition: the frontier did not move and no watch
-/// publish is implied. Settling as [`HeaderRootAuthenticationFailureKind::Stale`]
-/// would park the reactor on `root_auth_waiting_for_watch` until an unrelated
-/// commit happens to publish.
-fn root_auth_slot_occupied_failure_kind() -> HeaderRootAuthenticationFailureKind {
-    HeaderRootAuthenticationFailureKind::Local
-}
-
-fn header_root_authentication_failure_kind(
-    error: &(dyn std::error::Error + Send + Sync + 'static),
-) -> HeaderRootAuthenticationFailureKind {
-    // Walk the source chain: Tower/state layers may wrap the typed auth error in another
-    // `Error`. A top-level-only downcast would mis-classify every forgery as Local and
-    // silently disable peer scoring while all piecewise tests stay green.
-    let mut current: &(dyn std::error::Error + 'static) = error;
-    loop {
-        if let Some(auth_error) =
-            current.downcast_ref::<zakura_state::AuthenticateHeaderRootsError>()
-        {
-            return match auth_error {
-                zakura_state::AuthenticateHeaderRootsError::NonCanonicalHeader { height } => {
-                    HeaderRootAuthenticationFailureKind::CanonicalMismatch { height: *height }
+            HeaderRuntimeStatus::Failed { error, .. } => {
+                return Err(eyre!("header runtime attachment failed: {error}"))
+            }
+            HeaderRuntimeStatus::Reconstructing { epoch, progress } => {
+                attachment_pending_since = None;
+                if latest_progress != Some((epoch, progress)) {
+                    latest_progress = Some((epoch, progress));
+                    last_progress_at = tokio::time::Instant::now();
                 }
-                zakura_state::AuthenticateHeaderRootsError::Verification { .. } => {
-                    HeaderRootAuthenticationFailureKind::InvalidPeerRange
+                match tokio::time::timeout(
+                    RECONSTRUCTION_DIAGNOSTIC_INTERVAL,
+                    status.changed(),
+                )
+                .await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        return Err(eyre!(
+                            "header-runtime lifecycle publisher closed during startup"
+                        ))
+                    }
+                    Err(_) => tracing::warn!(
+                        header_runtime_epoch = epoch.get(),
+                        ?progress,
+                        progress_stale_for = ?last_progress_at.elapsed(),
+                        "header runtime reconstruction is still active"
+                    ),
                 }
-                zakura_state::AuthenticateHeaderRootsError::StaleState { .. }
-                | zakura_state::AuthenticateHeaderRootsError::AnchorMismatch { .. }
-                | zakura_state::AuthenticateHeaderRootsError::StartMismatch { .. }
-                | zakura_state::AuthenticateHeaderRootsError::WitnessAboveCompletedCheckpoint {
-                    ..
-                }
-                | zakura_state::AuthenticateHeaderRootsError::WitnessAlreadyPresent { .. }
-                | zakura_state::AuthenticateHeaderRootsError::WitnessNotNeeded { .. } => {
-                    HeaderRootAuthenticationFailureKind::Stale
-                }
-                zakura_state::AuthenticateHeaderRootsError::CountMismatch { .. }
-                | zakura_state::AuthenticateHeaderRootsError::MissingHeaderWitness { .. }
-                | zakura_state::AuthenticateHeaderRootsError::NonContiguous { .. }
-                | zakura_state::AuthenticateHeaderRootsError::HeightOverflow
-                | zakura_state::AuthenticateHeaderRootsError::Frontier(_) => {
-                    HeaderRootAuthenticationFailureKind::Local
-                }
-            };
-        }
-        match current.source() {
-            Some(source) => current = source,
-            None => return HeaderRootAuthenticationFailureKind::Local,
+            }
         }
     }
 }
 
 #[cfg(test)]
-mod operation_identity_tests {
-    use super::*;
-    use zakura_network::zakura::{
-        HeaderSyncOperationKind, HeaderSyncRequestId, HeaderSyncWireRequestIdentity, ZakuraPeerId,
-    };
-
-    fn operation() -> HeaderSyncOperationIdentity {
-        HeaderSyncOperationIdentity {
-            wire_request: HeaderSyncWireRequestIdentity {
-                peer: ZakuraPeerId::new(vec![1; 32]).expect("test peer ID is valid"),
-                session_id: 7,
-                request_id: HeaderSyncRequestId::new(9).expect("test request ID is non-zero"),
-            },
-            op_kind: HeaderSyncOperationKind::CommitHeaders,
-        }
-    }
-
-    #[test]
-    fn commit_completion_events_echo_exact_operation_identity() {
-        let operation = operation();
-        let tip_hash = block::Hash([3; 32]);
-        assert!(matches!(
-            header_range_committed(operation.clone(), tip_hash),
-            HeaderSyncEvent::HeaderRangeOperationCompleted {
-                operation: echoed,
-                tip_hash: echoed_hash,
-            } if echoed == operation && echoed_hash == tip_hash
-        ));
-
-        for kind in [
-            HeaderSyncCommitFailureKind::InvalidPeerRange,
-            HeaderSyncCommitFailureKind::UnknownAnchor,
-            HeaderSyncCommitFailureKind::Local,
-        ] {
-            assert!(matches!(
-                header_range_commit_failed(operation.clone(), kind),
-                HeaderSyncEvent::HeaderRangeOperationFailed {
-                    operation: echoed,
-                    kind: echoed_kind,
-                } if echoed == operation && echoed_kind == kind
-            ));
-        }
-    }
-
-    #[test]
-    fn root_auth_events_echo_exact_operation_identity() {
-        let mut operation = operation();
-        operation.op_kind = HeaderSyncOperationKind::AuthenticateRoots;
-
-        assert!(matches!(
-            header_root_authentication_completed(
-                operation.clone(),
-                HeaderRootAuthUpdate::WitnessRecovered {
-                    witness: HeaderWitnessState {
-                        height: block::Height(2),
-                        hash: block::Hash([2; 32]),
-                    },
-                },
-            ),
-            HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation: echoed, .. }
-                if echoed == operation
-        ));
-        for kind in [
-            HeaderRootAuthenticationFailureKind::Stale,
-            HeaderRootAuthenticationFailureKind::InvalidPeerRange,
-            HeaderRootAuthenticationFailureKind::Local,
-        ] {
-            assert!(matches!(
-                header_root_authentication_failed(operation.clone(), kind),
-                HeaderSyncEvent::HeaderRootAuthenticationFailed {
-                    operation: echoed,
-                    kind: echoed_kind,
-                } if echoed == operation && echoed_kind == kind
-            ));
-        }
-    }
-
-    #[test]
-    fn root_auth_slot_occupied_settles_as_local_not_stale() {
-        // Stale parks the reactor waiting for a frontier watch update. Slot
-        // occupancy does not imply a frontier move, so the backstop must be
-        // Local (reactor retries with delay) instead.
-        assert_eq!(
-            root_auth_slot_occupied_failure_kind(),
-            HeaderRootAuthenticationFailureKind::Local
-        );
-        assert_ne!(
-            root_auth_slot_occupied_failure_kind(),
-            HeaderRootAuthenticationFailureKind::Stale
-        );
-    }
-
-    #[test]
-    fn root_auth_error_classes_preserve_peer_attribution_policy() {
-        let state = zakura_state::HeaderRootAuthState {
-            authenticated_height: block::Height(1),
-            authenticated_hash: block::Hash([1; 32]),
-            completed_checkpoint_height: block::Height(3),
-            completed_checkpoint_hash: block::Hash([3; 32]),
-            header_witness: None,
-        };
-        let stale = zakura_state::AuthenticateHeaderRootsError::StaleState {
-            expected: state,
-            current: state,
-        };
-        let invalid = zakura_state::AuthenticateHeaderRootsError::CountMismatch {
-            headers: 2,
-            roots: 1,
-        };
-        let canonical_mismatch = zakura_state::AuthenticateHeaderRootsError::NonCanonicalHeader {
-            height: block::Height(2),
-        };
-        // Cryptographic forgery is the peer-scoring path: Verification must map to
-        // InvalidPeerRange or the reactor will endlessly retry a poisoned payload.
-        let verification = zakura_state::AuthenticateHeaderRootsError::Verification {
-            height: block::Height(1),
-            source: zakura_chain::parallel::commitment_aux_verify::SuppliedRootsError::MissingHistoryTreeRoot,
-        };
-        let local = std::io::Error::other("local state service failure");
-
-        assert_eq!(
-            header_root_authentication_failure_kind(&stale),
-            HeaderRootAuthenticationFailureKind::Stale
-        );
-        assert_eq!(
-            header_root_authentication_failure_kind(&invalid),
-            HeaderRootAuthenticationFailureKind::Local
-        );
-        assert_eq!(
-            header_root_authentication_failure_kind(&canonical_mismatch),
-            HeaderRootAuthenticationFailureKind::CanonicalMismatch {
-                height: block::Height(2)
-            }
-        );
-        assert_eq!(
-            header_root_authentication_failure_kind(&verification),
-            HeaderRootAuthenticationFailureKind::InvalidPeerRange
-        );
-        assert_eq!(
-            header_root_authentication_failure_kind(&local),
-            HeaderRootAuthenticationFailureKind::Local
-        );
-
-        // A wrapping layer must not demote Verification to Local.
-        #[derive(Debug, thiserror::Error)]
-        #[error("wrapped authenticate-header-roots failure")]
-        struct WrappedAuthError(#[source] zakura_state::AuthenticateHeaderRootsError);
-        let wrapped = WrappedAuthError(zakura_state::AuthenticateHeaderRootsError::Verification {
-            height: block::Height(1),
-            source: zakura_chain::parallel::commitment_aux_verify::SuppliedRootsError::MissingHistoryTreeRoot,
-        });
-        assert_eq!(
-            header_root_authentication_failure_kind(&wrapped),
-            HeaderRootAuthenticationFailureKind::InvalidPeerRange
-        );
-    }
-
-    #[tokio::test]
-    async fn panicked_root_auth_join_synthesizes_local_failure() {
-        let operation = {
-            let mut operation = operation();
-            operation.op_kind = HeaderSyncOperationKind::AuthenticateRoots;
-            operation
-        };
-        let mut in_flight = Some(operation.clone());
-        let panic_join = tokio::spawn(async {
-            panic!("simulated root-auth task panic");
-        })
-        .await
-        .expect_err("join must surface the panic");
-
-        let event = settle_root_auth_task_join(Some(Err(panic_join)), &mut in_flight);
-        assert!(
-            matches!(
-                event,
-                Some(HeaderSyncEvent::HeaderRootAuthenticationFailed {
-                    operation: ref echoed,
-                    kind: HeaderRootAuthenticationFailureKind::Local,
-                }) if *echoed == operation
-            ),
-            "unexpected settlement event: {event:?}"
-        );
-        assert!(
-            in_flight.is_none(),
-            "panic settlement must clear the tracked operation"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelled_root_auth_join_does_not_synthesize_failure() {
-        let operation = {
-            let mut operation = operation();
-            operation.op_kind = HeaderSyncOperationKind::AuthenticateRoots;
-            operation
-        };
-        let mut in_flight = Some(operation);
-        let handle = tokio::spawn(async {
-            std::future::pending::<()>().await;
-        });
-        handle.abort();
-        let cancelled_join = handle
-            .await
-            .expect_err("aborted join must surface cancellation");
-        assert!(cancelled_join.is_cancelled());
-
-        let event = settle_root_auth_task_join(Some(Err(cancelled_join)), &mut in_flight);
-        assert!(event.is_none(), "cancelled joins must not settle as Local");
-        assert!(
-            in_flight.is_none(),
-            "cancelled joins still clear the tracked operation"
-        );
-    }
-
-    #[tokio::test]
-    async fn successful_root_auth_join_forwards_event_and_clears_tracker() {
-        let operation = {
-            let mut operation = operation();
-            operation.op_kind = HeaderSyncOperationKind::AuthenticateRoots;
-            operation
-        };
-        let mut in_flight = Some(operation.clone());
-        let completed = header_root_authentication_completed(
-            operation.clone(),
-            HeaderRootAuthUpdate::WitnessRecovered {
-                witness: HeaderWitnessState {
-                    height: block::Height(2),
-                    hash: block::Hash([2; 32]),
-                },
-            },
-        );
-
-        let event = settle_root_auth_task_join(Some(Ok(completed)), &mut in_flight);
-        assert!(
-            matches!(
-                event,
-                Some(HeaderSyncEvent::HeaderRootAuthenticationCompleted {
-                    operation: ref echoed,
-                    ..
-                }) if *echoed == operation
-            ),
-            "unexpected settlement event: {event:?}"
-        );
-        assert!(in_flight.is_none());
-    }
-
-    #[tokio::test]
-    async fn root_auth_watch_emits_initial_value_before_waiting() {
-        let state = zakura_state::HeaderRootAuthState {
-            authenticated_height: block::Height(7),
-            authenticated_hash: block::Hash([7; 32]),
-            completed_checkpoint_height: block::Height(9),
-            completed_checkpoint_hash: block::Hash([9; 32]),
-            header_witness: None,
-        };
-        let (_sender, receiver) = tokio::sync::watch::channel(Some(state));
-        let (delivered_tx, mut delivered_rx) = mpsc::channel(1);
-        let task = tokio::spawn(drive_header_root_auth_watch_updates(
-            receiver,
-            std::future::pending(),
-            move |state| {
-                let delivered_tx = delivered_tx.clone();
-                async move { delivered_tx.send(state).await.is_ok() }
-            },
-        ));
-
-        let delivered = tokio::time::timeout(Duration::from_secs(1), delivered_rx.recv())
-            .await
-            .expect("initial watch value is delivered without a change")
-            .expect("delivery channel stays open");
-        assert_eq!(delivered, Some(header_root_auth_state(state)));
-        task.abort();
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ZakuraHeaderSyncDriverHandles {
-    pub(crate) endpoint: ZakuraEndpoint,
-    pub(crate) header_sync: zakura_network::zakura::HeaderSyncHandle,
-}
-
-pub(crate) async fn drive_vct_root_repairs(
-    read_state: zakura_state::ReadStateService,
-    header_sync: zakura_network::zakura::HeaderSyncHandle,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) {
-    let repairs = read_state.subscribe_vct_root_repairs();
-    drive_vct_root_repair_updates(repairs, shutdown, move |status| {
-        let read_state = read_state.clone();
-        let header_sync = header_sync.clone();
-        async move {
-            match status.state {
-                zakura_state::VctRootRepairState::Idle => header_sync
-                    .send(HeaderSyncEvent::VctRootRepairResolved {
-                        generation: status.generation,
-                    })
-                    .await
-                    .is_ok(),
-                zakura_state::VctRootRepairState::Unavailable { height } => {
-                    let Some(event) =
-                        vct_root_repair_event(read_state, height, status.generation).await
-                    else {
-                        return false;
-                    };
-                    header_sync.send(event).await.is_ok()
-                }
-            }
-        }
-    })
-    .await;
-}
-
-async fn drive_vct_root_repair_updates<Deliver, Delivery>(
-    mut repairs: tokio::sync::watch::Receiver<zakura_state::VctRootRepairStatus>,
-    shutdown: impl Future<Output = ()>,
-    mut deliver: Deliver,
-) where
-    Deliver: FnMut(zakura_state::VctRootRepairStatus) -> Delivery,
-    Delivery: Future<Output = bool>,
+async fn root_covered_best_header_tip_or_verified<ReadState>(
+    read_state: ReadState,
+    best_header_tip: (block::Height, block::Hash),
+    verified_block_tip: (block::Height, block::Hash),
+) -> Result<(block::Height, block::Hash), Report>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
 {
-    const RETRY_DELAY: Duration = Duration::from_millis(500);
-    /// One warning per this many consecutive failed deliveries (~30s at
-    /// [`RETRY_DELAY`]), so a permanently undeliverable repair status is
-    /// visible to operators instead of an invisible silent retry loop.
-    const RETRY_WARN_EVERY: u32 = 60;
-
-    pin!(shutdown);
-    let mut status = *repairs.borrow_and_update();
-    // A repair can already be pending when this driver subscribes. Idle is not
-    // sent initially because there cannot yet be a driver-owned repair to clear.
-    let mut delivery_pending = matches!(
-        status.state,
-        zakura_state::VctRootRepairState::Unavailable { .. }
-    );
-    let mut consecutive_failures: u32 = 0;
-
-    loop {
-        if delivery_pending {
-            delivery_pending = !deliver(status).await;
-            if delivery_pending {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                if consecutive_failures.is_multiple_of(RETRY_WARN_EVERY) {
-                    tracing::warn!(
-                        ?status,
-                        consecutive_failures,
-                        "VCT root repair status could not be delivered to header sync \
-                         (state read or event send keeps failing); still retrying"
-                    );
-                }
-            } else {
-                consecutive_failures = 0;
-            }
-        }
-
-        select! {
-            _ = &mut shutdown => return,
-            changed = repairs.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                status = *repairs.borrow_and_update();
-                delivery_pending = true;
-                consecutive_failures = 0;
-            }
-            _ = tokio::time::sleep(RETRY_DELAY), if delivery_pending => {}
-        }
+    if best_header_tip.0 <= verified_block_tip.0 {
+        return Ok(best_header_tip);
     }
-}
 
-async fn vct_root_repair_event(
-    read_state: zakura_state::ReadStateService,
-    height: block::Height,
-    generation: u64,
-) -> Option<HeaderSyncEvent> {
-    let anchor_height = height.0.checked_sub(1).map(block::Height)?;
-    let response = read_state
-        .oneshot(zakura_state::ReadRequest::HeadersByHeightRange {
-            start: anchor_height,
-            count: 3,
-        })
-        .await
-        .ok()?;
-    let zakura_state::ReadResponse::Headers(headers) = response else {
-        return None;
+    let Ok(start_height) = verified_block_tip.0.next() else {
+        return Ok(verified_block_tip);
     };
-    if headers.len() < 2 {
-        return None;
-    }
-
-    let (stored_anchor_height, anchor_hash, anchor_header) = &headers[0];
-    if *stored_anchor_height != anchor_height {
-        return None;
-    }
-    let mut expected_hashes: Vec<(block::Height, block::Hash)> = Vec::new();
-    for (expected_offset, (candidate_height, candidate_hash, candidate_header)) in
-        headers.iter().skip(1).take(2).enumerate()
+    let best_header_height = best_header_tip.0;
+    let verified_block_height = verified_block_tip.0;
+    let count = best_header_height
+        .0
+        .checked_sub(verified_block_height.0)
+        .ok_or_else(|| eyre!("best header tip is unexpectedly below verified block tip"))?;
+    let roots = match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state.oneshot(zakura_state::ReadRequest::BlockRoots {
+            start_height,
+            count,
+        }),
+    )
+    .await
+    .map_err(|_| eyre!("timed out reading BlockRoots"))?
+    .map_err(|error| eyre!("{error}"))?
     {
-        let expected_height = height.0.checked_add(u32::try_from(expected_offset).ok()?)?;
-        if *candidate_height != block::Height(expected_height) {
-            return None;
-        }
-        let expected_parent = if expected_offset == 0 {
-            *anchor_hash
-        } else {
-            expected_hashes.last().map(|(_, hash)| *hash)?
-        };
-        if candidate_header.previous_block_hash != expected_parent {
-            return None;
-        }
-        expected_hashes.push((*candidate_height, *candidate_hash));
-    }
-    if expected_hashes.is_empty() || block::Hash::from(anchor_header.as_ref()) != *anchor_hash {
-        return None;
-    }
+        zakura_state::ReadResponse::BlockRoots(roots) => roots,
+        response => Err(eyre!("unexpected BlockRoots response: {response:?}"))?,
+    };
 
-    Some(HeaderSyncEvent::VctRootRepairRequested {
-        height,
-        generation,
-        anchor_hash: *anchor_hash,
-        expected_hashes,
-    })
+    if block_roots_cover_range(start_height, count, &roots) {
+        Ok(best_header_tip)
+    } else {
+        Ok(verified_block_tip)
+    }
 }
 
 #[cfg(test)]
-mod vct_root_repair_driver_tests {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+pub(crate) async fn root_covered_query_best_header_tip<ReadState>(
+    read_state: ReadState,
+    best_header_tip: (block::Height, block::Hash),
+) -> Result<(block::Height, block::Hash), Report>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let verified_block_tip = match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state.clone().oneshot(zakura_state::ReadRequest::Tip),
+    )
+    .await
+    .map_err(|_| eyre!("timed out reading Tip"))?
+    .map_err(|error| eyre!("{error}"))?
+    {
+        zakura_state::ReadResponse::Tip(Some(tip)) => tip,
+        zakura_state::ReadResponse::Tip(None) => return Ok(best_header_tip),
+        response => Err(eyre!("unexpected Tip response: {response:?}"))?,
     };
 
-    use super::*;
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn retries_transient_delivery_failure_without_another_watch_change() {
-        let status = zakura_state::VctRootRepairStatus {
-            state: zakura_state::VctRootRepairState::Unavailable {
-                height: block::Height(42),
-            },
-            generation: 1,
-        };
-        let (_repairs_tx, repairs_rx) = tokio::sync::watch::channel(status);
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let delivery_attempts = attempts.clone();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-
-        let driver = tokio::spawn(drive_vct_root_repair_updates(
-            repairs_rx,
-            async move {
-                let _ = shutdown_rx.await;
-            },
-            move |delivered_status| {
-                assert_eq!(delivered_status, status);
-                let attempt = delivery_attempts.fetch_add(1, Ordering::SeqCst);
-                async move { attempt > 0 }
-            },
-        ));
-
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-
-        tokio::time::advance(Duration::from_millis(500)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            2,
-            "a successful delivery must stop timer retries"
-        );
-
-        shutdown_tx.send(()).expect("driver is still running");
-        driver.await.expect("driver shuts down cleanly");
-    }
+    root_covered_best_header_tip_or_verified(read_state, best_header_tip, verified_block_tip).await
 }
 
-pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
-    mut actions: mpsc::Receiver<HeaderSyncAction>,
-    handles: ZakuraHeaderSyncDriverHandles,
+pub(crate) fn block_roots_cover_range(
+    start_height: block::Height,
+    count: u32,
+    roots: &[BlockCommitmentRoots],
+) -> bool {
+    if roots.len() != usize::try_from(count).unwrap_or(usize::MAX) {
+        return false;
+    }
+
+    roots.iter().enumerate().all(|(offset, roots)| {
+        let Ok(offset) = u32::try_from(offset) else {
+            return false;
+        };
+        start_height
+            .0
+            .checked_add(offset)
+            .is_some_and(|height| roots.height == block::Height(height))
+    })
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HeaderChainServicePort<State, ReadState> {
     state: State,
     read_state: ReadState,
-    block_verifier: BlockVerifier,
-    trace: ZakuraTrace,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) where
+    authority: zakura_state::HeaderChainBodyEvidenceAuthority,
+    network: zakura_chain::parameters::Network,
+    adapter_key: port::AdapterKey,
+}
+
+impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
+    pub(crate) fn new(
+        state: State,
+        read_state: ReadState,
+        authority: zakura_state::HeaderChainBodyEvidenceAuthority,
+        network: zakura_chain::parameters::Network,
+    ) -> Self {
+        Self {
+            state,
+            read_state,
+            authority,
+            network,
+            adapter_key: port::AdapterKey::new(),
+        }
+    }
+}
+
+impl<State, ReadState> Port for HeaderChainServicePort<State, ReadState>
+where
     State: Service<
             zakura_state::Request,
             Response = zakura_state::Response,
             Error = zakura_state::BoxError,
         > + Clone
         + Send
+        + Sync
         + 'static,
     State::Future: Send + 'static,
     ReadState: Service<
@@ -799,909 +344,219 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
             Error = zakura_state::BoxError,
         > + Clone
         + Send
+        + Sync
         + 'static,
     ReadState::Future: Send + 'static,
-    BlockVerifier:
-        Service<zakura_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
-    BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
-    BlockVerifier::Future: Send + 'static,
 {
-    pin!(shutdown);
-    let mut root_auth_tasks = JoinSet::new();
-    let mut in_flight_root_auth = None;
-    loop {
-        let action = select! {
-            _ = &mut shutdown => {
-                root_auth_tasks.abort_all();
-                while root_auth_tasks.join_next().await.is_some() {}
-                return;
-            },
-            completed = root_auth_tasks.join_next(), if !root_auth_tasks.is_empty() => {
-                if let Some(event) =
-                    settle_root_auth_task_join(completed, &mut in_flight_root_auth)
-                {
-                    let _ = handles.header_sync.send(event).await;
-                }
-                continue;
-            },
-            action = actions.recv() => {
-                let Some(action) = action else {
-                    root_auth_tasks.abort_all();
-                    while root_auth_tasks.join_next().await.is_some() {}
-                    return;
-                };
-                action
+    fn continuation_locator(
+        &self,
+    ) -> HeaderChainFuture<'_, Result<Option<zakura_header_chain::HeaderLocator>, PortError>> {
+        let read_state = self.read_state.clone();
+        Box::pin(async move {
+            match tokio::time::timeout(
+                ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+                read_state.oneshot(zakura_state::ReadRequest::HeaderLocator),
+            )
+            .await
+            {
+                Ok(Ok(zakura_state::ReadResponse::HeaderLocator(locator))) => Ok(locator),
+                Ok(Ok(_)) => Err(PortError::Unavailable { source: None }),
+                Ok(Err(error)) => Err(PortError::Unavailable {
+                    source: Some(Arc::from(error)),
+                }),
+                Err(_) => Err(PortError::Timeout),
             }
-        };
-
-        trace.trace_header_action_received(&action);
-        match action {
-            HeaderSyncAction::Misbehavior { peer, reason } => {
-                // Record-only: peer scoring no longer drives disconnects.
-                debug!(?peer, ?reason, "recorded Zakura header-sync peer violation");
-            }
-            HeaderSyncAction::NewBlockReceived {
-                peer,
-                height,
-                hash,
-                block,
-            } => {
-                trace.trace_new_block_commit_started(&peer, height, hash);
-                let started = Instant::now();
-                match block_verifier
-                    .clone()
-                    .oneshot(zakura_consensus::Request::Commit(block.clone()))
-                    .await
-                {
-                    Ok(committed_hash) if committed_hash == hash => {
-                        // A contextually valid block also commits when it does
-                        // not land on the best chain, but only a best-chain
-                        // block may advance the header/verified frontiers or be
-                        // forwarded to peers: gossiping non-best-chain blocks
-                        // makes the whole Zakura layer follow a losing branch
-                        // while the node's own chain stays honest, stranding
-                        // zakura-only peers.
-                        let on_best_chain =
-                            new_block_is_on_best_chain(read_state.clone(), hash).await;
-                        let result_label = if on_best_chain {
-                            "accepted"
-                        } else {
-                            "accepted_non_best_chain"
-                        };
-                        trace.trace_header_commit_finished(
-                            "new_block",
-                            &peer,
-                            height,
-                            hash,
-                            result_label,
-                            started,
-                        );
-                        trace.trace_header_reactor_event(
-                            if on_best_chain {
-                                "new_block_accepted"
-                            } else {
-                                "new_block_accepted_non_best_chain"
-                            },
-                            Some(&peer),
-                            height,
-                            hash,
-                            1,
-                        );
-                        let event = if on_best_chain {
-                            HeaderSyncEvent::NewBlockAccepted {
-                                peer,
-                                height,
-                                hash,
-                                block,
-                            }
-                        } else {
-                            debug!(
-                                ?peer,
-                                ?height,
-                                ?hash,
-                                "Zakura NewBlock did not land on the best chain; \
-                                 not advancing frontiers or forwarding"
-                            );
-                            HeaderSyncEvent::NewBlockAcceptedNonBestChain { peer, height, hash }
-                        };
-                        if handles.header_sync.send(event).await.is_err() {
-                            return;
-                        }
-                        if on_best_chain {
-                            match best_durable_header_tip(read_state.clone()).await {
-                                Ok(Some((tip_height, tip_hash))) => {
-                                    if handles
-                                        .header_sync
-                                        .send(HeaderSyncEvent::BestHeaderTipLoaded {
-                                            tip_height,
-                                            tip_hash,
-                                            reanchor_from: None,
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    warn!(
-                                        ?height,
-                                        ?hash,
-                                        ?error,
-                                        "failed to reload the durable header tip after NewBlock acceptance"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Ok(committed_hash) => {
-                        trace.trace_header_commit_finished(
-                            "new_block",
-                            &peer,
-                            height,
-                            hash,
-                            "rejected",
-                            started,
-                        );
-                        warn!(
-                            ?peer,
-                            ?hash,
-                            ?committed_hash,
-                            "Zakura NewBlock verifier returned an unexpected hash"
-                        );
-                        trace.trace_header_reactor_event(
-                            "new_block_rejected",
-                            Some(&peer),
-                            height,
-                            hash,
-                            1,
-                        );
-                        let _ = handles
-                            .header_sync
-                            .send(HeaderSyncEvent::NewBlockRejected { peer, hash })
-                            .await;
-                    }
-                    Err(error) => {
-                        if block_verify_error_is_duplicate(&error) {
-                            trace.trace_header_commit_finished(
-                                "new_block",
-                                &peer,
-                                height,
-                                hash,
-                                "duplicate",
-                                started,
-                            );
-                            debug!(
-                                ?peer,
-                                ?height,
-                                ?hash,
-                                ?error,
-                                "Zakura NewBlock was already known by the block verifier"
-                            );
-                            trace.trace_header_reactor_event(
-                                "new_block_duplicate",
-                                Some(&peer),
-                                height,
-                                hash,
-                                1,
-                            );
-                            let _ = handles
-                                .header_sync
-                                .send(HeaderSyncEvent::NewBlockDuplicate { peer, height, hash })
-                                .await;
-                            continue;
-                        }
-
-                        trace.trace_header_commit_finished(
-                            "new_block",
-                            &peer,
-                            height,
-                            hash,
-                            "rejected",
-                            started,
-                        );
-                        debug!(
-                            ?peer,
-                            ?hash,
-                            ?error,
-                            "Zakura NewBlock rejected by block verifier"
-                        );
-                        trace.trace_header_reactor_event(
-                            "new_block_rejected",
-                            Some(&peer),
-                            height,
-                            hash,
-                            1,
-                        );
-                        let _ = handles
-                            .header_sync
-                            .send(HeaderSyncEvent::NewBlockRejected { peer, hash })
-                            .await;
-                    }
-                }
-            }
-            HeaderSyncAction::QueryHeadersByHeightRange {
-                peer,
-                session_id,
-                request_id,
-                start,
-                count,
-                want_tree_aux_roots,
-            } => {
-                trace.trace_header_state_read_started(
-                    "query_headers_by_height_range",
-                    Some(&peer),
-                    start,
-                    count,
-                );
-                let started = Instant::now();
-                match read_state
-                    .clone()
-                    .oneshot(zakura_state::ReadRequest::HeadersByHeightRange { start, count })
-                    .await
-                {
-                    Ok(zakura_state::ReadResponse::Headers(headers)) => {
-                        trace.trace_header_range_query_succeeded(
-                            &peer,
-                            start,
-                            headers.len(),
-                            started,
-                        );
-                        trace.trace_header_state_read_started(
-                            "block_size_hints",
-                            Some(&peer),
-                            start,
-                            count,
-                        );
-                        let body_size_hints = match read_state
-                            .clone()
-                            .oneshot(zakura_state::ReadRequest::BlockSizeHints {
-                                from: start,
-                                count,
-                            })
-                            .await
-                        {
-                            Ok(zakura_state::ReadResponse::BlockSizeHints(hints)) => hints,
-                            Ok(response) => {
-                                trace.trace_header_state_read_failed(
-                                    "block_size_hints",
-                                    Some(&peer),
-                                    start,
-                                    count,
-                                    "unexpected_response",
-                                    started,
-                                );
-                                warn!(?peer, ?response, "unexpected BlockSizeHints response");
-                                Vec::new()
-                            }
-                            Err(error) => {
-                                trace.trace_header_state_read_failed(
-                                    "block_size_hints",
-                                    Some(&peer),
-                                    start,
-                                    count,
-                                    &format!("{error}"),
-                                    started,
-                                );
-                                warn!(
-                                    ?peer,
-                                    ?error,
-                                    "failed to read Zakura BlockSizeHints response from state"
-                                );
-                                Vec::new()
-                            }
-                        };
-                        let block_roots = if want_tree_aux_roots {
-                            trace.trace_header_state_read_started(
-                                "block_roots",
-                                Some(&peer),
-                                start,
-                                count,
-                            );
-                            match read_state
-                                .clone()
-                                .oneshot(zakura_state::ReadRequest::BlockRoots {
-                                    start_height: start,
-                                    count,
-                                })
-                                .await
-                            {
-                                Ok(zakura_state::ReadResponse::BlockRoots(roots)) => roots,
-                                Ok(response) => {
-                                    trace.trace_header_state_read_failed(
-                                        "block_roots",
-                                        Some(&peer),
-                                        start,
-                                        count,
-                                        "unexpected_response",
-                                        started,
-                                    );
-                                    warn!(?peer, ?response, "unexpected BlockRoots response");
-                                    Vec::new()
-                                }
-                                Err(error) => {
-                                    trace.trace_header_state_read_failed(
-                                        "block_roots",
-                                        Some(&peer),
-                                        start,
-                                        count,
-                                        &format!("{error}"),
-                                        started,
-                                    );
-                                    warn!(
-                                        ?peer,
-                                        ?error,
-                                        "failed to read Zakura BlockRoots response from state"
-                                    );
-                                    Vec::new()
-                                }
-                            }
-                        } else {
-                            Vec::new()
-                        };
-                        let header_heights: Vec<_> =
-                            headers.iter().map(|(height, _, _)| *height).collect();
-                        let tree_aux_roots = if want_tree_aux_roots {
-                            tree_aux_roots_for_served_header_range(
-                                start,
-                                header_heights.iter().copied(),
-                                &block_roots,
-                            )
-                            .unwrap_or_else(|error| {
-                                metrics::counter!("sync.header.tree_aux.sender_alignment_failure")
-                                    .increment(1);
-                                static ALIGNMENT_FAILURES: AtomicU64 = AtomicU64::new(0);
-                                let occurrences =
-                                    ALIGNMENT_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-                                if occurrences.is_power_of_two() {
-                                    warn!(
-                                        ?peer,
-                                        ?start,
-                                        requested_count = count,
-                                        occurrences,
-                                        ?error,
-                                        "serving header range without tree aux roots"
-                                    );
-                                }
-
-                                Vec::new()
-                            })
-                        } else {
-                            Vec::new()
-                        };
-                        let body_sizes = body_sizes_for_served_header_range(
-                            start,
-                            header_heights.iter().copied(),
-                            &body_size_hints,
-                        );
-                        let headers = headers
-                            .into_iter()
-                            .map(|(_height, _hash, header)| header)
-                            .collect();
-                        trace.trace_header_reactor_event(
-                            "header_range_response_ready",
-                            Some(&peer),
-                            start,
-                            block::Hash([0; 32]),
-                            count,
-                        );
-                        let _ = handles
-                            .header_sync
-                            .send(HeaderSyncEvent::HeaderRangeResponseReady {
-                                peer,
-                                session_id,
-                                request_id,
-                                start_height: start,
-                                requested_count: count,
-                                want_tree_aux_roots,
-                                headers,
-                                body_sizes,
-                                tree_aux_roots,
-                            })
-                            .await;
-                    }
-                    Ok(response) => {
-                        trace.trace_header_state_read_failed(
-                            "query_headers_by_height_range",
-                            Some(&peer),
-                            start,
-                            count,
-                            "unexpected_response",
-                            started,
-                        );
-                        warn!(?peer, ?response, "unexpected HeadersByHeightRange response");
-                        trace.trace_header_range_finished(&peer, start, count, 0);
-                        let _ = handles
-                            .header_sync
-                            .send(HeaderSyncEvent::HeaderRangeResponseFinished {
-                                peer,
-                                session_id,
-                                request_id,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            })
-                            .await;
-                    }
-                    Err(error) => {
-                        trace.trace_header_state_read_failed(
-                            "query_headers_by_height_range",
-                            Some(&peer),
-                            start,
-                            count,
-                            &format!("{error}"),
-                            started,
-                        );
-                        warn!(
-                            ?peer,
-                            ?error,
-                            "failed to read Zakura Headers response from state"
-                        );
-                        trace.trace_header_range_finished(&peer, start, count, 0);
-                        let _ = handles
-                            .header_sync
-                            .send(HeaderSyncEvent::HeaderRangeResponseFinished {
-                                peer,
-                                session_id,
-                                request_id,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            })
-                            .await;
-                    }
-                }
-            }
-            HeaderSyncAction::CommitHeaderRange {
-                operation,
-                anchor,
-                payload,
-                finalized: _finalized,
-            } => {
-                let peer = operation.wire_request.peer.clone();
-                let range = payload.range();
-                let start_height = range.start();
-                let count = range.count();
-                let tree_aux_roots_len = payload
-                    .tree_aux_roots()
-                    .map_or(0, |roots| u32::try_from(roots.len()).unwrap_or(u32::MAX));
-                let (_range, headers, body_sizes, tree_aux_roots) = payload.into_parts();
-                let tree_aux_roots = tree_aux_roots.unwrap_or_default();
-                trace.trace_header_range_commit_started(
-                    &peer,
-                    start_height,
-                    count,
-                    tree_aux_roots_len,
-                    anchor,
-                );
-                let started = Instant::now();
-                match state
-                    .clone()
-                    .oneshot(zakura_state::Request::CommitHeaderRange {
-                        anchor,
-                        headers,
-                        body_sizes,
-                        tree_aux_roots,
-                    })
-                    .await
-                {
-                    Ok(zakura_state::Response::Committed(tip_hash)) => {
-                        trace.trace_header_range_commit_finished(
-                            &peer,
-                            start_height,
-                            count,
-                            Some(tree_aux_roots_len),
-                            "committed",
-                            started,
-                        );
-                        let tip_height =
-                            block::Height(start_height.0.saturating_add(count.saturating_sub(1)));
-                        let _ = handles
-                            .header_sync
-                            .send(header_range_committed(operation, tip_hash))
-                            .await;
-                        trace.trace_header_reactor_event(
-                            "header_range_committed",
-                            None,
-                            tip_height,
-                            tip_hash,
-                            count,
-                        );
-                    }
-                    Ok(response) => {
-                        trace.trace_header_range_commit_finished(
-                            &peer,
-                            start_height,
-                            count,
-                            None,
-                            "unexpected_response",
-                            started,
-                        );
-                        warn!(?peer, ?response, "unexpected CommitHeaderRange response");
-                        trace.trace_header_reactor_event(
-                            "header_range_commit_failed",
-                            Some(&peer),
-                            start_height,
-                            block::Hash([0; 32]),
-                            count,
-                        );
-                        let _ = handles
-                            .header_sync
-                            .send(header_range_commit_failed(
-                                operation,
-                                HeaderSyncCommitFailureKind::Local,
-                            ))
-                            .await;
-                    }
-                    Err(error) => {
-                        let kind = header_range_commit_failure_kind(error.as_ref());
-                        trace.trace_header_range_commit_failed(
-                            &peer,
-                            start_height,
-                            count,
-                            anchor,
-                            kind,
-                            error.as_ref(),
-                            started,
-                        );
-                        debug!(
-                            ?peer,
-                            ?start_height,
-                            ?count,
-                            ?kind,
-                            ?error,
-                            "Zakura header range commit failed"
-                        );
-                        trace.trace_header_reactor_event(
-                            "header_range_commit_failed",
-                            Some(&peer),
-                            start_height,
-                            block::Hash([0; 32]),
-                            count,
-                        );
-                        let _ = handles
-                            .header_sync
-                            .send(header_range_commit_failed(operation, kind))
-                            .await;
-                    }
-                }
-            }
-            HeaderSyncAction::AuthenticateHeaderRoots {
-                operation,
-                expected_state,
-                anchor,
-                payload,
-            } => {
-                if root_auth_tasks.len() >= MAX_ROOT_AUTH_STATE_TASKS {
-                    if handles
-                        .header_sync
-                        .send(header_root_authentication_failed(
-                            operation,
-                            root_auth_slot_occupied_failure_kind(),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    continue;
-                }
-                let peer = operation.wire_request.peer.clone();
-                let start = payload.range().start();
-                let (_range, headers, _body_sizes, roots) = payload.into_parts();
-                let request = zakura_state::AuthenticateHeaderRootsRequest {
-                    expected_state: state_header_root_auth_state(expected_state),
-                    anchor,
-                    start,
-                    headers,
-                    roots: roots.unwrap_or_default(),
-                };
-                let state = state.clone();
-                debug_assert!(
-                    in_flight_root_auth.is_none(),
-                    "at most one root-auth task is admitted"
-                );
-                in_flight_root_auth = Some(operation.clone());
-                root_auth_tasks.spawn(async move {
-                    match tokio::time::timeout(
-                        ROOT_AUTH_STATE_TIMEOUT,
-                        state.oneshot(request.map_request()),
-                    )
-                    .await
-                    {
-                        Ok(Ok(zakura_state::Response::AuthenticatedHeaderRoots(success))) => {
-                            header_root_authentication_completed(
-                                operation,
-                                header_root_auth_update(success.update),
-                            )
-                        }
-                        Ok(Ok(response)) => {
-                            warn!(
-                                ?peer,
-                                ?response,
-                                "unexpected AuthenticateHeaderRoots response"
-                            );
-                            header_root_authentication_failed(
-                                operation,
-                                HeaderRootAuthenticationFailureKind::Local,
-                            )
-                        }
-                        Ok(Err(error)) => {
-                            let kind = header_root_authentication_failure_kind(error.as_ref());
-                            if kind == HeaderRootAuthenticationFailureKind::Local {
-                                warn!(
-                                    ?peer,
-                                    ?start,
-                                    ?error,
-                                    "local header-root authentication failure"
-                                );
-                            } else {
-                                debug!(
-                                    ?peer,
-                                    ?start,
-                                    ?kind,
-                                    ?error,
-                                    "header-root authentication rejected"
-                                );
-                            }
-                            header_root_authentication_failed(operation, kind)
-                        }
-                        Err(_) => {
-                            warn!(
-                                ?peer,
-                                ?start,
-                                "header-root authentication state request timed out"
-                            );
-                            header_root_authentication_failed(
-                                operation,
-                                HeaderRootAuthenticationFailureKind::Local,
-                            )
-                        }
-                    }
-                });
-            }
-            HeaderSyncAction::QueryBestHeaderTip { reanchor_from } => {
-                trace.trace_best_header_tip_query_started();
-                match best_durable_header_tip(read_state.clone()).await {
-                    Ok(Some((tip_height, tip_hash))) => {
-                        trace.trace_best_header_tip_query_succeeded(tip_height, tip_hash);
-                        let _ = handles
-                            .header_sync
-                            .send(HeaderSyncEvent::BestHeaderTipLoaded {
-                                tip_height,
-                                tip_hash,
-                                reanchor_from,
-                            })
-                            .await;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        trace.trace_header_state_read_failed(
-                            "query_best_header_tip",
-                            None,
-                            block::Height(0),
-                            0,
-                            &format!("{error}"),
-                            Instant::now(),
-                        );
-                        warn!(?error, "failed to query Zakura best header tip")
-                    }
-                }
-            }
-            HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
-                log_missing_block_bodies(read_state.clone(), from, limit, &trace).await;
-            }
-            HeaderSyncAction::BodyGaps { from, to } => {
-                let limit =
-                    to.0.saturating_sub(from.0)
-                        .saturating_add(1)
-                        .min(DEFAULT_HS_RANGE);
-                log_missing_block_bodies(read_state.clone(), from, limit, &trace).await;
-            }
-            HeaderSyncAction::HeaderAdvanced { height, hash } => {
-                publish_header_frontier(
-                    &handles.endpoint,
-                    height,
-                    hash,
-                    FrontierChange::HeaderAdvanced,
-                    &trace,
-                );
-            }
-            HeaderSyncAction::HeaderReanchored { old: _, new } => {
-                publish_header_frontier(
-                    &handles.endpoint,
-                    new.0,
-                    new.1,
-                    FrontierChange::HeaderReanchored,
-                    &trace,
-                );
-            }
-        }
-    }
-}
-
-pub(crate) fn publish_header_frontier(
-    endpoint: &ZakuraEndpoint,
-    height: block::Height,
-    hash: block::Hash,
-    change: FrontierChange,
-    trace: &ZakuraTrace,
-) {
-    let Some(mut update) = endpoint.current_sync_frontier() else {
-        return;
-    };
-
-    update.frontier.best_header = Frontier::new(height, hash);
-    update.change = change;
-    endpoint.publish_sync_frontier_from(update, "header_sync_driver");
-    trace.trace_block_sync_notified(height, hash);
-}
-
-#[cfg(test)]
-pub(crate) async fn notify_block_sync_header_tip(
-    block_sync: Option<&BlockSyncHandle>,
-    height: block::Height,
-    hash: block::Hash,
-    trace: &ZakuraTrace,
-) {
-    if let Some(block_sync) = block_sync {
-        let _ = block_sync
-            .send(BlockSyncEvent::HeaderTipChanged { height, hash })
-            .await;
-        trace.trace_block_sync_notified(height, hash);
-    }
-}
-
-pub(crate) fn body_sizes_for_served_header_range(
-    start: block::Height,
-    header_heights: impl IntoIterator<Item = block::Height>,
-    body_size_hints: &[(block::Height, Option<u32>)],
-) -> Vec<u32> {
-    header_heights
-        .into_iter()
-        .map(|height| {
-            if height < start {
-                return 0;
-            }
-
-            let Some(offset) = usize::try_from(height - start).ok() else {
-                return 0;
-            };
-
-            body_size_hints
-                .get(offset)
-                .and_then(|(hint_height, size)| {
-                    (*hint_height == height).then_some(size.unwrap_or(0))
-                })
-                .unwrap_or(0)
         })
-        .collect()
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TreeAuxRootsForServedHeaderRangeError {
-    HeaderBeforeStart {
-        start: block::Height,
-        height: block::Height,
-    },
-    OffsetOutOfRange {
-        start: block::Height,
-        height: block::Height,
-    },
-    MissingRoot {
-        height: block::Height,
-        offset: usize,
-    },
-    RootHeightMismatch {
-        expected_height: block::Height,
-        actual_height: block::Height,
-        offset: usize,
-    },
-}
-
-pub(crate) fn tree_aux_roots_for_served_header_range(
-    start: block::Height,
-    header_heights: impl IntoIterator<Item = block::Height>,
-    block_roots: &[BlockCommitmentRoots],
-) -> Result<Vec<BlockCommitmentRoots>, TreeAuxRootsForServedHeaderRangeError> {
-    let mut roots = Vec::new();
-
-    for height in header_heights {
-        if height < start {
-            return Err(TreeAuxRootsForServedHeaderRangeError::HeaderBeforeStart { start, height });
-        }
-
-        let Some(offset) = usize::try_from(height - start).ok() else {
-            return Err(TreeAuxRootsForServedHeaderRangeError::OffsetOutOfRange { start, height });
-        };
-
-        let Some(root) = block_roots.get(offset) else {
-            return Err(TreeAuxRootsForServedHeaderRangeError::MissingRoot { height, offset });
-        };
-
-        if root.height != height {
-            return Err(TreeAuxRootsForServedHeaderRangeError::RootHeightMismatch {
-                expected_height: height,
-                actual_height: root.height,
-                offset,
-            });
-        }
-
-        roots.push(root.clone());
     }
 
-    Ok(roots)
+    fn vct_repair_context(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+    ) -> HeaderChainFuture<'_, Result<port::VctRepairContextReply, PortError>> {
+        let read_state = self.read_state.clone();
+        Box::pin(async move {
+            match tokio::time::timeout(
+                ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+                read_state.oneshot(zakura_state::ReadRequest::VctRepairContext { owner, height }),
+            )
+            .await
+            {
+                Ok(Ok(zakura_state::ReadResponse::VctRepairContext(Some(context)))) => {
+                    Ok(port::VctRepairContextReply::Resolved(context))
+                }
+                Ok(Ok(zakura_state::ReadResponse::VctRepairContext(None))) => {
+                    Ok(port::VctRepairContextReply::Stale)
+                }
+                Ok(Ok(_)) => Err(PortError::Unavailable { source: None }),
+                Ok(Err(error)) => Err(PortError::Unavailable {
+                    source: Some(Arc::from(error)),
+                }),
+                Err(_) => Err(PortError::Timeout),
+            }
+        })
+    }
+
+    fn acquire_header_path(
+        &self,
+        request: port::AcquirePath,
+    ) -> HeaderChainFuture<'_, Result<port::AcquirePathReply, PortError>> {
+        let read_state = self.read_state.clone();
+        let adapter_key = self.adapter_key.clone();
+        Box::pin(async move { acquire_header_path(read_state, adapter_key, request).await })
+    }
+
+    fn read_header_path(
+        &self,
+        path: port::RetainedHeaderPath,
+        request: port::ReadPath,
+    ) -> HeaderChainFuture<'_, Result<port::ReadPathReply, PortError>> {
+        let read_state = self.read_state.clone();
+        let adapter_key = self.adapter_key.clone();
+        let network = self.network.clone();
+        Box::pin(
+            async move { read_header_path(read_state, adapter_key, network, path, request).await },
+        )
+    }
+
+    fn release_header_path(
+        &self,
+        path: port::RetainedHeaderPath,
+    ) -> HeaderChainFuture<'_, Result<(), PortError>> {
+        let read_state = self.read_state.clone();
+        let adapter_key = self.adapter_key.clone();
+        Box::pin(async move { release_header_path(read_state, adapter_key, path).await })
+    }
+
+    fn prepare_header_target(
+        &self,
+        request: port::PrepareHeaderTarget,
+    ) -> HeaderChainFuture<'_, port::PrepareHeaderTargetReply> {
+        let read_state = self.read_state.clone();
+        let adapter_key = self.adapter_key.clone();
+        Box::pin(async move { prepare_header_target(read_state, adapter_key, request).await })
+    }
+
+    fn apply_header_target(
+        &self,
+        target: port::PreparedHeaderTarget,
+    ) -> HeaderChainFuture<'_, port::ApplyHeaderTargetReply> {
+        let state = self.state.clone();
+        let authority = self.authority.clone();
+        let adapter_key = self.adapter_key.clone();
+        Box::pin(async move { apply_header_target(state, authority, adapter_key, target).await })
+    }
 }
 
-async fn log_missing_block_bodies<ReadState>(
+fn header_failure_evidence(
+    source: zakura_header_chain::SourceId,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+    hash: block::Hash,
+    rule: zakura_header_chain::RuleId,
+) -> zakura_header_chain::EvidenceId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-header-validation-failure-v1");
+    hasher.update(source.digest());
+    hasher.update(owner.session_id().to_le_bytes());
+    hasher.update(owner.request_id().get().to_le_bytes());
+    hasher.update(hash.0);
+    hasher.update(rule.as_str().as_bytes());
+    zakura_header_chain::EvidenceId::from_digest(hasher.finalize().into())
+}
+
+/// Returns a deterministic, domain-separated delivery ID for the source, owner, and header.
+fn header_aux_delivery_id(
+    source: zakura_header_chain::SourceId,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+    hash: block::Hash,
+) -> zakura_header_chain::EvidenceId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-header-aux-delivery-v1");
+    hasher.update(source.digest());
+    hasher.update(owner.session_id().to_le_bytes());
+    hasher.update(owner.request_id().get().to_le_bytes());
+    hasher.update(hash.0);
+    zakura_header_chain::EvidenceId::from_digest(hasher.finalize().into())
+}
+
+fn classify_header_preparation_failure(
+    error: zakura_header_chain::HeaderFailure,
+    entries: &[port::TargetEntry],
+    source: zakura_header_chain::SourceId,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+) -> zakura_header_chain::HeaderChainError {
+    match error {
+        zakura_header_chain::HeaderFailure::Invalid {
+            offset,
+            rule,
+            reason,
+        } => {
+            let hash = entries
+                .get(offset)
+                .expect("the validation failure offset comes from this exact header batch")
+                .header
+                .hash();
+            let rule_id = rule
+                .rule_ids()
+                .first()
+                .copied()
+                .expect("every validation stage has normative rule ownership");
+            zakura_header_chain::HeaderChainError::invalid_header(
+                zakura_header_chain::ErrorSubject::Header(zakura_header_chain::HeaderId::new(hash)),
+                rule_id,
+                header_failure_evidence(source, owner, hash, rule_id),
+                source,
+                Some(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    reason,
+                ))),
+            )
+        }
+        zakura_header_chain::HeaderFailure::Empty
+        | zakura_header_chain::HeaderFailure::Oversized { .. } => {
+            zakura_header_chain::HeaderChainError::malformed_protocol(
+                zakura_header_chain::ErrorSubject::Request {
+                    source,
+                    request_id: owner.request_id(),
+                },
+                zakura_header_chain::RuleId::new("LC-WIRE-08"),
+                source,
+                None,
+            )
+        }
+        zakura_header_chain::HeaderFailure::InvalidLease => {
+            zakura_header_chain::HeaderChainError::stale_target(
+                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+            )
+        }
+        zakura_header_chain::HeaderFailure::ClockRange => {
+            zakura_header_chain::HeaderChainError::local_resource(
+                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+                Some(Box::new(zakura_header_chain::HeaderFailure::ClockRange)),
+            )
+        }
+    }
+}
+
+fn classify_body_size_hint_failure(
+    error: zakura_header_chain::TransitionTypeError,
+    hash: block::Hash,
+    source: zakura_header_chain::SourceId,
+) -> zakura_header_chain::HeaderChainError {
+    zakura_header_chain::HeaderChainError::malformed_protocol(
+        zakura_header_chain::ErrorSubject::Header(zakura_header_chain::HeaderId::new(hash)),
+        zakura_header_chain::RuleId::new("LC-WIRE-13"),
+        source,
+        Some(Box::new(error)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_header_target<ReadState>(
     read_state: ReadState,
-    from: block::Height,
-    limit: u32,
-    trace: &ZakuraTrace,
-) where
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    trace.trace_header_state_read_started("missing_block_bodies", None, from, limit);
-    let started = Instant::now();
-    match read_state
-        .oneshot(zakura_state::ReadRequest::MissingBlockBodies { from, limit })
-        .await
-    {
-        Ok(zakura_state::ReadResponse::MissingBlockBodies(heights)) => {
-            trace.trace_missing_block_bodies_query_succeeded(from, heights.len(), started);
-            let first = heights.first().copied();
-            let last = heights.last().copied();
-            let count = heights.len();
-            debug!(
-                ?from,
-                ?limit,
-                ?count,
-                ?first,
-                ?last,
-                "Zakura header-known body gaps from state"
-            );
-        }
-        Ok(response) => {
-            trace.trace_header_state_read_failed(
-                "missing_block_bodies",
-                None,
-                from,
-                limit,
-                "unexpected_response",
-                started,
-            );
-            warn!(?response, "unexpected MissingBlockBodies response")
-        }
-        Err(error) => {
-            trace.trace_header_state_read_failed(
-                "missing_block_bodies",
-                None,
-                from,
-                limit,
-                &format!("{error}"),
-                started,
-            );
-            warn!(?error, "failed to query Zakura missing block bodies")
-        }
-    }
-}
-
-/// Returns whether a just-committed `NewBlock` landed on the best chain.
-///
-/// `ReadRequest::Depth` returns `Some` only for best-chain blocks, so it
-/// distinguishes a best-chain extension (or a reorg the block just won) from a
-/// side-chain commit. Read failures are treated as *not* best-chain: the
-/// node's own frontier still advances through the chain-tip mirror, so the
-/// only cost of a false negative is skipping one gossip forward, while a
-/// false positive would gossip a possibly losing branch.
-async fn new_block_is_on_best_chain<ReadState>(read_state: ReadState, hash: block::Hash) -> bool
+    adapter_key: port::AdapterKey,
+    request: port::PrepareHeaderTarget,
+) -> port::PrepareHeaderTargetReply
 where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -1711,356 +566,1357 @@ where
         + 'static,
     ReadState::Future: Send + 'static,
 {
-    match read_state
-        .oneshot(zakura_state::ReadRequest::Depth(hash))
-        .await
-    {
-        Ok(zakura_state::ReadResponse::Depth(depth)) => depth.is_some(),
-        Ok(response) => {
-            warn!(?response, "unexpected Depth response for Zakura NewBlock");
-            false
-        }
-        Err(error) => {
-            warn!(
-                ?hash,
-                ?error,
-                "failed to read Zakura NewBlock depth from state"
-            );
-            false
-        }
-    }
-}
-
-pub(crate) fn header_range_commit_failure_kind(
-    error: &(dyn std::error::Error + Send + Sync + 'static),
-) -> HeaderSyncCommitFailureKind {
-    let Some(error) = error.downcast_ref::<zakura_state::CommitHeaderRangeError>() else {
-        return HeaderSyncCommitFailureKind::Local;
-    };
-
-    match error {
-        zakura_state::CommitHeaderRangeError::StorageWriteError { .. }
-        | zakura_state::CommitHeaderRangeError::MissingGenesisAnchor { .. }
-        | zakura_state::CommitHeaderRangeError::SendCommitRequestFailed
-        // A lower-work conflicting range is individually valid (each header passed
-        // PoW, difficulty, and contextual checks); the peer simply offered a worse
-        // fork. Treat it as non-scoring so this stays a liveness/correctness guard,
-        // not peer punishment.
-        | zakura_state::CommitHeaderRangeError::LowerWorkConflict { .. }
-        // The reactor already validates every peer response against the requested
-        // anchor and for internal continuity (`validate_header_range_links`) and
-        // scores linkage failures there, then commits with that same anchor. So the
-        // store's own linkage check failing means the local anchor/response pairing
-        // went wrong, not that the peer misbehaved.
-        | zakura_state::CommitHeaderRangeError::UnlinkedRange { .. }
-        // Store incoherence is by definition a local storage fault: the range was
-        // rejected because our own header rows failed a linkage/bijection check
-        // while reading validation context, not because the peer's range was shown
-        // invalid. Scoring peers for it recreates the disconnect-honest-peers
-        // failure mode.
-        | zakura_state::CommitHeaderRangeError::StoreIncoherent(_)
-        | zakura_state::CommitHeaderRangeError::CommitResponseDropped => {
-            HeaderSyncCommitFailureKind::Local
-        }
-        zakura_state::CommitHeaderRangeError::UnknownAnchor { .. } => {
-            // The requested anchor is chosen from our own published header
-            // frontier. If state cannot resolve it, our cached frontier and
-            // durable header view disagree; the peer did not choose that anchor.
-            HeaderSyncCommitFailureKind::UnknownAnchor
-        }
-        zakura_state::CommitHeaderRangeError::EmptyRange
-        | zakura_state::CommitHeaderRangeError::RangeTooLong { .. }
-        | zakura_state::CommitHeaderRangeError::BodySizeCountMismatch { .. }
-        | zakura_state::CommitHeaderRangeError::TreeAuxRootCountMismatch { .. }
-        | zakura_state::CommitHeaderRangeError::TreeAuxRootHeightMismatch { .. }
-        | zakura_state::CommitHeaderRangeError::HeightOverflow
-        | zakura_state::CommitHeaderRangeError::ImmutableConflict { .. }
-        | zakura_state::CommitHeaderRangeError::ReorgTooDeep { .. }
-        | zakura_state::CommitHeaderRangeError::CheckpointConflict { .. }
-        | zakura_state::CommitHeaderRangeError::ConflictingFullBlockHeader { .. }
-        | zakura_state::CommitHeaderRangeError::ValidateContextError(_) => {
-            HeaderSyncCommitFailureKind::InvalidPeerRange
-        }
-        _ => HeaderSyncCommitFailureKind::Local,
-    }
-}
-
-pub(crate) fn header_range_commit_error_label(
-    error: &(dyn std::error::Error + Send + Sync + 'static),
-) -> &'static str {
-    let Some(error) = error.downcast_ref::<zakura_state::CommitHeaderRangeError>() else {
-        return "non_commit_header_range_error";
-    };
-
-    match error {
-        zakura_state::CommitHeaderRangeError::EmptyRange => "empty_range",
-        zakura_state::CommitHeaderRangeError::RangeTooLong { .. } => "range_too_long",
-        zakura_state::CommitHeaderRangeError::BodySizeCountMismatch { .. } => {
-            "body_size_count_mismatch"
-        }
-        zakura_state::CommitHeaderRangeError::TreeAuxRootCountMismatch { .. } => {
-            "tree_aux_root_count_mismatch"
-        }
-        zakura_state::CommitHeaderRangeError::TreeAuxRootHeightMismatch { .. } => {
-            "tree_aux_root_height_mismatch"
-        }
-        zakura_state::CommitHeaderRangeError::UnknownAnchor { .. } => "unknown_anchor",
-        zakura_state::CommitHeaderRangeError::MissingGenesisAnchor { .. } => {
-            "missing_genesis_anchor"
-        }
-        zakura_state::CommitHeaderRangeError::HeightOverflow => "height_overflow",
-        zakura_state::CommitHeaderRangeError::ImmutableConflict { .. } => "immutable_conflict",
-        zakura_state::CommitHeaderRangeError::ReorgTooDeep { .. } => "reorg_too_deep",
-        zakura_state::CommitHeaderRangeError::LowerWorkConflict { .. } => "lower_work_conflict",
-        zakura_state::CommitHeaderRangeError::CheckpointConflict { .. } => "checkpoint_conflict",
-        zakura_state::CommitHeaderRangeError::ConflictingFullBlockHeader { .. } => {
-            "conflicting_full_block_header"
-        }
-        zakura_state::CommitHeaderRangeError::ValidateContextError(error) => {
-            validate_context_error_label(error)
-        }
-        zakura_state::CommitHeaderRangeError::StorageWriteError { .. } => "storage_write_error",
-        zakura_state::CommitHeaderRangeError::SendCommitRequestFailed => {
-            "send_commit_request_failed"
-        }
-        zakura_state::CommitHeaderRangeError::CommitResponseDropped => "commit_response_dropped",
-        _ => "unknown_commit_header_range_error",
-    }
-}
-
-fn validate_context_error_label(error: &zakura_state::ValidateContextError) -> &'static str {
-    match error {
-        zakura_state::ValidateContextError::BlockPreviouslyInvalidated { .. } => {
-            "validate_context_error.block_previously_invalidated"
-        }
-        zakura_state::ValidateContextError::VctSuppliedRootUnavailable { .. } => {
-            "validate_context_error.vct_supplied_root_unavailable"
-        }
-        zakura_state::ValidateContextError::VctSuppliedRootAwaitingSuccessor { .. } => {
-            "validate_context_error.vct_supplied_root_awaiting_successor"
-        }
-        zakura_state::ValidateContextError::OrphanedBlock { .. } => {
-            "validate_context_error.orphaned_block"
-        }
-        zakura_state::ValidateContextError::NonSequentialBlock { .. } => {
-            "validate_context_error.non_sequential_block"
-        }
-        zakura_state::ValidateContextError::TimeTooEarly { .. } => {
-            "validate_context_error.time_too_early"
-        }
-        zakura_state::ValidateContextError::TimeTooLate { .. } => {
-            "validate_context_error.time_too_late"
-        }
-        zakura_state::ValidateContextError::InvalidDifficultyThreshold { .. } => {
-            "validate_context_error.invalid_difficulty_threshold"
-        }
-        _ => "validate_context_error.other",
-    }
-}
-
-pub(super) fn header_range_commit_error_debug(
-    error: &(dyn std::error::Error + Send + Sync + 'static),
-) -> String {
-    error
-        .downcast_ref::<zakura_state::CommitHeaderRangeError>()
-        .map(|error| format!("{error:?}"))
-        .unwrap_or_else(|| error.to_string())
-}
-
-pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
-    mut chain_tip_change: zakura_state::ChainTipChange,
-    latest_chain_tip: zakura_state::LatestChainTip,
-    read_state: ReadState,
-    header_sync: zakura_network::zakura::HeaderSyncHandle,
-    endpoint: ZakuraEndpoint,
-    trace: ZakuraTrace,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) where
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    pin!(shutdown);
-    loop {
-        let action = select! {
-            _ = &mut shutdown => return,
-            action = chain_tip_change.wait_for_tip_change() => {
-                let Ok(action) = action else {
-                    return;
-                };
-                action
-            }
-        };
-        let height = action.best_tip_height();
-        let hash = action.best_tip_hash();
-        trace.trace_chain_tip_action(&action, height, hash);
-
-        let finalized_tip = match read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::FinalizedTip)
-            .await
-        {
-            Ok(zakura_state::ReadResponse::FinalizedTip(tip)) => tip,
-            Ok(response) => {
-                warn!(?response, "unexpected FinalizedTip response");
-                None
-            }
-            Err(error) => {
-                warn!(?error, "failed to query Zakura finalized frontier");
-                None
-            }
-        };
-        let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
-        trace.trace_finalized_tip_read(finalized_height);
-        let action_tip = Some((height, hash));
-        let verified_block_tip =
-            verified_block_tip_from_state(finalized_tip, action_tip, (height, hash));
-        let verified_block_tip = verified_block_tip_from_state(
-            Some(verified_block_tip),
-            latest_chain_tip.best_tip_height_and_hash(),
-            verified_block_tip,
-        );
-
-        trace.trace_mirror_frontier_derived(finalized_height, verified_block_tip);
-        if let Some(mut update) = endpoint.current_sync_frontier() {
-            let previous_verified_body = update.frontier.verified_body.height;
-            if let Some((finalized_height, finalized_hash)) = finalized_tip {
-                update.frontier.finalized = Frontier::new(finalized_height, finalized_hash);
-            }
-            update.frontier.verified_body =
-                Frontier::new(verified_block_tip.0, verified_block_tip.1);
-            update.change = chain_tip_mirror_frontier_change(
-                &action,
-                previous_verified_body,
-                verified_block_tip.0,
-            );
-            endpoint.publish_sync_frontier_from(update, "chain_tip_mirror");
-            trace.trace_mirror_frontier_sent(finalized_height, verified_block_tip);
-        }
-
-        trace.trace_committed_tip_lookup_started(height, hash);
-        match read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::Block(hash.into()))
-            .await
-        {
-            Ok(zakura_state::ReadResponse::Block(Some(_))) => {
-                trace.trace_committed_tip_lookup_finished(height, hash, "found");
-                if header_sync
-                    .send(HeaderSyncEvent::FullBlockCommitted { height, hash })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                trace.trace_full_block_committed(height, hash);
-                match best_durable_header_tip(read_state.clone()).await {
-                    Ok(Some((tip_height, tip_hash))) => {
-                        if header_sync
-                            .send(HeaderSyncEvent::BestHeaderTipLoaded {
-                                tip_height,
-                                tip_hash,
-                                reanchor_from: None,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Ok(None) => {
-                        debug!(
-                            ?height,
-                            ?hash,
-                            "verified block advanced while the durable header store is empty"
-                        );
-                    }
-                    Err(error) => {
-                        warn!(
-                            ?height,
-                            ?hash,
-                            ?error,
-                            "failed to reload the durable header tip after a full-block commit"
-                        );
-                    }
-                }
-            }
-            Ok(zakura_state::ReadResponse::Block(None)) => {
-                trace.trace_committed_tip_lookup_finished(height, hash, "missing");
-                debug!(
-                    ?height,
-                    ?hash,
-                    "Zakura full-block mirror could not find committed tip block"
-                );
-            }
-            Ok(response) => {
-                trace.trace_committed_tip_lookup_failed("unexpected_response");
-                warn!(?response, "unexpected block lookup response")
-            }
-            Err(error) => {
-                trace.trace_committed_tip_lookup_failed(&format!("{error}"));
-                warn!(?error, "failed to mirror Zakura full-block commit")
-            }
-        }
-    }
-}
-
-pub(crate) async fn best_durable_header_tip<ReadState>(
-    read_state: ReadState,
-) -> Result<Option<(block::Height, block::Hash)>, Report>
-where
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    match tokio::time::timeout(
-        DURABLE_HEADER_READ_TIMEOUT,
-        read_state.oneshot(zakura_state::ReadRequest::BestDurableHeaderTip),
+    let port::PrepareHeaderTarget {
+        source,
+        owner,
+        common_ancestor,
+        target,
+        entries,
+        completion,
+    } = request;
+    let entries = entries.into_vec();
+    let lease = match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state.oneshot(zakura_state::ReadRequest::HeaderValidationLease {
+            parent_hash: common_ancestor.hash,
+        }),
     )
     .await
     {
-        Ok(Ok(zakura_state::ReadResponse::BestDurableHeaderTip(tip))) => Ok(tip),
-        Ok(Ok(response)) => Err(eyre!(
-            "unexpected BestDurableHeaderTip response: {response:?}"
+        Ok(Ok(zakura_state::ReadResponse::HeaderValidationLease(Some(lease))))
+            if lease.parent() == common_ancestor =>
+        {
+            lease
+        }
+        Ok(Ok(zakura_state::ReadResponse::HeaderValidationLease(_))) => {
+            return Err(Arc::new(
+                zakura_header_chain::HeaderChainError::stale_target(
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+                ),
+            ));
+        }
+        Ok(Ok(_)) => {
+            return Err(Arc::new(
+                zakura_header_chain::HeaderChainError::local_resource(
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+                    None,
+                ),
+            ));
+        }
+        Ok(Err(error)) => {
+            return Err(Arc::new(
+                zakura_header_chain::HeaderChainError::local_resource(
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+                    Some(error),
+                ),
+            ));
+        }
+        Err(_) => {
+            return Err(Arc::new(
+                zakura_header_chain::HeaderChainError::local_resource(
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+                    None,
+                ),
+            ));
+        }
+    };
+
+    let prepared = tokio::task::spawn_blocking(move || {
+        let rules =
+            zakura_header_chain::HeaderRules::for_validation_lease(&lease).map_err(|error| {
+                Arc::new(zakura_header_chain::HeaderChainError::unknown_anchor(
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+                    Some(Box::new(error)),
+                ))
+            })?;
+        let headers: Vec<_> = entries.iter().map(|entry| entry.header.clone()).collect();
+        let batch = zakura_header_chain::prepare_headers(
+            zakura_header_chain::HeaderBatchInput::new(&headers),
+            common_ancestor,
+            &rules,
+            &zakura_header_chain::SystemClock,
+        )
+        .map_err(|error| {
+            Arc::new(classify_header_preparation_failure(
+                error, &entries, source, owner,
+            ))
+        })?;
+        let mut aux = Vec::with_capacity(entries.len());
+        for (entry, prepared) in entries.iter().zip(batch.headers()) {
+            let body_size =
+                zakura_header_chain::BodySizeHint::new(entry.body_size).map_err(|error| {
+                    Arc::new(classify_body_size_hint_failure(
+                        error,
+                        prepared.hash,
+                        source,
+                    ))
+                })?;
+            aux.push(zakura_header_chain::AuxDelivery {
+                delivery_id: header_aux_delivery_id(source, owner, prepared.hash),
+                header_hash: prepared.hash,
+                source,
+                owner,
+                body_size,
+                tree_aux: entry.tree_aux,
+                authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
+            });
+        }
+        Ok::<_, Arc<zakura_header_chain::HeaderChainError>>((batch, aux))
+    })
+    .await;
+    let (batch, aux) = match prepared {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => return Err(error),
+        Err(error) => {
+            return Err(Arc::new(
+                zakura_header_chain::HeaderChainError::local_resource(
+                    zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+                    Some(Box::new(error)),
+                ),
+            ));
+        }
+    };
+
+    Ok(port::PreparedHeaderTarget::from_insert(
+        &adapter_key,
+        Box::new(zakura_header_chain::InsertHeaders {
+            owner,
+            source,
+            parent_hash: common_ancestor.hash,
+            target_tip_hash: target.hash,
+            completion,
+            batch,
+            aux,
+        }),
+    ))
+}
+
+async fn apply_header_target<State>(
+    state: State,
+    authority: zakura_state::HeaderChainBodyEvidenceAuthority,
+    adapter_key: port::AdapterKey,
+    target: port::PreparedHeaderTarget,
+) -> port::ApplyHeaderTargetReply
+where
+    State: Service<
+            zakura_state::Request,
+            Response = zakura_state::Response,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    State::Future: Send + 'static,
+{
+    let owner = target.owner();
+    let insert = target.into_insert(&adapter_key).map_err(|_| {
+        Arc::new(zakura_header_chain::HeaderChainError::stale_target(
+            zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+        ))
+    })?;
+    let owner = insert.owner;
+    let prepared = authority.from_registered_header_attempt(insert);
+    match wait_for_header_target_apply(
+        owner,
+        state.oneshot(zakura_state::Request::ApplyHeaderChainInsert { prepared }),
+    )
+    .await
+    {
+        Ok(zakura_state::Response::HeaderChainInsertApplied(
+            zakura_header_chain::ApplyResult::Committed
+            | zakura_header_chain::ApplyResult::NoChange(_),
+        )) => Ok(port::ApplyHeaderTargetOutcome::Applied),
+        Ok(zakura_state::Response::HeaderChainInsertApplied(
+            zakura_header_chain::ApplyResult::ResourceStalled(receipt),
+        )) => Ok(port::ApplyHeaderTargetOutcome::ResourceStalled(receipt)),
+        Ok(zakura_state::Response::HeaderChainInsertApplied(
+            zakura_header_chain::ApplyResult::Stale(_),
+        )) => Err(Arc::new(
+            zakura_header_chain::HeaderChainError::stale_target(
+                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+            ),
         )),
-        Ok(Err(error)) => Err(eyre!("failed to read durable header tip: {error}")),
-        Err(_) => Err(eyre!(
-            "durable header tip read timed out after {DURABLE_HEADER_READ_TIMEOUT:?}"
+        Ok(response) => Err(header_target_apply_failure(
+            owner,
+            "unexpected_response",
+            Some(Box::new(std::io::Error::other(format!(
+                "unexpected state response: {response:?}"
+            )))),
         )),
+        Err(error) => Err(header_target_apply_failure(
+            owner,
+            "state_error",
+            Some(error),
+        )),
+    }
+}
+
+async fn wait_for_header_target_apply<F>(
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+    apply: F,
+) -> Result<zakura_state::Response, zakura_state::BoxError>
+where
+    F: Future<Output = Result<zakura_state::Response, zakura_state::BoxError>>,
+{
+    let started = tokio::time::Instant::now();
+    tokio::pin!(apply);
+    loop {
+        match tokio::time::timeout(ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT, &mut apply).await {
+            Ok(result) => return result,
+            Err(_) => {
+                let header_owner = owner.header_authority();
+                metrics::counter!(
+                    "sync.header.port.stall.total",
+                    "operation" => "apply_target",
+                )
+                .increment(1);
+                tracing::warn!(
+                    operation = "apply_target",
+                    session_id = owner.session_id(),
+                    request_id = owner.request_id().get(),
+                    header_generation = header_owner.header_generation.get(),
+                    branch = ?header_owner.branch,
+                    elapsed = ?started.elapsed(),
+                    "header target apply remains pending after a diagnostic interval"
+                );
+            }
+        }
+    }
+}
+
+fn header_target_apply_failure(
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+    reason: &'static str,
+    source: Option<zakura_state::BoxError>,
+) -> Arc<zakura_header_chain::HeaderChainError> {
+    let branch = owner.header_authority().branch;
+    metrics::counter!(
+        "sync.header.port.failure.total",
+        "operation" => "apply_target",
+        "reason" => reason,
+    )
+    .increment(1);
+    tracing::warn!(
+        reason,
+        ?branch,
+        error = ?source.as_deref(),
+        "failed to apply a prepared header target through state"
+    );
+    Arc::new(zakura_header_chain::HeaderChainError::local_resource(
+        zakura_header_chain::ErrorSubject::Branch(branch),
+        source,
+    ))
+}
+
+async fn acquire_header_path<ReadState>(
+    read_state: ReadState,
+    adapter_key: port::AdapterKey,
+    request: port::AcquirePath,
+) -> Result<port::AcquirePathReply, PortError>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let port::AcquirePath {
+        source,
+        session_id,
+        scope,
+        target_tip_hash,
+        locator_hashes,
+    } = request;
+    match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state.oneshot(zakura_state::ReadRequest::AcquireRetainedHeaderPath {
+            peer: source,
+            session_id,
+            target_tip_hash,
+            scope,
+            locator_hashes,
+        }),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::RetainedHeaderPathLease(outcome))) => match outcome {
+            zakura_state::RetainedPathLeaseOutcome::Acquired(lease) => Ok(
+                port::AcquirePathReply::Acquired(Box::new(port::RetainedHeaderPath::from_adapter(
+                    &adapter_key,
+                    lease.lease_id,
+                    source,
+                    session_id,
+                    lease.common_ancestor,
+                    lease.target,
+                    lease.scope,
+                ))),
+            ),
+            zakura_state::RetainedPathLeaseOutcome::TargetNotRetained => {
+                Ok(port::AcquirePathReply::TargetNotRetained)
+            }
+            zakura_state::RetainedPathLeaseOutcome::NoLocatorIntersection => {
+                Ok(port::AcquirePathReply::NoLocatorIntersection)
+            }
+            zakura_state::RetainedPathLeaseOutcome::HistoryPruned => {
+                Ok(port::AcquirePathReply::HistoryPruned)
+            }
+            zakura_state::RetainedPathLeaseOutcome::Busy => Ok(port::AcquirePathReply::Busy),
+        },
+        Ok(Ok(_)) => Err(PortError::Unavailable { source: None }),
+        Ok(Err(error)) => Err(PortError::Unavailable {
+            source: Some(Arc::from(error)),
+        }),
+        Err(_) => Err(PortError::Timeout),
+    }
+}
+
+async fn read_header_path<ReadState>(
+    read_state: ReadState,
+    adapter_key: port::AdapterKey,
+    network: zakura_chain::parameters::Network,
+    path: port::RetainedHeaderPath,
+    request: port::ReadPath,
+) -> Result<port::ReadPathReply, PortError>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let Some((lease_id, source, session_id)) = path.adapter_identity(&adapter_key) else {
+        return Err(PortError::Unavailable { source: None });
+    };
+    let port::ReadPath {
+        after_hash,
+        max_header_count,
+        want_tree_aux,
+    } = request;
+    match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::ReadRetainedHeaderPath {
+                peer: source,
+                session_id,
+                lease_id,
+                scope: path.scope,
+                after_hash,
+                max_count: max_header_count,
+            }),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::RetainedHeaderPathPage(
+            zakura_state::RetainedPathReadOutcome::Page(page),
+        ))) => {
+            let finalized_tree_aux = if want_tree_aux {
+                finalized_tree_aux_for_page(
+                    read_state,
+                    &network,
+                    page.common_ancestor,
+                    page.headers.len(),
+                )
+                .await?
+            } else {
+                vec![None; page.headers.len()]
+            };
+            Ok(port::ReadPathReply::Page(Box::new(
+                port::RetainedHeaderPathPage {
+                    common_ancestor: page.common_ancestor,
+                    target: page.target,
+                    scope: page.scope,
+                    headers: page.headers,
+                    aux_deliveries: page.aux_deliveries,
+                    finalized_tree_aux,
+                    complete: page.complete,
+                },
+            )))
+        }
+        Ok(Ok(zakura_state::ReadResponse::RetainedHeaderPathPage(
+            zakura_state::RetainedPathReadOutcome::Unavailable,
+        ))) => Ok(port::ReadPathReply::Unavailable),
+        Ok(Ok(_)) => Err(PortError::Unavailable { source: None }),
+        Ok(Err(error)) => Err(PortError::Unavailable {
+            source: Some(Arc::from(error)),
+        }),
+        Err(_) => Err(PortError::Timeout),
+    }
+}
+
+async fn finalized_tree_aux_for_page<ReadState>(
+    read_state: ReadState,
+    network: &zakura_chain::parameters::Network,
+    common_ancestor: zakura_header_chain::Frontier,
+    header_count: usize,
+) -> Result<Vec<Option<zakura_header_chain::TreeAuxRecordV1>>, PortError>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let empty = || vec![None; header_count];
+    let Ok(count) = u32::try_from(header_count) else {
+        return Ok(empty());
+    };
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let Ok(start_height) = common_ancestor.height.next() else {
+        return Ok(empty());
+    };
+    let Some(end_height) = start_height + i64::from(count.saturating_sub(1)) else {
+        return Ok(empty());
+    };
+
+    let finalized_tip = match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::FinalizedTip),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::FinalizedTip(tip))) => tip,
+        Ok(Ok(_)) => return Err(PortError::Unavailable { source: None }),
+        Ok(Err(error)) => {
+            return Err(PortError::Unavailable {
+                source: Some(Arc::from(error)),
+            })
+        }
+        Err(_) => return Err(PortError::Timeout),
+    };
+    if finalized_tip.is_none_or(|(height, _)| end_height > height) {
+        return Ok(empty());
+    }
+
+    let roots = match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state.oneshot(zakura_state::ReadRequest::BlockRoots {
+            start_height,
+            count,
+        }),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::BlockRoots(roots))) => roots,
+        Ok(Ok(_)) => return Err(PortError::Unavailable { source: None }),
+        Ok(Err(error)) => {
+            return Err(PortError::Unavailable {
+                source: Some(Arc::from(error)),
+            })
+        }
+        Err(_) => return Err(PortError::Timeout),
+    };
+    if !block_roots_cover_range(start_height, count, &roots) {
+        return Ok(empty());
+    }
+
+    Ok(roots
+        .into_iter()
+        .map(|roots| Some(finalized_tree_aux_record(roots, network)))
+        .collect())
+}
+
+fn finalized_tree_aux_record(
+    roots: BlockCommitmentRoots,
+    network: &zakura_chain::parameters::Network,
+) -> zakura_header_chain::TreeAuxRecordV1 {
+    use zakura_chain::parameters::NetworkUpgrade;
+
+    let nu5_active = NetworkUpgrade::Nu5
+        .activation_height(network)
+        .is_some_and(|height| roots.height >= height);
+    let nu6_3_active = NetworkUpgrade::Nu6_3
+        .activation_height(network)
+        .is_some_and(|height| roots.height >= height);
+
+    zakura_header_chain::TreeAuxRecordV1 {
+        height: roots.height,
+        sapling_root: roots.sapling_root,
+        orchard_root: if nu5_active {
+            roots.orchard_root
+        } else {
+            zakura_chain::orchard::tree::NoteCommitmentTree::default().root()
+        },
+        ironwood_root: if nu6_3_active {
+            roots.ironwood_root
+        } else {
+            zakura_chain::ironwood::tree::NoteCommitmentTree::default().root()
+        },
+        sapling_tx_count: roots.sapling_tx,
+        orchard_tx_count: if nu5_active { roots.orchard_tx } else { 0 },
+        ironwood_tx_count: if nu6_3_active { roots.ironwood_tx } else { 0 },
+        auth_data_root: if nu5_active {
+            roots.auth_data_root
+        } else {
+            [0; 32].into()
+        },
     }
 }
 
 #[cfg(test)]
-pub(crate) fn block_sync_chain_tip_event(
-    action: &zakura_state::TipAction,
-    frontiers: BlockSyncFrontiers,
-) -> BlockSyncEvent {
-    match action {
-        zakura_state::TipAction::Grow { .. } => BlockSyncEvent::ChainTipGrow(frontiers),
-        zakura_state::TipAction::Reset { .. } => BlockSyncEvent::ChainTipReset(frontiers),
+fn assemble_header_path_page(
+    lease_id: u64,
+    page: port::RetainedHeaderPathPage,
+    requested_schema: AuxSchema,
+) -> Option<HeaderPathPage> {
+    if page.headers.len() != page.aux_deliveries.len()
+        || page.headers.len() != page.finalized_tree_aux.len()
+    {
+        return None;
+    }
+
+    let tree_aux_schema = if requested_schema == AuxSchema::V1
+        && page
+            .aux_deliveries
+            .iter()
+            .zip(&page.finalized_tree_aux)
+            .all(|(deliveries, finalized_tree_aux)| {
+                finalized_tree_aux.is_some()
+                    || selected_aux_delivery(deliveries, AuxSchema::V1).is_some()
+            }) {
+        AuxSchema::V1
+    } else {
+        AuxSchema::None
+    };
+    let entries = page
+        .headers
+        .into_iter()
+        .zip(page.aux_deliveries)
+        .zip(page.finalized_tree_aux)
+        .map(|((header, deliveries), finalized_tree_aux)| {
+            let delivery_schema =
+                if tree_aux_schema == AuxSchema::V1 && finalized_tree_aux.is_none() {
+                    AuxSchema::V1
+                } else {
+                    AuxSchema::None
+                };
+            let delivery = selected_aux_delivery(&deliveries, delivery_schema);
+            HeaderEntry {
+                header,
+                body_size: delivery.map_or(0, |delivery| match delivery.body_size {
+                    zakura_header_chain::BodySizeHint::Unknown => 0,
+                    zakura_header_chain::BodySizeHint::Known(size) => size.get(),
+                }),
+                tree_aux: (tree_aux_schema == AuxSchema::V1)
+                    .then(|| finalized_tree_aux.or_else(|| delivery.and_then(|item| item.tree_aux)))
+                    .flatten(),
+            }
+        })
+        .collect();
+
+    Some(HeaderPathPage {
+        lease_id,
+        common_ancestor: page.common_ancestor,
+        target: page.target,
+        scope: page.scope,
+        tree_aux_schema,
+        entries,
+        complete: page.complete,
+    })
+}
+
+#[cfg(test)]
+fn selected_aux_delivery(
+    deliveries: &[zakura_header_chain::AuxDelivery],
+    schema: AuxSchema,
+) -> Option<zakura_header_chain::AuxDelivery> {
+    deliveries
+        .iter()
+        .copied()
+        .filter(|delivery| {
+            !matches!(
+                delivery.authentication,
+                zakura_header_chain::AuxAuthentication::Rejected { .. }
+            ) && match schema {
+                AuxSchema::None => {
+                    matches!(
+                        delivery.body_size,
+                        zakura_header_chain::BodySizeHint::Known(_)
+                    )
+                }
+                AuxSchema::V1 => delivery.tree_aux.is_some(),
+            }
+        })
+        .min_by_key(|delivery| {
+            (
+                !matches!(
+                    delivery.authentication,
+                    zakura_header_chain::AuxAuthentication::Authenticated { .. }
+                ),
+                delivery.delivery_id,
+            )
+        })
+}
+
+async fn release_header_path<ReadState>(
+    read_state: ReadState,
+    adapter_key: port::AdapterKey,
+    path: port::RetainedHeaderPath,
+) -> Result<(), PortError>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let Some((lease_id, source, session_id)) = path.adapter_identity(&adapter_key) else {
+        return Err(PortError::Unavailable { source: None });
+    };
+    match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state.oneshot(zakura_state::ReadRequest::ReleaseRetainedHeaderPath {
+            peer: source,
+            session_id,
+            lease_id,
+            scope: path.scope,
+        }),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(PortError::Unavailable {
+            source: Some(Arc::from(error)),
+        }),
+        Err(_) => Err(PortError::Timeout),
     }
 }
 
-pub(crate) fn chain_tip_mirror_frontier_change(
-    action: &zakura_state::TipAction,
-    previous_verified_body: block::Height,
-    verified_block_tip: block::Height,
-) -> FrontierChange {
-    match action {
-        zakura_state::TipAction::Grow { .. } => FrontierChange::VerifiedGrow,
-        zakura_state::TipAction::Reset { .. } if verified_block_tip > previous_verified_body => {
-            FrontierChange::VerifiedGrow
+#[cfg(test)]
+fn source_id(peer: &ZakuraPeerId) -> zakura_header_chain::SourceId {
+    zakura_header_chain::SourceId::from_digest(peer.digest())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::pending,
+        num::{NonZeroU32, NonZeroU64},
+    };
+
+    use zakura_chain::block::genesis::regtest_genesis_block;
+
+    use super::*;
+
+    fn owner() -> zakura_header_chain::HeaderSyncWorkOwner {
+        zakura_header_chain::HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(2),
+            branch: zakura_header_chain::BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
         }
-        zakura_state::TipAction::Reset { .. } => FrontierChange::VerifiedReset,
+        .bind(
+            3,
+            NonZeroU64::new(4).expect("the fixture request ID is nonzero"),
+        )
+        .into()
+    }
+
+    fn pending_read_state() -> tower::util::BoxCloneService<
+        zakura_state::ReadRequest,
+        zakura_state::ReadResponse,
+        zakura_state::BoxError,
+    > {
+        tower::service_fn(|_: zakura_state::ReadRequest| async {
+            pending::<Result<zakura_state::ReadResponse, zakura_state::BoxError>>().await
+        })
+        .boxed_clone()
+    }
+
+    #[tokio::test]
+    async fn runtime_wait_uses_explicit_attachment_state_without_height_inference() {
+        use zakura_node_services::sync_lifecycle::{
+            HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+        };
+
+        let (_detached_tx, mut detached) =
+            tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+                epoch: LifecycleEpoch::INITIAL,
+                reason: HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+            });
+        wait_for_header_runtime(&mut detached)
+            .await
+            .expect("detached checkpoint bootstrap starts without waiting");
+
+        let (pending_tx, mut pending) =
+            tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+                epoch: LifecycleEpoch::INITIAL,
+                reason: HeaderRuntimeDetachedReason::AttachmentPending,
+            });
+        let pending_wait = wait_for_header_runtime(&mut pending);
+        tokio::pin!(pending_wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut pending_wait)
+                .await
+                .is_err(),
+            "a durable restart must not pass startup while attachment remains pending",
+        );
+        pending_tx
+            .send(HeaderRuntimeStatus::Ready {
+                epoch: LifecycleEpoch::new(1),
+            })
+            .expect("the pending runtime status receiver remains live");
+        pending_wait
+            .await
+            .expect("the durable restart proceeds after explicit readiness");
+
+        let (_failed_tx, mut failed) = tokio::sync::watch::channel(HeaderRuntimeStatus::Failed {
+            epoch: LifecycleEpoch::new(1),
+            error: "fixture reconstruction failed".into(),
+        });
+        assert!(wait_for_header_runtime(&mut failed).await.is_err());
+
+        let (_ready_tx, mut ready) = tokio::sync::watch::channel(HeaderRuntimeStatus::Ready {
+            epoch: LifecycleEpoch::new(1),
+        });
+        wait_for_header_runtime(&mut ready)
+            .await
+            .expect("an already-ready restart never waits");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn durable_snapshot_startup_wait_outlives_driver_request_deadline() {
+        let (_status_sender, mut status) = tokio::sync::watch::channel(
+            zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Reconstructing {
+                epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch::new(1),
+                progress:
+                    zakura_node_services::sync_lifecycle::HeaderReconstructionProgress::STARTING,
+            },
+        );
+
+        let early_result = tokio::time::timeout(
+            ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT + std::time::Duration::from_secs(1),
+            wait_for_header_runtime(&mut status),
+        )
+        .await;
+
+        assert!(
+            early_result.is_err(),
+            "full-state reconstruction must not inherit the ordinary driver request deadline"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn attachment_pending_has_no_completion_deadline() {
+        use zakura_node_services::sync_lifecycle::{
+            HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+        };
+
+        let (status_sender, mut status) =
+            tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+                epoch: LifecycleEpoch::new(1),
+                reason: HeaderRuntimeDetachedReason::AttachmentPending,
+            });
+        let waiter = tokio::spawn(async move { wait_for_header_runtime(&mut status).await });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(2 * 30 + 1)).await;
+        assert!(
+            !waiter.is_finished(),
+            "periodic attachment diagnostics must not turn the startup wait into a failure"
+        );
+        status_sender
+            .send(HeaderRuntimeStatus::Ready {
+                epoch: LifecycleEpoch::new(1),
+            })
+            .expect("the attachment waiter remains subscribed");
+        waiter
+            .await
+            .expect("the waiter task remains live")
+            .expect("readiness completes the unbounded attachment wait");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn reconstruction_has_no_completion_deadline() {
+        use zakura_node_services::sync_lifecycle::{HeaderRuntimeStatus, LifecycleEpoch};
+
+        let (status_sender, mut status) =
+            tokio::sync::watch::channel(HeaderRuntimeStatus::Reconstructing {
+                epoch: LifecycleEpoch::new(1),
+                progress:
+                    zakura_node_services::sync_lifecycle::HeaderReconstructionProgress::STARTING,
+            });
+        let waiter = tokio::spawn(async move { wait_for_header_runtime(&mut status).await });
+
+        tokio::time::advance(std::time::Duration::from_secs(16 * 60)).await;
+        assert!(
+            !waiter.is_finished(),
+            "diagnostics must never abort reconstruction"
+        );
+        status_sender
+            .send(HeaderRuntimeStatus::Ready {
+                epoch: LifecycleEpoch::new(1),
+            })
+            .expect("the reconstruction waiter remains subscribed");
+        waiter
+            .await
+            .expect("the waiter task remains live")
+            .expect("readiness completes the unbounded wait");
+    }
+
+    #[test]
+    fn served_aux_selection_is_deterministic_and_excludes_rejected_evidence() {
+        let owner = owner();
+        let source = zakura_header_chain::SourceId::from_digest([5; 32]);
+        let header_hash = block::Hash([6; 32]);
+        let tree_aux = zakura_header_chain::TreeAuxRecordV1 {
+            height: block::Height(1),
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 0,
+            orchard_tx_count: 0,
+            ironwood_tx_count: 0,
+            auth_data_root: [0; 32].into(),
+        };
+        let delivery =
+            |marker, body_size, tree_aux, authentication| zakura_header_chain::AuxDelivery {
+                delivery_id: zakura_header_chain::EvidenceId::from_digest([marker; 32]),
+                header_hash,
+                source,
+                owner,
+                body_size,
+                tree_aux,
+                authentication,
+            };
+        let rejected = delivery(
+            1,
+            zakura_header_chain::BodySizeHint::Known(NonZeroU32::new(10).expect("ten is nonzero")),
+            Some(tree_aux),
+            zakura_header_chain::AuxAuthentication::Rejected {
+                evidence: zakura_header_chain::EvidenceId::from_digest([7; 32]),
+            },
+        );
+        let unauthenticated = delivery(
+            2,
+            zakura_header_chain::BodySizeHint::Known(
+                NonZeroU32::new(20).expect("twenty is nonzero"),
+            ),
+            Some(tree_aux),
+            zakura_header_chain::AuxAuthentication::Unauthenticated,
+        );
+        let authenticated = delivery(
+            3,
+            zakura_header_chain::BodySizeHint::Known(
+                NonZeroU32::new(30).expect("thirty is nonzero"),
+            ),
+            Some(tree_aux),
+            zakura_header_chain::AuxAuthentication::Authenticated {
+                evidence: zakura_header_chain::EvidenceId::from_digest([8; 32]),
+                boundary_hash: block::Hash([9; 32]),
+            },
+        );
+        let deliveries = [rejected, unauthenticated, authenticated];
+
+        assert_eq!(
+            selected_aux_delivery(&deliveries, AuxSchema::V1),
+            Some(authenticated)
+        );
+        assert_eq!(
+            selected_aux_delivery(&deliveries, AuxSchema::None),
+            Some(authenticated)
+        );
+        assert_eq!(selected_aux_delivery(&[rejected], AuxSchema::V1), None);
+    }
+
+    #[test]
+    fn retained_page_uses_v1_only_when_every_record_is_available() {
+        let header = regtest_genesis_block().header.clone();
+        let hash = header.hash();
+        let work = header
+            .difficulty_threshold
+            .to_work()
+            .expect("the genesis target has defined work");
+        let node = zakura_header_chain::HeaderNode::from_durable_parts(
+            header,
+            hash,
+            regtest_genesis_block().header.previous_block_hash,
+            block::Height(0),
+            work,
+            zakura_header_chain::WorkCoordinate::new(hash, work.as_u256()),
+            zakura_header_chain::HeaderValidationState::Valid,
+            Default::default(),
+            Default::default(),
+            Vec::new(),
+        )
+        .expect("the canonical genesis fields form a durable node");
+        let frontier = zakura_header_chain::Frontier::new(block::Height(0), hash);
+        let mut page = port::RetainedHeaderPathPage {
+            common_ancestor: frontier,
+            target: frontier,
+            scope: owner().header_authority(),
+            headers: vec![node.header],
+            aux_deliveries: vec![Vec::new()],
+            finalized_tree_aux: vec![None],
+            complete: true,
+        };
+
+        let fallback = assemble_header_path_page(1, page.clone(), AuxSchema::V1)
+            .expect("the coherent parallel page assembles");
+        assert_eq!(fallback.tree_aux_schema, AuxSchema::None);
+        assert_eq!(fallback.entries[0].body_size, 0);
+        assert_eq!(fallback.entries[0].tree_aux, None);
+
+        let tree_aux = zakura_header_chain::TreeAuxRecordV1 {
+            height: block::Height(0),
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 0,
+            orchard_tx_count: 0,
+            ironwood_tx_count: 0,
+            auth_data_root: [0; 32].into(),
+        };
+        page.finalized_tree_aux[0] = Some(tree_aux);
+        let served_from_finalized_state = assemble_header_path_page(1, page.clone(), AuxSchema::V1)
+            .expect("the coherent finalized-state page assembles");
+        assert_eq!(served_from_finalized_state.tree_aux_schema, AuxSchema::V1);
+        assert_eq!(served_from_finalized_state.entries[0].body_size, 0);
+        assert_eq!(
+            served_from_finalized_state.entries[0].tree_aux,
+            Some(tree_aux)
+        );
+        page.finalized_tree_aux[0] = None;
+
+        page.aux_deliveries[0].push(zakura_header_chain::AuxDelivery {
+            delivery_id: zakura_header_chain::EvidenceId::from_digest([10; 32]),
+            header_hash: hash,
+            source: zakura_header_chain::SourceId::from_digest([11; 32]),
+            owner: owner(),
+            body_size: zakura_header_chain::BodySizeHint::Known(
+                NonZeroU32::new(321).expect("321 is nonzero"),
+            ),
+            tree_aux: Some(tree_aux),
+            authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
+        });
+        let no_aux = assemble_header_path_page(1, page.clone(), AuxSchema::None)
+            .expect("the coherent parallel page assembles");
+        assert_eq!(no_aux.tree_aux_schema, AuxSchema::None);
+        assert_eq!(no_aux.entries[0].body_size, 321);
+        assert_eq!(no_aux.entries[0].tree_aux, None);
+
+        let served = assemble_header_path_page(1, page, AuxSchema::V1)
+            .expect("the coherent parallel page assembles");
+        assert_eq!(served.tree_aux_schema, AuxSchema::V1);
+        assert_eq!(served.entries[0].body_size, 321);
+        assert_eq!(served.entries[0].tree_aux, Some(tree_aux));
+    }
+
+    #[tokio::test]
+    async fn finalized_pages_load_contiguous_tree_aux_from_state() {
+        let roots = |height| BlockCommitmentRoots {
+            height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx: u64::from(height.0),
+            orchard_tx: 0,
+            ironwood_tx: 0,
+            auth_data_root: [9; 32].into(),
+        };
+        let read_state = tower::service_fn(move |request| async move {
+            Ok::<_, zakura_state::BoxError>(match request {
+                zakura_state::ReadRequest::FinalizedTip => {
+                    zakura_state::ReadResponse::FinalizedTip(Some((
+                        block::Height(2),
+                        block::Hash([2; 32]),
+                    )))
+                }
+                zakura_state::ReadRequest::BlockRoots {
+                    start_height,
+                    count,
+                } => {
+                    assert_eq!(start_height, block::Height(1));
+                    assert_eq!(count, 2);
+                    zakura_state::ReadResponse::BlockRoots(vec![
+                        roots(block::Height(1)),
+                        roots(block::Height(2)),
+                    ])
+                }
+                request => panic!("unexpected finalized-page state request: {request:?}"),
+            })
+        });
+
+        let records = finalized_tree_aux_for_page(
+            read_state,
+            &zakura_chain::parameters::Network::Mainnet,
+            zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+            2,
+        )
+        .await
+        .expect("the finalized roots are available");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0]
+                .expect("height one has a finalized root record")
+                .height,
+            block::Height(1)
+        );
+        assert_eq!(
+            records[1]
+                .expect("height two has a finalized root record")
+                .sapling_tx_count,
+            2
+        );
+    }
+
+    #[test]
+    fn finalized_tree_aux_uses_empty_tree_roots_before_activation() {
+        let orchard_root = zakura_chain::orchard::tree::NoteCommitmentTree::default().root();
+        let ironwood_root = zakura_chain::ironwood::tree::NoteCommitmentTree::default().root();
+        assert_ne!(orchard_root, Default::default());
+        assert_ne!(ironwood_root, Default::default());
+
+        let record = finalized_tree_aux_record(
+            BlockCommitmentRoots {
+                height: block::Height(1),
+                sapling_root: Default::default(),
+                orchard_root,
+                ironwood_root,
+                sapling_tx: 3,
+                orchard_tx: 4,
+                ironwood_tx: 5,
+                auth_data_root: [9; 32].into(),
+            },
+            &zakura_chain::parameters::Network::Mainnet,
+        );
+
+        assert_eq!(record.sapling_tx_count, 3);
+        assert_eq!(record.orchard_root, orchard_root);
+        assert_eq!(record.orchard_tx_count, 0);
+        assert_eq!(record.ironwood_root, ironwood_root);
+        assert_eq!(record.ironwood_tx_count, 0);
+        assert_eq!(record.auth_data_root, [0; 32].into());
+        zakura_chain::parallel::commitment_aux_verify::verify_supplied_orchard_root_below_nu5(
+            &zakura_chain::parameters::Network::Mainnet,
+            record.height,
+            &record.orchard_root,
+        )
+        .expect("the served pre-NU5 Orchard root passes native VCT verification");
+        zakura_chain::parallel::commitment_aux_verify::verify_supplied_ironwood_root_below_nu6_3(
+            &zakura_chain::parameters::Network::Mainnet,
+            record.height,
+            &record.ironwood_root,
+        )
+        .expect("the served pre-NU6.3 Ironwood root passes native VCT verification");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn wedged_state_read_returns_busy_at_the_driver_deadline() {
+        let owner = owner();
+        let peer = ZakuraPeerId::new(vec![7; 32]).expect("the peer identity has canonical width");
+        let request = port::AcquirePath {
+            source: source_id(&peer),
+            session_id: owner.session_id(),
+            scope: owner.header_authority(),
+            target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            locator_hashes: vec![owner.header_authority().branch.anchor_hash],
+        };
+        let started = tokio::time::Instant::now();
+
+        let result =
+            acquire_header_path(pending_read_state(), port::AdapterKey::new(), request).await;
+
+        assert!(matches!(result, Err(PortError::Timeout)));
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_path_capability_authenticates_the_state_lease_id() {
+        let lease_id = 42;
+        let owner = owner();
+        let source = zakura_header_chain::SourceId::from_digest([7; 32]);
+        let target = zakura_header_chain::Frontier::new(
+            block::Height(2),
+            owner.header_authority().branch.target_tip_hash,
+        );
+        let common_ancestor = zakura_header_chain::Frontier::new(
+            block::Height(1),
+            owner.header_authority().branch.anchor_hash,
+        );
+        let acquire_request = port::AcquirePath {
+            source,
+            session_id: owner.session_id(),
+            scope: owner.header_authority(),
+            target_tip_hash: target.hash,
+            locator_hashes: vec![common_ancestor.hash],
+        };
+        let adapter_key = port::AdapterKey::new();
+        let acquired = acquire_header_path(
+            tower::service_fn(move |request| {
+                assert!(matches!(
+                    request,
+                    zakura_state::ReadRequest::AcquireRetainedHeaderPath { .. }
+                ));
+                let lease = zakura_state::RetainedPathLease {
+                    lease_id,
+                    peer: source,
+                    session_id: owner.session_id(),
+                    target,
+                    common_ancestor,
+                    scope: owner.header_authority(),
+                    idle_deadline: tokio::time::Instant::now(),
+                };
+                async move {
+                    Ok::<_, zakura_state::BoxError>(
+                        zakura_state::ReadResponse::RetainedHeaderPathLease(
+                            zakura_state::RetainedPathLeaseOutcome::Acquired(Box::new(lease)),
+                        ),
+                    )
+                }
+            }),
+            adapter_key.clone(),
+            acquire_request,
+        )
+        .await
+        .expect("the fixture state service acquires a retained path");
+        let port::AcquirePathReply::Acquired(path) = acquired else {
+            panic!("the fixture state service grants the retained path");
+        };
+        assert_eq!(
+            path.adapter_identity(&adapter_key),
+            Some((lease_id, source, owner.session_id()))
+        );
+
+        let foreign_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = foreign_calls.clone();
+        let foreign_read = read_header_path(
+            tower::service_fn(move |_: zakura_state::ReadRequest| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::HeaderLocator(None))
+                }
+            }),
+            port::AdapterKey::new(),
+            zakura_chain::parameters::Network::Mainnet,
+            (*path).clone(),
+            port::ReadPath {
+                after_hash: common_ancestor.hash,
+                max_header_count: 1,
+                want_tree_aux: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            foreign_read,
+            Err(PortError::Unavailable { source: None })
+        ));
+        assert_eq!(
+            foreign_calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a foreign retained-path capability is rejected before a state read"
+        );
+
+        let read_path = (*path).clone();
+        let read = read_header_path(
+            tower::service_fn(move |request| {
+                let zakura_state::ReadRequest::ReadRetainedHeaderPath {
+                    lease_id: requested_lease_id,
+                    ..
+                } = request
+                else {
+                    panic!("the adapter reads through the retained-path request");
+                };
+                assert_eq!(requested_lease_id, lease_id);
+                async move {
+                    Ok::<_, zakura_state::BoxError>(
+                        zakura_state::ReadResponse::RetainedHeaderPathPage(
+                            zakura_state::RetainedPathReadOutcome::Unavailable,
+                        ),
+                    )
+                }
+            }),
+            adapter_key.clone(),
+            zakura_chain::parameters::Network::Mainnet,
+            read_path,
+            port::ReadPath {
+                after_hash: common_ancestor.hash,
+                max_header_count: 1,
+                want_tree_aux: true,
+            },
+        )
+        .await
+        .expect("the fixture state service reads through the retained path");
+        assert!(matches!(read, port::ReadPathReply::Unavailable));
+
+        release_header_path(
+            tower::service_fn(move |request| {
+                let zakura_state::ReadRequest::ReleaseRetainedHeaderPath {
+                    lease_id: released_lease_id,
+                    ..
+                } = request
+                else {
+                    panic!("the adapter releases through the retained-path request");
+                };
+                assert_eq!(released_lease_id, lease_id);
+                async move {
+                    Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::HeaderLocator(None))
+                }
+            }),
+            adapter_key,
+            *path,
+        )
+        .await
+        .expect("the fixture state service releases the retained path");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn header_target_apply_waits_past_diagnostic_intervals_for_terminal_result() {
+        let started = tokio::time::Instant::now();
+        let response = wait_for_header_target_apply(owner(), async {
+            tokio::time::sleep(
+                ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT * 2 + std::time::Duration::from_secs(1),
+            )
+            .await;
+            Ok(zakura_state::Response::HeaderChainInsertApplied(
+                zakura_header_chain::ApplyResult::Committed,
+            ))
+        })
+        .await
+        .expect("the accepted apply returns its terminal result after two stall intervals");
+
+        assert!(matches!(
+            response,
+            zakura_state::Response::HeaderChainInsertApplied(
+                zakura_header_chain::ApplyResult::Committed
+            )
+        ));
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT * 2 + std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn header_target_apply_failure_preserves_a_state_service_error() {
+        let error = header_target_apply_failure(
+            owner(),
+            "state_error",
+            Some("fixture state apply failure".into()),
+        );
+
+        assert_eq!(
+            error.category,
+            zakura_header_chain::ErrorCategory::LocalResourceOrStorage
+        );
+        assert_eq!(
+            error
+                .source
+                .as_ref()
+                .expect("the state source is retained")
+                .to_string(),
+            "fixture state apply failure"
+        );
+    }
+
+    #[test]
+    fn driver_preserves_every_header_preparation_failure_category() {
+        let source = zakura_header_chain::SourceId::from_digest([5; 32]);
+        let owner = owner();
+        let header = regtest_genesis_block().header.clone();
+        let entries = [port::TargetEntry {
+            header: header.clone(),
+            body_size: 0,
+            tree_aux: None,
+        }];
+
+        let invalid = classify_header_preparation_failure(
+            zakura_header_chain::HeaderFailure::Invalid {
+                offset: 0,
+                rule: zakura_header_chain::HeaderRule::ParentLink,
+                reason: "wrong parent".to_owned(),
+            },
+            &entries,
+            source,
+            owner,
+        );
+        assert_eq!(
+            invalid.category,
+            zakura_header_chain::ErrorCategory::InvalidHeader
+        );
+        assert_eq!(
+            invalid.subject,
+            zakura_header_chain::ErrorSubject::Header(zakura_header_chain::HeaderId::new(
+                header.hash()
+            ))
+        );
+        assert_eq!(
+            invalid.rule,
+            Some(zakura_header_chain::RuleId::new("LC-VAL-03"))
+        );
+        assert!(invalid.evidence.is_some());
+        assert_eq!(
+            invalid.attribution,
+            zakura_header_chain::Attribution::HeaderPeer(source)
+        );
+
+        for (failure, expected_category, expected_attribution) in [
+            (
+                zakura_header_chain::HeaderFailure::Empty,
+                zakura_header_chain::ErrorCategory::MalformedProtocol,
+                zakura_header_chain::Attribution::HeaderPeer(source),
+            ),
+            (
+                zakura_header_chain::HeaderFailure::InvalidLease,
+                zakura_header_chain::ErrorCategory::StaleTargetOrGeneration,
+                zakura_header_chain::Attribution::None,
+            ),
+            (
+                zakura_header_chain::HeaderFailure::ClockRange,
+                zakura_header_chain::ErrorCategory::LocalResourceOrStorage,
+                zakura_header_chain::Attribution::None,
+            ),
+        ] {
+            let error = classify_header_preparation_failure(failure, &entries, source, owner);
+            assert_eq!(error.category, expected_category);
+            assert_eq!(error.attribution, expected_attribution);
+        }
+    }
+
+    #[test]
+    fn oversized_body_hint_is_malformed_metadata_not_an_invalid_header() {
+        let source = zakura_header_chain::SourceId::from_digest([6; 32]);
+        let hash = block::Hash([7; 32]);
+        let error = classify_body_size_hint_failure(
+            zakura_header_chain::BodySizeHint::new(2_000_001)
+                .expect_err("the fixture exceeds the canonical body-size hint limit"),
+            hash,
+            source,
+        );
+
+        assert_eq!(
+            error.category,
+            zakura_header_chain::ErrorCategory::MalformedProtocol
+        );
+        assert_ne!(
+            error.category,
+            zakura_header_chain::ErrorCategory::InvalidHeader
+        );
+        assert_eq!(
+            error.subject,
+            zakura_header_chain::ErrorSubject::Header(zakura_header_chain::HeaderId::new(hash))
+        );
+        assert_eq!(
+            error.rule,
+            Some(zakura_header_chain::RuleId::new("LC-WIRE-13"))
+        );
+        assert_eq!(
+            error.attribution,
+            zakura_header_chain::Attribution::HeaderPeer(source)
+        );
     }
 }

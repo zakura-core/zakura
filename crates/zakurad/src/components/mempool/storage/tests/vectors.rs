@@ -93,9 +93,9 @@ fn oversized_policy_rejection_is_cached_by_exact_id() {
     let mut storage = Storage::new(&config::Config::default());
     let transaction = Network::Mainnet
         .unmined_transactions_in_blocks(..)
-        .find(|transaction| transaction.transaction.id.auth_digest().is_some())
+        .find(|transaction| transaction.transaction.id().auth_digest().is_some())
         .expect("mainnet test vectors contain a witnessed transaction");
-    let tx_id = transaction.transaction.id;
+    let tx_id = transaction.transaction.id();
     let rejection = NonStandardTransactionError::TransactionTooLarge {
         actual_bytes: 250_001,
         max_bytes: 250_000,
@@ -145,14 +145,14 @@ fn mempool_storage_crud_exact_mainnet() {
     let _ = storage.insert(unmined_tx.clone(), Vec::new(), None);
 
     // Check that it is in the mempool, and not rejected.
-    assert!(storage.contains_transaction_exact(&unmined_tx.transaction.id.mined_id()));
+    assert!(storage.contains_transaction_exact(&unmined_tx.transaction.id().mined_id()));
 
     // Remove tx
-    let removal_count = storage.remove_exact(&iter::once(unmined_tx.transaction.id).collect());
+    let removal_count = storage.remove_exact(&iter::once(unmined_tx.transaction.id()).collect());
 
     // Check that it is /not/ in the mempool.
     assert_eq!(removal_count, 1);
-    assert!(!storage.contains_transaction_exact(&unmined_tx.transaction.id.mined_id()));
+    assert!(!storage.contains_transaction_exact(&unmined_tx.transaction.id().mined_id()));
 }
 
 #[test]
@@ -226,13 +226,13 @@ fn mempool_storage_basic_for_network(network: Network) -> Result<()> {
 
     // Test if rejected transactions were actually rejected.
     for tx in some_rejected_transactions.iter() {
-        assert!(!storage.contains_transaction_exact(&tx.transaction.id.mined_id()));
+        assert!(!storage.contains_transaction_exact(&tx.transaction.id().mined_id()));
     }
 
     // Query all the ids we have for rejected, get back `total - MEMPOOL_SIZE`
     let all_ids: HashSet<UnminedTxId> = unmined_transactions
         .iter()
-        .map(|tx| tx.transaction.id)
+        .map(|tx| tx.transaction.id())
         .collect();
 
     // Convert response to a `HashSet`, because the order of the response doesn't matter.
@@ -240,7 +240,7 @@ fn mempool_storage_basic_for_network(network: Network) -> Result<()> {
 
     let some_rejected_ids = some_rejected_transactions
         .iter()
-        .map(|tx| tx.transaction.id)
+        .map(|tx| tx.transaction.id())
         .collect::<HashSet<_>>();
 
     // Test if the rejected transactions we have are a subset of the actually
@@ -273,23 +273,23 @@ fn mempool_storage_crud_same_effects_mainnet() {
     let _ = storage.insert(unmined_tx_1.clone(), Vec::new(), None);
 
     // Check that it is in the mempool, and not rejected.
-    assert!(storage.contains_transaction_exact(&unmined_tx_1.transaction.id.mined_id()));
+    assert!(storage.contains_transaction_exact(&unmined_tx_1.transaction.id().mined_id()));
 
     // Reject and remove mined tx
     let removal_count = storage
         .reject_and_remove_same_effects(
-            &iter::once(unmined_tx_1.transaction.id.mined_id()).collect(),
-            vec![unmined_tx_1.transaction.transaction.clone()],
+            &iter::once(unmined_tx_1.transaction.id().mined_id()).collect(),
+            vec![unmined_tx_1.transaction.transaction().clone()],
         )
         .total_len();
 
     // Check that it is /not/ in the mempool as a verified transaction.
     assert_eq!(removal_count, 1);
-    assert!(!storage.contains_transaction_exact(&unmined_tx_1.transaction.id.mined_id()));
+    assert!(!storage.contains_transaction_exact(&unmined_tx_1.transaction.id().mined_id()));
 
     // Check that it's rejection is cached in the chain_rejected_same_effects' `Mined` eviction list.
     assert_eq!(
-        storage.rejection_error(&unmined_tx_1.transaction.id),
+        storage.rejection_error(&unmined_tx_1.transaction.id()),
         Some(SameEffectsChainRejectionError::Mined.into())
     );
     assert_eq!(
@@ -302,7 +302,7 @@ fn mempool_storage_crud_same_effects_mainnet() {
         .unmined_transactions_in_blocks(1..)
         .find(|tx| {
             tx.transaction
-                .transaction
+                .transaction()
                 .spent_outpoints()
                 .next()
                 .is_some()
@@ -312,27 +312,27 @@ fn mempool_storage_crud_same_effects_mainnet() {
     // Insert unmined tx into the mempool.
     assert_eq!(
         storage.insert(unmined_tx_2.clone(), Vec::new(), None),
-        Ok(unmined_tx_2.transaction.id)
+        Ok(unmined_tx_2.transaction.id())
     );
 
     // Check that it is in the mempool, and not rejected.
-    assert!(storage.contains_transaction_exact(&unmined_tx_2.transaction.id.mined_id()));
+    assert!(storage.contains_transaction_exact(&unmined_tx_2.transaction.id().mined_id()));
 
     // Reject and remove duplicate spend tx
     let removal_count = storage
         .reject_and_remove_same_effects(
             &HashSet::new(),
-            vec![unmined_tx_2.transaction.transaction.clone()],
+            vec![unmined_tx_2.transaction.transaction().clone()],
         )
         .total_len();
 
     // Check that it is /not/ in the mempool as a verified transaction.
     assert_eq!(removal_count, 1);
-    assert!(!storage.contains_transaction_exact(&unmined_tx_2.transaction.id.mined_id()));
+    assert!(!storage.contains_transaction_exact(&unmined_tx_2.transaction.id().mined_id()));
 
     // Check that it's rejection is cached in the chain_rejected_same_effects' `SpendConflict` eviction list.
     assert_eq!(
-        storage.rejection_error(&unmined_tx_2.transaction.id),
+        storage.rejection_error(&unmined_tx_2.transaction.id()),
         Some(SameEffectsChainRejectionError::DuplicateSpend.into())
     );
     assert_eq!(
@@ -353,7 +353,7 @@ fn mempool_removes_ironwood_duplicate_spends() {
 
     let action = ironwood_action();
     let mempool_tx = verified_ironwood_v6_tx(Height(1), action.clone());
-    let mempool_id = mempool_tx.transaction.id;
+    let mempool_id = mempool_tx.transaction.id();
 
     assert_eq!(
         storage.insert(mempool_tx.clone(), Vec::new(), None),
@@ -391,8 +391,8 @@ fn mempool_rejects_ironwood_conflict_on_insert() {
     let first_mempool_tx = verified_ironwood_v6_tx(Height(1), action.clone());
     let second_mempool_tx = verified_ironwood_v6_tx(Height(2), action);
 
-    let first_mempool_id = first_mempool_tx.transaction.id;
-    let second_mempool_id = second_mempool_tx.transaction.id;
+    let first_mempool_id = first_mempool_tx.transaction.id();
+    let second_mempool_id = second_mempool_tx.transaction.id();
 
     assert_eq!(
         storage.insert(first_mempool_tx, Vec::new(), None),
@@ -538,10 +538,10 @@ fn mempool_removes_dependent_transactions() -> Result<()> {
             // treat outputs < 100 zatoshis as "dust" for these tests, we want them out
             let dust_threshold: Amount<NonNegative> =
                 Amount::try_from(100u64).expect("valid amount");
-            !tx.transaction.transaction.outputs().is_empty()
+            !tx.transaction.transaction().outputs().is_empty()
                 && tx
                     .transaction
-                    .transaction
+                    .transaction()
                     .outputs()
                     .iter()
                     .all(|out| out.value >= dust_threshold)
@@ -552,8 +552,8 @@ fn mempool_removes_dependent_transactions() -> Result<()> {
     let mut expected_transaction_dependencies = HashMap::new();
     let mut expected_transaction_dependents = HashMap::new();
     for unmined_tx in unmined_txs_with_transparent_outputs() {
-        let tx_id = unmined_tx.transaction.id.mined_id();
-        let num_outputs = unmined_tx.transaction.transaction.outputs().len();
+        let tx_id = unmined_tx.transaction.id().mined_id();
+        let num_outputs = unmined_tx.transaction.transaction().outputs().len();
 
         if let Some(&fake_spent_outpoint) = fake_spent_outpoints.first() {
             expected_transaction_dependencies
@@ -599,7 +599,7 @@ fn mempool_removes_dependent_transactions() -> Result<()> {
         .expect("at least one unmined transaction with transparent outputs");
 
     let expected_num_removed = storage.transaction_count();
-    let num_removed = storage.remove_exact(&[first_tx.transaction.id].into_iter().collect());
+    let num_removed = storage.remove_exact(&[first_tx.transaction.id()].into_iter().collect());
 
     assert_eq!(
         num_removed, expected_num_removed,

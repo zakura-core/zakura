@@ -13,6 +13,7 @@ use crate::{
     constants,
 };
 
+pub use zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS;
 pub use zakura_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
 
 /// The maximum chain reorganisation height; it bounds the length of the best
@@ -93,11 +94,11 @@ const DATABASE_FORMAT_VERSION: u64 = 28;
 /// - adding new column families,
 /// - changing the format of a column family in a compatible way, or
 /// - breaking changes with compatibility code in all supported Zebra versions.
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.
-const DATABASE_FORMAT_PATCH_VERSION: u64 = 3;
+const DATABASE_FORMAT_PATCH_VERSION: u64 = 5;
 
 /// Returns the full semantic version of the currently running state database format code.
 ///
@@ -130,17 +131,6 @@ pub(crate) const DATABASE_FORMAT_VERSION_FILE_NAME: &str = "version";
 /// time between v5 transactions.
 pub const MAX_LEGACY_CHAIN_BLOCKS: usize = 100_000;
 
-/// The maximum number of non-finalized chain forks Zebra will track.
-/// When this limit is reached, we drop the chain with the lowest work.
-///
-/// When the network is under heavy transaction load, there are around 5 active forks in the last
-/// 100 blocks. (1 fork per 20 blocks.) When block propagation is efficient, there is around
-/// 1 fork per 300 blocks.
-///
-/// This limits non-finalized chain memory, in the worst case, to around:
-/// `10 forks * 1000 blocks * 2 MB per block = 20 GB`
-pub const MAX_NON_FINALIZED_CHAIN_FORKS: usize = 10;
-
 /// The maximum number of block hashes allowed in `getblocks` responses in the Zcash network protocol.
 pub const MAX_FIND_BLOCK_HASHES_RESULTS: u32 = 500;
 
@@ -162,6 +152,9 @@ pub const MAX_HEADER_SYNC_HEIGHT_RANGE: u32 = 4000;
 pub const MAX_INVALIDATED_BLOCKS: usize = 100;
 
 lazy_static! {
-    /// Regex that matches the RocksDB error when its lock file is already open.
-    pub static ref LOCK_FILE_ERROR: Regex = Regex::new("(lock file).*(temporarily unavailable)|(in use)|(being used by another process)|(Database likely already open)").expect("regex is valid");
+    /// Regex that matches a direct RocksDB lock error or the state initialization hint that wraps it.
+    pub static ref LOCK_FILE_ERROR: Regex = Regex::new(
+        "(lock file).*(temporarily unavailable)|(in use)|(being used by another process)|(Database likely already open)|(database lock)"
+    )
+    .expect("regex is valid");
 }

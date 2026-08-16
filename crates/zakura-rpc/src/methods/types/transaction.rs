@@ -88,16 +88,16 @@ where
 impl From<&VerifiedUnminedTx> for TransactionTemplate<NonNegative> {
     fn from(tx: &VerifiedUnminedTx) -> Self {
         assert!(
-            !tx.transaction.transaction.is_coinbase(),
+            !tx.transaction.transaction().is_coinbase(),
             "unexpected coinbase transaction in mempool"
         );
 
         Self {
-            data: tx.transaction.transaction.as_ref().into(),
-            hash: tx.transaction.id.mined_id(),
+            data: tx.transaction.transaction().as_ref().into(),
+            hash: tx.transaction.id().mined_id(),
             auth_digest: tx
                 .transaction
-                .id
+                .id()
                 .auth_digest()
                 .unwrap_or(AUTH_DIGEST_PLACEHOLDER),
 

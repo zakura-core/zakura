@@ -5,7 +5,7 @@ use std::{
     fmt,
     path::PathBuf,
     sync::OnceLock,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
@@ -172,6 +172,7 @@ impl JsonlEventEmitter {
         let row = JsonlEventEnvelope {
             ts: elapsed_micros(self.started.elapsed()),
             node: &self.node,
+            process_trace_id: process_trace_id(),
             event: &event,
         };
 
@@ -196,6 +197,10 @@ impl JsonlEventEmitter {
             Value::from(elapsed_micros(self.started.elapsed())),
         );
         row.insert("node".to_string(), Value::String(self.node.to_string()));
+        row.insert(
+            "process_trace_id".to_string(),
+            Value::String(process_trace_id().to_string()),
+        );
         build(&mut row);
 
         if let Ok(line) = serde_json::to_vec(&Value::Object(row)) {
@@ -218,6 +223,7 @@ impl Default for JsonlEventEmitter {
 struct JsonlEventEnvelope<'a, E> {
     ts: u64,
     node: &'a str,
+    process_trace_id: &'static str,
     #[serde(flatten)]
     event: &'a E,
 }
@@ -243,6 +249,25 @@ pub fn node_id() -> &'static str {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "unknown".to_string())
+        })
+        .as_str()
+}
+
+/// Returns an opaque identifier shared by every JSONL emitter in this process.
+///
+/// The identifier disambiguates appended trace rows across process restarts.
+/// Emitter-local monotonic timestamps restart from zero after each restart.
+/// The identifier provides only a correlation label.
+/// The identifier does not provide randomness or security identity.
+pub fn process_trace_id() -> &'static str {
+    static PROCESS_TRACE_ID: OnceLock<String> = OnceLock::new();
+    PROCESS_TRACE_ID
+        .get_or_init(|| {
+            let started = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("{}-{started}", std::process::id())
         })
         .as_str()
 }
@@ -833,9 +858,27 @@ mod tests {
 
         let row: Value = serde_json::from_slice(&written.line).expect("valid typed event JSON");
         assert_eq!(row["node"], "node-typed");
+        assert_eq!(row["process_trace_id"], process_trace_id());
         assert_eq!(row["event"], "typed_event");
         assert_eq!(row["value"], 7);
         assert_eq!(row["optional"], Value::Null);
+        assert!(row["ts"].is_u64());
+    }
+
+    #[test]
+    fn compatibility_emitter_serializes_the_common_process_envelope() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let emitter = JsonlEventEmitter::new(JsonlTracer::new(tx), "node-raw");
+
+        emitter.emit_with(TEST_TABLE, |row| {
+            row.insert("event".to_string(), Value::String("raw_event".to_string()));
+        });
+
+        let written = rx.try_recv().expect("raw event uses the reserved slot");
+        let row: Value = serde_json::from_slice(&written.line).expect("valid raw event JSON");
+        assert_eq!(row["node"], "node-raw");
+        assert_eq!(row["process_trace_id"], process_trace_id());
+        assert_eq!(row["event"], "raw_event");
         assert!(row["ts"].is_u64());
     }
 

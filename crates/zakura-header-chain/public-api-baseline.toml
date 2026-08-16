@@ -1,0 +1,7 @@
+# Measured with nightly rustdoc JSON at PR 586 commit c6dc0e01687fa41fc90e12e3471f4270efaae7e6.
+baseline_public_items = 522
+baseline_authority_constructors = 4
+
+# Measured after F-225517 removed caller-selected auxiliary verdicts.
+current_public_items = 520
+current_authority_constructors = 0

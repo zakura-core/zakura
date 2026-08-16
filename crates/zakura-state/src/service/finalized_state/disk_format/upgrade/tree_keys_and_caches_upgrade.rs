@@ -7,7 +7,10 @@ use zakura_chain::block::Height;
 
 use crate::service::finalized_state::ZakuraDb;
 
-use super::{cache_genesis_roots, fix_tree_key_type, CancelFormatChange, DiskFormatUpgrade};
+use super::{
+    cache_genesis_roots, fix_tree_key_type, CancelFormatChange, DiskFormatUpgrade,
+    FormatChangeError,
+};
 
 /// Implements [`DiskFormatUpgrade`] for updating the sprout and history tree key type from
 /// `Height` to the empty key `()` and the genesis note commitment trees to cache their roots
@@ -25,13 +28,16 @@ impl DiskFormatUpgrade for FixTreeKeyTypeAndCacheGenesisRoots {
     #[allow(clippy::unwrap_in_result)]
     fn run(
         &self,
-        initial_tip_height: Height,
+        initial_finalized_tip_height: Option<Height>,
         db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<(), CancelFormatChange> {
+    ) -> Result<(), FormatChangeError> {
+        let Some(initial_finalized_tip_height) = initial_finalized_tip_height else {
+            return Ok(());
+        };
         // It shouldn't matter what order these are run in.
-        cache_genesis_roots::run(initial_tip_height, db, cancel_receiver)?;
-        fix_tree_key_type::run(initial_tip_height, db, cancel_receiver)?;
+        cache_genesis_roots::run(initial_finalized_tip_height, db, cancel_receiver)?;
+        fix_tree_key_type::run(initial_finalized_tip_height, db, cancel_receiver)?;
         Ok(())
     }
 
@@ -40,7 +46,7 @@ impl DiskFormatUpgrade for FixTreeKeyTypeAndCacheGenesisRoots {
         &self,
         db: &ZakuraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<Result<(), String>, CancelFormatChange> {
+    ) -> Result<Result<(), String>, FormatChangeError> {
         let results = [
             cache_genesis_roots::detailed_check(db, cancel_receiver)?,
             fix_tree_key_type::detailed_check(db, cancel_receiver)?,

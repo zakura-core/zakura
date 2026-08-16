@@ -1482,6 +1482,7 @@ impl fmt::Debug for ZakuraLocalDiscoveryState {
     }
 }
 
+#[allow(dead_code)]
 impl ZakuraDiscoveryHandle {
     /// Creates passive discovery state using the current wall-clock sequence.
     pub fn new(
@@ -1552,6 +1553,7 @@ impl ZakuraDiscoveryHandle {
     /// A node can keep its native connections longer than the record TTL. Refreshing lazily before
     /// a discovery exchange prevents a long-running node from sending an expired `Hello` to a new
     /// peer after its startup record has aged out.
+    #[allow(dead_code)]
     pub(crate) async fn current_self_record_for_gossip(
         &self,
     ) -> Result<Arc<ZakuraNodeRecord>, DiscoveryWireError> {

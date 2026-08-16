@@ -2317,7 +2317,8 @@ async fn obtain_tips_ignores_known_hash_after_first_unknown() -> Result<(), crat
         Ok::<_, crate::BoxError>(())
     };
 
-    let (extra_hashes, responded) = futures::join!(chain_sync.obtain_tips(), respond_to_requests);
+    let (extra_hashes, responded) =
+        futures::join!(chain_sync.obtain_tips(false), respond_to_requests);
     responded?;
     let extra_hashes = extra_hashes?;
     assert!(extra_hashes.is_empty());

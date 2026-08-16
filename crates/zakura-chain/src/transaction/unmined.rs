@@ -228,21 +228,25 @@ impl UnminedTxId {
 ///
 /// This transaction has been structurally verified.
 /// (But it might still need semantic or contextual verification.)
+///
+/// Its fields are private so the ID, serialized size, and conventional fee
+/// cannot diverge from the transaction. Construct values using the available
+/// [`From`] implementations.
 #[derive(Clone, Eq, PartialEq)]
 pub struct UnminedTx {
     /// The unmined transaction itself.
-    pub transaction: Arc<Transaction>,
+    transaction: Arc<Transaction>,
 
     /// A unique identifier for this unmined transaction.
-    pub id: UnminedTxId,
+    id: UnminedTxId,
 
     /// The size in bytes of the serialized transaction data
-    pub size: usize,
+    size: usize,
 
     /// The conventional fee for this transaction, as defined by [ZIP-317].
     ///
     /// [ZIP-317]: https://zips.z.cash/zip-0317#fee-calculation
-    pub conventional_fee: Amount<NonNegative>,
+    conventional_fee: Amount<NonNegative>,
 }
 
 impl fmt::Debug for UnminedTx {
@@ -256,6 +260,36 @@ impl fmt::Debug for UnminedTx {
 impl fmt::Display for UnminedTx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("UnminedTx").field(&"private").finish()
+    }
+}
+
+impl UnminedTx {
+    /// Returns the unmined transaction.
+    pub fn transaction(&self) -> &Arc<Transaction> {
+        &self.transaction
+    }
+
+    /// Returns the unmined transaction, consuming this wrapper.
+    pub fn into_transaction(self) -> Arc<Transaction> {
+        self.transaction
+    }
+
+    /// Returns the unique identifier for this unmined transaction.
+    pub fn id(&self) -> UnminedTxId {
+        self.id
+    }
+
+    /// Returns the size in bytes of the serialized transaction data.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Returns the conventional fee for this transaction, as defined by
+    /// [ZIP-317].
+    ///
+    /// [ZIP-317]: https://zips.z.cash/zip-0317#fee-calculation
+    pub fn conventional_fee(&self) -> Amount<NonNegative> {
+        self.conventional_fee
     }
 }
 

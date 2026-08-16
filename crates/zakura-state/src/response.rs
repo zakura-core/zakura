@@ -19,7 +19,7 @@ use zakura_chain::{
     value_balance::ValueBalance,
 };
 
-use zakura_chain::work::difficulty::CompactDifficulty;
+use zakura_chain::work::difficulty::{CompactDifficulty, U256};
 
 // Allow *only* these unused imports, so that rustdoc link resolution
 // will work with inline links.
@@ -37,12 +37,24 @@ mod tests;
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
 pub enum Response {
+    /// Response to [`Request::ApplyHeaderChainInsert`].
+    HeaderChainInsertApplied(zakura_header_chain::ApplyResult),
+
+    /// Result of persisting one retryable header-chain body-availability result.
+    HeaderChainBodyUnavailableRecorded(zakura_header_chain::ApplyResult),
+
+    /// Result of persisting one deterministic header-chain body rejection.
+    HeaderChainBodyInvalidRecorded(zakura_header_chain::ApplyResult),
+
+    /// Result of restarting one persistent body-unavailability episode.
+    HeaderChainBodyAvailabilityRestarted(zakura_header_chain::ApplyResult),
+
+    /// Result of an authenticated operator body-availability retry.
+    HeaderChainBodyAvailabilityRetried(zakura_header_chain::ApplyResult),
+
     /// Response to [`Request::CommitSemanticallyVerifiedBlock`] and [`Request::CommitCheckpointVerifiedBlock`]
     /// indicating that a block was successfully committed to the state.
     Committed(block::Hash),
-
-    /// Response to [`Request::AuthenticateHeaderRoots`] after durable promotion.
-    AuthenticatedHeaderRoots(crate::AuthenticatedHeaderRoots),
 
     /// Response to [`Request::InvalidateBlock`] indicating that a block was found and
     /// invalidated in the state.
@@ -367,6 +379,15 @@ impl PartialEq for NonFinalizedBlocksListener {
 
 impl Eq for NonFinalizedBlocksListener {}
 
+/// Selected-chain body anchor and missing-body metadata for one block-sync query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockSyncBodyMetadata {
+    /// Highest full-state block shared with the selected header chain.
+    pub anchor: zakura_header_chain::Frontier,
+    /// Selected-header bodies that block sync must download after `anchor`.
+    pub blocks: Vec<(block::Height, block::Hash, Option<u32>)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a read-only
 /// [`ReadStateService`](crate::service::ReadStateService)'s [`ReadRequest`].
@@ -468,23 +489,48 @@ pub enum ReadResponse {
     /// The response to a `FindBlockHeaders` request.
     BlockHeaders(Vec<block::CountedHeader>),
 
-    /// Response to [`ReadRequest::HeadersByHeightRange`].
-    Headers(Vec<(block::Height, block::Hash, Arc<block::Header>)>),
+    /// Response to [`ReadRequest::HeaderChainSnapshot`], absent before semantic handoff.
+    HeaderChainSnapshot(Option<zakura_header_chain::EngineSnapshot>),
 
-    /// Response to [`ReadRequest::BestDurableHeaderTip`].
-    BestDurableHeaderTip(Option<(block::Height, block::Hash)>),
+    /// Response to [`ReadRequest::HeaderLocator`], absent before semantic handoff.
+    HeaderLocator(Option<zakura_header_chain::HeaderLocator>),
+
+    /// Response to [`ReadRequest::HeaderValidationLease`].
+    /// State returns `None` before attachment or after it stops retaining the requested parent.
+    HeaderValidationLease(Option<zakura_header_chain::ValidationLease>),
+
+    /// Response to [`ReadRequest::VctRepairContext`].
+    /// State returns `None` when the owner is stale.
+    VctRepairContext(Option<zakura_header_chain::VctRepairContext>),
+
+    /// Response to [`ReadRequest::AcquireRetainedHeaderPath`].
+    RetainedHeaderPathLease(crate::RetainedPathLeaseOutcome),
+
+    /// Response to [`ReadRequest::ReadRetainedHeaderPath`].
+    RetainedHeaderPathPage(crate::RetainedPathReadOutcome),
+
+    /// Response to [`ReadRequest::ReleaseRetainedHeaderPath`].
+    RetainedHeaderPathReleased(bool),
+
+    /// Response to [`ReadRequest::BestHeaderTip`].
+    BestHeaderTip(Option<(block::Height, block::Hash)>),
 
     /// Response to [`ReadRequest::MissingBlockBodies`].
     MissingBlockBodies(Vec<block::Height>),
 
     /// Response to [`ReadRequest::MissingBlockBodyMetadata`].
-    MissingBlockBodyMetadata(Vec<(block::Height, block::Hash, Option<u32>)>),
+    MissingBlockBodyMetadata(BlockSyncBodyMetadata),
 
     /// Response to [`ReadRequest::BlockSizeHints`].
     BlockSizeHints(Vec<(block::Height, Option<u32>)>),
 
     /// Response to [`ReadRequest::BlocksByHeightRange`].
     Blocks(Vec<(block::Height, Arc<Block>, usize)>),
+
+    /// Response to [`ReadRequest::RawBlocksByHeightRange`], with each block's
+    /// raw Zcash consensus serialization.
+    #[cfg(feature = "indexer")]
+    RawBlocks(Vec<(block::Height, Vec<u8>)>),
 
     /// The response to a `UnspentBestChainUtxo` request, from verified blocks in the
     /// _best_ non-finalized chain, or the finalized chain.
@@ -557,7 +603,7 @@ pub enum ReadResponse {
     ChainInfo(GetBlockTemplateChainInfo),
 
     /// Response to [`ReadRequest::SolutionRate`]
-    SolutionRate(Option<u128>),
+    SolutionRate(Option<U256>),
 
     /// Response to [`ReadRequest::CheckBlockProposalValidity`]
     ValidBlockProposal,
@@ -671,8 +717,14 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::AddressesTransactionIds(_)
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)
-            | ReadResponse::Headers(_)
-            | ReadResponse::BestDurableHeaderTip(_)
+            | ReadResponse::HeaderChainSnapshot(_)
+            | ReadResponse::HeaderLocator(_)
+            | ReadResponse::HeaderValidationLease(_)
+            | ReadResponse::VctRepairContext(_)
+            | ReadResponse::RetainedHeaderPathLease(_)
+            | ReadResponse::RetainedHeaderPathPage(_)
+            | ReadResponse::RetainedHeaderPathReleased(_)
+            | ReadResponse::BestHeaderTip(_)
             | ReadResponse::MissingBlockBodies(_)
             | ReadResponse::MissingBlockBodyMetadata(_)
             | ReadResponse::BlockSizeHints(_)
@@ -683,7 +735,9 @@ impl TryFrom<ReadResponse> for Response {
             }
 
             #[cfg(feature = "indexer")]
-            ReadResponse::TransactionId(_) => Err("there is no corresponding Response for this ReadResponse"),
+            ReadResponse::TransactionId(_) | ReadResponse::RawBlocks(_) => {
+                Err("there is no corresponding Response for this ReadResponse")
+            }
 
             ReadResponse::ValidBlockProposal => Ok(Response::ValidBlockProposal),
 

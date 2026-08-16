@@ -6996,6 +6996,7 @@ dependencies = [
  "socket2 0.6.4",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.5.3",
  "tower-layer",
@@ -8235,6 +8236,12 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "toml 1.1.2+spec-1.1.0",
+]
 
 [[package]]
 name = "yoke"
@@ -8267,7 +8274,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
 name = "zakura"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "abscissa_core",
  "anyhow",
@@ -8343,6 +8350,7 @@ dependencies = [
  "vergen-git2",
  "zakura-chain",
  "zakura-consensus",
+ "zakura-header-chain",
  "zakura-jsonl-trace",
  "zakura-network",
  "zakura-node-services",
@@ -8357,7 +8365,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "4.1.0"
+version = "6.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -8427,7 +8435,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -8465,6 +8473,7 @@ dependencies = [
  "tracing-futures",
  "tracing-subscriber",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-node-services",
  "zakura-script",
  "zakura-state",
@@ -8476,6 +8485,20 @@ dependencies = [
  "zcash_protocol",
  "zcash_script",
  "zcash_transparent",
+]
+
+[[package]]
+name = "zakura-header-chain"
+version = "1.0.0-rc0"
+dependencies = [
+ "chrono",
+ "proptest",
+ "rayon",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
+ "zakura-chain",
+ "zakura-test",
 ]
 
 [[package]]
@@ -8492,7 +8515,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -8534,13 +8557,15 @@ dependencies = [
  "tracing-futures",
  "tracing-subscriber",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-jsonl-trace",
+ "zakura-node-services",
  "zakura-test",
 ]
 
 [[package]]
 name = "zakura-node-services"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "color-eyre",
  "jsonrpsee-types",
@@ -8550,11 +8575,12 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "zakura-chain",
+ "zakura-header-chain",
 ]
 
 [[package]]
 name = "zakura-rpc"
-version = "6.0.0"
+version = "7.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8623,7 +8649,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "hex",
  "lazy_static",
@@ -8641,7 +8667,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "6.1.0"
+version = "7.0.0"
 dependencies = [
  "bincode",
  "chrono",
@@ -8687,6 +8713,7 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "zakura-chain",
+ "zakura-header-chain",
  "zakura-node-services",
  "zakura-test",
 ]
@@ -8754,7 +8781,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "clap",
  "color-eyre",

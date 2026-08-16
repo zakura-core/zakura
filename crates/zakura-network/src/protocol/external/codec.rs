@@ -358,7 +358,7 @@ impl Codec {
             Message::Inv(hashes) => hashes.zcash_serialize(&mut writer)?,
             Message::GetData(hashes) => hashes.zcash_serialize(&mut writer)?,
             Message::NotFound(hashes) => hashes.zcash_serialize(&mut writer)?,
-            Message::Tx(transaction) => transaction.transaction.zcash_serialize(&mut writer)?,
+            Message::Tx(transaction) => transaction.transaction().zcash_serialize(&mut writer)?,
             Message::Mempool => { /* Empty payload -- no-op */ }
             Message::FilterLoad {
                 filter,

@@ -25,6 +25,17 @@ on:
         type: boolean
         required: false
         default: false
+      p2p_stack:
+        description: "P2P stack override; auto preserves each node's fleet role"
+        type: choice
+        required: false
+        options: [auto, dual, zakura, legacy]
+        default: auto
+      header_sync_trace:
+        description: "Write structured header/block-sync traces to the data volume"
+        type: boolean
+        required: false
+        default: false
       node:
         description: "Optional single deployer node name; blank deploys the whole fleet"
         required: false
@@ -49,8 +60,23 @@ jobs:
       ZAKURA_DEPLOYER_BUILD_CACHE_DIR: /mnt/data/zakura-deployer/binaries
 
     steps:
+      - name: Validate deploy inputs
+        env:
+          REF: ${{ inputs.ref }}
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "invalid ref: allowed chars [A-Za-z0-9._/-]" >&2
+            exit 1
+          fi
+          if [ -n "${NODE}" ] && ! [[ "${NODE}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "invalid node: allowed chars [A-Za-z0-9._-]" >&2
+            exit 1
+          fi
+
       - name: Checkout deploy ref
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
           ref: ${{ inputs.ref }}
@@ -108,8 +134,35 @@ jobs:
 
       - name: Generate deployer fleet config
         working-directory: deploy/deployer
+        env:
+          HEADER_SYNC_TRACE: ${{ inputs.header_sync_trace }}
+          NODE: ${{ inputs.node }}
+          P2P_STACK: ${{ inputs.p2p_stack }}
+          REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
+
+          requested_p2p_stack="${P2P_STACK}"
+          default_p2p_stack="dual"
+
+          if [ "$requested_p2p_stack" != "auto" ]; then
+            if [ -z "${NODE}" ]; then
+              echo "p2p_stack overrides require one explicit node" >&2
+              exit 1
+            fi
+            default_p2p_stack="$requested_p2p_stack"
+          fi
+
+          if [ "${HEADER_SYNC_TRACE}" = "true" ] \
+            && [ -z "${NODE}" ]; then
+            echo "header_sync_trace requires one explicit node" >&2
+            exit 1
+          fi
+
+          zakura_trace_line=""
+          if [ "${HEADER_SYNC_TRACE}" = "true" ]; then
+            zakura_trace_line='trace_dir = "/mnt/data/traces/header-chain-canary"'
+          fi
 
           cat > nodes.ci.toml <<EOF
           [defaults]
@@ -121,14 +174,16 @@ jobs:
           rpc_listen_addr = "0.0.0.0:18232"
           rpc_enable_cookie_auth = false
           storage_mode    = "archive"
-          p2p_stack       = "dual"
+          p2p_stack       = "${default_p2p_stack}"
           metrics_endpoint = "127.0.0.1:9999"
+          health_listen_addr = "127.0.0.1:8080"
           tracing_filter  = "info,zakura_network::zakura=info"
           checkpoint_sync = false
           vct_fast_sync   = false
 
           [defaults.zakura]
           listen_addr = "0.0.0.0:8234"
+          ${zakura_trace_line}
           bootstrap_peers = [
               "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49@167.99.103.111:8234",
               "2bbb907b5d90598ef49f2e637066586b311a64587479be6ed43e8388587fcd2a@164.92.209.78:8234",
@@ -138,7 +193,7 @@ jobs:
           [[nodes]]
           name       = "zakura-testnet-1"
           ssh_string = "root@167.99.103.111"
-          commit     = "${{ inputs.ref }}"
+          commit     = "${REF}"
           network_cache_dir = "/mnt/data/zakura-cache"
           state_cache_dir = "/mnt/data/zakura-cache"
           log_file = "/mnt/data/logs/zakura.log"
@@ -146,7 +201,7 @@ jobs:
           [[nodes]]
           name       = "zakura-testnet-eu"
           ssh_string = "root@164.92.209.78"
-          commit     = "${{ inputs.ref }}"
+          commit     = "${REF}"
           network_cache_dir = "/mnt/data/zakura-cache"
           state_cache_dir = "/mnt/data/zakura-cache"
           log_file = "/mnt/data/logs/zakura.log"
@@ -154,7 +209,7 @@ jobs:
           [[nodes]]
           name       = "zakura-testnet-as"
           ssh_string = "root@206.189.148.0"
-          commit     = "${{ inputs.ref }}"
+          commit     = "${REF}"
           network_cache_dir = "/mnt/data/zakura-cache"
           state_cache_dir = "/mnt/data/zakura-cache"
           log_file = "/mnt/data/logs/zakura.log"
@@ -162,33 +217,40 @@ jobs:
 
       - name: Build deployer binary
         working-directory: deploy/deployer
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml)
-          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+          if [ "${FORCE_REBUILD}" = "true" ]; then
             args+=(--force)
           fi
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py build "${args[@]}"
 
       - name: Deploy fleet
         working-directory: deploy/deployer
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml)
-          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+          if [ "${FORCE_REBUILD}" = "true" ]; then
             args+=(--force)
           fi
-          if [ "${{ inputs.no_restart }}" = "true" ]; then
+          if [ "${NO_RESTART}" = "true" ]; then
             args+=(--no-restart)
           fi
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py deploy "${args[@]}"
@@ -196,12 +258,14 @@ jobs:
       - name: Show fleet status
         if: always()
         working-directory: deploy/deployer
+        env:
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml)
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py status "${args[@]}"
@@ -225,7 +289,7 @@ jobs:
           [Service]
           Type=simple
           WorkingDirectory=/opt/zakura-testnet-dashboard
-          ExecStart=/usr/bin/python3 /opt/zakura-testnet-dashboard/zakura-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --network testnet --interval 10 --stale-after 300 --upgrade-height 4134000 --target-spacing 7.5 --state-file /var/lib/zakura-testnet-dashboard/orphan-pairs.json
+          ExecStart=/usr/bin/python3 /opt/zakura-testnet-dashboard/zakura-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --network testnet --interval 10 --stale-after 300 --state-file /var/lib/zakura-testnet-dashboard/orphan-pairs.json
           Restart=always
           RestartSec=5
 
@@ -305,19 +369,21 @@ jobs:
       - name: Fetch recent logs on failure
         if: failure()
         working-directory: deploy/deployer
+        env:
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml --lines 300)
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py logs fetch "${args[@]}" || true
 
       - name: Upload failure logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:
           name: zakura-testnet-deploy-logs-${{ github.run_id }}
           path: deploy/deployer/logs/

@@ -17,10 +17,7 @@ use zakura_chain::{
     work::difficulty::CompactDifficulty,
 };
 
-use crate::{
-    constants::{MAX_HEADER_SYNC_HEIGHT_RANGE, MIN_TRANSPARENT_COINBASE_MATURITY},
-    HashOrHeight, KnownBlock,
-};
+use crate::{constants::MIN_TRANSPARENT_COINBASE_MATURITY, HashOrHeight, KnownBlock};
 
 /// A wrapper for type erased errors that is itself clonable and implements the
 /// Error trait
@@ -135,6 +132,39 @@ pub enum HistoricalSubtreeUnavailableReason {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
+    /// State could not read or parse the on-disk semantic format version.
+    #[error(
+        "cannot read state database format version at {path:?}. Hint: check the cache directory permissions and version file contents"
+    )]
+    DatabaseFormatVersion {
+        /// Version file whose read or parse failed.
+        path: PathBuf,
+        /// Underlying I/O or semantic-version error.
+        source: BoxError,
+    },
+
+    /// RocksDB could not open the requested primary or secondary database.
+    #[error(
+        "cannot open state database at {path:?}. Hint: check whether another process holds the database lock and whether cache_dir is readable and writable"
+    )]
+    DatabaseOpen {
+        /// Database directory that failed to open.
+        path: PathBuf,
+        /// Underlying RocksDB error.
+        source: rocksdb::Error,
+    },
+
+    /// A migration failure prevents the state database from opening.
+    #[error(
+        "cannot upgrade state database format at {path:?}. The database version remains unchanged, so Zakura can retry the migration: {source}"
+    )]
+    DatabaseFormatUpgrade {
+        /// The path identifies the database that failed migration.
+        path: PathBuf,
+        /// The source describes the migration failure.
+        source: BoxError,
+    },
+
     /// A read-only state was requested, but the configured cache directory is
     /// missing or unreadable.
     ///
@@ -208,9 +238,13 @@ pub enum CommitBlockError {
     #[error("could not contextually validate semantically verified block")]
     ValidateContextError(#[from] Box<ValidateContextError>),
 
-    /// Header-only commit validation failed.
-    #[error("could not commit header range")]
-    HeaderCommitError(#[from] Box<CommitHeaderRangeError>),
+    /// The body mutation could not commit its matching fork-aware header transition.
+    #[error("could not commit matching header-chain transition: {error}")]
+    HeaderChainError {
+        /// Stable local error diagnostic.
+        /// State never attributes this diagnostic to a peer.
+        error: String,
+    },
 
     /// The write task exited (likely during shutdown).
     #[error("block commit task exited. Is Zakura shutting down?")]
@@ -243,7 +277,7 @@ impl CommitBlockError {
         }
     }
 
-    /// Returns the height for any retryable VCT root stall (absent or rejected root, or one
+    /// Returns the height for any retryable VCT root stall (absent/evicted root, or one
     /// not yet verifiable for lack of a stored successor header). See
     /// [`ValidateContextError::vct_retryable_height`].
     pub fn vct_retryable_height(&self) -> Option<block::Height> {
@@ -265,11 +299,21 @@ impl CommitBlockError {
             _ => 0,
         }
     }
-}
 
-impl From<CommitHeaderRangeError> for CommitBlockError {
-    fn from(value: CommitHeaderRangeError) -> Self {
-        Self::HeaderCommitError(Box::new(value))
+    /// Classify this commit result before the caller attaches supplier identity and stable evidence.
+    pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
+        use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
+
+        match self {
+            Self::Duplicate { .. } => BodyVerificationClass::Duplicate,
+            Self::ValidateContextError(error) => error.body_verification_class(),
+            Self::HeaderChainError { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
+            }
+            Self::WriteTaskExited => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
+        }
     }
 }
 
@@ -296,12 +340,6 @@ impl From<ValidateContextError> for CommitSemanticallyVerifiedError {
     }
 }
 
-impl From<CommitHeaderRangeError> for CommitSemanticallyVerifiedError {
-    fn from(value: CommitHeaderRangeError) -> Self {
-        Self(CommitBlockError::HeaderCommitError(Box::new(value)))
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum LayeredStateError<E: std::error::Error + std::fmt::Display> {
     #[error("{0}")]
@@ -322,281 +360,66 @@ impl<E: std::error::Error + 'static> From<BoxError> for LayeredStateError<E> {
 /// An error describing why a `CommitCheckpointVerifiedBlock` request failed.
 #[derive(Debug, Error, Clone)]
 #[error("could not commit checkpoint-verified block")]
-pub struct CommitCheckpointVerifiedError(#[from] CommitBlockError);
+pub struct CommitCheckpointVerifiedError {
+    #[source]
+    inner: CommitBlockError,
+    vct_failure: Option<VctCommitFailure>,
+}
+
+/// Exact VCT verification input implicated by a failed checkpoint commit.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VctCommitFailure {
+    /// A direct current-root check or fold failed.
+    CurrentRoots,
+    /// The successor boundary rejected the candidate containing the current roots.
+    SuccessorBoundary,
+}
 
 impl CommitCheckpointVerifiedError {
     /// Returns the [`CommitBlockError`] describing why the commit failed.
     pub fn inner(&self) -> &CommitBlockError {
-        &self.0
+        &self.inner
     }
 
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&KnownBlock> {
-        self.0.duplicate_location()
+        self.inner.duplicate_location()
     }
 
     /// Returns the missing VCT supplied-root height for retryable root-fetch stalls.
     pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
-        self.0.vct_supplied_root_unavailable_height()
+        self.inner.vct_supplied_root_unavailable_height()
     }
 
-    /// Returns the height for any retryable VCT root stall (absent or rejected root, or one
+    /// Returns the height for any retryable VCT root stall (absent/evicted root, or one
     /// not yet verifiable for lack of a stored successor header). See
     /// [`ValidateContextError::vct_retryable_height`].
     pub fn vct_retryable_height(&self) -> Option<block::Height> {
-        self.0.vct_retryable_height()
+        self.inner.vct_retryable_height()
+    }
+
+    pub(crate) fn with_vct_failure(mut self, failure: VctCommitFailure) -> Self {
+        self.vct_failure = Some(failure);
+        self
+    }
+
+    pub(crate) fn vct_failure(&self) -> Option<VctCommitFailure> {
+        self.vct_failure
+    }
+}
+
+impl From<CommitBlockError> for CommitCheckpointVerifiedError {
+    fn from(inner: CommitBlockError) -> Self {
+        Self {
+            inner,
+            vct_failure: None,
+        }
     }
 }
 
 impl From<ValidateContextError> for CommitCheckpointVerifiedError {
     fn from(value: ValidateContextError) -> Self {
-        Self(CommitBlockError::ValidateContextError(Box::new(value)))
-    }
-}
-
-impl From<CommitHeaderRangeError> for CommitCheckpointVerifiedError {
-    fn from(value: CommitHeaderRangeError) -> Self {
-        Self(CommitBlockError::HeaderCommitError(Box::new(value)))
-    }
-}
-
-/// An internal invariant of the zakura header store was found violated while
-/// reading it.
-///
-/// This is a **local storage fault**, never evidence about a peer: readers
-/// return it instead of feeding rows from more than one branch (or from beside
-/// a gap) into consensus validation, where the corruption would otherwise
-/// surface as a misleading validation failure (`InvalidDifficultyThreshold`,
-/// `UnknownAnchor`) attributed to whoever supplied the input being validated.
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum StoreIncoherentError {
-    /// The header row at `height` does not link to the stored row below it.
-    #[error(
-        "header store incoherent: header at {height:?} links to {expected_parent} but the stored row below is {actual_below}"
-    )]
-    BrokenLinkage {
-        /// Height of the header whose parent link failed to resolve.
-        height: block::Height,
-        /// The parent hash the header claims (`previous_block_hash`).
-        expected_parent: block::Hash,
-        /// The hash actually stored at `height - 1`.
-        actual_below: block::Hash,
-    },
-
-    /// A header row exists at `height` but the row below it is missing.
-    #[error(
-        "header store incoherent: no stored row at {missing:?} below the header at {height:?}"
-    )]
-    Gap {
-        /// Height of the stored header above the gap.
-        height: block::Height,
-        /// The missing height (`height - 1`).
-        missing: block::Height,
-    },
-
-    /// The header row at `height` is not the block its hash row names.
-    #[error(
-        "header store incoherent: header stored at {height:?} hashes to {computed} but the hash row names {indexed}"
-    )]
-    HeaderHashMismatch {
-        /// Height of the divergent rows.
-        height: block::Height,
-        /// The hash the height→hash index names.
-        indexed: block::Hash,
-        /// The stored header's actual hash.
-        computed: block::Hash,
-    },
-
-    /// The hash→height and height→hash indexes disagree about a hash.
-    #[error(
-        "header store incoherent: hash {hash} is indexed at {height:?} but that height stores {stored:?}"
-    )]
-    BijectionMismatch {
-        /// The hash whose round-trip failed.
-        hash: block::Hash,
-        /// The height the hash→height index reports for it.
-        height: block::Height,
-        /// What the height→hash index stores there instead.
-        stored: Option<block::Hash>,
-    },
-}
-
-/// An error describing why a header-only range could not be committed.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CommitHeaderRangeError {
-    /// The request did not contain any headers.
-    #[error("header range is empty")]
-    EmptyRange,
-
-    /// The request exceeded the native header-sync range cap.
-    #[error(
-        "header range contains {actual} headers, exceeding the maximum {MAX_HEADER_SYNC_HEIGHT_RANGE}"
-    )]
-    RangeTooLong {
-        /// Number of headers in the request.
-        actual: usize,
-    },
-
-    /// The request supplied a different number of body-size hints than headers.
-    #[error("header range body-size count {body_sizes} does not match header count {headers}")]
-    BodySizeCountMismatch {
-        /// Header count.
-        headers: usize,
-        /// Body-size hint count.
-        body_sizes: usize,
-    },
-
-    /// The request supplied a different number of roots than headers.
-    #[error("header range tree-aux root count {roots} does not match header count {headers}")]
-    TreeAuxRootCountMismatch {
-        /// Header count.
-        headers: usize,
-        /// Tree-aux root count.
-        roots: usize,
-    },
-
-    /// A supplied tree-aux root did not match the inferred header height.
-    #[error("header range tree-aux root height {root_height:?} does not match expected height {expected_height:?}")]
-    TreeAuxRootHeightMismatch {
-        /// Expected root height.
-        expected_height: block::Height,
-        /// Actual root height.
-        root_height: block::Height,
-    },
-
-    /// The supplied anchor is not known to state.
-    #[error("header range anchor {anchor} is not known")]
-    UnknownAnchor {
-        /// The supplied anchor hash.
-        anchor: block::Hash,
-    },
-
-    /// The supplied anchor is the network genesis hash, but the genesis block has not been
-    /// committed to state yet.
-    #[error("header range genesis anchor {anchor} is not committed to state yet")]
-    MissingGenesisAnchor {
-        /// The supplied genesis anchor hash.
-        anchor: block::Hash,
-    },
-
-    /// The inferred header height overflowed the valid block height range.
-    #[error("header height overflow")]
-    HeightOverflow,
-
-    /// A header in the range does not link to the anchor or to its predecessor,
-    /// so committing it would break the header store's linkage invariant.
-    #[error(
-        "header at {height:?} links to {actual_parent} instead of its predecessor {expected_parent}"
-    )]
-    UnlinkedRange {
-        /// Height of the first header that fails to link.
-        height: block::Height,
-        /// The hash of the row the header must link to (the anchor, or the
-        /// previous header in the range).
-        expected_parent: block::Hash,
-        /// The header's actual `previous_block_hash`.
-        actual_parent: block::Hash,
-    },
-
-    /// A committed immutable header conflicts with the requested header.
-    #[error("header at finalized height {height:?} conflicts with an existing header")]
-    ImmutableConflict {
-        /// The conflicting height.
-        height: block::Height,
-    },
-
-    /// Local checkpoint-frontier reconstruction failed while preparing the range.
-    #[error("could not update the highest completed checkpoint: {0}")]
-    HighestCompletedCheckpoint(
-        #[from] crate::service::finalized_state::HighestCompletedCheckpointError,
-    ),
-
-    /// A provisional reorg tried to overwrite too far behind the best header tip.
-    #[error(
-        "header reorg at {height:?} is deeper than the maximum reorg window from best header tip {best_header_tip:?}"
-    )]
-    ReorgTooDeep {
-        /// Height of the conflicting header.
-        height: block::Height,
-        /// Current best header tip.
-        best_header_tip: block::Height,
-    },
-
-    /// A conflicting header range carried no more cumulative work than the existing
-    /// header chain it would replace, so it was rejected to keep the most-work chain.
-    #[error(
-        "conflicting header range at {height:?} has cumulative work {new_work} <= existing work {existing_work}"
-    )]
-    LowerWorkConflict {
-        /// Height where the new range first conflicts with the stored chain.
-        height: block::Height,
-        /// Cumulative work of the existing conflicting suffix.
-        existing_work: u128,
-        /// Cumulative work of the new conflicting suffix.
-        new_work: u128,
-    },
-
-    /// A header conflicts with a trusted checkpoint hash.
-    #[error("checkpoint conflict at {height:?}: expected {expected}, got {actual}")]
-    CheckpointConflict {
-        /// Checkpoint height.
-        height: block::Height,
-        /// Expected checkpoint hash.
-        expected: block::Hash,
-        /// Actual header hash.
-        actual: block::Hash,
-    },
-
-    /// The requested header conflicts with a full block already stored at the same height.
-    #[error("header at height {height:?} conflicts with an already stored full block")]
-    ConflictingFullBlockHeader {
-        /// The conflicting height.
-        height: block::Height,
-    },
-
-    /// The local header store was found internally incoherent while reading
-    /// the context needed to validate the range.
-    ///
-    /// This is a local storage fault, not a peer validation failure: the range
-    /// was rejected because the store cannot supply trustworthy context, not
-    /// because the range itself was shown invalid.
-    #[error("header store incoherent while validating range: {0}")]
-    StoreIncoherent(#[from] StoreIncoherentError),
-
-    /// The durable authenticated-root frontier could not be safely rebased.
-    #[error("header-root authentication frontier is incoherent: {reason}")]
-    HeaderRootAuthFrontier {
-        /// The local frontier coherence failure.
-        reason: String,
-    },
-
-    /// Contextual header validation failed.
-    #[error("could not contextually validate header")]
-    ValidateContextError(#[from] Box<ValidateContextError>),
-
-    /// Local storage failed while writing a validated header range.
-    ///
-    /// This is a local resource/storage failure, not a peer validation failure.
-    #[error("failed to write validated header range to disk: {error}")]
-    StorageWriteError {
-        /// RocksDB error details.
-        error: String,
-    },
-
-    /// Sending the commit request to the write task failed.
-    #[error("failed to send header range commit request to block write task")]
-    SendCommitRequestFailed,
-
-    /// The commit request was dropped before processing.
-    #[error("header range commit request was unexpectedly dropped")]
-    CommitResponseDropped,
-}
-
-impl From<ValidateContextError> for CommitHeaderRangeError {
-    fn from(value: ValidateContextError) -> Self {
-        Self::ValidateContextError(Box::new(value))
+        CommitBlockError::ValidateContextError(Box::new(value)).into()
     }
 }
 
@@ -619,6 +442,14 @@ pub enum InvalidateError {
     /// The block hash was not found in any non-finalized chain.
     #[error("block hash {0} not found in any non-finalized chain")]
     BlockNotFound(block::Hash),
+
+    /// The staged state mutation disagreed with or could not commit its header transition.
+    #[error("could not commit matching header-chain invalidation: {error}")]
+    HeaderChain {
+        /// Stable local error diagnostic.
+        /// State never attributes this diagnostic to a peer.
+        error: String,
+    },
 }
 
 /// An error describing why a `ReconsiderBlock` request failed.
@@ -657,6 +488,14 @@ pub enum ReconsiderError {
     /// The finalized parent chain is missing its Sprout tip frontier.
     #[error(transparent)]
     MissingSproutTipTree(#[from] MissingSproutTipTree),
+
+    /// The staged state mutation disagreed with or could not commit its header transition.
+    #[error("could not commit matching header-chain reconsideration: {error}")]
+    HeaderChain {
+        /// Stable local error diagnostic.
+        /// State never attributes this diagnostic to a peer.
+        error: String,
+    },
 }
 
 /// An error describing why a block failed contextual validation.
@@ -666,9 +505,6 @@ pub enum ReconsiderError {
 pub enum ValidateContextError {
     #[error(transparent)]
     MissingSproutTipTree(#[from] MissingSproutTipTree),
-
-    #[error("header-root authentication frontier is incoherent: {reason}")]
-    HeaderRootAuthFrontier { reason: String },
 
     #[error("block hash {block_hash} was previously invalidated")]
     #[non_exhaustive]
@@ -753,6 +589,13 @@ pub enum ValidateContextError {
     InvalidDifficultyThreshold {
         difficulty_threshold: CompactDifficulty,
         expected_difficulty: CompactDifficulty,
+    },
+
+    #[error("cumulative chain work overflows at block {block_hash} ({height:?})")]
+    #[non_exhaustive]
+    CumulativeWorkOverflow {
+        height: block::Height,
+        block_hash: block::Hash,
     },
 
     #[error("transparent double-spend: {outpoint:?} is spent twice in {location:?}")]
@@ -951,6 +794,128 @@ pub enum ValidateContextError {
 }
 
 impl ValidateContextError {
+    /// Classify contextual validation without conflating peer data and local availability.
+    pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
+        use zakura_chain::block::CommitmentError;
+        use zakura_header_chain::{
+            BodyCommitmentKind, BodyRuleId, BodyVerificationClass, TransientBodyFailureKind,
+        };
+
+        let consensus = |rule| BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(rule));
+        match self {
+            Self::MissingSproutTipTree(_) | Self::NotReadyToBeCommitted => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+            }
+            Self::BlockPreviouslyInvalidated { .. }
+            | Self::InvalidAncestorBlock(_)
+            | Self::OrphanedBlock { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::Canceled)
+            }
+            Self::VctSuppliedRootUnavailable { .. }
+            | Self::VctSuppliedRootAwaitingSuccessor { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+            }
+            Self::VctBlockAuthDataRootMismatch { .. } => {
+                BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
+            }
+            Self::VctSproutHandoffRootMismatch { .. }
+            | Self::CumulativeWorkOverflow { .. }
+            | Self::NoteCommitmentTreeError(_)
+            | Self::HistoryTreeError(_) => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
+            }
+            Self::InvalidBlockCommitment(error) => {
+                let kind = match error {
+                    CommitmentError::InvalidAuthDataRoot { .. } => BodyCommitmentKind::AuthDataRoot,
+                    CommitmentError::InvalidFinalSaplingRoot { .. } => {
+                        BodyCommitmentKind::Other("final_sapling_root")
+                    }
+                    CommitmentError::InvalidChainHistoryActivationReserved { .. } => {
+                        BodyCommitmentKind::Other("chain_history_activation_reserved")
+                    }
+                    CommitmentError::InvalidChainHistoryRoot { .. } => {
+                        BodyCommitmentKind::Other("chain_history_root")
+                    }
+                    CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. } => {
+                        BodyCommitmentKind::Other("chain_history_block_tx_auth_commitment")
+                    }
+                    CommitmentError::InvalidPreNu5OrchardRoot { .. } => {
+                        BodyCommitmentKind::Other("pre_nu5_orchard_root")
+                    }
+                    CommitmentError::InvalidPreNu5OrchardTxCount { .. } => {
+                        BodyCommitmentKind::Other("pre_nu5_orchard_tx_count")
+                    }
+                    CommitmentError::InvalidPreSaplingSaplingTxCount { .. } => {
+                        BodyCommitmentKind::Other("pre_sapling_sapling_tx_count")
+                    }
+                    CommitmentError::InvalidPreNu6_3IronwoodRoot { .. } => {
+                        BodyCommitmentKind::Other("pre_nu6_3_ironwood_root")
+                    }
+                    CommitmentError::InvalidPreNu6_3IronwoodTxCount { .. } => {
+                        BodyCommitmentKind::Other("pre_nu6_3_ironwood_tx_count")
+                    }
+                    CommitmentError::MissingBlockHeight { .. } => {
+                        BodyCommitmentKind::Other("missing_block_height")
+                    }
+                    CommitmentError::InvalidSapingRootBytes => {
+                        BodyCommitmentKind::Other("invalid_sapling_root_bytes")
+                    }
+                };
+                BodyVerificationClass::PayloadMismatch(kind)
+            }
+            Self::NonSequentialBlock { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+            }
+            Self::TimeTooEarly { .. }
+            | Self::TimeTooLate { .. }
+            | Self::InvalidDifficultyThreshold { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
+            Self::DuplicateTransparentSpend { .. } => {
+                consensus("context.duplicate_transparent_spend")
+            }
+            Self::MissingTransparentOutput { .. } => {
+                consensus("context.missing_transparent_output")
+            }
+            Self::EarlyTransparentSpend { .. } => consensus("context.early_transparent_spend"),
+            Self::UnshieldedTransparentCoinbaseSpend { .. } => {
+                consensus("context.unshielded_transparent_coinbase_spend")
+            }
+            Self::ImmatureTransparentCoinbaseSpend { .. } => {
+                consensus("context.immature_transparent_coinbase_spend")
+            }
+            Self::DuplicateSproutNullifier { .. } => {
+                consensus("context.duplicate_sprout_nullifier")
+            }
+            Self::DuplicateSaplingNullifier { .. } => {
+                consensus("context.duplicate_sapling_nullifier")
+            }
+            Self::DuplicateOrchardNullifier { .. } => {
+                consensus("context.duplicate_orchard_nullifier")
+            }
+            Self::DuplicateIronwoodNullifier { .. } => {
+                consensus("context.duplicate_ironwood_nullifier")
+            }
+            Self::NegativeRemainingTransactionValue { .. } => {
+                consensus("context.negative_remaining_transaction_value")
+            }
+            Self::CalculateRemainingTransactionValue { .. } => {
+                consensus("context.calculate_remaining_transaction_value")
+            }
+            Self::CalculateTransactionValueBalances { .. } => {
+                consensus("context.calculate_transaction_value_balances")
+            }
+            Self::CalculateBlockChainValueChange { .. } => {
+                consensus("context.calculate_block_chain_value_change")
+            }
+            Self::AddValuePool { .. } => consensus("context.add_value_pool"),
+            Self::UnknownSproutAnchor { .. } => consensus("context.unknown_sprout_anchor"),
+            Self::UnknownSaplingAnchor { .. } => consensus("context.unknown_sapling_anchor"),
+            Self::UnknownOrchardAnchor { .. } => consensus("context.unknown_orchard_anchor"),
+            Self::UnknownIronwoodAnchor { .. } => consensus("context.unknown_ironwood_anchor"),
+        }
+    }
+
     // Keep this match exhaustive so new contextual errors must make an explicit
     // peer-attribution decision.
     fn misbehavior_score(&self) -> u32 {
@@ -996,7 +961,6 @@ impl ValidateContextError {
             // out-of-order arrival, retryable stalls, and auxiliary roots that
             // may have come from a different peer.
             | ValidateContextError::MissingSproutTipTree(_)
-            | ValidateContextError::HeaderRootAuthFrontier { .. }
             | ValidateContextError::BlockPreviouslyInvalidated { .. }
             | ValidateContextError::NotReadyToBeCommitted
             | ValidateContextError::InvalidAncestorBlock(_)
@@ -1004,6 +968,7 @@ impl ValidateContextError {
             | ValidateContextError::VctSuppliedRootAwaitingSuccessor { .. }
             | ValidateContextError::VctBlockAuthDataRootMismatch { .. }
             | ValidateContextError::VctSproutHandoffRootMismatch { .. }
+            | ValidateContextError::CumulativeWorkOverflow { .. }
             | ValidateContextError::OrphanedBlock { .. }
             | ValidateContextError::NoteCommitmentTreeError(_)
             | ValidateContextError::HistoryTreeError(_) => 0,
@@ -1012,11 +977,11 @@ impl ValidateContextError {
 
     /// Returns the missing VCT supplied-root height for retryable root stalls.
     ///
-    /// This is the subset of [`Self::vct_retryable_height`] where the supplied root itself is
-    /// unusable: authentication has not stored a row for it yet, or the stored row failed
-    /// body-time verification and the commit refuses to use it. The stall clears when the
-    /// root-authentication lane (or its bounded repair path) stores a verifiable row. An
-    /// await-successor stall ([`Self::vct_retryable_height`] but not this) already has its root
+    /// The query returns the subset of [`Self::vct_retryable_height`] where the supplied root is
+    /// missing. The peer either omitted the root from its header range or supplied a root that
+    /// verification later evicted. Only a later delivery of the same header range can fill the
+    /// missing root. Header sync does not request individual roots. An await-successor stall
+    /// ([`Self::vct_retryable_height`] but not this method) already has its root
     /// and only waits for the next header to be stored.
     pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
         match self {
@@ -1025,7 +990,7 @@ impl ValidateContextError {
         }
     }
 
-    /// Returns the height for any retryable VCT root stall: either an absent or rejected supplied
+    /// Returns the height for any retryable VCT root stall: either an absent/evicted supplied
     /// root ([`Self::VctSuppliedRootUnavailable`]) or one not yet verifiable because no successor
     /// is buffered to confirm it ([`Self::VctSuppliedRootAwaitingSuccessor`]). The write loop
     /// parks and retries the same block for both; the former polls slower because nothing is
@@ -1081,6 +1046,141 @@ impl DuplicateNullifierError for orchard::Nullifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zakura_header_chain::{
+        BodyCommitmentKind, BodyVerificationClass, TransientBodyFailureKind,
+    };
+
+    #[test]
+    fn body_verification_classes_preserve_attribution_boundaries() {
+        assert_eq!(
+            ValidateContextError::VctSuppliedRootUnavailable { height: Height(7) }
+                .body_verification_class(),
+            BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+        );
+        assert_eq!(
+            ValidateContextError::InvalidAncestorBlock(block::Hash([9; 32]))
+                .body_verification_class(),
+            BodyVerificationClass::Retryable(TransientBodyFailureKind::Canceled)
+        );
+        assert_eq!(
+            ValidateContextError::VctBlockAuthDataRootMismatch {
+                height: Height(7),
+                expected: block::merkle::AuthDataRoot::from([1; 32]),
+                actual: block::merkle::AuthDataRoot::from([2; 32]),
+            }
+            .body_verification_class(),
+            BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
+        );
+        assert_eq!(
+            ValidateContextError::DuplicateTransparentSpend {
+                outpoint: transparent::OutPoint {
+                    hash: [3; 32].into(),
+                    index: 0,
+                },
+                location: "test chain",
+            }
+            .body_verification_class(),
+            BodyVerificationClass::ConsensusInvalid(zakura_header_chain::BodyRuleId::new(
+                "context.duplicate_transparent_spend"
+            ))
+        );
+        assert_eq!(
+            CommitBlockError::HeaderChainError {
+                error: "local transition failure".to_owned(),
+            }
+            .body_verification_class(),
+            BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
+        );
+        assert_eq!(
+            CommitBlockError::Duplicate {
+                hash_or_height: None,
+                location: KnownBlock::BestChain,
+            }
+            .body_verification_class(),
+            BodyVerificationClass::Duplicate
+        );
+    }
+
+    #[test]
+    // DF-02: representative contextual failures cover every shared body
+    // classification, so the two validation paths retain only intended differences.
+    fn contextual_body_failure_classes_match_header_engine_contract() {
+        use zakura_chain::value_balance::ValueBalanceError;
+        use zakura_header_chain::{BodyRuleId, BodyVerificationClass};
+
+        let outpoint = transparent::OutPoint {
+            hash: [3; 32].into(),
+            index: 0,
+        };
+        let transaction_hash = transaction::Hash::from([4; 32]);
+        let now = Utc::now();
+        let cases = [
+            (
+                ValidateContextError::DuplicateTransparentSpend {
+                    outpoint,
+                    location: "test chain",
+                }
+                .body_verification_class(),
+                BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                    "context.duplicate_transparent_spend",
+                )),
+            ),
+            (
+                ValidateContextError::DuplicateSproutNullifier {
+                    nullifier: sprout::Nullifier::from([6; 32]),
+                    in_finalized_state: false,
+                }
+                .body_verification_class(),
+                BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                    "context.duplicate_sprout_nullifier",
+                )),
+            ),
+            (
+                ValidateContextError::UnknownSproutAnchor {
+                    anchor: sprout::tree::Root::default(),
+                    height: Some(Height(7)),
+                    tx_index_in_block: Some(0),
+                    transaction_hash,
+                }
+                .body_verification_class(),
+                BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                    "context.unknown_sprout_anchor",
+                )),
+            ),
+            (
+                ValidateContextError::CalculateBlockChainValueChange {
+                    value_balance_error: ValueBalanceError::Unparsable,
+                    height: Height(7),
+                    block_hash: block::Hash([5; 32]),
+                    transaction_count: 1,
+                    spent_utxo_count: 1,
+                }
+                .body_verification_class(),
+                BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                    "context.calculate_block_chain_value_change",
+                )),
+            ),
+            (
+                ValidateContextError::TimeTooLate {
+                    candidate_time: now,
+                    block_time_max: now - chrono::Duration::seconds(1),
+                }
+                .body_verification_class(),
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable),
+            ),
+            (
+                CommitBlockError::HeaderChainError {
+                    error: "local transition failure".to_owned(),
+                }
+                .body_verification_class(),
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage),
+            ),
+        ];
+
+        for (actual, expected) in cases {
+            assert_eq!(actual, expected);
+        }
+    }
     use zakura_chain::{
         block::{CommitmentError, Height},
         parameters::Network,
@@ -1243,13 +1343,6 @@ mod tests {
         ));
         assert_eq!(transient_context_error.misbehavior_score(), 0);
 
-        let local_frontier_error = CommitBlockError::ValidateContextError(Box::new(
-            ValidateContextError::HeaderRootAuthFrontier {
-                reason: "test local storage fault".to_string(),
-            },
-        ));
-        assert_eq!(local_frontier_error.misbehavior_score(), 0);
-
         let invalid_ancestor_error = CommitBlockError::ValidateContextError(Box::new(
             ValidateContextError::InvalidAncestorBlock(block::Hash([1; 32])),
         ));
@@ -1262,13 +1355,6 @@ mod tests {
             }));
         assert_eq!(stale_fork_error.misbehavior_score(), 0);
 
-        let local_frontier_error = CommitBlockError::ValidateContextError(Box::new(
-            ValidateContextError::HeaderRootAuthFrontier {
-                reason: "test frontier failure".to_string(),
-            },
-        ));
-        assert_eq!(local_frontier_error.misbehavior_score(), 0);
-
         let dup_err = CommitBlockError::Duplicate {
             hash_or_height: None,
             location: KnownBlock::BestChain,
@@ -1279,12 +1365,20 @@ mod tests {
     #[test]
     fn checkpoint_error_exposes_retryable_vct_root_height() {
         let height = Height(42);
-        let retryable: CommitCheckpointVerifiedError =
-            ValidateContextError::VctSuppliedRootUnavailable { height }.into();
+        let retryable =
+            CommitCheckpointVerifiedError::from(ValidateContextError::VctSuppliedRootUnavailable {
+                height,
+            })
+            .with_vct_failure(VctCommitFailure::SuccessorBoundary);
         assert_eq!(
             retryable.vct_supplied_root_unavailable_height(),
             Some(height),
             "checkpoint commit errors expose retryable VCT root misses"
+        );
+        assert_eq!(
+            retryable.vct_failure(),
+            Some(VctCommitFailure::SuccessorBoundary),
+            "checkpoint errors preserve the exact VCT verifier stage"
         );
 
         let non_retryable: CommitCheckpointVerifiedError =

@@ -67,24 +67,30 @@ jobs:
       - id: filter
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
             # The pulls/files API exposes changed paths as `filename` (unlike
             # the compare API's `.files[].filename`, this array is top-level).
             changed=$(gh api --paginate \
-              "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+              "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files" \
               --jq '.[].filename')
           else
-            before="${{ github.event.before }}"
+            before="${EVENT_BEFORE}"
             # The first push of a branch (and force-pushes that orphan the old
             # tip) have no usable `before` commit, so the compare would 404;
             # fall back to comparing against the default branch.
             if [[ "$before" == "0000000000000000000000000000000000000000" ]] || \
                ! changed=$(gh api \
-                 "repos/${{ github.repository }}/compare/${before}...${{ github.sha }}" \
+                 "repos/${REPOSITORY}/compare/${before}...${HEAD_SHA}" \
                  --jq '.files[].filename'); then
               changed=$(gh api \
-                "repos/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...${{ github.sha }}" \
+                "repos/${REPOSITORY}/compare/${DEFAULT_BRANCH}...${HEAD_SHA}" \
                 --jq '.files[].filename')
             fi
           fi
@@ -122,7 +128,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.16.1 # zizmor: ignore[cache-poisoning] -- CI e2e job; uploads only diagnostic traces and builds a throwaway debug binary, nothing published/released
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI e2e job; uploads only diagnostic traces and builds a throwaway debug binary, nothing published/released
         with:
           toolchain: stable
           # The two regtest-e2e jobs share one debug `cargo test --no-run` build
@@ -194,7 +200,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.16.1 # zizmor: ignore[cache-poisoning] -- CI integration job; uploads only diagnostic test traces
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI integration job; uploads only diagnostic test traces
         with:
           toolchain: stable
           # Same debug + default-release-binaries workspace build as the unit
@@ -238,7 +244,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.16.1 # zizmor: ignore[cache-poisoning] -- CI fuzz-scenario job; uploads only diagnostic test traces
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI fuzz-scenario job; uploads only diagnostic test traces
         with:
           toolchain: stable
           cache-shared-key: zakura-drb-debug
@@ -283,7 +289,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.16.1 # zizmor: ignore[cache-poisoning] -- CI e2e job; uploads only diagnostic traces and builds a throwaway debug binary, nothing published/released
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI e2e job; uploads only diagnostic traces and builds a throwaway debug binary, nothing published/released
         with:
           toolchain: stable
           cache-shared-key: zakura-e2e-debug

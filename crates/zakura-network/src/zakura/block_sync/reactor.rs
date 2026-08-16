@@ -3,10 +3,12 @@ use super::{
     wire::*, *,
 };
 use crate::zakura::{
-    FrontierChange, FrontierUpdate, OrderedSendError, ServiceAdmissionDecision,
-    ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState,
+    OrderedSendError, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
+    ZakuraBlockSyncCandidateState,
 };
 use iroh::NodeId;
+use rand::{rngs::OsRng, RngCore};
+use std::num::NonZeroU64;
 
 mod trace;
 
@@ -28,6 +30,16 @@ const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
 /// State's header range read cap, mirrored here to keep `zakura-network` from
 /// depending upward on `zakura-state`.
 const NEEDED_BLOCK_REFILL_LIMIT: u32 = 4_000;
+
+/// Delay checkpoint body application until a far-ahead empty-state header bootstrap settles.
+/// Each selected-header page advances the body-work scope. Applying bodies between
+/// pages lets newer duplicate requests replace older requests before the node commits
+/// the first complete checkpoint.
+pub(super) const EMPTY_STATE_HEADER_QUIET_PERIOD: Duration = Duration::from_secs(30);
+
+/// One complete maximum checkpoint gap.
+/// The minimum lets a small startup window complete a checkpoint between header-page commits.
+pub(super) const EMPTY_STATE_HEADER_QUIET_MIN_LAG: u32 = 400;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct FloorGapDiagnostics {
@@ -52,9 +64,65 @@ struct RangeResponseTrace {
     total_elapsed: Option<Duration>,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct PendingNeededQuery {
+    query_id: NonZeroU64,
+    scope: zakura_header_chain::BodyWorkAuthority,
+    from: block::Height,
+    limit: u32,
+    best_header_tip: block::Height,
+    best_header_hash: block::Hash,
+}
+
+fn synchronize_persisted_body_alarm(
+    registry: &PeerRegistry,
+    snapshot: Option<&zakura_header_chain::EngineSnapshot>,
+) {
+    let alarm = snapshot.and_then(|snapshot| {
+        snapshot
+            .alarms
+            .header_best_body_unavailable
+            .filter(|summary| summary.alarmed)
+            .map(|summary| {
+                (
+                    zakura_header_chain::BodyWorkAuthority::for_snapshot(snapshot),
+                    snapshot.frontiers.header_best.hash,
+                    retry_deadline_instant(summary.next_probe_at),
+                )
+            })
+    });
+    registry.set_persisted_body_alarm(alarm);
+}
+
+fn block_sync_frontiers(snapshot: &zakura_header_chain::EngineSnapshot) -> BlockSyncFrontiers {
+    BlockSyncFrontiers {
+        finalized_height: snapshot.frontiers.finalized.height,
+        verified_block_tip: snapshot.frontiers.verified_best.height,
+        verified_block_hash: snapshot.frontiers.verified_best.hash,
+    }
+}
+
+/// Return whether a committed snapshot only advances body progress under the same header target.
+///
+/// The target hash fixes the branch for already-issued body downloads. A
+/// target change or any frontier retreat still takes the destructive scope
+/// transition path.
+pub(super) fn body_progress_preserves_download_pipeline(
+    old: &zakura_header_chain::EngineSnapshot,
+    new: &zakura_header_chain::EngineSnapshot,
+) -> bool {
+    old.frontiers.header_best == new.frontiers.header_best
+        && new.frontiers.finalized.height >= old.frontiers.finalized.height
+        && new.frontiers.verified_best.height >= old.frontiers.verified_best.height
+        && (new.frontiers.finalized.height != old.frontiers.finalized.height
+            || new.frontiers.finalized.hash == old.frontiers.finalized.hash)
+        && (new.frontiers.verified_best.height != old.frontiers.verified_best.height
+            || new.frontiers.verified_best.hash == old.frontiers.verified_best.hash)
+}
+
 /// Spawn a block-sync reactor and return its handle plus action stream.
 pub fn spawn_block_sync_reactor(
-    startup: BlockSyncStartup,
+    mut startup: BlockSyncStartup,
 ) -> (
     BlockSyncHandle,
     mpsc::Receiver<BlockSyncAction>,
@@ -62,9 +130,22 @@ pub fn spawn_block_sync_reactor(
 ) {
     debug_assert!(
         !startup.state_queries_enabled
-            || (startup.header_tip.is_some() ^ startup.frontier_updates.is_some()),
-        "state-backed block sync must have exactly one frontier source",
+            || startup.committed_snapshots.is_some()
+            || startup.header_tip.is_some(),
+        "state-backed block sync must have a frontier source",
     );
+
+    let committed_snapshot = startup
+        .committed_snapshots
+        .as_ref()
+        .and_then(|snapshots| snapshots.borrow().clone());
+    if let Some(snapshot) = committed_snapshot.as_ref() {
+        startup.frontiers = block_sync_frontiers(snapshot);
+        startup.best_header_tip = (
+            snapshot.frontiers.header_best.height,
+            snapshot.frontiers.header_best.hash,
+        );
+    }
 
     let state = BlockSyncState::new(&startup);
     let (events_tx, events_rx) =
@@ -102,18 +183,39 @@ pub fn spawn_block_sync_reactor(
     let (sequencer_input_tx, sequencer_body_input_rx) =
         mpsc::channel(startup.config.submitted_apply_limit().max(1));
     let (sequencer_control_tx, sequencer_control_rx) = mpsc::unbounded_channel();
+    let initial_body_scope = committed_snapshot
+        .as_ref()
+        .map(zakura_header_chain::BodyWorkAuthority::for_snapshot);
+    let initial_state_version = committed_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.state_version);
+    #[cfg(test)]
+    let initial_state_version = initial_state_version.or_else(|| {
+        startup
+            .committed_snapshots
+            .is_none()
+            .then_some(zakura_header_chain::StateVersion::default())
+    });
     let sequencer_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sequencer_input_decoded_attributed_memory_bytes =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
+    // Shared peer facts are also the exact per-supplier body-retry admission gate.
+    let registry = Arc::new(PeerRegistry::new());
+    synchronize_persisted_body_alarm(&registry, committed_snapshot.as_ref());
+    let mut retry_jitter_seed = [0u8; 32];
+    OsRng.fill_bytes(&mut retry_jitter_seed);
 
     let sequencer_task = SequencerTask::new(
         sequencer,
         state.budget.clone(),
         state.work_queue.clone(),
+        registry.clone(),
         actions_tx.clone(),
         committed_throughput,
         startup.frontiers,
+        initial_body_scope,
+        crate::zakura::header_sync::SeededRetryJitter::new(retry_jitter_seed),
         sequencer_body_input_rx,
         sequencer_control_rx,
         sequencer_input_bytes.clone(),
@@ -121,13 +223,13 @@ pub fn spawn_block_sync_reactor(
         sequencer_view_tx,
         ACTION_SEND_TIMEOUT,
         startup.trace.clone(),
-    );
+    )
+    .with_initial_state_version(initial_state_version);
     tokio::spawn(sequencer_task.run());
 
     // the shared per-peer fact table read by the producer / candidate / trace
     // and written by the routines (servable/caps/outstanding) and the reactor
     // (admission/teardown entry insert/remove).
-    let registry = Arc::new(PeerRegistry::new());
     // The shared routine→reactor channel: every per-peer pipe-routine forwards its
     // serving / status-advertise / re-query / serving-misbehavior concerns here.
     let (routine_to_reactor_tx, routine_to_reactor_rx) = mpsc::channel(ROUTINE_TO_REACTOR_DEPTH);
@@ -163,9 +265,20 @@ pub fn spawn_block_sync_reactor(
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
+        pending_body_supplier_restart: None,
+        pending_operator_body_retry: None,
+        next_needed_query_id: NonZeroU64::new(1),
         last_reset_epoch: 0,
         last_reaction_epoch: 0,
         last_view: initial_view(startup.frontiers),
+        published_body_alarm: None,
+        empty_state_body_sync_started: startup.committed_snapshots.is_none()
+            || startup.frontiers.verified_block_tip > block::Height(0),
+        empty_state_header_quiet_until: committed_snapshot.as_ref().and_then(|snapshot| {
+            empty_state_header_quiet_required(snapshot)
+                .then(|| Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD)
+        }),
+        committed_snapshot,
         startup,
         state,
         registry,
@@ -193,6 +306,8 @@ pub fn spawn_block_sync_reactor(
 pub(super) struct BlockSyncReactor {
     startup: BlockSyncStartup,
     state: BlockSyncState,
+    /// Latest atomic header-engine snapshot used to stamp body-work ownership.
+    committed_snapshot: Option<zakura_header_chain::EngineSnapshot>,
     /// Shared per-peer fact table: servable/caps/outstanding written by the
     /// per-peer pipe-routines; read by producer/candidate/trace. The reactor owns
     /// only entry insert (admission) / remove (teardown).
@@ -237,10 +352,16 @@ pub(super) struct BlockSyncReactor {
     /// download floor, but it is not verified state and must not be used for
     /// serving/status advertisement.
     request_floor: block::Height,
-    /// `(from, limit, best_header_tip, best_header_hash)` for a dispatched
-    /// `QueryNeededBlocks` action whose `NeededBlocks` response has not come
-    /// back yet.
-    pending_needed_query: Option<(block::Height, u32, block::Height, block::Hash)>,
+    /// Identity and scope of the state query awaiting a response.
+    pending_needed_query: Option<PendingNeededQuery>,
+    /// Supplier-set restart submitted against the current durable version.
+    pending_body_supplier_restart:
+        Option<(zakura_header_chain::StateVersion, block::Hash, [u8; 32])>,
+    /// Operator retry submitted against the current durable version.
+    pending_operator_body_retry: Option<(zakura_header_chain::StateVersion, block::Hash, [u8; 32])>,
+    /// Next reactor-local identity for a body-work state query.
+    /// `None` means the reactor exhausted the identifier space and stops scheduling.
+    next_needed_query_id: Option<NonZeroU64>,
     /// Last `reset_epoch` the reactor reacted to, so it can tell an advance from
     /// a destructive reset.
     last_reset_epoch: u64,
@@ -251,14 +372,30 @@ pub(super) struct BlockSyncReactor {
     /// Latest view snapshot, kept so the periodic trace tick can read the
     /// (remote) Sequencer's reorder/applying/throughput counters.
     last_view: SequencerView,
+    /// Last labeled persistent alarm exported to metrics, for exact clearing.
+    published_body_alarm: Option<zakura_header_chain::Frontier>,
+    /// True once this process has observed body progress above genesis.
+    empty_state_body_sync_started: bool,
+    /// Earliest body-query time after the latest far-ahead header bootstrap update.
+    empty_state_header_quiet_until: Option<Instant>,
+}
+
+fn empty_state_header_quiet_required(snapshot: &zakura_header_chain::EngineSnapshot) -> bool {
+    snapshot.frontiers.verified_best.height == block::Height(0)
+        && snapshot
+            .frontiers
+            .header_best
+            .height
+            .0
+            .saturating_sub(snapshot.frontiers.verified_best.height.0)
+            >= EMPTY_STATE_HEADER_QUIET_MIN_LAG
 }
 
 impl BlockSyncReactor {
     async fn run(mut self) {
         let mut header_tip = self.startup.header_tip.clone();
         let mut header_tip_open = header_tip.is_some();
-        let mut frontier_updates = self.startup.frontier_updates.clone();
-        let mut frontier_updates_open = frontier_updates.is_some();
+        let mut committed_snapshots = self.startup.committed_snapshots.clone();
         set_block_reactor_active_connection_gauge(self.state.peers.len());
         // Metrics/trace snapshot cadence only. Per-peer request timeouts are owned
         // by the routines (each sleeps to its own earliest deadline), so this timer
@@ -284,6 +421,8 @@ impl BlockSyncReactor {
             // completes, or advances the floor re-arms it to the next deadline.
             let floor_watchdog = self.earliest_floor_deadline_sleep();
             tokio::pin!(floor_watchdog);
+            let empty_state_header_quiet = self.empty_state_header_quiet_sleep();
+            tokio::pin!(empty_state_header_quiet);
             tokio::select! {
                 _ = self.startup.shutdown.cancelled() => break,
                 event = self.lifecycle.recv() => {
@@ -293,6 +432,23 @@ impl BlockSyncReactor {
                 event = self.events.recv() => {
                     let Some(event) = event else { break };
                     self.handle_event(event).await;
+                }
+                changed = async {
+                    match committed_snapshots.as_mut() {
+                        Some(snapshots) => snapshots.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_ok() {
+                        if let Some(snapshot) = committed_snapshots
+                            .as_ref()
+                            .and_then(|snapshots| snapshots.borrow().clone())
+                        {
+                            self.observe_committed_snapshot(snapshot).await;
+                        }
+                    } else {
+                        committed_snapshots = None;
+                    }
                 }
                 changed = async {
                     match header_tip.as_mut() {
@@ -310,24 +466,6 @@ impl BlockSyncReactor {
                             self.publish_metrics();
                         }
                         Err(_) => header_tip_open = false,
-                    }
-                }
-                changed = async {
-                    match frontier_updates.as_mut() {
-                        Some(frontier_updates) => frontier_updates.changed().await,
-                        None => std::future::pending().await,
-                    }
-                }, if frontier_updates_open => {
-                    match changed {
-                        Ok(()) => {
-                            let frontier_updates = frontier_updates
-                                .as_mut()
-                                .expect("frontier update receiver exists while frontier_updates_open is true");
-                            let update = *frontier_updates.borrow_and_update();
-                            self.handle_frontier_update(update).await;
-                            self.publish_metrics();
-                        }
-                        Err(_) => frontier_updates_open = false,
                     }
                 }
                 changed = self.sequencer_view.changed() => {
@@ -369,7 +507,20 @@ impl BlockSyncReactor {
                     self.run_floor_watchdog(Instant::now());
                     self.publish_metrics();
                 }
+                _ = &mut empty_state_header_quiet,
+                    if self.empty_state_header_quiet_until.is_some() =>
+                {
+                    self.empty_state_header_quiet_until = None;
+                    self.query_needed_blocks_with_options(true).await;
+                }
             }
+        }
+    }
+
+    fn empty_state_header_quiet_sleep(&self) -> time::Sleep {
+        match self.empty_state_header_quiet_until {
+            Some(deadline) => time::sleep_until(deadline.into()),
+            None => time::sleep(Duration::from_secs(3600)),
         }
     }
 
@@ -397,8 +548,13 @@ impl BlockSyncReactor {
                 continue;
             }
 
-            self.registry
-                .clear_outstanding_height(&claim.peer, claim.height);
+            if !self.registry.clear_outstanding_height_for_owner(
+                &claim.peer,
+                claim.height,
+                claim.meta.owner,
+            ) {
+                continue;
+            }
             if servable_peers > 2 {
                 self.registry.avoid_floor_height_until(
                     &claim.peer,
@@ -409,7 +565,10 @@ impl BlockSyncReactor {
             let released = self
                 .state
                 .work_queue
-                .release_reserved_and_return_items_detailed([claim.height]);
+                .release_reserved_and_return_items_detailed_for_owner(
+                    claim.meta.owner,
+                    [claim.height],
+                );
             self.state.budget.release(released.released_bytes);
             self.trace_floor_watchdog_cancelled(&claim, released);
             metrics::counter!("sync.block.floor_watchdog.cancelled").increment(1);
@@ -430,30 +589,61 @@ impl BlockSyncReactor {
         match event {
             BlockSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
             BlockSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),
+            BlockSyncEvent::RetryBodyAvailability { hash } => self.retry_body_availability(hash),
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::HeaderTipChanged { height, hash } => {
                 self.handle_header_tip_changed(height, hash).await
             }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::StateFrontiersChanged(frontiers) => {
                 self.handle_state_frontiers_changed(frontiers).await
             }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::ChainTipGrow(frontiers) => {
                 self.handle_state_frontiers_changed(frontiers).await
             }
+            #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::ChainTipReset(frontiers) => {
                 self.handle_chain_tip_reset(frontiers, true).await
             }
+            BlockSyncEvent::ScopedNeededBlocks {
+                query_id,
+                scope,
+                body_anchor,
+                blocks,
+            } => {
+                self.handle_scoped_needed_blocks(query_id, scope, body_anchor, blocks)
+                    .await;
+            }
+            #[cfg(test)]
             BlockSyncEvent::NeededBlocks(blocks) => {
-                self.handle_needed_blocks(blocks).await;
+                let scope = self
+                    .body_work_scope()
+                    .expect("test reactors synthesize a body-work scope");
+                self.handle_needed_blocks(scope, blocks).await;
             }
             BlockSyncEvent::BlockApplyFinished {
+                owner,
+                source,
                 token,
                 height,
                 hash,
-                result,
-                local_frontier,
+                outcome,
             } => {
-                self.handle_block_apply_finished(token, height, hash, result, local_frontier)
-                    .await
+                let semantic_current = matches!(
+                    outcome.verification(),
+                    zakura_header_chain::BodyVerificationOutcome::Verified(_)
+                ) || self.body_completion_is_current(source, &owner);
+                self.handle_block_apply_finished(
+                    owner,
+                    source,
+                    token,
+                    height,
+                    hash,
+                    outcome,
+                    semantic_current,
+                )
+                .await
             }
             BlockSyncEvent::BlockRangeResponseReady {
                 peer,
@@ -618,60 +808,102 @@ impl BlockSyncReactor {
         self.query_needed_blocks().await;
     }
 
-    async fn handle_frontier_update(&mut self, update: FrontierUpdate) {
-        let frontier = update.frontier;
-        let state_frontiers = BlockSyncFrontiers {
-            finalized_height: frontier.finalized.height,
-            verified_block_tip: frontier.verified_body.height,
-            verified_block_hash: frontier.verified_body.hash,
-        };
-        match update.change {
-            FrontierChange::Snapshot => {
-                self.handle_header_tip_changed(
-                    frontier.best_header.height,
-                    frontier.best_header.hash,
-                )
-                .await;
-                self.handle_state_frontiers_changed(state_frontiers).await;
-            }
-            FrontierChange::HeaderAdvanced => {
-                self.handle_header_tip_changed(
-                    frontier.best_header.height,
-                    frontier.best_header.hash,
-                )
-                .await;
-                if frontier.verified_body.height > self.verified_block_tip {
-                    self.handle_state_frontiers_changed(state_frontiers).await;
-                }
-            }
-            FrontierChange::HeaderReanchored => {
-                self.state.best_header_tip = frontier.best_header.height;
-                self.state.best_header_hash = frontier.best_header.hash;
-                self.handle_chain_tip_reset(state_frontiers, false).await;
-            }
-            FrontierChange::VerifiedGrow => {
-                self.handle_state_frontiers_changed(state_frontiers).await;
-                if frontier.best_header.height > self.state.best_header_tip {
-                    self.handle_header_tip_changed(
-                        frontier.best_header.height,
-                        frontier.best_header.hash,
+    async fn observe_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
+        let previous = self.committed_snapshot.clone();
+        let previous_scope = self.body_work_scope();
+        let preserves_download_pipeline = previous
+            .as_ref()
+            .is_some_and(|old| body_progress_preserves_download_pipeline(old, &snapshot));
+        let previous_body_alarm = previous.as_ref().and_then(|snapshot| {
+            snapshot
+                .alarms
+                .header_best_body_unavailable
+                .filter(|summary| summary.alarmed)
+                .map(|_| {
+                    (
+                        zakura_header_chain::BodyWorkAuthority::for_snapshot(snapshot),
+                        snapshot.frontiers.header_best.hash,
                     )
-                    .await;
+                })
+        });
+        let frontiers = block_sync_frontiers(&snapshot);
+        let header_best = snapshot.frontiers.header_best;
+        self.committed_snapshot = Some(snapshot.clone());
+        self.pending_body_supplier_restart = None;
+        self.pending_operator_body_retry = None;
+        synchronize_persisted_body_alarm(&self.registry, Some(&snapshot));
+
+        let current_alarm_hash = snapshot
+            .alarms
+            .header_best_body_unavailable
+            .filter(|summary| summary.alarmed)
+            .map(|_| header_best.hash);
+        if let Some((scope, hash)) =
+            previous_body_alarm.filter(|(_, hash)| Some(*hash) != current_alarm_hash)
+        {
+            let _ = self
+                .sequencer_control
+                .send(SequencerControlInput::BodyAlarmCleared { scope, hash });
+        }
+
+        let current_scope = self.body_work_scope();
+        if previous.as_ref().map(|old| old.state_version) != Some(snapshot.state_version) {
+            let _ = self
+                .sequencer_control
+                .send(SequencerControlInput::StateVersionChanged(
+                    snapshot.state_version,
+                ));
+        }
+        if current_scope != previous_scope {
+            if preserves_download_pipeline {
+                if let Some(scope) = current_scope {
+                    let _ = self
+                        .sequencer_control
+                        .send(SequencerControlInput::WorkScopeAdvanced { scope });
                 }
-            }
-            FrontierChange::VerifiedReset => {
-                self.handle_chain_tip_reset(state_frontiers, true).await;
-                if frontier.best_header.height > self.state.best_header_tip {
-                    self.handle_header_tip_changed(
-                        frontier.best_header.height,
-                        frontier.best_header.hash,
-                    )
-                    .await;
-                }
+            } else {
+                let released = match current_scope {
+                    Some(scope) => self.state.work_queue.retire_obsolete_scope(scope),
+                    None => self.state.work_queue.retire_all(),
+                };
+                self.state.budget.release(released);
+                let _ = self
+                    .sequencer_control
+                    .send(SequencerControlInput::WorkScopeChanged {
+                        scope: current_scope,
+                    });
             }
         }
-        // Per-peer request timeouts are reclaimed by the routines themselves (each
-        // sleeps to its earliest deadline); the reactor no longer sweeps here.
+
+        let header_changed = previous
+            .as_ref()
+            .is_none_or(|old| old.frontiers.header_best != header_best);
+        if header_changed {
+            self.state.best_header_tip = header_best.height;
+            self.state.best_header_hash = header_best.hash;
+            if !self.empty_state_body_sync_started && empty_state_header_quiet_required(&snapshot) {
+                self.empty_state_header_quiet_until =
+                    Some(Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD);
+            }
+        }
+
+        match previous.as_ref() {
+            None => self.handle_chain_tip_reset(frontiers, false).await,
+            Some(old) if old.verified_generation != snapshot.verified_generation => {
+                self.handle_chain_tip_reset(frontiers, false).await;
+            }
+            Some(old)
+                if old.frontiers.verified_best != snapshot.frontiers.verified_best
+                    || old.frontiers.finalized != snapshot.frontiers.finalized =>
+            {
+                self.handle_state_frontiers_changed(frontiers).await;
+            }
+            Some(_) => {}
+        }
+
+        if header_changed || (current_scope != previous_scope && !preserves_download_pipeline) {
+            self.query_needed_blocks_with_options(true).await;
+        }
     }
 
     async fn handle_state_frontiers_changed(&mut self, frontiers: BlockSyncFrontiers) {
@@ -800,6 +1032,11 @@ impl BlockSyncReactor {
         let old_serving_tip = (self.state.servable_high, self.state.servable_hash);
         let tip_advanced = view.verified_tip > self.verified_block_tip;
 
+        if view.verified_tip > block::Height(0) {
+            self.empty_state_body_sync_started = true;
+            self.empty_state_header_quiet_until = None;
+        }
+
         self.last_view = view;
         self.state.finalized_height = self.state.finalized_height.max(view.finalized);
         self.verified_block_tip = view.verified_tip;
@@ -856,7 +1093,11 @@ impl BlockSyncReactor {
         self.query_needed_blocks_with_options(reset_advanced).await;
     }
 
-    async fn handle_needed_blocks(&mut self, blocks: Vec<BlockSyncBlockMeta>) {
+    async fn handle_needed_blocks(
+        &mut self,
+        scope: zakura_header_chain::BodyWorkAuthority,
+        blocks: Vec<BlockSyncBlockMeta>,
+    ) {
         self.pending_needed_query = None;
         // The state reports every header-known, body-missing height above the
         // download floor, but it has no visibility into our in-memory buffers.
@@ -894,9 +1135,11 @@ impl BlockSyncReactor {
             .filter(|block| {
                 block.height > self.request_floor
                     && !self.state.work_queue.in_flight_contains(block.height)
-                    && !self
-                        .registry
-                        .has_outstanding_request(block.height, block.hash)
+                    && !self.registry.has_outstanding_request_in_scope(
+                        scope,
+                        block.height,
+                        block.hash,
+                    )
             })
             .collect();
 
@@ -920,12 +1163,55 @@ impl BlockSyncReactor {
         // the matching heights already being takeable, with no extend-vs-observe
         // race.
         let count = self.state.work_queue.extend(
+            scope,
             blocks
                 .into_iter()
                 .map(|block| (block.height, block.hash, block.size)),
         );
         self.trace_work_extended(count);
         self.publish_candidate_state();
+    }
+
+    async fn handle_scoped_needed_blocks(
+        &mut self,
+        query_id: NonZeroU64,
+        scope: zakura_header_chain::BodyWorkAuthority,
+        body_anchor: zakura_header_chain::Frontier,
+        blocks: Vec<BlockSyncBlockMeta>,
+    ) {
+        let completion = (query_id, scope);
+        let pending = self
+            .pending_needed_query
+            .map(|pending| (pending.query_id, pending.scope));
+        if pending != Some(completion) {
+            metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query")
+                .increment(1);
+            return;
+        }
+        self.pending_needed_query = None;
+
+        if self.body_work_scope() != Some(scope) {
+            metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks")
+                .increment(1);
+            self.query_needed_blocks().await;
+            return;
+        }
+        let anchor_changed = body_anchor.height != self.verified_block_tip
+            || body_anchor.hash != self.state.verified_block_hash;
+        if anchor_changed {
+            let frontiers = BlockSyncFrontiers {
+                finalized_height: self.state.finalized_height,
+                verified_block_tip: body_anchor.height,
+                verified_block_hash: body_anchor.hash,
+            };
+            if body_anchor.height > self.verified_block_tip {
+                self.handle_state_frontiers_changed(frontiers).await;
+            } else {
+                self.handle_chain_tip_reset(frontiers, false).await;
+            }
+            return;
+        }
+        self.handle_needed_blocks(scope, blocks).await;
     }
 
     /// Header tip minus verified body tip, emitted as the `body_lag` trace field
@@ -975,9 +1261,138 @@ impl BlockSyncReactor {
             return;
         }
         self.publish_candidate_state();
+        self.restart_body_alarm_for_new_supplier();
         if send_reply {
             self.send_status(&peer, "status_reply");
         }
+    }
+
+    fn restart_body_alarm_for_new_supplier(&mut self) {
+        let Some(snapshot) = self.committed_snapshot.as_ref() else {
+            return;
+        };
+        let Some(previous) = snapshot
+            .alarms
+            .header_best_body_unavailable
+            .filter(|summary| summary.alarmed)
+        else {
+            return;
+        };
+        let header = snapshot.frontiers.header_best;
+        let eligible_sources = self.registry.eligible_sources(header.height);
+        let suppliers = u32::try_from(eligible_sources.len()).unwrap_or(u32::MAX);
+        let supplier_set_digest =
+            zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(&eligible_sources);
+        let has_new_supplier = suppliers > previous.suppliers
+            || (suppliers == previous.suppliers
+                && supplier_set_digest != previous.supplier_set_digest);
+        if !has_new_supplier
+            || self.pending_body_supplier_restart
+                == Some((snapshot.state_version, header.hash, supplier_set_digest))
+        {
+            return;
+        }
+
+        let now = chrono::Utc::now();
+        let availability = zakura_header_chain::BodyUnavailableSummary {
+            started_at: previous.started_at,
+            attempts: previous.attempts,
+            suppliers,
+            supplier_set_digest,
+            alarmed: true,
+            next_probe_at: now,
+        };
+        let mut hasher = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(b"ZkBodyDiscover1_")
+            .to_state();
+        hasher.update(&snapshot.state_version.get().to_le_bytes());
+        hasher.update(&header.height.0.to_le_bytes());
+        hasher.update(&header.hash.0);
+        hasher.update(&supplier_set_digest);
+        let discovery = zakura_header_chain::BodySupplierDiscovered {
+            hash: header.hash,
+            evidence: zakura_header_chain::EvidenceId::from_digest(
+                hasher
+                    .finalize()
+                    .as_bytes()
+                    .try_into()
+                    .expect("the configured discovery digest is exactly 32 bytes"),
+            ),
+            availability,
+        };
+        if !self.dispatch_action(BlockSyncAction::RestartBodyAvailability {
+            expected_version: snapshot.state_version,
+            discovery,
+        }) {
+            return;
+        }
+        self.pending_body_supplier_restart =
+            Some((snapshot.state_version, header.hash, supplier_set_digest));
+    }
+
+    fn retry_body_availability(&mut self, hash: block::Hash) {
+        let Some(snapshot) = self.committed_snapshot.as_ref() else {
+            return;
+        };
+        let header = snapshot.frontiers.header_best;
+        if header.hash != hash
+            || !snapshot
+                .alarms
+                .header_best_body_unavailable
+                .is_some_and(|summary| summary.alarmed)
+        {
+            return;
+        }
+        let eligible_sources = self.registry.eligible_sources(header.height);
+        let suppliers = u32::try_from(eligible_sources.len()).unwrap_or(u32::MAX);
+        if suppliers == 0 {
+            return;
+        }
+        let supplier_set_digest =
+            zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(&eligible_sources);
+        if self.pending_operator_body_retry
+            == Some((snapshot.state_version, header.hash, supplier_set_digest))
+        {
+            return;
+        }
+
+        let now = chrono::Utc::now();
+        let availability = zakura_header_chain::BodyUnavailableSummary {
+            started_at: now,
+            attempts: 0,
+            suppliers,
+            supplier_set_digest,
+            alarmed: false,
+            next_probe_at: now,
+        };
+        let mut hasher = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(b"ZkBodyOperator1_")
+            .to_state();
+        hasher.update(&snapshot.state_version.get().to_le_bytes());
+        hasher.update(&header.height.0.to_le_bytes());
+        hasher.update(&header.hash.0);
+        hasher.update(&supplier_set_digest);
+        let retry = zakura_header_chain::OperatorBodyRetry {
+            hash: header.hash,
+            evidence: zakura_header_chain::EvidenceId::from_digest(
+                hasher
+                    .finalize()
+                    .as_bytes()
+                    .try_into()
+                    .expect("the configured operator-retry digest is exactly 32 bytes"),
+            ),
+            availability,
+        };
+        if !self.dispatch_action(BlockSyncAction::RetryBodyAvailability {
+            expected_version: snapshot.state_version,
+            retry,
+        }) {
+            return;
+        }
+        self.pending_operator_body_retry =
+            Some((snapshot.state_version, header.hash, supplier_set_digest));
     }
 
     async fn handle_get_blocks(
@@ -1120,31 +1535,48 @@ impl BlockSyncReactor {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_block_apply_finished(
         &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
         token: BlockApplyToken,
         height: block::Height,
         hash: block::Hash,
-        result: BlockApplyResult,
-        local_frontier: Option<BlockSyncFrontiers>,
+        outcome: BlockApplyOutcome,
+        semantic_current: bool,
     ) {
-        // The whole commit-pipeline body (token validate, embedded local-frontier
-        // advance, applying removal, throughput record, rollback + misbehavior,
-        // drain + submit) runs on the Sequencer task. The reactor
+        // The whole commit-pipeline body (token validate, applying removal,
+        // throughput record, rollback + misbehavior, drain + submit) runs on the
+        // Sequencer task. The reactor
         // forwards the completion and reacts to the resulting progress view
         // (serving/status/query/schedule) on the `view` arm.
-        self.trace_apply_finished(height, token, result, self.state.budget.reserved());
+        self.trace_apply_finished(
+            height,
+            token,
+            outcome.result(),
+            self.state.budget.reserved(),
+        );
+        let persisted_availability = self.committed_snapshot.as_ref().and_then(|snapshot| {
+            (snapshot.frontiers.header_best.hash == hash)
+                .then_some(snapshot.alarms.header_best_body_unavailable)
+                .flatten()
+        });
         let capacity = self.sequencer_input.capacity();
         let max_capacity = self.sequencer_input.max_capacity();
         let started = Instant::now();
         let send_result = self
             .sequencer_control
             .send(SequencerControlInput::ApplyFinished {
+                owner: Box::new(owner),
+                source,
                 token,
                 height,
                 hash,
-                result,
-                local_frontier,
+                outcome,
+                eligible_sources: self.registry.eligible_sources(height),
+                persisted_availability,
+                semantic_current,
             });
         self.trace_sequencer_control_send(
             "apply_finished",
@@ -1195,6 +1627,9 @@ impl BlockSyncReactor {
         if !self.startup.state_queries_enabled {
             return false;
         }
+        if self.empty_state_header_quiet_until.is_some() {
+            return true;
+        }
         if self.request_floor >= self.state.best_header_tip {
             self.pending_needed_query = None;
             return true;
@@ -1206,36 +1641,105 @@ impl BlockSyncReactor {
             return true;
         }
         let limit = self.refill_query_limit_blocks(from);
-        let query = (
-            from,
-            limit,
-            self.state.best_header_tip,
-            self.state.best_header_hash,
-        );
-        if self.pending_needed_query == Some(query) {
-            return true;
-        }
-        let dispatched = self.dispatch_action(BlockSyncAction::QueryNeededBlocks {
+        let Some(scope) = self.body_work_scope() else {
+            tracing::error!("cannot schedule Zakura body work without a committed engine snapshot");
+            return false;
+        };
+        let Some(query_id) = self.next_needed_query_id else {
+            tracing::error!("exhausted Zakura body-work state-query identifiers");
+            return false;
+        };
+        let query = PendingNeededQuery {
+            query_id,
+            scope,
             from,
             limit,
             best_header_tip: self.state.best_header_tip,
+            best_header_hash: self.state.best_header_hash,
+        };
+        if self.pending_needed_query.is_some_and(|pending| {
+            pending.scope == query.scope
+                && pending.from == query.from
+                && pending.limit == query.limit
+                && pending.best_header_tip == query.best_header_tip
+                && pending.best_header_hash == query.best_header_hash
+        }) {
+            return true;
+        }
+        let dispatched = self.dispatch_action(BlockSyncAction::QueryNeededBlocks {
+            query_id,
+            from,
+            limit,
+            best_header_tip: self.state.best_header_tip,
+            scope,
         });
         if dispatched {
             self.pending_needed_query = Some(query);
+            self.next_needed_query_id = query_id.get().checked_add(1).and_then(NonZeroU64::new);
         }
         dispatched
     }
 
-    /// Where the next producer query starts: the lowest height above the request
-    /// floor that the WorkQueue does not already hold.
-    ///
-    /// This is deliberately *not* `max_claimed() + 1`. A forward-only cursor can
-    /// never re-offer a height that left `pending`/`in_flight` while a higher
-    /// height stayed claimed, so a single such height permanently pins the
-    /// download floor one below it and the reorder buffer grows without bound.
-    /// Both observed stalls reached that state: a destructive `reset_above` racing
-    /// an unreceived request, and a refill batch whose surviving heights advanced
-    /// `max_claimed` past the one the `has_outstanding_request` filter dropped.
+    fn body_work_scope(&self) -> Option<zakura_header_chain::BodyWorkAuthority> {
+        let scope = self
+            .committed_snapshot
+            .as_ref()
+            .map(zakura_header_chain::BodyWorkAuthority::for_snapshot);
+        #[cfg(not(test))]
+        {
+            scope
+        }
+        #[cfg(test)]
+        {
+            scope.or_else(|| {
+                self.startup.committed_snapshots.is_none().then_some(
+                    zakura_header_chain::BodyWorkAuthority {
+                        header: zakura_header_chain::HeaderWorkAuthority {
+                            header_generation: zakura_header_chain::HeaderGeneration::new(0),
+                            branch: zakura_header_chain::BranchId::new(
+                                self.startup.frontiers.verified_block_hash,
+                                self.state.best_header_hash,
+                            ),
+                        },
+                        verified_generation: zakura_header_chain::VerifiedGeneration::new(0),
+                    },
+                )
+            })
+        }
+    }
+
+    fn body_completion_is_current(
+        &self,
+        source: zakura_header_chain::SourceId,
+        owner: &zakura_header_chain::BodyWorkOwner,
+    ) -> bool {
+        let current = self
+            .startup
+            .committed_snapshots
+            .as_ref()
+            .and_then(|snapshots| snapshots.borrow().clone());
+        #[cfg(test)]
+        if current.is_none() {
+            return self.body_work_scope() == Some(owner.authority());
+        }
+        let Some(current) = current else {
+            return false;
+        };
+        let mut pending = zakura_header_chain::PendingOwners::default();
+        pending.insert(source, *owner);
+        match zakura_header_chain::Gate::check(&current, &pending, source, owner) {
+            zakura_header_chain::CompletionDecision::Current => true,
+            zakura_header_chain::CompletionDecision::Stale(reason) => {
+                metrics::counter!(
+                    "sync.header_chain.stale_completion.total",
+                    "kind" => format!("body_{reason:?}")
+                )
+                .increment(1);
+                false
+            }
+        }
+    }
+
     fn next_needed_block_query_start(&self) -> Option<block::Height> {
         let from = self
             .state
@@ -1266,7 +1770,9 @@ impl BlockSyncReactor {
         // The unreceived in-flight heights live in the routines, mirrored into the
         // registry's per-peer outstanding set (per-request granularity: each entry
         // is one still-unreceived requested height). `total_unreceived` sums them.
-        let outstanding = self.registry.total_unreceived();
+        let outstanding = self
+            .body_work_scope()
+            .map_or(0, |scope| self.registry.total_unreceived_in_scope(scope));
 
         // Count only the download pipeline (pending WorkQueue heights + the
         // unreceived heights of in-flight requests) against the refill low-water
@@ -1536,11 +2042,14 @@ impl BlockSyncReactor {
         // first real advertisement after connect is silently dropped (the
         // connect-time retry would have already taken the window).
         let status = self.local_status();
-        let status_changed = self.state.pending_status_refresh
-            && status != self.state.last_advertised_status
-            && self.state.status_refresh.try_take(now);
+        let status_needs_refresh =
+            self.state.pending_status_refresh && status != self.state.last_advertised_status;
+        let status_changed = status_needs_refresh && self.state.status_refresh.try_take(now);
 
-        self.state.pending_status_refresh = false;
+        // Keep a rate-limited change pending until the periodic tick advertises the
+        // latest status. Clearing the change here can lose a serving-tip advance
+        // when several commits occur during one refresh interval.
+        self.state.pending_status_refresh = status_needs_refresh && !status_changed;
         if status_changed {
             self.state.last_advertised_status = status;
             let _ = self.status.send(status);
@@ -1634,7 +2143,7 @@ impl BlockSyncReactor {
         })
     }
 
-    fn publish_metrics(&self) {
+    fn publish_metrics(&mut self) {
         // These lossy casts are metrics-only gauges; consensus and scheduling
         // continue to use the original integer values.
         let view = *self.sequencer_view.borrow();
@@ -1664,6 +2173,74 @@ impl BlockSyncReactor {
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).
         metrics::gauge!("sync.block.outstanding").set(self.registry.total_unreceived() as f64);
+        self.publish_body_unavailable_metrics();
+    }
+
+    fn publish_body_unavailable_metrics(&mut self) {
+        let current = self.committed_snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .alarms
+                .header_best_body_unavailable
+                .filter(|summary| summary.alarmed)
+                .map(|summary| (snapshot.frontiers.header_best, summary))
+        });
+        let current_frontier = current.map(|(frontier, _)| frontier);
+        if self.published_body_alarm != current_frontier {
+            if let Some(previous) = self.published_body_alarm {
+                let hash = format!("{:?}", previous.hash);
+                let height = previous.height.0.to_string();
+                metrics::gauge!(
+                    "sync.header_chain.body_unavailable",
+                    "hash" => hash.clone(),
+                    "height" => height.clone(),
+                )
+                .set(0.0);
+                for name in [
+                    "sync.header_chain.body_unavailable.age_seconds",
+                    "sync.header_chain.body_unavailable.attempts",
+                    "sync.header_chain.body_unavailable.available_suppliers",
+                ] {
+                    metrics::gauge!(name, "hash" => hash.clone(), "height" => height.clone())
+                        .set(0.0);
+                }
+            }
+            self.published_body_alarm = current_frontier;
+        }
+        metrics::gauge!("sync.header_chain.body_unavailable.active")
+            .set(f64::from(current.is_some()));
+        if let Some((frontier, summary)) = current {
+            let hash = format!("{:?}", frontier.hash);
+            let height = frontier.height.0.to_string();
+            let age_seconds = chrono::Utc::now()
+                .signed_duration_since(summary.started_at)
+                .num_milliseconds()
+                .max(0) as f64
+                / 1_000.0;
+            metrics::gauge!(
+                "sync.header_chain.body_unavailable",
+                "hash" => hash.clone(),
+                "height" => height.clone(),
+            )
+            .set(1.0);
+            metrics::gauge!(
+                "sync.header_chain.body_unavailable.age_seconds",
+                "hash" => hash.clone(),
+                "height" => height.clone(),
+            )
+            .set(age_seconds);
+            metrics::gauge!(
+                "sync.header_chain.body_unavailable.attempts",
+                "hash" => hash.clone(),
+                "height" => height.clone(),
+            )
+            .set(f64::from(summary.attempts));
+            metrics::gauge!(
+                "sync.header_chain.body_unavailable.available_suppliers",
+                "hash" => hash,
+                "height" => height,
+            )
+            .set(f64::from(summary.suppliers));
+        }
     }
 
     fn clamp_served_block_count(&self, start_height: block::Height, count: u32) -> u32 {

@@ -156,6 +156,7 @@ fn header_daa_accepts_valid_threshold_with_full_context() {
         &network,
         relevant_headers.clone(),
     )
+    .expect("the test supplies the complete late-chain difficulty context")
     .expected_difficulty_threshold();
     let mut candidate = *zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
@@ -251,6 +252,7 @@ fn short_context_early_height_uses_pow_limit_threshold() {
         &network,
         context,
     )
+    .expect("height one requires exactly one predecessor")
     .expected_difficulty_threshold();
 
     assert_eq!(expected, network.target_difficulty_limit().to_compact());
@@ -281,6 +283,7 @@ fn full_context_at_averaging_window_height_uses_pow_limit_threshold() {
         &network,
         context,
     )
+    .expect("the test supplies the complete late-chain difficulty context")
     .expected_difficulty_threshold();
 
     assert_eq!(expected, difficulty);

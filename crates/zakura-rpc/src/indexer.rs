@@ -80,7 +80,36 @@ impl BlockAndHash {
                     .zcash_deserialize_into()
                     .map_err(|err| tracing::warn!(?err, "failed to deserialize block",))
                     .ok()
-                    .zip(Some(hash))
+                    .and_then(|block: block::Block| {
+                        block.coinbase_height().map(|_| (block, hash)).or_else(|| {
+                            tracing::warn!("decoded block is missing a coinbase height");
+                            None
+                        })
+                    })
+            })
+    }
+}
+
+impl BlockAndHeight {
+    /// Creates a new [`BlockAndHeight`] from a [`block::Height`] and the
+    /// block's Zcash consensus serialization.
+    pub fn new(block::Height(height): block::Height, data: Vec<u8>) -> Self {
+        BlockAndHeight { height, data }
+    }
+
+    /// Try to convert a [`BlockAndHeight`] into a tuple of a decoded block and height.
+    pub fn decode(self) -> Option<(block::Block, block::Height)> {
+        block::Height::try_from(self.height)
+            .map_err(|err| {
+                tracing::warn!(?err, "failed to convert height: {}", self.height);
+            })
+            .ok()
+            .and_then(|height| {
+                self.data
+                    .zcash_deserialize_into()
+                    .map_err(|err| tracing::warn!(?err, "failed to deserialize block",))
+                    .ok()
+                    .zip(Some(height))
             })
     }
 }

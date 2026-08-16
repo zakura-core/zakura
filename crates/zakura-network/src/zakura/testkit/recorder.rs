@@ -1,7 +1,7 @@
 //! Bounded inbound sink used by Zakura tests.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -35,6 +35,7 @@ pub struct InboundRecorder {
     capacity: usize,
     messages: Arc<Mutex<VecDeque<RecordedInbound>>>,
     dropped: Arc<AtomicUsize>,
+    active_sessions: Arc<Mutex<HashMap<(ZakuraPeerId, ZakuraConnId), u64>>>,
 }
 
 impl InboundRecorder {
@@ -44,6 +45,17 @@ impl InboundRecorder {
             capacity: capacity.max(1),
             messages: Arc::new(Mutex::new(VecDeque::with_capacity(capacity.max(1)))),
             dropped: Arc::new(AtomicUsize::new(0)),
+            active_sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn finish_session(&self, peer_id: &ZakuraPeerId, conn_id: ZakuraConnId, session_id: u64) {
+        let mut active_sessions = self
+            .active_sessions
+            .lock()
+            .expect("recorder active-session mutex should not be poisoned");
+        if active_sessions.get(&(peer_id.clone(), conn_id)) == Some(&session_id) {
+            active_sessions.remove(&(peer_id.clone(), conn_id));
         }
     }
 
@@ -118,27 +130,40 @@ impl Service for InboundRecorder {
         legacy_gossip_streams()
     }
 
+    fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        self.active_sessions
+            .lock()
+            .expect("recorder active-session mutex should not be poisoned")
+            .contains_key(&(peer.clone(), conn_id))
+    }
+
     fn add_peer(&self, mut peer: Peer) {
         for stream in self
             .streams()
             .iter()
             .filter(|stream| matches!(stream.mode, crate::zakura::StreamMode::Ordered))
         {
-            let Some((mut recv, _send)) = peer.take_stream(stream.kind) else {
+            let Some((session_id, mut recv, _send)) = peer.take_stream_with_session_id(stream.kind)
+            else {
                 continue;
             };
             // The recorder observes inbound frames only; it has no source side.
             let recorder = self.clone();
             let peer_id = peer.id.clone();
+            let conn_id = peer.conn_id;
             let stream_kind = stream.kind;
             let cancel_token = peer.cancel_token();
+            self.active_sessions
+                .lock()
+                .expect("recorder active-session mutex should not be poisoned")
+                .insert((peer_id.clone(), conn_id), session_id);
             tokio::spawn(async move {
                 loop {
                     let frame = tokio::select! {
-                        _ = cancel_token.cancelled() => return,
+                        _ = cancel_token.cancelled() => break,
                         frame = recv.recv() => {
                             let Some(frame) = frame else {
-                                return;
+                                break;
                             };
                             frame
                         }
@@ -148,11 +173,17 @@ impl Service for InboundRecorder {
                         debug!(?error, ?peer_id, "inbound recorder could not record frame");
                     }
                 }
+                recorder.finish_session(&peer_id, conn_id, session_id);
             });
         }
     }
 
-    fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
+    fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
+        self.active_sessions
+            .lock()
+            .expect("recorder active-session mutex should not be poisoned")
+            .remove(&(peer.clone(), conn_id));
+    }
 
     fn deliver_frame(
         &self,
@@ -167,6 +198,34 @@ impl Service for InboundRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer_session(
+        peer_id: ZakuraPeerId,
+        conn_id: ZakuraConnId,
+        session_id: u64,
+    ) -> (Peer, crate::zakura::FramedSend) {
+        let (peer_send, service_recv) = crate::zakura::framed_channel(1);
+        let (service_send, _peer_recv) = crate::zakura::framed_channel(1);
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let stream = crate::zakura::ServiceStream::new(
+            session_id,
+            1,
+            service_recv,
+            service_send,
+            cancel_token.child_token(),
+        );
+        let peer = Peer::new_with_service_streams(
+            conn_id,
+            peer_id,
+            None,
+            crate::zakura::ZAKURA_CAP_LEGACY_GOSSIP,
+            crate::zakura::ServicePeerDirection::Outbound,
+            HashMap::from([(crate::zakura::ZAKURA_STREAM_GOSSIP, stream)]),
+            cancel_token,
+            crate::zakura::CloseCause::new(),
+        );
+        (peer, peer_send)
+    }
 
     #[test]
     fn recorder_is_bounded_and_reports_drops() {
@@ -191,5 +250,31 @@ mod tests {
         assert_eq!(messages[0].frame.payload, vec![2]);
         assert_eq!(messages[1].frame.payload, vec![3]);
         assert_eq!(recorder.dropped_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn recorder_ownership_is_connection_and_session_scoped() {
+        let recorder = InboundRecorder::new(1);
+        let peer_id = ZakuraPeerId::new(vec![7; 32]).expect("valid test peer id");
+        let (first, first_send) = peer_session(peer_id.clone(), 11, 1);
+        recorder.add_peer(first);
+        assert!(recorder.owns_connection_for_peer(&peer_id, 11));
+
+        let (replacement, replacement_send) = peer_session(peer_id.clone(), 11, 2);
+        recorder.add_peer(replacement);
+        recorder.finish_session(&peer_id, 11, 1);
+        assert!(
+            recorder.owns_connection_for_peer(&peer_id, 11),
+            "stale session teardown must not release replacement ownership"
+        );
+
+        recorder.remove_peer(&peer_id, 12);
+        assert!(
+            recorder.owns_connection_for_peer(&peer_id, 11),
+            "another connection generation must not release ownership"
+        );
+        recorder.remove_peer(&peer_id, 11);
+        assert!(!recorder.owns_connection_for_peer(&peer_id, 11));
+        drop((first_send, replacement_send));
     }
 }

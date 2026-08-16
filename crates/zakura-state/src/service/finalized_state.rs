@@ -22,7 +22,6 @@ use std::{
     },
 };
 
-use tokio::sync::oneshot;
 use zakura_chain::{
     block, ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
@@ -82,6 +81,7 @@ pub(crate) mod commitment_aux;
 pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
+pub(super) mod header_chain;
 mod vct;
 pub mod vct_treestate_audit;
 mod zakura_db;
@@ -106,22 +106,21 @@ pub use commitment_aux::{
 pub use disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk};
 #[allow(unused_imports)]
 pub use disk_format::{
-    FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
-    MAX_ON_DISK_HEIGHT,
+    FallibleDiskValue, FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex,
+    TransactionLocation, MAX_ON_DISK_HEIGHT,
 };
-pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, NextVctBlock};
+#[cfg(any(test, feature = "header-fuzz"))]
+pub use header_chain::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
+pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, VctSuccessorWitness};
+pub(crate) use vct::{VctAuthenticationProof, VctAuxiliaryFailureAttribution, VctAuxiliaryWindow};
 pub use vct_treestate_audit::{
     derived_roots_in_display_order, inventory, inventory_with_scans, measure_derivations,
     replay_inputs, verify_subtrees_against_stored, DerivationSample, ReplayInputs,
     SubtreeVerification, VctTreestateInventory,
 };
 #[allow(unused_imports)]
-pub use zakura_db::commitment_roots_db::{
-    AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
-    CommitmentRootIndexIssue, HeaderRootAuthFrontier, HeaderRootAuthFrontierError,
-    HeaderRootAuthState, HeaderRootAuthUpdate, HeaderWitnessState, COMMITMENT_ROOTS_BY_HEIGHT,
-    HEADER_ROOT_AUTH_FRONTIER,
-};
+pub use zakura_db::commitment_roots_db::{CommitmentRootIndexIssue, COMMITMENT_ROOTS_BY_HEIGHT};
+#[allow(unused_imports)]
 pub use zakura_db::highest_completed_checkpoint::*;
 pub use zakura_db::ZakuraDb;
 
@@ -151,6 +150,19 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "zakura_header_height_by_hash",
     "zakura_header_by_height",
     ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+    // Fork-aware header-chain engine v1
+    HEADER_NODE_BY_HASH,
+    HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+    HEADER_BODY_EVIDENCE_AUTHORITY,
+    HEADER_CHILD,
+    HEADER_SELECTED,
+    HEADER_VERIFIED,
+    HEADER_ELIGIBILITY_ROOT,
+    HEADER_AUX_DELIVERY,
+    HEADER_DEFERRED,
+    HEADER_FINALITY_HISTORY,
+    HEADER_VALIDATION_CONTEXT,
+    HEADER_ENGINE_META,
     // Transactions
     "tx_by_loc",
     "hash_by_tx_loc",
@@ -186,12 +198,36 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     BLOCK_INFO,
     // Verified-commitment-trees serving index
     COMMITMENT_ROOTS_BY_HEIGHT,
-    HEADER_ROOT_AUTH_FRONTIER,
     // Storage policy
     PRUNING_METADATA,
     VCT_SYNC_METADATA,
     VCT_UPGRADE_METADATA,
 ];
+
+/// Fork-aware header-chain node rows keyed by canonical hash.
+pub const HEADER_NODE_BY_HASH: &str = "header_node_by_hash_v1";
+/// Append-only consensus-invalid body evidence keyed by canonical header hash.
+pub const HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE: &str = "header_consensus_invalid_tombstone_v1";
+/// Durable full-state authority for verified and consensus-invalid body projections.
+pub const HEADER_BODY_EVIDENCE_AUTHORITY: &str = "header_body_evidence_authority_v1";
+/// Parent/child adjacency index.
+pub const HEADER_CHILD: &str = "header_child_v1";
+/// Reconstructible selected-header projection.
+pub const HEADER_SELECTED: &str = "header_selected_v1";
+/// Reconstructible verified-header projection.
+pub const HEADER_VERIFIED: &str = "header_verified_v1";
+/// Direct eligibility reason roots.
+pub const HEADER_ELIGIBILITY_ROOT: &str = "header_eligibility_root_v1";
+/// Hash-keyed auxiliary deliveries.
+pub const HEADER_AUX_DELIVERY: &str = "header_aux_delivery_v1";
+/// Ordered future-time deferral index.
+pub const HEADER_DEFERRED: &str = "header_deferred_v1";
+/// Authoritative append-only finality history.
+pub const HEADER_FINALITY_HISTORY: &str = "header_finality_history_v1";
+/// Immutable validation-context rows.
+pub const HEADER_VALIDATION_CONTEXT: &str = "header_validation_context_v1";
+/// Singleton header-engine metadata root.
+pub const HEADER_ENGINE_META: &str = "header_engine_meta_v1";
 
 /// The name of the column family that records pruning progress.
 ///
@@ -353,12 +389,7 @@ impl FinalizedState {
             read_only,
         )?;
 
-        let vct = VctState::from_config(
-            config.checkpoint_sync,
-            config.vct_fast_sync,
-            network,
-            db.clone(),
-        );
+        let vct = VctState::from_config(config.checkpoint_sync, config.vct_fast_sync, network);
 
         // Re-derive this flag from the durable fast-sync marker, so reopening
         // before the checkpoint handoff still refuses roots below the last
@@ -485,7 +516,7 @@ impl FinalizedState {
     /// This is the single place the raw-transaction retention decision is made:
     /// whether to write this block's raw transactions, which aged-out or backlog
     /// range to delete, and how to advance the pruning marker.
-    /// [`ZakuraDb::write_block`] applies the returned plan without re-deriving it.
+    /// [`ZakuraDb::write_block_with`] applies the returned plan without re-deriving it.
     ///
     /// `is_checkpoint` selects the checkpoint-sync policy (a retention start
     /// before which raw transactions are skipped, plus bounded archive-backlog
@@ -564,21 +595,99 @@ impl FinalizedState {
         &mut self,
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        next_vct_block: Option<NextVctBlock>,
+        vct_successor_witness: Option<VctSuccessorWitness>,
     ) -> Result<
-        (
-            CheckpointVerifiedBlock,
-            NoteCommitmentTrees,
-            oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
-        ),
+        (CheckpointVerifiedBlock, NoteCommitmentTrees),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     > {
+        self.commit_finalized_inner(
+            ordered_block,
+            prev_note_commitment_trees,
+            vct_successor_witness,
+            None,
+        )
+    }
+
+    /// Commit a checkpoint block and delegate its exact full-state batch to `commit`.
+    pub(in crate::service) fn commit_finalized_with_aux_and<C>(
+        &mut self,
+        ordered_block: QueuedCheckpointVerified,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        vct_auxiliary_window: Option<VctAuxiliaryWindow>,
+        commit: C,
+    ) -> Result<
+        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+    >
+    where
+        C: FnOnce(
+            &mut ZakuraDb,
+            DiskWriteBatch,
+            VctAuthenticationProof,
+        ) -> Result<(), CommitCheckpointVerifiedError>,
+    {
+        let vct_successor_witness = vct_auxiliary_window
+            .as_ref()
+            .and_then(|auxiliary_window| auxiliary_window.successor.clone());
+        self.commit_finalized_inner_with(
+            ordered_block,
+            prev_note_commitment_trees,
+            vct_successor_witness,
+            vct_auxiliary_window,
+            commit,
+        )
+    }
+
+    fn commit_finalized_inner(
+        &mut self,
+        ordered_block: QueuedCheckpointVerified,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        vct_successor_witness: Option<VctSuccessorWitness>,
+        vct_auxiliary_window: Option<VctAuxiliaryWindow>,
+    ) -> Result<
+        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+    > {
+        self.commit_finalized_inner_with(
+            ordered_block,
+            prev_note_commitment_trees,
+            vct_successor_witness,
+            vct_auxiliary_window,
+            |db, batch, _proof| {
+                db.header_chain_disk_db()
+                    .write(batch)
+                    .expect("unexpected rocksdb error while writing block");
+                Ok(())
+            },
+        )
+    }
+
+    fn commit_finalized_inner_with<C>(
+        &mut self,
+        ordered_block: QueuedCheckpointVerified,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        vct_successor_witness: Option<VctSuccessorWitness>,
+        vct_auxiliary_window: Option<VctAuxiliaryWindow>,
+        commit: C,
+    ) -> Result<
+        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+    >
+    where
+        C: FnOnce(
+            &mut ZakuraDb,
+            DiskWriteBatch,
+            VctAuthenticationProof,
+        ) -> Result<(), CommitCheckpointVerifiedError>,
+    {
         let (checkpoint_verified, rsp_tx) = ordered_block;
-        let result = self.commit_finalized_direct(
+        let result = self.commit_finalized_direct_with_aux(
             checkpoint_verified.clone().into(),
             prev_note_commitment_trees,
-            next_vct_block,
+            vct_successor_witness,
+            vct_auxiliary_window,
             "commit checkpoint-verified request",
+            commit,
         );
 
         if result.is_ok() {
@@ -599,11 +708,9 @@ impl FinalizedState {
         };
 
         match result {
-            // Leave the oneshot pending until the write loop publishes auth state and
-            // the chain tip. Callers that await the commit response then wait for a tip
-            // change must not resume between the DB commit and those notifications.
-            Ok((_hash, note_commitment_trees)) => {
-                Ok((checkpoint_verified, note_commitment_trees, rsp_tx))
+            Ok((hash, note_commitment_trees)) => {
+                let _ = rsp_tx.send(Ok(hash));
+                Ok((checkpoint_verified, note_commitment_trees))
             }
             Err(error) => Err(((checkpoint_verified, rsp_tx), error)),
         }
@@ -627,9 +734,90 @@ impl FinalizedState {
         &mut self,
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        next_vct_block: Option<NextVctBlock>,
+        vct_successor_witness: Option<VctSuccessorWitness>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+        self.commit_finalized_direct_with(
+            finalizable_block,
+            prev_note_commitment_trees,
+            vct_successor_witness,
+            source,
+            |db, batch, _proof| {
+                db.header_chain_disk_db()
+                    .write(batch)
+                    .expect("unexpected rocksdb error while writing block");
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn commit_finalized_direct_with_exact_aux_for_test(
+        &mut self,
+        finalizable_block: FinalizableBlock,
+        vct_auxiliary_window: VctAuxiliaryWindow,
+        source: &str,
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+        let vct_successor_witness = vct_auxiliary_window.successor.clone();
+        self.commit_finalized_direct_with_aux(
+            finalizable_block,
+            None,
+            vct_successor_witness,
+            Some(vct_auxiliary_window),
+            source,
+            |db, batch, _proof| {
+                db.header_chain_disk_db()
+                    .write(batch)
+                    .expect("unexpected rocksdb error while writing block");
+                Ok(())
+            },
+        )
+    }
+
+    /// Prepare a finalized block and delegate its single durable batch to `commit`.
+    pub(in crate::service) fn commit_finalized_direct_with<C>(
+        &mut self,
+        finalizable_block: FinalizableBlock,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        vct_successor_witness: Option<VctSuccessorWitness>,
+        source: &str,
+        commit: C,
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError>
+    where
+        C: FnOnce(
+            &mut ZakuraDb,
+            DiskWriteBatch,
+            VctAuthenticationProof,
+        ) -> Result<(), CommitCheckpointVerifiedError>,
+    {
+        self.commit_finalized_direct_with_aux(
+            finalizable_block,
+            prev_note_commitment_trees,
+            vct_successor_witness,
+            None,
+            source,
+            commit,
+        )
+    }
+
+    /// Prepare a finalized block with exact auxiliary provenance and delegate its durable batch.
+    fn commit_finalized_direct_with_aux<C>(
+        &mut self,
+        finalizable_block: FinalizableBlock,
+        prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        vct_successor_witness: Option<VctSuccessorWitness>,
+        vct_auxiliary_window: Option<VctAuxiliaryWindow>,
+        source: &str,
+        commit: C,
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError>
+    where
+        C: FnOnce(
+            &mut ZakuraDb,
+            DiskWriteBatch,
+            VctAuthenticationProof,
+        ) -> Result<(), CommitCheckpointVerifiedError>,
+    {
+        let mut vct_authentication = VctAuthenticationProof::NotAuthenticated;
         let (height, hash, finalized, prev_note_commitment_trees, retention, fast_write) =
             match finalizable_block {
                 FinalizableBlock::Checkpoint {
@@ -663,19 +851,27 @@ impl FinalizedState {
                         .source()
                         .map(|v| v.vct_sync_last_checkpoint_height());
 
-                    // In vct mode, if the source has this height's roots at or below the
-                    // last checkpoint height, we skip the per-block note-commitment frontier recompute
-                    // (`update_trees_parallel`). Instead, we validate the peer-supplied roots
-                    // against the successor block's header/MMR.
-                    let vct_roots = self.vct.source().and_then(|v| {
-                        if vct_last_checkpoint_height
-                            .is_some_and(|last_checkpoint_height| height > last_checkpoint_height)
-                        {
-                            None
-                        } else {
-                            v.vct_roots_at_height(height)
-                        }
-                    });
+                    // Exact hash-scoped roots below the handoff skip per-block note-commitment
+                    // frontier recomputation. Tests can inject an equivalent local fixture through
+                    // the source seam.
+                    let exact_vct_roots =
+                        vct_auxiliary_window.as_ref().and_then(|auxiliary_window| {
+                            auxiliary_window.delivery_roots(height, block.hash())
+                        });
+                    let vct_roots = exact_vct_roots;
+                    #[cfg(test)]
+                    let vct_roots = match vct_auxiliary_window.as_ref() {
+                        Some(_) => vct_roots,
+                        None => self.vct.source().and_then(|v| {
+                            if vct_last_checkpoint_height.is_some_and(|last_checkpoint_height| {
+                                height > last_checkpoint_height
+                            }) {
+                                None
+                            } else {
+                                v.vct_roots_at_height(height)
+                            }
+                        }),
+                    };
 
                     let mut vct_write = VctWriteData::default();
 
@@ -694,24 +890,30 @@ impl FinalizedState {
                         let block_hash = block.hash();
 
                         // Defense in depth: only a witness that links to this block can
-                        // authenticate its roots — a non-successor's commitment binds a
-                        // different parent tree, so verifying against it would fail and
-                        // wrongly reject a good supplied root. Treat a non-linking witness
-                        // as absent, so the await-successor deferral below handles it. The
-                        // header-store lookup only returns direct successors, so this
-                        // should never fire in production.
-                        let next_vct_block = next_vct_block.filter(|next_vct_block| {
-                            let links = next_vct_block.header.previous_block_hash == block_hash;
-                            if !links {
+                        // authenticate its roots. A non-successor commitment binds a different
+                        // parent tree. Verification against that commitment would fail and reject
+                        // a valid supplied root. The writer treats a non-linking witness as absent.
+                        // The header store returns only direct successors, so production should not
+                        // reach this case.
+                        let vct_successor_witness = vct_successor_witness.filter(|witness| {
+                            let links = witness.header.previous_block_hash == block_hash;
+                            let delivery_matches = witness.delivery.is_none_or(|delivery| {
+                                delivery.header_hash == witness.hash
+                                    && delivery.tree_aux.is_some_and(|auxiliary_data| {
+                                        auxiliary_data.height == witness.height
+                                            && Some(auxiliary_data.auth_data_root)
+                                                == witness.auth_data_root
+                                    })
+                            });
+                            if !links || !delivery_matches {
                                 tracing::warn!(
                                     ?height,
-                                    witness_parent = ?next_vct_block.header.previous_block_hash,
+                                    witness_parent = ?witness.header.previous_block_hash,
                                     expected_parent = ?block_hash,
-                                    "VCT: ignoring a successor witness that does not link \
-                                     to the block being committed"
+                                    "VCT: ignoring an incoherent successor witness"
                                 );
                             }
-                            links
+                            links && delivery_matches
                         });
 
                         // NU5+ block hashes do not commit to authorizing data. Include the
@@ -725,8 +927,8 @@ impl FinalizedState {
                         // A successful look-ahead check authenticates both this header and
                         // its NU5+ auth-data root. A same-header body with a different root
                         // can never become valid by replacing the supplied note-commitment
-                        // roots, so reject the body outright, without touching the stored
-                        // roots or entering the write loop's retry path.
+                        // roots, so reject the body without evicting those roots or entering
+                        // the write loop's retry path.
                         if let (
                             Some((
                                 prevalidated_height,
@@ -784,12 +986,12 @@ impl FinalizedState {
 
                         // If a buffered VCT successor block is available, we verify the current block's
                         // supplied roots against the successor block's header/MMR.
-                        if let Some(next_vct_block) = &next_vct_block {
+                        if let Some(successor_witness) = &vct_successor_witness {
                             verification_items.push(
                                 commitment_aux_verify::CommitmentRootVerification::header_only(
-                                    next_vct_block.header.clone(),
-                                    next_vct_block.height,
-                                    next_vct_block.auth_data_root,
+                                    successor_witness.header.clone(),
+                                    successor_witness.height,
+                                    successor_witness.auth_data_root,
                                 ),
                             );
                         }
@@ -812,28 +1014,61 @@ impl FinalizedState {
                                         error,
                                         ..
                                     } => error.into(),
-                                    commitment_aux_verify::CommitmentRootVerificationError::SuppliedRoot {
+                                    commitment_aux_verify::CommitmentRootVerificationError::CurrentRoots {
                                         error,
                                         ..
-                                    } => self.vct_reject_supplied_root(height, error),
+                                    } => self.vct_reject_supplied_root(
+                                        height,
+                                        error,
+                                        crate::error::VctCommitFailure::CurrentRoots,
+                                    ),
+                                    commitment_aux_verify::CommitmentRootVerificationError::SuccessorBoundary {
+                                        error,
+                                        ..
+                                    } => self.vct_reject_supplied_root(
+                                        height,
+                                        error,
+                                        crate::error::VctCommitFailure::SuccessorBoundary,
+                                    ),
                                 }
                             })?;
 
-                        if let Some(next_vct_block) = &next_vct_block {
+                        if let (Some(window), Some(successor)) = (
+                            vct_auxiliary_window.as_ref(),
+                            vct_successor_witness.as_ref(),
+                        ) {
+                            let authenticates_history = matches!(
+                                successor.header.commitment(&network, successor.height),
+                                Ok(block::Commitment::ChainHistoryRoot(_)
+                                    | block::Commitment::ChainHistoryBlockTxAuthCommitment(_))
+                            );
+                            if authenticates_history {
+                                if let Some(boundary_auth_data_root) = successor.auth_data_root {
+                                    vct_authentication = VctAuthenticationProof::Successor {
+                                        delivery_id: window.delivery.delivery_id,
+                                        delivery_header_hash: block_hash,
+                                        boundary_hash: successor.hash,
+                                        boundary_auth_data_root,
+                                    };
+                                }
+                            }
+                        }
+
+                        if let Some(successor_witness) = &vct_successor_witness {
                             let next_auth_data_root =
-                                (NetworkUpgrade::current(&network, next_vct_block.height)
+                                (NetworkUpgrade::current(&network, successor_witness.height)
                                     >= NetworkUpgrade::Nu5)
-                                    .then_some(next_vct_block.auth_data_root)
+                                    .then_some(successor_witness.auth_data_root)
                                     .flatten();
                             self.vct.mark_prevalidated(
-                                next_vct_block.height,
-                                next_vct_block.hash,
+                                successor_witness.height,
+                                successor_witness.hash,
                                 next_auth_data_root,
                             );
                         } else if self
                             .vct
                             .source()
-                            .is_some_and(|v| v.vct_root_needs_successor(height, &network))
+                            .is_some_and(|v| v.vct_root_needs_successor(height, &network, true))
                         {
                             // Untrusted root at/above Heartwood, no successor to confirm it,
                             // not the last checkpoint: defer rather than persist it unverified. Leaves
@@ -860,10 +1095,9 @@ impl FinalizedState {
                         if let Some(v) = self.vct.source() {
                             v.record_fast_block();
                         }
-                        // Observability: this block folded supplied roots and skipped the
-                        // note-commitment frontier recompute (the verified-commitment-trees
-                        // fast path). Paired with `state.vct.legacy.block.count` below, this
-                        // gives a live fast-vs-legacy ratio.
+                        // This block folded supplied roots and skipped note-commitment frontier
+                        // recomputation. This counter and `state.vct.legacy.block.count` provide a
+                        // live VCT-to-legacy ratio.
                         metrics::counter!("state.vct.fast.block.count").increment(1);
 
                         // When final frontiers are loaded, this is a persistent fast
@@ -930,12 +1164,12 @@ impl FinalizedState {
                             self.vct.start_vct_sync_below_last_checkpoint();
                         }
                     } else if self.vct.is_below_last_checkpoint() {
-                        // Frozen-frontier safety: a fast sync has already frozen the
-                        // note-commitment frontier, but this height has no valid supplied root
-                        // (not yet authenticated, or rejected by verification). Recomputing
-                        // here would fold a wrong root into the history MMR and corrupt state,
-                        // so refuse with a retryable error and leave the database untouched —
-                        // the block is committed once a verifiable root is fetched from a peer.
+                        // Frozen-frontier safety: fast sync already froze the note-commitment
+                        // frontier. This height has no valid supplied root because no peer supplied
+                        // one or verification evicted it. Local recomputation would fold an
+                        // incorrect root into the history MMR and corrupt state. Return a retryable
+                        // error and leave the database untouched. State commits the block after a
+                        // peer supplies a verifiable root.
                         metrics::counter!("state.vct.root.unavailable.count").increment(1);
                         tracing::warn!(
                             ?height,
@@ -1096,13 +1330,14 @@ impl FinalizedState {
         // round-trip; its internal rayon uses the global pool instead. Measured net
         // win on the sandblast region (see PR).
         let network = self.network();
-        let result = self.db.write_block(
+        let result = self.db.write_block_with(
             finalized,
             prev_note_commitment_trees,
             &network,
             source,
             retention,
             fast_write,
+            move |db, batch| commit(db, batch, vct_authentication),
         );
 
         if result.is_ok() {
@@ -1138,13 +1373,11 @@ impl FinalizedState {
         result.map(|hash| (hash, note_commitment_trees))
     }
 
-    /// POC: `true` when the verified-commitment-trees fast (skip-recompute) path will
-    /// apply to `height` — i.e. fast mode is active *and* the source already holds this
-    /// height's roots, so the committer will fold them in and skip the frontier recompute.
-    pub(crate) fn vct_fast_will_apply(&self, height: block::Height) -> bool {
+    /// `true` when the production VCT path requires exact header-owned roots at `height`.
+    pub(crate) fn vct_requires_exact_roots(&self, height: block::Height) -> bool {
         self.vct
             .source()
-            .is_some_and(|v| v.is_enabled() && v.vct_roots_at_height(height).is_some())
+            .is_some_and(|v| v.accepts_exact_roots_at(height))
     }
 
     /// Clears any cached successor prevalidation.
@@ -1163,51 +1396,14 @@ impl FinalizedState {
     /// checkpoint handoff is exempt because its embedded final frontiers are verified
     /// against this block's roots before the real tip treestate is written; trusted
     /// local fixtures can commit their tip root on the in-arrears check.
-    pub(crate) fn vct_fast_needs_successor(&self, height: block::Height) -> bool {
-        self.vct
-            .source()
-            .is_some_and(|v| v.vct_root_needs_successor(height, &self.network()))
-    }
-
-    /// Returns a VCT successor witness from the contextually validated Zakura
-    /// header store, without requiring the successor's block body.
-    pub(crate) fn vct_successor_from_header_store(
+    pub(crate) fn vct_fast_needs_successor(
         &self,
         height: block::Height,
-        hash: block::Hash,
-    ) -> Option<NextVctBlock> {
-        let successor_height = (height + 1)?;
-        let header = self.db.zakura_header(successor_height)?;
-        if header.previous_block_hash != hash {
-            tracing::warn!(
-                ?height,
-                ?hash,
-                ?successor_height,
-                successor_parent = ?header.previous_block_hash,
-                "VCT: ignoring a stored successor header that does not link to the block being committed"
-            );
-            return None;
-        }
-
-        let auth_data_root = self
-            .db
-            .commitment_roots_by_height_range(successor_height..=successor_height)
-            .into_iter()
-            .next()
-            .filter(|roots| roots.height == successor_height)
-            .map(|roots| roots.auth_data_root)
-            .or_else(|| {
-                self.db.header_witness_auth_data_root(
-                    successor_height,
-                    block::Hash::from(header.as_ref()),
-                )
-            })?;
-
-        Some(NextVctBlock::from_header(
-            header,
-            successor_height,
-            auth_data_root,
-        ))
+        has_exact_roots: bool,
+    ) -> bool {
+        self.vct
+            .source()
+            .is_some_and(|v| v.vct_root_needs_successor(height, &self.network(), has_exact_roots))
     }
 
     /// Verify checkpoint handoff frontiers against this block's supplied roots.
@@ -1230,6 +1426,7 @@ impl FinalizedState {
             return Err(self.vct_reject_supplied_root(
                 height,
                 ValidateContextError::VctSuppliedRootUnavailable { height },
+                crate::error::VctCommitFailure::CurrentRoots,
             ));
         }
 
@@ -1238,26 +1435,33 @@ impl FinalizedState {
 
     /// Reject a supplied fast-path root that failed verification for `height`.
     ///
-    /// Returns a typed, retryable error. In fast mode the note-commitment frontier is
-    /// frozen, so the committer cannot recompute the root locally (that would fold a
-    /// wrong root into the history MMR); it must refuse and leave the database untouched
-    /// rather than persist or corrupt state. The stored row is authenticated durable
-    /// state and is not deleted — deleting it individually would create a gap below the
-    /// persisted authentication frontier — so the commit stays parked and the §8 stall
-    /// metrics/logs surface it. A wrong root therefore never corrupts state, at the cost
+    /// The rejection path returns a typed, retryable error.
+    /// Fast mode freezes the note-commitment frontier.
+    /// The committer therefore cannot recompute the root locally.
+    /// Local recomputation could fold an incorrect root into the history MMR.
+    /// The committer leaves the database untouched.
+    /// Header sync does not request individual roots.
+    /// A later delivery of the same header range can fill the missing root.
+    /// Another fanout peer's in-flight response can provide that delivery.
+    /// Otherwise, the commit remains parked and the section 8 stall metrics and logs report it.
+    /// An incorrect root therefore never corrupts state, at the cost
     /// of stalling the sync at this height.
     fn vct_reject_supplied_root(
         &self,
         height: block::Height,
         error: ValidateContextError,
+        failure: crate::error::VctCommitFailure,
     ) -> CommitCheckpointVerifiedError {
         metrics::counter!("state.vct.root.rejected.count").increment(1);
         tracing::warn!(
             ?height,
             ?error,
-            "VCT: supplied commitment root failed verification; refusing to commit this block"
+            "VCT: supplied commitment root failed verification"
         );
-        ValidateContextError::VctSuppliedRootUnavailable { height }.into()
+        CommitCheckpointVerifiedError::from(ValidateContextError::VctSuppliedRootUnavailable {
+            height,
+        })
+        .with_vct_failure(failure)
     }
 
     /// Test-only: enable fast mode reading roots/frontiers from an arbitrary
@@ -1274,6 +1478,30 @@ impl FinalizedState {
     ) {
         self.vct
             .install_test_source(source, requires_verified_successor);
+    }
+
+    /// Test-only: enable the production VCT source, whose per-header roots come only from
+    /// hash-scoped auxiliary deliveries, with the handoff placed above `last_exact_height`.
+    ///
+    /// This is what the header-time authentication sweep runs against: it needs
+    /// [`Self::vct_requires_exact_roots`] to hold over the swept range and nothing else.
+    #[cfg(test)]
+    pub(in crate::service) fn enable_vct_exact_root_source_for_test(
+        &mut self,
+        last_exact_height: block::Height,
+    ) {
+        self.vct.install_test_source(
+            Box::new(commitment_aux::EmbeddedFrontierSource::new(
+                commitment_aux::FinalFrontiers {
+                    height: last_exact_height,
+                    sapling: Arc::new(Default::default()),
+                    orchard: Arc::new(Default::default()),
+                    sprout: Arc::new(Default::default()),
+                    ironwood: Arc::new(Default::default()),
+                },
+            )),
+            true,
+        );
     }
 
     /// Test-only: the fast-sync handoff height recorded in the database marker, if any.

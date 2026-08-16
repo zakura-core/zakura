@@ -15,6 +15,7 @@ use crate::{zakura::ZakuraPeerId, BoxError};
 pub struct PeerStreamSession {
     peer_id: ZakuraPeerId,
     stream_kind: u16,
+    stream_version: u16,
     recv: FramedRecv,
     send: FramedSend,
     cancel_token: CancellationToken,
@@ -25,6 +26,7 @@ impl PeerStreamSession {
     pub fn new(
         peer_id: ZakuraPeerId,
         stream_kind: u16,
+        stream_version: u16,
         recv: FramedRecv,
         send: FramedSend,
         cancel_token: CancellationToken,
@@ -32,6 +34,7 @@ impl PeerStreamSession {
         Self {
             peer_id,
             stream_kind,
+            stream_version,
             recv,
             send,
             cancel_token,
@@ -46,6 +49,11 @@ impl PeerStreamSession {
     /// Ordered stream kind owned by this session.
     pub fn stream_kind(&self) -> u16 {
         self.stream_kind
+    }
+
+    /// Negotiated stream-prelude version for this session.
+    pub fn stream_version(&self) -> u16 {
+        self.stream_version
     }
 
     /// Peer disconnect/local shutdown cancellation token.
@@ -73,10 +81,20 @@ impl PeerStreamSession {
     }
 
     /// Split into fields for service-specific session workers.
-    pub fn into_parts(self) -> (ZakuraPeerId, u16, FramedRecv, FramedSend, CancellationToken) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        ZakuraPeerId,
+        u16,
+        u16,
+        FramedRecv,
+        FramedSend,
+        CancellationToken,
+    ) {
         (
             self.peer_id,
             self.stream_kind,
+            self.stream_version,
             self.recv,
             self.send,
             self.cancel_token,

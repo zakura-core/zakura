@@ -177,7 +177,7 @@ impl std::iter::FromIterator<UnminedTx> for Root {
     {
         transactions
             .into_iter()
-            .map(|tx| tx.id.mined_id())
+            .map(|tx| tx.id().mined_id())
             .collect()
     }
 }
@@ -198,7 +198,7 @@ impl std::iter::FromIterator<VerifiedUnminedTx> for Root {
     {
         transactions
             .into_iter()
-            .map(|tx| tx.transaction.id.mined_id())
+            .map(|tx| tx.transaction.id().mined_id())
             .collect()
     }
 }
@@ -337,7 +337,7 @@ impl std::iter::FromIterator<UnminedTx> for AuthDataRoot {
     {
         transactions
             .into_iter()
-            .map(|tx| tx.id.auth_digest().unwrap_or(AUTH_DIGEST_PLACEHOLDER))
+            .map(|tx| tx.id().auth_digest().unwrap_or(AUTH_DIGEST_PLACEHOLDER))
             .collect()
     }
 }
@@ -351,7 +351,7 @@ impl std::iter::FromIterator<VerifiedUnminedTx> for AuthDataRoot {
             .into_iter()
             .map(|tx| {
                 tx.transaction
-                    .id
+                    .id()
                     .auth_digest()
                     .unwrap_or(AUTH_DIGEST_PLACEHOLDER)
             })

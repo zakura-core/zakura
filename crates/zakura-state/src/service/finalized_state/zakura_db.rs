@@ -33,7 +33,9 @@ use super::disk_format::upgrade::restorable_db_versions;
 
 pub mod block;
 pub mod chain;
+#[allow(dead_code)]
 pub(crate) mod commitment_roots_db;
+#[allow(dead_code)]
 pub mod highest_completed_checkpoint;
 pub mod metrics;
 
@@ -107,6 +109,11 @@ pub struct ZakuraDb {
 }
 
 impl ZakuraDb {
+    /// Clone the shared low-level database for the atomic header-chain migration.
+    pub(in crate::service) fn header_chain_disk_db(&self) -> DiskDb {
+        self.db.clone()
+    }
+
     /// Opens or creates the database at a path based on the kind, major version and network,
     /// with the supplied column families, preserving any existing column families,
     /// and returns a shared high-level typed database wrapper.
@@ -142,28 +149,30 @@ impl ZakuraDb {
         // on-disk database) and reads the on-disk format version directly. The cache directory is
         // checked for readability first, so a missing or unreadable directory returns a typed
         // `ReadOnlyCacheDirUnreadable` error here instead of panicking on the version-file read.
+        let version_path =
+            config.version_file_path(&db_kind, format_version_in_code.major, network);
+        let read_disk_version = || {
+            database_format_version_on_disk(config, &db_kind, format_version_in_code.major, network)
+                .map_err(|source| StateInitError::DatabaseFormatVersion {
+                    path: version_path.clone(),
+                    source,
+                })
+        };
         let disk_version = if read_only {
             DiskDb::check_cache_dir_readable(&config.cache_dir)?;
 
-            database_format_version_on_disk(config, &db_kind, format_version_in_code.major, network)
-                .expect("unable to read database format version file")
+            read_disk_version()?
         } else {
-            DiskDb::try_reusing_previous_db_after_major_upgrade(
+            match DiskDb::try_reusing_previous_db_after_major_upgrade(
                 &restorable_db_versions(),
                 format_version_in_code,
                 config,
                 &db_kind,
                 network,
-            )
-            .or_else(|| {
-                database_format_version_on_disk(
-                    config,
-                    &db_kind,
-                    format_version_in_code.major,
-                    network,
-                )
-                .expect("unable to read database format version file")
-            })
+            ) {
+                Some(version) => Some(version),
+                None => read_disk_version()?,
+            }
         };
         let disk_version_before_open = disk_version.clone();
 
@@ -226,39 +235,40 @@ impl ZakuraDb {
             )
         }
 
-        // Optionally audit the zakura header store's on-disk invariants and
-        // truncate any incoherent suffix. This can scan a large header frontier
-        // while syncing from genesis, so operators opt in when they need a
-        // startup repair. Read-only instances cannot repair; the audit is left
-        // to an explicit writable reopen.
-        if !read_only && config.repair_zakura_header_store_on_startup {
-            db.audit_and_repair_zakura_header_store()
-                .unwrap_or_else(|error| panic!("startup header-store repair failed: {error}"));
-        }
-
-        db.run_startup_format_change(format_change);
+        db.run_startup_format_change(format_change)?;
 
         Ok(db)
     }
 
-    /// Complete the startup format change before exposing the database, then launch only
-    /// configured periodic current-format checks in the background.
-    pub(crate) fn run_startup_format_change(&mut self, format_change: DbFormatChange) {
+    /// The method completes the startup format change before exposing the database.
+    ///
+    /// The method then launches configured periodic current-format checks.
+    pub(crate) fn run_startup_format_change(
+        &mut self,
+        format_change: DbFormatChange,
+    ) -> Result<(), StateInitError> {
         if self.debug_skip_format_upgrades {
-            return;
+            return Ok(());
         }
 
         // No state service can commit while this synchronous startup operation is running.
-        let initial_tip_height = self.finalized_tip_height();
+        let initial_finalized_tip_height = self.finalized_tip_height();
         let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
         format_change
-            .run_format_change_or_check(self, initial_tip_height, &never_cancel_receiver)
-            .expect("startup format change cannot be cancelled");
+            .run_format_change_or_check(self, initial_finalized_tip_height, &never_cancel_receiver)
+            .map_err(|source| StateInitError::DatabaseFormatUpgrade {
+                path: self.path().to_owned(),
+                source: Box::new(source),
+            })?;
 
-        let format_change_handle =
-            DbFormatChange::spawn_periodic_format_checks(self.clone(), initial_tip_height);
+        let format_change_handle = DbFormatChange::spawn_periodic_format_checks(
+            self.clone(),
+            initial_finalized_tip_height,
+        );
 
         self.format_change_handle = Some(format_change_handle);
+
+        Ok(())
     }
 
     /// Sets `finished_format_upgrades` to true on the inner [`DiskDb`] to indicate that Zebra has

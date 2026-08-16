@@ -73,6 +73,9 @@ pub enum VerifyBlockError {
     },
 
     #[error(transparent)]
+    PowPolicy(#[from] zakura_header_chain::PowPolicyError),
+
+    #[error(transparent)]
     Time(zakura_chain::block::BlockTimeError),
 
     /// Error when attempting to commit a block after semantic verification.
@@ -96,6 +99,54 @@ pub enum VerifyBlockError {
 }
 
 impl VerifyBlockError {
+    /// Classify semantic verification without treating local failures as invalid bodies.
+    pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
+        use zakura_header_chain::{
+            BodyCommitmentKind, BodyRuleId, BodyVerificationClass, TransientBodyFailureKind,
+        };
+
+        let consensus = |rule| BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(rule));
+        match self {
+            Self::Depth { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+            }
+            Self::Block { source } => match source {
+                BlockError::BadMerkleRoot { .. } => BodyVerificationClass::PayloadMismatch(
+                    BodyCommitmentKind::TransactionMerkleRoot,
+                ),
+                BlockError::AlreadyInChain(..) => BodyVerificationClass::Duplicate,
+                BlockError::Transaction(error) => error.body_verification_class(),
+                BlockError::NoTransactions => consensus("block.no_transactions"),
+                BlockError::DuplicateTransaction => consensus("block.duplicate_transaction"),
+                BlockError::WrongTransactionConsensusBranchId => {
+                    consensus("block.wrong_transaction_consensus_branch_id")
+                }
+                BlockError::TooManyTransparentSignatureOperations { .. } => {
+                    consensus("block.too_many_transparent_signature_operations")
+                }
+                BlockError::SummingMinerFees { .. } => consensus("block.summing_miner_fees"),
+                BlockError::InvalidHeaderEncoding(_)
+                | BlockError::MissingHeight(_)
+                | BlockError::MaxHeight(_, _, _)
+                | BlockError::InvalidDifficulty(_, _)
+                | BlockError::TargetDifficultyLimit(_, _, _, _, _)
+                | BlockError::DifficultyFilter(_, _, _, _)
+                | BlockError::Other(_) => {
+                    BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+                }
+            },
+            Self::Equihash { .. } | Self::PowPolicy(_) | Self::Time(_) => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
+            Self::Commit(error) => error.body_verification_class(),
+            Self::ValidateProposal(_) | Self::StateService { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
+            Self::Transaction(error) => error.body_verification_class(),
+            Self::Subsidy(_) => consensus("block.subsidy"),
+        }
+    }
+
     /// Returns `true` if this is definitely a duplicate request.
     /// Some duplicate requests might not be detected, and therefore return `false`.
     pub fn is_duplicate_request(&self) -> bool {
@@ -214,7 +265,8 @@ where
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         async move {
-            let hash = block.hash();
+            let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
+                .map_err(BlockError::from)?;
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");
             match state_service
@@ -246,7 +298,8 @@ where
             // > The block data MUST be validated and checked against the server's usual
             // > acceptance rules (excluding the check for a valid proof-of-work).
             // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
-            if request.is_proposal() || network.disable_pow() {
+            let pow_policy = zakura_header_chain::PowPolicy::for_network(&network)?;
+            if request.is_proposal() || pow_policy.is_authenticated_custom_waiver() {
                 check::difficulty_threshold_is_valid(&block.header, &network, &height, &hash)?;
             } else {
                 // Do the difficulty checks first, to raise the threshold for

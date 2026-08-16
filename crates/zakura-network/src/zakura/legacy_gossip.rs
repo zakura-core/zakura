@@ -114,6 +114,9 @@ const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
 const LEGACY_REQUEST_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Reserve half of each connection's stream-open budget for native ordered
+/// streams, reconnects, and other request clients.
+const LEGACY_REQUEST_STREAM_RATE_DIVISOR: u32 = 2;
 /// How long the dual-stack tries the (buffered) legacy peer set for an inventory
 /// fetch before falling back to Zakura. Without this bound, a node that upgraded
 /// all its peers to Zakura (and so has no ready legacy peer) would block every
@@ -139,8 +142,6 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
     Stream {
         kind: ZAKURA_STREAM_GOSSIP,
         version: LEGACY_GOSSIP_VERSION,
-        // Advisory until the transport wires Stream::frame_cap end-to-end; the
-        // authoritative inbound cap is app_frame_cap_for_stream_kind.
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
         mode: StreamMode::Ordered,
@@ -148,8 +149,6 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
     Stream {
         kind: ZAKURA_STREAM_LEGACY_REQUESTS,
         version: LEGACY_GOSSIP_VERSION,
-        // Advisory until the transport wires Stream::frame_cap end-to-end; the
-        // authoritative inbound cap is app_frame_cap_for_stream_kind.
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
         mode: StreamMode::RequestResponse,
@@ -366,7 +365,7 @@ impl LegacyRequestFrame {
             Self::PushTransaction(transaction) => Ok(Frame {
                 message_type: MSG_REQUEST_PUSH_TRANSACTION,
                 flags: 0,
-                payload: transaction.transaction.zcash_serialize_to_vec()?,
+                payload: transaction.transaction().zcash_serialize_to_vec()?,
             }),
         }
     }
@@ -549,7 +548,7 @@ impl LegacyResponseCodec {
                                 request_id,
                                 max_frame_bytes,
                                 max_message_bytes,
-                                transaction.transaction.zcash_serialize_to_vec()?,
+                                transaction.transaction().zcash_serialize_to_vec()?,
                             )?;
                         }
                         InventoryResponse::Missing(id) => missing.push(id),
@@ -748,7 +747,13 @@ impl LegacyResponseCodec {
         reassembler.finish()?;
 
         match request_kind {
+            LegacyRequestKind::Blocks if blocks.is_empty() => {
+                Err(LegacyGossipError::MissingResponse(request_kind.command()))
+            }
             LegacyRequestKind::Blocks => Ok(Response::Blocks(blocks)),
+            LegacyRequestKind::Transactions if transactions.is_empty() => {
+                Err(LegacyGossipError::MissingResponse(request_kind.command()))
+            }
             LegacyRequestKind::Transactions => Ok(Response::Transactions(transactions)),
             LegacyRequestKind::FindBlocks => Ok(Response::BlockHashes(block_hashes)),
             LegacyRequestKind::FindHeaders => Ok(Response::BlockHeaders(block_headers)),
@@ -1739,6 +1744,20 @@ impl LegacyRequestAdapter {
         }
     }
 
+    fn new_with_trace_and_stream_rate(
+        supervisor: ZakuraSupervisorHandle,
+        trace: ZakuraTrace,
+        stream_open_rate_per_second: u32,
+    ) -> Self {
+        Self {
+            client: ZakuraRequestClient::new_with_trace_and_stream_rate(
+                supervisor,
+                trace,
+                stream_open_rate_per_second,
+            ),
+        }
+    }
+
     #[cfg(test)]
     fn new_with_timeout(supervisor: ZakuraSupervisorHandle, request_timeout: Duration) -> Self {
         Self {
@@ -1847,11 +1866,16 @@ impl<L> ZakuraDualStackService<L> {
         supervisor: ZakuraSupervisorHandle,
         legacy_enabled: bool,
         trace: ZakuraTrace,
+        stream_open_rate_per_second: u32,
     ) -> Self {
         Self {
             legacy,
             gossip: LegacyGossipAdapter::new(supervisor.clone()),
-            request: LegacyRequestAdapter::new_with_trace(supervisor, trace),
+            request: LegacyRequestAdapter::new_with_trace_and_stream_rate(
+                supervisor,
+                trace,
+                stream_open_rate_per_second,
+            ),
             legacy_enabled,
         }
     }
@@ -1963,6 +1987,8 @@ pub struct ZakuraRequestClient {
     supervisor: ZakuraSupervisorHandle,
     request_timeout: Duration,
     trace: ZakuraTrace,
+    request_interval: Duration,
+    next_request_at: Arc<Mutex<Instant>>,
 }
 
 impl ZakuraRequestClient {
@@ -1973,20 +1999,47 @@ impl ZakuraRequestClient {
 
     /// Create a client from a Zakura supervisor and trace emitter.
     pub fn new_with_trace(supervisor: ZakuraSupervisorHandle, trace: ZakuraTrace) -> Self {
+        Self::new_with_trace_and_stream_rate(
+            supervisor,
+            trace,
+            super::DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
+        )
+    }
+
+    fn new_with_trace_and_stream_rate(
+        supervisor: ZakuraSupervisorHandle,
+        trace: ZakuraTrace,
+        stream_open_rate_per_second: u32,
+    ) -> Self {
+        let request_rate = legacy_request_stream_rate(stream_open_rate_per_second);
+        let interval_nanos = 1_000_000_000u64
+            .checked_div(u64::from(request_rate))
+            .unwrap_or(1)
+            .max(1);
         Self {
             supervisor,
             request_timeout: LEGACY_REQUEST_TIMEOUT,
             trace,
+            request_interval: Duration::from_nanos(interval_nanos),
+            next_request_at: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
     #[cfg(test)]
     fn new_with_timeout(supervisor: ZakuraSupervisorHandle, request_timeout: Duration) -> Self {
-        Self {
-            supervisor,
-            request_timeout,
-            trace: ZakuraTrace::noop(),
-        }
+        let mut client = Self::new(supervisor);
+        client.request_timeout = request_timeout;
+        client
+    }
+
+    async fn wait_for_request_slot(&self) {
+        let request_at = {
+            let mut next_request_at = self.next_request_at.lock().await;
+            let request_at = (*next_request_at).max(Instant::now());
+            *next_request_at = request_at + self.request_interval;
+            request_at
+        };
+        tokio::time::sleep_until(request_at).await;
     }
 
     async fn request(
@@ -2080,6 +2133,7 @@ impl ZakuraRequestClient {
         frame: LegacyRequestFrame,
         request_kind: LegacyRequestKind,
     ) -> Result<Response, BoxError> {
+        self.wait_for_request_slot().await;
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         // Capture the requested block hashes (if any) before consuming the frame,
         // so the response can be bound to a hash we actually asked for.
@@ -2176,6 +2230,12 @@ impl ZakuraRequestClient {
         });
         Ok(response)
     }
+}
+
+fn legacy_request_stream_rate(stream_open_rate_per_second: u32) -> u32 {
+    stream_open_rate_per_second
+        .max(1)
+        .div_ceil(LEGACY_REQUEST_STREAM_RATE_DIVISOR)
 }
 
 fn select_handle(
@@ -3174,7 +3234,7 @@ mod tests {
                     Response::Transactions(
                         ids.into_iter()
                             .map(|id| {
-                                if id == self.transaction.id {
+                                if id == self.transaction.id() {
                                     InventoryResponse::Available((self.transaction.clone(), None))
                                 } else {
                                     InventoryResponse::Missing(id)
@@ -3350,7 +3410,7 @@ mod tests {
                     Response::Transactions(
                         ids.into_iter()
                             .map(|id| match &self.transaction {
-                                Some(transaction) if id == transaction.id => {
+                                Some(transaction) if id == transaction.id() => {
                                     InventoryResponse::Available((transaction.clone(), None))
                                 }
                                 _ => InventoryResponse::Missing(id),
@@ -3398,7 +3458,7 @@ mod tests {
                 Request::FindBlocks { .. } => Response::BlockHashes(vec![self.block.hash()]),
                 Request::FindHeaders { .. } => Response::BlockHeaders(vec![self.header()]),
                 Request::MempoolTransactionIds => {
-                    Response::TransactionIds(vec![self.transaction.id])
+                    Response::TransactionIds(vec![self.transaction.id()])
                 }
                 Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
                     Response::Blocks(
@@ -3415,7 +3475,7 @@ mod tests {
                     )
                 }
                 Request::PushTransaction(transaction, _) => {
-                    if let Err(error) = self.pushed_tx.send(transaction.id) {
+                    if let Err(error) = self.pushed_tx.send(transaction.id()) {
                         return std::future::ready(Err(Box::new(error)));
                     }
                     Response::Nil
@@ -3581,6 +3641,7 @@ mod tests {
         let (service_send, _peer_recv) = framed_channel(8);
         let stream = ServiceStream::new(
             session_id,
+            LEGACY_GOSSIP_VERSION,
             service_recv,
             service_send,
             cancel_token.child_token(),
@@ -3616,16 +3677,26 @@ mod tests {
     }
 
     async fn wait_registered_count(node: &ZakuraTestNode, count: usize) -> Result<(), BoxError> {
-        tokio::time::timeout(TEST_NET_TIMEOUT, async {
+        let result = tokio::time::timeout(TEST_NET_TIMEOUT, async {
             loop {
-                if node.supervisor().registered_ids().await.len() == count {
+                let observed = node.supervisor().registered_ids().await.len();
+                if observed == count {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .map_err(|_| -> BoxError { "timed out waiting for peer registration count".into() })
+        .await;
+
+        if result.is_err() {
+            let observed = node.supervisor().registered_ids().await.len();
+            return Err(format!(
+                "timed out waiting for {count} peer registrations; observed {observed}"
+            )
+            .into());
+        }
+
+        Ok(())
     }
 
     /// Regression for `claude-legacy-request-orphaned-handler-permits`.
@@ -3819,7 +3890,7 @@ mod tests {
     async fn request_adapter_fetches_available_and_missing_transactions() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let transaction = UnminedTx::from(empty_v5_transaction(2));
-        let available_id = transaction.id;
+        let available_id = transaction.id();
         let missing_id = witnessed_tx_id(99);
         let node_a = inventory_node(63, transaction.clone()).await?;
         let node_b = ZakuraTestNode::builder(64).spawn().await?;
@@ -3840,7 +3911,7 @@ mod tests {
         assert!(transactions.iter().any(|response| {
             matches!(
                 response,
-                InventoryResponse::Available((tx, None)) if tx.id == transaction.id
+                InventoryResponse::Available((tx, None)) if tx.id() == transaction.id()
             )
         }));
         assert!(transactions.iter().any(
@@ -4034,7 +4105,7 @@ mod tests {
         )?);
         let transaction = UnminedTx::from(empty_v5_transaction(5));
         let pushed_transaction = UnminedTx::from(empty_v5_transaction(6));
-        let pushed_id = pushed_transaction.id;
+        let pushed_id = pushed_transaction.id();
         let (node_a, mut pushed_rx) = normal_network_node(83, block, transaction.clone()).await?;
         let node_b = ZakuraTestNode::builder(84).spawn().await?;
         node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
@@ -4047,7 +4118,7 @@ mod tests {
                 Some(PeerSource::Zakura(a_peer_id.clone())),
             )
             .await?;
-        assert_eq!(mempool, Response::TransactionIds(vec![transaction.id]));
+        assert_eq!(mempool, Response::TransactionIds(vec![transaction.id()]));
 
         let ping = adapter
             .request_from_source(
@@ -4179,7 +4250,7 @@ mod tests {
     ) -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let transaction = UnminedTx::from(empty_v5_transaction(3));
-        let txid = transaction.id;
+        let txid = transaction.id();
         let (advertiser, mut advertiser_rx) = recording_inventory_node(65, None).await?;
         let (fallback, mut fallback_rx) =
             recording_inventory_node(66, Some(transaction.clone())).await?;
@@ -4223,7 +4294,7 @@ mod tests {
         };
         assert!(matches!(
             transactions.as_slice(),
-            [InventoryResponse::Available((tx, None))] if tx.id == transaction.id
+            [InventoryResponse::Available((tx, None))] if tx.id() == transaction.id()
         ));
 
         advertiser.shutdown().await;
@@ -4966,6 +5037,47 @@ mod tests {
             ),
             Err(LegacyGossipError::OversizedResponse(_))
         ));
+    }
+
+    #[test]
+    fn response_codec_rejects_empty_inventory_frame_sets() {
+        for kind in [LegacyRequestKind::Blocks, LegacyRequestKind::Transactions] {
+            assert!(matches!(
+                LegacyResponseCodec::decode_response(1, kind, Vec::new(), None),
+                Err(LegacyGossipError::MissingResponse(_))
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_client_paces_stream_opens_below_the_connection_limit() {
+        let client = ZakuraRequestClient::new_with_trace_and_stream_rate(
+            ZakuraSupervisorHandle::new(1),
+            ZakuraTrace::noop(),
+            4,
+        );
+        let started = Instant::now();
+
+        client.wait_for_request_slot().await;
+        assert_eq!(
+            Instant::now(),
+            started,
+            "the first request uses the open slot"
+        );
+
+        client.wait_for_request_slot().await;
+        assert_eq!(
+            Instant::now().duration_since(started),
+            Duration::from_millis(500),
+            "compatibility requests use half the configured stream-open rate"
+        );
+
+        client.wait_for_request_slot().await;
+        assert_eq!(
+            Instant::now().duration_since(started),
+            Duration::from_secs(1),
+            "successive request slots stay evenly spaced"
+        );
     }
 
     /// The inbound service returns `Response::Nil` (a lone nil frame) for an empty
@@ -5766,7 +5878,7 @@ mod tests {
                         StubInventory::Available(tx) => Response::Transactions(
                             ids.into_iter()
                                 .map(|id| {
-                                    if id == tx.id {
+                                    if id == tx.id() {
                                         InventoryResponse::Available((tx.clone(), None))
                                     } else {
                                         InventoryResponse::Missing(id)
@@ -5857,7 +5969,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::TransactionsById(HashSet::from([transaction.id])))
+            .call(Request::TransactionsById(HashSet::from([transaction.id()])))
             .await?;
         match response {
             Response::Transactions(items) => {
@@ -5893,7 +6005,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::TransactionsById(HashSet::from([transaction.id])))
+            .call(Request::TransactionsById(HashSet::from([transaction.id()])))
             .await?;
         match response {
             Response::Transactions(items) => {
@@ -5930,7 +6042,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::TransactionsById(HashSet::from([transaction.id])))
+            .call(Request::TransactionsById(HashSet::from([transaction.id()])))
             .await?;
         match response {
             Response::Transactions(items) => {
@@ -6007,7 +6119,7 @@ mod tests {
             .call(Request::MempoolTransactionIds)
             .await?;
         assert!(
-            matches!(mempool_ids, Response::TransactionIds(ref ids) if *ids == vec![transaction.id]),
+            matches!(mempool_ids, Response::TransactionIds(ref ids) if *ids == vec![transaction.id()]),
             "MempoolTransactionIds should be served over Zakura, got {mempool_ids:?}",
         );
 
@@ -6020,7 +6132,7 @@ mod tests {
             .recv()
             .await
             .expect("transaction pushed over Zakura");
-        assert_eq!(pushed, transaction.id);
+        assert_eq!(pushed, transaction.id());
 
         // None of these requests consulted the legacy peer set.
         assert!(

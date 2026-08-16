@@ -2,7 +2,7 @@
 //!
 //! This module holds the embedded-final-frontier plumbing and run counters for the
 //! verified-commitment-trees fast-sync. On networks with an embedded final frontier,
-//! the default source is the peer `tree_aux` source. `checkpoint_sync = false` or
+//! the default source is exact hash-scoped `tree_aux` data. `checkpoint_sync = false` or
 //! `consensus.vct_fast_sync = false` selects legacy recompute.
 
 use std::sync::{
@@ -19,16 +19,32 @@ use zakura_chain::{
     parameters::{Network, NetworkUpgrade},
     sapling, sprout,
 };
+use zakura_header_chain::{AuxAuthentication, AuxDelivery};
 
-use super::{
-    commitment_aux::{CommitmentRootSource, FinalFrontiers, PeerSource},
-    ZakuraDb,
-};
+/// Positive result proving which exact successor boundary authenticated supplied roots.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VctAuthenticationProof {
+    /// The successful commit did not authenticate an auxiliary delivery.
+    NotAuthenticated,
+    /// One exact successor history-root commitment accepted the delivery roots.
+    Successor {
+        /// Delivery whose roots verification folded into the verified history tree.
+        delivery_id: zakura_header_chain::EvidenceId,
+        /// Header that owns the delivery roots.
+        delivery_header_hash: block::Hash,
+        /// Exact successor header whose commitment verification checked.
+        boundary_hash: block::Hash,
+        /// Exact successor authorizing-data root checked with that header.
+        boundary_auth_data_root: AuthDataRoot,
+    },
+}
 
-/// A VCT successor header used to authenticate the current block's supplied
-/// note-commitment roots.
+use super::commitment_aux::{CommitmentRootSource, EmbeddedFrontierSource, FinalFrontiers};
+use crate::error::VctCommitFailure;
+
+/// A selected successor header and auxiliary delivery that authenticate VCT roots.
 #[derive(Clone, Debug)]
-pub struct NextVctBlock {
+pub struct VctSuccessorWitness {
     /// The successor header that commits to the current block's VCT roots.
     pub(crate) header: Arc<Header>,
     /// The successor header's height.
@@ -37,10 +53,13 @@ pub struct NextVctBlock {
     pub(crate) hash: block::Hash,
     /// The successor block's precomputed ZIP-244 auth-data root, if available.
     pub(crate) auth_data_root: Option<AuthDataRoot>,
+    /// Exact auxiliary delivery that supplied the successor auth-data root.
+    pub(crate) delivery: Option<AuxDelivery>,
 }
 
-impl NextVctBlock {
-    /// Build a successor witness from a header and its precomputed auth-data root.
+impl VctSuccessorWitness {
+    /// Builds a successor witness from a header and its precomputed authorizing-data root.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_header(
         header: Arc<Header>,
         height: block::Height,
@@ -53,7 +72,163 @@ impl NextVctBlock {
             height,
             hash,
             auth_data_root: Some(auth_data_root),
+            delivery: None,
         }
+    }
+
+    /// Builds a successor witness from an exact auxiliary delivery.
+    ///
+    /// The method returns `None` when the delivery identifies another header or height.
+    pub(crate) fn from_delivery(
+        header: Arc<Header>,
+        height: block::Height,
+        delivery: AuxDelivery,
+    ) -> Option<Self> {
+        let aux = delivery.tree_aux?;
+        if delivery.header_hash != header.hash() || aux.height != height {
+            return None;
+        }
+        let hash = block::Hash::from(&header);
+
+        Some(Self {
+            header,
+            height,
+            hash,
+            auth_data_root: Some(aux.auth_data_root),
+            delivery: Some(delivery),
+        })
+    }
+}
+
+/// One selected VCT auxiliary delivery and its optional successor authentication boundary.
+#[derive(Clone, Debug)]
+pub(crate) struct VctAuxiliaryWindow {
+    /// Committed engine snapshot under which state selected both deliveries.
+    pub(crate) engine_snapshot: zakura_header_chain::EngineSnapshot,
+    /// Retained header that owns the delivery under verification.
+    ///
+    /// The committer already holds this header in the block it will commit. The sweep
+    /// verifies ahead of block bodies, so the window carries the header for the sweep.
+    pub(crate) delivery_header: Arc<Header>,
+    /// Auxiliary delivery whose roots verification folds for the current block.
+    pub(crate) delivery: AuxDelivery,
+    /// Height of the retained direct successor, even when state lacks its auxiliary delivery.
+    pub(crate) successor_height: Option<block::Height>,
+    /// Exact direct-successor witness used for one-header-later authentication.
+    pub(crate) successor: Option<VctSuccessorWitness>,
+}
+
+/// Attribution result for a failed VCT auxiliary verification.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VctAuxiliaryFailureAttribution {
+    /// Verification proved only the current roots invalid.
+    CurrentDelivery,
+    /// Verification proved only the successor auth-data root invalid.
+    SuccessorDelivery,
+    /// Either of two unauthenticated deliveries may have caused the boundary mismatch.
+    AmbiguousDeliveries,
+    /// Verification cannot safely attribute failure to a mutable metadata delivery.
+    NoDelivery,
+}
+
+impl VctAuxiliaryFailureAttribution {
+    /// Returns a stable metrics label for this attribution result.
+    pub(crate) fn attribution_label(self) -> &'static str {
+        match self {
+            Self::CurrentDelivery => "current",
+            Self::SuccessorDelivery => "successor",
+            Self::AmbiguousDeliveries => "ambiguous",
+            Self::NoDelivery => "none",
+        }
+    }
+
+    /// Returns whether the writer must dispute both deliveries.
+    pub(crate) fn requires_dispute(self) -> bool {
+        self == Self::AmbiguousDeliveries
+    }
+
+    /// Returns the lowest delivery height that repair must replace.
+    pub(crate) fn repair_height(
+        self,
+        current_delivery_height: block::Height,
+        successor_delivery_height: Option<block::Height>,
+    ) -> Option<block::Height> {
+        match self {
+            Self::CurrentDelivery | Self::AmbiguousDeliveries => Some(current_delivery_height),
+            Self::SuccessorDelivery => successor_delivery_height,
+            Self::NoDelivery => None,
+        }
+    }
+}
+
+impl VctAuxiliaryWindow {
+    /// Returns the delivery roots when the delivery identifies the requested block.
+    pub(crate) fn delivery_roots(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Option<(
+        sapling::tree::Root,
+        orchard::tree::Root,
+        ironwood::tree::Root,
+    )> {
+        let auxiliary_data = self.delivery.tree_aux?;
+        (self.delivery.header_hash == hash && auxiliary_data.height == height).then_some((
+            auxiliary_data.sapling_root,
+            auxiliary_data.orchard_root,
+            auxiliary_data.ironwood_root,
+        ))
+    }
+
+    /// Attributes a verification failure without weakening authenticated evidence.
+    pub(crate) fn attribute_failure(
+        &self,
+        failure: VctCommitFailure,
+    ) -> VctAuxiliaryFailureAttribution {
+        attribute_vct_auxiliary_failure(
+            self.delivery,
+            self.successor
+                .as_ref()
+                .and_then(|successor| successor.delivery),
+            failure,
+        )
+    }
+}
+
+fn attribute_vct_auxiliary_failure(
+    current_delivery: AuxDelivery,
+    successor_delivery: Option<AuxDelivery>,
+    failure: VctCommitFailure,
+) -> VctAuxiliaryFailureAttribution {
+    let current_untrusted = matches!(
+        current_delivery.authentication,
+        AuxAuthentication::Unauthenticated | AuxAuthentication::Disputed { .. }
+    );
+    if failure == VctCommitFailure::CurrentRoots {
+        return if current_untrusted {
+            VctAuxiliaryFailureAttribution::CurrentDelivery
+        } else {
+            VctAuxiliaryFailureAttribution::NoDelivery
+        };
+    }
+
+    let Some(successor_delivery) = successor_delivery else {
+        return if current_untrusted {
+            VctAuxiliaryFailureAttribution::CurrentDelivery
+        } else {
+            VctAuxiliaryFailureAttribution::NoDelivery
+        };
+    };
+    let successor_untrusted = matches!(
+        successor_delivery.authentication,
+        AuxAuthentication::Unauthenticated | AuxAuthentication::Disputed { .. }
+    );
+
+    match (current_untrusted, successor_untrusted) {
+        (true, true) => VctAuxiliaryFailureAttribution::AmbiguousDeliveries,
+        (true, false) => VctAuxiliaryFailureAttribution::CurrentDelivery,
+        (false, true) => VctAuxiliaryFailureAttribution::SuccessorDelivery,
+        (false, false) => VctAuxiliaryFailureAttribution::NoDelivery,
     }
 }
 
@@ -83,15 +258,14 @@ pub enum FinalFrontiersValidationError {
 /// State for the verified-commitment-trees fast-sync.
 /// (`docs/design/verified-commitment-trees.md`).
 ///
-/// A checkpoint-trusting sync (`checkpoint_sync = true`) uses the peer `tree_aux` source by
+/// A checkpoint-trusting sync (`checkpoint_sync = true`) uses exact header `tree_aux` data by
 /// default on networks with embedded final frontiers; `checkpoint_sync = false` or
 /// `vct_fast_sync = false` opts out to the legacy per-block recompute (no VCT state).
 #[derive(Debug)]
 pub(crate) struct VctState {
     /// `true` when the VCT fast-sync is enabled.
     enabled: bool,
-    /// Where the verified per-block roots and final frontier come from. The
-    /// committer reads roots/final frontier through this seam only.
+    /// Embedded final-frontier authority, plus test-only root fixtures.
     source: Box<dyn CommitmentRootSource>,
     /// Whether roots from this VCT state must be confirmed against a stored successor header
     /// before they are committed.
@@ -104,23 +278,22 @@ pub(crate) struct VctState {
     prevalidated_count: AtomicU64,
 }
 
-/// Which commitment-root source the committer uses, resolved from the (already read)
+/// Commitment-root source that the committer uses, resolved from the
 /// configuration signals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceMode {
-    /// Legacy recompute committer (no VCT state).
+    /// Legacy committer that recomputes every tree without VCT state.
     Legacy,
-    /// Fetch per-block roots from peers — the default where embedded frontiers exist.
-    Peer,
+    /// Consume exact hash-scoped header auxiliary data.
+    HeaderAuxiliary,
 }
 
-/// Resolve the source mode as a pure function, so the peer-source default is
-/// unit-testable without touching embedded-frontier files. The fast verified path
-/// (peer source) is the default whenever the node syncs under checkpoint trust and
-/// the network has an embedded handoff frontier. `checkpoint_sync = false` or
-/// `vct_fast_sync = false` selects the legacy recompute; a network with no embedded
-/// frontier also falls back to legacy. Storage mode (Archive vs. Pruned) is orthogonal and not
-/// an input here.
+/// Resolve the source mode without reading embedded-frontier files.
+/// The selector chooses the exact header-auxiliary path for checkpoint-trusting sync on a network
+/// with an embedded handoff frontier. Disabling checkpoint sync selects legacy recomputation.
+/// Disabling VCT fast sync also selects legacy recomputation.
+/// A network without an embedded handoff frontier uses legacy recomputation.
+/// Storage mode does not affect this selection.
 fn select_source_mode(
     checkpoint_sync: bool,
     vct_fast_sync: bool,
@@ -129,42 +302,38 @@ fn select_source_mode(
     if !checkpoint_sync || !vct_fast_sync || !has_embedded_frontiers {
         SourceMode::Legacy
     } else {
-        SourceMode::Peer
+        SourceMode::HeaderAuxiliary
     }
 }
 
 impl VctState {
-    /// Build the committer state from `checkpoint_sync` (the mirror of
-    /// `consensus.checkpoint_sync`) and the `vct_fast_sync` knob.
-    /// On networks with an embedded handoff frontier (Mainnet) a checkpoint-trusting sync
-    /// defaults to the peer (`tree_aux`) fast source; disabling checkpoint sync, setting
-    /// `vct_fast_sync = false`, or using a network without an embedded frontier returns `None` for
-    /// a zero-overhead legacy committer that recomputes the trees per block.
+    /// Builds committer state from `checkpoint_sync` and `vct_fast_sync`.
+    /// `checkpoint_sync` mirrors `consensus.checkpoint_sync`.
+    /// Mainnet checkpoint sync defaults to the peer `tree_aux` source.
+    /// Disabled checkpoint sync returns `None` for legacy per-block recomputation.
+    /// Disabled VCT fast sync also returns `None`.
+    /// Networks without an embedded handoff frontier also return `None`.
     pub(super) fn from_config(
         checkpoint_sync: bool,
         vct_fast_sync: bool,
         network: &Network,
-        db: ZakuraDb,
     ) -> Option<Arc<Self>> {
-        // Parse the embedded handoff frontier once (None on networks without one, e.g.
-        // Testnet). The decision below only needs its presence; the peer arm reuses the
-        // parsed value.
+        // Parse the embedded handoff frontier once.
+        // Networks such as Testnet return `None`.
+        // Source selection uses only the frontier's presence.
+        // The peer arm reuses the parsed value.
         let embedded = embedded_final_frontiers(network);
 
         match select_source_mode(checkpoint_sync, vct_fast_sync, embedded.is_some()) {
-            // Default: the peer (`tree_aux`) source on any network with embedded final
-            // frontiers (Mainnet). Per-block roots arrive from peers into a shared cache
-            // filled by the driver; the committer reads them per height and folds them in,
-            // skipping the recompute. A height the peer cannot supply — or any node with no
-            // serving peers — stays in legacy mode, bit-identical to a legacy committer by
-            // construction.
-            SourceMode::Peer => {
+            // Default: hash-scoped `tree_aux` deliveries from the header-chain store,
+            // authenticated against this embedded handoff frontier.
+            SourceMode::HeaderAuxiliary => {
                 let parsed = embedded?;
                 tracing::info!(
                     handoff_height = parsed.height.0,
-                    "VCT: peer (tree_aux) source enabled by default — roots fetched from peers"
+                    "VCT: exact header auxiliary source enabled by default"
                 );
-                let source = PeerSource::new(db, parsed);
+                let source = EmbeddedFrontierSource::new(parsed);
                 Some(Arc::new(VctState {
                     enabled: true,
                     source: Box::new(source),
@@ -174,20 +343,15 @@ impl VctState {
                 }))
             }
 
-            // Legacy committer: full per-block recompute when checkpoint sync is disabled, the
-            // force-disable knob is set, or the network has no embedded frontiers. No VCT state,
-            // zero overhead.
+            // The legacy committer performs full per-block recomputation.
+            // This mode allocates no VCT state.
             SourceMode::Legacy => None,
         }
     }
 
-    /// `true` when the VCT fast-sync is enabled.
-    pub(super) fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     /// The supplied roots for `height`, when vct mode has a source entry for it
     /// (the signal that this block takes the VCT fast-sync).
+    #[cfg(test)]
     pub(super) fn vct_roots_at_height(
         &self,
         height: block::Height,
@@ -207,23 +371,30 @@ impl VctState {
         self.source.vct_root(height)
     }
 
-    /// `true` when committing `height` on the vct path needs a stored successor header before
-    /// it can safely persist this block's supplied roots.
+    /// Return `true` when the VCT path needs a stored successor header before it can safely persist
+    /// this block's supplied roots.
     ///
-    /// Only untrusted peer-supplied roots at or above Heartwood require this. The
-    /// checkpoint handoff is exempt because its embedded final frontiers are verified
-    /// against this block's roots before the real tip treestate is written; trusted
-    /// local fixtures can commit their tip root on the in-arrears check.
+    /// Only untrusted peer-supplied roots at or above Heartwood require a successor header.
+    /// The checkpoint handoff verifies embedded final frontiers against this block's roots before
+    /// writing the real tip tree state. Trusted local fixtures can commit their tip root during the
+    /// in-arrears check.
     pub(super) fn vct_root_needs_successor(
         &self,
         height: block::Height,
         network: &Network,
+        has_exact_roots: bool,
     ) -> bool {
         self.enabled
-            && self.vct_roots_at_height(height).is_some()
+            && has_exact_roots
+            && height <= self.source.vct_last_checkpoint_height()
             && self.requires_verified_successor
             && self.source.final_frontiers().height != height
             && Some(height) >= NetworkUpgrade::Heartwood.activation_height(network)
+    }
+
+    /// `true` when exact header-owned roots are required for `height`.
+    pub(super) fn accepts_exact_roots_at(&self, height: block::Height) -> bool {
+        self.enabled && height <= self.source.vct_last_checkpoint_height()
     }
 
     /// The checkpoint handoff height: the boundary below which the fast path skips
@@ -435,8 +606,8 @@ impl VctCommitState {
 }
 
 /// Fast-path (vct) outputs for the block being committed, passed as one
-/// parameter from the committer down through
-/// `ZakuraDb::write_block` to `ZakuraDb::prepare_trees_batch`.
+/// parameter from the committer through
+/// `super::ZakuraDb::write_block` to `super::ZakuraDb::prepare_trees_batch`.
 ///
 /// The fields are independent: a checkpoint-handoff block sets `sync_below`
 /// but leaves `anchor_roots` `None` (it writes the real frontier via the
@@ -561,12 +732,91 @@ fn final_frontiers_bytes(height: block::Height, trees: &NoteCommitmentTrees) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{io::Write, num::NonZeroU64};
 
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    fn aux_delivery(byte: u8, authentication: AuxAuthentication) -> AuxDelivery {
+        AuxDelivery {
+            delivery_id: zakura_header_chain::EvidenceId::from_digest([byte; 32]),
+            header_hash: block::Hash([byte; 32]),
+            source: zakura_header_chain::SourceId::from_digest([byte; 32]),
+            owner: zakura_header_chain::BodyWorkOwner {
+                authority: zakura_header_chain::BodyWorkAuthority {
+                    header: zakura_header_chain::HeaderWorkAuthority {
+                        header_generation: zakura_header_chain::HeaderGeneration::new(2),
+                        branch: zakura_header_chain::BranchId::new(
+                            block::Hash([4; 32]),
+                            block::Hash([5; 32]),
+                        ),
+                    },
+                    verified_generation: zakura_header_chain::VerifiedGeneration::new(3),
+                },
+                session_id: 6,
+                request_id: NonZeroU64::new(7).expect("seven is nonzero"),
+            }
+            .into(),
+            body_size: zakura_header_chain::BodySizeHint::Unknown,
+            tree_aux: None,
+            authentication,
+        }
+    }
+
+    #[test]
+    fn vct_boundary_failure_attribution_never_weakens_authenticated_evidence() {
+        let unauthenticated = aux_delivery(1, AuxAuthentication::Unauthenticated);
+        let authenticated = aux_delivery(
+            2,
+            AuxAuthentication::Authenticated {
+                evidence: zakura_header_chain::EvidenceId::from_digest([3; 32]),
+                boundary_hash: block::Hash([4; 32]),
+            },
+        );
+
+        assert_eq!(
+            attribute_vct_auxiliary_failure(
+                unauthenticated,
+                Some(authenticated),
+                VctCommitFailure::SuccessorBoundary,
+            ),
+            VctAuxiliaryFailureAttribution::CurrentDelivery,
+        );
+        assert_eq!(
+            attribute_vct_auxiliary_failure(
+                authenticated,
+                Some(unauthenticated),
+                VctCommitFailure::SuccessorBoundary,
+            ),
+            VctAuxiliaryFailureAttribution::SuccessorDelivery,
+        );
+        assert_eq!(
+            attribute_vct_auxiliary_failure(
+                unauthenticated,
+                Some(unauthenticated),
+                VctCommitFailure::SuccessorBoundary,
+            ),
+            VctAuxiliaryFailureAttribution::AmbiguousDeliveries,
+        );
+        assert_eq!(
+            attribute_vct_auxiliary_failure(
+                authenticated,
+                Some(authenticated),
+                VctCommitFailure::SuccessorBoundary,
+            ),
+            VctAuxiliaryFailureAttribution::NoDelivery,
+        );
+        assert_eq!(
+            attribute_vct_auxiliary_failure(
+                unauthenticated,
+                Some(authenticated),
+                VctCommitFailure::CurrentRoots,
+            ),
+            VctAuxiliaryFailureAttribution::CurrentDelivery,
+        );
+    }
 
     /// The tracked provenance record for the embedded Mainnet frontier.
     const MAINNET_FRONTIER_PROVENANCE: &[u8] = include_bytes!("vct/mainnet-frontier.json");
@@ -595,21 +845,21 @@ mod tests {
         use SourceMode::*;
         // Args are (checkpoint_sync, vct_fast_sync, has_embedded_frontiers).
 
-        // The default: a checkpoint-trusting sync with VCT fast sync on uses the peer source
+        // The default: a checkpoint-trusting sync with VCT fast sync on uses header auxiliary data
         // wherever embedded frontiers exist (Mainnet). Storage mode (Archive/Pruned) is not an
         // input, so this covers both Archive and Pruned.
-        assert_eq!(select_source_mode(true, true, true), Peer);
+        assert_eq!(select_source_mode(true, true, true), HeaderAuxiliary);
         // `vct_fast_sync = false` keeps checkpoint sync on but forces the legacy recompute,
         // regardless of embedded frontiers.
         assert_eq!(select_source_mode(true, false, true), Legacy);
         assert_eq!(select_source_mode(true, false, false), Legacy);
-        // `checkpoint_sync = false` also fully recomputes the trees: legacy, never peer,
+        // `checkpoint_sync = false` also fully recomputes the trees: legacy, never auxiliary,
         // regardless of the fast-sync knob or embedded frontiers.
         assert_eq!(select_source_mode(false, true, true), Legacy);
         assert_eq!(select_source_mode(false, true, false), Legacy);
         assert_eq!(select_source_mode(false, false, true), Legacy);
         assert_eq!(select_source_mode(false, false, false), Legacy);
-        // No embedded frontiers (e.g. Testnet): legacy, never peer, even under checkpoint sync.
+        // Networks without embedded frontiers use legacy recomputation during checkpoint sync.
         assert_eq!(select_source_mode(true, true, false), Legacy);
     }
 
@@ -644,7 +894,7 @@ mod tests {
             false,
         );
         assert!(
-            !trusted.vct_root_needs_successor(height, &network),
+            !trusted.vct_root_needs_successor(height, &network, true),
             "trusted fixture roots can commit without a stored successor header"
         );
 
@@ -656,7 +906,7 @@ mod tests {
             true,
         );
         assert!(
-            untrusted.vct_root_needs_successor(height, &network),
+            untrusted.vct_root_needs_successor(height, &network, true),
             "untrusted roots defer until a stored successor header verifies them"
         );
     }

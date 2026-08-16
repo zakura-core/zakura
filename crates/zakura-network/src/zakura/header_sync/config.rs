@@ -1,53 +1,17 @@
-use super::{error::*, validation::*, wire::*, *};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use zakura_chain::{block, parameters::Network};
+
+use super::{wire::*, HeaderSyncStartError};
 use crate::zakura::ServicePeerLimits;
 
-/// Header-sync peer status advertisement.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct HeaderSyncStatus {
-    /// Sender's best known tip height.
-    pub tip_height: block::Height,
-    /// Sender's best known tip hash.
-    pub tip_hash: block::Hash,
-    /// Sender's lowest contiguous header height.
-    pub anchor_height: block::Height,
-    /// Maximum headers the sender will serve per response.
-    pub max_headers_per_response: u32,
-    /// Maximum concurrent `GetHeaders` requests the sender will service.
-    pub max_inflight_requests: u16,
-}
-
-impl HeaderSyncStatus {
-    pub(super) fn encode_to<W: Write>(&self, writer: &mut W) -> Result<(), HeaderSyncWireError> {
-        write_height(writer, self.tip_height)?;
-        self.tip_hash.zcash_serialize(&mut *writer)?;
-        write_height(writer, self.anchor_height)?;
-        writer.write_u32::<LittleEndian>(clamp_advertised_range(self.max_headers_per_response))?;
-        writer.write_u16::<LittleEndian>(self.max_inflight_requests)?;
-        Ok(())
-    }
-
-    pub(super) fn decode_from<R: Read>(reader: &mut R) -> Result<Self, HeaderSyncWireError> {
-        Ok(Self {
-            tip_height: read_height(reader)?,
-            tip_hash: block::Hash::zcash_deserialize(&mut *reader)?,
-            anchor_height: read_height(reader)?,
-            max_headers_per_response: clamp_advertised_range(reader.read_u32::<LittleEndian>()?),
-            max_inflight_requests: reader.read_u16::<LittleEndian>()?,
-        })
-    }
-}
-
-impl Default for HeaderSyncStatus {
-    fn default() -> Self {
-        Self {
-            tip_height: block::Height::MIN,
-            tip_hash: block::Hash([0; 32]),
-            anchor_height: block::Height::MIN,
-            max_headers_per_response: DEFAULT_HS_RANGE,
-            max_inflight_requests: DEFAULT_HS_MAX_INFLIGHT,
-        }
-    }
-}
+const COMMON_HEADER_BYTES: usize = 1_487;
+const REGTEST_HEADER_BYTES: usize = 177;
+const LOCAL_MAX_HS_INFLIGHT_PER_PEER: u16 = 1;
+const DEFAULT_HS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const DEFAULT_HS_MAX_UNPRODUCTIVE_REQUESTS: u32 = 3;
+const DEFAULT_HS_UNPRODUCTIVE_PEER_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Header-sync configuration nested under the Zakura P2P-v2 config.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -55,22 +19,24 @@ impl Default for HeaderSyncStatus {
 pub struct ZakuraHeaderSyncConfig {
     /// Maximum headers this node advertises per `GetHeaders` response.
     pub max_headers_per_response: u32,
-    /// Maximum concurrent `GetHeaders` requests per peer.
-    ///
-    /// This is both the inbound limit advertised to remote peers and the local
-    /// outbound requester ceiling. The effective requester limit is the minimum
-    /// of this value, the peer's advertisement, and the hard protocol cap of 16.
-    pub max_inflight_requests: u16,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
     #[serde(with = "humantime_serde")]
     pub status_refresh_interval: Duration,
     /// Header-sync peer caps and queue limits owned by this reactor.
     pub peer_limits: ServicePeerLimits,
-    /// Accept full blocks delivered on Zakura full-block gossip paths.
+    /// Consecutive unproductive header requests before this node drops the peer's session.
     ///
-    /// Disabling this keeps range-based header sync and legacy request/response
-    /// active while forcing block bodies to arrive through the block-sync stream.
-    pub accept_new_blocks: bool,
+    /// A deadline marks its request as unproductive.
+    /// Do not charge a peer that reports the selected tip.
+    /// Set this value to `0` to keep all peers.
+    pub max_unproductive_header_requests: u32,
+    /// How long the node refuses header-sync readmission to an unproductive peer.
+    ///
+    /// Discovery applies dial backoff only after a failed dial.
+    /// The cooldown prevents an immediate redial after a successful dial ends in eviction.
+    /// Set this value to zero to allow immediate readmission.
+    #[serde(with = "humantime_serde")]
+    pub unproductive_peer_cooldown: Duration,
     /// Optional trusted header-sync anchor height.
     ///
     /// When unset, header sync starts from genesis. When set, [`anchor_hash`](Self::anchor_hash)
@@ -87,10 +53,10 @@ impl Default for ZakuraHeaderSyncConfig {
     fn default() -> Self {
         Self {
             max_headers_per_response: DEFAULT_HS_RANGE,
-            max_inflight_requests: DEFAULT_HS_MAX_INFLIGHT,
             status_refresh_interval: DEFAULT_HS_STATUS_REFRESH_INTERVAL,
             peer_limits: ServicePeerLimits::default(),
-            accept_new_blocks: true,
+            max_unproductive_header_requests: DEFAULT_HS_MAX_UNPRODUCTIVE_REQUESTS,
+            unproductive_peer_cooldown: DEFAULT_HS_UNPRODUCTIVE_PEER_COOLDOWN,
             anchor_height: None,
             anchor_hash: None,
         }
@@ -100,13 +66,17 @@ impl Default for ZakuraHeaderSyncConfig {
 impl ZakuraHeaderSyncConfig {
     /// Return the clamped served-range advertisement for wire status messages.
     pub fn advertised_max_headers_per_response(&self) -> u32 {
-        clamp_advertised_range(self.max_headers_per_response)
+        self.max_headers_per_response.clamp(1, MAX_HS_RANGE)
     }
 
     /// Return the locally capped in-flight advertisement for status messages.
     pub fn advertised_max_inflight_requests(&self) -> u16 {
-        self.max_inflight_requests
-            .clamp(1, LOCAL_MAX_HS_INFLIGHT_PER_PEER)
+        LOCAL_MAX_HS_INFLIGHT_PER_PEER
+    }
+
+    /// Return the status refresh interval, clamped to the publication-rate floor.
+    pub fn effective_status_refresh_interval(&self) -> Duration {
+        self.status_refresh_interval.max(Duration::from_secs(1))
     }
 
     /// Return the configured trusted anchor, or genesis when no override is configured.
@@ -115,7 +85,12 @@ impl ZakuraHeaderSyncConfig {
         network: &Network,
     ) -> Result<(block::Height, block::Hash), HeaderSyncStartError> {
         match (self.anchor_height, self.anchor_hash) {
-            (Some(height), Some(hash)) => Ok((height, hash)),
+            (Some(height), Some(hash)) if network.checkpoint_list().hash(height) == Some(hash) => {
+                Ok((height, hash))
+            }
+            (Some(height), Some(hash)) => Err(HeaderSyncStartError::InvalidAnchor {
+                anchor: (height, hash),
+            }),
             (None, None) => Ok((block::Height(0), network.genesis_hash())),
             _ => Err(HeaderSyncStartError::IncompleteAnchor),
         }
@@ -132,71 +107,4 @@ pub fn header_sync_header_bytes_for_network(network: &Network) -> usize {
     } else {
         COMMON_HEADER_BYTES
     }
-}
-
-/// Maximum `Headers` count that fits the header-sync payload and app frame caps.
-///
-/// The fixed overhead includes the per-message request ID.
-pub fn header_sync_count_by_byte_budget(
-    network: &Network,
-    max_frame_bytes: u32,
-    want_tree_aux_roots: bool,
-) -> u32 {
-    let frame_payload_cap = usize::try_from(max_frame_bytes)
-        .unwrap_or(usize::MAX)
-        .saturating_sub(FRAME_HEADER_BYTES);
-    let payload_cap = MAX_HS_MESSAGE_BYTES.min(frame_payload_cap);
-    let root_bytes = if want_tree_aux_roots {
-        HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES
-    } else {
-        0
-    };
-    let header_bytes = header_sync_header_bytes_for_network(network)
-        .saturating_add(HEADER_SYNC_BODY_SIZE_BYTES)
-        .saturating_add(root_bytes);
-    let count = payload_cap.saturating_sub(
-        HEADER_SYNC_MESSAGE_TYPE_BYTES
-            + HEADER_SYNC_REQUEST_ID_BYTES
-            + HEADER_SYNC_COUNT_BYTES
-            + HEADER_SYNC_HAS_ROOTS_BYTES,
-    ) / header_bytes;
-
-    u32::try_from(count)
-        .unwrap_or(u32::MAX)
-        .clamp(1, MAX_HS_RANGE)
-}
-
-/// Clamp an outbound `GetHeaders.count` by peer, hard, payload, and frame caps.
-pub fn clamp_header_sync_request_count(
-    desired_count: u32,
-    peer_max_headers_per_response: u32,
-    network: &Network,
-    max_frame_bytes: u32,
-    want_tree_aux_roots: bool,
-) -> u32 {
-    desired_count
-        .min(clamp_advertised_range(peer_max_headers_per_response))
-        .min(MAX_HS_RANGE)
-        .min(header_sync_count_by_byte_budget(
-            network,
-            max_frame_bytes,
-            want_tree_aux_roots,
-        ))
-        .max(1)
-}
-
-/// Maximum inbound `GetHeaders.count` this node will serve.
-pub fn inbound_get_headers_count_limit(
-    config: &ZakuraHeaderSyncConfig,
-    network: &Network,
-    max_frame_bytes: u32,
-    want_tree_aux_roots: bool,
-) -> u32 {
-    clamp_header_sync_request_count(
-        u32::MAX,
-        config.advertised_max_headers_per_response(),
-        network,
-        max_frame_bytes,
-        want_tree_aux_roots,
-    )
 }

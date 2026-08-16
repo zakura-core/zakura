@@ -481,21 +481,21 @@ pub(crate) fn tx_anchors_refer_to_final_treestates(
     sapling_orchard_ironwood_anchors_refer_to_final_treestates(
         finalized_state,
         parent_chain,
-        &unmined_tx.transaction,
-        unmined_tx.id.mined_id(),
+        unmined_tx.transaction(),
+        unmined_tx.id().mined_id(),
         None,
         None,
     )?;
 
     // If there are no sprout transactions in the block, avoid running a rayon scope
-    if unmined_tx.transaction.has_sprout_joinsplit_data() {
+    if unmined_tx.transaction().has_sprout_joinsplit_data() {
         let mut sprout_final_treestates = HashMap::new();
 
         fetch_sprout_final_treestates(
             &mut sprout_final_treestates,
             finalized_state,
             parent_chain,
-            &unmined_tx.transaction,
+            unmined_tx.transaction(),
             None,
             None,
         );
@@ -515,8 +515,8 @@ pub(crate) fn tx_anchors_refer_to_final_treestates(
 
                 sprout_anchors_result = Some(sprout_anchors_refer_to_treestates(
                     &sprout_final_treestates,
-                    &unmined_tx.transaction,
-                    unmined_tx.id.mined_id(),
+                    unmined_tx.transaction(),
+                    unmined_tx.id().mined_id(),
                     None,
                     None,
                 ));

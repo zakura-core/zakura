@@ -78,6 +78,14 @@ impl LegacySyncTrace {
         });
     }
 
+    pub(super) fn checkpoint_handoff(&self, state_tip: Option<Height>, checkpoint_height: Height) {
+        self.emitter.emit_event(|| LegacyEvent::CheckpointHandoff {
+            reason: "checkpoint_handoff",
+            state_tip: state_tip.map(|height| height.0),
+            checkpoint_height: checkpoint_height.0,
+        });
+    }
+
     pub(super) fn tips_obtained(&self, reserve: usize, prospective_tips: usize) {
         self.emitter.emit_event(|| LegacyEvent::TipsObtained {
             reserve: bounded_count(reserve),
@@ -195,6 +203,13 @@ enum LegacyEvent {
         state_tip: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    #[serde(rename = "round_finish")]
+    CheckpointHandoff {
+        reason: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state_tip: Option<u32>,
+        checkpoint_height: u32,
     },
     TipsObtained {
         reserve: u64,
@@ -339,6 +354,33 @@ mod tests {
         assert_eq!(event["event"], "round_start");
         assert_eq!(event["node"], "test-node");
         assert_eq!(event["state_tip"], 42);
+    }
+
+    #[tokio::test]
+    async fn writes_checkpoint_handoff_boundary() {
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
+        let trace = LegacySyncTrace {
+            emitter: JsonlEventEmitter::new(guard.tracer(), "test-node"),
+            expose_peer_addresses: false,
+        };
+
+        trace.checkpoint_handoff(Some(Height(160)), Height(160));
+        drop(trace);
+        guard.shutdown().await;
+
+        let event = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
+            .expect("legacy trace file is written");
+        let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
+        assert_eq!(event["event"], "round_finish");
+        assert_eq!(event["reason"], "checkpoint_handoff");
+        assert_eq!(event["state_tip"], 160);
+        assert_eq!(event["checkpoint_height"], 160);
+        assert_eq!(event["node"], "test-node");
+        assert_eq!(
+            event["process_trace_id"],
+            zakura_jsonl_trace::process_trace_id()
+        );
     }
 
     #[test]

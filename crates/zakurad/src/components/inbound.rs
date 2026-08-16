@@ -672,7 +672,8 @@ impl Service<zn::Request> for Inbound {
                     };
 
                     // Work out which transaction IDs were missing.
-                    let available_tx_ids: HashSet<UnminedTxId> = transactions.iter().map(|tx| tx.id).collect();
+                    let available_tx_ids: HashSet<UnminedTxId> =
+                        transactions.iter().map(|tx| tx.id()).collect();
                     // We don't need to limit the size of the missing transaction IDs list,
                     // because it is already limited to the size of the getdata request
                     // sent by the peer. (Their content and encodings are the same.)
@@ -687,7 +688,7 @@ impl Service<zn::Request> for Inbound {
                         // (but only one at a time)
                         let within_limit = total_size < GETDATA_SENT_BYTES_LIMIT;
 
-                        total_size += tx.size;
+                        total_size += tx.size();
 
                         within_limit
                     }).map(|tx| Available((tx, None)));
@@ -751,6 +752,15 @@ impl Service<zn::Request> for Inbound {
                     // The response just indicates if processing was queued or not; ignore it
                     .map_ok(|_resp| zn::Response::Nil)
                     .boxed()
+            }
+            zn::Request::AdvertiseBlock(hash, Some(zn::PeerSource::Zakura(peer_id))) => {
+                debug!(
+                    ?hash,
+                    ?peer_id,
+                    "ignoring Zakura block advertisement because native block sync owns block bodies",
+                );
+                metrics::counter!("gossip.zakura.native_sync.block.hash.count").increment(1);
+                async { Ok(zn::Response::Nil) }.boxed()
             }
             zn::Request::AdvertiseBlock(hash, advertiser) => {
                 block_downloads.download_and_verify(hash, advertiser);

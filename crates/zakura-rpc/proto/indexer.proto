@@ -22,6 +22,15 @@ message BlockAndHash {
   bytes data = 2;
 };
 
+// An encoded block and its height.
+message BlockAndHeight {
+  // The height of the block in the chain.
+  uint32 height = 1;
+
+  // The encoded block data, in the same encoding as `BlockAndHash.data`.
+  bytes data = 2;
+};
+
 // A request for a single block by hash or height from the best chain.
 message BlockRequest {
   // The block to fetch, identified by either its hash or its height.
@@ -30,6 +39,18 @@ message BlockRequest {
   // value is interpreted as a big-endian block height. Any other length is
   // rejected.
   bytes hash_or_height = 1;
+};
+
+// A request for a range of finalized blocks by height.
+message BlockRangeRequest {
+  // The height of the first block in the range.
+  uint32 start_height = 1;
+
+  // The height of the last block in the range, inclusive.
+  //
+  // Must be at least `start_height`; the served range ends at the finalized
+  // tip if that is lower.
+  uint32 end_height = 2;
 };
 
 // A request to subscribe to non-finalized state changes.
@@ -85,4 +106,16 @@ service Indexer {
   // Used by a syncer to fetch finalized blocks that bridge the gap between its
   // local finalized tip and the start of the streamed non-finalized chain.
   rpc GetBlock(BlockRequest) returns (BlockAndHash);
+
+  // Streams the finalized blocks in the requested height range, in ascending
+  // height order.
+  //
+  // Used by indexers to backfill finalized history without a request round
+  // trip per block. The stream ends cleanly at the finalized tip, or before
+  // the first block in the range whose body is not stored, whichever comes
+  // first; a consumer that stops reading for longer than the server's send
+  // timeout also ends the stream early, which is indistinguishable on the
+  // wire from a clean end. Rejects ranges whose end is below their start
+  // with `INVALID_ARGUMENT`.
+  rpc GetBlockRange(BlockRangeRequest) returns (stream BlockAndHeight);
 }

@@ -65,6 +65,9 @@ DEFAULTS = {
     # One of: default | legacy | zakura | dual.
     "p2p_stack": "dual",
     "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
+    # e.g. "127.0.0.1:8080" -> renders [health] (/healthy, /ready); "" omits it.
+    # Both endpoints are unauthenticated, so keep them on loopback.
+    "health_listen_addr": "",
     "tracing_filter": "",    # e.g. "info,zakura_network::zakura=debug"; "" uses zakurad default
     "checkpoint_sync": True,
     # Setting this false keeps checkpoint sync on while selecting the legacy non-VCT path.
@@ -108,6 +111,7 @@ class Node:
     storage_mode: str
     p2p_stack: str
     metrics_endpoint: str
+    health_listen_addr: str
     tracing_filter: str
     checkpoint_sync: bool
     vct_fast_sync: bool
@@ -234,6 +238,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
                 merged["p2p_stack"], where=f"[[nodes]] {name}"
             ),
             metrics_endpoint=merged["metrics_endpoint"],
+            health_listen_addr=merged["health_listen_addr"],
             tracing_filter=merged["tracing_filter"],
             checkpoint_sync=merged["checkpoint_sync"],
             vct_fast_sync=merged["vct_fast_sync"],
@@ -460,6 +465,9 @@ def render_node_config(node: Node) -> str:
     else:
         rpc_block = "# listen_addr disabled"
     metrics_block = f'[metrics]\nendpoint_addr = "{node.metrics_endpoint}"\n' if node.metrics_endpoint else ""
+    health_block = (
+        f'[health]\nlisten_addr = "{node.health_listen_addr}"\n' if node.health_listen_addr else ""
+    )
     filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zakurad default)"
     network_cache_line = (
         f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zakurad default)"
@@ -477,6 +485,7 @@ def render_node_config(node: Node) -> str:
         "P2P_STACK": node.p2p_stack,
         "ZAKURA_BLOCK": render_zakura_block(node.zakura),
         "METRICS_BLOCK": metrics_block,
+        "HEALTH_BLOCK": health_block,
         "TRACING_FILTER": filter_line,
         "LOG_FILE": node.log_file,
         "RPC_BLOCK": rpc_block,

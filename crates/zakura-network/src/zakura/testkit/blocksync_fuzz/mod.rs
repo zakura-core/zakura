@@ -27,7 +27,7 @@ use super::mock_blocksync::{
 use super::{SyntheticBlockSyncPeers, TraceCapture};
 use crate::zakura::{
     BlockApplyResult, BlockSyncAction, BlockSyncEvent, BlockSyncFrontiers, BlockSyncHandle,
-    ChainFrontier, Frontier, FrontierChange, FrontierUpdate, ZakuraSyncExchange, ZakuraTrace,
+    ZakuraTrace,
 };
 use crate::BoxError;
 
@@ -62,27 +62,28 @@ pub(crate) async fn run_scenario(
     let initial_header = scenario.initial_best_header.min(target);
     let initial_header_hash = corpus_hash(&corpus, initial_header);
 
-    // The node under test starts at genesis with `initial_best_header` as its download
-    // target; timeline `GrowTo` events can grow it toward the corpus tip.
-    let initial = FrontierUpdate {
-        frontier: ChainFrontier {
-            finalized: Frontier::new(block::Height(0), genesis_hash),
-            verified_body: Frontier::new(block::Height(0), genesis_hash),
-            best_header: Frontier::new(initial_header, initial_header_hash),
-        },
-        change: FrontierChange::Snapshot,
-    };
-    let exchange = ZakuraSyncExchange::new(initial, trace.clone());
+    // The commit driver advances one shared mock frontier as bodies apply.
+    // The timeline driver rolls it back after a verified reset.
+    let apply = MockApplyFrontier::new(corpus.clone());
+    let initial = fuzz_snapshot(
+        1,
+        1,
+        1,
+        zakura_header_chain::Frontier::new(block::Height(0), genesis_hash),
+        zakura_header_chain::Frontier::new(block::Height(0), genesis_hash),
+        zakura_header_chain::Frontier::new(initial_header, initial_header_hash),
+    );
+    let (snapshots, committed_snapshots) = watch::channel(Some(initial));
 
     let shutdown = CancellationToken::new();
-    let mut startup = crate::zakura::BlockSyncStartup::new_with_exchange(
+    let mut startup = crate::zakura::BlockSyncStartup::new_with_committed_snapshots(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
             verified_block_hash: genesis_hash,
         },
         (initial_header, initial_header_hash),
-        exchange.subscribe_frontier(),
+        committed_snapshots,
         scenario.config.clone(),
     );
     startup.trace = trace.clone();
@@ -91,11 +92,6 @@ pub(crate) async fn run_scenario(
     let (handle, actions, reactor_task) = crate::zakura::spawn_block_sync_reactor(startup);
 
     let (committed_tx, mut committed_rx) = watch::channel(block::Height(0));
-
-    // One shared mock commit frontier: the commit driver advances it as bodies apply;
-    // the timeline driver rolls it back on a verified reset so the node's reorg and
-    // the committer stay consistent.
-    let apply = MockApplyFrontier::new(corpus.clone());
 
     let mut tasks = Vec::new();
     tasks.push(spawn_action_driver(
@@ -110,7 +106,7 @@ pub(crate) async fn run_scenario(
     ));
     if !scenario.timeline.is_empty() {
         tasks.push(spawn_timeline_driver(
-            exchange.clone(),
+            snapshots.clone(),
             corpus.clone(),
             apply.clone(),
             scenario.timeline.clone(),
@@ -229,9 +225,11 @@ fn spawn_action_driver(
             };
             match action {
                 BlockSyncAction::QueryNeededBlocks {
+                    query_id,
                     from,
                     limit,
                     best_header_tip,
+                    scope,
                 } => {
                     let start = from;
                     let metas = if limit == 0 {
@@ -248,7 +246,18 @@ fn spawn_action_driver(
                         }
                     };
                     if handle
-                        .send(BlockSyncEvent::NeededBlocks(metas))
+                        .send(BlockSyncEvent::ScopedNeededBlocks {
+                            query_id,
+                            scope,
+                            body_anchor: {
+                                let frontiers = apply.frontiers();
+                                zakura_header_chain::Frontier::new(
+                                    frontiers.verified_block_tip,
+                                    frontiers.verified_block_hash,
+                                )
+                            },
+                            blocks: metas,
+                        })
                         .await
                         .is_err()
                     {
@@ -270,7 +279,12 @@ fn spawn_action_driver(
                         break;
                     }
                 }
-                BlockSyncAction::SubmitBlock { token, block } => {
+                BlockSyncAction::SubmitBlock {
+                    owner,
+                    source,
+                    token,
+                    block,
+                } => {
                     // Model a slow/bursty commit drain: hold the submitted body before
                     // applying so its reserved bytes stay held until
                     // `BlockApplyFinished`, letting the apply backlog build against the
@@ -289,16 +303,24 @@ fn spawn_action_driver(
                     }
                     if handle
                         .send(BlockSyncEvent::BlockApplyFinished {
+                            owner,
+                            source,
                             token,
                             height,
                             hash: block.hash(),
-                            result: outcome.result,
-                            local_frontier: Some(outcome.frontiers),
+                            outcome: crate::zakura::block_sync::test_block_apply_outcome(
+                                outcome.result,
+                            ),
                         })
                         .await
                         .is_err()
                     {
                         break;
+                    }
+                    if outcome.result == BlockApplyResult::Committed {
+                        let _ = handle
+                            .send(BlockSyncEvent::ChainTipGrow(outcome.frontiers))
+                            .await;
                     }
                     applied = applied.saturating_add(1);
                     if let Some(burst) = commit.burst {
@@ -311,16 +333,19 @@ fn spawn_action_driver(
                         }
                     }
                 }
+                BlockSyncAction::RecordBodyUnavailable { .. }
+                | BlockSyncAction::RecordBodyInvalid { .. }
+                | BlockSyncAction::RestartBodyAvailability { .. }
+                | BlockSyncAction::RetryBodyAvailability { .. } => {}
                 BlockSyncAction::Misbehavior { .. } => {}
             }
         }
     })
 }
 
-/// Publishes the scenario's timed frontier changes (header growth / reanchor /
-/// verified reset) into the shared sync exchange, driving the node's download target.
+/// Publishes the scenario's timed committed snapshots, driving the node's download target.
 fn spawn_timeline_driver(
-    exchange: ZakuraSyncExchange,
+    snapshots: watch::Sender<Option<zakura_header_chain::EngineSnapshot>>,
     corpus: SyntheticBlockCorpus,
     apply: MockApplyFrontier,
     mut timeline: Vec<TipEvent>,
@@ -342,42 +367,84 @@ fn spawn_timeline_driver(
             } else {
                 apply.frontiers()
             };
-            let mut current = exchange.current_frontier().frontier;
-            current.finalized = Frontier::new(
+            let mut current = snapshots
+                .borrow()
+                .clone()
+                .expect("the fuzz harness starts after semantic handoff");
+            current.state_version =
+                zakura_header_chain::StateVersion::new(current.state_version.get() + 1);
+            current.frontiers.finalized = zakura_header_chain::Frontier::new(
                 apply_frontiers.finalized_height,
                 apply_frontiers.verified_block_hash,
             );
-            current.verified_body = Frontier::new(
+            current.frontiers.verified_best = zakura_header_chain::Frontier::new(
                 apply_frontiers.verified_block_tip,
                 apply_frontiers.verified_block_hash,
             );
-            let (frontier, change) = apply_tip_event(&corpus, current, event.kind);
-            exchange.publish_frontier(
-                FrontierUpdate { frontier, change },
-                "blocksync_fuzz_timeline",
-            );
+            apply_tip_event(&corpus, &mut current, event.kind);
+            snapshots
+                .send(Some(current))
+                .expect("the fuzz reactor keeps its committed-snapshot receiver");
         }
     })
 }
 
 fn apply_tip_event(
     corpus: &SyntheticBlockCorpus,
-    mut frontier: ChainFrontier,
+    snapshot: &mut zakura_header_chain::EngineSnapshot,
     kind: TipEventKind,
-) -> (ChainFrontier, FrontierChange) {
+) {
     match kind {
         TipEventKind::GrowTo(height) => {
-            frontier.best_header = Frontier::new(height, corpus_hash(corpus, height));
-            (frontier, FrontierChange::HeaderAdvanced)
+            snapshot.header_generation =
+                zakura_header_chain::HeaderGeneration::new(snapshot.header_generation.get() + 1);
+            snapshot.frontiers.header_best =
+                zakura_header_chain::Frontier::new(height, corpus_hash(corpus, height));
         }
         TipEventKind::HeaderReanchor(height) => {
-            frontier.best_header = Frontier::new(height, corpus_hash(corpus, height));
-            (frontier, FrontierChange::HeaderReanchored)
+            snapshot.header_generation =
+                zakura_header_chain::HeaderGeneration::new(snapshot.header_generation.get() + 1);
+            snapshot.frontiers.header_best =
+                zakura_header_chain::Frontier::new(height, corpus_hash(corpus, height));
         }
         TipEventKind::VerifiedReset(height) => {
-            frontier.verified_body = Frontier::new(height, corpus_hash(corpus, height));
-            (frontier, FrontierChange::VerifiedReset)
+            snapshot.verified_generation = zakura_header_chain::VerifiedGeneration::new(
+                snapshot.verified_generation.get() + 1,
+            );
+            snapshot.frontiers.verified_best =
+                zakura_header_chain::Frontier::new(height, corpus_hash(corpus, height));
         }
+    }
+    snapshot.header_best_score = zakura_header_chain::ChainScore::new(
+        zakura_header_chain::SuffixWork::zero(),
+        snapshot.frontiers.header_best.hash,
+    );
+}
+
+fn fuzz_snapshot(
+    state_version: u64,
+    header_generation: u64,
+    verified_generation: u64,
+    finalized: zakura_header_chain::Frontier,
+    verified_best: zakura_header_chain::Frontier,
+    header_best: zakura_header_chain::Frontier,
+) -> zakura_header_chain::EngineSnapshot {
+    zakura_header_chain::EngineSnapshot {
+        mode: zakura_header_chain::EngineMode::Integrated,
+        state_version: zakura_header_chain::StateVersion::new(state_version),
+        header_generation: zakura_header_chain::HeaderGeneration::new(header_generation),
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(verified_generation),
+        frontiers: zakura_header_chain::FrontierSet {
+            finalized,
+            header_best,
+            verified_best,
+        },
+        header_best_score: zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            header_best.hash,
+        ),
+        oldest_retained_height: finalized.height,
+        alarms: zakura_header_chain::AlarmSet::default(),
     }
 }
 

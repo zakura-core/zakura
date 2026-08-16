@@ -279,6 +279,7 @@ impl NonFinalizedState {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn insert_test_chain(&mut self, chain: Arc<Chain>) {
         self.insert(chain);
     }

@@ -360,6 +360,7 @@ impl FinalFrontiers {
 /// Source for the VCT fast-sync's verified per-block roots and final frontier.
 pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// The supplied roots for `height`, if this source has them.
+    #[cfg(test)]
     fn vct_root(
         &self,
         height: block::Height,
@@ -431,59 +432,35 @@ impl CommitmentRootSource for FixtureSource {
     }
 }
 
-/// A [`CommitmentRootSource`] backed by authenticated header-ahead roots in `db`.
+/// Embedded handoff frontiers for the production VCT path.
 ///
-/// State persists only roots sealed by header-root verification ahead of body commit;
-/// the committer reads them per height through the [`CommitmentRootSource`] seam.
-/// Tests can still fill fixture roots directly. The handoff frontier is embedded in the binary, held
-/// immutably here and never fetched over the network — a peer source always has one,
-/// because peer mode is only selected on networks with an embedded frontier. Committed
-/// rows are cleaned up by the database's own retention, not through this seam.
-///
-/// At the handoff height itself the header-root lane never promotes a peer row: checkpoint
-/// header `C` is only the final pinned witness for `C - 1`, and no later configured
-/// checkpoint can authenticate a successor at `C + 1`. [`Self::vct_root`] therefore returns
-/// the embedded frontier roots at `C` so the handoff commit can verify the block commitment
-/// against that reviewed frontier (design §13.2) instead of stalling on a missing DB row.
+/// Hash-scoped auxiliary deliveries in the header-chain store provide all per-header roots.
+/// This source intentionally provides no height-keyed root lookup.
 #[derive(Debug)]
-pub(super) struct PeerSource {
-    db: ZakuraDb,
+pub(super) struct EmbeddedFrontierSource {
     frontiers: FinalFrontiers,
 }
 
-impl PeerSource {
-    /// Create a source backed by authenticated header-ahead roots in `db`. `frontiers`
-    /// is the embedded handoff frontier for the network.
-    pub(super) fn new(db: ZakuraDb, frontiers: FinalFrontiers) -> Self {
-        PeerSource { db, frontiers }
+impl EmbeddedFrontierSource {
+    /// Create a source from the verified handoff frontier embedded for the network.
+    pub(super) fn new(frontiers: FinalFrontiers) -> Self {
+        Self { frontiers }
     }
 }
 
-impl CommitmentRootSource for PeerSource {
+impl CommitmentRootSource for EmbeddedFrontierSource {
+    #[cfg(test)]
     fn vct_root(
         &self,
-        height: block::Height,
+        _height: block::Height,
     ) -> Option<(
         sapling::tree::Root,
         orchard::tree::Root,
         ironwood::tree::Root,
     )> {
-        // Header-root authentication promotes through C-1 only. Serve the embedded
-        // handoff frontier roots at C so body commit can finish the fast sync.
-        if height == self.frontiers.height {
-            return Some((
-                self.frontiers.sapling.root(),
-                self.frontiers.orchard.root(),
-                self.frontiers.ironwood.root(),
-            ));
-        }
-
-        self.db
-            .commitment_roots_by_height_range(height..=height)
-            .into_iter()
-            .next()
-            .map(|roots| (roots.sapling_root, roots.orchard_root, roots.ironwood_root))
+        None
     }
+
     fn final_frontiers(&self) -> &FinalFrontiers {
         &self.frontiers
     }
@@ -1476,91 +1453,6 @@ mod tests {
             source.vct_last_checkpoint_height(),
             block::Height(11),
             "handoff height comes from the supplied frontiers"
-        );
-    }
-
-    /// A peer source exposes no way to delete a stored row: a body-time rejection
-    /// cannot create a gap below the durable frontier, and repeated reads of the
-    /// same height stay stable.
-    #[test]
-    fn peer_source_keeps_authenticated_roots_on_body_mismatch() {
-        let db = ephemeral_mainnet_db();
-        db.insert_zakura_header_commitment_roots([BlockCommitmentRoots {
-            height: block::Height(42),
-            sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
-            orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-            ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-            sapling_tx: 0,
-            orchard_tx: 0,
-            ironwood_tx: 0,
-            auth_data_root: AuthDataRoot::from([0u8; 32]),
-        }])
-        .expect("writing header-sync roots to an ephemeral database succeeds");
-
-        // The handoff frontier is mandatory for a peer source; its height is above the
-        // roots under test so it does not interact with the lookups.
-        let frontiers = FinalFrontiers {
-            height: block::Height(50),
-            sapling: Arc::new(Default::default()),
-            orchard: Arc::new(Default::default()),
-            sprout: Arc::new(Default::default()),
-            ironwood: Arc::new(Default::default()),
-        };
-        let source = PeerSource::new(db, frontiers);
-
-        assert!(
-            source.vct_root(block::Height(42)).is_some(),
-            "a header-sync-persisted root is read back by height"
-        );
-        assert!(
-            source.vct_root(block::Height(43)).is_none(),
-            "an absent height has no root"
-        );
-
-        assert_eq!(
-            source.vct_root(block::Height(42)),
-            Some((
-                sapling::tree::NoteCommitmentTree::default().root(),
-                orchard::tree::NoteCommitmentTree::default().root(),
-                ironwood::tree::NoteCommitmentTree::default().root(),
-            )),
-            "a re-read returns the same authenticated row below the frontier"
-        );
-    }
-
-    /// The header-root lane never writes an authenticated row at the handoff height, so
-    /// [`PeerSource`] must still expose the embedded frontier roots there for commit.
-    #[test]
-    fn peer_source_serves_embedded_frontier_roots_at_handoff() {
-        let db = ephemeral_mainnet_db();
-
-        let handoff = block::Height(50);
-        let frontiers = FinalFrontiers {
-            height: handoff,
-            sapling: Arc::new(Default::default()),
-            orchard: Arc::new(Default::default()),
-            sprout: Arc::new(Default::default()),
-            ironwood: Arc::new(Default::default()),
-        };
-        let expected = (
-            frontiers.sapling.root(),
-            frontiers.orchard.root(),
-            frontiers.ironwood.root(),
-        );
-        let source = PeerSource::new(db, frontiers);
-
-        assert!(
-            source.vct_root(block::Height(49)).is_none(),
-            "heights below the handoff still require an authenticated DB row"
-        );
-        assert_eq!(
-            source.vct_root(handoff),
-            Some(expected),
-            "handoff height is served from the embedded frontiers without a DB row"
-        );
-        assert!(
-            source.vct_root(block::Height(51)).is_none(),
-            "heights above the handoff are never served by PeerSource"
         );
     }
 }

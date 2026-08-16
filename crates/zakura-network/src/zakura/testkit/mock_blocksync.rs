@@ -22,7 +22,7 @@ use super::{await_until, ZakuraTestCluster, ZakuraTestNode};
 use crate::{
     zakura::{
         BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
-        BlockSyncFrontiers, HeaderSyncFrontiers, ServicePeerLimits, ZakuraBlockSyncConfig,
+        BlockSyncFrontiers, FullStateFrontiers, ServicePeerLimits, ZakuraBlockSyncConfig,
         ZakuraLocalLimits,
     },
     BoxError, Config,
@@ -491,7 +491,7 @@ async fn spawn_mock_node(
         .header_sync_driver(
             Config::default().network,
             anchor,
-            HeaderSyncFrontiers {
+            FullStateFrontiers {
                 finalized_height: initial_frontiers.finalized_height,
                 verified_block_tip: initial_frontiers.verified_block_tip,
                 verified_block_hash: initial_frontiers.verified_block_hash,
@@ -533,9 +533,11 @@ async fn drive_mock_block_sync_actions(
             };
             match action {
                 BlockSyncAction::QueryNeededBlocks {
+                    query_id,
                     from,
                     limit,
                     best_header_tip,
+                    scope,
                 } => {
                     if let Some(gate) = needed_blocks_gate.as_mut() {
                         while !*gate.borrow_and_update() {
@@ -558,7 +560,28 @@ async fn drive_mock_block_sync_actions(
                             Vec::new()
                         }
                     };
-                    let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
+                    let _ = handle
+                        .send(BlockSyncEvent::ScopedNeededBlocks {
+                            query_id,
+                            scope,
+                            body_anchor: apply.as_ref().map_or_else(
+                                || {
+                                    zakura_header_chain::Frontier::new(
+                                        block::Height(0),
+                                        mainnet_genesis_hash(),
+                                    )
+                                },
+                                |apply| {
+                                    let frontiers = apply.frontiers();
+                                    zakura_header_chain::Frontier::new(
+                                        frontiers.verified_block_tip,
+                                        frontiers.verified_block_hash,
+                                    )
+                                },
+                            ),
+                            blocks: metas,
+                        })
+                        .await;
                 }
                 BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
                     let blocks = corpus.blocks_in_range(start, count, servable_high);
@@ -575,7 +598,12 @@ async fn drive_mock_block_sync_actions(
                         })
                         .await;
                 }
-                BlockSyncAction::SubmitBlock { token, block } => {
+                BlockSyncAction::SubmitBlock {
+                    owner,
+                    source,
+                    token,
+                    block,
+                } => {
                     let Some(apply) = &apply else {
                         continue;
                     };
@@ -590,14 +618,26 @@ async fn drive_mock_block_sync_actions(
                     }
                     let _ = handle
                         .send(BlockSyncEvent::BlockApplyFinished {
+                            owner,
+                            source,
                             token,
                             height,
                             hash: block.hash(),
-                            result: outcome.result,
-                            local_frontier: Some(outcome.frontiers),
+                            outcome: crate::zakura::block_sync::test_block_apply_outcome(
+                                outcome.result,
+                            ),
                         })
                         .await;
+                    if outcome.result == BlockApplyResult::Committed {
+                        let _ = handle
+                            .send(BlockSyncEvent::ChainTipGrow(outcome.frontiers))
+                            .await;
+                    }
                 }
+                BlockSyncAction::RecordBodyUnavailable { .. }
+                | BlockSyncAction::RecordBodyInvalid { .. }
+                | BlockSyncAction::RestartBodyAvailability { .. }
+                | BlockSyncAction::RetryBodyAvailability { .. } => {}
                 BlockSyncAction::Misbehavior { .. } => {}
             }
         }
@@ -842,7 +882,6 @@ fn env_u16(name: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
-#[allow(clippy::print_stdout)]
 fn print_summary(config: &HarnessConfig, summary: &ThroughputSummary, trace_root: Option<&Path>) {
     let elapsed_secs = summary.elapsed.as_secs_f64().max(f64::EPSILON);
     // These casts are for approximate human-readable throughput output only.
@@ -850,34 +889,24 @@ fn print_summary(config: &HarnessConfig, summary: &ThroughputSummary, trace_root
     // These casts are for approximate human-readable throughput output only.
     let mib_per_second = summary.committed_bytes as f64 / (1024.0 * 1024.0) / elapsed_secs;
 
-    println!(
-        "zakura mock blocksync: seeds={} blocks={} max_blocks_per_response={} max_inflight={} target_block_bytes={}",
-        config.seeds,
-        config.blocks,
-        config.max_blocks_per_response,
-        config.max_inflight,
-        config
-            .shape
-            .target_block_bytes
-            .map(|bytes| bytes.to_string())
-            .unwrap_or_else(|| "random-small".to_string()),
+    tracing::info!(
+        seeds = config.seeds,
+        blocks = config.blocks,
+        max_blocks_per_response = config.max_blocks_per_response,
+        max_inflight = config.max_inflight,
+        target_block_bytes = ?config.shape.target_block_bytes,
+        blocks_per_second,
+        mib_per_second,
+        elapsed_seconds = elapsed_secs,
+        request_count = summary.request_count,
+        request_blocks_p50 = summary.request_blocks_p50,
+        request_bytes_p50 = summary.request_bytes_p50,
+        request_blocks_p95 = summary.request_blocks_p95,
+        request_bytes_p95 = summary.request_bytes_p95,
+        final_frontier = summary.final_frontier.0,
+        trace_dir = ?trace_root,
+        "completed mock block-sync throughput run"
     );
-    println!(
-        "throughput: {:.2} blocks/sec, {:.2} MiB/sec, elapsed={:.3}s",
-        blocks_per_second, mib_per_second, elapsed_secs,
-    );
-    println!(
-        "requests: count={} p50={} blocks/{} bytes p95={} blocks/{} bytes",
-        summary.request_count,
-        summary.request_blocks_p50,
-        summary.request_bytes_p50,
-        summary.request_blocks_p95,
-        summary.request_bytes_p95,
-    );
-    println!("final frontier: {}", summary.final_frontier.0);
-    if let Some(trace_root) = trace_root {
-        println!("trace dir: {}", trace_root.display());
-    }
 }
 
 #[test]

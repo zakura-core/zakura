@@ -23,6 +23,8 @@ Require or confirm:
 - `nodes`: one or more exact names from the inventories below.
 - `force_rebuild`: optional; defaults to `false`.
 - `no_restart`: optional; defaults to `false`.
+- `p2p_stack`: optional testnet override; defaults to `auto`, which preserves
+  the inventory's dual-stack role.
 
 For any mainnet node, confirm the `ref` and complete node list explicitly with
 the user immediately before dispatch.
@@ -112,11 +114,16 @@ Append these workflow fields only when requested:
 -f no_restart=true
 ```
 
+Do not override `p2p_stack` merely because a node is being redeployed. Let
+`auto` preserve its inventory role unless the user explicitly requests a
+topology experiment.
+
 ## Verification
 
 - Confirm every workflow run succeeded and its final node status is healthy.
 - Confirm each node reports the expected commit/version.
 - For restarted nodes, confirm RPC height is current and advances.
+- Confirm the configured P2P role after an explicit testnet stack override.
 - For mainnet `zakura-compat`, confirm both Zakura and zcashd remain healthy.
 - Stop on failure; do not continue to additional requested nodes.
 - Report each requested node and its workflow run URL.
@@ -126,6 +133,8 @@ Append these workflow fields only when requested:
 - Never dispatch with an empty `node` input.
 - Never add unrequested nodes to the deployment.
 - Do not change cache, state, identity, or node configuration paths.
+- Preserve the node-specific P2P role unless the user explicitly requests an
+  override.
 - Only one deploy per network runs at a time (`cancel-in-progress: false`).
 
 ## References

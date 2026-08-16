@@ -693,7 +693,7 @@ impl Service<Request> for Mempool {
                         // the best chain changes (which is the only way to stay at the same height), and the
                         // mempool re-verifies all pending tx_downloads when there's a `TipAction::Reset`.
                         if best_tip_height == expected_tip_height {
-                            let tx_id = tx.transaction.id;
+                            let tx_id = tx.transaction.id();
                             let (insert_result, evicted_ids) = storage.insert_with_evicted_ids(
                                 tx,
                                 spent_mempool_outpoints,
@@ -1132,7 +1132,7 @@ impl Service<Request> for Mempool {
                     if let Some((tx_version, output)) = storage
                         .transactions()
                         .get(&outpoint.hash)
-                        .map(|tx| tx.transaction.transaction.clone())
+                        .map(|tx| tx.transaction.transaction().clone())
                         .and_then(|tx| {
                             tx.outputs()
                                 .get(outpoint.index as usize)

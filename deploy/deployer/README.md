@@ -28,6 +28,18 @@ Copy `nodes.example.toml` to `nodes.toml` and edit. Each `[[nodes]]` entry needs
 `[defaults]` supplies fleet-wide values (service name, paths, network, ssh
 `port`); any field can be overridden per node. `nodes.toml` is gitignored.
 
+Two optional keys turn on the node's observability endpoints, which the status
+dashboard reads over its own ssh probe:
+
+- `metrics_endpoint` — renders `[metrics] endpoint_addr`, the Prometheus
+  `/metrics` exporter.
+- `health_listen_addr` — renders `[health] listen_addr`, serving `/healthy` and
+  `/ready`.
+
+Both are unauthenticated, so bind them to loopback. `zakurad` panics if either
+address is already in use, so check the port on the node before enabling one.
+Neither is rendered on a fleet running `manage_config = false`.
+
 ## Commands
 
 ```bash
@@ -85,12 +97,20 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 - `ref` — branch, tag, or SHA to build and deploy, default `main`.
 - `force_rebuild` — pass `--force` to rebuild the cached binary.
 - `no_restart` — stage binary/config/unit without restarting, default `false`.
+- `p2p_stack` — optionally override the selected node with `dual`, `zakura`, or
+  `legacy`. The default `auto` preserves the fleet's dual-stack role.
+- `header_sync_trace` — write structured canary traces under
+  `/mnt/data/traces/header-chain-canary`; defaults to `false`.
 - `node` — optional deployer node name; blank deploys the whole fleet.
+
+Explicit `p2p_stack` overrides and `header_sync_trace = true` require an
+explicit `node`, preventing canary settings from being applied fleet-wide.
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
 while forcing the legacy non-VCT path. Fleet nodes use `p2p_stack = "dual"`.
-It also writes `/etc/zakura/zakura.toml` and uses each node's existing
+Explicit per-node overrides remain available for staged experiments. The
+workflow also writes `/etc/zakura/zakura.toml` and uses each node's existing
 `/mnt/data/zakura-cache` snapshot directory, so CI restarts the current
 `zakurad.service` against the existing state instead of creating a fresh
 database. Volume-backed fleet hosts mount their attached DigitalOcean block
@@ -109,10 +129,8 @@ The workflow also refreshes a simple fleet status dashboard on
 
 The dashboard reads the generated deployer node config and polls each node over
 SSH. It shows the running commit from the node log, last restart time, current
-RPC height, whether the height advanced in the last five minutes, and an upgrade
-ETA for Ironwood testnet activation height `4134000`. The ETA uses observed
-cluster block movement when enough samples are available, otherwise it falls back
-to `--target-spacing 7.5`.
+RPC height, and whether the height advanced in the last five minutes. Node names
+link to `/node/<name>` for per-node host vitals, sync pipeline, and peer detail.
 
 The same service exposes the narrow public website API at
 `/ironwood-status.json` and its liveness check at `/healthz`. The public response
@@ -166,9 +184,7 @@ python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
-  --network testnet \
-  --upgrade-height 4134000 \
-  --target-spacing 7.5
+  --network testnet
 ```
 
 ## GitHub Actions mainnet fleet deploy
@@ -237,20 +253,14 @@ The gateway allowlists `sendrawtransaction`, rate-limits at 30 req/min/IP, and
 load-balances across the mainnet `:8232` backends listed in
 `deploy/gateway/mainnet/backends.toml`.
 
-It is the same `zakura-cluster-status.py` as testnet, launched with
-`--upgrade-height 3428143` for the Ironwood mainnet activation height. The ETA
-uses observed cluster block movement when enough samples are available,
-otherwise it falls back to `--target-spacing 75` (post-Blossom mainnet spacing).
-Manual run:
+It is the same `zakura-cluster-status.py` as testnet. Manual run:
 
 ```bash
 python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
-  --network mainnet \
-  --upgrade-height 3428143 \
-  --target-spacing 75
+  --network mainnet
 ```
 
 The mainnet workflow also installs a Slack watchdog on `us-east-0`:

@@ -62,7 +62,7 @@ fn main() {
         // proceed with the build.
         // Note that this won't be printed unless in cargo very verbose mode (-vv).
         // We could emit a build warning, but that might scare users.
-        println!("git error in vergen build script: skipping git env vars: {e:?}",);
+        eprintln!("git error in vergen build script: skipping git env vars: {e:?}",);
     }
 
     emitter.emit().expect("base emit should succeed");

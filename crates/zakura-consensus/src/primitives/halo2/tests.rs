@@ -666,6 +666,34 @@ async fn cache_evicts_in_insertion_order_and_stays_correct_when_full() {
 /// `&'static` handle and every request goes through a fresh `.clone()` of it. A cache that lived
 /// in the handle rather than behind the shared `Arc` would be empty for every request, so this
 /// pins the sharing that makes the cache reachable at all.
+/// A remembered result is never visible to another era's cache.
+///
+/// The cache key deliberately does not name the verifying key. What binds an entry to the key it
+/// was produced under is which era's cache holds it — [`batch_verifier`](super::batch_verifier)
+/// builds one per era, and [`verifier_routes_each_network_upgrade_to_the_correct_key`] pins the
+/// routing. This pins the other half: two cache instances share no state, so an item verified
+/// under the pre-NU6.2 insecure key can never be answered from that entry when it is later
+/// routed to a different era's verifier.
+#[tokio::test]
+async fn a_result_cached_under_one_era_is_not_visible_to_another() {
+    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+    let item = cacheable_item(&bundle, sighash, test_wtx_id(9));
+
+    let inner = CountingVerifier::new(true);
+    let mut one_era = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
+    let mut another_era = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
+
+    verify_through(&mut one_era, item.clone()).await;
+    assert_eq!(inner.calls(), 1, "the first verification must be a miss");
+
+    verify_through(&mut another_era, item).await;
+    assert_eq!(
+        inner.calls(),
+        2,
+        "another era's cache must not answer from an entry this one never recorded"
+    );
+}
+
 #[tokio::test]
 async fn cache_is_shared_between_clones() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();

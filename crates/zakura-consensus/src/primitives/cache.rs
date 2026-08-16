@@ -34,18 +34,27 @@ use zakura_chain::transaction::UnminedTxId;
 
 use crate::BoxError;
 
+#[cfg(test)]
+mod tests;
+
 /// The number of verified-bundle keys retained per cache.
 ///
 /// Sized to hold several blocks of history plus a full mempool, so that a transaction gossiped
-/// well before the block that mines it is still remembered. A transaction ID, sighash and pool
-/// tag use about 2 MB per cache before collection overhead.
+/// well before the block that mines it is still remembered.
+///
+/// Each key is a 98-byte transaction ID, sighash and pool tag, held twice — once in the lookup
+/// set and once in the eviction queue — so a full cache costs about 5 MiB, and about 20 MiB
+/// across the three Orchard circuit eras and Sapling. Only the eras a node actually verifies pay
+/// it, because each cache is built with its verifier on first use.
 pub(super) const CACHE_CAPACITY: usize = 20_000;
 
 /// The label naming which verifier's cache a metric belongs to.
 ///
 /// One cache instance per Orchard circuit era and one for Sapling all report under the same
 /// metric names, so every series carries this label. The values are the names those verifiers
-/// already use in their batch metrics and flush logs, so the two can be joined.
+/// already use in their explicit-flush logs: `halo2_pre_nu6_2`, `halo2_nu6_2`,
+/// `halo2_nu6_3_onward` and `groth16_sapling`. Only Sapling's matches its batch duration metric
+/// as well; the Halo2 batch metric reports all three eras as one `halo2` series.
 const VERIFIER_LABEL: &str = "verifier";
 
 /// Counts verifications answered from a cache.
@@ -107,9 +116,12 @@ impl From<orchard::ValuePool> for ShieldedPool {
 ///     transaction, so it commits to the Sapling proofs and signatures directly. V4 transactions
 ///     have no witnessed ID, and this is why they do not need one here.
 ///
-/// The sighash is named separately because it is not a function of the transaction alone: the
-/// amounts and `scriptPubKey`s of the spent transparent outputs enter it, and those come from the
-/// verification context.
+/// The sighash is named separately because it is not always a function of the transaction alone.
+/// A v5 or v6 sighash also commits to the amounts and `scriptPubKey`s of the spent transparent
+/// outputs, which the verification context supplies. A v4 shielded sighash does not — it is
+/// computed with no input index, so ZIP 143 and ZIP 243 leave the spent output out — but it does
+/// commit to the block's consensus branch id, which a v4 transaction ID does not carry, and which
+/// selects the verification a bundle is checked against.
 ///
 /// The verifying key is absent on purpose. Each Orchard circuit era has its own cache, so an
 /// entry is only ever read back under the key it was written against, and Sapling has one key
@@ -147,16 +159,30 @@ pub(super) trait CachedItem {
     fn cache_key(&self) -> Option<CacheKey>;
 }
 
-#[cfg(test)]
-mod tests;
+/// What one [`VerifiedBundles::insert`] did, so the caller can report it after releasing the
+/// lock.
+///
+/// Metrics are emitted outside the critical section: a labelled `metrics` macro allocates its
+/// label set on every call, and this lock is taken by every shielded verification the node runs.
+#[derive(Clone, Copy, Debug)]
+struct InsertOutcome {
+    /// Whether this key was new, rather than a concurrent duplicate.
+    inserted: bool,
 
-/// A bounded set of keys for items that have already verified successfully.
+    /// How many keys were evicted to make room for it.
+    evicted: usize,
+
+    /// How many keys the cache holds now.
+    size: usize,
+}
+
+/// A bounded set of keys for bundles that have already verified successfully.
 ///
 /// Eviction is first-in-first-out rather than least-recently-used: the working set is the
 /// mempool, which turns over in arrival order anyway, and FIFO needs no bookkeeping on the read
 /// path. Evicting an entry only costs a re-verification, never correctness.
 #[derive(Debug)]
-struct VerifiedProofs {
+struct VerifiedBundles {
     /// The keys currently remembered.
     keys: HashSet<CacheKey>,
 
@@ -165,19 +191,15 @@ struct VerifiedProofs {
 
     /// The maximum number of keys to retain.
     capacity: usize,
-
-    /// The `verifier` label this cache reports its metrics under.
-    verifier: &'static str,
 }
 
-impl VerifiedProofs {
+impl VerifiedBundles {
     /// Creates an empty cache that retains at most `capacity` keys.
-    fn new(capacity: usize, verifier: &'static str) -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
             keys: HashSet::with_capacity(capacity),
             insertion_order: VecDeque::with_capacity(capacity),
             capacity,
-            verifier,
         }
     }
 
@@ -186,28 +208,68 @@ impl VerifiedProofs {
         self.keys.contains(key)
     }
 
-    /// Records that `key` has verified, evicting the oldest keys if that exceeds the capacity.
-    fn insert(&mut self, key: CacheKey) {
+    /// Records that `key` has verified, evicting the oldest keys to stay within the capacity.
+    fn insert(&mut self, key: CacheKey) -> InsertOutcome {
         // Concurrent verifications of the same item both miss and both insert. The second is a
         // no-op, and must not push a duplicate into the eviction queue.
         if !self.keys.insert(key) {
-            return;
+            return InsertOutcome {
+                inserted: false,
+                evicted: 0,
+                size: self.keys.len(),
+            };
+        }
+
+        // Evict before pushing, so the queue never has to grow past the capacity it was built
+        // with. Pushing first would take it to `capacity + 1` and double its allocation for the
+        // rest of the process.
+        let mut evicted = 0;
+        while self.insertion_order.len() >= self.capacity {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.keys.remove(&oldest);
+            evicted += 1;
         }
 
         self.insertion_order.push_back(key);
-        metrics::counter!(CACHE_INSERT, VERIFIER_LABEL => self.verifier).increment(1);
 
-        while self.insertion_order.len() > self.capacity {
-            let evicted = self
-                .insertion_order
-                .pop_front()
-                .expect("queue is longer than the capacity, which is at least one");
-            self.keys.remove(&evicted);
-            metrics::counter!(CACHE_EVICT, VERIFIER_LABEL => self.verifier).increment(1);
+        InsertOutcome {
+            inserted: true,
+            evicted,
+            size: self.keys.len(),
+        }
+    }
+
+    /// Forgets every key.
+    ///
+    /// Benchmarks only, through [`Cached::clear`]. Forgetting a key only costs a
+    /// re-verification, so this is always safe.
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.insertion_order.clear();
+    }
+}
+
+impl InsertOutcome {
+    /// Reports this insert under `verifier`.
+    ///
+    /// Called after the cache lock is released.
+    fn report(self, verifier: &'static str) {
+        if !self.inserted {
+            return;
+        }
+
+        metrics::counter!(CACHE_INSERT, VERIFIER_LABEL => verifier).increment(1);
+
+        if self.evicted > 0 {
+            // Cast is safe: at most `capacity` keys are evicted by one insert.
+            metrics::counter!(CACHE_EVICT, VERIFIER_LABEL => verifier)
+                .increment(self.evicted as u64);
         }
 
         // Cast is safe: the length is bounded by `capacity`, far below f64's exact integer range.
-        metrics::gauge!(CACHE_SIZE, VERIFIER_LABEL => self.verifier).set(self.keys.len() as f64);
+        metrics::gauge!(CACHE_SIZE, VERIFIER_LABEL => verifier).set(self.size as f64);
     }
 }
 
@@ -223,7 +285,7 @@ pub struct Cached<S> {
     inner: S,
 
     /// The keys of items that have already verified under this cache's verifying key.
-    verified: Arc<Mutex<VerifiedProofs>>,
+    verified: Arc<Mutex<VerifiedBundles>>,
 
     /// The `verifier` label this cache reports its metrics under.
     verifier: &'static str,
@@ -253,7 +315,7 @@ impl<S> Cached<S> {
     pub(super) fn new(inner: S, capacity: usize, verifier: &'static str) -> Self {
         Self {
             inner,
-            verified: Arc::new(Mutex::new(VerifiedProofs::new(capacity, verifier))),
+            verified: Arc::new(Mutex::new(VerifiedBundles::new(capacity))),
             verifier,
             #[cfg(test)]
             inner_calls: Arc::new(Mutex::new(Vec::new())),
@@ -263,6 +325,20 @@ impl<S> Cached<S> {
     /// Returns the wrapped verification service.
     pub(super) fn inner(&self) -> &S {
         &self.inner
+    }
+
+    /// Forgets every remembered bundle.
+    ///
+    /// This exists for [`clear_shielded_verification_caches`](super::clear_shielded_verification_caches),
+    /// which benchmarks call to measure verification rather than cache hits. Forgetting a key
+    /// only costs a re-verification, so calling it can never accept an unverified bundle.
+    pub(super) fn clear(&self) {
+        self.verified
+            .lock()
+            .expect("verified bundle cache mutex should not be poisoned")
+            .clear();
+
+        metrics::gauge!(CACHE_SIZE, VERIFIER_LABEL => self.verifier).set(0.0);
     }
 
     /// Returns how many times an item equivalent to `item` has reached the inner service.
@@ -342,7 +418,7 @@ where
             if self
                 .verified
                 .lock()
-                .expect("verified proof cache mutex should not be poisoned")
+                .expect("verified bundle cache mutex should not be poisoned")
                 .contains(&key)
             {
                 metrics::counter!(CACHE_HIT, VERIFIER_LABEL => self.verifier).increment(1);
@@ -353,6 +429,7 @@ where
         metrics::counter!(CACHE_MISS, VERIFIER_LABEL => self.verifier).increment(1);
 
         let verified = self.verified.clone();
+        let verifier = self.verifier;
         let mut inner = self.inner.clone();
 
         #[cfg(test)]
@@ -378,10 +455,12 @@ where
 
             // Only successes are recorded: see the module docs.
             if let (Ok(()), Some(key)) = (&result, key) {
-                verified
+                let outcome = verified
                     .lock()
-                    .expect("verified proof cache mutex should not be poisoned")
+                    .expect("verified bundle cache mutex should not be poisoned")
                     .insert(key);
+
+                outcome.report(verifier);
             }
 
             result

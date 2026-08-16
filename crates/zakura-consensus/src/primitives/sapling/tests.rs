@@ -24,7 +24,7 @@ use zakura_chain::{
     block::{Block, Height},
     parameters::{Network, NetworkUpgrade},
     primitives::Groth16Proof,
-    sapling::{PerSpendAnchor, ShieldedData, Spend, TransferData},
+    sapling::{Nullifier, Output, PerSpendAnchor, ShieldedData, Spend, TransferData},
     serialization::{AtLeastOne, ZcashDeserializeInto},
     transaction::{arbitrary::transaction_to_fake_v5, HashType, Transaction},
     transparent,
@@ -32,7 +32,7 @@ use zakura_chain::{
 
 use crate::BoxError;
 
-use super::{sapling_prover, CacheKey, Cached, CachedItem, Item};
+use super::{sapling_prover, Authorized, Bundle, CacheKey, Cached, CachedItem, Item, ZatBalance};
 
 /// The `verifier` label the test caches report their metrics under.
 ///
@@ -176,6 +176,50 @@ fn mutated_spend(tx: &Transaction, mutate: impl FnOnce(&mut Spend<PerSpendAnchor
     })
 }
 
+/// Returns a fingerprint of everything `check_bundle` reads out of `bundle`.
+///
+/// Used where a test needs "these two transactions carry the same bundle" as a precondition.
+/// Comparing the fields directly rather than a `Debug` rendering keeps the assertion meaningful
+/// if an upstream `Debug` is ever redacted.
+fn bundle_fingerprint(bundle: &Bundle<Authorized, ZatBalance>) -> Vec<Vec<u8>> {
+    let mut parts = vec![
+        i64::from(*bundle.value_balance()).to_le_bytes().to_vec(),
+        <[u8; 64]>::from(bundle.authorization().binding_sig).to_vec(),
+    ];
+
+    for spend in bundle.shielded_spends() {
+        parts.push(spend.anchor().to_bytes().to_vec());
+        parts.push(spend.nullifier().0.to_vec());
+        parts.push(spend.zkproof().to_vec());
+        parts.push(<[u8; 64]>::from(*spend.spend_auth_sig()).to_vec());
+    }
+
+    for output in bundle.shielded_outputs() {
+        parts.push(output.cmu().to_bytes().to_vec());
+        parts.push(output.ephemeral_key().0.to_vec());
+        parts.push(output.zkproof().to_vec());
+    }
+
+    parts
+}
+
+/// Returns `tx` with `mutate` applied to the first output of its V4 Sapling shielded data.
+fn mutated_output(tx: &Transaction, mutate: impl FnOnce(&mut Output)) -> Transaction {
+    mutated_transaction(tx, |shielded_data| {
+        let TransferData::SpendsAndMaybeOutputs { maybe_outputs, .. } =
+            &mut shielded_data.transfers
+        else {
+            panic!("the fixture was selected for having spends")
+        };
+
+        mutate(
+            maybe_outputs
+                .first_mut()
+                .expect("the fixture was selected for having outputs"),
+        );
+    })
+}
+
 /// Returns `tx` as a V5 transaction carrying the same Sapling bundle.
 ///
 /// The Sapling test vectors are V4 transactions, so this is how the V5 side of the key — the
@@ -259,10 +303,16 @@ fn v4_cache_key_changes_with_every_piece_of_authorizing_data() {
     let tx = sapling_transaction_with_spends();
     let original = cache_key(&tx, NetworkUpgrade::Nu5);
 
-    let mutations = authorizing_data_mutations(&tx).into_iter().chain([(
-        mutated_value_balance(&tx),
-        "the value balance, which enters the binding verification key",
-    )]);
+    let mutations = authorizing_data_mutations(&tx).into_iter().chain([
+        (
+            mutated_value_balance(&tx),
+            "the value balance, which enters the binding verification key",
+        ),
+        (
+            mutated_nullifier(&tx),
+            "a spend nullifier, which is a public input to its proof",
+        ),
+    ]);
 
     for (mutated, what) in mutations {
         assert_ne!(
@@ -300,15 +350,23 @@ fn v5_cache_key_changes_with_authorizing_data_its_txid_ignores() {
         );
     }
 
-    // The value balance is the one input to the same check that a V5 txid does cover.
-    assert_ne!(
-        original,
-        cache_key(
-            &as_fake_v5(&mutated_value_balance(&v4)),
-            NetworkUpgrade::Nu5
+    // These are inputs to the same verification that a V5 txid does cover.
+    for (mutated, what) in [
+        (
+            mutated_value_balance(&v4),
+            "the value balance, which enters the binding verification key",
         ),
-        "the value balance enters the binding verification key, so it must be in the key"
-    );
+        (
+            mutated_nullifier(&v4),
+            "a spend nullifier, which is a public input to its proof",
+        ),
+    ] {
+        assert_ne!(
+            original,
+            cache_key(&as_fake_v5(&mutated), NetworkUpgrade::Nu5),
+            "{what} is verified, so it must be an input to the key"
+        );
+    }
 }
 
 /// Returns `tx` with each piece of the authorizing data `check_bundle` reads mutated in turn.
@@ -326,12 +384,25 @@ fn authorizing_data_mutations(tx: &Transaction) -> Vec<(Transaction, &'static st
             "a spend authorization signature",
         ),
         (
+            mutated_output(tx, |output| output.zkproof = Groth16Proof([0xFF; 192])),
+            "an output proof",
+        ),
+        (
             mutated_transaction(tx, |shielded_data| {
                 shielded_data.binding_sig = [0xFF; 64].into()
             }),
             "the binding signature",
         ),
     ]
+}
+
+/// Returns `tx` with the nullifier of its first Sapling spend changed.
+///
+/// The nullifier is effecting data rather than authorizing data — it is inside every transaction
+/// ID including a v5 txid — but it is also a public input to the spend proof, so a key that
+/// missed it would reuse one spend's verification for another's.
+fn mutated_nullifier(tx: &Transaction) -> Transaction {
+    mutated_spend(tx, |spend| spend.nullifier = Nullifier([0xFF; 32].into()))
 }
 
 /// Returns `tx` with its Sapling value balance changed.
@@ -363,8 +434,8 @@ fn cache_key_distinguishes_v4_and_v5_carrying_the_same_bundle() {
     let v5_item = item(&v5, NetworkUpgrade::Nu5).expect("the V5 transaction has a bundle");
 
     assert_eq!(
-        format!("{:?}", v4_item.bundle),
-        format!("{:?}", v5_item.bundle),
+        bundle_fingerprint(&v4_item.bundle),
+        bundle_fingerprint(&v5_item.bundle),
         "the conversion must carry the Sapling bundle across unchanged, or this test proves \
          nothing"
     );
@@ -458,6 +529,44 @@ async fn cache_does_not_reuse_a_result_across_bundles() {
         inner.calls(),
         2,
         "bundles with different keys must each be verified"
+    );
+}
+
+/// Clearing a cache forces re-verification.
+///
+/// This is what [`clear_shielded_verification_caches`](crate::clear_shielded_verification_caches)
+/// gives the benchmarks: a workload replayed against a cleared cache measures verification, not
+/// hits.
+#[tokio::test]
+async fn clearing_the_cache_forces_reverification() {
+    let tx = sapling_transaction();
+    let inner = CountingVerifier::new(true);
+    let mut verifier = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
+
+    for _ in 0..2 {
+        verifier
+            .ready()
+            .await
+            .expect("the cache must become ready")
+            .call(item(&tx, NetworkUpgrade::Nu5).expect("the transaction has a bundle"))
+            .await
+            .expect("a valid item must verify");
+    }
+    assert_eq!(inner.calls(), 1, "the second verification must be a hit");
+
+    verifier.clear();
+
+    verifier
+        .ready()
+        .await
+        .expect("the cache must become ready")
+        .call(item(&tx, NetworkUpgrade::Nu5).expect("the transaction has a bundle"))
+        .await
+        .expect("a valid item must verify");
+    assert_eq!(
+        inner.calls(),
+        2,
+        "a cleared cache must send the bundle back to the inner service"
     );
 }
 
@@ -611,6 +720,69 @@ fn uncached_verification_behind_a_fresh_cache() -> Cached<super::BatchFallbackSe
         8,
         TEST_CACHE_VERIFIER_LABEL,
     )
+}
+
+/// A bundle verified under one network upgrade is not reused under another.
+///
+/// The sighash is the only key component that separates these two verifications: one transaction
+/// has one transaction ID whatever height it is verified at, but a V4 sighash commits to the
+/// consensus branch id of the block that mines it (ZIP 143 and ZIP 243 put it in the BLAKE2b
+/// personalization). So this is the end-to-end evidence for keying on the sighash at all: the
+/// same bundle, the same transaction ID, a different branch id, and the remembered `Ok` must not
+/// answer it.
+///
+/// Real verification runs underneath, so the second call is not merely a miss — the mainnet
+/// signatures do not verify against another era's sighash, and the rejection proves the bundle
+/// was actually checked rather than answered from the cache.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundle_verified_under_one_upgrade_is_not_reused_under_another() {
+    use crate::error::TransactionError;
+
+    let _init_guard = zakura_test::init();
+
+    let (mined_upgrade, tx) = mined_v4_sapling_transaction_with_spends();
+
+    // Any other upgrade that accepts V4 transactions will do: only its branch id matters here.
+    let other_upgrade = if mined_upgrade == NetworkUpgrade::Nu5 {
+        NetworkUpgrade::Canopy
+    } else {
+        NetworkUpgrade::Nu5
+    };
+
+    let mined_item = item(&tx, mined_upgrade).expect("the transaction has a bundle");
+    let other_item = item(&tx, other_upgrade).expect("the transaction has a bundle");
+    assert_eq!(
+        bundle_fingerprint(&mined_item.bundle),
+        bundle_fingerprint(&other_item.bundle),
+        "the branch id must not change the parsed bundle, or this test proves nothing"
+    );
+    assert_ne!(
+        mined_item.cache_key(),
+        other_item.cache_key(),
+        "the two sighashes must produce different keys"
+    );
+
+    let verifier = uncached_verification_behind_a_fresh_cache();
+
+    verifier
+        .clone()
+        .oneshot(mined_item)
+        .await
+        .expect("a real mainnet Sapling bundle must verify under the upgrade that mined it");
+
+    let error = verifier
+        .clone()
+        .oneshot(other_item)
+        .await
+        .expect_err("the same bundle must not verify against another upgrade's sighash");
+
+    let error = error
+        .downcast::<TransactionError>()
+        .expect("the verifier reports a typed transaction error");
+    assert!(
+        matches!(*error, TransactionError::SaplingVerificationFailed),
+        "expected SaplingVerificationFailed, got: {error:?}"
+    );
 }
 
 /// The cache still rejects an invalid bundle after a valid one, with real verification underneath.

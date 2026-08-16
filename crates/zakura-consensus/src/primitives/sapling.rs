@@ -68,11 +68,9 @@ impl Item {
     /// Creates a new [`Item`] from a Sapling bundle, its sighash, and its transaction's ID.
     ///
     /// `tx_id` must identify the transaction containing `bundle`, because the cache treats it as
-    /// determining the bundle — see [`Item::cache_key`]. The transaction verifier passes the
-    /// precomputed ID from its [`Request`](crate::transaction::Request), whose caller must
-    /// preserve this invariant.
-    ///
-    /// [`Item::cache_key`]: Item#method.cache_key
+    /// determining the bundle — see this type's [`CachedItem`] implementation. The transaction
+    /// verifier passes the precomputed ID from its [`Request`](crate::transaction::Request),
+    /// whose caller must preserve this invariant.
     pub fn new(
         bundle: Bundle<Authorized, ZatBalance>,
         sighash: SigHash,
@@ -96,8 +94,12 @@ impl CachedItem for Item {
     /// authorizing data. So unlike Orchard, which only exists in v5 and v6 transactions, Sapling
     /// caches v4 bundles too.
     ///
-    /// The sighash additionally commits to the amounts and scripts of spent transparent outputs,
-    /// which are supplied by the verification context and are not part of the transaction ID.
+    /// The sighash is keyed separately because it is not always a function of the transaction
+    /// alone. A v5 or v6 sighash also commits to the amounts and scripts of the spent transparent
+    /// outputs, which the verification context supplies. A v4 shielded sighash does not — it is
+    /// computed with no input index, so ZIP 143 and ZIP 243 leave the spent output out — but it
+    /// does commit to the consensus branch id of the block, which the transaction ID of a v4
+    /// transaction does not carry.
     ///
     /// The verifying keys are absent on purpose: Sapling has one spend and one output verifying
     /// key for all of history, so unlike Orchard it has no circuit eras to keep apart, and every

@@ -20,9 +20,9 @@ pub(super) struct BoundRequest {
 
 /// Check replay identity, async ownership, and version freshness for an admitted request.
 ///
-/// Returns `no_change_effect` when the event matches the last committed fingerprint or the
-/// header is already present; otherwise returns the event for further planning. Conflicting
-/// replay keys or stale versions fail.
+/// Returns `no_change_effect` when the event matches the last committed fingerprint or finality
+/// already consumed the prepared headers; otherwise returns the event for further planning.
+/// Conflicting replay keys or stale versions fail.
 pub(super) fn bind_replay_and_freshness(
     engine: &HeaderChainEngine,
     input: &TransitionInput,
@@ -42,6 +42,17 @@ pub(super) fn bind_replay_and_freshness(
     }
     if let Some(owner) = event.body_owner() {
         validate_body_owner(owner, snapshot_before_commit)?;
+    }
+    if matches!(
+        header_rebase.header_work_effect(),
+        Some(crate::HeaderWorkEffect::AlreadyApplied)
+    ) {
+        return Ok(BoundRequest {
+            event,
+            domain,
+            header_rebase,
+            no_change_effect: Some(TransitionEffect::header_work_already_applied()),
+        });
     }
 
     let fingerprint = event.fingerprint();
@@ -77,10 +88,6 @@ pub(super) fn bind_replay_and_freshness(
         event,
         domain,
         header_rebase,
-        no_change_effect: matches!(
-            header_rebase.header_work_effect(),
-            Some(crate::HeaderWorkEffect::AlreadyApplied)
-        )
-        .then_some(TransitionEffect::header_work_already_applied()),
+        no_change_effect: None,
     })
 }

@@ -79,7 +79,7 @@ fn apply_with_header_rebase_facts(
 }
 
 #[test]
-fn header_insert_rebases_and_trims_across_each_monotone_finality_position() {
+fn f_225522_finality_consumed_header_work_precedes_replay_conflict() {
     for finalized_count in 1..=3_u32 {
         let (mut store, config) = TestStore::new(EngineMode::Integrated);
         let clock = ManualClock(Utc::now());
@@ -192,6 +192,10 @@ fn header_insert_rebases_and_trims_across_each_monotone_finality_position() {
                 ),
                 Err(TransitionFailure::Counter(_))
             ));
+        }
+        if finalized_count == 3 {
+            // Reproduce an adjacent replay key whose original payload finality fully consumed.
+            store.metadata.last_transition = held.event.fingerprint();
         }
 
         let plan =
@@ -844,6 +848,30 @@ fn integrated_finality_requires_authority_and_exact_verified_path() {
             InvalidTransitionEvidence::Finality(FinalityViolation::Retreated)
         ))
     ));
+}
+
+#[test]
+fn f_225521_empty_checkpoint_growth_has_no_finality_effect() {
+    let (store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let old_tip = store.metadata.frontiers.verified_best;
+    let request = TransitionRequest {
+        expected_version: store.metadata.state_version,
+        event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+            full_state_transition_id: EvidenceId::from_digest([0x90; 32]),
+            old_tip,
+            new_path: Vec::new(),
+            cause: crate::VerifiedChangeCause::CheckpointFinalizedGrow,
+        }),
+    };
+
+    let plan = apply_transition(&store, request, &context(&config, &clock, Some(&Authority)))
+        .expect("empty checkpoint growth is a valid no-change");
+
+    assert!(plan.is_no_change());
+    assert!(!plan.effect().is_checkpoint_finality());
+    assert!(plan.change_set.finality_append.is_none());
+    assert_eq!(plan.change_set.metadata, store.metadata);
 }
 
 #[test]

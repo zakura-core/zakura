@@ -10,6 +10,7 @@ use tokio::sync::oneshot::error::RecvError;
 
 use crate::BoxError;
 
+mod cache;
 pub mod ed25519;
 pub mod groth16;
 pub mod halo2;
@@ -138,7 +139,7 @@ fn flush_block_verifier_batches() {
     }
 
     if let Some(verifier) = Lazy::get(&sapling::VERIFIER) {
-        queue_batch_flush("sapling", verifier.primary().clone().try_flush());
+        queue_batch_flush("sapling", sapling::try_flush(verifier));
     }
 
     if let Some(verifier) = Lazy::get(&halo2::VERIFIER_PRE_NU6_2) {

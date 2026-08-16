@@ -14,12 +14,11 @@ use once_cell::sync::Lazy;
 use orchard::{
     bundle::{BatchError, BatchValidator},
     circuit::{OrchardCircuitVersion, VerifyingKey},
-    ValuePool,
 };
 use rand::thread_rng;
 use zakura_chain::{
     parameters::NetworkUpgrade,
-    transaction::{SigHash, WtxId},
+    transaction::{SigHash, UnminedTxId, WtxId},
 };
 use zcash_protocol::value::ZatBalance;
 
@@ -32,12 +31,10 @@ use tower_fallback::Fallback;
 
 use super::spawn_fifo;
 
-mod cache;
-
 #[cfg(test)]
 mod tests;
 
-use cache::Cached;
+use super::cache::{CacheKey, CacheMetrics, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
 
 /// Adjusted batch size for halo2 batches.
 ///
@@ -49,33 +46,17 @@ use cache::Cached;
 /// [`HALO2_MAX_BATCH_SIZE`] total actions among pending items in the queue.
 const HALO2_MAX_BATCH_SIZE: usize = super::MAX_BATCH_SIZE;
 
-/// The number of verified-proof keys retained per Orchard circuit era.
+/// The metric names each Orchard circuit era's cache reports under.
 ///
-/// Sized to hold several blocks of history plus a full mempool, so that a
-/// transaction gossiped well before the block that mines it is still
-/// remembered. The witnessed transaction ID, sighash, and pool tag use about
-/// 2 MB per era before collection overhead.
-const CACHE_CAPACITY: usize = 20_000;
-
-/// A witnessed transaction, sighash, and value pool whose Halo2 bundle has
-/// verified.
-///
-/// [`WtxId`] contains both the transaction ID, which commits to the bundle's
-/// effecting data, and the authorizing-data digest, which commits to its proof
-/// and signatures. The pool distinguishes the Orchard and Ironwood bundles in
-/// a v6 transaction, because they share one [`WtxId`].
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct CacheKey {
-    /// The witnessed transaction ID containing the txid and authorizing-data
-    /// digest.
-    wtx_id: WtxId,
-
-    /// The signature digest used to verify the bundle's signatures.
-    sighash: [u8; 32],
-
-    /// The bundle slot verified for this transaction.
-    pool: ValuePool,
-}
+/// The three eras share one set of names, so the counters report the Halo2
+/// cache as a whole.
+const CACHE_METRICS: CacheMetrics = CacheMetrics {
+    hit: "zakura.consensus.halo2.cache.hit",
+    miss: "zakura.consensus.halo2.cache.miss",
+    insert: "zakura.consensus.halo2.cache.insert",
+    evict: "zakura.consensus.halo2.cache.evict",
+    size: "zakura.consensus.halo2.cache.size",
+};
 
 /// The type of verification results.
 type VerifyResult = bool;
@@ -195,16 +176,16 @@ impl Item {
         sighash: SigHash,
         wtx_id: WtxId,
     ) -> Self {
-        let pool = bundle.bundle_version().value_pool();
+        let pool = ShieldedPool::from(bundle.bundle_version().value_pool());
 
         Self {
             bundle: Arc::new(bundle),
             sighash,
-            cache_key: Some(CacheKey {
-                wtx_id,
-                sighash: sighash.0,
+            cache_key: Some(CacheKey::new(
+                UnminedTxId::Witnessed(wtx_id),
+                sighash.0,
                 pool,
-            }),
+            )),
         }
     }
 
@@ -220,7 +201,9 @@ impl Item {
         }
         batch.validate(thread_rng())
     }
+}
 
+impl CachedItem for Item {
     /// Returns this item's cache key, if it was constructed with a witnessed
     /// transaction ID.
     ///
@@ -333,7 +316,7 @@ type VerifierService = Cached<BatchFallbackService>;
 /// verifier here, each era also gets its own cache, which is what binds a remembered result to the
 /// `vk` it was produced under.
 fn batch_verifier(vk: &'static ItemVerifyingKey) -> VerifierService {
-    Cached::new(batch_fallback_verifier(vk), CACHE_CAPACITY)
+    Cached::new(batch_fallback_verifier(vk), CACHE_CAPACITY, CACHE_METRICS)
 }
 
 /// Builds the uncached batching-and-fallback stack for `vk`.

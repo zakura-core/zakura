@@ -1,7 +1,9 @@
-//! A bounded cache of Halo2 Orchard Action proofs that have already verified.
+//! A bounded cache of shielded bundle verifications that have already succeeded.
 //!
-//! Zakura verifies an Orchard proof when its transaction arrives over mempool gossip, and again
-//! when the transaction arrives in a block. This service skips the second verification.
+//! Zakura verifies a transaction's shielded proofs and signatures when the transaction arrives
+//! over mempool gossip, and again when it arrives in a block. This service skips the second
+//! verification. The Halo2 Orchard and Ironwood verifiers ([`super::halo2`]) and the Sapling
+//! verifier ([`super::sapling`]) share it, and key their entries the same way.
 //!
 //! # Why this is not the mempool bypass
 //!
@@ -9,11 +11,11 @@
 //! removed it as a security fix (PR #10494). Transaction validity depends on height, block time
 //! and spent outputs, and that cache's key named none of them.
 //!
-//! This cache remembers successful bundle verification by witnessed transaction
-//! ID and value pool. A hit still runs the whole transaction verifier against
-//! the block's height, time and spent outputs, and skips only the proof and
-//! signature checks. Each Orchard circuit era has its own cache, which binds an
-//! entry to its verifying key (see [`super::verifier_for`]).
+//! This cache remembers successful bundle verification by transaction ID, sighash and shielded
+//! pool. A hit still runs the whole transaction verifier against the block's height, time and
+//! spent outputs, and skips only the proof and signature checks. Each Orchard circuit era has its
+//! own cache, which binds an entry to its verifying key (see [`super::halo2::verifier_for`]);
+//! Sapling has one verifying key pair for all of history, so one cache covers it.
 //!
 //! Only `Ok` results are cached. A batch error is not per-item evidence, because
 //! [`Fallback`](tower_fallback::Fallback) re-verifies failures singly, and it may not be a verdict
@@ -28,10 +30,125 @@ use std::{
 
 use futures::{future::BoxFuture, FutureExt};
 use tower::{Service, ServiceExt};
+use zakura_chain::transaction::UnminedTxId;
 
 use crate::BoxError;
 
-use super::{CacheKey, Item};
+/// The number of verified-bundle keys retained per cache.
+///
+/// Sized to hold several blocks of history plus a full mempool, so that a transaction gossiped
+/// well before the block that mines it is still remembered. A transaction ID, sighash and pool
+/// tag use about 2 MB per cache before collection overhead.
+pub(super) const CACHE_CAPACITY: usize = 20_000;
+
+/// The shielded bundle slot a cache entry was verified for.
+///
+/// One v6 transaction has an Orchard bundle, an Ironwood bundle and a Sapling bundle, all under
+/// one transaction ID and one sighash, so the key names which one it stands for. The Orchard and
+/// Ironwood caches at NU6.3 onward are the same cache, so this tag is what keeps their entries
+/// apart; Sapling has its own cache and its tag is defence in depth.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum ShieldedPool {
+    /// The Sapling value pool.
+    Sapling,
+
+    /// The Orchard value pool.
+    Orchard,
+
+    /// The Ironwood value pool.
+    Ironwood,
+}
+
+impl From<orchard::ValuePool> for ShieldedPool {
+    fn from(pool: orchard::ValuePool) -> Self {
+        match pool {
+            orchard::ValuePool::Orchard => Self::Orchard,
+            orchard::ValuePool::Ironwood => Self::Ironwood,
+        }
+    }
+}
+
+/// A transaction, sighash and shielded pool whose bundle has verified.
+///
+/// # Correctness
+///
+/// A hit replaces a verification, so the key must determine every input that verification reads:
+/// the bundle and the sighash.
+///
+/// The transaction ID determines the bundle, in both of the forms it takes:
+///
+///   * [`UnminedTxId::Witnessed`] carries a [`WtxId`](zakura_chain::transaction::WtxId), whose
+///     txid commits to the transaction's effecting data and whose ZIP 244 authorizing-data digest
+///     commits to its proofs and signatures. The txid alone would not: it excludes authorizing
+///     data, which is what CVE-2026-34377 exploited.
+///   * [`UnminedTxId::Legacy`] is a v1-v4 transaction ID, the hash of the whole serialized
+///     transaction, so it commits to the Sapling proofs and signatures directly. V4 transactions
+///     have no witnessed ID, and this is why they do not need one here.
+///
+/// The sighash is named separately because it is not a function of the transaction alone: the
+/// amounts and `scriptPubKey`s of the spent transparent outputs enter it, and those come from the
+/// verification context.
+///
+/// The verifying key is absent on purpose. Each Orchard circuit era has its own cache, so an
+/// entry is only ever read back under the key it was written against, and Sapling has one key
+/// pair for all of history.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct CacheKey {
+    /// The ID of the transaction the bundle was parsed from.
+    tx_id: UnminedTxId,
+
+    /// The signature digest used to verify the bundle's signatures.
+    sighash: [u8; 32],
+
+    /// The bundle slot verified for this transaction.
+    pool: ShieldedPool,
+}
+
+impl CacheKey {
+    /// Returns the key for `pool`'s bundle in the transaction identified by `tx_id`, verified
+    /// against `sighash`.
+    pub(super) fn new(tx_id: UnminedTxId, sighash: [u8; 32], pool: ShieldedPool) -> Self {
+        Self {
+            tx_id,
+            sighash,
+            pool,
+        }
+    }
+}
+
+/// An item whose successful verification can be remembered.
+///
+/// Items without a key are verified normally and never cached, which is how a caller that has no
+/// transaction identity to offer stays correct.
+pub(super) trait CachedItem {
+    /// Returns this item's cache key, if it has one.
+    fn cache_key(&self) -> Option<CacheKey>;
+}
+
+/// The metric names one cache reports under.
+///
+/// Each verifier keeps its own names rather than sharing one name with a `verifier` label,
+/// because the Halo2 names are already released.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CacheMetrics {
+    /// Counts verifications answered from the cache.
+    pub(super) hit: &'static str,
+
+    /// Counts verifications that reached the inner service.
+    pub(super) miss: &'static str,
+
+    /// Counts keys recorded as verified.
+    pub(super) insert: &'static str,
+
+    /// Counts keys dropped to stay within the capacity.
+    pub(super) evict: &'static str,
+
+    /// Reports how many keys are currently remembered.
+    pub(super) size: &'static str,
+}
+
+#[cfg(test)]
+mod tests;
 
 /// A bounded set of keys for items that have already verified successfully.
 ///
@@ -48,15 +165,19 @@ struct VerifiedProofs {
 
     /// The maximum number of keys to retain.
     capacity: usize,
+
+    /// The metric names this cache reports under.
+    metrics: CacheMetrics,
 }
 
 impl VerifiedProofs {
     /// Creates an empty cache that retains at most `capacity` keys.
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, metrics: CacheMetrics) -> Self {
         Self {
             keys: HashSet::with_capacity(capacity),
             insertion_order: VecDeque::with_capacity(capacity),
             capacity,
+            metrics,
         }
     }
 
@@ -74,7 +195,7 @@ impl VerifiedProofs {
         }
 
         self.insertion_order.push_back(key);
-        metrics::counter!("zakura.consensus.halo2.cache.insert").increment(1);
+        metrics::counter!(self.metrics.insert).increment(1);
 
         while self.insertion_order.len() > self.capacity {
             let evicted = self
@@ -82,27 +203,30 @@ impl VerifiedProofs {
                 .pop_front()
                 .expect("queue is longer than the capacity, which is at least one");
             self.keys.remove(&evicted);
-            metrics::counter!("zakura.consensus.halo2.cache.evict").increment(1);
+            metrics::counter!(self.metrics.evict).increment(1);
         }
 
         // Cast is safe: the length is bounded by `capacity`, far below f64's exact integer range.
-        metrics::gauge!("zakura.consensus.halo2.cache.size").set(self.keys.len() as f64);
+        metrics::gauge!(self.metrics.size).set(self.keys.len() as f64);
     }
 }
 
-/// A service that skips inner verification for items whose proof has already verified.
+/// A service that skips inner verification for items whose bundle has already verified.
 ///
-/// This wraps one Orchard circuit era's batch-and-fallback stack. The cache is shared between
-/// clones, so every handle to a global verifier sees the same set of verified proofs.
+/// This wraps one verifier's batch-and-fallback stack. The cache is shared between clones, so
+/// every handle to a global verifier sees the same set of verified bundles.
 ///
 /// This type is public only because it appears in existing public verifier signatures. The
-/// private `cache` module does not re-export it, and its constructor and accessors are private.
+/// private `cache` module is not re-exported, and its constructor and accessors are private.
 pub struct Cached<S> {
     /// The verification service to consult on a miss.
     inner: S,
 
-    /// The keys of items that have already verified under this era's key.
+    /// The keys of items that have already verified under this cache's verifying key.
     verified: Arc<Mutex<VerifiedProofs>>,
+
+    /// The metric names this cache reports under.
+    metrics: CacheMetrics,
 
     /// The keys of the items that reached the inner service, in call order.
     ///
@@ -116,6 +240,7 @@ impl<S: Clone> Clone for Cached<S> {
         Self {
             inner: self.inner.clone(),
             verified: self.verified.clone(),
+            metrics: self.metrics,
             #[cfg(test)]
             inner_calls: self.inner_calls.clone(),
         }
@@ -123,11 +248,13 @@ impl<S: Clone> Clone for Cached<S> {
 }
 
 impl<S> Cached<S> {
-    /// Wraps `inner` in a cache that retains at most `capacity` verified-proof keys.
-    pub(super) fn new(inner: S, capacity: usize) -> Self {
+    /// Wraps `inner` in a cache that retains at most `capacity` verified-bundle keys and reports
+    /// under `metrics`.
+    pub(super) fn new(inner: S, capacity: usize, metrics: CacheMetrics) -> Self {
         Self {
             inner,
-            verified: Arc::new(Mutex::new(VerifiedProofs::new(capacity))),
+            verified: Arc::new(Mutex::new(VerifiedProofs::new(capacity, metrics))),
+            metrics,
             #[cfg(test)]
             inner_calls: Arc::new(Mutex::new(Vec::new())),
         }
@@ -147,7 +274,7 @@ impl<S> Cached<S> {
     /// Readiness failures are not counted: an item that never reached the inner service was never
     /// verified by it.
     #[cfg(test)]
-    pub(super) fn inner_calls_for(&self, item: &Item) -> usize {
+    pub(super) fn inner_calls_for<I: CachedItem>(&self, item: &I) -> usize {
         let Some(key) = item.cache_key() else {
             return 0;
         };
@@ -170,14 +297,18 @@ impl<S> Cached<S> {
         Cached {
             inner,
             verified: self.verified.clone(),
+            metrics: self.metrics,
             inner_calls: self.inner_calls.clone(),
         }
     }
 }
 
-impl<S> Service<Item> for Cached<S>
+impl<S, I> Service<I> for Cached<S>
 where
-    S: Service<Item, Response = (), Error = BoxError> + Clone + Send + 'static,
+    // `Send + 'static` because a miss moves the item into the boxed future that awaits inner
+    // readiness — see `poll_ready`.
+    I: CachedItem + Send + 'static,
+    S: Service<I, Response = (), Error = BoxError> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {
     type Response = ();
@@ -203,7 +334,7 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, item: Item) -> Self::Future {
+    fn call(&mut self, item: I) -> Self::Future {
         // Copied once here, outside `Fallback`, which clones every request eagerly.
         let key = item.cache_key();
 
@@ -214,12 +345,12 @@ where
                 .expect("verified proof cache mutex should not be poisoned")
                 .contains(&key)
             {
-                metrics::counter!("zakura.consensus.halo2.cache.hit").increment(1);
+                metrics::counter!(self.metrics.hit).increment(1);
                 return future::ready(Ok(())).boxed();
             }
         }
 
-        metrics::counter!("zakura.consensus.halo2.cache.miss").increment(1);
+        metrics::counter!(self.metrics.miss).increment(1);
 
         let verified = self.verified.clone();
         let mut inner = self.inner.clone();

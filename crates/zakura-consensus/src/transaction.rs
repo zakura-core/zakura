@@ -593,6 +593,7 @@ where
                     script_verifier,
                     cached_ffi_transaction.clone(),
                     joinsplit_data,
+                    tx_id,
                 )?,
                 Transaction::V5 {
                     ..
@@ -917,6 +918,7 @@ where
     /// - the prepared `cached_ffi_transaction` used by the script verifier
     /// - the Sprout `joinsplit_data` shielded data in the transaction
     /// - the `sapling_shielded_data` in the transaction
+    /// - the transaction's precomputed `tx_id`, used by the Sapling cache
     #[allow(clippy::unwrap_in_result)]
     fn verify_v4_transaction(
         request: &Request,
@@ -924,6 +926,7 @@ where
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
         joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
+        tx_id: UnminedTxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let tx = request.transaction();
         let nu = request.upgrade(network);
@@ -942,7 +945,7 @@ where
             cached_ffi_transaction,
         )?
         .and(Self::verify_sprout_shielded_data(joinsplit_data, &sighash)?)
-        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash)))
+        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash, tx_id)))
     }
 
     /// Verifies if a V4 `transaction` is supported by `network_upgrade`.
@@ -1033,7 +1036,11 @@ where
             script_verifier,
             cached_ffi_transaction,
         )?
-        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
+        .and(Self::verify_sapling_bundle(
+            sapling_bundle,
+            &sighash,
+            UnminedTxId::Witnessed(wtx_id),
+        ))
         .and(Self::verify_orchard_bundle(
             orchard_bundle,
             &sighash,
@@ -1110,7 +1117,11 @@ where
             script_verifier,
             cached_ffi_transaction,
         )?
-        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
+        .and(Self::verify_sapling_bundle(
+            sapling_bundle,
+            &sighash,
+            UnminedTxId::Witnessed(wtx_id),
+        ))
         .and(Self::verify_orchard_bundle(
             orchard_bundle,
             &sighash,
@@ -1241,9 +1252,13 @@ where
     }
 
     /// Verifies a transaction's Sapling shielded data.
+    ///
+    /// `tx_id` identifies the transaction containing `bundle`; the cache adds it to the key that
+    /// lets a mempool verification be reused for the block that mines it.
     fn verify_sapling_bundle(
         bundle: Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
+        tx_id: UnminedTxId,
     ) -> AsyncChecks {
         let mut async_checks = AsyncChecks::new();
 
@@ -1298,7 +1313,7 @@ where
             async_checks.push(
                 primitives::sapling::VERIFIER
                     .clone()
-                    .oneshot(primitives::sapling::Item::new(bundle, *sighash)),
+                    .oneshot(primitives::sapling::Item::new(bundle, *sighash, tx_id)),
             );
         }
 

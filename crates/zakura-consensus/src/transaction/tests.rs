@@ -3132,6 +3132,7 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
 
             (valid_bundle_one, valid_bundle_two, valid_sighash)
         };
+        let valid_tx_id = transaction.unmined_id();
 
         modify_first_sapling_spend_proof(
             Arc::get_mut(&mut transaction).expect("transaction only has one active reference"),
@@ -3158,6 +3159,7 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
             .expect("test fixture has Sapling shielded data");
         let sighash = sighasher.sighash(HashType::ALL, None);
         drop(sighasher);
+        let tx_id = transaction.unmined_id();
 
         let mut verifier = sapling_crypto::BatchValidator::default();
         assert!(
@@ -3167,7 +3169,7 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
 
         let mut batch_verifier = crate::primitives::sapling::Verifier::default();
         let batch_result = batch_verifier.call(BatchControl::Item(
-            crate::primitives::sapling::Item::new(batch_bundle, sighash),
+            crate::primitives::sapling::Item::new(batch_bundle, sighash, tx_id),
         ));
         let flush_result = batch_verifier.call(BatchControl::Flush);
         let (batch_result, flush_result) = futures::join!(batch_result, flush_result);
@@ -3178,18 +3180,18 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
         );
 
         let single_result = crate::primitives::sapling::verify_single(
-            crate::primitives::sapling::Item::new(single_bundle, sighash),
+            crate::primitives::sapling::Item::new(single_bundle, sighash, tx_id),
         )
         .await;
         assert_sapling_verification_error(
             single_result.expect_err("corrupted Sapling proof must be rejected"),
         );
 
-        let invalid_item = crate::primitives::sapling::Item::new(fallback_bundle, sighash);
+        let invalid_item = crate::primitives::sapling::Item::new(fallback_bundle, sighash, tx_id);
         let items = vec![
-            crate::primitives::sapling::Item::new(valid_bundle_one, valid_sighash),
+            crate::primitives::sapling::Item::new(valid_bundle_one, valid_sighash, valid_tx_id),
             invalid_item.clone(),
-            crate::primitives::sapling::Item::new(valid_bundle_two, valid_sighash),
+            crate::primitives::sapling::Item::new(valid_bundle_two, valid_sighash, valid_tx_id),
         ];
         let expected_results: Vec<_> = futures::future::join_all(
             items
@@ -3336,7 +3338,7 @@ fn v4_with_malformed_sapling_proof_returns_typed_error() {
         );
 
         let result = crate::primitives::sapling::verify_single(
-            crate::primitives::sapling::Item::new(bundle, sighash),
+            crate::primitives::sapling::Item::new(bundle, sighash, transaction.unmined_id()),
         )
         .await;
         assert_sapling_verification_error(
@@ -6182,6 +6184,245 @@ fn the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it() {
                 primitives::halo2::inner_calls_for(network_upgrade, &mutated_item),
                 1,
                 "the {mutated_field} mutation must reach the inner Halo2 verifier"
+            );
+        }
+    });
+}
+
+/// Returns the real mainnet Sapling transaction that the Sapling cache test drives through the
+/// verifier, with the network upgrade whose branch id its signatures commit to.
+///
+/// Selected from the mainnet test blocks for what full verification needs:
+///
+///   * a Sapling bundle with spends, which is what the cache holds;
+///   * no transparent inputs, so its sighash does not depend on previous outputs that the test
+///     vectors do not carry;
+///   * no Sprout JoinSplits and no Orchard bundle, which keeps the test on the Sapling verifier;
+///     and
+///   * a fee covering its own inputs and outputs, so the mempool's ZIP-317 policy accepts it.
+///
+/// It is taken from the front of the test vectors on purpose. Every other test that verifies a
+/// real Sapling transaction successfully takes the last matching one, so this transaction reaches
+/// the process-wide Sapling verifier only here and its cache entry is cold when this test starts.
+fn cacheable_mainnet_sapling_transaction() -> (NetworkUpgrade, Transaction) {
+    test_transactions(&Network::Mainnet)
+        .find(|(_, tx)| {
+            tx.sapling_spends_per_anchor().next().is_some()
+                && tx.inputs().is_empty()
+                && tx.joinsplit_count() == 0
+                && tx.orchard_shielded_data().is_none()
+                && tx
+                    .value_balance(&HashMap::new())
+                    .ok()
+                    .and_then(|balance| balance.remaining_transaction_value().ok())
+                    .is_some_and(|fee| fee >= zip317::conventional_fee(tx))
+        })
+        .map(|(height, tx)| {
+            (
+                NetworkUpgrade::current(&Network::Mainnet, height),
+                tx.as_ref().clone(),
+            )
+        })
+        .expect("the mainnet test blocks must contain a fee-paying Sapling-only transaction")
+}
+
+/// Returns the Sapling verification item the transaction verifier builds for `tx` at
+/// `network_upgrade`.
+///
+/// Mirrors `Verifier::verify_v4_transaction`: the bundle and the sighash come from one sighasher
+/// over an empty set of previous outputs, which is correct only because
+/// [`cacheable_mainnet_sapling_transaction`] has no transparent inputs.
+fn sapling_item(tx: &Transaction, network_upgrade: NetworkUpgrade) -> primitives::sapling::Item {
+    let sighasher = tx
+        .sighasher(network_upgrade, Arc::new(Vec::new()))
+        .expect("a mainnet Sapling transaction has a sighasher at its own network upgrade");
+    let bundle = sighasher
+        .sapling_bundle()
+        .expect("the transaction was selected for having a Sapling bundle");
+
+    primitives::sapling::Item::new(
+        bundle,
+        sighasher.sighash(HashType::ALL, None),
+        tx.unmined_id(),
+    )
+}
+
+/// Returns `tx`'s V4 Sapling shielded data for mutation.
+fn sapling_shielded_data_for_mutation(
+    tx: &mut Transaction,
+) -> &mut sapling::ShieldedData<sapling::PerSpendAnchor> {
+    let Transaction::V4 {
+        sapling_shielded_data: Some(shielded_data),
+        ..
+    } = tx
+    else {
+        panic!("the transaction was selected for being a V4 transaction with Sapling data")
+    };
+
+    shielded_data
+}
+
+/// Applies `mutate` to the first Sapling spend of `tx`.
+fn mutate_first_sapling_spend(
+    tx: &mut Transaction,
+    mutate: impl FnOnce(&mut sapling::Spend<sapling::PerSpendAnchor>),
+) {
+    let sapling::TransferData::SpendsAndMaybeOutputs { spends, .. } =
+        &mut sapling_shielded_data_for_mutation(tx).transfers
+    else {
+        panic!("the transaction was selected for having Sapling spends")
+    };
+
+    let mut spends_vec = spends.as_slice().to_vec();
+    mutate(&mut spends_vec[0]);
+    *spends = AtLeastOne::from_vec(spends_vec).expect("replacing a field keeps at least one spend");
+}
+
+/// Mutations that must each force a fresh Sapling verification.
+///
+/// Every one is a single bit flip in authorizing data, so the mutated transaction still passes
+/// the structural checks that run before verification — including the not-small-order check on
+/// `cv` and `epk`, which neither proofs nor signatures are part of.
+///
+/// All three are inside a v1-v4 transaction ID, which is the hash of the whole serialized
+/// transaction. That is why a Sapling bundle in a V4 transaction can be cached at all: it has no
+/// witnessed transaction ID, and its txid is what commits to its authorizing data.
+const SAPLING_CACHE_KEY_MUTATIONS: &[(&str, fn(&mut Transaction))] = &[
+    ("spend proof", |tx| {
+        mutate_first_sapling_spend(tx, |spend| spend.zkproof.0[0] ^= 1);
+    }),
+    ("spend authorization signature", |tx| {
+        mutate_first_sapling_spend(tx, |spend| {
+            let mut bytes = <[u8; 64]>::from(spend.spend_auth_sig);
+            bytes[0] ^= 1;
+            spend.spend_auth_sig = bytes.into();
+        });
+    }),
+    ("binding signature", |tx| {
+        let data = sapling_shielded_data_for_mutation(tx);
+        let mut bytes = <[u8; 64]>::from(data.binding_sig);
+        bytes[0] ^= 1;
+        data.binding_sig = bytes.into();
+    }),
+];
+
+/// The Sapling bundle cache, exercised end to end through the transaction verifier.
+///
+/// This is the Sapling counterpart of
+/// [`the_halo2_cache_is_reused_only_for_the_transaction_that_earned_it`], and it is one test for
+/// the same reason: all three claims need the same transaction and a cold cache for it.
+///
+/// It also covers what Sapling does not share with Orchard. Its fixture is a V4 transaction,
+/// which has no witnessed transaction ID, so its cache key is built from the legacy transaction
+/// ID instead — and these mutations are the evidence that the legacy ID commits to the
+/// authorizing data the witnessed ID's digest would have covered.
+///
+/// The three claims, in order:
+///
+///   1. a mempool verification records the bundle, and the block that mines the same transaction
+///      is answered from that record instead of verifying the bundle again;
+///   2. the record does not carry the transaction past the height-dependent checks: the block one
+///      height past its expiry is still rejected;
+///   3. a transaction with any verification input mutated never inherits the record.
+#[test]
+fn the_sapling_cache_is_reused_only_for_the_transaction_that_earned_it() {
+    let _init_guard = zakura_test::init();
+
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let (mut verifier, state) = cache_test_verifier();
+
+        let (network_upgrade, tx) = cacheable_mainnet_sapling_transaction();
+        let expiry_height = tx
+            .expiry_height()
+            .expect("the fixture is an Overwinter-onward transaction with an expiry height");
+        assert_eq!(
+            NetworkUpgrade::current(&Network::Mainnet, expiry_height),
+            network_upgrade,
+            "the expiry height must be in the same upgrade as the block that mined the fixture, \
+             or its V4 sighash would commit to a different branch id"
+        );
+
+        let item = sapling_item(&tx, network_upgrade);
+        assert_eq!(
+            primitives::sapling::inner_calls_for(&item),
+            0,
+            "this transaction's bundle must not have been verified before this test"
+        );
+
+        // 1. The mempool verification is the only one that reaches the Sapling verifier.
+        respond_to_nullifier_and_anchor_check(&state);
+        verify(
+            &mut verifier,
+            Request::Mempool {
+                transaction: tx.clone().into(),
+                height: expiry_height,
+            },
+        )
+        .await
+        .expect("a real mainnet Sapling transaction must verify at its expiry height");
+
+        assert_eq!(
+            primitives::sapling::inner_calls_for(&item),
+            1,
+            "the mempool verification must reach the inner Sapling verifier"
+        );
+
+        verify(&mut verifier, block_request(&tx, expiry_height))
+            .await
+            .expect("the same transaction must verify in a block");
+
+        assert_eq!(
+            primitives::sapling::inner_calls_for(&item),
+            1,
+            "the block verification must be answered from the cache"
+        );
+
+        // 2. The cached bundle does not carry the transaction past the expiry check.
+        let too_late =
+            (expiry_height + 1).expect("a mainnet expiry height is far below the maximum");
+        let error = verify(&mut verifier, block_request(&tx, too_late))
+            .await
+            .expect_err("a transaction mined past its expiry height must be rejected");
+
+        assert_eq!(
+            error,
+            TransactionError::ExpiredTransaction {
+                expiry_height,
+                block_height: too_late,
+                transaction_hash: tx.hash(),
+            },
+            "the rejection must be the expiry rule, not some other failure"
+        );
+
+        // 3. No mutated transaction inherits the cached result.
+        for (mutated_field, mutate) in SAPLING_CACHE_KEY_MUTATIONS {
+            let mut mutated_tx = tx.clone();
+            mutate(&mut mutated_tx);
+            let mutated_item = sapling_item(&mutated_tx, network_upgrade);
+
+            // A collision here would already be the failure: the mutation would inherit the
+            // valid transaction's result instead of being verified.
+            assert_eq!(
+                primitives::sapling::inner_calls_for(&mutated_item),
+                0,
+                "the {mutated_field} mutation must get a different cache key"
+            );
+
+            let Err(error) = verify(&mut verifier, block_request(&mutated_tx, expiry_height)).await
+            else {
+                panic!("a transaction with a mutated {mutated_field} must be rejected");
+            };
+
+            assert_eq!(
+                error,
+                TransactionError::SaplingVerificationFailed,
+                "the {mutated_field} twin must fail Sapling verification"
+            );
+
+            assert_eq!(
+                primitives::sapling::inner_calls_for(&mutated_item),
+                1,
+                "the {mutated_field} mutation must reach the inner Sapling verifier"
             );
         }
     });

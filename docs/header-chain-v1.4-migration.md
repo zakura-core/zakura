@@ -6,9 +6,10 @@ upgrade of the predecessor header overlay.
 - The three obsolete canonical predecessor-overlay indexes are discarded.
   Zakura does not decode, trust, or import those rows. Their deletion and the
   initial header DAG write commit atomically.
-- The header DAG initializes exclusively from authenticated finalized and
-  reconstructed full-state facts. Headers above the verified block tip are
-  downloaded again.
+- The header DAG initializes exclusively from the authenticated finalized tip
+  and its bounded predecessor context. Work coordinates are rebased at that
+  tip, so historical finalized headers are not rescanned. Headers above the
+  verified block tip are downloaded again.
 - `network.zakura.header_sync.accept_new_blocks` no longer exists because header
   sync does not relay blocks. Configuration parsing rejects the stale field;
   remove it before starting the upgraded node.

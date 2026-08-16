@@ -5,6 +5,7 @@ use std::sync::Arc;
 use zakura_chain::{
     block::{self, Height},
     parameters::Network,
+    work::difficulty::U256,
 };
 use zakura_header_chain::{
     prepare_headers, CheckpointSet, EngineConfig, EngineMode, Frontier, HeaderBatchInput,
@@ -62,9 +63,15 @@ fn clean_store_initializes_only_from_finalized_full_state() {
     assert_eq!(report.validation_context_rows, 1);
     assert_eq!(report.startup.current.frontiers.header_best, anchor);
     assert_eq!(runtime.publisher().snapshot(), report.startup.current);
+    let store = HeaderChainStore::new(state.header_chain_disk_db());
+    let metadata = StoreAuditRead::metadata(&store).expect("the initialized metadata decodes");
+    assert_eq!(metadata.work_origin, anchor);
+    let nodes = StoreAuditRead::all_header_nodes(&store).expect("the initialized node decodes");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].work_coordinate().origin_hash(), anchor.hash);
+    assert_eq!(nodes[0].work_coordinate().cumulative_work(), U256::zero());
     assert_eq!(
-        StoreAuditRead::selected_projection(&HeaderChainStore::new(state.header_chain_disk_db()))
-            .expect("the initialized selection decodes"),
+        StoreAuditRead::selected_projection(&store).expect("the initialized selection decodes"),
         vec![anchor]
     );
 
@@ -233,6 +240,52 @@ fn predecessor_overlay_is_preserved_when_full_state_authentication_fails() {
             .raw_range_cf(&header_cf, &[], None)
             .expect("the rejected startup leaves the predecessor row untouched"),
         before
+    );
+}
+
+#[test]
+fn initialization_rejects_finalized_tip_header_mismatch_before_cleanup() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let genesis = mainnet_block(0);
+    let block1 = mainnet_block(1);
+    let block2 = mainnet_block(2);
+    let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
+    write_full_block_header_and_transactions(&state, block1);
+    let finalized_header_cf = state
+        .db
+        .cf_handle("block_header_by_height")
+        .expect("the finalized header column exists");
+    let legacy_header_cf = state
+        .db
+        .cf_handle(ZAKURA_HEADER_BY_HEIGHT)
+        .expect("the obsolete column remains physically present");
+    let mut corrupted = DiskWriteBatch::new();
+    corrupted.zs_insert(&finalized_header_cf, Height(1), &genesis.header);
+    corrupted.zs_insert(&legacy_header_cf, Height(2), &block2.header);
+    state
+        .db
+        .write(corrupted)
+        .expect("the mismatched tip and legacy fixture write");
+    let legacy_before = state
+        .db
+        .raw_range_cf(&legacy_header_cf, &[], None)
+        .expect("the predecessor row can be observed without decoding it");
+    let config = engine_config(network, &genesis);
+
+    assert!(matches!(
+        initialize_header_chain_reconciled(&state, &config, Vec::new()),
+        Err(HeaderChainInitializationError::AnchorMismatch)
+    ));
+    assert!(
+        StoreAuditRead::metadata(&HeaderChainStore::new(state.header_chain_disk_db())).is_err()
+    );
+    assert_eq!(
+        state
+            .db
+            .raw_range_cf(&legacy_header_cf, &[], None)
+            .expect("the rejected startup leaves the predecessor row untouched"),
+        legacy_before
     );
 }
 

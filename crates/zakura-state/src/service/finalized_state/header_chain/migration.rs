@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use zakura_chain::block;
+use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{
     AlarmSet, BodyValidationState, ChainScore, ChangeSet, EngineConfig, EngineMetadata, EngineMode,
     EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
@@ -45,11 +45,11 @@ pub enum HeaderChainInitializationError {
     /// Full state has no finalized tip to authenticate initialization.
     #[error("header-chain initialization requires a finalized full-state anchor")]
     MissingFinalizedAnchor,
-    /// The engine bootstrap is not an exact full-state ancestor of the finalized tip.
-    #[error("engine bootstrap anchor is not an exact finalized full-state ancestor")]
+    /// The engine bootstrap is above the finalized tip, or the finalized anchor is incoherent.
+    #[error("engine bootstrap or finalized full-state anchor is incoherent")]
     AnchorMismatch,
-    /// Exact work construction failed.
-    #[error("authenticated full-state path could not form an exact work coordinate")]
+    /// Exact finalized-anchor work construction failed.
+    #[error("authenticated finalized anchor could not form an exact work coordinate")]
     Work,
     /// Authenticated full-state context is missing or incoherent.
     #[error("authenticated full-state header context is incoherent: {0}")]
@@ -119,7 +119,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
         mode: config.mode,
         network_id: config.network.kind(),
         anchor_manifest_digest: config.trust_anchor_digest(),
-        work_origin: config.bootstrap_anchor().frontier,
+        work_origin: anchor,
         state_version: StateVersion::new(1),
         header_generation: HeaderGeneration::new(1),
         verified_generation: VerifiedGeneration::new(1),
@@ -221,34 +221,15 @@ fn finalized_anchor(
     {
         return Err(HeaderChainInitializationError::AnchorMismatch);
     }
-    let bootstrap_work = stored_bootstrap
-        .difficulty_threshold
-        .to_work()
-        .ok_or(HeaderChainInitializationError::Work)?;
-    let mut coordinate = WorkCoordinate::new(bootstrap.hash, bootstrap_work.as_u256());
-    let mut header = stored_bootstrap;
-    let mut height = bootstrap.height;
-    while height < finalized.height {
-        height = height
-            .next()
-            .map_err(|_| HeaderChainInitializationError::Work)?;
-        let (hash, next) = finalized_header_by_height(source, height)
-            .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
-        if next.hash() != hash || next.previous_block_hash != header.hash() {
-            return Err(HeaderChainInitializationError::AnchorMismatch);
-        }
-        let work = next
-            .difficulty_threshold
-            .to_work()
-            .ok_or(HeaderChainInitializationError::Work)?;
-        coordinate = coordinate
-            .checked_add(work)
-            .map_err(|_| HeaderChainInitializationError::Work)?;
-        header = next;
-    }
+    let header = source
+        .block_header(finalized.height.into())
+        .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
     if header.hash() != finalized.hash {
         return Err(HeaderChainInitializationError::AnchorMismatch);
     }
+    // Every selectable branch descends from finality, so pre-finality work is a
+    // shared constant. Rebasing here avoids rescanning the complete finalized chain.
+    let coordinate = WorkCoordinate::new(finalized.hash, U256::zero());
     Ok((header, coordinate))
 }
 

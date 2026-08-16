@@ -139,7 +139,7 @@ fn flush_block_verifier_batches() {
     }
 
     if let Some(verifier) = Lazy::get(&sapling::VERIFIER) {
-        queue_batch_flush("groth16_sapling", sapling::try_flush(verifier));
+        queue_batch_flush(sapling::VERIFIER_NAME, sapling::try_flush(verifier));
     }
 
     if let Some(verifier) = Lazy::get(&halo2::VERIFIER_PRE_NU6_2) {

@@ -28,10 +28,11 @@ use super::cache::{CacheKey, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
 #[cfg(test)]
 mod tests;
 
-/// The `verifier` label the Sapling cache reports its metrics under.
+/// The name this verifier reports under in every metric and log line.
 ///
-/// It matches the label this verifier's batch duration metric already uses.
-const CACHE_VERIFIER_LABEL: &str = "groth16_sapling";
+/// The cache metrics, the batch duration histogram and the explicit-flush log all carry it, so
+/// one verifier is named the same way everywhere.
+pub(super) const VERIFIER_NAME: &str = "groth16_sapling";
 
 /// Sapling prover containing spend and output params for the Sapling circuit.
 ///
@@ -71,7 +72,7 @@ impl Item {
     /// determining the bundle — see this type's [`CachedItem`] implementation. The transaction
     /// verifier passes the precomputed ID from its [`Request`](crate::transaction::Request),
     /// whose caller must preserve this invariant.
-    pub fn new(
+    pub(crate) fn new(
         bundle: Bundle<Authorized, ZatBalance>,
         sighash: SigHash,
         tx_id: UnminedTxId,
@@ -227,7 +228,7 @@ impl Service<BatchControl<Item>> for Verifier {
                     };
                     metrics::histogram!(
                         "zakura.consensus.batch.duration_seconds",
-                        "verifier" => "groth16_sapling",
+                        "verifier" => VERIFIER_NAME,
                         "result" => result_label
                     )
                     .record(duration);
@@ -289,13 +290,8 @@ type VerifierService = Cached<BatchFallbackService>;
 /// gossiped into the mempool does not have to be verified again when the block that mines it
 /// arrives. One cache covers all of Sapling: its spend and output verifying keys have never
 /// changed, so unlike Orchard there are no circuit eras to keep apart.
-pub static VERIFIER: Lazy<VerifierService> = Lazy::new(|| {
-    Cached::new(
-        batch_fallback_verifier(),
-        CACHE_CAPACITY,
-        CACHE_VERIFIER_LABEL,
-    )
-});
+pub static VERIFIER: Lazy<VerifierService> =
+    Lazy::new(|| Cached::new(batch_fallback_verifier(), CACHE_CAPACITY, VERIFIER_NAME));
 
 /// Builds the uncached batching-and-fallback stack.
 fn batch_fallback_verifier() -> BatchFallbackService {
@@ -310,7 +306,11 @@ fn batch_fallback_verifier() -> BatchFallbackService {
     )
 }
 
-/// Attempts to flush the batching service wrapped by `verifier`.
+/// Attempts to queue an explicit flush of the batch service inside `verifier`.
+///
+/// Returns `Ok(true)` when it queued the flush, and `Ok(false)` when the batch queue has no free
+/// capacity — a full queue is already flushing on size, so the caller skips it rather than
+/// waiting. An `Err` reports that the batch worker has exited.
 pub(super) fn try_flush(verifier: &VerifierService) -> Result<bool, BoxError> {
     verifier.inner().primary().clone().try_flush()
 }

@@ -1,14 +1,15 @@
-//! Tests for the shared verification cache key.
+//! Tests for the shared verification cache key and the bounded store behind it.
 //!
-//! The verifiers pin their own key construction over real bundles. These cover the part of the
-//! key that is the same for all of them: which of its three components separate two entries.
+//! The verifiers pin their own key construction over real bundles. These cover the parts that are
+//! the same for all of them: which of the key's three components separate two entries, and the
+//! store's capacity and eviction.
 
 use zakura_chain::{
     serialization::BytesInDisplayOrder,
     transaction::{AuthDigest, Hash, UnminedTxId, WtxId},
 };
 
-use super::{CacheKey, ShieldedPool};
+use super::{CacheKey, ShieldedPool, VerifiedBundles};
 
 /// Returns a transaction ID with no witness, as a v1-v4 transaction has.
 fn legacy_tx_id(tag: u8) -> UnminedTxId {
@@ -99,4 +100,41 @@ fn orchard_value_pools_map_to_distinct_tags() {
         ShieldedPool::from(orchard::ValuePool::Ironwood),
         ShieldedPool::Ironwood
     );
+}
+
+/// The lookup set and the eviction queue always hold the same keys.
+///
+/// They are two representations of one fact. A path that updated one without the other would
+/// either drop a key that `contains` still answers — remembering a bundle for the rest of the
+/// process — or grow the queue past the capacity it was built with.
+#[test]
+fn the_lookup_set_and_the_eviction_queue_hold_the_same_keys() {
+    let mut verified = VerifiedBundles::new(2);
+    let keys = [
+        CacheKey::new(legacy_tx_id(1), [0; 32], ShieldedPool::Sapling),
+        CacheKey::new(legacy_tx_id(2), [0; 32], ShieldedPool::Sapling),
+        CacheKey::new(legacy_tx_id(3), [0; 32], ShieldedPool::Sapling),
+    ];
+
+    for key in keys {
+        verified.insert(key);
+        assert_eq!(
+            verified.keys.len(),
+            verified.insertion_order.len(),
+            "the lookup set and the eviction queue must hold the same keys"
+        );
+        assert!(verified.keys.len() <= 2, "the capacity bounds the cache");
+    }
+    assert!(
+        !verified.contains(&keys[0]),
+        "the oldest key must be evicted"
+    );
+
+    let repeated = verified.insert(keys[2]);
+    assert!(!repeated.inserted, "a concurrent duplicate is not recorded");
+    assert_eq!(repeated.evicted, 0, "a duplicate must not evict anything");
+    assert_eq!(verified.keys.len(), verified.insertion_order.len());
+
+    verified.clear();
+    assert!(verified.keys.is_empty() && verified.insertion_order.is_empty());
 }

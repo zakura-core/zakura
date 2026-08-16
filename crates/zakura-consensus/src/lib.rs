@@ -56,10 +56,11 @@ pub use block::{subsidy::funding_stream_address, Request, VerifyBlockError, MAX_
 pub use checkpoint::{VerifyCheckpointError, MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};
 pub use config::Config;
 pub use error::BlockError;
-pub use primitives::{
-    clear_shielded_verification_caches, ed25519, groth16, halo2, redjubjub, redpallas,
-    sapling::sapling_prover,
-};
+pub use primitives::{ed25519, groth16, halo2, redjubjub, redpallas, sapling::sapling_prover};
+
+// Benchmarks only: hidden from the documentation, exported so a bench target can reach it.
+#[doc(hidden)]
+pub use primitives::clear_shielded_verification_caches;
 pub use router::RouterError;
 
 /// A boxed [`std::error::Error`].

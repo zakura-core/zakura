@@ -660,12 +660,6 @@ async fn cache_evicts_in_insertion_order_and_stays_correct_when_full() {
     assert_eq!(inner.calls(), 4, "an evicted entry must be re-verified");
 }
 
-/// Clones of a cache answer from the same set of verified proofs.
-///
-/// Production never calls a global verifier directly: [`super::verifier_for`] hands out a
-/// `&'static` handle and every request goes through a fresh `.clone()` of it. A cache that lived
-/// in the handle rather than behind the shared `Arc` would be empty for every request, so this
-/// pins the sharing that makes the cache reachable at all.
 /// A remembered result is never visible to another era's cache.
 ///
 /// The cache key deliberately does not name the verifying key. What binds an entry to the key it
@@ -694,6 +688,12 @@ async fn a_result_cached_under_one_era_is_not_visible_to_another() {
     );
 }
 
+/// Clones of a cache answer from the same set of verified proofs.
+///
+/// Production never calls a global verifier directly: [`super::verifier_for`] hands out a
+/// `&'static` handle and every request goes through a fresh `.clone()` of it. A cache that lived
+/// in the handle rather than behind the shared `Arc` would be empty for every request, so this
+/// pins the sharing that makes the cache reachable at all.
 #[tokio::test]
 async fn cache_is_shared_between_clones() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();

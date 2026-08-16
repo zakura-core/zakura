@@ -302,10 +302,10 @@ type VerifierService = Cached<BatchFallbackService>;
 /// The stack is wrapped in a [`Cached`] so that a proof gossiped into the mempool does not have
 /// to be verified again when the block that mines it arrives. Because each era builds its own
 /// verifier here, each era also gets its own cache, which is what binds a remembered result to the
-/// `vk` it was produced under. `verifier` is the era's `verifier` metrics label, so each era's
-/// cache reports its own hit rate.
-fn batch_verifier(vk: &'static ItemVerifyingKey, verifier: &'static str) -> VerifierService {
-    Cached::new(batch_fallback_verifier(vk), CACHE_CAPACITY, verifier)
+/// `vk` it was produced under. `verifier_name` is the era's `verifier` metrics label, so each
+/// era's cache reports its own hit rate.
+fn batch_verifier(vk: &'static ItemVerifyingKey, verifier_name: &'static str) -> VerifierService {
+    Cached::new(batch_fallback_verifier(vk), CACHE_CAPACITY, verifier_name)
 }
 
 /// Builds the uncached batching-and-fallback stack for `vk`.

@@ -154,8 +154,21 @@ impl CacheKey {
 ///
 /// Items without a key are verified normally and never cached, which is how a caller that has no
 /// transaction identity to offer stays correct.
+///
+/// # Correctness
+///
+/// An implementer promises that the returned key determines every input the item's verification
+/// reads: the bundle, and the sighash it is checked against. [`Cached`] answers any later item
+/// with an equal key from the remembered `Ok` without verifying it, so a key that two different
+/// bundles can share accepts a bundle this node never checked. An implementer that cannot offer
+/// a complete key returns `None`, and the item is verified every time.
 pub(super) trait CachedItem {
-    /// Returns this item's cache key, if it has one.
+    /// Returns the key this item's successful verification is remembered under, or `None` if the
+    /// item must always be verified.
+    ///
+    /// The key is a pure function of the item: two calls on one item return the same key, and two
+    /// items with equal keys have identical verification inputs. [`CacheKey`] derives why a
+    /// transaction ID, a sighash and a shielded pool are enough.
     fn cache_key(&self) -> Option<CacheKey>;
 }
 
@@ -181,6 +194,12 @@ struct InsertOutcome {
 /// Eviction is first-in-first-out rather than least-recently-used: the working set is the
 /// mempool, which turns over in arrival order anyway, and FIFO needs no bookkeeping on the read
 /// path. Evicting an entry only costs a re-verification, never correctness.
+///
+/// # Correctness
+///
+/// `keys` and `insertion_order` hold the same keys. `keys` answers [`Self::contains`], and
+/// `insertion_order` chooses which key to drop. Only [`Self::insert`] and [`Self::clear`] change
+/// them, and each changes both, so no caller can leave them holding different keys.
 #[derive(Debug)]
 struct VerifiedBundles {
     /// The keys currently remembered.
@@ -225,6 +244,9 @@ impl VerifiedBundles {
         // rest of the process.
         let mut evicted = 0;
         while self.insertion_order.len() >= self.capacity {
+            // The queue is non-empty whenever its length reaches a capacity of one or more, which
+            // is what every caller passes. Breaking rather than unwrapping keeps a capacity of
+            // zero from looping forever.
             let Some(oldest) = self.insertion_order.pop_front() else {
                 break;
             };
@@ -243,8 +265,8 @@ impl VerifiedBundles {
 
     /// Forgets every key.
     ///
-    /// Benchmarks only, through [`Cached::clear`]. Forgetting a key only costs a
-    /// re-verification, so this is always safe.
+    /// [`Cached::clear`] is the only caller; benchmarks and tests use it to start from a cold
+    /// cache. Forgetting a key only costs a re-verification, so this is always safe.
     fn clear(&mut self) {
         self.keys.clear();
         self.insertion_order.clear();
@@ -252,24 +274,24 @@ impl VerifiedBundles {
 }
 
 impl InsertOutcome {
-    /// Reports this insert under `verifier`.
+    /// Reports this insert under `verifier_name`.
     ///
-    /// Called after the cache lock is released.
-    fn report(self, verifier: &'static str) {
+    /// [`Cached::call`] calls this after it releases the cache lock.
+    fn report(self, verifier_name: &'static str) {
         if !self.inserted {
             return;
         }
 
-        metrics::counter!(CACHE_INSERT, VERIFIER_LABEL => verifier).increment(1);
+        metrics::counter!(CACHE_INSERT, VERIFIER_LABEL => verifier_name).increment(1);
 
         if self.evicted > 0 {
             // Cast is safe: at most `capacity` keys are evicted by one insert.
-            metrics::counter!(CACHE_EVICT, VERIFIER_LABEL => verifier)
+            metrics::counter!(CACHE_EVICT, VERIFIER_LABEL => verifier_name)
                 .increment(self.evicted as u64);
         }
 
         // Cast is safe: the length is bounded by `capacity`, far below f64's exact integer range.
-        metrics::gauge!(CACHE_SIZE, VERIFIER_LABEL => verifier).set(self.size as f64);
+        metrics::gauge!(CACHE_SIZE, VERIFIER_LABEL => verifier_name).set(self.size as f64);
     }
 }
 
@@ -287,8 +309,8 @@ pub struct Cached<S> {
     /// The keys of items that have already verified under this cache's verifying key.
     verified: Arc<Mutex<VerifiedBundles>>,
 
-    /// The `verifier` label this cache reports its metrics under.
-    verifier: &'static str,
+    /// The value this cache reports in the `verifier` label of its metrics.
+    verifier_name: &'static str,
 
     /// The keys of the items that reached the inner service, in call order.
     ///
@@ -302,7 +324,7 @@ impl<S: Clone> Clone for Cached<S> {
         Self {
             inner: self.inner.clone(),
             verified: self.verified.clone(),
-            verifier: self.verifier,
+            verifier_name: self.verifier_name,
             #[cfg(test)]
             inner_calls: self.inner_calls.clone(),
         }
@@ -311,12 +333,12 @@ impl<S: Clone> Clone for Cached<S> {
 
 impl<S> Cached<S> {
     /// Wraps `inner` in a cache that retains at most `capacity` verified-bundle keys and reports
-    /// its metrics under the `verifier` label.
-    pub(super) fn new(inner: S, capacity: usize, verifier: &'static str) -> Self {
+    /// its metrics under the `verifier` label `verifier_name`.
+    pub(super) fn new(inner: S, capacity: usize, verifier_name: &'static str) -> Self {
         Self {
             inner,
             verified: Arc::new(Mutex::new(VerifiedBundles::new(capacity))),
-            verifier,
+            verifier_name,
             #[cfg(test)]
             inner_calls: Arc::new(Mutex::new(Vec::new())),
         }
@@ -338,7 +360,7 @@ impl<S> Cached<S> {
             .expect("verified bundle cache mutex should not be poisoned")
             .clear();
 
-        metrics::gauge!(CACHE_SIZE, VERIFIER_LABEL => self.verifier).set(0.0);
+        metrics::gauge!(CACHE_SIZE, VERIFIER_LABEL => self.verifier_name).set(0.0);
     }
 
     /// Returns how many times an item equivalent to `item` has reached the inner service.
@@ -373,7 +395,7 @@ impl<S> Cached<S> {
         Cached {
             inner,
             verified: self.verified.clone(),
-            verifier: self.verifier,
+            verifier_name: self.verifier_name,
             inner_calls: self.inner_calls.clone(),
         }
     }
@@ -421,15 +443,15 @@ where
                 .expect("verified bundle cache mutex should not be poisoned")
                 .contains(&key)
             {
-                metrics::counter!(CACHE_HIT, VERIFIER_LABEL => self.verifier).increment(1);
+                metrics::counter!(CACHE_HIT, VERIFIER_LABEL => self.verifier_name).increment(1);
                 return future::ready(Ok(())).boxed();
             }
         }
 
-        metrics::counter!(CACHE_MISS, VERIFIER_LABEL => self.verifier).increment(1);
+        metrics::counter!(CACHE_MISS, VERIFIER_LABEL => self.verifier_name).increment(1);
 
         let verified = self.verified.clone();
-        let verifier = self.verifier;
+        let verifier_name = self.verifier_name;
         let mut inner = self.inner.clone();
 
         #[cfg(test)]
@@ -460,7 +482,7 @@ where
                     .expect("verified bundle cache mutex should not be poisoned")
                     .insert(key);
 
-                outcome.report(verifier);
+                outcome.report(verifier_name);
             }
 
             result

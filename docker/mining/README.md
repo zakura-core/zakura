@@ -28,6 +28,11 @@ peer port published by the Compose configuration.
 
 All block rewards go to the address configured in `MINER_ADDRESS`.
 
+The S-NOMP image pins a Valargroup `node-stratum-pool` revision that uses the
+Merkle root and block commitments supplied in Zakura's `defaultroots`. This is
+required for templates containing Ironwood v6 transactions; recalculating those
+roots with pre-Ironwood transaction hashing produces invalid blocks.
+
 ## Quick Start
 
 ```bash
@@ -57,12 +62,30 @@ Edit `.env` to configure:
 | Variable        | Default    | Description                                  |
 |-----------------|------------|----------------------------------------------|
 | `MINER_ADDRESS` | (required) | Transparent address for block rewards        |
+| `MINER_DATA`    | `valargroup` | UTF-8 data included in mined coinbase transactions |
 | `NETWORK`       | `Testnet`  | `Mainnet` or `Testnet`                       |
 | `RPC_PORT`      | `18232`    | Zebra RPC port (18232 Testnet, 8232 Mainnet) |
 | `PEER_PORT`     | `18233`    | P2P port (18233 Testnet, 8233 Mainnet)       |
-| `STRATUM_PORT`  | `3333`     | Port miners connect to                       |
+| `STRATUM_PORT`  | `3333`     | Fixed-difficulty ASIC Stratum port            |
+| `CPU_STRATUM_PORT` | `3334`  | Low-difficulty CPU Stratum port               |
+| `ASIC_DIFFICULTY` | `64`     | S-NOMP share difficulty for ASIC miners       |
+| `CPU_DIFFICULTY` | `0.000125` | S-NOMP share difficulty for CPU miners       |
 | `WORKER_NAME`   | `docker`   | Worker name suffix (for nheqminer container) |
 | `CPU_THREADS`   | `1`        | CPU threads for nheqminer                    |
+
+### Share Difficulty
+
+Both Stratum ports use fixed share difficulty. Values lower than `0.000125`
+are rejected because S-NOMP cannot represent their mining target.
+
+Mining Rig Rentals reports Equihash difficulty at approximately 8192 times
+the S-NOMP value. The default `ASIC_DIFFICULTY=64` therefore appears as
+`524288`, within its recommended 500k–3M range. After changing either value,
+recreate S-NOMP:
+
+```bash
+docker compose up -d --force-recreate s-nomp
+```
 
 ## Checking Sync Status
 
@@ -86,7 +109,9 @@ docker exec zebra curl -s -H "Content-Type: application/json" \
 
 ### Built-in nheqminer Container
 
-The setup includes an optional nheqminer container for CPU mining. It uses a Docker Compose profile, so it won't start by default.
+The setup includes an optional nheqminer container for CPU mining. It uses the
+low-difficulty CPU Stratum port and a Docker Compose profile, so it won't start
+by default.
 
 ```bash
 # Start the miner (after Zebra is synced)
@@ -102,14 +127,14 @@ docker compose --profile miner stop nheqminer
 CPU_THREADS=4
 ```
 
-### External nheqminer (CPU/GPU)
+### External nheqminer (CPU)
 
 ```bash
 # CPU mining
-./nheqminer -l <pool-host>:3333 -u <your-address>.worker1 -t <threads>
+./nheqminer -l <pool-host>:3334 -u <your-address>.worker1 -t <threads>
 
 # Example
-./nheqminer -l 192.168.1.100:3333 -u t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v.rig1 -t 4
+./nheqminer -l 192.168.1.100:3334 -u t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v.rig1 -t 4
 ```
 
 ### Antminer Z15
@@ -136,7 +161,8 @@ API endpoint: `http://<host>:8080/api/stats`
 
 | Port       | Service | Purpose                       |
 |------------|---------|-------------------------------|
-| 3333       | S-NOMP  | Stratum (miners connect here) |
+| 3333       | S-NOMP  | Fixed-difficulty ASIC Stratum |
+| 3334       | S-NOMP  | Low-difficulty CPU Stratum    |
 | 8080       | S-NOMP  | Web UI and API                |
 | 18233/8233 | Zebra   | P2P network (Testnet/Mainnet) |
 
@@ -209,6 +235,15 @@ Check logs for errors:
 
 ```bash
 docker compose logs s-nomp | tail -50
+```
+
+### Zakura rejects submitted blocks with `BadMerkleRoot`
+
+Rebuild the pinned Valargroup S-NOMP image, then force-recreate the service:
+
+```bash
+docker compose build --no-cache s-nomp
+docker compose up -d --force-recreate s-nomp
 ```
 
 ### Miners can't connect

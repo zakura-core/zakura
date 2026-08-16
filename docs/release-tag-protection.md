@@ -60,7 +60,9 @@ ruleset administration must remain limited.
 2. Open **Actions > Create release > Run workflow**.
 3. Select the `main` branch, enter the exact release tag, and set the expected
    tag delay. Dispatching the workflow acknowledges that no release hold is
-   active.
+   active. Leave `publish_crates` on `auto` unless this release departs from
+   the norm: `auto` publishes stable tags to crates.io and leaves release
+   candidates to an explicit dispatch.
 4. The workflow resolves the latest digest-verified Mainnet release-state
    bundle and warns about release-level, committed-state, or
    `ESTIMATED_RELEASE_HEIGHT` readiness problems. Then wait for it to build and
@@ -71,6 +73,9 @@ ruleset administration must remain limited.
 6. Confirm that `Release binaries` starts from the new tag, skips rebuilding
    the existing assets, publishes the Docker images, and opens the installer
    metadata update pull request.
+7. If the run dispatched crates.io publishing, approve the `crates-io`
+   deployment on that run. See
+   [Crates.io Trusted Publishing](#cratesio-trusted-publishing).
 
 The workflow always builds the commit selected when it was dispatched, even if
 `main` advances before approval. It is safe to rerun after a partial failure:
@@ -82,11 +87,29 @@ when and how a release is promoted.
 
 ## Crates.io Trusted Publishing
 
-The manually dispatched
-[`Publish crates`](../.github/workflows/publish-crates.yml) workflow publishes
-Zakura's crates from a published release tag, authenticated by short-lived
-tokens crates.io mints against this repository's GitHub OIDC identity. No
-registry credential is stored anywhere.
+The [`Publish crates`](../.github/workflows/publish-crates.yml) workflow
+publishes Zakura's crates from a published release tag, authenticated by
+short-lived tokens crates.io mints against this repository's GitHub OIDC
+identity. No registry credential is stored anywhere.
+
+`Create release` dispatches it as the last thing it does, once the tag exists,
+subject to its `publish_crates` input:
+
+- **`auto`** (the default) publishes a stable tag and skips a release
+  candidate. Release candidates have gone both ways — `v1.1.0-rc1` and
+  `v1.1.0-rc2` were published while `v1.0.3-rc1`, `v1.1.0-rc0`, and
+  `v1.2.0-rc0` deliberately were not — so `auto` asks for a decision instead
+  of assuming one.
+- **`always`** publishes whatever the tag looks like.
+- **`never`**, and any release using `allow_unpublishable_crate_graph`, does
+  not dispatch. That override means the publish graph does not resolve, so the
+  release is GitHub-only by definition.
+
+Dispatching only queues the upload behind the `crates-io` environment
+reviewer. Because that approval waits in the dispatched run rather than in
+`Create release`, a release left pending a publishing decision does not hold
+the release workflow open. Dispatch `Publish crates` by hand at any later
+point for a tag that was skipped, or to retry one that failed.
 
 The workflow takes a `mode`:
 
@@ -153,25 +176,23 @@ this file would present `create-release.yml`. That is why release automation
 dispatches this workflow instead of calling it, and why renaming this file
 means reconfiguring every crate.
 
-### Publishing a release
+### Approving a publish
 
-An operator needs repository Write access or higher, but no crates.io account
-permission:
+Approving needs no crates.io account permission, only membership in the
+`crates-io` environment's reviewers:
 
-1. Open **Actions > Publish crates > Run workflow**.
-2. Select `main`, enter the published release tag, choose the mode, and
-   dispatch. Always dispatch from `main`, including for a hotfix release: the
-   tag is resolved by name and checked out on its own, so the `crates-io`
-   environment stays restricted to `main`.
-3. Ask a `crates-io` environment reviewer to approve the pending deployment,
-   after reviewing the crate/version/status table in the run summary. Watch
-   for rows flagged as below the newest published version: expected for a
-   hotfix on an older release line, and otherwise a sign the run is publishing
-   from a stale tag.
-4. Confirm every job passes. After a `publish` run, `Verify the published
-   versions` asserts that each new version's crates.io record names this
-   workflow run and the dispatch commit on `main` (the OIDC `sha` claim),
-   and `Install zakurad from crates.io` installs and runs the published binary.
+1. Open the pending `Publish crates` run and read the crate/version/status
+   table in the `Plan and verify crate publication` summary. This is the last
+   point at which the upload can be stopped.
+2. Watch for rows flagged as below the newest published version. That is
+   expected for a hotfix on an older release line, and otherwise means the run
+   is publishing from a stale tag — most likely a tag that was deliberately
+   never published.
+3. Approve the `crates-io` deployment.
+4. Confirm every job passes. `Verify the published versions` asserts that each
+   new version's public crates.io record names this workflow run and the
+   dispatch commit on `main` (the OIDC `sha` claim), and `Install zakurad from
+   crates.io` installs and runs the published binary.
 
 Both post-publish jobs run after the uploads are already irreversible, so a
 failure there reports a problem rather than preventing one. `Install zakurad
@@ -179,10 +200,17 @@ from crates.io` in particular is a cold release build of the whole node and can
 exhaust its timeout on a slow runner; re-run the job before concluding the
 published crates are broken.
 
-Publishing to crates.io has historically been a separate decision from
-tagging — `v1.0.3-rc1`, `v1.1.0-rc0`, and `v1.2.0-rc0` were tagged but
-intentionally never published — and the environment reviewer is where that
-decision is now recorded.
+### Dispatching by hand
+
+An operator needs repository Write access or higher. Open **Actions > Publish
+crates > Run workflow**, select `main`, enter the published release tag, and
+choose the mode. Always dispatch from `main`, including for a hotfix release:
+the workflow resolves the tag by name and checks it out on its own, so the
+`crates-io` environment stays restricted to `main`.
+
+Reach for this to publish a tag `Create release` skipped, to retry a failed or
+partial publish, or — with `mode: verify` — to confirm before a release that
+the crate selection and the trusted-publisher configuration are still good.
 
 ## Promotion and the "Latest" Release
 

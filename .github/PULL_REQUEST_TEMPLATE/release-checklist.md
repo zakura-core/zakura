@@ -320,20 +320,25 @@ from publication until deletion.
 
 ## Publish Crates
 
-- [ ] [Run `cargo login`](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio)
-- [ ] It is recommended that the following step be run from a fresh checkout of
-      the repo, to avoid accidentally publishing files like e.g. logs that might
-      be lingering around
-- [ ] Publish the crates to crates.io; edit the list to only include the crates that
-      have been changed, but keep their overall order:
+CI publishes the crates from the tagged commit using crates.io Trusted
+Publishing. There is no `cargo login`, no local publish loop, and no crate list
+to edit: the set comes from `cargo metadata` filtered against the live index,
+so only crates whose workspace version is absent are uploaded. See
+[`docs/release-tag-protection.md`](https://github.com/zakura-core/zakura/blob/main/docs/release-tag-protection.md).
 
-```
-for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakura-header-chain zakura-tower-batch-control zakura-node-services zakura-script zakura-state zakura-consensus zakura-network zakura-rpc zakura-utils zakura; do cargo release publish --verbose --execute -p $c; done
-```
-
-- [ ] Check that Zakura can be installed from `crates.io`:
-      `cargo install --locked --force --version <version> zakura && ~/.cargo/bin/zakurad`
-      and put the output in a comment on the PR.
+- [ ] Confirm `Create release` dispatched `Publish crates` for this tag. It
+      does so automatically for a stable tag; for a release candidate, dispatch
+      it by hand from `main` with `mode: publish` once the decision to publish
+      has been made.
+- [ ] Review the crate/version/status table in that run's summary, then have a
+      `crates-io` environment reviewer approve the deployment. Approving is
+      irreversible — a published version can be yanked, never replaced.
+- [ ] Confirm `Verify the published versions` and `Install zakurad from
+      crates.io` pass, and put the reported `zakurad --version` in a comment on
+      the PR.
+- [ ] If the publish failed partway through, dispatch `Publish crates` again
+      for the same tag: the plan skips whatever landed and publishes the rest.
+      Never repair a partial publish by yanking and re-uploading a version.
 
 ## Publish Docker Images
 

@@ -103,6 +103,10 @@ For crates.io publishing:
    runs the same script as the `crates.io publish graph` job in
    `tests-unit.yml` (part of `test success`), so a missing cascade bump
    cannot merge. It is also step 5 of `make pre-release`.
+7. Reserve any crate name the release adds. The same check warns when a
+   selected crate has never been published; CI cannot bootstrap it, because
+   its crates.io Trusted Publishing entry lives on a crate that must already
+   exist. Publish the name manually and configure it before the release.
 
 Partial version graphs are allowed, but all tooling must handle them. Do not
 assume every publishable crate has the `zakura` package version.
@@ -236,6 +240,9 @@ The workflow must:
 5. create the immutable tag and GitHub pre-release
 6. publish the release assets; the tag push then triggers
    `release-binaries.yml`, which publishes the Docker images
+7. dispatch `publish-crates.yml` for the new tag, unless `publish_crates` is
+   `never`, the tag is a release candidate under the default `auto`, or
+   `allow_unpublishable_crate_graph` is set
 
 The documented emergency source-first mode skips the pre-tag VCT crossing and
 asset build. A handoff-canary failure in the normal path blocks release
@@ -257,8 +264,12 @@ still has the previous package version.
 - Verify release checksums.
 - Verify the standard Docker image has amd64 and arm64; verify the
   zcashd-compat image has amd64.
-- Publish only changed crates, preserving dependency order.
-- Install the exact version from crates.io and run `zakurad --version`.
+- Approve the `crates-io` deployment on the dispatched `Publish crates` run
+  after reviewing its plan table; that approval is the crates.io publish, and
+  it is irreversible. Retry a partial publish by dispatching the workflow again
+  for the same tag, never by yanking.
+- Confirm the run's `Verify the published versions` and `Install zakurad from
+  crates.io` jobs passed; they replace publishing and installing by hand.
 - Replace the boilerplate GitHub release body with concrete notes from the final
   changelog or approved release-note draft.
 - Promote stable releases with `./scripts/release-t0.sh promote --tag <tag>`

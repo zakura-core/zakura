@@ -127,6 +127,7 @@ local_internal_reqs="$(jq -r '
 publish_set=()
 exclude_args=()
 divergent=0
+unreserved=0
 
 echo "Crates.io publish set (exact workspace versions absent from the index):"
 while IFS=$'\t' read -r crate version; do
@@ -159,6 +160,17 @@ while IFS=$'\t' read -r crate version; do
     1)
       printf '  %s@%s: to publish\n' "$crate" "$version"
       publish_set+=("${crate}@${version}")
+
+      # Advisory: Trusted Publishing cannot create a crate, because the
+      # configuration authorizing the release workflow lives on an existing
+      # crate. Surfacing an unreserved name here puts it in the release PR,
+      # rather than in a half-finished publish at T-0. The index response is
+      # already cached by the query above, so this costs no extra request.
+      if [ -z "$(crates_index_versions "$crate")" ]; then
+        printf '      WARNING: %s has never been published; reserve the name manually and add its crates.io Trusted Publishing entry (docs/release-tag-protection.md) before this release\n' \
+          "$crate"
+        unreserved=1
+      fi
       ;;
     *)
       echo "ERROR: could not query the crates.io index for ${crate}." >&2
@@ -263,5 +275,8 @@ fi
 echo "Publish graph resolves at workspace versions: ${publish_set[*]}"
 if [ "$divergent" = 1 ]; then
   echo "WARNING: published crates with locally diverged requirements were skipped above; review the warnings." >&2
+fi
+if [ "$unreserved" = 1 ]; then
+  echo "WARNING: crate names that do not exist on crates.io were selected above; automated publishing refuses to run until they are reserved and configured." >&2
 fi
 exit 0

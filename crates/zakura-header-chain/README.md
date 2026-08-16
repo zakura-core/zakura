@@ -60,3 +60,6 @@ cargo test -p zakura-header-chain
 
 Property and mutation fuzzing are documented in the
 [header-chain fuzz target](../../fuzz/header-chain/README.md).
+
+The [targeted V12 closure record](TARGETED-V12-CLOSURE.md) maps the focused security corrections to their tests and
+performance contracts.

@@ -149,15 +149,6 @@ impl Builder {
         self.max_len = len;
         self
     }
-
-    /// Previously attached a peer-address label to byte counters.
-    ///
-    /// This is a no-op: per-addr labels are never pruned by the Prometheus
-    /// exporter and grew without bound on public listeners.
-    #[allow(dead_code)]
-    pub fn with_metrics_addr_label(self, _metrics_addr_label: String) -> Self {
-        self
-    }
 }
 
 // ======== Encoding =========

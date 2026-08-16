@@ -250,11 +250,8 @@ fn verify_plan_against_graph<G: HeaderGraphView>(
             FinalitySource::FullState { .. } => metadata.mode == EngineMode::Integrated,
             FinalitySource::HeadersOnlyDepth { selected_tip } => {
                 metadata.mode == EngineMode::HeadersOnly
-                    && selected_tip
-                        .height
-                        .0
-                        .saturating_sub(record.current.height.0)
-                        == plan.limits.local_finality_depth.get()
+                    && record.headers_only_depth_witness(plan.limits.local_finality_depth.get())
+                        == Some(selected_tip)
                     && graph
                         .view_header_ancestor(selected_tip.hash, record.current.height)
                         .ok()
@@ -613,6 +610,39 @@ mod tests {
             assert_eq!(
                 graph_error_violation(error, &plan),
                 InvariantViolation::Index(fixture.anchor.hash)
+            );
+        }
+    }
+
+    #[test]
+    fn f_225520_live_headers_only_witness_must_descend_to_the_new_frontier() {
+        let fixture = fixture(EngineMode::HeadersOnly);
+        let mut overlay = GraphOverlay::new(fixture.engine.graph());
+        overlay
+            .advance_finalized_frontier(fixture.child)
+            .expect("the selected child is a valid finality candidate");
+        let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
+        plan.change_set.metadata.frontiers.finalized = fixture.child;
+        plan.change_set.metadata.frontiers.verified_best = fixture.child;
+        plan.change_set.metadata.finality_epoch = plan
+            .change_set
+            .metadata
+            .finality_epoch
+            .checked_next()
+            .expect("the fixture finality epoch can advance");
+        plan.change_set.finality_append = Some(crate::FinalityRecord {
+            previous: fixture.anchor,
+            current: fixture.child,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: Frontier::new(block::Height(1_001), hash(0x52)),
+            },
+            epoch: plan.change_set.metadata.finality_epoch,
+        });
+
+        for mode in [VerificationMode::Production, VerificationMode::Exhaustive] {
+            assert_eq!(
+                verify_plan_with_mode(&fixture.engine, &plan, mode),
+                Err(InvariantViolation::Protected(fixture.child.hash))
             );
         }
     }

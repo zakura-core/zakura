@@ -139,13 +139,25 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
     store.visit_finality_history(RowLimit::new(65_536), &mut |record| {
         history_count = history_count.saturating_add(1);
         first.get_or_insert(record);
+        let source_matches = source_matches_mode(&record, metadata, config);
         if previous.is_some_and(|previous: FinalityRecord| {
             previous.current != record.previous
                 || previous.epoch.get().checked_add(1) != Some(record.epoch.get())
                 || record.current.height <= record.previous.height
-        }) || !source_matches_mode(&record, metadata, config)
+        }) || !source_matches
         {
             invalid_history = true;
+        }
+        if source_matches {
+            if let Some(selected_tip) =
+                record.headers_only_depth_witness(config.limits.local_finality_depth.get())
+            {
+                if store.authenticated_canonical_hash(selected_tip.height)?
+                    != Some(selected_tip.hash)
+                {
+                    invalid_history = true;
+                }
+            }
         }
         previous = Some(record);
         last = Some(record);
@@ -239,14 +251,9 @@ fn source_matches_mode(
         (EngineMode::HeadersOnly, None, FinalitySource::MigratedHeadersOnly) => {
             record.epoch == crate::FinalityEpoch::new(0)
         }
-        (EngineMode::HeadersOnly, None, FinalitySource::HeadersOnlyDepth { selected_tip }) => {
-            record.current.height > record.previous.height
-                && selected_tip
-                    .height
-                    .0
-                    .saturating_sub(record.current.height.0)
-                    == config.limits.local_finality_depth.get()
-        }
+        (EngineMode::HeadersOnly, None, FinalitySource::HeadersOnlyDepth { .. }) => record
+            .headers_only_depth_witness(config.limits.local_finality_depth.get())
+            .is_some(),
         _ => false,
     }
 }

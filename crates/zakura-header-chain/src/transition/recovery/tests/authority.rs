@@ -12,13 +12,13 @@ use super::super::{
     audit_store, audit_store_at, AuditViolation, RecoveryFailure, RecoveryRepair,
     ValidationContextRecord,
 };
-use super::{fixture, injected_store_error, violations, AuditRead};
+use super::{fixture, injected_store_error, violations, AuditRead, AuditStore};
 use crate::{
     AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId, ChainScore,
-    CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState, EngineMode,
-    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, HeaderGeneration,
-    HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, SourceId, StoreError,
-    SuffixWork, WorkCoordinate,
+    CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState,
+    EngineConfig, EngineMode, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
+    HeaderGeneration, HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner,
+    SourceId, StoreError, SuffixWork, WorkCoordinate,
 };
 
 #[test]
@@ -618,6 +618,104 @@ fn bounded_finality_history_continues_from_an_authenticated_checkpoint() {
 
     store.canonical.remove(&anchor.height);
     assert!(violations(&store, &config).contains(&AuditViolation::Finality));
+}
+
+fn headers_only_depth_history_fixture() -> (AuditStore, EngineConfig, Frontier) {
+    let (mut store, mut config) = fixture();
+    let anchor_node = store.nodes[0].clone();
+    let child_node = store.nodes[1].clone();
+    let anchor = Frontier::new(anchor_node.height, anchor_node.hash);
+    let child = Frontier::new(child_node.height, child_node.hash);
+    let mut tip_header = *child_node.header;
+    tip_header.previous_block_hash = child.hash;
+    tip_header.time += Duration::seconds(1);
+    tip_header.nonce = [0x52; 32].into();
+    let tip_header = Arc::new(tip_header);
+    let tip_hash = tip_header.hash();
+    let tip_work = tip_header
+        .difficulty_threshold
+        .to_work()
+        .expect("the fixture tip target has work");
+    let tip = Frontier::new(
+        child
+            .height
+            .next()
+            .expect("the fixture child has a successor height"),
+        tip_hash,
+    );
+    let tip_node = HeaderNode::from_durable_parts(
+        tip_header,
+        tip.hash,
+        child.hash,
+        tip.height,
+        tip_work,
+        child_node
+            .work_coordinate()
+            .checked_add(tip_work)
+            .expect("the fixture tip work fits"),
+        HeaderValidationState::Valid,
+        EligibilityState::default(),
+        BodyValidationState::Unknown,
+        Vec::new(),
+    )
+    .expect("the fixture tip fields agree");
+
+    config.mode = EngineMode::HeadersOnly;
+    config.limits.local_finality_depth = std::num::NonZeroU32::new(1).expect("one is nonzero");
+    store.metadata.mode = EngineMode::HeadersOnly;
+    store.metadata.frontiers.finalized = child;
+    store.metadata.frontiers.header_best = tip;
+    store.metadata.frontiers.verified_best = child;
+    store.metadata.header_best_score =
+        ChainScore::new(SuffixWork::new(tip_work.as_u256()), tip.hash);
+    store.metadata.oldest_retained_height = child.height;
+    store.nodes = vec![child_node, tip_node];
+    store.children = vec![(child.hash, tip.hash)];
+    store.selected = vec![child, tip];
+    store.verified = vec![child];
+    store.contexts = vec![ValidationContextRecord {
+        header: anchor_node.header,
+        height: anchor.height,
+    }];
+    store.finality = vec![FinalityRecord {
+        previous: anchor,
+        current: child,
+        source: FinalitySource::HeadersOnlyDepth { selected_tip: tip },
+        epoch: FinalityEpoch::new(0),
+    }];
+    store.canonical.insert(tip.height, tip.hash);
+    store.snapshot = store.metadata.snapshot();
+    (store, config, tip)
+}
+
+#[test]
+fn f_225520_recovery_authenticates_headers_only_selected_tip_witness() {
+    use std::sync::atomic::Ordering;
+
+    let (store, config, _) = headers_only_depth_history_fixture();
+    audit_store(&store, &config).expect("the canonical selected-tip witness recovers");
+    assert_eq!(store.canonical_reads.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn f_225520_recovery_rejects_missing_or_forged_selected_tip_witness() {
+    let (base, config, tip) = headers_only_depth_history_fixture();
+
+    let mut missing = base.clone();
+    missing.canonical.remove(&tip.height);
+    assert!(violations(&missing, &config).contains(&AuditViolation::Finality));
+
+    let mut forged_index = base.clone();
+    forged_index
+        .canonical
+        .insert(tip.height, block::Hash([0x53; 32]));
+    assert!(violations(&forged_index, &config).contains(&AuditViolation::Finality));
+
+    let mut forged_record = base;
+    forged_record.finality[0].source = FinalitySource::HeadersOnlyDepth {
+        selected_tip: Frontier::new(tip.height, block::Hash([0x54; 32])),
+    };
+    assert!(violations(&forged_record, &config).contains(&AuditViolation::Finality));
 }
 
 #[test]

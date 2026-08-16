@@ -108,6 +108,126 @@ fn f_225512_startup_commits_deferred_reevaluation_before_publication() {
 }
 
 #[test]
+fn f_225520_rocksdb_recovery_rejects_a_forged_headers_only_witness() {
+    let db_config = Config::ephemeral();
+    let (mut engine_config, anchor, mut metadata) = fixture();
+    engine_config.mode = EngineMode::HeadersOnly;
+    engine_config.limits.local_finality_depth =
+        std::num::NonZeroU32::new(1).expect("one is nonzero");
+    metadata.mode = EngineMode::HeadersOnly;
+    let db = open(&db_config, &engine_config.network);
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the headers-only anchor initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("the initial headers-only store audits");
+    let before = runtime.publisher().snapshot();
+    let lease = runtime
+        .reader()
+        .validation_context(anchor.hash)
+        .expect("the anchor validation context is coherent")
+        .expect("the anchor is retained");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the authenticated network policy is valid");
+    let mut headers = Vec::new();
+    let mut parent = anchor.hash;
+    let mut parent_header = anchor.header;
+    for nonce in [0x61, 0x62] {
+        let mut header = *parent_header;
+        header.previous_block_hash = parent;
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[0] = nonce;
+        let header = Arc::new(header);
+        parent = header.hash();
+        parent_header = header.clone();
+        headers.push(header);
+    }
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&headers),
+        lease.parent(),
+        &rules,
+        &SystemClock,
+    )
+    .expect("the two-header branch prepares");
+    let selected_tip = Frontier::new(block::Height(2), headers[1].hash());
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner: header_owner(&before, selected_tip.hash, 0x61, 0x62),
+                    source: SourceId::from_digest([0x61; 32]),
+                    parent_hash: anchor.hash,
+                    target_tip_hash: selected_tip.hash,
+                    completion: TargetCompletion::TargetComplete {
+                        common_ancestor: Frontier::new(anchor.height, anchor.hash),
+                    },
+                    batch,
+                    aux: Vec::new(),
+                })),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: None,
+                retention_references: &[],
+            },
+        )
+        .expect("the headers-only finality transition commits");
+    let finalized = runtime.publisher().snapshot().frontiers.finalized;
+    assert_eq!(finalized.height, block::Height(1));
+
+    let mut canonical = DiskWriteBatch::new();
+    for frontier in [finalized, selected_tip] {
+        runtime
+            .store
+            .put_raw(
+                &mut canonical,
+                "zakura_header_hash_by_height",
+                HeaderHeightKey(frontier.height).as_bytes(),
+                frontier.hash.0,
+            )
+            .expect("the independent canonical witness row encodes");
+    }
+    db.write(canonical)
+        .expect("the independent canonical witness rows commit");
+    audit_store(&runtime.store, &engine_config)
+        .expect("the exact headers-only selected-tip witness recovers");
+
+    let mut forged = runtime
+        .store
+        .finality_history()
+        .expect("the finality history is readable")
+        .last()
+        .copied()
+        .expect("the depth transition appended a finality record");
+    forged.source = FinalitySource::HeadersOnlyDepth {
+        selected_tip: Frontier::new(selected_tip.height, block::Hash([0x63; 32])),
+    };
+    let mut corruption = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_value(
+            &mut corruption,
+            HEADER_FINALITY_HISTORY,
+            HeaderFinalityKey(forged.epoch).as_bytes(),
+            &forged,
+        )
+        .expect("the forged finality row encodes");
+    db.write(corruption)
+        .expect("the forged finality row reaches RocksDB");
+    drop(runtime);
+
+    assert!(matches!(
+        HeaderChainStore::new(db).startup(&engine_config),
+        Err(HeaderChainStoreError::Recovery(RecoveryFailure::Source { violations }))
+            if violations.contains(&zakura_header_chain::AuditViolation::Finality)
+    ));
+}
+
+#[test]
 fn rocksdb_snapshot_stops_at_the_first_extra_row_without_decoding() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();

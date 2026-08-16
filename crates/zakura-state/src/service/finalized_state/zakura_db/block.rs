@@ -396,7 +396,7 @@ impl ZakuraDb {
     /// are missing because they have been pruned.
     #[cfg(feature = "indexer")]
     #[allow(clippy::unwrap_in_result)]
-    pub fn raw_block_bytes(&self, hash_or_height: HashOrHeight) -> Option<Vec<u8>> {
+    pub(crate) fn raw_block_bytes(&self, hash_or_height: HashOrHeight) -> Option<Vec<u8>> {
         let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
 
         let tx_count = CompactSizeMessage::try_from(raw_txs.len())

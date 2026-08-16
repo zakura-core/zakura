@@ -91,8 +91,13 @@ pub fn wait_for_state_version_upgrade<T>(
     );
 
     if state_version_message.contains("launching upgrade task") {
+        // Upgrade log fields contain the numeric format version, without the
+        // feature build metadata used by indexer binaries.
+        let mut logged_version = required_version.clone();
+        logged_version.build = semver::BuildMetadata::EMPTY;
         let upgrade_pattern = format!(
-            "marked database format as upgraded.*format_upgrade_version.*=.*{required_version}"
+            "marked database format as upgraded.*format_upgrade_version.*=.*{}",
+            regex::escape(&logged_version.to_string())
         );
         let extra_required_log_regexes = extra_required_log_regexes.into_iter();
         let required_logs: Vec<String> = iter::once(upgrade_pattern)

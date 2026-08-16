@@ -9,7 +9,7 @@
 //! [`crate::constants::state_database_format_version_in_code()`] must be incremented
 //! each time the database format (column, serialization, etc) changes.
 
-use std::{path::Path, sync::Arc};
+use std::{cmp::Ordering, path::Path, sync::Arc};
 
 use crossbeam_channel::bounded;
 use semver::Version;
@@ -425,7 +425,8 @@ impl ZakuraDb {
 
                 // We block here because the checks are quick and database validity is
                 // consensus-critical.
-                if disk_version >= self.db.format_version_in_code() {
+                if disk_version.cmp_precedence(&self.db.format_version_in_code()) != Ordering::Less
+                {
                     DbFormatChange::check_new_blocks(self)
                         .run_format_change_or_check(
                             self,

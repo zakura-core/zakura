@@ -873,7 +873,20 @@ impl DbFormatChange {
              running: {running_version}"
         );
 
-        db.update_format_version_on_disk(format_upgrade_version)
+        // Preserve the indexer marker while a non-indexer build applies numeric
+        // upgrades. The cleanup below uses it to remove indexer-only data.
+        #[cfg(feature = "indexer")]
+        let version_to_write = format_upgrade_version;
+        #[cfg(not(feature = "indexer"))]
+        let version_to_write = {
+            let mut version = format_upgrade_version.clone();
+            if version.build.is_empty() && disk_version.build.contains("indexer") {
+                version.build = disk_version.build.clone();
+            }
+            version
+        };
+
+        db.update_format_version_on_disk(&version_to_write)
             .expect("unable to write database format version file to disk");
 
         info!(
@@ -881,7 +894,7 @@ impl DbFormatChange {
             %disk_version,
             // wait_for_state_version_upgrade() needs this to be the last field,
             // so the regex matches correctly
-            %format_upgrade_version,
+            format_upgrade_version = %version_to_write,
             "marked database format as upgraded"
         );
     }

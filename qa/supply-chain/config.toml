@@ -285,6 +285,12 @@ version = "0.2.31"
 criteria = "safe-to-deploy"
 notes = "Audit held: timestamp parsing rounds arbitrary fractional precision to nanoseconds before calling Timestamp::__new_unchecked. timestamp!(0.9999999999) reproducibly produces 1_000_000_000 nanoseconds and fails the ranged-integer invariant during compilation instead of yielding a valid value or a normal macro diagnostic. Retain the exemption pending explicit carry or truncation handling."
 
+[[exemptions.vergen-gitcl]]
+version = "9.1.0"
+criteria = "safe-to-deploy"
+suggest = false
+notes = "Audit deferred in #691: the crate executes the shell and Git selected from the ambient build environment, and Git operations can invoke configured helpers such as core.fsmonitor. PR #619 keeps a fixed describe pattern and writes Git errors to stderr rather than Cargo directives, but that does not remove the broader SHELL, PATH, and Git-configuration authority. Retain this exemption until #691 chooses and verifies a constrained CLI backend, a patched git2 backend, or a reasonably auditable gix backend."
+
 [[exemptions.vergen-lib]]
 version = "9.1.0"
 criteria = "safe-to-deploy"

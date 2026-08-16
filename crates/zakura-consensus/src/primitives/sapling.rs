@@ -23,19 +23,15 @@ use zcash_protocol::value::ZatBalance;
 
 use crate::{error::TransactionError, BoxError};
 
-use super::cache::{CacheKey, CacheMetrics, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
+use super::cache::{CacheKey, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
 
 #[cfg(test)]
 mod tests;
 
-/// The metric names the Sapling cache reports under.
-const CACHE_METRICS: CacheMetrics = CacheMetrics {
-    hit: "zakura.consensus.sapling.cache.hit",
-    miss: "zakura.consensus.sapling.cache.miss",
-    insert: "zakura.consensus.sapling.cache.insert",
-    evict: "zakura.consensus.sapling.cache.evict",
-    size: "zakura.consensus.sapling.cache.size",
-};
+/// The `verifier` label the Sapling cache reports its metrics under.
+///
+/// It matches the label this verifier's batch duration metric already uses.
+const CACHE_VERIFIER_LABEL: &str = "groth16_sapling";
 
 /// Sapling prover containing spend and output params for the Sapling circuit.
 ///
@@ -291,8 +287,13 @@ type VerifierService = Cached<BatchFallbackService>;
 /// gossiped into the mempool does not have to be verified again when the block that mines it
 /// arrives. One cache covers all of Sapling: its spend and output verifying keys have never
 /// changed, so unlike Orchard there are no circuit eras to keep apart.
-pub static VERIFIER: Lazy<VerifierService> =
-    Lazy::new(|| Cached::new(batch_fallback_verifier(), CACHE_CAPACITY, CACHE_METRICS));
+pub static VERIFIER: Lazy<VerifierService> = Lazy::new(|| {
+    Cached::new(
+        batch_fallback_verifier(),
+        CACHE_CAPACITY,
+        CACHE_VERIFIER_LABEL,
+    )
+});
 
 /// Builds the uncached batching-and-fallback stack.
 fn batch_fallback_verifier() -> BatchFallbackService {

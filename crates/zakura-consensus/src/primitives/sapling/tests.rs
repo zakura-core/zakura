@@ -32,19 +32,13 @@ use zakura_chain::{
 
 use crate::BoxError;
 
-use super::{sapling_prover, CacheKey, CacheMetrics, Cached, CachedItem, Item};
+use super::{sapling_prover, CacheKey, Cached, CachedItem, Item};
 
-/// The metric names the test caches report under.
+/// The `verifier` label the test caches report their metrics under.
 ///
-/// Test caches use their own names so their counts never land in the metrics the production
+/// Test caches use their own label so their counts never land in the series the production
 /// verifier reports.
-const TEST_CACHE_METRICS: CacheMetrics = CacheMetrics {
-    hit: "zakura.consensus.sapling.test_cache.hit",
-    miss: "zakura.consensus.sapling.test_cache.miss",
-    insert: "zakura.consensus.sapling.test_cache.insert",
-    evict: "zakura.consensus.sapling.test_cache.evict",
-    size: "zakura.consensus.sapling.test_cache.size",
-};
+const TEST_CACHE_VERIFIER_LABEL: &str = "groth16_sapling_test";
 
 #[test]
 fn sapling_prover_is_reused() {
@@ -425,7 +419,7 @@ impl Service<Item> for CountingVerifier {
 async fn cache_skips_the_inner_service_for_an_already_verified_bundle() {
     let tx = sapling_transaction();
     let inner = CountingVerifier::new(true);
-    let mut verifier = Cached::new(inner.clone(), 8, TEST_CACHE_METRICS);
+    let mut verifier = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
 
     for _ in 0..3 {
         verifier
@@ -448,7 +442,7 @@ async fn cache_skips_the_inner_service_for_an_already_verified_bundle() {
 async fn cache_does_not_reuse_a_result_across_bundles() {
     let transactions = sapling_transactions();
     let inner = CountingVerifier::new(true);
-    let mut verifier = Cached::new(inner.clone(), 8, TEST_CACHE_METRICS);
+    let mut verifier = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
 
     for tx in transactions.iter().take(2) {
         verifier
@@ -476,7 +470,7 @@ async fn cache_does_not_reuse_a_result_across_bundles() {
 async fn cache_does_not_remember_failures() {
     let tx = sapling_transaction();
     let inner = CountingVerifier::new(false);
-    let mut verifier = Cached::new(inner.clone(), 8, TEST_CACHE_METRICS);
+    let mut verifier = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
 
     for _ in 0..3 {
         verifier
@@ -540,7 +534,7 @@ async fn cache_hit_survives_an_inner_service_that_never_becomes_ready() {
     let tx = sapling_transaction();
 
     let healthy = CountingVerifier::new(true);
-    let mut verifier = Cached::new(healthy.clone(), 8, TEST_CACHE_METRICS);
+    let mut verifier = Cached::new(healthy.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
     verifier
         .ready()
         .await
@@ -574,7 +568,7 @@ async fn cache_hit_survives_an_inner_service_that_never_becomes_ready() {
 async fn cache_miss_propagates_an_inner_readiness_failure() {
     let tx = sapling_transaction();
     let dead = UnreadyVerifier::new();
-    let mut verifier = Cached::new(dead.clone(), 8, TEST_CACHE_METRICS);
+    let mut verifier = Cached::new(dead.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
 
     verifier
         .ready()
@@ -612,7 +606,11 @@ async fn cache_miss_propagates_an_inner_readiness_failure() {
 /// fallback stack behind a fresh cache, so a test can prove what a cold cache does with real
 /// Sapling verification underneath.
 fn uncached_verification_behind_a_fresh_cache() -> Cached<super::BatchFallbackService> {
-    Cached::new(super::batch_fallback_verifier(), 8, TEST_CACHE_METRICS)
+    Cached::new(
+        super::batch_fallback_verifier(),
+        8,
+        TEST_CACHE_VERIFIER_LABEL,
+    )
 }
 
 /// The cache still rejects an invalid bundle after a valid one, with real verification underneath.

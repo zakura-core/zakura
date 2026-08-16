@@ -41,6 +41,28 @@ use crate::BoxError;
 /// tag use about 2 MB per cache before collection overhead.
 pub(super) const CACHE_CAPACITY: usize = 20_000;
 
+/// The label naming which verifier's cache a metric belongs to.
+///
+/// One cache instance per Orchard circuit era and one for Sapling all report under the same
+/// metric names, so every series carries this label. The values are the names those verifiers
+/// already use in their batch metrics and flush logs, so the two can be joined.
+const VERIFIER_LABEL: &str = "verifier";
+
+/// Counts verifications answered from a cache.
+const CACHE_HIT: &str = "zakura.consensus.cache.hit";
+
+/// Counts verifications that reached a cache's inner service.
+const CACHE_MISS: &str = "zakura.consensus.cache.miss";
+
+/// Counts keys recorded as verified.
+const CACHE_INSERT: &str = "zakura.consensus.cache.insert";
+
+/// Counts keys dropped to stay within a cache's capacity.
+const CACHE_EVICT: &str = "zakura.consensus.cache.evict";
+
+/// Reports how many keys a cache currently remembers.
+const CACHE_SIZE: &str = "zakura.consensus.cache.size";
+
 /// The shielded bundle slot a cache entry was verified for.
 ///
 /// One v6 transaction has an Orchard bundle, an Ironwood bundle and a Sapling bundle, all under
@@ -125,28 +147,6 @@ pub(super) trait CachedItem {
     fn cache_key(&self) -> Option<CacheKey>;
 }
 
-/// The metric names one cache reports under.
-///
-/// Each verifier keeps its own names rather than sharing one name with a `verifier` label,
-/// because the Halo2 names are already released.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct CacheMetrics {
-    /// Counts verifications answered from the cache.
-    pub(super) hit: &'static str,
-
-    /// Counts verifications that reached the inner service.
-    pub(super) miss: &'static str,
-
-    /// Counts keys recorded as verified.
-    pub(super) insert: &'static str,
-
-    /// Counts keys dropped to stay within the capacity.
-    pub(super) evict: &'static str,
-
-    /// Reports how many keys are currently remembered.
-    pub(super) size: &'static str,
-}
-
 #[cfg(test)]
 mod tests;
 
@@ -166,18 +166,18 @@ struct VerifiedProofs {
     /// The maximum number of keys to retain.
     capacity: usize,
 
-    /// The metric names this cache reports under.
-    metrics: CacheMetrics,
+    /// The `verifier` label this cache reports its metrics under.
+    verifier: &'static str,
 }
 
 impl VerifiedProofs {
     /// Creates an empty cache that retains at most `capacity` keys.
-    fn new(capacity: usize, metrics: CacheMetrics) -> Self {
+    fn new(capacity: usize, verifier: &'static str) -> Self {
         Self {
             keys: HashSet::with_capacity(capacity),
             insertion_order: VecDeque::with_capacity(capacity),
             capacity,
-            metrics,
+            verifier,
         }
     }
 
@@ -195,7 +195,7 @@ impl VerifiedProofs {
         }
 
         self.insertion_order.push_back(key);
-        metrics::counter!(self.metrics.insert).increment(1);
+        metrics::counter!(CACHE_INSERT, VERIFIER_LABEL => self.verifier).increment(1);
 
         while self.insertion_order.len() > self.capacity {
             let evicted = self
@@ -203,11 +203,11 @@ impl VerifiedProofs {
                 .pop_front()
                 .expect("queue is longer than the capacity, which is at least one");
             self.keys.remove(&evicted);
-            metrics::counter!(self.metrics.evict).increment(1);
+            metrics::counter!(CACHE_EVICT, VERIFIER_LABEL => self.verifier).increment(1);
         }
 
         // Cast is safe: the length is bounded by `capacity`, far below f64's exact integer range.
-        metrics::gauge!(self.metrics.size).set(self.keys.len() as f64);
+        metrics::gauge!(CACHE_SIZE, VERIFIER_LABEL => self.verifier).set(self.keys.len() as f64);
     }
 }
 
@@ -225,8 +225,8 @@ pub struct Cached<S> {
     /// The keys of items that have already verified under this cache's verifying key.
     verified: Arc<Mutex<VerifiedProofs>>,
 
-    /// The metric names this cache reports under.
-    metrics: CacheMetrics,
+    /// The `verifier` label this cache reports its metrics under.
+    verifier: &'static str,
 
     /// The keys of the items that reached the inner service, in call order.
     ///
@@ -240,7 +240,7 @@ impl<S: Clone> Clone for Cached<S> {
         Self {
             inner: self.inner.clone(),
             verified: self.verified.clone(),
-            metrics: self.metrics,
+            verifier: self.verifier,
             #[cfg(test)]
             inner_calls: self.inner_calls.clone(),
         }
@@ -249,12 +249,12 @@ impl<S: Clone> Clone for Cached<S> {
 
 impl<S> Cached<S> {
     /// Wraps `inner` in a cache that retains at most `capacity` verified-bundle keys and reports
-    /// under `metrics`.
-    pub(super) fn new(inner: S, capacity: usize, metrics: CacheMetrics) -> Self {
+    /// its metrics under the `verifier` label.
+    pub(super) fn new(inner: S, capacity: usize, verifier: &'static str) -> Self {
         Self {
             inner,
-            verified: Arc::new(Mutex::new(VerifiedProofs::new(capacity, metrics))),
-            metrics,
+            verified: Arc::new(Mutex::new(VerifiedProofs::new(capacity, verifier))),
+            verifier,
             #[cfg(test)]
             inner_calls: Arc::new(Mutex::new(Vec::new())),
         }
@@ -297,7 +297,7 @@ impl<S> Cached<S> {
         Cached {
             inner,
             verified: self.verified.clone(),
-            metrics: self.metrics,
+            verifier: self.verifier,
             inner_calls: self.inner_calls.clone(),
         }
     }
@@ -345,12 +345,12 @@ where
                 .expect("verified proof cache mutex should not be poisoned")
                 .contains(&key)
             {
-                metrics::counter!(self.metrics.hit).increment(1);
+                metrics::counter!(CACHE_HIT, VERIFIER_LABEL => self.verifier).increment(1);
                 return future::ready(Ok(())).boxed();
             }
         }
 
-        metrics::counter!(self.metrics.miss).increment(1);
+        metrics::counter!(CACHE_MISS, VERIFIER_LABEL => self.verifier).increment(1);
 
         let verified = self.verified.clone();
         let mut inner = self.inner.clone();

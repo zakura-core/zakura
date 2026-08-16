@@ -34,7 +34,7 @@ use super::spawn_fifo;
 #[cfg(test)]
 mod tests;
 
-use super::cache::{CacheKey, CacheMetrics, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
+use super::cache::{CacheKey, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
 
 /// Adjusted batch size for halo2 batches.
 ///
@@ -45,18 +45,6 @@ use super::cache::{CacheKey, CacheMetrics, Cached, CachedItem, ShieldedPool, CAC
 /// To compensate for larger proofs, we process the batch once there are over
 /// [`HALO2_MAX_BATCH_SIZE`] total actions among pending items in the queue.
 const HALO2_MAX_BATCH_SIZE: usize = super::MAX_BATCH_SIZE;
-
-/// The metric names each Orchard circuit era's cache reports under.
-///
-/// The three eras share one set of names, so the counters report the Halo2
-/// cache as a whole.
-const CACHE_METRICS: CacheMetrics = CacheMetrics {
-    hit: "zakura.consensus.halo2.cache.hit",
-    miss: "zakura.consensus.halo2.cache.miss",
-    insert: "zakura.consensus.halo2.cache.insert",
-    evict: "zakura.consensus.halo2.cache.evict",
-    size: "zakura.consensus.halo2.cache.size",
-};
 
 /// The type of verification results.
 type VerifyResult = bool;
@@ -314,9 +302,10 @@ type VerifierService = Cached<BatchFallbackService>;
 /// The stack is wrapped in a [`Cached`] so that a proof gossiped into the mempool does not have
 /// to be verified again when the block that mines it arrives. Because each era builds its own
 /// verifier here, each era also gets its own cache, which is what binds a remembered result to the
-/// `vk` it was produced under.
-fn batch_verifier(vk: &'static ItemVerifyingKey) -> VerifierService {
-    Cached::new(batch_fallback_verifier(vk), CACHE_CAPACITY, CACHE_METRICS)
+/// `vk` it was produced under. `verifier` is the era's `verifier` metrics label, so each era's
+/// cache reports its own hit rate.
+fn batch_verifier(vk: &'static ItemVerifyingKey, verifier: &'static str) -> VerifierService {
+    Cached::new(batch_fallback_verifier(vk), CACHE_CAPACITY, verifier)
 }
 
 /// Builds the uncached batching-and-fallback stack for `vk`.
@@ -341,7 +330,7 @@ fn batch_fallback_verifier(vk: &'static ItemVerifyingKey) -> BatchFallbackServic
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
 pub static VERIFIER_PRE_NU6_2: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_PRE_NU6_2));
+    Lazy::new(|| batch_verifier(&VERIFYING_KEY_PRE_NU6_2, "halo2_pre_nu6_2"));
 
 /// Global batch verification context for **NU6.2-until-NU6.3** Halo2 Action proofs.
 ///
@@ -352,7 +341,7 @@ pub static VERIFIER_PRE_NU6_2: Lazy<VerifierService> =
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
 pub static VERIFIER_NU6_2: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_2));
+    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_2, "halo2_nu6_2"));
 
 /// Global batch verification context for **NU6.3-onward** Halo2 Action proofs.
 ///
@@ -365,7 +354,7 @@ pub static VERIFIER_NU6_2: Lazy<VerifierService> =
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
 pub static VERIFIER_NU6_3_ONWARD: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_3_ONWARD));
+    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_3_ONWARD, "halo2_nu6_3_onward"));
 
 /// Selects the lazily initialized Halo2 verifier for `network_upgrade`.
 ///

@@ -96,6 +96,9 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
             mark_metadata_as_v1(&metadata),
         )
         .expect("the version-one metadata stages");
+    store
+        .delete_raw(&mut batch, HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
+        .expect("the version-one fixture omits the current tombstone count");
     store.db.write(batch).expect("the legacy fixture commits");
 
     assert!(store
@@ -116,6 +119,12 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
             .expect("the fixture state version can advance")
     );
     assert_eq!(migrated_metadata.last_transition, None);
+    assert_eq!(
+        store
+            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
+            .expect("the migrated tombstone count is readable"),
+        Some(HeaderRowCountDisk(0))
+    );
     assert_eq!(
         store
             .load_aux_deliveries()

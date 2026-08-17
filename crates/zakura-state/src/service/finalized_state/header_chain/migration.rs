@@ -19,7 +19,7 @@ use crate::service::finalized_state::{
         header_chain::HeaderAuxDeliveryKey,
         header_chain_values::{
             decode_v1_aux_delivery, decode_v1_engine_metadata, HeaderChainValueError,
-            HeaderValidationContextDisk,
+            HeaderRowCountDisk, HeaderValidationContextDisk,
         },
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
@@ -29,7 +29,8 @@ use crate::service::finalized_state::{
         },
         ZakuraDb,
     },
-    DiskWriteBatch, HEADER_AUX_DELIVERY, HEADER_ENGINE_META, HEADER_VALIDATION_CONTEXT,
+    DiskWriteBatch, HEADER_AUX_DELIVERY, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+    HEADER_ENGINE_META, HEADER_VALIDATION_CONTEXT,
 };
 
 impl HeaderChainStore {
@@ -98,6 +99,34 @@ impl HeaderChainStore {
         metadata.disk_format = HeaderChainDiskVersion::CURRENT;
         metadata.state_version = metadata.state_version.checked_next()?;
         metadata.last_transition = None;
+        let tombstone_cf = self.cf(HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE)?;
+        let mut tombstone_rows = 0;
+        self.db
+            .raw_visit_cf(&tombstone_cf, &mut |_, _| {
+                if tombstone_rows == super::TOMBSTONE_LIMIT {
+                    return Err(HeaderChainStoreError::Store(
+                        zakura_header_chain::StoreError::LimitExceeded {
+                            collection:
+                                zakura_header_chain::StoreCollection::ConsensusInvalidBodyTombstones,
+                            limit: zakura_header_chain::RowLimit::new(super::TOMBSTONE_LIMIT),
+                        },
+                    ));
+                }
+                tombstone_rows += 1;
+                Ok(())
+            })
+            .map_err(|error| match error {
+                RawVisitError::RocksDb(error) => HeaderChainStoreError::RocksDb(error),
+                RawVisitError::Visitor(error) => error,
+            })?;
+        self.put_value(
+            &mut batch,
+            HEADER_ENGINE_META,
+            super::TOMBSTONE_COUNT_KEY,
+            &HeaderRowCountDisk(u64::try_from(tombstone_rows).map_err(|_| {
+                HeaderChainStoreError::Incoherent("tombstone count does not fit u64")
+            })?),
+        )?;
         self.put_value(
             &mut batch,
             HEADER_ENGINE_META,
@@ -107,6 +136,7 @@ impl HeaderChainStore {
         self.db.write(batch)?;
         tracing::info!(
             auxiliary_rows = rows,
+            tombstone_rows,
             from_version = 1,
             to_version = HeaderChainDiskVersion::CURRENT.0,
             "migrated the durable header-chain format"

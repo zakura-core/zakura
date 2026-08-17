@@ -1243,15 +1243,26 @@ impl ReadStateService {
         read::best_tip(&self.latest_non_finalized_state(), &self.db)
     }
 
-    /// Returns the embedded subtree artifact only when it describes this database's fast-sync
-    /// last checkpoint.
+    /// Returns the embedded subtree artifact and this database's fast-sync marker when the
+    /// artifact can fill the skip band that marker describes.
+    ///
+    /// The marker is the height this database originally fast-synced to; it does not move when
+    /// later releases raise the last checkpoint. A newer artifact is still eligible because it is
+    /// append-only and therefore still contains every root skipped at that marker. An older
+    /// artifact is not, because it cannot cover the extra skipped indexes.
+    ///
+    /// Serving clips published records to the marker, so the extra suffix of a newer artifact
+    /// never answers for heights this node synced itself.
     ///
     /// This check is made when serving rather than at construction because the durable last
     /// checkpoint marker can be written after the read service starts.
-    fn historical_subtrees_at_last_checkpoint(&self) -> Option<&finalized_state::SubtreeArtifact> {
+    fn historical_subtrees_at_last_checkpoint(
+        &self,
+    ) -> Option<(&finalized_state::SubtreeArtifact, block::Height)> {
         let artifact = self.historical_subtrees.as_deref()?;
+        let vct_applied_below = self.db.vct_synced_below()?;
 
-        (self.db.vct_synced_below() == Some(artifact.last_checkpoint)).then_some(artifact)
+        (artifact.last_checkpoint >= vct_applied_below).then_some((artifact, vct_applied_below))
     }
 
     /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.
@@ -2491,7 +2502,7 @@ impl Service<ReadRequest> for ReadStateService {
                         state
                             .historical_subtrees_at_last_checkpoint()
                             .zip(verified_tip)
-                            .map(|(artifact, verified_tip)| {
+                            .map(|((artifact, vct_applied_below), verified_tip)| {
                                 let range = range_for(start_index, end_index);
                                 let mut merged =
                                     read::sapling_subtrees_with_gaps(best_chain, &state.db, range);
@@ -2499,6 +2510,7 @@ impl Service<ReadRequest> for ReadStateService {
                                     &mut merged,
                                     artifact.sapling_range(range),
                                     verified_tip,
+                                    vct_applied_below,
                                 );
                                 merged
                             })
@@ -2540,7 +2552,7 @@ impl Service<ReadRequest> for ReadStateService {
                         state
                             .historical_subtrees_at_last_checkpoint()
                             .zip(verified_tip)
-                            .map(|(artifact, verified_tip)| {
+                            .map(|((artifact, vct_applied_below), verified_tip)| {
                                 let range = range_for(start_index, end_index);
                                 let mut merged =
                                     read::orchard_subtrees_with_gaps(best_chain, &state.db, range);
@@ -2548,6 +2560,7 @@ impl Service<ReadRequest> for ReadStateService {
                                     &mut merged,
                                     artifact.orchard_range(range),
                                     verified_tip,
+                                    vct_applied_below,
                                 );
                                 merged
                             })
@@ -2585,7 +2598,7 @@ impl Service<ReadRequest> for ReadStateService {
                         state
                             .historical_subtrees_at_last_checkpoint()
                             .zip(verified_tip)
-                            .map(|(artifact, verified_tip)| {
+                            .map(|((artifact, vct_applied_below), verified_tip)| {
                                 let range = range_for(start_index, end_index);
                                 let mut merged =
                                     read::ironwood_subtrees_with_gaps(best_chain, &state.db, range);
@@ -2593,6 +2606,7 @@ impl Service<ReadRequest> for ReadStateService {
                                     &mut merged,
                                     artifact.ironwood_range(range),
                                     verified_tip,
+                                    vct_applied_below,
                                 );
                                 merged
                             })

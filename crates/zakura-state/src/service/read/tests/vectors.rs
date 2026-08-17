@@ -6,7 +6,7 @@ use tower::ServiceExt;
 use zakura_chain::{
     block::{Block, Height},
     ironwood, orchard,
-    parameters::Network::*,
+    parameters::{Network, Network::*},
     serialization::ZcashDeserializeInto,
     subtree::{
         NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex,
@@ -1134,6 +1134,7 @@ fn published_subtree_merge_includes_non_finalized_rows() {
             (NoteCommitmentSubtreeIndex(1), node(3)),
         ],
         Height(11),
+        Height(11),
     );
     let served = contiguous_subtrees_from(merged, NoteCommitmentSubtreeIndex(0));
 
@@ -1173,6 +1174,7 @@ fn published_subtrees_never_displace_the_nodes_own_rows() {
             (NoteCommitmentSubtreeIndex(2), node(3)),
         ],
         Height(11),
+        Height(11),
     );
 
     assert_eq!(
@@ -1207,6 +1209,7 @@ fn published_subtrees_are_bounded_by_the_verified_tip() {
             (NoteCommitmentSubtreeIndex(2), node(11)),
         ],
         Height(10),
+        Height(100),
     );
 
     assert_eq!(
@@ -1216,12 +1219,54 @@ fn published_subtrees_are_bounded_by_the_verified_tip() {
     );
 }
 
-/// The embedded artifact is authoritative only for a database fast-synced to its checkpoint.
+/// A newer artifact may fill history skipped at an older fast-sync marker, but not heights the
+/// node synced itself.
+#[test]
+fn newer_artifact_fills_only_the_skipped_band() {
+    let node = |height: u32, root: u8| {
+        NoteCommitmentSubtreeData::new(
+            Height(height),
+            sapling_crypto::Node::from_bytes([root; 32]).unwrap(),
+        )
+    };
+    let mut stored = std::collections::BTreeMap::new();
+    stored.insert(NoteCommitmentSubtreeIndex(1), node(12, 2));
+
+    merge_published_subtrees(
+        &mut stored,
+        [
+            (NoteCommitmentSubtreeIndex(0), node(5, 1)),
+            (NoteCommitmentSubtreeIndex(1), node(12, 9)),
+            (NoteCommitmentSubtreeIndex(2), node(18, 3)),
+        ],
+        Height(20),
+        Height(10),
+    );
+
+    assert_eq!(
+        stored[&NoteCommitmentSubtreeIndex(0)].root,
+        node(5, 1).root,
+        "the H1 skip band comes from the newer H2 artifact"
+    );
+    assert_eq!(
+        stored[&NoteCommitmentSubtreeIndex(1)].root,
+        node(12, 2).root,
+        "a local row after H1 wins over the H2 artifact"
+    );
+    assert!(
+        !stored.contains_key(&NoteCommitmentSubtreeIndex(2)),
+        "a post-H1 hole is not filled from the H2 artifact"
+    );
+    assert_eq!(stored.len(), 2);
+}
+
+/// The embedded artifact may fill this database's skip band when it is at least as new as the
+/// durable fast-sync marker.
 #[tokio::test]
-async fn historical_subtrees_require_the_matching_fast_sync_last_checkpoint() {
+async fn historical_subtrees_accept_a_newer_artifact_for_an_older_fast_sync_marker() {
     let _init_guard = zakura_test::init();
     let (_state, mut read_state, _latest_chain_tip, _chain_tip_change) =
-        init_test_services(&Mainnet).await;
+        init_test_services(&Network::new_default_testnet()).await;
     let artifact_checkpoint = Height(10);
 
     read_state.historical_subtrees = Some(Arc::new(SubtreeArtifact {
@@ -1237,16 +1282,16 @@ async fn historical_subtrees_require_the_matching_fast_sync_last_checkpoint() {
     );
 
     let mut batch = DiskWriteBatch::new();
-    batch.update_vct_sync_marker(&read_state.db, Height(9));
+    batch.update_vct_sync_marker(&read_state.db, Height(11));
     read_state
         .db
         .write_batch(batch)
-        .expect("seeding a mismatched last checkpoint succeeds");
+        .expect("seeding a newer last checkpoint succeeds");
     assert!(
         read_state
             .historical_subtrees_at_last_checkpoint()
             .is_none(),
-        "a different fast-sync last checkpoint must not use the artifact"
+        "an older artifact cannot cover a newer skip band"
     );
 
     let mut batch = DiskWriteBatch::new();
@@ -1255,10 +1300,118 @@ async fn historical_subtrees_require_the_matching_fast_sync_last_checkpoint() {
         .db
         .write_batch(batch)
         .expect("seeding the matching last checkpoint succeeds");
-    assert!(
+    assert_eq!(
         read_state
             .historical_subtrees_at_last_checkpoint()
-            .is_some(),
+            .map(|(_, vct_applied_below)| vct_applied_below),
+        Some(artifact_checkpoint),
         "the artifact is eligible once its checkpoint matches the durable last checkpoint"
     );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, Height(9));
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding an older last checkpoint succeeds");
+    assert_eq!(
+        read_state
+            .historical_subtrees_at_last_checkpoint()
+            .map(|(_, vct_applied_below)| vct_applied_below),
+        Some(Height(9)),
+        "a newer artifact may fill the skip band of an older fast-sync marker"
+    );
+}
+
+/// An H1-fast-synced database may use a newer H2 artifact only for history skipped at H1.
+#[tokio::test]
+async fn older_fast_sync_marker_uses_newer_artifact_only_for_skipped_history() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_TESTNET_BLOCKS
+        .values()
+        .take(5)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, mut read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Network::new_default_testnet()).await;
+
+    let vct_applied_below = Height(2);
+    let artifact_checkpoint = Height(10);
+    let skipped_root = sapling_crypto::Node::from_bytes([1; 32]).unwrap();
+    let local_root = sapling_crypto::Node::from_bytes([2; 32]).unwrap();
+    let post_handoff_root = sapling_crypto::Node::from_bytes([3; 32]).unwrap();
+
+    read_state.historical_subtrees = Some(Arc::new(SubtreeArtifact {
+        last_checkpoint: artifact_checkpoint,
+        sapling: vec![
+            SubtreeRecord {
+                index: NoteCommitmentSubtreeIndex(0),
+                end_height: Height(1),
+                root: skipped_root.to_bytes(),
+            },
+            SubtreeRecord {
+                index: NoteCommitmentSubtreeIndex(1),
+                end_height: Height(3),
+                root: post_handoff_root.to_bytes(),
+            },
+            SubtreeRecord {
+                index: NoteCommitmentSubtreeIndex(2),
+                end_height: Height(3),
+                root: post_handoff_root.to_bytes(),
+            },
+        ],
+        ..SubtreeArtifact::default()
+    }));
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, vct_applied_below);
+    batch.insert_sapling_subtree(
+        &read_state.db,
+        &NoteCommitmentSubtree::new(1, Height(3), local_root),
+    );
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding an older marker and a post-handoff row succeeds");
+
+    let ReadResponse::SaplingSubtrees(served) = read_state
+        .clone()
+        .oneshot(ReadRequest::SaplingSubtrees {
+            start_index: NoteCommitmentSubtreeIndex(0),
+            limit: Some(NoteCommitmentSubtreeIndex(2)),
+        })
+        .await
+        .expect("the H1 skip band plus the local post-H1 row are servable")
+    else {
+        panic!("SaplingSubtrees must return SaplingSubtrees");
+    };
+
+    assert_eq!(
+        served[&NoteCommitmentSubtreeIndex(0)].root,
+        skipped_root,
+        "the H2 artifact fills history skipped at H1"
+    );
+    assert_eq!(
+        served[&NoteCommitmentSubtreeIndex(1)].root,
+        local_root,
+        "the node's own row after H1 wins over the H2 artifact"
+    );
+    assert_eq!(served.len(), 2);
+
+    let post_handoff = read_state
+        .oneshot(ReadRequest::SaplingSubtrees {
+            start_index: NoteCommitmentSubtreeIndex(2),
+            limit: Some(NoteCommitmentSubtreeIndex(1)),
+        })
+        .await;
+    match post_handoff {
+        Ok(ReadResponse::SaplingSubtrees(subtrees)) => {
+            assert!(
+                subtrees.is_empty(),
+                "a post-H1 hole must not be filled from the H2 artifact"
+            );
+        }
+        Err(_) => {}
+        Ok(other) => panic!("unexpected response for a post-H1 hole: {other:?}"),
+    }
 }

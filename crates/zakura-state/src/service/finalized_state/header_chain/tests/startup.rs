@@ -66,11 +66,14 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
         zakura_header_chain::BodySizeHint::Unknown,
         None,
     );
+    anchor.body_validation_state = BodyValidationState::Verified {
+        evidence: EvidenceId::from_digest([0x34; 32]),
+    };
     anchor.aux_delivery_ids.push(delivery.delivery_id);
     let db = open(&db_config, &engine_config.network);
     let store = HeaderChainStore::new(db.clone());
     store
-        .initialize(metadata.clone(), anchor)
+        .initialize(metadata.clone(), anchor.clone())
         .expect("the current fixture initializes");
 
     let delivery_key = HeaderAuxDeliveryKey {
@@ -96,6 +99,23 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
             mark_metadata_as_v1(&metadata),
         )
         .expect("the version-one metadata stages");
+    let authority_cf = store
+        .cf(HEADER_BODY_EVIDENCE_AUTHORITY)
+        .expect("the body-evidence authority column family exists");
+    let mut authority_value = store
+        .db
+        .raw_get_cf(&authority_cf, &anchor.hash.0)
+        .expect("the body-evidence authority is readable")
+        .expect("verified full state writes body-evidence authority");
+    authority_value[0] = 1;
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_BODY_EVIDENCE_AUTHORITY,
+            anchor.hash.0,
+            authority_value,
+        )
+        .expect("the version-one body-evidence authority stages");
     store
         .delete_raw(&mut batch, HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
         .expect("the version-one fixture omits the current tombstone count");
@@ -129,6 +149,20 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
     store
         .delete_raw(&mut interrupted, HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
         .expect("the interrupted migration omits the tombstone count");
+    let mut interrupted_authority = store
+        .db
+        .raw_get_cf(&authority_cf, &anchor.hash.0)
+        .expect("the migrated body-evidence authority is readable")
+        .expect("the migrated body-evidence authority exists");
+    interrupted_authority[0] = 1;
+    store
+        .put_raw(
+            &mut interrupted,
+            HEADER_BODY_EVIDENCE_AUTHORITY,
+            anchor.hash.0,
+            interrupted_authority,
+        )
+        .expect("the interrupted migration retains version-one body authority");
     store
         .db
         .write(interrupted)

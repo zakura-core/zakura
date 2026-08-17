@@ -427,6 +427,31 @@ impl FallibleDiskValue for ConsensusInvalidBodyTombstone {
     }
 }
 
+/// Decode a released version-one tombstone, supplying the height omitted by v1.
+pub(crate) fn decode_v1_consensus_invalid_body_tombstone(
+    bytes: &[u8],
+    header_height: block::Height,
+) -> Result<ConsensusInvalidBodyTombstone, HeaderChainValueError> {
+    let mut decoder = Decoder::new(bytes);
+    if decoder.u8()? != 1 {
+        return Err(HeaderChainValueError::UnknownDiscriminant {
+            field: "consensus_invalid_tombstone_version",
+            value: bytes.first().copied().unwrap_or_default(),
+        });
+    }
+    let hash = block::Hash(decoder.array()?);
+    let evidence = EvidenceId::from_digest(decoder.array()?);
+    let rule = std::str::from_utf8(decoder.bounded("consensus_invalid_rule", MAX_RULE_ID_BYTES)?)
+        .map_err(|_| HeaderChainValueError::RuleId)?;
+    decoder.finish()?;
+    Ok(ConsensusInvalidBodyTombstone {
+        hash,
+        height: header_height,
+        evidence,
+        rule: BodyRuleId::new(rule),
+    })
+}
+
 /// Durable full-state evidence authority for one retained body-validation projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FullStateBodyValidationEvidenceAuthorityDisk {
@@ -557,6 +582,47 @@ impl FallibleDiskValue for FullStateBodyValidationEvidenceAuthorityDisk {
         decoder.finish()?;
         Ok(authority)
     }
+}
+
+/// Decode released version-one full-state authority, supplying the height omitted by v1.
+pub(crate) fn decode_v1_full_state_body_validation_evidence_authority(
+    bytes: &[u8],
+    header_height: block::Height,
+) -> Result<FullStateBodyValidationEvidenceAuthorityDisk, HeaderChainValueError> {
+    let mut decoder = Decoder::new(bytes);
+    if decoder.u8()? != 1 {
+        return Err(HeaderChainValueError::UnknownDiscriminant {
+            field: "body_evidence_authority_version",
+            value: bytes.first().copied().unwrap_or_default(),
+        });
+    }
+    let kind = decoder.u8()?;
+    let hash = block::Hash(decoder.array()?);
+    let evidence = EvidenceId::from_digest(decoder.array()?);
+    let authority = match kind {
+        0 => FullStateBodyValidationEvidenceAuthorityDisk::Verified { hash, evidence },
+        1 => {
+            let rule =
+                std::str::from_utf8(decoder.bounded("body_evidence_rule", MAX_RULE_ID_BYTES)?)
+                    .map_err(|_| HeaderChainValueError::RuleId)?;
+            FullStateBodyValidationEvidenceAuthorityDisk::ConsensusInvalid(
+                ConsensusInvalidBodyTombstone {
+                    hash,
+                    height: header_height,
+                    evidence,
+                    rule: BodyRuleId::new(rule),
+                },
+            )
+        }
+        value => {
+            return Err(HeaderChainValueError::UnknownDiscriminant {
+                field: "body_evidence_authority_kind",
+                value,
+            })
+        }
+    };
+    decoder.finish()?;
+    Ok(authority)
 }
 
 fn get_frontier(decoder: &mut Decoder<'_>) -> Result<Frontier, HeaderChainValueError> {

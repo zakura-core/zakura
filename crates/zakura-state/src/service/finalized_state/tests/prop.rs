@@ -3002,7 +3002,10 @@ fn read_service_over(finalized_state: &FinalizedState) -> crate::ReadStateServic
             &finalized_state.network(),
             finalized_state.db.config(),
         )
-        .expect("the test historical frontier artifact loads"),
+        .and_then(|artifact| {
+            artifact.require_vct_handoff_coverage(finalized_state.db.config(), &finalized_state.db)
+        })
+        .expect("the test historical frontier artifact loads and covers the VCT handoff"),
     )
 }
 

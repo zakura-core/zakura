@@ -1514,6 +1514,9 @@ async fn raw_block_range_read_stops_at_pruned_gap_before_retained_bodies() {
             reader: header_chain_reader_receiver,
         },
         crate::service::load_historical_frontier_artifact(&state.network(), state.db.config())
+            .and_then(|artifact| {
+                artifact.require_vct_handoff_coverage(state.db.config(), &state.db)
+            })
             .expect("the default historical frontier configuration is valid"),
     );
 

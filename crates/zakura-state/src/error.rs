@@ -148,6 +148,21 @@ pub enum StateInitError {
         source: BoxError,
     },
 
+    /// The configured historical frontier artifact does not cover this database's absent band.
+    #[error(
+        "historical frontier artifact at {path:?} ends at {artifact_checkpoint:?}, below this \
+         database's VCT handoff {vct_handoff:?}; configure an artifact generated at or after the \
+         database handoff"
+    )]
+    HistoricalFrontierArtifactBeforeVctHandoff {
+        /// Artifact path that does not cover the absent band.
+        path: PathBuf,
+        /// Last checkpoint encoded in the artifact.
+        artifact_checkpoint: block::Height,
+        /// Durable VCT handoff recorded by this database.
+        vct_handoff: block::Height,
+    },
+
     /// State could not read or parse the on-disk semantic format version.
     #[error(
         "cannot read state database format version at {path:?}. Hint: check the cache directory permissions and version file contents"

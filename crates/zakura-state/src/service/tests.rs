@@ -24,7 +24,12 @@ use zakura_test::{prelude::*, transcript::Transcript};
 use crate::{
     arbitrary::Prepare,
     init_test,
-    service::{arbitrary::populated_state, chain_tip::TipAction, StateService},
+    service::{
+        arbitrary::populated_state,
+        chain_tip::TipAction,
+        finalized_state::{DiskWriteBatch, FinalizedState, FrontierArtifact, FrontierEntry},
+        StateService,
+    },
     tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
     BoxError, CheckpointVerifiedBlock, Config, Request, Response, SemanticallyVerifiedBlock,
     StateInitError, CHAIN_TIP_UPDATE_WAIT_LIMIT,
@@ -79,6 +84,74 @@ async fn historical_frontier_load_errors_are_returned_from_state_init() {
         super::init(corrupt_config, &network, Height::MAX, 0).await,
         Err(StateInitError::HistoricalFrontierArtifact { path, .. }) if path == corrupt_path
     ));
+}
+
+#[test]
+fn historical_frontier_artifact_must_cover_the_database_vct_handoff() {
+    let network = Network::Mainnet;
+    let temp_dir = tempfile::tempdir().expect("temporary directory is created");
+    let state_config = Config::ephemeral();
+    let finalized_state =
+        FinalizedState::new(&state_config, &network).expect("ephemeral finalized state opens");
+    let vct_handoff = Height(10);
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&finalized_state.db, vct_handoff);
+    finalized_state
+        .db
+        .write_batch(batch)
+        .expect("VCT handoff marker is written");
+
+    let artifact_path = |checkpoint: Height| {
+        let path = temp_dir
+            .path()
+            .join(format!("frontiers-{}.bin", checkpoint.0));
+        let artifact = FrontierArtifact {
+            spacing: 1,
+            last_checkpoint: checkpoint,
+            entries: vec![FrontierEntry {
+                height: checkpoint,
+                sapling: Arc::new(Default::default()),
+                orchard: Arc::new(Default::default()),
+                ironwood: Arc::new(Default::default()),
+            }],
+        };
+        std::fs::write(&path, artifact.encode(&network))
+            .expect("historical frontier artifact is written");
+        path
+    };
+
+    let stale_path = artifact_path(Height(9));
+    let stale_config = Config {
+        derive_historical_trees: true,
+        historical_frontier_artifact: Some(stale_path.clone()),
+        ..state_config.clone()
+    };
+    assert!(matches!(
+        super::load_historical_frontier_artifact(&network, &stale_config).and_then(|artifact| {
+            artifact.require_vct_handoff_coverage(&stale_config, &finalized_state.db)
+        }),
+        Err(StateInitError::HistoricalFrontierArtifactBeforeVctHandoff {
+            path,
+            artifact_checkpoint: Height(9),
+            vct_handoff: Height(10),
+        }) if path == stale_path
+    ));
+
+    for checkpoint in [vct_handoff, Height(11)] {
+        let config = Config {
+            derive_historical_trees: true,
+            historical_frontier_artifact: Some(artifact_path(checkpoint)),
+            ..state_config.clone()
+        };
+        assert!(
+            super::load_historical_frontier_artifact(&network, &config)
+                .and_then(|artifact| {
+                    artifact.require_vct_handoff_coverage(&config, &finalized_state.db)
+                })
+                .is_ok(),
+            "an artifact at or above the VCT handoff must cover the absent band"
+        );
+    }
 }
 
 #[test]

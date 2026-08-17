@@ -431,6 +431,9 @@ impl StateService {
             .expect("failed to join blocking task")
         };
 
+        let historical_trees =
+            historical_trees.require_vct_handoff_coverage(&config, &finalized_state.db)?;
+
         // # Correctness
         //
         // The state service must set the finalized block write sender to `None`
@@ -1960,6 +1963,39 @@ fn subtrees_with_published_fallback<Node, Error>(
     }
 }
 
+/// A decoded frontier artifact waiting for the database-dependent coverage check.
+struct LoadedHistoricalFrontierArtifact {
+    cache: Arc<Mutex<read::HistoricalTreeCache>>,
+    last_checkpoint: Option<block::Height>,
+}
+
+impl LoadedHistoricalFrontierArtifact {
+    fn require_vct_handoff_coverage(
+        self,
+        config: &Config,
+        db: &ZakuraDb,
+    ) -> Result<Arc<Mutex<read::HistoricalTreeCache>>, StateInitError> {
+        if config.derive_historical_trees {
+            if let Some((artifact_checkpoint, vct_handoff)) = self
+                .last_checkpoint
+                .zip(db.vct_synced_below())
+                .filter(|(artifact_checkpoint, vct_handoff)| artifact_checkpoint < vct_handoff)
+            {
+                return Err(StateInitError::HistoricalFrontierArtifactBeforeVctHandoff {
+                    path: config
+                        .historical_frontier_artifact
+                        .clone()
+                        .expect("a loaded artifact has a configured path"),
+                    artifact_checkpoint,
+                    vct_handoff,
+                });
+            }
+        }
+
+        Ok(self.cache)
+    }
+}
+
 /// Loads the configured frontier grid into a fresh derivation cache.
 ///
 /// When [`Config::derive_historical_trees`] is off, a missing, unreadable, or invalid artifact is
@@ -1970,13 +2006,16 @@ fn subtrees_with_published_fallback<Node, Error>(
 fn load_historical_frontier_artifact(
     network: &Network,
     config: &Config,
-) -> Result<Arc<Mutex<read::HistoricalTreeCache>>, StateInitError> {
+) -> Result<LoadedHistoricalFrontierArtifact, StateInitError> {
     let Some(path) = config.historical_frontier_artifact.as_ref() else {
         if config.derive_historical_trees {
             return Err(StateInitError::HistoricalFrontierArtifactRequired);
         }
 
-        return Ok(Arc::new(Mutex::new(read::HistoricalTreeCache::default())));
+        return Ok(LoadedHistoricalFrontierArtifact {
+            cache: Arc::new(Mutex::new(read::HistoricalTreeCache::default())),
+            last_checkpoint: None,
+        });
     };
 
     let artifact = std::fs::read(path)
@@ -1994,9 +2033,12 @@ fn load_historical_frontier_artifact(
                 spacing = artifact.spacing,
                 "loaded historical frontier artifact"
             );
-            Ok(Arc::new(Mutex::new(
-                read::HistoricalTreeCache::with_artifact(Arc::new(artifact)),
-            )))
+            Ok(LoadedHistoricalFrontierArtifact {
+                last_checkpoint: Some(artifact.last_checkpoint),
+                cache: Arc::new(Mutex::new(read::HistoricalTreeCache::with_artifact(
+                    Arc::new(artifact),
+                ))),
+            })
         }
         Err(source) if config.derive_historical_trees => {
             Err(StateInitError::HistoricalFrontierArtifact {
@@ -2006,7 +2048,10 @@ fn load_historical_frontier_artifact(
         }
         Err(error) => {
             tracing::warn!(?path, %error, "ignoring historical frontier artifact");
-            Ok(Arc::new(Mutex::new(read::HistoricalTreeCache::default())))
+            Ok(LoadedHistoricalFrontierArtifact {
+                cache: Arc::new(Mutex::new(read::HistoricalTreeCache::default())),
+                last_checkpoint: None,
+            })
         }
     }
 }
@@ -3058,6 +3103,8 @@ pub fn init_read_only(
 > {
     let historical_trees = load_historical_frontier_artifact(network, &config)?;
     let finalized_state = FinalizedState::new_with_debug(&config, network, true, true)?;
+    let historical_trees =
+        historical_trees.require_vct_handoff_coverage(&config, &finalized_state.db)?;
     let (non_finalized_state_sender, non_finalized_state_receiver) =
         tokio::sync::watch::channel(NonFinalizedState::new(network));
     let (_vct_root_repair_sender, vct_root_repair_receiver) =

@@ -174,7 +174,18 @@ impl HeaderChainStore {
         batch: &mut DiskWriteBatch,
     ) -> Result<usize, HeaderChainStoreError> {
         let authority_cf = self.cf(HEADER_BODY_EVIDENCE_AUTHORITY)?;
-        let limit = zakura_header_chain::RowLimit::new(config.limits.max_non_finalized_nodes.get());
+        // Authorities cover the finalized anchor, bounded non-finalized nodes, and bounded
+        // tombstones whose consensus-invalid nodes have already been pruned.
+        let maximum_authorities = config
+            .limits
+            .max_non_finalized_nodes
+            .get()
+            .checked_add(1)
+            .and_then(|maximum| maximum.checked_add(super::TOMBSTONE_LIMIT))
+            .ok_or(HeaderChainStoreError::Incoherent(
+                "body-evidence authority limit overflow",
+            ))?;
+        let limit = zakura_header_chain::RowLimit::new(maximum_authorities);
         let mut rows = 0;
         self.db
             .raw_visit_cf(&authority_cf, &mut |key, value| {

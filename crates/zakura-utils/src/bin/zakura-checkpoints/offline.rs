@@ -255,6 +255,8 @@ fn write_release_treestate_artifacts(
 ) -> Result<()> {
     let artifacts = zakura_state::produce_release_treestate_artifacts(db, height)
         .wrap_err("producing the Mainnet release treestate artifacts")?;
+    zakura_state::validate_final_frontiers_bytes(&artifacts.final_frontiers, height)
+        .wrap_err("validating the Mainnet release frontier bytes")?;
     atomic_write(frontier_path.to_path_buf(), &artifacts.final_frontiers)
         .wrap_err_with(|| format!("writing {}", frontier_path.display()))?
         .wrap_err_with(|| format!("persisting {}", frontier_path.display()))?;

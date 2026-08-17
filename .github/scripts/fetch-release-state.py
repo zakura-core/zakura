@@ -36,10 +36,6 @@ META_MAX_BYTES = 64 * 1024
 FILE_LIMITS = {
     "main-checkpoints.txt": 4 * 1024 * 1024,
     "mainnet-frontier.bin": 1 * 1024 * 1024,
-}
-OPTIONAL_FILE_LIMITS = {
-    # Optional during the publisher rollout. The importer requires a matching artifact before it
-    # can advance a checkout that already embeds historical subtree roots.
     "mainnet-treestate-subtrees.bin": 8 * 1024 * 1024,
 }
 LATEST_REQUIRED_KEYS = {
@@ -238,17 +234,9 @@ def resolve_bundle(
         raise BundleError(f"release-state bundle is older than {max_age_hours} hours")
 
     files = _object(meta["files"], "meta.files")
-    _check_keys(files, set(FILE_LIMITS), set(OPTIONAL_FILE_LIMITS), "meta.files")
+    _check_keys(files, set(FILE_LIMITS), set(), "meta.files")
     validated: dict[str, dict[str, Any]] = {}
-    limits = {
-        **FILE_LIMITS,
-        **{
-            name: limit
-            for name, limit in OPTIONAL_FILE_LIMITS.items()
-            if name in files
-        },
-    }
-    for name, max_size in limits.items():
+    for name, max_size in FILE_LIMITS.items():
         entry = _object(files[name], f"meta.files.{name}")
         _check_keys(entry, {"size", "sha256"}, set(), f"meta.files.{name}")
         size = _integer(entry["size"], f"meta.files.{name}.size", maximum=max_size)
@@ -308,14 +296,12 @@ def _self_test() -> int:
         meta_mutate: Callable[[dict[str, Any]], None] = lambda meta: None,
         latest_mutate: Callable[[dict[str, Any]], None] = lambda latest: None,
         file_overrides: dict[str, bytes] | None = None,
-        include_subtrees: bool = False,
     ) -> dict[str, bytes]:
         data_files = {
             "main-checkpoints.txt": checkpoints,
             "mainnet-frontier.bin": frontier,
+            "mainnet-treestate-subtrees.bin": subtrees,
         }
-        if include_subtrees:
-            data_files["mainnet-treestate-subtrees.bin"] = subtrees
         meta = {
             "schema_version": 1,
             "network": "Mainnet",
@@ -348,9 +334,8 @@ def _self_test() -> int:
             f"{base}meta.json": meta_bytes,
             f"{base}main-checkpoints.txt": checkpoints,
             f"{base}mainnet-frontier.bin": frontier,
+            f"{base}mainnet-treestate-subtrees.bin": subtrees,
         }
-        if include_subtrees:
-            responses[f"{base}mainnet-treestate-subtrees.bin"] = subtrees
         responses.update(file_overrides or {})
         return responses
 
@@ -379,9 +364,16 @@ def _self_test() -> int:
             resolution = self.resolve(build())
             self.assertEqual(resolution["height"], 3415600)
 
-        def test_optional_subtree_artifact_is_downloaded(self):
-            resolution = self.resolve(build(include_subtrees=True))
+        def test_subtree_artifact_is_downloaded(self):
+            resolution = self.resolve(build())
             self.assertEqual(resolution["height"], 3415600)
+
+        def test_missing_subtree_artifact_is_rejected(self):
+            def remove_subtrees(meta: dict[str, Any]) -> None:
+                del meta["files"]["mainnet-treestate-subtrees.bin"]
+
+            with self.assertRaisesRegex(BundleError, "missing keys"):
+                self.resolve(build(meta_mutate=remove_subtrees))
 
         def test_wrong_host_rejected(self):
             with self.assertRaisesRegex(BundleError, "host"):

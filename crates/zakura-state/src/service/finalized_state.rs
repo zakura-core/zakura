@@ -119,7 +119,7 @@ pub use treestate_artifact::{
     VerifiedSubtreeCounts,
 };
 pub use treestate_export::{
-    export as export_subtree_artifact, TreestateExport, TreestateExportError,
+    produce_release_treestate_artifacts, ReleaseTreestateArtifacts, ReleaseTreestateArtifactsError,
 };
 pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, VctSuccessorWitness};
 pub(crate) use vct::{VctAuthenticationProof, VctAuxiliaryFailureAttribution, VctAuxiliaryWindow};

@@ -81,6 +81,7 @@ list_remote_object() {
     --state-cache-dir "$STATE_DIR" \
     --full-list \
     --mainnet-frontier-output "$STAGE/mainnet-frontier.bin" \
+    --mainnet-subtree-output "$STAGE/mainnet-treestate-subtrees.bin" \
     > "$STAGE/main-checkpoints.txt"
 
 HEIGHT=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f1)
@@ -107,7 +108,11 @@ import hashlib, json, os, sys
 
 stage = sys.argv[1]
 files = {}
-for name in ("main-checkpoints.txt", "mainnet-frontier.bin"):
+for name in (
+    "main-checkpoints.txt",
+    "mainnet-frontier.bin",
+    "mainnet-treestate-subtrees.bin",
+):
     data = open(os.path.join(stage, name), "rb").read()
     files[name] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
@@ -152,6 +157,7 @@ else
     # never resolvable through a pointer.
     rclone copyto "$STAGE/main-checkpoints.txt" "$BUNDLE_REMOTE/main-checkpoints.txt"
     rclone copyto "$STAGE/mainnet-frontier.bin" "$BUNDLE_REMOTE/mainnet-frontier.bin"
+    rclone copyto "$STAGE/mainnet-treestate-subtrees.bin" "$BUNDLE_REMOTE/mainnet-treestate-subtrees.bin"
     rclone copyto "$STAGE/meta.json" "$BUNDLE_REMOTE/meta.json"
     echo "published bundle v1/$HEIGHT ($BLOCK_HASH)" >&2
 fi

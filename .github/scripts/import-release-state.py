@@ -114,22 +114,9 @@ def _prepare_subtree_import(
     repo_root: Path,
     bundle: Path,
     expected_last_checkpoint: int,
-) -> tuple[bytes | None, bool]:
+) -> bytes:
     committed_path = repo_root / SUBTREES
     bundle_path = bundle / SUBTREE_BUNDLE_NAME
-
-    if not bundle_path.exists():
-        try:
-            committed_bytes = committed_path.read_bytes()
-        except OSError as error:
-            raise BundleImportError(f"cannot read {SUBTREES}: {error}") from error
-        committed_last_checkpoint, *_ = _subtree_pools(committed_bytes, str(SUBTREES))
-        if committed_last_checkpoint != expected_last_checkpoint:
-            raise BundleImportError(
-                "bundle carries no subtree-root artifact for its last checkpoint"
-            )
-        print("bundle carries no new subtree roots; keeping the matching committed artifact")
-        return committed_bytes, False
 
     try:
         bundle_bytes = bundle_path.read_bytes()
@@ -158,7 +145,7 @@ def _prepare_subtree_import(
                     f"bundle rewrites committed {name} subtree roots"
                 )
 
-    return bundle_bytes, True
+    return bundle_bytes
 
 
 def import_bundle(
@@ -203,25 +190,14 @@ def import_bundle(
     if _checkpoint_height(bundle_checkpoints, "bundle checkpoint list") != bundle_height:
         raise BundleImportError("bundle checkpoint height does not match the resolution")
 
-    subtree_bytes, import_subtrees = _prepare_subtree_import(
-        repo_root, bundle, bundle_height
-    )
+    subtree_bytes = _prepare_subtree_import(repo_root, bundle, bundle_height)
 
     checkpoint_path.write_bytes(bundle_checkpoints)
     frontier_path.write_bytes(bundle_frontier)
-    if import_subtrees:
-        subtree_path.parent.mkdir(parents=True, exist_ok=True)
-        subtree_path.write_bytes(subtree_bytes or b"")
-        print("imported subtree-root artifact")
+    subtree_path.parent.mkdir(parents=True, exist_ok=True)
+    subtree_path.write_bytes(subtree_bytes)
+    print("imported subtree-root artifact")
 
-    subtree_provenance = (
-        {
-            "subtrees_sha256": hashlib.sha256(subtree_bytes).hexdigest(),
-            "subtrees_size": len(subtree_bytes),
-        }
-        if subtree_bytes is not None
-        else {}
-    )
     _write_json(
         provenance_path,
         {
@@ -234,7 +210,8 @@ def import_bundle(
             "checkpoints_sha256": hashlib.sha256(bundle_checkpoints).hexdigest(),
             "frontier_sha256": hashlib.sha256(bundle_frontier).hexdigest(),
             "frontier_size": len(bundle_frontier),
-            **subtree_provenance,
+            "subtrees_sha256": hashlib.sha256(subtree_bytes).hexdigest(),
+            "subtrees_size": len(subtree_bytes),
             "meta_sha256": resolution["meta_sha256"],
         },
     )
@@ -264,13 +241,13 @@ def import_bundle(
 
 
 def _self_test() -> int:
-    def subtree_artifact(*pools: bytes) -> bytes:
+    def subtree_artifact(last_checkpoint: int, *pools: bytes) -> bytes:
         payload = b"".join(pools)
         prefix = SUBTREE_HEADER_PREFIX.pack(
             b"ZKVCTST1",
             SUBTREE_VERSION,
             1,
-            2,
+            last_checkpoint,
             *(len(pool) // SUBTREE_RECORD_LEN for pool in pools),
         )
         return prefix + _subtree_digest(prefix, payload) + payload
@@ -283,7 +260,7 @@ def _self_test() -> int:
                 (self.root / relative).parent.mkdir(parents=True, exist_ok=True)
             (self.root / CHECKPOINTS).write_text("1 aa\n", encoding="utf-8")
             (self.root / FRONTIER).write_bytes(b"old")
-            (self.root / SUBTREES).write_bytes(subtree_artifact(b"", b"", b""))
+            (self.root / SUBTREES).write_bytes(subtree_artifact(1, b"", b"", b""))
             (self.root / EOS_FILE).write_text(
                 "const ESTIMATED_RELEASE_HEIGHT: u32 = 1_000;\n",
                 encoding="utf-8",
@@ -292,6 +269,9 @@ def _self_test() -> int:
             self.bundle.mkdir()
             (self.bundle / CHECKPOINTS.name).write_text("1 aa\n2 bb\n", encoding="utf-8")
             (self.bundle / FRONTIER.name).write_bytes(b"new")
+            (self.bundle / SUBTREE_BUNDLE_NAME).write_bytes(
+                subtree_artifact(2, b"", b"", b"")
+            )
             self.resolution = self.root / "resolution.json"
             self.resolution.write_text(
                 json.dumps(
@@ -337,8 +317,9 @@ def _self_test() -> int:
                 import_bundle(self.root, self.bundle, self.resolution)
 
         def test_subtree_roots_are_imported_append_only(self) -> None:
-            old = subtree_artifact(b"a" * SUBTREE_RECORD_LEN, b"", b"")
+            old = subtree_artifact(1, b"a" * SUBTREE_RECORD_LEN, b"", b"")
             new = subtree_artifact(
+                2,
                 b"a" * SUBTREE_RECORD_LEN + b"b" * SUBTREE_RECORD_LEN,
                 b"c" * SUBTREE_RECORD_LEN,
                 b"",
@@ -357,12 +338,17 @@ def _self_test() -> int:
             self.assertEqual(provenance["subtrees_size"], len(new))
 
         def test_rewritten_subtree_roots_are_rejected(self) -> None:
-            old = subtree_artifact(b"a" * SUBTREE_RECORD_LEN, b"", b"")
-            rewritten = subtree_artifact(b"b" * SUBTREE_RECORD_LEN, b"", b"")
+            old = subtree_artifact(1, b"a" * SUBTREE_RECORD_LEN, b"", b"")
+            rewritten = subtree_artifact(2, b"b" * SUBTREE_RECORD_LEN, b"", b"")
             (self.root / SUBTREES).write_bytes(old)
             (self.bundle / SUBTREE_BUNDLE_NAME).write_bytes(rewritten)
 
             with self.assertRaisesRegex(BundleImportError, "rewrites committed sapling"):
+                import_bundle(self.root, self.bundle, self.resolution)
+
+        def test_missing_subtree_artifact_is_rejected(self) -> None:
+            (self.bundle / SUBTREE_BUNDLE_NAME).unlink()
+            with self.assertRaisesRegex(BundleImportError, SUBTREE_BUNDLE_NAME):
                 import_bundle(self.root, self.bundle, self.resolution)
 
         def test_import_can_leave_eos_for_release_preparation(self) -> None:

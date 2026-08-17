@@ -16,7 +16,7 @@ fn commit_elapsed_deferral(
     let db_config = Config::ephemeral();
     let (engine_config, anchor, mut metadata) = fixture();
     metadata.header_generation = header_generation;
-    let db = open(&db_config, &engine_config.network);
+    let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata, anchor.clone())
@@ -158,7 +158,7 @@ fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
     engine_config.limits.local_finality_depth =
         std::num::NonZeroU32::new(1).expect("one is nonzero");
     metadata.mode = EngineMode::HeadersOnly;
-    let db = open(&db_config, &engine_config.network);
+    let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata, anchor.clone())
@@ -274,7 +274,7 @@ fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
 fn rocksdb_snapshot_stops_at_the_first_extra_row_without_decoding() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor)
         .expect("the valid anchor initializes the fixture");
@@ -308,13 +308,13 @@ fn startup_atomically_rebinds_an_extended_checkpoint_manifest() {
     let previous_state_version = metadata.state_version;
     let updated_config = EngineConfig::new(
         engine_config.mode,
-        engine_config.network.clone(),
+        engine_config.network().clone(),
         engine_config.bootstrap_anchor().clone(),
         CheckpointSet::new([Frontier::new(block::Height(10), block::Hash([0x93; 32]))])
             .expect("the extension checkpoint is unique"),
     )
     .expect("the updated engine configuration is coherent");
-    let db = open(&db_config, &engine_config.network);
+    let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata, anchor)
@@ -352,7 +352,7 @@ fn startup_reconciles_restored_full_state_before_first_publication() {
     };
     let (engine_config, anchor, metadata) = fixture();
     let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
-    let db = open(&db_config, &engine_config.network);
+    let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata, anchor.clone())
@@ -436,7 +436,7 @@ fn startup_reconciliation_chunks_finalized_gaps_at_the_node_limit() {
     let db_config = Config::ephemeral();
     let (mut engine_config, anchor, metadata) = fixture();
     engine_config.limits.max_non_finalized_nodes = NonZeroUsize::new(2).expect("two is nonzero");
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the header schema initializes");
@@ -499,7 +499,7 @@ fn streaming_reconstruction_resumes_from_the_last_atomic_chunk() {
     let db_config = Config::ephemeral();
     let (mut engine_config, anchor, metadata) = fixture();
     engine_config.limits.max_non_finalized_nodes = NonZeroUsize::new(2).expect("two is nonzero");
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the header schema initializes");
@@ -596,7 +596,7 @@ fn malformed_reconstruction_progress_fails_closed() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor)
         .expect("the header schema initializes");
@@ -632,7 +632,7 @@ fn malformed_reconstruction_progress_fails_closed() {
 
     let target = Frontier::new(block::Height(1), block::Hash([0x91; 32]));
     let contradictory = HeaderReconstructionProgressDisk {
-        network: engine_config.network.kind(),
+        network: engine_config.network().kind(),
         target,
         next_height: block::Height(1),
         phase: HeaderReconstructionPhaseDisk::FinalAudit,
@@ -665,7 +665,7 @@ fn startup_repairs_every_reconstructible_index_atomically_before_publication() {
         ..Config::default()
     };
     let (engine_config, anchor, metadata) = fixture();
-    let network = engine_config.network.clone();
+    let network = engine_config.network().clone();
     let db = open(&db_config, &network);
     let store = HeaderChainStore::new(db.clone());
     store
@@ -818,7 +818,7 @@ fn startup_repairs_every_reconstructible_index_atomically_before_publication() {
 fn authoritative_corruption_fails_before_publisher_construction() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the empty schema initializes");
@@ -845,7 +845,7 @@ fn startup_rejects_verified_projection_without_exact_body_authority() {
     let (engine_config, mut anchor, metadata) = fixture();
     let evidence = EvidenceId::from_digest([0xa5; 32]);
     anchor.body_validation_state = BodyValidationState::Verified { evidence };
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the verified fixture initializes with body authority");

@@ -28,7 +28,7 @@ fn finality_rebase_reads_only_the_generation_bounded_recent_suffix() {
     };
     let (engine_config, anchor, mut metadata) = fixture();
     let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
-    let db = open(&db_config, &engine_config.network);
+    let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata.clone(), anchor)
@@ -120,7 +120,7 @@ fn migrated_headers_only_pin_refutation_is_durable_and_fail_closed() {
     headers_only_config.mode = EngineMode::HeadersOnly;
     metadata.mode = EngineMode::HeadersOnly;
     let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
-    let db = open(&db_config, &integrated_config.network);
+    let db = open(&db_config, integrated_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata, anchor.clone())
@@ -239,7 +239,7 @@ fn serialized_apply_commits_before_receipt_and_reopens_exactly() {
         ..Config::default()
     };
     let (engine_config, anchor, metadata) = fixture();
-    let network = engine_config.network.clone();
+    let network = engine_config.network().clone();
     let db = open(&db_config, &network);
     let store = HeaderChainStore::new(db.clone());
     store
@@ -387,7 +387,7 @@ fn failed_batch_encoding_has_zero_durable_effects() {
         ..Config::default()
     };
     let (engine_config, mut anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata.clone(), anchor.clone())
         .expect("the empty schema initializes");
@@ -436,7 +436,7 @@ fn finality_history_creates_an_authenticated_checkpoint_at_the_retained_bound() 
     let db_config = Config::ephemeral();
     let (engine_config, anchor_node, metadata) = fixture();
     let anchor = metadata.frontiers.finalized;
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata.clone(), anchor_node)
         .expect("the bounded history fixture initializes");
@@ -535,7 +535,7 @@ fn finality_history_creates_an_authenticated_checkpoint_at_the_retained_bound() 
 fn prepared_full_state_swaps_only_after_combined_commit() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata.clone(), anchor.clone())
         .expect("the empty schema initializes");
@@ -562,7 +562,7 @@ fn prepared_full_state_swaps_only_after_combined_commit() {
             EvidenceId::from_digest([0x45; 32]),
             metadata.frontiers.verified_best,
             Vec::new(),
-            NonFinalizedState::new(&engine_config.network),
+            NonFinalizedState::new(engine_config.network()),
             None,
             request.clone(),
         ),
@@ -582,14 +582,14 @@ fn prepared_full_state_swaps_only_after_combined_commit() {
             evidence,
             Frontier::new(block::Height(1), block::Hash([0x55; 32])),
             Vec::new(),
-            NonFinalizedState::new(&engine_config.network),
+            NonFinalizedState::new(engine_config.network()),
             None,
             verified_request,
         ),
         Err(PreparedFullStateTransitionError::VerifiedPathMismatch)
     ));
 
-    let staged = NonFinalizedState::new(&engine_config.network);
+    let staged = NonFinalizedState::new(engine_config.network());
     let mut live = NonFinalizedState::new(&Network::Mainnet);
     let prepared = PreparedFullStateTransition::new(
         evidence,
@@ -611,7 +611,7 @@ fn prepared_full_state_swaps_only_after_combined_commit() {
         .expect("the staged mutation commits");
     assert_eq!(result, ApplyResult::Committed);
     let committed = runtime.publisher().snapshot();
-    assert_eq!(live.network, engine_config.network);
+    assert_eq!(&live.network, engine_config.network());
     assert_eq!(
         runtime
             .store
@@ -631,7 +631,7 @@ fn unrelated_body_commit_cannot_stale_current_header_generation_work() {
         ..Config::default()
     };
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the header schema initializes");
@@ -747,7 +747,7 @@ fn lazy_work_rebase_commits_coordinates_and_reopens() {
         anchor.aux_delivery_ids.clone(),
     )
     .expect("the near-overflow anchor retains its canonical identity");
-    let db = open(&db_config, &engine_config.network);
+    let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata, anchor.clone())
@@ -826,7 +826,7 @@ fn lazy_work_rebase_commits_coordinates_and_reopens() {
 
     drop(runtime);
     drop(db);
-    let (reopened, report) = HeaderChainStore::new(open(&db_config, &engine_config.network))
+    let (reopened, report) = HeaderChainStore::new(open(&db_config, engine_config.network()))
         .startup(&engine_config)
         .expect("recovery authenticates the durable rebased coordinates");
     assert_eq!(report.current, committed);
@@ -854,7 +854,7 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
     };
     let (mut engine_config, anchor, metadata) = fixture();
     engine_config.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("one is nonzero");
-    let db = open(&db_config, &engine_config.network);
+    let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata, anchor.clone())
@@ -985,7 +985,7 @@ fn resource_stall_alarm_is_published_and_durable_before_refusal() {
 fn stale_prepared_full_state_transition_is_a_hard_error() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata.clone(), anchor.clone())
         .expect("the empty schema initializes");
@@ -1008,7 +1008,7 @@ fn stale_prepared_full_state_transition_is_a_hard_error() {
         evidence,
         metadata.frontiers.verified_best,
         Vec::new(),
-        NonFinalizedState::new(&engine_config.network),
+        NonFinalizedState::new(engine_config.network()),
         Some(full_state_batch),
         TransitionRequest {
             expected_version: StateVersion::new(0),
@@ -1065,7 +1065,7 @@ fn stale_prepared_full_state_transition_is_a_hard_error() {
 fn no_change_header_plan_still_commits_full_state_then_swaps_without_publication() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata.clone(), anchor.clone())
         .expect("the empty schema initializes");
@@ -1098,7 +1098,7 @@ fn no_change_header_plan_still_commits_full_state_then_swaps_without_publication
         evidence,
         metadata.frontiers.verified_best,
         Vec::new(),
-        NonFinalizedState::new(&engine_config.network),
+        NonFinalizedState::new(engine_config.network()),
         Some(full_state_batch),
         request,
     )
@@ -1117,7 +1117,7 @@ fn no_change_header_plan_still_commits_full_state_then_swaps_without_publication
         .expect("the full-state-only mutation commits");
 
     assert!(matches!(result, ApplyResult::NoChange(_)));
-    assert_eq!(live.network, engine_config.network);
+    assert_eq!(&live.network, engine_config.network());
     assert_eq!(runtime.publisher().snapshot(), metadata.snapshot());
     let marker_cf = runtime
         .store
@@ -1137,7 +1137,7 @@ fn no_change_header_plan_still_commits_full_state_then_swaps_without_publication
 fn mismatched_staged_frontier_writes_and_swaps_nothing() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata.clone(), anchor.clone())
         .expect("the empty schema initializes");

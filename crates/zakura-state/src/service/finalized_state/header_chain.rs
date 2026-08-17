@@ -1166,7 +1166,7 @@ impl HeaderChainReader {
             return Ok(None);
         }
         self.store
-            .validation_context(parent_hash, &self.config.network)
+            .validation_context(parent_hash, self.config.network())
             .map(Some)
             .map_err(HeaderChainStoreError::Store)
     }
@@ -2119,7 +2119,7 @@ impl HeaderChainRuntime {
         } else {
             vec![self
                 .store
-                .validation_context(checkpoint_parent.hash, &self.config.network)?]
+                .validation_context(checkpoint_parent.hash, self.config.network())?]
         };
         let checkpoint_authority = StateIssuedAuthority {
             inner: checkpoint_context.full_state_authority,
@@ -2436,7 +2436,7 @@ impl HeaderChainRuntime {
             .map(HeaderSyncWorkOwner::header_authority)
             .map(|authority| authority.branch)
             .or_else(|| request.event.body_owner().map(|owner| owner.branch));
-        let input = self.build_transition_input(request, &before, &base_context.config.network)?;
+        let input = self.build_transition_input(request, &before, base_context.config.network())?;
         let validation_leases = input
             .header_validation_facts()
             .map(|facts| facts.validation_leases.clone())
@@ -2933,7 +2933,7 @@ impl HeaderChainStore {
             ));
         }
         let base = snapshot.frontiers.finalized;
-        let network = config.network.kind();
+        let network = config.network().kind();
         let mut progress = match self.reconstruction_progress()? {
             Some(mut progress) => {
                 if progress.network != network
@@ -3157,7 +3157,7 @@ impl HeaderChainStore {
             cause: VerifiedChangeCause::Reset,
         });
         let validation_context =
-            self.validation_context(snapshot.frontiers.finalized.hash, &config.network)?;
+            self.validation_context(snapshot.frontiers.finalized.hash, config.network())?;
         let authority = Authority {
             event: event
                 .fingerprint()

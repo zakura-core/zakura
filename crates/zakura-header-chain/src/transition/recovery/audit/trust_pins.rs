@@ -12,7 +12,7 @@ pub(super) fn check_trust_pins(
     config: &EngineConfig,
     violations: &mut Vec<AuditViolation>,
 ) {
-    let settled = config.settled_manifest().pin_for_network(&config.network);
+    let settled = config.settled_manifest().pin_for_network(config.network());
     for node in nodes {
         for reason in &node.eligibility.direct_reasons {
             let valid = match reason {
@@ -131,7 +131,7 @@ mod tests {
         .expect("the mainnet configuration has a settled pin");
         let settled = config
             .settled_manifest()
-            .pin_for_network(&config.network)
+            .pin_for_network(config.network())
             .expect("mainnet has a settled pin")
             .activation;
         let checkpoint = Frontier::new(settled.height, block::Hash([0x5c; 32]));

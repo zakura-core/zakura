@@ -61,7 +61,7 @@ fn insert_deferred_chain(
     insert.batch = PreparedHeaderBatch::new(
         headers,
         store.lease.parent,
-        config.network.clone(),
+        config.network().clone(),
         config.trust_anchor_digest(),
         evidence,
     )

@@ -10,7 +10,7 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
             ..Config::default()
         };
         let (engine_config, anchor, metadata) = fixture();
-        let network = engine_config.network.clone();
+        let network = engine_config.network().clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
         store
@@ -290,7 +290,7 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
             ..Config::default()
         };
         let (engine_config, anchor, metadata) = fixture();
-        let network = engine_config.network.clone();
+        let network = engine_config.network().clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
         store
@@ -537,7 +537,7 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
             ..Config::default()
         };
         let (engine_config, mut anchor, metadata) = fixture();
-        let network = engine_config.network.clone();
+        let network = engine_config.network().clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
         store

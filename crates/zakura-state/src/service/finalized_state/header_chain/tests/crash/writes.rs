@@ -17,7 +17,7 @@ pub(super) fn crash_fixture_startup_recovery_reopens_complete_before_or_after_wi
             ..Config::default()
         };
         let (engine_config, anchor, metadata) = fixture();
-        let network = engine_config.network.clone();
+        let network = engine_config.network().clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
         store
@@ -134,7 +134,7 @@ pub(super) fn crash_fixture_every_state_writer_crash_point_reopens_complete_befo
             ..Config::default()
         };
         let (engine_config, anchor, metadata) = fixture();
-        let network = engine_config.network.clone();
+        let network = engine_config.network().clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
         store
@@ -235,7 +235,7 @@ pub(super) fn crash_fixture_requester_insertion_reopens_complete_before_or_after
             ..Config::default()
         };
         let (engine_config, anchor, metadata) = fixture();
-        let network = engine_config.network.clone();
+        let network = engine_config.network().clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
         store

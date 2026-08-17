@@ -212,8 +212,8 @@ impl SettledUpgradeManifest {
 pub struct EngineConfig {
     /// Finality authority mode.
     pub mode: EngineMode,
-    /// Authenticated network parameters.
-    pub network: Network,
+    /// Authenticated network parameters, closed over by the cached policy digest.
+    network: Network,
     /// Exact trusted bootstrap anchor.
     bootstrap_anchor: TrustedAnchor,
     /// Optional authenticated local checkpoints.
@@ -297,6 +297,11 @@ impl EngineConfig {
     /// Digest binding every absolute trust anchor used by validation and startup.
     pub const fn trust_anchor_digest(&self) -> [u8; 32] {
         self.trust_anchor_digest
+    }
+
+    /// Authenticated network parameters that [`Self::network_policy_digest`] binds.
+    pub const fn network(&self) -> &Network {
+        &self.network
     }
 
     /// Digest binding every network parameter used by header validation.

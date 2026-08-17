@@ -106,7 +106,7 @@ fn same_transition_auxiliary_eviction_has_no_generation_effect() {
                 .header
                 .clone(),
         }],
-        config.network.clone(),
+        config.network().clone(),
         config.trust_anchor_digest(),
     );
     config.limits.max_non_finalized_nodes = std::num::NonZeroUsize::new(1).expect("one is nonzero");

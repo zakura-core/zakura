@@ -161,7 +161,7 @@ impl Harness {
         let metadata = EngineMetadata {
             disk_format: HeaderChainDiskVersion::CURRENT,
             mode: EngineMode::Integrated,
-            network_id: config.network.kind(),
+            network_id: config.network().kind(),
             network_policy_digest: config.network_policy_digest(),
             anchor_manifest_digest: config.trust_anchor_digest(),
             work_origin: frontier,
@@ -180,7 +180,7 @@ impl Harness {
             alarms: AlarmSet::default(),
             last_transition: None,
         };
-        let db = open(&db_config, &config.network);
+        let db = open(&db_config, config.network());
         let store = HeaderChainStore::new(db);
         store
             .initialize(metadata, anchor)
@@ -645,7 +645,7 @@ impl Harness {
                 .take()
                 .expect("the coherence runtime is present before reopen"),
         );
-        let store = HeaderChainStore::new(open(&self.db_config, &self.config.network));
+        let store = HeaderChainStore::new(open(&self.db_config, self.config.network()));
         let (runtime, report) = store
             .startup(&self.config)
             .expect("the coherent persistent store reopens");

@@ -124,7 +124,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
     let metadata = EngineMetadata {
         disk_format: HeaderChainDiskVersion::CURRENT,
         mode: config.mode,
-        network_id: config.network.kind(),
+        network_id: config.network().kind(),
         network_policy_digest: config.network_policy_digest(),
         anchor_manifest_digest: config.trust_anchor_digest(),
         work_origin: config.bootstrap_anchor().frontier,

@@ -15,9 +15,9 @@ use zakura_header_chain::{
     EngineConfig, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet,
     FullStateEvidenceAuthority, FullStateFinalized, HeaderBatchInput, HeaderChainDiskVersion,
     HeaderGeneration, HeaderNode, HeaderRules, HeaderValidationState, InsertHeaders, SourceId,
-    StateVersion, StoreAuditRead, SuffixWork, SystemClock, TargetCompletion, TransitionContext,
-    TransitionEvent, TransitionFailure, TransitionRequest, TrustedAnchor, VerifiedChainChanged,
-    VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate,
+    StateVersion, SuffixWork, SystemClock, TargetCompletion, TransitionContext, TransitionEvent,
+    TransitionFailure, TransitionRequest, TrustedAnchor, VerifiedChainChanged, VerifiedChangeCause,
+    VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate,
 };
 
 use super::{
@@ -159,7 +159,7 @@ impl Harness {
         )
         .expect("the genesis node is internally coherent");
         let metadata = EngineMetadata {
-            disk_format: HeaderChainDiskVersion(1),
+            disk_format: HeaderChainDiskVersion::CURRENT,
             mode: EngineMode::Integrated,
             network_id: config.network.kind(),
             anchor_manifest_digest: config.trust_anchor_digest(),
@@ -729,7 +729,7 @@ impl Harness {
 
         let stored_nodes = runtime
             .store
-            .all_header_nodes()
+            .load_header_nodes()
             .expect("the exhaustive node rows are readable");
         assert_eq!(stored_nodes.len(), self.model.len());
         for node in stored_nodes {

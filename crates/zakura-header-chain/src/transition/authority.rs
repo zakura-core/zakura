@@ -54,6 +54,11 @@ pub trait FullStateEvidenceAuthority: Send + Sync {
     fn authorizes_validation_lease(&self, _lease: &ValidationLease) -> bool {
         false
     }
+
+    /// Return true only when an active retained-path lease protects this exact target.
+    fn authorizes_retention_reference(&self, _reference: zakura_chain::block::Hash) -> bool {
+        false
+    }
 }
 
 /// Trusted dependencies used while deriving a transition plan.
@@ -69,6 +74,6 @@ pub struct TransitionContext<'a> {
     pub clock: &'a dyn Clock,
     /// Integrated full-state authority, available only inside the state writer.
     pub full_state_authority: Option<&'a dyn FullStateEvidenceAuthority>,
-    /// Active retained-path targets that resource eviction must protect.
+    /// Parent hashes from active, coherent, and authorized validation leases.
     pub retention_references: &'a [zakura_chain::block::Hash],
 }

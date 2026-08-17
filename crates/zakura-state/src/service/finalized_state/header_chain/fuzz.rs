@@ -494,7 +494,7 @@ fn fixture() -> (EngineConfig, HeaderNode, EngineMetadata) {
     )
     .expect("the canonical genesis fields agree");
     let metadata = EngineMetadata {
-        disk_format: HeaderChainDiskVersion(1),
+        disk_format: HeaderChainDiskVersion::CURRENT,
         mode: EngineMode::Integrated,
         network_id: config.network.kind(),
         anchor_manifest_digest: config.trust_anchor_digest(),

@@ -231,15 +231,14 @@ async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
         &zakura_header_chain::SystemClock,
     )
     .expect("the fixture repair header prepares");
-    let delivery = zakura_header_chain::AuxDelivery {
-        delivery_id: zakura_header_chain::EvidenceId::from_digest([0x44; 32]),
-        header_hash: repair_header.hash,
+    let delivery = zakura_header_chain::AuxDelivery::new(
+        zakura_header_chain::EvidenceId::from_digest([0x44; 32]),
+        repair_header.hash,
         source,
-        owner: action_owner,
-        body_size: zakura_header_chain::BodySizeHint::Unknown,
-        tree_aux: entry.tree_aux,
-        authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
-    };
+        action_owner,
+        zakura_header_chain::BodySizeHint::Unknown,
+        entry.tree_aux,
+    );
     let insert = Box::new(zakura_header_chain::InsertHeaders {
         owner: action_owner,
         source,

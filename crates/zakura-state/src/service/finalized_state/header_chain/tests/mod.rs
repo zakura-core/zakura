@@ -121,7 +121,7 @@ fn fixture() -> (EngineConfig, HeaderNode, EngineMetadata) {
     )
     .expect("the canonical genesis fields agree");
     let metadata = EngineMetadata {
-        disk_format: HeaderChainDiskVersion(1),
+        disk_format: HeaderChainDiskVersion::CURRENT,
         mode: EngineMode::Integrated,
         network_id: config.network.kind(),
         anchor_manifest_digest: config.trust_anchor_digest(),
@@ -151,7 +151,7 @@ fn assert_transition_engine_matches_store(runtime: &HeaderChainRuntime) {
         .expect("the transition engine mutex is not poisoned");
     let durable_nodes = runtime
         .store
-        .all_header_nodes()
+        .load_header_nodes()
         .expect("the durable nodes are readable");
     assert_eq!(engine.graph().header_node_count(), durable_nodes.len());
     for node in durable_nodes {
@@ -178,21 +178,20 @@ fn assert_transition_engine_matches_store(runtime: &HeaderChainRuntime) {
             .verified_projection()
             .expect("the durable verified projection is readable")
     );
-    let mut durable_aux: HashMap<_, Vec<_>> = HashMap::new();
+    let durable_engine = load_transition_engine(&runtime.store)
+        .expect("the durable auxiliary rows pass recovery validation");
+    let mut durable_headers = HashSet::new();
     for delivery in runtime
         .store
-        .all_aux_deliveries()
+        .load_aux_deliveries()
         .expect("the durable auxiliary deliveries are readable")
     {
-        durable_aux
-            .entry(delivery.header_hash)
-            .or_default()
-            .push(delivery);
+        durable_headers.insert(delivery.delivery().header_hash);
     }
-    for deliveries in durable_aux.values_mut() {
-        deliveries.sort_unstable_by_key(|delivery| delivery.delivery_id);
-    }
-    for (hash, deliveries) in durable_aux {
-        assert_eq!(engine.aux_deliveries(hash), deliveries);
+    for hash in durable_headers {
+        assert_eq!(
+            engine.aux_deliveries(hash),
+            durable_engine.aux_deliveries(hash)
+        );
     }
 }

@@ -14,6 +14,11 @@ use super::event::TransitionFingerprint;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct HeaderChainDiskVersion(pub u32);
 
+impl HeaderChainDiskVersion {
+    /// Current durable header-chain schema version.
+    pub const CURRENT: Self = Self(2);
+}
+
 /// Persistent externally visible engine alarms.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AlarmSet {

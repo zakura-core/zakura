@@ -98,15 +98,12 @@ fn active_prepared_header_limit_accepts_exactly_limit_and_rejects_one_more() {
 }
 
 #[test]
-fn retention_references_admit_all_staged_targets_and_candidate_tips() {
+fn unauthenticated_retention_reference_is_rejected() {
     let (store, config) = TestStore::new(EngineMode::HeadersOnly);
     let clock = ManualClock(Utc::now());
-    let references = vec![
-        store.metadata.frontiers.finalized.hash;
-        crate::MAX_STAGED_TARGETS_V1 + crate::MAX_CANDIDATE_TIPS_V1
-    ];
+    let references = [store.metadata.frontiers.finalized.hash];
 
-    apply_transition(
+    let result = apply_transition(
         &store,
         TransitionRequest {
             expected_version: store.metadata.state_version,
@@ -118,13 +115,16 @@ fn retention_references_admit_all_staged_targets_and_candidate_tips() {
             full_state_authority: None,
             retention_references: &references,
         },
-    )
-    .expect("one transition admits every active header target and full-state fork tip");
+    );
+
+    assert!(matches!(result, Err(TransitionFailure::Authority)));
 }
 
 #[test]
 fn retention_references_are_bounded_before_ancestry_walks() {
-    let (store, config) = TestStore::new(EngineMode::HeadersOnly);
+    let (store, mut config) = TestStore::new(EngineMode::HeadersOnly);
+    config.limits.max_retention_references =
+        std::num::NonZeroUsize::new(1).expect("one is nonzero");
     let clock = ManualClock(Utc::now());
     let references = vec![
         store.metadata.frontiers.finalized.hash;
@@ -208,14 +208,13 @@ fn typed_body_authority_ignores_global_version_but_rejects_stale_generation() {
         panic!("the fixture constructs a header insertion");
     };
     let header_hash = insert_event.batch.headers()[0].hash;
-    let boundary_hash = insert_event.batch.headers()[1].hash;
-    let delivery = crate::AuxDelivery {
-        delivery_id: EvidenceId::from_digest([0xa1; 32]),
+    let delivery = crate::AuxDelivery::new(
+        EvidenceId::from_digest([0xa1; 32]),
         header_hash,
-        source: SourceId::from_digest([0xa2; 32]),
-        owner: insert_event.owner,
-        body_size: crate::BodySizeHint::Unknown,
-        tree_aux: Some(crate::TreeAuxRecordV1 {
+        SourceId::from_digest([0xa2; 32]),
+        insert_event.owner,
+        crate::BodySizeHint::Unknown,
+        Some(crate::TreeAuxRecordV1 {
             height: block::Height(1),
             sapling_root: zakura_chain::sapling::tree::Root::default(),
             orchard_root: zakura_chain::orchard::tree::Root::default(),
@@ -225,8 +224,7 @@ fn typed_body_authority_ignores_global_version_but_rejects_stale_generation() {
             ironwood_tx_count: 1,
             auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0xa3; 32]),
         }),
-        authentication: crate::AuxAuthentication::Unauthenticated,
-    };
+    );
     insert_event.source = delivery.source;
     insert_event.aux.push(delivery);
     let inserted = apply_transition(&store, insert, &context(&config, &clock, None))
@@ -237,17 +235,16 @@ fn typed_body_authority_ignores_global_version_but_rejects_stale_generation() {
         1,
         NonZeroU64::new(1).expect("fixture request IDs are nonzero"),
     );
-    let authentication = crate::AuxAuthentication::Authenticated {
-        evidence: EvidenceId::from_digest([0xa4; 32]),
-        boundary_hash,
-    };
+    let observation = crate::AuxObservationV1::from_vct(
+        owner,
+        vec![delivery],
+        crate::AuxVerificationFactV1::current_delivery_verified(),
+        Some([0xa4; 32].into()),
+    )
+    .expect("the observation fixture is valid");
     let request = TransitionRequest {
         expected_version: StateVersion::new(9),
-        event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
-            owner,
-            deliveries: vec![delivery],
-            authentication,
-        })),
+        event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence::observed(observation))),
     };
     apply_transition(
         &store,
@@ -259,7 +256,8 @@ fn typed_body_authority_ignores_global_version_but_rejects_stale_generation() {
     let TransitionEvent::AuxEvidence(event) = &request.event else {
         panic!("the fixture constructs auxiliary evidence");
     };
-    let owner = event.owner;
+    let observation = event.observation().expect("the fixture has an observation");
+    let owner = observation.owner();
     let stale_authorities = [
         crate::BodyWorkAuthority {
             header: crate::HeaderWorkAuthority {
@@ -288,7 +286,18 @@ fn typed_body_authority_ignores_global_version_but_rejects_stale_generation() {
         let TransitionEvent::AuxEvidence(event) = &mut stale.event else {
             unreachable!("the cloned fixture remains auxiliary evidence");
         };
-        event.owner = crate::BodyWorkOwner { authority, ..owner };
+        let observation = event
+            .observation()
+            .expect("the cloned fixture has an observation");
+        **event = crate::AuxEvidence::observed(
+            crate::AuxObservationV1::from_vct(
+                crate::BodyWorkOwner { authority, ..owner },
+                observation.deliveries().to_vec(),
+                observation.verification(),
+                observation.boundary_witness(),
+            )
+            .expect("the stale observation fixture is valid"),
+        );
         assert!(matches!(
             apply_transition(
                 &store,
@@ -384,8 +393,7 @@ fn graph_boundary_and_transition_invariants_reject_corruption() {
     use std::num::NonZeroUsize;
 
     use crate::{
-        AuxAuthentication, AuxDelivery, BodySizeHint, ChainScore, InvariantViolation, SuffixWork,
-        WorkCoordinate,
+        AuxDelivery, BodySizeHint, ChainScore, InvariantViolation, SuffixWork, WorkCoordinate,
     };
     use zakura_chain::work::difficulty::U256;
 
@@ -532,15 +540,14 @@ fn graph_boundary_and_transition_invariants_reject_corruption() {
     corrupt
         .change_set
         .aux_changes
-        .push(crate::AuxDelta::Put(Box::new(AuxDelivery {
-            delivery_id: EvidenceId::from_digest([0xac; 32]),
-            header_hash: missing,
-            source: SourceId::from_digest([0xad; 32]),
+        .push(crate::AuxDelta::Put(Box::new(AuxDelivery::new(
+            EvidenceId::from_digest([0xac; 32]),
+            missing,
+            SourceId::from_digest([0xad; 32]),
             owner,
-            body_size: BodySizeHint::Unknown,
-            tree_aux: None,
-            authentication: AuxAuthentication::Unauthenticated,
-        })));
+            BodySizeHint::Unknown,
+            None,
+        ))));
     assert_eq!(
         verify_plan(&test_engine(&store), &corrupt),
         Err(InvariantViolation::Auxiliary(missing))

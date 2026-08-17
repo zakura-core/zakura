@@ -8,11 +8,11 @@ use zakura_chain::{
     parameters::{testnet::RegtestParameters, Network},
 };
 use zakura_header_chain::{
-    prepare_headers, AlarmSet, AuxAuthentication, AuxDelivery, AuxEvidence, AuxiliaryViolation,
-    BodySizeHint, BodyWorkAuthority, BranchId, CheckpointSet, Clock, EngineConfig, EngineMetadata,
-    EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet, FullStateEvidenceAuthority,
-    HeaderBatchInput, HeaderChainDiskVersion, HeaderChainEngine, HeaderContextFact,
-    HeaderGeneration, HeaderInsertionFacts, HeaderRules, HeaderValidationFacts,
+    prepare_headers, AlarmSet, AuxDelivery, AuxEvidence, AuxObservationV1, AuxVerificationFactV1,
+    AuxiliaryViolation, BodySizeHint, BodyWorkAuthority, BranchId, CheckpointSet, Clock,
+    EngineConfig, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet,
+    FullStateEvidenceAuthority, HeaderBatchInput, HeaderChainDiskVersion, HeaderChainEngine,
+    HeaderContextFact, HeaderGeneration, HeaderInsertionFacts, HeaderRules, HeaderValidationFacts,
     HeaderWorkAuthority, InvalidTransitionEvidence, MemHeaderStore, SourceId, StateVersion,
     TargetCompletion, TransitionContext, TransitionEvent, TransitionFailure, TransitionInput,
     TransitionRequest, TreeAuxRecordV1, TrustedAnchor, ValidationLease, VerifiedGeneration,
@@ -63,7 +63,7 @@ fn engine_fixture() -> (HeaderChainEngine, EngineConfig, ValidationLease) {
     )
     .expect("the fixture configuration is coherent");
     let metadata = EngineMetadata {
-        disk_format: HeaderChainDiskVersion(1),
+        disk_format: HeaderChainDiskVersion::CURRENT,
         mode: EngineMode::Integrated,
         network_id: config.network.kind(),
         anchor_manifest_digest: config.trust_anchor_digest(),
@@ -145,13 +145,13 @@ fn production_incremental_verifier_accepts_exact_auxiliary_evidence() {
         NonZeroU64::new(1).expect("the fixture request ID is nonzero"),
     );
     let source = SourceId::from_digest([3; 32]);
-    let delivery = AuxDelivery {
-        delivery_id: EvidenceId::from_digest([4; 32]),
+    let delivery = AuxDelivery::new(
+        EvidenceId::from_digest([4; 32]),
         header_hash,
         source,
-        owner: owner.into(),
-        body_size: BodySizeHint::Unknown,
-        tree_aux: Some(TreeAuxRecordV1 {
+        owner.into(),
+        BodySizeHint::Unknown,
+        Some(TreeAuxRecordV1 {
             height: block::Height(1),
             sapling_root: zakura_chain::sapling::tree::Root::default(),
             orchard_root: zakura_chain::orchard::tree::Root::default(),
@@ -161,8 +161,7 @@ fn production_incremental_verifier_accepts_exact_auxiliary_evidence() {
             ironwood_tx_count: 0,
             auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([5; 32]),
         }),
-        authentication: AuxAuthentication::Unauthenticated,
-    };
+    );
     let insertion = TransitionRequest {
         expected_version: engine.snapshot().state_version,
         event: TransitionEvent::InsertHeaders(Box::new(zakura_header_chain::InsertHeaders {
@@ -198,20 +197,20 @@ fn production_incremental_verifier_accepts_exact_auxiliary_evidence() {
         .install_committed_transition(transition)
         .expect("the fixture insertion commits");
 
-    let authentication = AuxAuthentication::Authenticated {
-        evidence: EvidenceId::from_digest([6; 32]),
-        boundary_hash,
-    };
     let request = |delivery| TransitionRequest {
         expected_version: engine.snapshot().state_version,
-        event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence {
-            owner: BodyWorkAuthority::for_snapshot(&engine.snapshot()).bind(
-                2,
-                NonZeroU64::new(2).expect("the fixture request ID is nonzero"),
-            ),
-            deliveries: vec![delivery],
-            authentication,
-        })),
+        event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence::observed(
+            AuxObservationV1::from_vct(
+                BodyWorkAuthority::for_snapshot(&engine.snapshot()).bind(
+                    2,
+                    NonZeroU64::new(2).expect("the fixture request ID is nonzero"),
+                ),
+                vec![delivery],
+                AuxVerificationFactV1::current_delivery_verified(),
+                Some([6; 32].into()),
+            )
+            .expect("the observation fixture is valid"),
+        ))),
     };
     let mut altered = delivery;
     altered.source = SourceId::from_digest([7; 32]);
@@ -247,8 +246,9 @@ fn production_incremental_verifier_accepts_exact_auxiliary_evidence() {
     projected
         .install_committed_transition(transition)
         .expect("the verified transition applies to a cloned source engine");
+    assert!(projected.aux_deliveries(header_hash)[0].is_authenticated());
     assert_eq!(
-        projected.aux_deliveries(header_hash)[0].authentication,
-        authentication
+        projected.aux_deliveries(header_hash)[0].outcome_boundary_hash(),
+        Some(boundary_hash)
     );
 }

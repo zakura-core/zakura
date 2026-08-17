@@ -14,11 +14,11 @@ use super::super::{
 };
 use super::{fixture, injected_store_error, violations, AuditRead};
 use crate::{
-    AuxAuthentication, AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId,
-    ChainScore, CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState,
-    EngineMode, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
-    HeaderGeneration, HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner,
-    SourceId, SuffixWork, WorkCoordinate,
+    AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId, ChainScore,
+    CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState, EngineMode,
+    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, HeaderGeneration,
+    HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, SourceId, StoreError,
+    SuffixWork, WorkCoordinate,
 };
 
 #[test]
@@ -111,6 +111,7 @@ fn rejects_missing_duplicate_orphan_and_mismatched_tombstones() {
     };
     let matching = ConsensusInvalidBodyTombstone {
         hash: child_hash,
+        height: block::Height(1),
         evidence,
         rule,
     };
@@ -168,6 +169,7 @@ fn denies_body_states_without_full_state_authority() {
             },
             vec![ConsensusInvalidBodyTombstone {
                 hash: child_hash,
+                height: block::Height(1),
                 evidence,
                 rule,
             }],
@@ -225,6 +227,7 @@ fn violations_are_sorted_and_deduplicated() {
     store.nodes.push(store.nodes[1].clone());
     store.tombstones.push(ConsensusInvalidBodyTombstone {
         hash: child_hash,
+        height: block::Height(1),
         evidence: EvidenceId::from_digest([0x51; 32]),
         rule: BodyRuleId::new("body.rule"),
     });
@@ -402,6 +405,133 @@ fn migrated_finality_is_rejected_after_the_migration_boundary() {
 }
 
 #[test]
+fn recovery_rejects_an_extra_node_before_decoding_rows() {
+    let (mut store, mut config) = fixture();
+    config.limits.max_non_finalized_nodes =
+        NonZeroUsize::new(1).expect("one is a valid node limit");
+    store.nodes.push(store.nodes[1].clone());
+    store.failed_read = Some(AuditRead::HeaderNodes);
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
+            collection: crate::StoreCollection::HeaderNodes,
+            limit: crate::RowLimit::new(2),
+        }))
+    );
+}
+
+#[test]
+fn resource_alarm_does_not_exempt_the_startup_node_limit() {
+    let (mut store, mut config) = fixture();
+    config.limits.max_non_finalized_nodes =
+        NonZeroUsize::new(1).expect("one is a valid node limit");
+    store.nodes.push(store.nodes[1].clone());
+    store.metadata.alarms.resource_stalled = true;
+    store.snapshot = store.metadata.snapshot();
+    store.failed_read = Some(AuditRead::HeaderNodes);
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
+            collection: crate::StoreCollection::HeaderNodes,
+            limit: crate::RowLimit::new(2),
+        }))
+    );
+}
+
+#[test]
+fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
+    let (mut store, mut config) = fixture();
+    config.limits.max_aux_deliveries_total =
+        NonZeroUsize::new(1).expect("one is a valid auxiliary limit");
+    let delivery = AuxDelivery::new(
+        EvidenceId::from_digest([0x51; 32]),
+        store.nodes[1].hash,
+        SourceId::from_digest([0x52; 32]),
+        HeaderWorkOwner {
+            authority: HeaderWorkAuthority {
+                header_generation: HeaderGeneration::new(1),
+                branch: BranchId::new(store.metadata.work_origin.hash, store.nodes[1].hash),
+            },
+            session_id: 1,
+            request_id: NonZeroU64::new(1).expect("one is nonzero"),
+        }
+        .into(),
+        BodySizeHint::Unknown,
+        None,
+    );
+    store.aux = vec![delivery, delivery];
+    store.failed_read = Some(AuditRead::AuxDeliveries);
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
+            collection: crate::StoreCollection::AuxiliaryDeliveries,
+            limit: crate::RowLimit::new(1),
+        }))
+    );
+
+    let (mut store, config) = fixture();
+    store.contexts = vec![
+        ValidationContextRecord {
+            header: store.nodes[0].header.clone(),
+            height: block::Height(0),
+        };
+        crate::POW_PREDECESSOR_CONTEXT_SPAN + 1
+    ];
+    store.failed_read = Some(AuditRead::ValidationContexts);
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
+            collection: crate::StoreCollection::ValidationContexts,
+            limit: crate::RowLimit::new(crate::POW_PREDECESSOR_CONTEXT_SPAN),
+        }))
+    );
+}
+
+#[test]
+fn fatal_configuration_mismatch_fails_before_collection_visit() {
+    let (mut store, config) = fixture();
+    store.metadata.mode = EngineMode::HeadersOnly;
+    store.snapshot = store.metadata.snapshot();
+    store.failed_read = Some(AuditRead::HeaderNodes);
+
+    assert_eq!(
+        audit_store(&store, &config),
+        Err(RecoveryFailure::Source {
+            violations: vec![AuditViolation::Configuration],
+        })
+    );
+}
+
+#[test]
+fn bounded_finality_history_continues_from_an_authenticated_checkpoint() {
+    let (mut store, config) = fixture();
+    let anchor = store.metadata.frontiers.finalized;
+    store.finality_checkpoint = Some(crate::FinalityHistoryCheckpoint {
+        epoch: FinalityEpoch::new(0),
+        frontier: anchor,
+    });
+    store.finality = vec![FinalityRecord {
+        previous: anchor,
+        current: anchor,
+        source: FinalitySource::FullState {
+            evidence: EvidenceId::from_digest([0x71; 32]),
+        },
+        epoch: FinalityEpoch::new(1),
+    }];
+    store.metadata.finality_epoch = FinalityEpoch::new(1);
+    store.snapshot = store.metadata.snapshot();
+
+    audit_store(&store, &config).expect("the authenticated checkpoint continues finality audit");
+
+    store.canonical.remove(&anchor.height);
+    assert!(violations(&store, &config).contains(&AuditViolation::Finality));
+}
+
+#[test]
 fn audits_each_normative_invariant() {
     let (base, config) = fixture();
     let child_hash = base.metadata.frontiers.header_best.hash;
@@ -452,6 +582,7 @@ fn audits_each_normative_invariant() {
     };
     store.tombstones.push(ConsensusInvalidBodyTombstone {
         hash: child_hash,
+        height: block::Height(1),
         evidence,
         rule,
     });
@@ -537,15 +668,21 @@ fn audits_each_normative_invariant() {
     limited.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("one is nonzero");
     let mut oversized = base.clone();
     oversized.nodes.push(oversized.nodes[1].clone());
-    assert!(violations(&oversized, &limited).contains(&AuditViolation::Limits));
+    assert_eq!(
+        audit_store(&oversized, &limited),
+        Err(RecoveryFailure::Store(StoreError::LimitExceeded {
+            collection: crate::StoreCollection::HeaderNodes,
+            limit: crate::RowLimit::new(2),
+        }))
+    );
 
     let mut store = base.clone();
     let evidence = EvidenceId::from_digest([5; 32]);
-    store.aux.push(AuxDelivery {
-        delivery_id: evidence,
-        header_hash: block::Hash([6; 32]),
-        source: SourceId::from_digest([7; 32]),
-        owner: HeaderWorkOwner {
+    store.aux.push(AuxDelivery::new(
+        evidence,
+        block::Hash([6; 32]),
+        SourceId::from_digest([7; 32]),
+        HeaderWorkOwner {
             authority: HeaderWorkAuthority {
                 header_generation: HeaderGeneration::new(1),
                 branch: BranchId::new(base.metadata.work_origin.hash, child_hash),
@@ -554,10 +691,9 @@ fn audits_each_normative_invariant() {
             request_id: NonZeroU64::new(1).expect("one is nonzero"),
         }
         .into(),
-        body_size: BodySizeHint::Unknown,
-        tree_aux: None,
-        authentication: AuxAuthentication::Unauthenticated,
-    });
+        BodySizeHint::Unknown,
+        None,
+    ));
     assert!(violations(&store, &config)
         .iter()
         .any(|violation| matches!(violation, AuditViolation::Auxiliary(_))));

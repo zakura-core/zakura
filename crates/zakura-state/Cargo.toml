@@ -90,6 +90,7 @@ derive-getters.workspace = true
 derive-new.workspace = true
 
 [dev-dependencies]
+zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0-rc0", features = ["test-support"] }
 color-eyre = { workspace = true }
 
 once_cell = { workspace = true }

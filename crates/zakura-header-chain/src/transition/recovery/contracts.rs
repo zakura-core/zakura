@@ -7,9 +7,9 @@ use thiserror::Error;
 use zakura_chain::block;
 
 use crate::{
-    AuxDelivery, BodyValidationState, ConsensusInvalidBodyTombstone, CounterExhausted,
-    EligibilityReason, EngineMetadata, EngineSnapshot, FinalityRecord, Frontier, HeaderNode,
-    StoreError,
+    BodyValidationState, ConsensusInvalidBodyTombstone, CounterExhausted, EligibilityReason,
+    EngineMetadata, EngineSnapshot, FinalityHistoryCheckpoint, FinalityRecord, Frontier,
+    HeaderNode, RowLimit, StoreError, UntrustedAuxDeliveryRow,
 };
 
 /// One immutable predecessor record stored below the selectable finalized anchor.
@@ -29,53 +29,108 @@ pub struct ValidationContextRecord {
 ///   must observe the same durable version as [`Self::snapshot`] /
 ///   [`Self::metadata`]. Mixing rows from concurrent commits is undefined and
 ///   must surface as [`StoreError::Incoherent`] or fail closed in the audit.
-/// - **Visit ordering.** [`Self::visit_finality_history`] yields records in
+/// - **Visit ordering.** [`StoreAuditSnapshot::visit_finality_history`] yields records in
 ///   ascending finality-epoch order, contiguous from the bootstrap epoch.
 /// - **No side effects.** Implementations are read-only: no writes, no
 ///   publication, no repair mutations. Reconstruction plans are returned by
 ///   the audit API, not applied through this trait.
 pub trait StoreAuditRead {
+    /// One coherent store view retained for the complete audit.
+    type Snapshot<'a>: StoreAuditSnapshot
+    where
+        Self: 'a;
+
+    /// Open one coherent store view for singleton and collection reads.
+    fn audit_snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError>;
+}
+
+/// One coherent, bounded, read-only startup view.
+pub trait StoreAuditSnapshot {
     /// Return the atomic externally meaningful snapshot.
     fn snapshot(&self) -> Result<EngineSnapshot, StoreError>;
     /// Return complete singleton metadata from the same version as [`Self::snapshot`].
     fn metadata(&self) -> Result<EngineMetadata, StoreError>;
-    /// Return every header-node row, including disconnected rows.
-    fn all_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError>;
-    /// Return every append-only consensus-invalid body tombstone, including pruned hashes.
-    fn all_consensus_invalid_body_tombstones(
+    /// Visit header-node rows, including disconnected rows.
+    ///
+    /// Stop before decoding row `limit + 1` and return
+    /// [`StoreError::LimitExceeded`] when that row exists.
+    fn visit_header_nodes(
         &self,
-    ) -> Result<Vec<ConsensusInvalidBodyTombstone>, StoreError>;
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(HeaderNode) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError>;
+    /// Visit consensus-invalid body tombstones.
+    fn visit_consensus_invalid_body_tombstones(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(ConsensusInvalidBodyTombstone) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError>;
+    /// Return the tombstone row count stored with the logical root.
+    fn consensus_invalid_body_tombstone_count(&self) -> Result<usize, StoreError>;
     /// Return whether full-state evidence attests to this exact body-validation state.
     fn full_state_attests_to_body_validation_state(
         &self,
         header_hash: block::Hash,
         body_validation_state: &BodyValidationState,
     ) -> Result<bool, StoreError>;
-    /// Return every persisted header parent-child edge.
-    fn header_child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError>;
-    /// Complete selected projection.
-    fn selected_projection(&self) -> Result<Vec<Frontier>, StoreError>;
-    /// Complete verified projection.
-    fn verified_projection(&self) -> Result<Vec<Frontier>, StoreError>;
-    /// Complete deferred-time index.
-    fn deferred_entries(&self) -> Result<Vec<(DateTime<Utc>, block::Hash)>, StoreError>;
-    /// Every authoritative direct-reason root.
-    fn eligibility_roots(&self) -> Result<Vec<(block::Hash, EligibilityReason)>, StoreError>;
-    /// Every auxiliary delivery, including dangling rows.
-    fn all_aux_deliveries(&self) -> Result<Vec<AuxDelivery>, StoreError>;
-    /// Every immutable below-finalized context row.
-    fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError>;
+    /// Visit persisted header parent-child edges.
+    fn visit_header_child_edges(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut((block::Hash, block::Hash)) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError>;
+    /// Visit the selected projection.
+    fn visit_selected_projection(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(Frontier) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError>;
+    /// Visit the verified projection.
+    fn visit_verified_projection(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(Frontier) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError>;
+    /// Visit the deferred-time index.
+    fn visit_deferred_entries(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut((DateTime<Utc>, block::Hash)) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError>;
+    /// Visit authoritative direct-reason roots.
+    fn visit_eligibility_roots(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut((block::Hash, EligibilityReason)) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError>;
+    /// Visit untrusted auxiliary delivery rows, including dangling rows.
+    fn visit_aux_deliveries(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(UntrustedAuxDeliveryRow) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError>;
+    /// Visit immutable below-finalized context rows.
+    fn visit_validation_context_records(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(ValidationContextRecord) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError>;
     /// Return the independently authenticated canonical hash at `height`, when available.
     fn authenticated_canonical_hash(
         &self,
         height: block::Height,
     ) -> Result<Option<block::Hash>, StoreError>;
+    /// Return the authenticated frontier before the retained finality-history window.
+    fn finality_history_checkpoint(&self) -> Result<Option<FinalityHistoryCheckpoint>, StoreError>;
+    /// Return the retained finality-history row count stored with the logical root.
+    fn finality_history_count(&self) -> Result<usize, StoreError>;
     /// Visit append-only finality provenance in ascending epoch order.
     ///
     /// The visitor must see each record exactly once, oldest epoch first, with
     /// no durable mutation between visits.
     fn visit_finality_history(
         &self,
+        limit: RowLimit,
         visitor: &mut dyn FnMut(FinalityRecord) -> Result<(), StoreError>,
     ) -> Result<(), StoreError>;
 }

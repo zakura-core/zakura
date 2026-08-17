@@ -366,13 +366,16 @@ What Mode B trades, explicitly:
 
 ### Crates publish
 
-From a fresh checkout of the new tag, per the standard checklist: `cargo
-login`, then the publish loop in dependency order (`zakura-test … zakura`),
-edited to the crates that changed. Hotfix notes: crates.io is **public and
-irreversible from the first crate** — it's part of T-0, never earlier;
-`[workspace.metadata.release]` in the root `Cargo.toml` allows publishing
-from `hotfix/v*` checkouts; a mid-loop
-failure is fixed forward by publishing the remainder, not by yanking.
+`Create release` dispatches `Publish crates` once the tag exists, per the
+standard checklist; approving its `crates-io` deployment is the publish.
+Hotfix notes: crates.io is **public and irreversible from the first crate** —
+that approval is part of T-0, never earlier; the dispatch always targets
+`main` and the workflow checks out the tag itself, so publishing works from a
+`hotfix/v*` release without the `crates-io` environment accepting hotfix
+branches; a mid-publish failure is fixed forward by dispatching the workflow
+again for the same tag, which skips what landed, not by yanking. A hotfix on
+an older release line publishes versions below the newest on crates.io, so
+expect the plan to flag those rows — here that is correct.
 
 ### Pre-announcement
 

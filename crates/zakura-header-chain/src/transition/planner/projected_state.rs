@@ -173,7 +173,6 @@ impl<'a> ProjectedTransitionState<'a> {
     pub(super) fn enforce_retention(
         &mut self,
         header_best: Frontier,
-        protect_all_verified_body_paths: bool,
         retention_references: impl IntoIterator<Item = zakura_chain::block::Hash>,
         limits: EngineLimits,
     ) -> Result<RetentionPlan, TransitionFailure> {
@@ -186,7 +185,6 @@ impl<'a> ProjectedTransitionState<'a> {
             &mut self.graph,
             header_best,
             verified_best,
-            protect_all_verified_body_paths,
             retention_references,
             limits,
         )?)

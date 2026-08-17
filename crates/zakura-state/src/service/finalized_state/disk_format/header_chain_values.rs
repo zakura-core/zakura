@@ -15,14 +15,14 @@ use zakura_chain::{
     work::difficulty::U256,
 };
 use zakura_header_chain::{
-    AlarmSet, AuxAuthentication, AuxDelivery, BodyRuleId, BodySizeHint, BodyUnavailableSummary,
-    BodyValidationState, BodyWorkAuthority, BodyWorkOwner, BranchId, ChainScore,
-    ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState, EngineMetadata, EngineMode,
-    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
+    AlarmSet, AuxDelivery, BodyRuleId, BodySizeHint, BodyUnavailableSummary, BodyValidationState,
+    BodyWorkAuthority, BodyWorkOwner, BranchId, ChainScore, ConsensusInvalidBodyTombstone,
+    EligibilityReason, EligibilityState, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch,
+    FinalityHistoryCheckpoint, FinalityRecord, FinalitySource, Frontier, FrontierSet,
     HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner,
     HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, OperatorInvalidationId, SourceId,
     StateVersion, SuffixWork, TransitionDomain, TransitionFingerprint, TreeAuxRecordV1,
-    VerifiedGeneration, WorkCoordinate,
+    UntrustedAuxDeliveryRow, VerifiedGeneration, WorkCoordinate,
 };
 
 use super::FallibleDiskValue;
@@ -30,6 +30,37 @@ use super::FallibleDiskValue;
 const MAX_HEADER_BYTES: usize = 2 * 1024;
 const MAX_RULE_ID_BYTES: usize = 128;
 const MAX_AUX_DELIVERY_IDS: usize = zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS * 16;
+
+/// Bounded collection count stored with the atomic header-chain root.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderRowCountDisk(pub u64);
+
+impl FallibleDiskValue for HeaderRowCountDisk {
+    type Error = HeaderChainValueError;
+
+    fn encode(&self) -> Result<Vec<u8>, Self::Error> {
+        let mut encoder = Encoder::default();
+        encoder.u8(1);
+        encoder.u64(self.0);
+        Ok(encoder.0)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let mut decoder = Decoder::new(bytes);
+        match decoder.u8()? {
+            1 => {}
+            value => {
+                return Err(HeaderChainValueError::UnknownDiscriminant {
+                    field: "header_row_count_version",
+                    value,
+                })
+            }
+        }
+        let count = Self(decoder.u64()?);
+        decoder.finish()?;
+        Ok(count)
+    }
+}
 
 /// Malformed, truncated, oversized, or unknown version-one value data.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -80,6 +111,9 @@ pub enum HeaderChainValueError {
     /// The decoder found a noncanonical auxiliary commitment-tree root.
     #[error("invalid {0} auxiliary commitment-tree root")]
     TreeAuxRoot(&'static str),
+    /// The decoder found a malformed sealed auxiliary outcome.
+    #[error("invalid auxiliary outcome")]
+    InvalidAuxOutcome,
 }
 
 /// Durable phase of bounded full-state/header reconciliation.
@@ -354,8 +388,9 @@ impl FallibleDiskValue for ConsensusInvalidBodyTombstone {
 
     fn encode(&self) -> Result<Vec<u8>, Self::Error> {
         let mut encoder = Encoder::default();
-        encoder.u8(1);
+        encoder.u8(2);
         encoder.fixed(&self.hash.0);
+        encoder.u32(self.height.0);
         encoder.fixed(&self.evidence.digest());
         encoder.bounded(
             "consensus_invalid_rule",
@@ -368,7 +403,7 @@ impl FallibleDiskValue for ConsensusInvalidBodyTombstone {
     fn decode(bytes: &[u8]) -> Result<Self, Self::Error> {
         let mut decoder = Decoder::new(bytes);
         match decoder.u8()? {
-            1 => {}
+            2 => {}
             value => {
                 return Err(HeaderChainValueError::UnknownDiscriminant {
                     field: "consensus_invalid_tombstone_version",
@@ -377,6 +412,7 @@ impl FallibleDiskValue for ConsensusInvalidBodyTombstone {
             }
         }
         let hash = block::Hash(decoder.array()?);
+        let height = block::Height(decoder.u32()?);
         let evidence = EvidenceId::from_digest(decoder.array()?);
         let rule =
             std::str::from_utf8(decoder.bounded("consensus_invalid_rule", MAX_RULE_ID_BYTES)?)
@@ -384,6 +420,7 @@ impl FallibleDiskValue for ConsensusInvalidBodyTombstone {
         decoder.finish()?;
         Ok(Self {
             hash,
+            height,
             evidence,
             rule: BodyRuleId::new(rule),
         })
@@ -408,6 +445,7 @@ impl FullStateBodyValidationEvidenceAuthorityDisk {
     /// Build authority for a body-validation state that requires full-state authentication.
     pub fn from_body_validation_state(
         header_hash: block::Hash,
+        header_height: block::Height,
         body_validation_state: &BodyValidationState,
     ) -> Option<Self> {
         match body_validation_state {
@@ -418,6 +456,7 @@ impl FullStateBodyValidationEvidenceAuthorityDisk {
             BodyValidationState::ConsensusInvalid { evidence, rule } => {
                 Some(Self::ConsensusInvalid(ConsensusInvalidBodyTombstone {
                     hash: header_hash,
+                    height: header_height,
                     evidence: *evidence,
                     rule: rule.clone(),
                 }))
@@ -458,7 +497,7 @@ impl FallibleDiskValue for FullStateBodyValidationEvidenceAuthorityDisk {
 
     fn encode(&self) -> Result<Vec<u8>, Self::Error> {
         let mut encoder = Encoder::default();
-        encoder.u8(1);
+        encoder.u8(2);
         match self {
             Self::Verified { hash, evidence } => {
                 encoder.u8(0);
@@ -468,6 +507,7 @@ impl FallibleDiskValue for FullStateBodyValidationEvidenceAuthorityDisk {
             Self::ConsensusInvalid(tombstone) => {
                 encoder.u8(1);
                 encoder.fixed(&tombstone.hash.0);
+                encoder.u32(tombstone.height.0);
                 encoder.fixed(&tombstone.evidence.digest());
                 encoder.bounded(
                     "body_evidence_rule",
@@ -481,7 +521,7 @@ impl FallibleDiskValue for FullStateBodyValidationEvidenceAuthorityDisk {
 
     fn decode(bytes: &[u8]) -> Result<Self, Self::Error> {
         let mut decoder = Decoder::new(bytes);
-        if decoder.u8()? != 1 {
+        if decoder.u8()? != 2 {
             return Err(HeaderChainValueError::UnknownDiscriminant {
                 field: "body_evidence_authority_version",
                 value: bytes.first().copied().unwrap_or_default(),
@@ -489,15 +529,20 @@ impl FallibleDiskValue for FullStateBodyValidationEvidenceAuthorityDisk {
         }
         let kind = decoder.u8()?;
         let hash = block::Hash(decoder.array()?);
-        let evidence = EvidenceId::from_digest(decoder.array()?);
         let authority = match kind {
-            0 => Self::Verified { hash, evidence },
+            0 => Self::Verified {
+                hash,
+                evidence: EvidenceId::from_digest(decoder.array()?),
+            },
             1 => {
+                let height = block::Height(decoder.u32()?);
+                let evidence = EvidenceId::from_digest(decoder.array()?);
                 let rule =
                     std::str::from_utf8(decoder.bounded("body_evidence_rule", MAX_RULE_ID_BYTES)?)
                         .map_err(|_| HeaderChainValueError::RuleId)?;
                 Self::ConsensusInvalid(ConsensusInvalidBodyTombstone {
                     hash,
+                    height,
                     evidence,
                     rule: BodyRuleId::new(rule),
                 })
@@ -991,14 +1036,24 @@ impl FallibleDiskValue for AuxDelivery {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
-        let mut decoder = Decoder::new(bytes);
-        let value = get_aux(&mut decoder)?;
-        decoder.finish()?;
-        Ok(value)
+        let untrusted_row = decode_untrusted_aux_delivery(bytes)?;
+        if untrusted_row.outcome_status_code() == 0
+            && untrusted_row.observation_digests() == [None, None]
+            && untrusted_row.outcome_boundary_hash().is_none()
+        {
+            Ok(untrusted_row.delivery())
+        } else {
+            Err(HeaderChainValueError::InvalidAuxOutcome)
+        }
     }
 }
 
 fn put_aux(encoder: &mut Encoder, value: AuxDelivery) {
+    put_aux_base(encoder, value);
+    put_aux_outcome(encoder, value);
+}
+
+fn put_aux_base(encoder: &mut Encoder, value: AuxDelivery) {
     encoder.fixed(&value.delivery_id.digest());
     encoder.fixed(&value.header_hash.0);
     encoder.fixed(&value.source.digest());
@@ -1017,28 +1072,35 @@ fn put_aux(encoder: &mut Encoder, value: AuxDelivery) {
         encoder.u64(aux.ironwood_tx_count);
         encoder.fixed(&<[u8; 32]>::from(aux.auth_data_root));
     });
-    match value.authentication {
-        AuxAuthentication::Unauthenticated => encoder.u8(0),
-        AuxAuthentication::Authenticated {
-            evidence,
-            boundary_hash,
-        } => {
-            encoder.u8(1);
-            encoder.fixed(&evidence.digest());
-            encoder.fixed(&boundary_hash.0);
+}
+
+fn put_aux_outcome(encoder: &mut Encoder, value: AuxDelivery) {
+    let status_code = if value.is_unauthenticated() {
+        0
+    } else if value.is_authenticated() {
+        1
+    } else if value.is_rejected() {
+        2
+    } else {
+        3
+    };
+    encoder.u8(status_code);
+    if status_code != 0 {
+        for observation_id in value.observation_ids() {
+            encoder.optional(observation_id, |encoder, observation_id| {
+                encoder.fixed(&observation_id.digest());
+            });
         }
-        AuxAuthentication::Rejected { evidence } => {
-            encoder.u8(2);
-            encoder.fixed(&evidence.digest());
-        }
-        AuxAuthentication::Disputed { evidence } => {
-            encoder.u8(3);
-            encoder.fixed(&evidence.digest());
-        }
+        encoder.fixed(
+            &value
+                .outcome_boundary_hash()
+                .expect("derived auxiliary outcomes always retain their boundary")
+                .0,
+        );
     }
 }
 
-fn get_aux(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueError> {
+fn get_aux_base(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueError> {
     let delivery_id = EvidenceId::from_digest(decoder.array()?);
     let header_hash = block::Hash(decoder.array()?);
     let source = SourceId::from_digest(decoder.array()?);
@@ -1063,18 +1125,20 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueErr
             auth_data_root: AuthDataRoot::from(decoder.array()?),
         })
     })?;
-    let authentication = match decoder.u8()? {
-        0 => AuxAuthentication::Unauthenticated,
-        1 => AuxAuthentication::Authenticated {
-            evidence: EvidenceId::from_digest(decoder.array()?),
-            boundary_hash: block::Hash(decoder.array()?),
-        },
-        2 => AuxAuthentication::Rejected {
-            evidence: EvidenceId::from_digest(decoder.array()?),
-        },
-        3 => AuxAuthentication::Disputed {
-            evidence: EvidenceId::from_digest(decoder.array()?),
-        },
+    Ok(AuxDelivery::new(
+        delivery_id,
+        header_hash,
+        source,
+        owner,
+        body_size,
+        tree_aux,
+    ))
+}
+
+fn get_aux(decoder: &mut Decoder<'_>) -> Result<UntrustedAuxDeliveryRow, HeaderChainValueError> {
+    let delivery = get_aux_base(decoder)?;
+    let status_code = match decoder.u8()? {
+        value @ 0..=3 => value,
         value => {
             return Err(HeaderChainValueError::UnknownDiscriminant {
                 field: "aux_authentication",
@@ -1082,15 +1146,52 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueErr
             });
         }
     };
-    Ok(AuxDelivery {
-        delivery_id,
-        header_hash,
-        source,
-        owner,
-        body_size,
-        tree_aux,
-        authentication,
-    })
+    let (observation_digests, boundary_hash) = if status_code == 0 {
+        ([None, None], None)
+    } else {
+        let first = decoder.optional(|decoder| decoder.array())?;
+        let second = decoder.optional(|decoder| decoder.array())?;
+        ([first, second], Some(block::Hash(decoder.array()?)))
+    };
+    Ok(UntrustedAuxDeliveryRow::new(
+        delivery,
+        status_code,
+        observation_digests,
+        boundary_hash,
+    ))
+}
+
+pub(crate) fn decode_untrusted_aux_delivery(
+    bytes: &[u8],
+) -> Result<UntrustedAuxDeliveryRow, HeaderChainValueError> {
+    let mut decoder = Decoder::new(bytes);
+    let row = get_aux(&mut decoder)?;
+    decoder.finish()?;
+    Ok(row)
+}
+
+/// Decode a version-one delivery and discard its caller-selected outcome.
+pub(crate) fn decode_v1_aux_delivery(bytes: &[u8]) -> Result<AuxDelivery, HeaderChainValueError> {
+    let mut decoder = Decoder::new(bytes);
+    let delivery = get_aux_base(&mut decoder)?;
+    match decoder.u8()? {
+        0 => {}
+        1 => {
+            let _evidence = decoder.array::<32>()?;
+            let _boundary_hash = decoder.array::<32>()?;
+        }
+        2 | 3 => {
+            let _evidence = decoder.array::<32>()?;
+        }
+        value => {
+            return Err(HeaderChainValueError::UnknownDiscriminant {
+                field: "aux_authentication",
+                value,
+            });
+        }
+    }
+    decoder.finish()?;
+    Ok(delivery)
 }
 
 fn put_owner(encoder: &mut Encoder, owner: HeaderSyncWorkOwner) {
@@ -1197,6 +1298,37 @@ impl FallibleDiskValue for FinalityRecord {
             source,
             epoch,
         })
+    }
+}
+
+impl FallibleDiskValue for FinalityHistoryCheckpoint {
+    type Error = HeaderChainValueError;
+
+    fn encode(&self) -> Result<Vec<u8>, Self::Error> {
+        let mut encoder = Encoder::default();
+        encoder.u8(1);
+        encoder.u64(self.epoch.get());
+        put_frontier(&mut encoder, self.frontier);
+        Ok(encoder.0)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let mut decoder = Decoder::new(bytes);
+        match decoder.u8()? {
+            1 => {}
+            value => {
+                return Err(HeaderChainValueError::UnknownDiscriminant {
+                    field: "finality_history_checkpoint_version",
+                    value,
+                })
+            }
+        }
+        let checkpoint = Self {
+            epoch: FinalityEpoch::new(decoder.u64()?),
+            frontier: get_frontier(&mut decoder)?,
+        };
+        decoder.finish()?;
+        Ok(checkpoint)
     }
 }
 
@@ -1314,91 +1446,105 @@ impl FallibleDiskValue for EngineMetadata {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
-        let mut decoder = Decoder::new(bytes);
-        let disk_format = decoder.u32()?;
-        if disk_format != 1 {
-            return Err(HeaderChainValueError::UnsupportedDiskFormat(disk_format));
-        }
-        let disk_format = HeaderChainDiskVersion(disk_format);
-        let mode = match decoder.u8()? {
-            0 => EngineMode::Integrated,
-            1 => EngineMode::HeadersOnly,
-            value => {
-                return Err(HeaderChainValueError::UnknownDiscriminant {
-                    field: "engine_mode",
-                    value,
-                })
-            }
-        };
-        let network_id = match decoder.u8()? {
-            0 => NetworkKind::Mainnet,
-            1 => NetworkKind::Testnet,
-            2 => NetworkKind::Regtest,
-            value => {
-                return Err(HeaderChainValueError::UnknownDiscriminant {
-                    field: "network_kind",
-                    value,
-                })
-            }
-        };
-        let anchor_manifest_digest = decoder.array()?;
-        let work_origin = get_frontier(&mut decoder)?;
-        let state_version = StateVersion::new(decoder.u64()?);
-        let header_generation = HeaderGeneration::new(decoder.u64()?);
-        let verified_generation = VerifiedGeneration::new(decoder.u64()?);
-        let finality_epoch = FinalityEpoch::new(decoder.u64()?);
-        let headers_only_migration_epoch =
-            decoder.optional(|decoder| Ok(FinalityEpoch::new(decoder.u64()?)))?;
-        let frontiers = FrontierSet {
-            finalized: get_frontier(&mut decoder)?,
-            header_best: get_frontier(&mut decoder)?,
-            verified_best: get_frontier(&mut decoder)?,
-        };
-        let header_best_score = ChainScore::new(
-            SuffixWork::new(U256::from_big_endian(&decoder.array::<32>()?)),
-            block::Hash(decoder.array()?),
-        );
-        let oldest_retained_height = block::Height(decoder.u32()?);
-        let resource_stalled = decoder.bool()?;
-        let header_best_body_unavailable = decoder.optional(get_unavailable)?;
-        let last_transition = decoder.optional(|decoder| {
-            let code = decoder.u8()?;
-            let domain = TransitionDomain::from_code(code).ok_or(
-                HeaderChainValueError::UnknownDiscriminant {
-                    field: "transition_domain",
-                    value: code,
-                },
-            )?;
-            Ok(TransitionFingerprint::from_parts(
-                domain,
-                EvidenceId::from_digest(decoder.array()?),
-                decoder.array()?,
-            ))
-        })?;
-        let migrated_pin_refuted = decoder.optional(get_frontier)?;
-        decoder.finish()?;
-        Ok(EngineMetadata {
-            disk_format,
-            mode,
-            network_id,
-            anchor_manifest_digest,
-            work_origin,
-            state_version,
-            header_generation,
-            verified_generation,
-            finality_epoch,
-            headers_only_migration_epoch,
-            frontiers,
-            header_best_score,
-            oldest_retained_height,
-            alarms: AlarmSet {
-                resource_stalled,
-                header_best_body_unavailable,
-                migrated_pin_refuted,
-            },
-            last_transition,
-        })
+        decode_engine_metadata(bytes, HeaderChainDiskVersion::CURRENT)
     }
+}
+
+/// Decode metadata that carries the released version-one marker.
+pub(crate) fn decode_v1_engine_metadata(
+    bytes: &[u8],
+) -> Result<EngineMetadata, HeaderChainValueError> {
+    decode_engine_metadata(bytes, HeaderChainDiskVersion(1))
+}
+
+fn decode_engine_metadata(
+    bytes: &[u8],
+    expected_disk_format: HeaderChainDiskVersion,
+) -> Result<EngineMetadata, HeaderChainValueError> {
+    let mut decoder = Decoder::new(bytes);
+    let disk_format = decoder.u32()?;
+    if disk_format != expected_disk_format.0 {
+        return Err(HeaderChainValueError::UnsupportedDiskFormat(disk_format));
+    }
+    let disk_format = HeaderChainDiskVersion(disk_format);
+    let mode = match decoder.u8()? {
+        0 => EngineMode::Integrated,
+        1 => EngineMode::HeadersOnly,
+        value => {
+            return Err(HeaderChainValueError::UnknownDiscriminant {
+                field: "engine_mode",
+                value,
+            })
+        }
+    };
+    let network_id = match decoder.u8()? {
+        0 => NetworkKind::Mainnet,
+        1 => NetworkKind::Testnet,
+        2 => NetworkKind::Regtest,
+        value => {
+            return Err(HeaderChainValueError::UnknownDiscriminant {
+                field: "network_kind",
+                value,
+            })
+        }
+    };
+    let anchor_manifest_digest = decoder.array()?;
+    let work_origin = get_frontier(&mut decoder)?;
+    let state_version = StateVersion::new(decoder.u64()?);
+    let header_generation = HeaderGeneration::new(decoder.u64()?);
+    let verified_generation = VerifiedGeneration::new(decoder.u64()?);
+    let finality_epoch = FinalityEpoch::new(decoder.u64()?);
+    let headers_only_migration_epoch =
+        decoder.optional(|decoder| Ok(FinalityEpoch::new(decoder.u64()?)))?;
+    let frontiers = FrontierSet {
+        finalized: get_frontier(&mut decoder)?,
+        header_best: get_frontier(&mut decoder)?,
+        verified_best: get_frontier(&mut decoder)?,
+    };
+    let header_best_score = ChainScore::new(
+        SuffixWork::new(U256::from_big_endian(&decoder.array::<32>()?)),
+        block::Hash(decoder.array()?),
+    );
+    let oldest_retained_height = block::Height(decoder.u32()?);
+    let resource_stalled = decoder.bool()?;
+    let header_best_body_unavailable = decoder.optional(get_unavailable)?;
+    let last_transition = decoder.optional(|decoder| {
+        let code = decoder.u8()?;
+        let domain = TransitionDomain::from_code(code).ok_or(
+            HeaderChainValueError::UnknownDiscriminant {
+                field: "transition_domain",
+                value: code,
+            },
+        )?;
+        Ok(TransitionFingerprint::from_parts(
+            domain,
+            EvidenceId::from_digest(decoder.array()?),
+            decoder.array()?,
+        ))
+    })?;
+    let migrated_pin_refuted = decoder.optional(get_frontier)?;
+    decoder.finish()?;
+    Ok(EngineMetadata {
+        disk_format,
+        mode,
+        network_id,
+        anchor_manifest_digest,
+        work_origin,
+        state_version,
+        header_generation,
+        verified_generation,
+        finality_epoch,
+        headers_only_migration_epoch,
+        frontiers,
+        header_best_score,
+        oldest_retained_height,
+        alarms: AlarmSet {
+            resource_stalled,
+            header_best_body_unavailable,
+            migrated_pin_refuted,
+        },
+        last_transition,
+    })
 }
 
 #[cfg(test)]
@@ -1553,13 +1699,13 @@ mod tests {
             request_id: NonZeroU64::new(5).expect("five is nonzero"),
         }
         .into();
-        let aux = AuxDelivery {
-            delivery_id: EvidenceId::from_digest([6; 32]),
-            header_hash: block::Hash([7; 32]),
-            source: SourceId::from_digest([8; 32]),
+        let base_aux = AuxDelivery::new(
+            EvidenceId::from_digest([6; 32]),
+            block::Hash([7; 32]),
+            SourceId::from_digest([8; 32]),
             owner,
-            body_size: BodySizeHint::Known(NonZeroU32::new(9).expect("nine is nonzero")),
-            tree_aux: Some(TreeAuxRecordV1 {
+            BodySizeHint::Known(NonZeroU32::new(9).expect("nine is nonzero")),
+            Some(TreeAuxRecordV1 {
                 height: block::Height(10),
                 sapling_root: sapling::tree::Root::default(),
                 orchard_root: orchard::tree::Root::default(),
@@ -1569,38 +1715,87 @@ mod tests {
                 ironwood_tx_count: 13,
                 auth_data_root: AuthDataRoot::from([14; 32]),
             }),
-            authentication: AuxAuthentication::Authenticated {
-                evidence: EvidenceId::from_digest([11; 32]),
-                boundary_hash: block::Hash([12; 32]),
-            },
-        };
-        assert_eq!(
-            AuxDelivery::decode(&aux.encode().expect("aux encodes")),
-            Ok(aux)
         );
-        let disputed_aux = AuxDelivery {
-            authentication: AuxAuthentication::Disputed {
-                evidence: EvidenceId::from_digest([15; 32]),
-            },
-            ..aux
-        };
+        let aux = base_aux
+            .test_only_with_outcome(1, [Some([11; 32]), None], Some(block::Hash([12; 32])))
+            .expect("the authenticated outcome is coherent");
         assert_eq!(
-            AuxDelivery::decode(&disputed_aux.encode().expect("disputed aux encodes")),
-            Ok(disputed_aux)
+            decode_untrusted_aux_delivery(&aux.encode().expect("aux encodes")),
+            Ok(UntrustedAuxDeliveryRow::new(
+                base_aux,
+                1,
+                [Some([11; 32]), None],
+                Some(block::Hash([12; 32])),
+            ))
+        );
+        let rejected_aux = base_aux
+            .test_only_with_outcome(2, [Some([13; 32]), None], Some(block::Hash([14; 32])))
+            .expect("the rejected outcome is coherent");
+        assert_eq!(
+            decode_untrusted_aux_delivery(&rejected_aux.encode().expect("rejected aux encodes")),
+            Ok(UntrustedAuxDeliveryRow::new(
+                base_aux,
+                2,
+                [Some([13; 32]), None],
+                Some(block::Hash([14; 32])),
+            ))
+        );
+        let disputed_aux = base_aux
+            .test_only_with_outcome(3, [Some([15; 32]), None], Some(block::Hash([16; 32])))
+            .expect("the disputed outcome is coherent");
+        assert_eq!(
+            decode_untrusted_aux_delivery(&disputed_aux.encode().expect("disputed aux encodes")),
+            Ok(UntrustedAuxDeliveryRow::new(
+                base_aux,
+                3,
+                [Some([15; 32]), None],
+                Some(block::Hash([16; 32])),
+            ))
         );
         let mut legacy_aux = aux.encode().expect("aux encodes");
         const OWNER_STATE_VERSION_OFFSET: usize = 32 + 32 + 32;
         legacy_aux[OWNER_STATE_VERSION_OFFSET..OWNER_STATE_VERSION_OFFSET + 8]
             .copy_from_slice(&99_u64.to_be_bytes());
-        assert_eq!(AuxDelivery::decode(&legacy_aux), Ok(aux));
+        assert_eq!(
+            decode_untrusted_aux_delivery(&legacy_aux),
+            Ok(UntrustedAuxDeliveryRow::new(
+                base_aux,
+                1,
+                [Some([11; 32]), None],
+                Some(block::Hash([12; 32])),
+            ))
+        );
         let mut malformed_aux = aux.encode().expect("aux encodes");
         const SAPLING_ROOT_OFFSET: usize = 32 + 32 + 32 + 105 + 4 + 1 + 4;
         malformed_aux[SAPLING_ROOT_OFFSET..SAPLING_ROOT_OFFSET + 32].fill(0xff);
         assert_eq!(
-            AuxDelivery::decode(&malformed_aux),
+            decode_untrusted_aux_delivery(&malformed_aux),
             Err(HeaderChainValueError::TreeAuxRoot("Sapling"))
         );
-
+        let legacy_outcome = |status_code, evidence: [u8; 32], boundary: Option<[u8; 32]>| {
+            let mut bytes = base_aux.encode().expect("base auxiliary delivery encodes");
+            *bytes
+                .last_mut()
+                .expect("the encoded delivery ends in its status code") = status_code;
+            bytes.extend(evidence);
+            if let Some(boundary) = boundary {
+                bytes.extend(boundary);
+            }
+            bytes
+        };
+        for bytes in [
+            legacy_outcome(1, [17; 32], Some([18; 32])),
+            legacy_outcome(2, [19; 32], None),
+            legacy_outcome(3, [20; 32], None),
+        ] {
+            assert_eq!(decode_v1_aux_delivery(&bytes), Ok(base_aux));
+        }
+        let mut truncated_legacy = legacy_outcome(2, [21; 32], None);
+        truncated_legacy.pop();
+        assert_eq!(
+            decode_v1_aux_delivery(&truncated_legacy),
+            Err(HeaderChainValueError::Truncated)
+        );
         let finality = FinalityRecord {
             previous: frontier(10, 1),
             current: frontier(11, 2),
@@ -1615,7 +1810,7 @@ mod tests {
         );
 
         let metadata = EngineMetadata {
-            disk_format: HeaderChainDiskVersion(1),
+            disk_format: HeaderChainDiskVersion::CURRENT,
             mode: EngineMode::HeadersOnly,
             network_id: NetworkKind::Regtest,
             anchor_manifest_digest: [13; 32],
@@ -1660,8 +1855,21 @@ mod tests {
             )),
         };
         let bytes = metadata.encode().expect("metadata encodes");
-        assert_eq!(&bytes[..6], &[0, 0, 0, 1, 1, 2]);
+        assert_eq!(&bytes[..6], &[0, 0, 0, 2, 1, 2]);
         assert_eq!(EngineMetadata::decode(&bytes), Ok(metadata.clone()));
+        let mut version_one_bytes = bytes.clone();
+        version_one_bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
+        assert_eq!(
+            EngineMetadata::decode(&version_one_bytes),
+            Err(HeaderChainValueError::UnsupportedDiskFormat(1))
+        );
+        assert_eq!(
+            decode_v1_engine_metadata(&version_one_bytes),
+            Ok(EngineMetadata {
+                disk_format: HeaderChainDiskVersion(1),
+                ..metadata.clone()
+            })
+        );
         let mut legacy_bytes = bytes.clone();
         legacy_bytes.truncate(
             legacy_bytes
@@ -1675,7 +1883,7 @@ mod tests {
         );
         // These digests pin the on-disk encodings. Regenerate a digest only together with a
         // deliberate encoding change; an unexplained change means a value's layout drifted.
-        // The metadata digest last moved when `headers_only_migration_epoch` was appended.
+        // The metadata digest last moved when the header-chain disk version advanced to 2.
         assert_eq!(
             [
                 digest(&aux.encode().expect("aux encodes")),
@@ -1683,9 +1891,9 @@ mod tests {
                 digest(&bytes),
             ],
             [
-                "ef31b854deb19b68411aabedc15a681405065939be00a691a050a4325df3348e",
+                "c041fc819cc43fcd28dd3ba7fe296271ae0c7225c9bbcdf1dd38152dc313346a",
                 "b887bf384510dfb1a255221a8c97066617cb145eaf3e272ad70dc94cd17a3802",
-                "538aaccaf8a97966ec5d3b678c608067e950402ac95995ef7e0eecfecba36066",
+                "3f4965a634583e651b4904de0601c44e934719dbcb4e22a783bf052b7c21e9eb",
             ]
         );
     }
@@ -1762,13 +1970,13 @@ mod tests {
                 ..
             })
         ));
-        let mut metadata = vec![0, 0, 0, 2];
+        let mut metadata = vec![0, 0, 0, 3];
         metadata.resize(512, 0);
         assert_eq!(
             EngineMetadata::decode(&metadata),
-            Err(HeaderChainValueError::UnsupportedDiskFormat(2))
+            Err(HeaderChainValueError::UnsupportedDiskFormat(3))
         );
-        metadata[3] = 1;
+        metadata[3] = 2;
         metadata[4] = 9;
         assert!(matches!(
             EngineMetadata::decode(&metadata),

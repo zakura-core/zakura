@@ -8,7 +8,8 @@ mod operator;
 mod replay;
 mod verified;
 
-pub use auxiliary_evidence::AuxEvidence;
+pub(crate) use auxiliary_evidence::AuxVerificationKindV1;
+pub use auxiliary_evidence::{AuxEvidence, AuxObservationV1, AuxVerificationFactV1};
 pub use body::{
     BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch, BodySupplierDiscovered,
     BodyVerificationClass, BodyVerificationOutcome, ConsensusBodyInvalid, OperatorBodyRetry,
@@ -22,7 +23,7 @@ pub use verified::{
     VerifiedBlockAccepted, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
-use crate::{AuxAuthentication, BodyWorkOwner, EvidenceId, HeaderSyncWorkOwner, StateVersion};
+use crate::{BodyWorkOwner, EvidenceId, HeaderSyncWorkOwner, StateVersion};
 
 use replay::hash_transition_payload;
 use sha2::{Digest, Sha256};
@@ -111,12 +112,9 @@ impl TransitionEvent {
             Self::OperatorReconsider(event) => Some(event.evidence),
             Self::FullStateFinalized(event) => Some(event.full_state_transition_id),
             Self::MigratedPinRefutation(event) => Some(event.full_state_transition_id),
-            Self::AuxEvidence(event) => match event.authentication {
-                AuxAuthentication::Unauthenticated => None,
-                AuxAuthentication::Authenticated { evidence, .. }
-                | AuxAuthentication::Rejected { evidence }
-                | AuxAuthentication::Disputed { evidence } => Some(evidence),
-            },
+            Self::AuxEvidence(event) => event
+                .observation()
+                .map(|observation| EvidenceId::from_digest(observation.observation_id().digest())),
             Self::ReevaluateDeferred => None,
         }
     }
@@ -169,7 +167,7 @@ impl TransitionEvent {
     /// Return body authority for asynchronous body-originated evidence.
     pub fn body_owner(&self) -> Option<BodyWorkOwner> {
         match self {
-            Self::AuxEvidence(event) => Some(event.owner),
+            Self::AuxEvidence(event) => event.observation().map(AuxObservationV1::owner),
             _ => None,
         }
     }

@@ -15,7 +15,7 @@ use crate::EngineConfig;
 
 pub use contracts::{
     AuditViolation, RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead,
-    ValidationContextRecord,
+    StoreAuditSnapshot, ValidationContextRecord,
 };
 
 use audit::audit_authoritative;
@@ -59,12 +59,13 @@ fn audit_store_at_with_policy<S: StoreAuditRead>(
     now: DateTime<Utc>,
     allow_trust_anchor_update: bool,
 ) -> Result<RecoveryPlan, RecoveryFailure> {
+    let snapshot = store.audit_snapshot()?;
     // Phase 1: load exhaustive durable rows
-    let rows = load_pre_audit_store_rows(store, config, allow_trust_anchor_update)?;
+    let rows = load_pre_audit_store_rows(&snapshot, config, allow_trust_anchor_update)?;
     // Phase 2: fail closed on authoritative contradictions
-    let audited = audit_authoritative(store, rows, config, now)?;
+    let audited = audit_authoritative(&snapshot, rows, config, now)?;
     // Phase 3: reconstruct derived views from audited source
     let derived = reconstruct_derived_views(&audited, config, now)?;
     // Phase 4: classify reconstructible repairs and assemble the plan
-    classify_and_plan(store, audited, derived, config)
+    classify_and_plan(&snapshot, audited, derived, config)
 }

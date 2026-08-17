@@ -25,6 +25,8 @@ on:
       - rust-toolchain.toml
       - .github/actions/setup-zakura-build/**
       - .github/workflows/tests-unit.yml
+      - scripts/check-crate-publish-graph.sh
+      - scripts/lib/crates-index.sh
       - docs/specs/fork-aware-header-chain-engine.md
       - crates/zakura-header-chain/conformance.toml
 
@@ -74,6 +76,7 @@ jobs:
     outputs:
       config: ${{ steps.filter.outputs.config }}
       rust: ${{ steps.filter.outputs.rust }}
+      publish_graph: ${{ steps.filter.outputs.publish_graph }}
     steps:
       - id: filter
         env:
@@ -97,6 +100,7 @@ jobs:
                  (( TOTAL_CHANGED_FILES >= 3000 )); then
                 echo "config=true" >> "$GITHUB_OUTPUT"
                 echo "rust=true" >> "$GITHUB_OUTPUT"
+                echo "publish_graph=true" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
 
@@ -127,11 +131,15 @@ jobs:
             workflow_dispatch)
               echo "config=true" >> "$GITHUB_OUTPUT"
               echo "rust=true" >> "$GITHUB_OUTPUT"
+              echo "publish_graph=true" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
             schedule)
               echo "config=false" >> "$GITHUB_OUTPUT"
               echo "rust=false" >> "$GITHUB_OUTPUT"
+              # Nightly re-checks the live index so main cannot silently
+              # accumulate a skipped-dependent pin after a crates.io publish.
+              echo "publish_graph=true" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
@@ -172,8 +180,18 @@ jobs:
             rust=false
           fi
 
+          # Semver-checks cannot see a dependency major underneath unchanged
+          # type names. This path set is what can introduce a skipped crate
+          # whose index manifest still pins the old major.
+          if grep -qE '(^|/)Cargo\.(toml|lock)$|^scripts/check-crate-publish-graph\.sh$|^scripts/lib/crates-index\.sh$|^\.github/workflows/tests-unit\.yml$' <<< "$changed"; then
+            publish_graph=true
+          else
+            publish_graph=false
+          fi
+
           echo "config=$config" >> "$GITHUB_OUTPUT"
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "publish_graph=$publish_graph" >> "$GITHUB_OUTPUT"
 
   # Compile the whole workspace and every test binary ONCE, then hand the result
   # to the shard jobs as a nextest archive. Previously each of the 3 shards ran
@@ -401,6 +419,38 @@ jobs:
       - name: Check no git dependencies
         run: cargo nextest run --profile check-no-git-dependencies --locked --run-ignored=only
 
+  # Semver-checks compares rustdoc APIs and cannot see a dependency's major
+  # bump underneath an unchanged type name. This job is the gate that can:
+  # it dry-run-publishes the real publish set against the live crates.io
+  # index, so a skipped dependent whose index manifest still pins the old
+  # major fails here instead of accumulating on main. It lives in this
+  # workflow because only `test success` is globally required.
+  publish-graph:
+    name: crates.io publish graph
+    needs: changes
+    # Path-gated on PRs and pushes. Always runs in the merge queue and
+    # nightly so a docs-only merge cannot land on top of a broken graph.
+    if: >
+      needs.changes.outputs.publish_graph == 'true'
+      || github.event_name == 'merge_group'
+      || github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
+          # Packages crates with --no-verify; does not compile them.
+          cache: false
+      - name: Check crates.io publish graph
+        run: ./scripts/check-crate-publish-graph.sh
+
   # NOTE: the Zakura regtest e2e jobs moved to `zakura-e2e.yml` so they can be
   # path-gated independently of the broad Rust filter here (they run on
   # Zakura-relevant PRs, always in the merge queue, and nightly for long modes).
@@ -417,6 +467,7 @@ jobs:
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
+      - publish-graph
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed
@@ -427,9 +478,10 @@ jobs:
           # build-tests / unit-tests / network-dependent skip on pull requests
           # that touch no test-relevant paths (unit-tests and zakura-config
           # cascade-skip with build-tests), pruned-storage is push-main only,
-          # check-no-git-dependencies is A-release-label only. Failed,
-          # non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent
+          # check-no-git-dependencies is A-release-label only, publish-graph
+          # skips on PRs that do not touch Cargo manifests or this check.
+          # Failed, non-skipped jobs still fail this aggregate status.
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, publish-graph
 
   report-nightly-result:
     name: report nightly release test result

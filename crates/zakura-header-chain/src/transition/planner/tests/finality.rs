@@ -1058,18 +1058,12 @@ fn authenticated_verified_reset_replaces_a_full_retention_fork_set() {
         .header
         .clone();
     store.lease = validation_lease_for(&store, anchor);
-    let staged_tips = retained_tips
-        .iter()
-        .copied()
-        .filter(|tip| *tip != dropped)
-        .map(|tip| tip.hash)
-        .chain(std::iter::once(replacement.hash))
-        .collect::<Vec<_>>();
+    let active_validation_context = [anchor.hash];
     let context = TransitionContext {
         config: &config,
         clock: &clock,
         full_state_authority: Some(&authority),
-        retention_references: &staged_tips,
+        retention_references: &active_validation_context,
     };
     let request = TransitionRequest {
         expected_version: store.metadata.state_version,
@@ -1088,7 +1082,10 @@ fn authenticated_verified_reset_replaces_a_full_retention_fork_set() {
     let plan = apply_transition(&store, request, &context)
         .expect("the authenticated full-state fork set replaces one retained branch");
 
-    assert!(plan.change_set.delete_nodes.contains(&dropped.hash));
+    assert_eq!(plan.change_set.delete_nodes.len(), 1);
+    assert!(retained_tips
+        .iter()
+        .any(|tip| plan.change_set.delete_nodes.contains(&tip.hash)));
     assert!(!plan.change_set.delete_nodes.contains(&replacement.hash));
     assert_eq!(
         plan.change_set.metadata.frontiers.verified_best,

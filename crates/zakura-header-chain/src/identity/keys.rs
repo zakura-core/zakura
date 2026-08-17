@@ -48,6 +48,31 @@ impl fmt::Debug for EvidenceId {
     }
 }
 
+/// Opaque identity of one complete auxiliary verification observation.
+#[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AuxObservationId([u8; 32]);
+
+impl AuxObservationId {
+    /// Return the opaque digest bytes.
+    pub const fn digest(self) -> [u8; 32] {
+        self.0
+    }
+
+    /// Reconstruct an identity from its validated durable digest.
+    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+}
+
+impl fmt::Debug for AuxObservationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("AuxObservationId")
+            .field(&self.0)
+            .finish()
+    }
+}
+
 /// Stable identifier for one independently removable operator invalidation.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OperatorInvalidationId([u8; 16]);

@@ -100,13 +100,13 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
         let repair_owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&before)
             .bind(53, NonZeroU64::new(54).expect("fifty-four is nonzero"));
         let source = SourceId::from_digest([marker.wrapping_add(2); 32]);
-        let delivery = AuxDelivery {
-            delivery_id: EvidenceId::from_digest([marker.wrapping_add(3); 32]),
-            header_hash: child.hash,
+        let delivery = AuxDelivery::new(
+            EvidenceId::from_digest([marker.wrapping_add(3); 32]),
+            child.hash,
             source,
-            owner: repair_owner.into(),
-            body_size: zakura_header_chain::BodySizeHint::Unknown,
-            tree_aux: Some(zakura_header_chain::TreeAuxRecordV1 {
+            repair_owner.into(),
+            zakura_header_chain::BodySizeHint::Unknown,
+            Some(zakura_header_chain::TreeAuxRecordV1 {
                 height: child.height,
                 sapling_root: Default::default(),
                 orchard_root: Default::default(),
@@ -118,8 +118,7 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
                     [marker.wrapping_add(4); 32],
                 ),
             }),
-            authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
-        };
+        );
         let context = TransitionContext {
             config: &engine_config,
             clock: &SystemClock,
@@ -340,13 +339,13 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
         let boundary = Frontier::new(boundary_height, boundary_header.hash());
         let insertion_owner = header_owner(&initial, boundary.hash, 21, 22);
         let source = SourceId::from_digest([marker.wrapping_add(2); 32]);
-        let delivery = AuxDelivery {
-            delivery_id: EvidenceId::from_digest([marker.wrapping_add(3); 32]),
-            header_hash: current.hash,
+        let delivery = AuxDelivery::new(
+            EvidenceId::from_digest([marker.wrapping_add(3); 32]),
+            current.hash,
             source,
-            owner: insertion_owner,
-            body_size: zakura_header_chain::BodySizeHint::Unknown,
-            tree_aux: Some(zakura_header_chain::TreeAuxRecordV1 {
+            insertion_owner,
+            zakura_header_chain::BodySizeHint::Unknown,
+            Some(zakura_header_chain::TreeAuxRecordV1 {
                 height: current.height,
                 sapling_root: Default::default(),
                 orchard_root: Default::default(),
@@ -358,8 +357,7 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
                     [marker.wrapping_add(4); 32],
                 ),
             }),
-            authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
-        };
+        );
         let insertion_context = TransitionContext {
             config: &engine_config,
             clock: &SystemClock,
@@ -387,11 +385,18 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
             .expect("the unauthenticated delivery inserts with its exact headers");
 
         let before = runtime.publisher().snapshot();
-        let evidence = EvidenceId::from_digest([marker.wrapping_add(5); 32]);
-        let authentication = zakura_header_chain::AuxAuthentication::Authenticated {
-            evidence,
-            boundary_hash: boundary.hash,
-        };
+        let observation = zakura_header_chain::AuxObservationV1::from_vct(
+            body_owner(
+                &before,
+                insertion_owner.session_id(),
+                insertion_owner.request_id().get(),
+            ),
+            vec![delivery],
+            zakura_header_chain::AuxVerificationFactV1::current_delivery_verified(),
+            Some([marker.wrapping_add(5); 32].into()),
+        )
+        .expect("the authentication observation is valid");
+        let evidence = EvidenceId::from_digest(observation.observation_id().digest());
         let authority = Authority(evidence);
         let context = TransitionContext {
             config: &engine_config,
@@ -401,15 +406,9 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
         };
         let request = TransitionRequest {
             expected_version: before.state_version,
-            event: TransitionEvent::AuxEvidence(Box::new(zakura_header_chain::AuxEvidence {
-                owner: body_owner(
-                    &before,
-                    insertion_owner.session_id(),
-                    insertion_owner.request_id().get(),
-                ),
-                deliveries: vec![delivery],
-                authentication,
-            })),
+            event: TransitionEvent::AuxEvidence(Box::new(
+                zakura_header_chain::AuxEvidence::observed(observation),
+            )),
         };
         let marker_key = [marker; 4];
         let mut full_state_batch = DiskWriteBatch::new();
@@ -484,12 +483,8 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
             .expect("the auxiliary row read succeeds");
         assert_eq!(stored_delivery.len(), 1, "{target:?}");
         assert_eq!(
-            stored_delivery[0].authentication,
-            if committed {
-                authentication
-            } else {
-                zakura_header_chain::AuxAuthentication::Unauthenticated
-            },
+            stored_delivery[0].is_authenticated(),
+            committed,
             "{target:?}"
         );
         let current_node = observation
@@ -523,12 +518,8 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
             .expect("the reopened auxiliary row is readable");
         assert_eq!(reopened_delivery.len(), 1, "{target:?}");
         assert_eq!(
-            reopened_delivery[0].authentication,
-            if committed {
-                authentication
-            } else {
-                zakura_header_chain::AuxAuthentication::Unauthenticated
-            },
+            reopened_delivery[0].is_authenticated(),
+            committed,
             "{target:?}"
         );
     }
@@ -556,20 +547,22 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
         let delivery_owner =
             zakura_header_chain::BodyWorkAuthority::for_snapshot(&metadata.snapshot())
                 .bind(61, NonZeroU64::new(62).expect("sixty-two is nonzero"));
-        let first = AuxDelivery {
-            delivery_id: EvidenceId::from_digest([marker.wrapping_add(1); 32]),
-            header_hash: anchor.hash,
-            source: SourceId::from_digest([marker.wrapping_add(2); 32]),
-            owner: delivery_owner.into(),
-            body_size: zakura_header_chain::BodySizeHint::Unknown,
-            tree_aux: None,
-            authentication: zakura_header_chain::AuxAuthentication::Unauthenticated,
-        };
-        let second = AuxDelivery {
-            delivery_id: EvidenceId::from_digest([marker.wrapping_add(3); 32]),
-            source: SourceId::from_digest([marker.wrapping_add(4); 32]),
-            ..first
-        };
+        let first = AuxDelivery::new(
+            EvidenceId::from_digest([marker.wrapping_add(1); 32]),
+            anchor.hash,
+            SourceId::from_digest([marker.wrapping_add(2); 32]),
+            delivery_owner.into(),
+            zakura_header_chain::BodySizeHint::Unknown,
+            None,
+        );
+        let second = AuxDelivery::new(
+            EvidenceId::from_digest([marker.wrapping_add(3); 32]),
+            first.header_hash,
+            SourceId::from_digest([marker.wrapping_add(4); 32]),
+            first.owner,
+            first.body_size,
+            first.tree_aux,
+        );
         anchor
             .aux_delivery_ids
             .extend([first.delivery_id, second.delivery_id]);
@@ -602,8 +595,15 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
             .startup(&engine_config)
             .expect("the two-delivery fixture audits");
         let before = runtime.publisher().snapshot();
-        let evidence = EvidenceId::from_digest([marker.wrapping_add(5); 32]);
-        let authentication = zakura_header_chain::AuxAuthentication::Rejected { evidence };
+        let observation = zakura_header_chain::AuxObservationV1::from_vct(
+            zakura_header_chain::BodyWorkAuthority::for_snapshot(&before)
+                .bind(delivery_owner.session_id, delivery_owner.request_id),
+            vec![first],
+            zakura_header_chain::AuxVerificationFactV1::successor_delivery_failed(1),
+            Some([marker.wrapping_add(5); 32].into()),
+        )
+        .expect("the rejection observation is valid");
+        let evidence = EvidenceId::from_digest(observation.observation_id().digest());
         let authority = Authority(evidence);
         let context = TransitionContext {
             config: &engine_config,
@@ -627,12 +627,9 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
         let result = runtime.apply_combined_with_fault(
             TransitionRequest {
                 expected_version: before.state_version,
-                event: TransitionEvent::AuxEvidence(Box::new(zakura_header_chain::AuxEvidence {
-                    owner: zakura_header_chain::BodyWorkAuthority::for_snapshot(&before)
-                        .bind(delivery_owner.session_id, delivery_owner.request_id),
-                    deliveries: vec![first, second],
-                    authentication,
-                })),
+                event: TransitionEvent::AuxEvidence(Box::new(
+                    zakura_header_chain::AuxEvidence::observed(observation),
+                )),
             },
             &context,
             full_state_batch,
@@ -683,14 +680,8 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
             .aux_deliveries(anchor.hash)
             .expect("the rejected delivery rows are readable");
         assert_eq!(stored.len(), 2);
-        assert!(stored.iter().all(|delivery| {
-            delivery.authentication
-                == if committed {
-                    authentication
-                } else {
-                    zakura_header_chain::AuxAuthentication::Unauthenticated
-                }
-        }));
+        assert_eq!(stored[0].is_rejected(), committed);
+        assert!(stored[1].is_unauthenticated());
         assert_eq!(
             observation
                 .reopened
@@ -716,13 +707,7 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
             .aux_deliveries(anchor.hash)
             .expect("the reopened rejected delivery rows are readable");
         assert_eq!(reopened_deliveries.len(), 2);
-        assert!(reopened_deliveries.iter().all(|delivery| {
-            delivery.authentication
-                == if committed {
-                    authentication
-                } else {
-                    zakura_header_chain::AuxAuthentication::Unauthenticated
-                }
-        }));
+        assert_eq!(reopened_deliveries[0].is_rejected(), committed);
+        assert!(reopened_deliveries[1].is_unauthenticated());
     }
 }

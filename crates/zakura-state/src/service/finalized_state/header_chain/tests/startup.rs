@@ -1,5 +1,241 @@
 use super::*;
 
+fn legacy_rejected_aux_bytes(delivery: AuxDelivery, evidence: [u8; 32]) -> Vec<u8> {
+    let mut bytes = delivery
+        .encode()
+        .expect("the base auxiliary delivery encodes");
+    *bytes
+        .last_mut()
+        .expect("the encoded delivery ends in its status code") = 2;
+    bytes.extend(evidence);
+    bytes
+}
+
+fn mark_metadata_as_v1(metadata: &EngineMetadata) -> Vec<u8> {
+    let mut bytes = metadata.encode().expect("the metadata fixture encodes");
+    bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
+    bytes
+}
+
+#[test]
+fn rocksdb_snapshot_stops_at_the_first_extra_row_without_decoding() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    store
+        .initialize(metadata, anchor)
+        .expect("the valid anchor initializes the fixture");
+    let cf = store
+        .cf(HEADER_NODE_BY_HASH)
+        .expect("the node column family exists");
+    store
+        .db
+        .put_cf(&cf, [0xff; 32], b"intentionally malformed")
+        .expect("the malformed extra row writes");
+
+    let audit = store.audit_snapshot().expect("the audit snapshot opens");
+    let mut decoded = 0;
+    assert_eq!(
+        audit.visit_header_nodes(RowLimit::new(1), &mut |_| {
+            decoded += 1;
+            Ok(())
+        }),
+        Err(StoreError::LimitExceeded {
+            collection: StoreCollection::HeaderNodes,
+            limit: RowLimit::new(1),
+        })
+    );
+    assert_eq!(decoded, 1);
+}
+
+#[test]
+fn version_one_migration_downgrades_legacy_verdicts_atomically() {
+    let db_config = Config::ephemeral();
+    let (engine_config, mut anchor, mut metadata) = fixture();
+    metadata.last_transition = Some(zakura_header_chain::TransitionFingerprint::from_parts(
+        zakura_header_chain::TransitionDomain::AuxEvidence,
+        EvidenceId::from_digest([0x30; 32]),
+        [0x30; 32],
+    ));
+    let previous_state_version = metadata.state_version;
+    let delivery = AuxDelivery::new(
+        EvidenceId::from_digest([0x31; 32]),
+        anchor.hash,
+        SourceId::from_digest([0x32; 32]),
+        header_owner(&metadata.snapshot(), anchor.hash, 1, 1),
+        zakura_header_chain::BodySizeHint::Unknown,
+        None,
+    );
+    anchor.aux_delivery_ids.push(delivery.delivery_id);
+    let db = open(&db_config, &engine_config.network);
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata.clone(), anchor)
+        .expect("the current fixture initializes");
+
+    let delivery_key = HeaderAuxDeliveryKey {
+        header: delivery.header_hash,
+        delivery: delivery.delivery_id,
+    }
+    .as_bytes();
+    let delivery_value = legacy_rejected_aux_bytes(delivery, [0x33; 32]);
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_AUX_DELIVERY,
+            delivery_key,
+            &delivery_value,
+        )
+        .expect("the legacy auxiliary row stages");
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            mark_metadata_as_v1(&metadata),
+        )
+        .expect("the version-one metadata stages");
+    store.db.write(batch).expect("the legacy fixture commits");
+
+    assert!(store
+        .migrate_v1_to_current(&engine_config)
+        .expect("the version-one store migrates"));
+    let migrated_metadata = store.metadata().expect("the metadata remains readable");
+    assert_eq!(
+        migrated_metadata.disk_format,
+        HeaderChainDiskVersion::CURRENT
+    );
+    assert_eq!(
+        migrated_metadata.state_version,
+        previous_state_version
+            .checked_next()
+            .expect("the fixture state version can advance")
+    );
+    assert_eq!(migrated_metadata.last_transition, None);
+    assert_eq!(
+        store
+            .load_aux_deliveries()
+            .expect("the legacy delivery is readable"),
+        vec![UntrustedAuxDeliveryRow::new(
+            delivery,
+            0,
+            [None, None],
+            None,
+        )]
+    );
+    let (_, report) = store
+        .clone()
+        .startup(&engine_config)
+        .expect("startup audits the migrated store");
+    assert!(report.publication_allowed);
+    let aux_cf = store
+        .cf(HEADER_AUX_DELIVERY)
+        .expect("the auxiliary column family exists");
+    let migrated_value = store
+        .db
+        .raw_get_cf(&aux_cf, &delivery_key)
+        .expect("the migrated row is readable")
+        .expect("the migrated row exists");
+    assert_eq!(AuxDelivery::decode(&migrated_value), Ok(delivery));
+    assert_ne!(migrated_value, delivery_value);
+    assert!(!HeaderChainStore::new(db)
+        .migrate_v1_to_current(&engine_config)
+        .expect("reopening the migrated store is a no-op"));
+}
+
+#[test]
+fn version_one_migration_limit_leaves_every_row_unchanged() {
+    let db_config = Config::ephemeral();
+    let (mut engine_config, mut anchor, metadata) = fixture();
+    engine_config.limits.max_aux_deliveries_total = NonZeroUsize::new(1).expect("one is nonzero");
+    let deliveries = [0x41, 0x42].map(|marker| {
+        AuxDelivery::new(
+            EvidenceId::from_digest([marker; 32]),
+            anchor.hash,
+            SourceId::from_digest([marker.wrapping_add(1); 32]),
+            header_owner(&metadata.snapshot(), anchor.hash, u64::from(marker), 1),
+            zakura_header_chain::BodySizeHint::Unknown,
+            None,
+        )
+    });
+    anchor
+        .aux_delivery_ids
+        .extend(deliveries.iter().map(|delivery| delivery.delivery_id));
+    let db = open(&db_config, &engine_config.network);
+    let store = HeaderChainStore::new(db);
+    store
+        .initialize(metadata.clone(), anchor)
+        .expect("the current fixture initializes");
+
+    let first_key = HeaderAuxDeliveryKey {
+        header: deliveries[0].header_hash,
+        delivery: deliveries[0].delivery_id,
+    }
+    .as_bytes();
+    let second_key = HeaderAuxDeliveryKey {
+        header: deliveries[1].header_hash,
+        delivery: deliveries[1].delivery_id,
+    }
+    .as_bytes();
+    let first_value = legacy_rejected_aux_bytes(deliveries[0], [0x51; 32]);
+    let second_value = legacy_rejected_aux_bytes(deliveries[1], [0x52; 32]);
+    let metadata_value = mark_metadata_as_v1(&metadata);
+    let mut batch = DiskWriteBatch::new();
+    for (key, value) in [
+        (first_key, first_value.clone()),
+        (second_key, second_value.clone()),
+    ] {
+        store
+            .put_raw(&mut batch, HEADER_AUX_DELIVERY, key, value)
+            .expect("the legacy auxiliary row stages");
+    }
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            &metadata_value,
+        )
+        .expect("the legacy metadata row stages");
+    store.db.write(batch).expect("the legacy fixture commits");
+
+    assert!(matches!(
+        store.migrate_v1_to_current(&engine_config),
+        Err(HeaderChainStoreError::Store(StoreError::LimitExceeded {
+            collection: StoreCollection::AuxiliaryDeliveries,
+            limit,
+        })) if limit == RowLimit::new(1)
+    ));
+    let aux_cf = store
+        .cf(HEADER_AUX_DELIVERY)
+        .expect("the auxiliary column family exists");
+    let metadata_cf = store
+        .cf(HEADER_ENGINE_META)
+        .expect("the metadata column family exists");
+    assert_eq!(
+        store
+            .db
+            .raw_get_cf(&aux_cf, &first_key)
+            .expect("the first row is readable"),
+        Some(first_value)
+    );
+    assert_eq!(
+        store
+            .db
+            .raw_get_cf(&aux_cf, &second_key)
+            .expect("the second row is readable"),
+        Some(second_value)
+    );
+    assert_eq!(
+        store
+            .db
+            .raw_get_cf(&metadata_cf, METADATA_KEY)
+            .expect("the metadata row is readable"),
+        Some(metadata_value)
+    );
+}
+
 #[test]
 fn startup_atomically_rebinds_an_extended_checkpoint_manifest() {
     let db_config = Config::ephemeral();
@@ -177,7 +413,7 @@ fn startup_reconciliation_chunks_finalized_gaps_at_the_node_limit() {
     assert_eq!(
         runtime
             .store
-            .all_header_nodes()
+            .load_header_nodes()
             .expect("the retained nodes are readable")
             .len(),
         1,

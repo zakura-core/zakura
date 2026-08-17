@@ -1,5 +1,41 @@
 use super::*;
 
+struct TestStalledMaintenance {
+    stalled_version: Mutex<Option<StateVersion>>,
+    clear_on_reevaluation: bool,
+    reevaluations: AtomicUsize,
+}
+
+impl HeaderChainMaintenance for TestStalledMaintenance {
+    fn resource_stalled_version(&self) -> Option<StateVersion> {
+        *self
+            .stalled_version
+            .lock()
+            .expect("the stalled-version test lock is available")
+    }
+
+    fn earliest_deferred(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, HeaderChainStoreError> {
+        Ok(None)
+    }
+
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+
+    fn reevaluate_deferred(&self) -> Result<(), HeaderChainStoreError> {
+        self.reevaluations.fetch_add(1, Ordering::SeqCst);
+        if self.clear_on_reevaluation {
+            *self
+                .stalled_version
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)? = None;
+        }
+        Ok(())
+    }
+}
+
 #[test]
 fn deferred_maintenance_wakes_an_idle_writer_at_the_deadline() {
     let (sender, mut receiver) = mpsc::unbounded_channel();
@@ -14,7 +50,6 @@ fn deferred_maintenance_wakes_an_idle_writer_at_the_deadline() {
         .build()
         .expect("the test deadline runtime is available");
     let started = Instant::now();
-
     let message = receive_until_deferred_deadline(&mut receiver, Some(&maintenance), &runtime)
         .expect("deadline maintenance succeeds");
 
@@ -39,7 +74,6 @@ fn deferred_maintenance_advances_to_the_next_deadline() {
         .enable_time()
         .build()
         .expect("the test deadline runtime is available");
-
     let message = receive_until_deferred_deadline(&mut receiver, Some(&maintenance), &runtime)
         .expect("both deadline maintenance passes succeed");
 
@@ -72,7 +106,6 @@ fn state_messages_preempt_the_deferred_deadline() {
         .build()
         .expect("the test deadline runtime is available");
     let started = Instant::now();
-
     let message = receive_until_deferred_deadline(&mut receiver, Some(&maintenance), &runtime)
         .expect("the queued state message wins");
     delayed_send
@@ -86,6 +119,48 @@ fn state_messages_preempt_the_deferred_deadline() {
     ));
     assert_eq!(maintenance.reevaluations.load(Ordering::SeqCst), 0);
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn writer_reevaluates_a_resource_stall_without_a_deferred_deadline() {
+    let maintenance = TestStalledMaintenance {
+        stalled_version: Mutex::new(Some(StateVersion::new(7))),
+        clear_on_reevaluation: true,
+        reevaluations: AtomicUsize::new(0),
+    };
+    let mut last_resource_stall_recovery = None;
+
+    recover_resource_stall(Some(&maintenance), &mut last_resource_stall_recovery)
+        .expect("resource-stall maintenance succeeds");
+
+    assert_eq!(maintenance.reevaluations.load(Ordering::SeqCst), 1);
+    assert_eq!(last_resource_stall_recovery, None);
+}
+
+#[test]
+fn writer_reevaluates_a_resource_stall_once_per_state_version() {
+    let maintenance = TestStalledMaintenance {
+        stalled_version: Mutex::new(Some(StateVersion::new(7))),
+        clear_on_reevaluation: false,
+        reevaluations: AtomicUsize::new(0),
+    };
+    let mut last_resource_stall_recovery = None;
+
+    for (iteration, expected_reevaluations) in [(1u8, 1usize), (2, 1), (3, 2)] {
+        if iteration == 3 {
+            *maintenance
+                .stalled_version
+                .lock()
+                .expect("the stalled-version test lock is available") = Some(StateVersion::new(8));
+        }
+        recover_resource_stall(Some(&maintenance), &mut last_resource_stall_recovery)
+            .expect("bounded resource-stall maintenance succeeds");
+
+        assert_eq!(
+            maintenance.reevaluations.load(Ordering::SeqCst),
+            expected_reevaluations
+        );
+    }
 }
 
 #[test]

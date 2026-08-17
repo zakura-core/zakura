@@ -7,4 +7,6 @@ pub use counters::{
     BodyWorkEpoch, CounterExhausted, FinalityEpoch, HeaderGeneration, StateVersion,
     VerifiedGeneration,
 };
-pub use keys::{BranchId, EvidenceId, HeaderId, OperatorInvalidationId, SourceId};
+pub use keys::{
+    AuxObservationId, BranchId, EvidenceId, HeaderId, OperatorInvalidationId, SourceId,
+};

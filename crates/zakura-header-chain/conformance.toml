@@ -63,8 +63,8 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-SCOPE-07"
 name = "Auxiliary-evidence boundary"
 status = "implemented"
-owner = "zakura_header_chain::AuxAuthentication"
-tests = ["IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "IN-06::selected_auxiliary_repair_adds_only_one_exact_provenance_record"]
+owner = "zakura_header_chain::AuxObservationV1"
+tests = ["IN-06::auxiliary_outcomes_derive_from_exact_owned_observations", "IN-06::selected_auxiliary_repair_adds_only_one_exact_provenance_record"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -136,7 +136,7 @@ id = "LC-GEN-01"
 name = "State-version advancement"
 status = "implemented"
 owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
-tests = ["IN-05::structured_replay_is_bounded_and_deterministic", "IN-05::bounded_transition_examples_replay_deterministically", "IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header"]
+tests = ["IN-05::structured_replay_is_bounded_and_deterministic", "IN-05::bounded_transition_examples_replay_deterministically", "IN-06::auxiliary_outcomes_derive_from_exact_owned_observations"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -693,7 +693,7 @@ id = "LC-AUX-02"
 name = "Unauthenticated metadata isolation"
 status = "implemented"
 owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
-tests = ["IN-06::auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral", "IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "PW-06::oversized_body_hint_is_malformed_metadata_not_an_invalid_header", "IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence"]
+tests = ["IN-06::auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral", "IN-06::auxiliary_outcomes_derive_from_exact_owned_observations", "PW-06::oversized_body_hint_is_malformed_metadata_not_an_invalid_header", "IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -709,7 +709,7 @@ id = "LC-AUX-04"
 name = "Cryptographic metadata authentication"
 status = "implemented"
 owner = "zakura_state::service::write::HeaderChainWriter::vct_authentication_request"
-tests = ["IN-06::auxiliary_authentication_requires_exact_provenance_and_owned_next_header", "IN-06::vct_untrusted_source_defers_unverifiable_tip_root_until_successor", "IN-06::vct_untrusted_source_bad_root_replacement_commits_same_height", "IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence", "IN-06::authenticates_every_supplied_delivery_ahead_of_its_body", "IN-06::never_authenticates_or_over_rejects_a_corrupted_delivery", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+tests = ["IN-06::auxiliary_outcomes_derive_from_exact_owned_observations", "IN-06::vct_untrusted_source_defers_unverifiable_tip_root_until_successor", "IN-06::vct_untrusted_source_bad_root_replacement_commits_same_height", "IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence", "IN-06::authenticates_every_supplied_delivery_ahead_of_its_body", "IN-06::never_authenticates_or_over_rejects_a_corrupted_delivery", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

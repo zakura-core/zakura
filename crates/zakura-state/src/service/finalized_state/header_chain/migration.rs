@@ -14,16 +14,106 @@ use zakura_header_chain::{
 
 use super::{HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError, StartupReport};
 use crate::service::finalized_state::{
-    disk_db::{ReadDisk, WriteDisk},
-    disk_format::{header_chain_values::HeaderValidationContextDisk, RawBytes},
+    disk_db::{RawVisitError, ReadDisk, WriteDisk},
+    disk_format::{
+        header_chain::HeaderAuxDeliveryKey,
+        header_chain_values::{
+            decode_v1_aux_delivery, decode_v1_engine_metadata, HeaderChainValueError,
+            HeaderValidationContextDisk,
+        },
+        FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
+    },
     zakura_db::{
         block::{
             ZAKURA_HEADER_BY_HEIGHT, ZAKURA_HEADER_HASH_BY_HEIGHT, ZAKURA_HEADER_HEIGHT_BY_HASH,
         },
         ZakuraDb,
     },
-    HEADER_VALIDATION_CONTEXT,
+    DiskWriteBatch, HEADER_AUX_DELIVERY, HEADER_ENGINE_META, HEADER_VALIDATION_CONTEXT,
 };
+
+impl HeaderChainStore {
+    /// Atomically migrate released version-one rows to the current format.
+    pub(in crate::service) fn migrate_v1_to_current(
+        &self,
+        config: &EngineConfig,
+    ) -> Result<bool, HeaderChainStoreError> {
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let metadata_cf = self.cf(HEADER_ENGINE_META)?;
+        let Some(metadata_bytes) = self.db.raw_get_cf(&metadata_cf, super::METADATA_KEY)? else {
+            return Ok(false);
+        };
+        let mut version_bytes = [0; 4];
+        version_bytes.copy_from_slice(
+            metadata_bytes
+                .get(..4)
+                .ok_or(HeaderChainValueError::Truncated)?,
+        );
+        let version = u32::from_be_bytes(version_bytes);
+        if version == HeaderChainDiskVersion::CURRENT.0 {
+            EngineMetadata::decode(&metadata_bytes)?;
+            return Ok(false);
+        }
+
+        let mut metadata = decode_v1_engine_metadata(&metadata_bytes)?;
+        let limit =
+            zakura_header_chain::RowLimit::new(config.limits.max_aux_deliveries_total.get());
+        let aux_cf = self.cf(HEADER_AUX_DELIVERY)?;
+        let mut batch = DiskWriteBatch::new();
+        let mut rows = 0;
+        self.db
+            .raw_visit_cf(&aux_cf, &mut |key, value| {
+                if rows == limit.get() {
+                    return Err(HeaderChainStoreError::Store(
+                        zakura_header_chain::StoreError::LimitExceeded {
+                            collection: zakura_header_chain::StoreCollection::AuxiliaryDeliveries,
+                            limit,
+                        },
+                    ));
+                }
+                rows += 1;
+                if key.len() != 64 {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "invalid version-one auxiliary key width",
+                    ));
+                }
+                let key = HeaderAuxDeliveryKey::from_bytes(key);
+                let delivery = decode_v1_aux_delivery(value)?;
+                if delivery.header_hash != key.header || delivery.delivery_id != key.delivery {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "version-one auxiliary key/value mismatch",
+                    ));
+                }
+                self.put_value(&mut batch, HEADER_AUX_DELIVERY, key.as_bytes(), &delivery)?;
+                Ok(())
+            })
+            .map_err(|error| match error {
+                RawVisitError::RocksDb(error) => HeaderChainStoreError::RocksDb(error),
+                RawVisitError::Visitor(error) => error,
+            })?;
+
+        metadata.disk_format = HeaderChainDiskVersion::CURRENT;
+        metadata.state_version = metadata.state_version.checked_next()?;
+        metadata.last_transition = None;
+        self.put_value(
+            &mut batch,
+            HEADER_ENGINE_META,
+            super::METADATA_KEY,
+            &metadata,
+        )?;
+        self.db.write(batch)?;
+        tracing::info!(
+            auxiliary_rows = rows,
+            from_version = 1,
+            to_version = HeaderChainDiskVersion::CURRENT.0,
+            "migrated the durable header-chain format"
+        );
+        Ok(true)
+    }
+}
 
 /// Successful initialization from authenticated full-state facts.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,7 +205,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
         epoch: FinalityEpoch::new(0),
     };
     let metadata = EngineMetadata {
-        disk_format: HeaderChainDiskVersion(1),
+        disk_format: HeaderChainDiskVersion::CURRENT,
         mode: config.mode,
         network_id: config.network.kind(),
         anchor_manifest_digest: config.trust_anchor_digest(),

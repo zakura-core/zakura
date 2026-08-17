@@ -11,15 +11,14 @@ fn unauthenticated_delivery(
         .headers()
         .first()
         .expect("the insertion fixture is nonempty");
-    crate::AuxDelivery {
+    crate::AuxDelivery::new(
         delivery_id,
-        header_hash: header.hash,
-        source: insert.source,
-        owner: insert.owner,
-        body_size: crate::BodySizeHint::Unknown,
-        tree_aux: None,
-        authentication: crate::AuxAuthentication::Unauthenticated,
-    }
+        header.hash,
+        insert.source,
+        insert.owner,
+        crate::BodySizeHint::Unknown,
+        None,
+    )
 }
 
 #[test]
@@ -56,56 +55,27 @@ fn auxiliary_delivery_ids_are_globally_unique_across_headers() {
 
 #[test]
 fn auxiliary_evidence_rejects_invalid_counts_and_duplicate_identity() {
-    let (mut store, config) = TestStore::new(EngineMode::Integrated);
-    let clock = ManualClock(Utc::now());
+    let (store, _) = TestStore::new(EngineMode::Integrated);
     let mut insert = insertion(&store, 1, EvidenceId::from_digest([0xd6; 32]));
     let TransitionEvent::InsertHeaders(insert_event) = &mut insert.event else {
         unreachable!("the fixture constructs a header insertion")
     };
     let delivery = unauthenticated_delivery(insert_event, EvidenceId::from_digest([0xd7; 32]));
-    insert_event.aux.push(delivery);
-    let plan = apply_transition(&store, insert, &context(&config, &clock, None))
-        .expect("the exact unauthenticated delivery is admitted");
-    store.commit(&plan);
-
-    let cases = [
-        ("empty", Vec::new(), AuxiliaryViolation::DeliveryCount),
-        (
-            "three deliveries",
-            vec![delivery, delivery, delivery],
-            AuxiliaryViolation::DeliveryCount,
-        ),
-        (
-            "duplicate identity",
-            vec![delivery, delivery],
-            AuxiliaryViolation::DuplicateDelivery,
-        ),
-    ];
-    for (label, deliveries, violation) in cases {
-        let result = apply_transition(
-            &store,
-            TransitionRequest {
-                expected_version: store.metadata.state_version,
-                event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
-                    owner: body_owner(&store.snapshot(), 7, 1),
-                    deliveries,
-                    authentication: crate::AuxAuthentication::Rejected {
-                        evidence: EvidenceId::from_digest([0xd9; 32]),
-                    },
-                })),
-            },
-            &context(&config, &clock, Some(&Authority)),
-        );
-        assert!(
-            matches!(
-                result,
-                Err(TransitionFailure::InvalidEvidence(
-                    InvalidTransitionEvidence::Auxiliary(actual)
-                )) if actual == violation
-            ),
-            "{label}: {result:?}"
-        );
-    }
+    let owner = body_owner(&store.snapshot(), 7, 1);
+    assert!(crate::AuxObservationV1::from_vct(
+        owner,
+        Vec::new(),
+        crate::AuxVerificationFactV1::current_delivery_verified(),
+        None,
+    )
+    .is_none());
+    assert!(crate::AuxObservationV1::from_vct(
+        owner,
+        vec![delivery, delivery],
+        crate::AuxVerificationFactV1::ambiguous_deliveries_failed(1),
+        None,
+    )
+    .is_none());
 }
 
 #[test]
@@ -203,33 +173,30 @@ fn auxiliary_deletes_for_evicted_headers_are_sorted_by_hash_and_delivery_id() {
     );
     // Attach deliveries out of sorted order so the plan must impose (hash, id) order.
     let deliveries = [
-        crate::AuxDelivery {
-            delivery_id: EvidenceId::from_digest([0xf2; 32]),
-            header_hash: competing[1].hash,
+        crate::AuxDelivery::new(
+            EvidenceId::from_digest([0xf2; 32]),
+            competing[1].hash,
             source,
             owner,
-            body_size: crate::BodySizeHint::Unknown,
-            tree_aux: None,
-            authentication: crate::AuxAuthentication::Unauthenticated,
-        },
-        crate::AuxDelivery {
-            delivery_id: EvidenceId::from_digest([0xf0; 32]),
-            header_hash: competing[0].hash,
+            crate::BodySizeHint::Unknown,
+            None,
+        ),
+        crate::AuxDelivery::new(
+            EvidenceId::from_digest([0xf0; 32]),
+            competing[0].hash,
             source,
             owner,
-            body_size: crate::BodySizeHint::Unknown,
-            tree_aux: None,
-            authentication: crate::AuxAuthentication::Unauthenticated,
-        },
-        crate::AuxDelivery {
-            delivery_id: EvidenceId::from_digest([0xf1; 32]),
-            header_hash: competing[0].hash,
+            crate::BodySizeHint::Unknown,
+            None,
+        ),
+        crate::AuxDelivery::new(
+            EvidenceId::from_digest([0xf1; 32]),
+            competing[0].hash,
             source,
             owner,
-            body_size: crate::BodySizeHint::Unknown,
-            tree_aux: None,
-            authentication: crate::AuxAuthentication::Unauthenticated,
-        },
+            crate::BodySizeHint::Unknown,
+            None,
+        ),
     ];
     for delivery in &deliveries {
         store
@@ -299,13 +266,13 @@ fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
     store.lease.context_digest = [0x67; 32];
     let owner = body_owner(&store.snapshot(), 8, 9);
     let source = SourceId::from_digest([0x68; 32]);
-    let delivery = crate::AuxDelivery {
-        delivery_id: EvidenceId::from_digest([0x69; 32]),
-        header_hash: repaired.hash,
+    let delivery = crate::AuxDelivery::new(
+        EvidenceId::from_digest([0x69; 32]),
+        repaired.hash,
         source,
-        owner: owner.into(),
-        body_size: crate::BodySizeHint::Unknown,
-        tree_aux: Some(crate::TreeAuxRecordV1 {
+        owner.into(),
+        crate::BodySizeHint::Unknown,
+        Some(crate::TreeAuxRecordV1 {
             height: repaired.height,
             sapling_root: zakura_chain::sapling::tree::Root::default(),
             orchard_root: zakura_chain::orchard::tree::Root::default(),
@@ -315,8 +282,7 @@ fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
             ironwood_tx_count: 3,
             auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0x6a; 32]),
         }),
-        authentication: crate::AuxAuthentication::Unauthenticated,
-    };
+    );
     let repair = TransitionRequest {
         expected_version: store.metadata.state_version,
         event: TransitionEvent::InsertHeaders(Box::new(crate::InsertHeaders {
@@ -404,13 +370,13 @@ fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
         panic!("the fixture constructs a header insertion");
     };
     let prepared = insert.batch.headers()[0].clone();
-    let delivery = crate::AuxDelivery {
-        delivery_id: EvidenceId::from_digest([0x71; 32]),
-        header_hash: prepared.hash,
-        source: insert.source,
-        owner: insert.owner,
-        body_size: crate::BodySizeHint::Unknown,
-        tree_aux: Some(crate::TreeAuxRecordV1 {
+    let delivery = crate::AuxDelivery::new(
+        EvidenceId::from_digest([0x71; 32]),
+        prepared.hash,
+        insert.source,
+        insert.owner,
+        crate::BodySizeHint::Unknown,
+        Some(crate::TreeAuxRecordV1 {
             height: prepared.height,
             sapling_root: zakura_chain::sapling::tree::Root::default(),
             orchard_root: zakura_chain::orchard::tree::Root::default(),
@@ -420,8 +386,7 @@ fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
             ironwood_tx_count: 3,
             auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0x72; 32]),
         }),
-        authentication: crate::AuxAuthentication::Unauthenticated,
-    };
+    );
     let without_plan =
         apply_transition(&store, without_aux.clone(), &context(&config, &clock, None))
             .expect("the control target inserts without advisory metadata");
@@ -492,11 +457,9 @@ fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
     };
     let mut wrong_source = delivery;
     wrong_source.source = SourceId::from_digest([0x73; 32]);
-    let mut preauthenticated = delivery;
-    preauthenticated.authentication = crate::AuxAuthentication::Authenticated {
-        evidence: EvidenceId::from_digest([0x74; 32]),
-        boundary_hash: block::Hash([0x75; 32]),
-    };
+    let preauthenticated = delivery
+        .promote_recovered_outcome(1, [Some([0x74; 32]), None], Some(block::Hash([0x75; 32])))
+        .expect("the test outcome is coherent");
     for (label, deliveries) in [
         ("header outside the admitted batch", vec![unrelated]),
         ("tree-aux height mismatch", vec![wrong_height]),
@@ -530,7 +493,7 @@ fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
 }
 
 #[test]
-fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
+fn auxiliary_outcomes_derive_from_exact_owned_observations() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let mut insert = insertion(&store, 2, EvidenceId::from_digest([0xb0; 32]));
@@ -539,33 +502,35 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
     };
     let header_hash = insert_event.batch.headers()[0].hash;
     let boundary_hash = insert_event.batch.headers()[1].hash;
-    let delivery = crate::AuxDelivery {
-        delivery_id: EvidenceId::from_digest([0xb1; 32]),
+    let tree_aux = |height, marker| crate::TreeAuxRecordV1 {
+        height: block::Height(height),
+        sapling_root: zakura_chain::sapling::tree::Root::default(),
+        orchard_root: zakura_chain::orchard::tree::Root::default(),
+        ironwood_root: zakura_chain::ironwood::tree::Root::default(),
+        sapling_tx_count: 3,
+        orchard_tx_count: 4,
+        ironwood_tx_count: 5,
+        auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([marker; 32]),
+    };
+    let delivery = crate::AuxDelivery::new(
+        EvidenceId::from_digest([0xb1; 32]),
         header_hash,
-        source: SourceId::from_digest([0xb2; 32]),
-        owner: insert_event.owner,
-        body_size: crate::BodySizeHint::Unknown,
-        tree_aux: Some(crate::TreeAuxRecordV1 {
-            height: block::Height(1),
-            sapling_root: zakura_chain::sapling::tree::Root::default(),
-            orchard_root: zakura_chain::orchard::tree::Root::default(),
-            ironwood_root: zakura_chain::ironwood::tree::Root::default(),
-            sapling_tx_count: 3,
-            orchard_tx_count: 4,
-            ironwood_tx_count: 5,
-            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0xb3; 32]),
-        }),
-        authentication: crate::AuxAuthentication::Unauthenticated,
-    };
+        SourceId::from_digest([0xb2; 32]),
+        insert_event.owner,
+        crate::BodySizeHint::Unknown,
+        Some(tree_aux(1, 0xb3)),
+    );
+    let second_delivery = crate::AuxDelivery::new(
+        EvidenceId::from_digest([0xc1; 32]),
+        boundary_hash,
+        delivery.source,
+        delivery.owner,
+        crate::BodySizeHint::Unknown,
+        Some(tree_aux(2, 0xc2)),
+    );
+    let mut third_delivery = delivery;
+    third_delivery.delivery_id = EvidenceId::from_digest([0xc3; 32]);
     insert_event.source = delivery.source;
-    let second_delivery = crate::AuxDelivery {
-        delivery_id: EvidenceId::from_digest([0xc1; 32]),
-        ..delivery
-    };
-    let third_delivery = crate::AuxDelivery {
-        delivery_id: EvidenceId::from_digest([0xc3; 32]),
-        ..delivery
-    };
     insert_event
         .aux
         .extend([delivery, second_delivery, third_delivery]);
@@ -574,17 +539,13 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
     store.commit(&inserted);
 
     let repair_owner = body_owner(&store.snapshot(), 2, 2);
-    let authentication = crate::AuxAuthentication::Authenticated {
-        evidence: EvidenceId::from_digest([0xb4; 32]),
-        boundary_hash,
-    };
-    let request = |delivery, authentication| TransitionRequest {
-        expected_version: store.metadata.state_version,
-        event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
-            owner: repair_owner,
-            deliveries: vec![delivery],
-            authentication,
-        })),
+    let observed = |deliveries: Vec<crate::AuxDelivery>,
+                    verification: crate::AuxVerificationFactV1,
+                    witness: Option<zakura_chain::block::merkle::AuthDataRoot>| {
+        TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence::observed(
+            crate::AuxObservationV1::from_vct(repair_owner, deliveries, verification, witness)
+                .expect("the observation fixture is valid"),
+        )))
     };
 
     let mut changed_provenance = delivery;
@@ -592,32 +553,71 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
     assert!(matches!(
         apply_transition(
             &store,
-            request(changed_provenance, authentication),
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                event: observed(
+                    vec![changed_provenance],
+                    crate::AuxVerificationFactV1::current_delivery_verified(),
+                    Some([0xb4; 32].into()),
+                ),
+            },
             &context(&config, &clock, Some(&Authority)),
         ),
         Err(TransitionFailure::InvalidEvidence(
             InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::ProvenanceMismatch)
         ))
     ));
-    let wrong_boundary = crate::AuxAuthentication::Authenticated {
-        evidence: EvidenceId::from_digest([0xb6; 32]),
-        boundary_hash: header_hash,
-    };
-    assert!(matches!(
-        apply_transition(
-            &store,
-            request(delivery, wrong_boundary),
-            &context(&config, &clock, Some(&Authority)),
-        ),
-        Err(TransitionFailure::InvalidEvidence(
-            InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::InvalidBoundary)
-        ))
-    ));
+    let missing = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: observed(
+                vec![delivery],
+                crate::AuxVerificationFactV1::current_delivery_verified(),
+                None,
+            ),
+        },
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .expect("missing boundary evidence is a verified no-change");
+    assert!(missing.is_no_change());
+
+    let disputed = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: observed(
+                vec![third_delivery, second_delivery],
+                crate::AuxVerificationFactV1::ambiguous_deliveries_failed(2),
+                Some([0xb7; 32].into()),
+            ),
+        },
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .expect("ambiguous observations dispute both deliveries");
+    assert_eq!(disputed.change_set.aux_changes.len(), 2);
+    assert!(disputed.change_set.aux_changes.iter().all(|change| {
+        matches!(
+            change,
+            AuxDelta::Put(delivery)
+                if delivery.outcome().status() == crate::AuxOutcomeStatus::Disputed
+                    && delivery.outcome().boundary_hash() == Some(boundary_hash)
+        )
+    }));
+    store.commit(&disputed);
 
     let before = store.snapshot();
+    let authentication_event = observed(
+        vec![delivery],
+        crate::AuxVerificationFactV1::current_delivery_verified(),
+        Some([0xb4; 32].into()),
+    );
     let authenticated = apply_transition(
         &store,
-        request(delivery, authentication),
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: authentication_event.clone(),
+        },
         &context(&config, &clock, Some(&Authority)),
     )
     .expect("exact integrated evidence authenticates metadata only");
@@ -643,12 +643,16 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
             &authenticated
         )
     );
+    let AuxDelta::Put(authenticated_delivery) = &authenticated.change_set.aux_changes[0] else {
+        unreachable!("authentication puts one delivery")
+    };
     assert_eq!(
-        authenticated.change_set.aux_changes,
-        vec![crate::AuxDelta::Put(Box::new(crate::AuxDelivery {
-            authentication,
-            ..delivery
-        }))]
+        authenticated_delivery.outcome().status(),
+        crate::AuxOutcomeStatus::Authenticated
+    );
+    assert_eq!(
+        authenticated_delivery.outcome().boundary_hash(),
+        Some(boundary_hash)
     );
 
     let mut corrupt = authenticated.clone();
@@ -662,37 +666,31 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
     );
     store.commit(&authenticated);
 
-    let rejection = crate::AuxAuthentication::Rejected {
-        evidence: EvidenceId::from_digest([0xc5; 32]),
-    };
-    let rejection_owner = body_owner(&store.snapshot(), 2, 2);
     let rejected = apply_transition(
         &store,
         TransitionRequest {
             expected_version: store.metadata.state_version,
-            event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
-                owner: rejection_owner,
-                deliveries: vec![second_delivery, third_delivery],
-                authentication: rejection,
-            })),
+            event: observed(
+                vec![second_delivery],
+                crate::AuxVerificationFactV1::successor_delivery_failed(2),
+                Some([0xc5; 32].into()),
+            ),
         },
         &context(&config, &clock, Some(&Authority)),
     )
     .expect("two exact metadata deliveries reject in one atomic transition");
     assert!(rejected.effect().is_aux_authentication());
     assert_eq!(rejected.domain(), TransitionDomain::AuxEvidence);
+    let AuxDelta::Put(rejected_delivery) = &rejected.change_set.aux_changes[0] else {
+        unreachable!("rejection puts one delivery")
+    };
     assert_eq!(
-        rejected.change_set.aux_changes,
-        vec![
-            crate::AuxDelta::Put(Box::new(crate::AuxDelivery {
-                authentication: rejection,
-                ..second_delivery
-            })),
-            crate::AuxDelta::Put(Box::new(crate::AuxDelivery {
-                authentication: rejection,
-                ..third_delivery
-            })),
-        ],
+        rejected_delivery.outcome().status(),
+        crate::AuxOutcomeStatus::Rejected
+    );
+    assert_eq!(
+        rejected_delivery.outcome().boundary_hash(),
+        Some(boundary_hash)
     );
     assert_eq!(
         rejected.change_set.metadata.state_version,
@@ -701,7 +699,7 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
             .state_version
             .checked_next()
             .expect("the fixture state version can advance"),
-        "the two-delivery rejection advances one atomic state version"
+        "the rejection advances one atomic state version"
     );
     store.commit(&rejected);
 
@@ -709,14 +707,7 @@ fn auxiliary_authentication_requires_exact_provenance_and_owned_next_header() {
         &store,
         TransitionRequest {
             expected_version: store.metadata.state_version,
-            event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence {
-                owner: body_owner(&store.snapshot(), 2, 2),
-                deliveries: vec![crate::AuxDelivery {
-                    authentication,
-                    ..delivery
-                }],
-                authentication,
-            })),
+            event: authentication_event,
         },
         &context(&config, &clock, Some(&Authority)),
     )
@@ -738,15 +729,14 @@ fn auxiliary_resource_limits_reject_equal_plus_one_without_effects() {
         unreachable!("the fixture is a header insertion");
     };
     let header_hash = insert.batch.headers()[0].hash;
-    insert.aux.push(crate::AuxDelivery {
-        delivery_id: EvidenceId::from_digest([0xd2; 32]),
+    insert.aux.push(crate::AuxDelivery::new(
+        EvidenceId::from_digest([0xd2; 32]),
         header_hash,
-        source: insert.source,
-        owner: insert.owner,
-        body_size: crate::BodySizeHint::Unknown,
-        tree_aux: None,
-        authentication: crate::AuxAuthentication::Unauthenticated,
-    });
+        insert.source,
+        insert.owner,
+        crate::BodySizeHint::Unknown,
+        None,
+    ));
     apply_transition(&store, exact.clone(), &context(&config, &clock, None))
         .expect("the exact per-header auxiliary limit is admitted");
 

@@ -30,11 +30,11 @@ pub use graph::{
     ConsensusInvalidBodyTombstone, DurableNodeError, EligibilityReason, EligibilityState, Frontier,
     FrontierSet, GraphError, GraphRevision, HeaderGraphReconstruction, HeaderNode,
     HeaderNodeInvariant, HeaderValidationState, InsertResult, MemHeaderStore, SuffixWork,
-    WorkCoordinate, WorkCoordinateError,
+    WorkCoordinate, WorkCoordinateError, MAX_DIRECT_ELIGIBILITY_REASONS_V1,
 };
 pub use identity::{
-    BodyWorkEpoch, BranchId, CounterExhausted, EvidenceId, FinalityEpoch, HeaderGeneration,
-    HeaderId, OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration,
+    AuxObservationId, BodyWorkEpoch, BranchId, CounterExhausted, EvidenceId, FinalityEpoch,
+    HeaderGeneration, HeaderId, OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration,
 };
 pub use transition::*;
 pub use validation::{
@@ -53,6 +53,25 @@ pub use work::{
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn architecture_reduces_public_api_and_seals_auxiliary_authority() {
+        let baseline: toml::Value = toml::from_str(include_str!("../public-api-baseline.toml"))
+            .expect("the public API baseline is valid TOML");
+        let count = |name| {
+            baseline[name]
+                .as_integer()
+                .expect("public API counts are integers")
+        };
+        assert!(count("current_public_items") < count("baseline_public_items"));
+        assert_eq!(count("current_authority_constructors"), 0);
+
+        let auxiliary = include_str!("transition/types/auxiliary.rs");
+        assert!(!auxiliary.contains("pub enum AuxAuthentication"));
+        assert!(!auxiliary.contains("pub authentication:"));
+        assert!(!auxiliary.contains("pub fn validate_decoded"));
+        assert!(!auxiliary.contains("pub fn validate_decoded_outcome"));
+    }
+
     #[test]
     fn architecture_dependencies_stay_sync_only_and_layered() {
         let manifest: toml::Value = toml::from_str(include_str!("../Cargo.toml"))

@@ -599,6 +599,11 @@ impl DiskWriteBatch {
 }
 
 impl DiskDb {
+    /// Open one coherent RocksDB snapshot for a multi-collection audit.
+    pub(crate) fn rocksdb_snapshot(&self) -> rocksdb::SnapshotWithThreadMode<'_, DB> {
+        rocksdb::SnapshotWithThreadMode::new(&self.db)
+    }
+
     /// Prints rocksdb metrics for each column family along with total database disk size, live data disk size and database memory size.
     pub fn print_db_metrics(&self) {
         let mut total_size_on_disk = 0;

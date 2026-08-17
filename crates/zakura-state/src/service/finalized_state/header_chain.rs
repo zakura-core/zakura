@@ -18,12 +18,13 @@ use zakura_header_chain::{
     audit_store, audit_store_for_trust_anchor_update, ApplyResult, AuxDelivery, AuxDelta,
     BodyWorkAuthority, BodyWorkOwner, ChangeSet, CommittedHeaderChainView, CommittedStallReceipt,
     CounterExhausted, EligibilityReason, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
-    EvidenceId, FinalityRecord, FinalitySource, Frontier, FullStateEvidenceAuthority,
-    FullStateFinalized, HeaderChainEngine, HeaderInsertionFacts, HeaderLocator, HeaderNode,
-    HeaderSyncWorkOwner, HeaderValidationFacts, HeaderWorkAuthority, MemHeaderStore,
-    NoChangeReceipt, RecoveryFailure, RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt,
-    StateVersion, StoreAuditRead, StoreError, SystemClock, TransitionContext, TransitionEffect,
-    TransitionEvent, TransitionFailure, TransitionInput, TransitionRequest,
+    EvidenceId, FinalityHistoryCheckpoint, FinalityRecord, FinalitySource, Frontier,
+    FullStateEvidenceAuthority, FullStateFinalized, HeaderChainEngine, HeaderInsertionFacts,
+    HeaderLocator, HeaderNode, HeaderSyncWorkOwner, HeaderValidationFacts, HeaderWorkAuthority,
+    MemHeaderStore, NoChangeReceipt, RecoveryFailure, RecoveryPlan, RecoveryRepair, RowLimit,
+    SourceId, StaleReceipt, StateVersion, StoreAuditRead, StoreAuditSnapshot, StoreCollection,
+    StoreError, SystemClock, TransitionContext, TransitionEffect, TransitionEvent,
+    TransitionFailure, TransitionInput, TransitionRequest, UntrustedAuxDeliveryRow,
     ValidationContextRecord, ValidationLease, VerifiedChainChanged, VerifiedChangeCause,
     VerifiedHeaderRef,
 };
@@ -41,9 +42,10 @@ use super::{
             HeaderEligibilityRootKey, HeaderFinalityKey, HeaderHeightKey,
         },
         header_chain_values::{
-            FullStateBodyValidationEvidenceAuthorityDisk, HeaderChainValueError,
-            HeaderEligibilityReasonDisk, HeaderNodeDisk, HeaderReconstructionPhaseDisk,
-            HeaderReconstructionProgressDisk, HeaderValidationContextDisk,
+            decode_untrusted_aux_delivery, FullStateBodyValidationEvidenceAuthorityDisk,
+            HeaderChainValueError, HeaderEligibilityReasonDisk, HeaderNodeDisk,
+            HeaderReconstructionPhaseDisk, HeaderReconstructionProgressDisk, HeaderRowCountDisk,
+            HeaderValidationContextDisk,
         },
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
@@ -54,6 +56,11 @@ use super::{
 };
 
 const METADATA_KEY: &[u8] = b"";
+const FINALITY_HISTORY_CHECKPOINT_KEY: &[u8] = b"finality-history-checkpoint-v1";
+const FINALITY_HISTORY_COUNT_KEY: &[u8] = b"finality-history-count-v1";
+const TOMBSTONE_COUNT_KEY: &[u8] = b"consensus-invalid-tombstone-count-v1";
+const FINALITY_HISTORY_LIMIT: usize = 65_536;
+const TOMBSTONE_LIMIT: usize = 65_536;
 const RECONSTRUCTION_PROGRESS_KEY: &[u8] = b"reconstruction-progress-v1";
 const RETAINED_PATH_LEASE_IDLE: Duration = Duration::from_secs(30);
 
@@ -80,11 +87,17 @@ impl FullStateEvidenceAuthority for TestHeaderCompletionAuthority<'_> {
         self.0
             .is_some_and(|inner| inner.authorizes_validation_lease(lease))
     }
+
+    fn authorizes_retention_reference(&self, reference: block::Hash) -> bool {
+        self.0
+            .is_some_and(|inner| inner.authorizes_retention_reference(reference))
+    }
 }
 
 struct StateIssuedAuthority<'a> {
     inner: Option<&'a dyn FullStateEvidenceAuthority>,
     validation_leases: &'a [ValidationLease],
+    active_retention_references: &'a [block::Hash],
 }
 
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
@@ -106,6 +119,13 @@ impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
     fn authorizes_validation_lease(&self, lease: &ValidationLease) -> bool {
         self.validation_leases.contains(lease)
     }
+
+    fn authorizes_retention_reference(&self, reference: block::Hash) -> bool {
+        self.active_retention_references.contains(&reference)
+            || self
+                .inner
+                .is_some_and(|inner| inner.authorizes_retention_reference(reference))
+    }
 }
 
 fn combined_retention_references<'a>(
@@ -126,6 +146,7 @@ fn combined_retention_references<'a>(
     Cow::Owned(references)
 }
 
+mod audit_snapshot;
 #[cfg(test)]
 #[path = "header_chain/coherence.rs"]
 mod coherence;
@@ -143,24 +164,48 @@ pub use fuzz::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub(crate) fn select_vct_auxiliary_delivery(deliveries: Vec<AuxDelivery>) -> Option<AuxDelivery> {
     deliveries
         .into_iter()
-        .filter(|delivery| {
-            delivery.tree_aux.is_some()
-                && !matches!(
-                    delivery.authentication,
-                    zakura_header_chain::AuxAuthentication::Rejected { .. }
-                )
-        })
+        .filter(|delivery| delivery.tree_aux.is_some() && !delivery.is_rejected())
         .min_by_key(|delivery| {
             (
-                match delivery.authentication {
-                    zakura_header_chain::AuxAuthentication::Authenticated { .. } => 0,
-                    zakura_header_chain::AuxAuthentication::Unauthenticated => 1,
-                    zakura_header_chain::AuxAuthentication::Disputed { .. } => 2,
-                    zakura_header_chain::AuxAuthentication::Rejected { .. } => 3,
+                if delivery.is_authenticated() {
+                    0
+                } else if delivery.is_unauthenticated() {
+                    1
+                } else if delivery.is_disputed() {
+                    2
+                } else {
+                    3
                 },
                 delivery.delivery_id,
             )
         })
+}
+
+fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDeliveryRow) -> bool {
+    let expected_base = AuxDelivery::new(
+        authoritative.delivery_id,
+        authoritative.header_hash,
+        authoritative.source,
+        authoritative.owner,
+        authoritative.body_size,
+        authoritative.tree_aux,
+    );
+    let expected_status = if authoritative.is_unauthenticated() {
+        0
+    } else if authoritative.is_authenticated() {
+        1
+    } else if authoritative.is_rejected() {
+        2
+    } else {
+        3
+    };
+    let expected_observations = authoritative
+        .observation_ids()
+        .map(|id| id.map(|id| id.digest()));
+    row.delivery() == expected_base
+        && row.outcome_status_code() == expected_status
+        && row.observation_digests() == expected_observations
+        && row.outcome_boundary_hash() == authoritative.outcome_boundary_hash()
 }
 
 /// Failure at the durable header-chain boundary.
@@ -445,16 +490,16 @@ fn load_transition_engine(
     let metadata = store.metadata()?;
     let graph = MemHeaderStore::reconstruct(zakura_header_chain::HeaderGraphReconstruction::new(
         metadata.frontiers.finalized,
-        store.all_header_nodes()?,
-        store.all_consensus_invalid_body_tombstones()?,
+        store.load_header_nodes()?,
+        store.load_consensus_invalid_body_tombstones()?,
     ))
     .map_err(|_| HeaderChainStoreError::Incoherent("audited node graph is invalid"))?;
-    HeaderChainEngine::from_audited_state(
+    HeaderChainEngine::from_untrusted_durable_state(
         graph,
         metadata,
         store.selected_projection()?,
         store.verified_projection()?,
-        store.all_aux_deliveries()?,
+        store.load_aux_deliveries()?,
     )
     .map_err(|_| HeaderChainStoreError::Incoherent("audited engine state is invalid"))
 }
@@ -891,15 +936,33 @@ impl HeaderChainReader {
         hash: block::Hash,
         aux_delivery_ids: &[EvidenceId],
     ) -> Result<Vec<AuxDelivery>, HeaderChainStoreError> {
-        let deliveries = self.store.aux_deliveries(hash)?;
+        let deliveries = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .aux_deliveries(hash)
+            .to_vec();
+        let durable = self.store.untrusted_aux_deliveries(hash)?;
         let indexed: BTreeSet<_> = aux_delivery_ids.iter().copied().collect();
         let stored: BTreeSet<_> = deliveries
             .iter()
             .map(|delivery| delivery.delivery_id)
             .collect();
+        let durable_ids: BTreeSet<_> = durable
+            .iter()
+            .map(|row| row.delivery().delivery_id)
+            .collect();
         if indexed.len() != aux_delivery_ids.len()
             || stored.len() != deliveries.len()
+            || durable_ids.len() != durable.len()
             || indexed != stored
+            || indexed != durable_ids
+            || durable.iter().any(|row| {
+                deliveries
+                    .iter()
+                    .find(|delivery| delivery.delivery_id == row.delivery().delivery_id)
+                    .is_none_or(|delivery| !untrusted_aux_row_matches(*delivery, *row))
+            })
         {
             return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
                 "retained node and auxiliary delivery index disagree",
@@ -2013,6 +2076,7 @@ impl HeaderChainRuntime {
         let first_authority = StateIssuedAuthority {
             inner: first_context.full_state_authority,
             validation_leases: &[],
+            active_retention_references: lease_references.as_ref(),
         };
         let first_context = TransitionContext {
             config: first_context.config,
@@ -2051,6 +2115,7 @@ impl HeaderChainRuntime {
         let checkpoint_authority = StateIssuedAuthority {
             inner: checkpoint_context.full_state_authority,
             validation_leases: validation_leases.as_slice(),
+            active_retention_references: lease_references.as_ref(),
         };
         let checkpoint_context = TransitionContext {
             config: checkpoint_context.config,
@@ -2371,6 +2436,7 @@ impl HeaderChainRuntime {
         let state_authority = StateIssuedAuthority {
             inner: base_context.full_state_authority,
             validation_leases: &validation_leases,
+            active_retention_references: lease_references.as_deref().unwrap_or_default(),
         };
         let transition_context = TransitionContext {
             config: base_context.config,
@@ -3390,6 +3456,7 @@ impl HeaderChainStore {
             if let Some(authority) =
                 FullStateBodyValidationEvidenceAuthorityDisk::from_body_validation_state(
                     node.hash,
+                    node.height,
                     &node.body_validation_state,
                 )
             {
@@ -3429,25 +3496,18 @@ impl HeaderChainStore {
             }
         }
 
-        for tombstone in &changes.put_consensus_invalid_body_tombstones {
-            if let Some(existing) = self
-                .get_value::<zakura_header_chain::ConsensusInvalidBodyTombstone>(
-                    HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
-                    tombstone.hash.0,
-                )?
-            {
-                if existing != *tombstone {
-                    return Err(HeaderChainStoreError::Incoherent(
-                        "consensus-invalid tombstone changed",
-                    ));
-                }
-                continue;
-            }
-            self.put_value(
+        let finality_advanced = current_metadata.as_ref().is_some_and(|metadata| {
+            metadata.frontiers.finalized != changes.metadata.frontiers.finalized
+        });
+        if current_metadata.is_none()
+            || finality_advanced
+            || !changes.put_consensus_invalid_body_tombstones.is_empty()
+        {
+            self.apply_consensus_invalid_tombstones(
                 &mut batch,
-                HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
-                tombstone.hash.0,
-                tombstone,
+                changes,
+                current_metadata.is_some(),
+                finality_advanced,
             )?;
         }
 
@@ -3504,12 +3564,85 @@ impl HeaderChainStore {
         }
 
         if let Some(record) = changes.finality_append {
-            self.put_value(
-                &mut batch,
-                HEADER_FINALITY_HISTORY,
-                HeaderFinalityKey(record.epoch).as_bytes(),
-                &record,
-            )?;
+            let record_key = HeaderFinalityKey(record.epoch);
+            let existing =
+                self.get_value::<FinalityRecord>(HEADER_FINALITY_HISTORY, record_key.as_bytes())?;
+            if existing.is_some_and(|existing| existing != record) {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "finality epoch changed its immutable record",
+                ));
+            }
+            if existing.is_none() {
+                let count = self
+                    .get_value::<HeaderRowCountDisk>(
+                        HEADER_ENGINE_META,
+                        FINALITY_HISTORY_COUNT_KEY,
+                    )?
+                    .map_or(0, |count| count.0);
+                let limit = u64::try_from(FINALITY_HISTORY_LIMIT).map_err(|_| {
+                    HeaderChainStoreError::Incoherent("finality history limit does not fit u64")
+                })?;
+                if count > limit {
+                    return Err(StoreError::LimitExceeded {
+                        collection: StoreCollection::FinalityHistory,
+                        limit: RowLimit::new(FINALITY_HISTORY_LIMIT),
+                    }
+                    .into());
+                }
+                let next_count = if count == limit {
+                    let cf = self.cf(HEADER_FINALITY_HISTORY)?;
+                    let (first_key, first_value) =
+                        self.db
+                            .raw_first_cf(&cf)?
+                            .ok_or(HeaderChainStoreError::Incoherent(
+                                "bounded finality history is unexpectedly empty",
+                            ))?;
+                    let first = FinalityRecord::decode(&first_value).map_err(|_| {
+                        HeaderChainStoreError::Incoherent("invalid oldest finality record")
+                    })?;
+                    if first_key != first.epoch.get().to_be_bytes() {
+                        return Err(HeaderChainStoreError::Incoherent(
+                            "oldest finality key/value mismatch",
+                        ));
+                    }
+                    if self.authenticated_canonical_hash(first.current.height)?
+                        != Some(first.current.hash)
+                    {
+                        return Err(HeaderChainStoreError::Incoherent(
+                            "finality checkpoint lacks canonical authentication",
+                        ));
+                    }
+                    self.put_value(
+                        &mut batch,
+                        HEADER_ENGINE_META,
+                        FINALITY_HISTORY_CHECKPOINT_KEY,
+                        &FinalityHistoryCheckpoint {
+                            epoch: first.epoch,
+                            frontier: first.current,
+                        },
+                    )?;
+                    self.delete_raw(&mut batch, HEADER_FINALITY_HISTORY, first_key)?;
+                    count
+                } else {
+                    count
+                        .checked_add(1)
+                        .ok_or(HeaderChainStoreError::Incoherent(
+                            "finality history count overflow",
+                        ))?
+                };
+                self.put_value(
+                    &mut batch,
+                    HEADER_FINALITY_HISTORY,
+                    record_key.as_bytes(),
+                    &record,
+                )?;
+                self.put_value(
+                    &mut batch,
+                    HEADER_ENGINE_META,
+                    FINALITY_HISTORY_COUNT_KEY,
+                    &HeaderRowCountDisk(next_count),
+                )?;
+            }
         }
 
         // The adapter enqueues the singleton logical root last in the atomic batch.
@@ -3520,6 +3653,167 @@ impl HeaderChainStore {
             &changes.metadata,
         )?;
         Ok(batch)
+    }
+
+    /// Apply the bounded tombstone lifecycle through the same atomic batch as its source change.
+    ///
+    /// Ordinary additions use one count read and one point read per distinct hash. Finality and
+    /// actual limit pressure may scan the bounded tombstone table because both paths reduce or
+    /// rebalance retained resources.
+    fn apply_consensus_invalid_tombstones(
+        &self,
+        batch: &mut DiskWriteBatch,
+        changes: &ChangeSet,
+        initialized: bool,
+        finality_advanced: bool,
+    ) -> Result<(), HeaderChainStoreError> {
+        let count =
+            match self.get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)? {
+                Some(count) => usize::try_from(count.0).map_err(|_| {
+                    HeaderChainStoreError::Incoherent("tombstone count does not fit usize")
+                })?,
+                None if !initialized => 0,
+                None => {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "consensus-invalid tombstone count is absent",
+                    ));
+                }
+            };
+        if count > TOMBSTONE_LIMIT {
+            return Err(StoreError::LimitExceeded {
+                collection: StoreCollection::ConsensusInvalidBodyTombstones,
+                limit: RowLimit::new(TOMBSTONE_LIMIT),
+            }
+            .into());
+        }
+
+        let finalized_height = changes.metadata.frontiers.finalized.height;
+        let mut staged = HashMap::new();
+        for tombstone in &changes.put_consensus_invalid_body_tombstones {
+            if tombstone.height <= finalized_height {
+                continue;
+            }
+            if let Some(previous) = staged.insert(tombstone.hash, tombstone.clone()) {
+                if previous != *tombstone {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "consensus-invalid tombstone changed in one transition",
+                    ));
+                }
+            }
+        }
+
+        let mut additions = Vec::new();
+        for tombstone in staged.into_values() {
+            match self.get_value::<zakura_header_chain::ConsensusInvalidBodyTombstone>(
+                HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+                tombstone.hash.0,
+            )? {
+                Some(existing) if existing != tombstone => {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "consensus-invalid tombstone changed",
+                    ));
+                }
+                Some(_) => {}
+                None => additions.push(tombstone),
+            }
+        }
+
+        let prospective_count =
+            count
+                .checked_add(additions.len())
+                .ok_or(HeaderChainStoreError::Incoherent(
+                    "consensus-invalid tombstone count overflow",
+                ))?;
+        if !finality_advanced && prospective_count <= TOMBSTONE_LIMIT {
+            for tombstone in additions {
+                self.put_value(
+                    batch,
+                    HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+                    tombstone.hash.0,
+                    &tombstone,
+                )?;
+            }
+            self.put_value(
+                batch,
+                HEADER_ENGINE_META,
+                TOMBSTONE_COUNT_KEY,
+                &HeaderRowCountDisk(u64::try_from(prospective_count).map_err(|_| {
+                    HeaderChainStoreError::Incoherent("tombstone count does not fit u64")
+                })?),
+            )?;
+            return Ok(());
+        }
+
+        let audit = self.audit_snapshot()?;
+        let mut tombstones = HashMap::with_capacity(prospective_count.min(TOMBSTONE_LIMIT));
+        audit.visit_consensus_invalid_body_tombstones(
+            RowLimit::new(TOMBSTONE_LIMIT),
+            &mut |tombstone| {
+                tombstones.insert(tombstone.hash, tombstone);
+                Ok(())
+            },
+        )?;
+        if tombstones.len() != count {
+            return Err(HeaderChainStoreError::Incoherent(
+                "consensus-invalid tombstone count mismatch",
+            ));
+        }
+
+        let finalized_hashes: Vec<_> = tombstones
+            .values()
+            .filter(|tombstone| tombstone.height <= finalized_height)
+            .map(|tombstone| tombstone.hash)
+            .collect();
+        for hash in finalized_hashes {
+            tombstones.remove(&hash);
+            self.delete_raw(batch, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, hash.0)?;
+        }
+        for tombstone in additions {
+            tombstones.insert(tombstone.hash, tombstone.clone());
+            self.put_value(
+                batch,
+                HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+                tombstone.hash.0,
+                &tombstone,
+            )?;
+        }
+
+        if tombstones.len() > TOMBSTONE_LIMIT {
+            let deleted: HashSet<_> = changes.delete_nodes.iter().copied().collect();
+            let inserted: HashSet<_> = changes.put_nodes.iter().map(|node| node.hash).collect();
+            let mut evictable = Vec::new();
+            for tombstone in tombstones.values() {
+                let retained = inserted.contains(&tombstone.hash)
+                    || !deleted.contains(&tombstone.hash)
+                        && self.header_node(tombstone.hash)?.is_some();
+                if !retained {
+                    evictable.push((tombstone.height, tombstone.hash));
+                }
+            }
+            evictable.sort_unstable_by_key(|(height, hash)| (*height, hash.0));
+            let excess = tombstones.len() - TOMBSTONE_LIMIT;
+            if evictable.len() < excess {
+                return Err(StoreError::LimitExceeded {
+                    collection: StoreCollection::ConsensusInvalidBodyTombstones,
+                    limit: RowLimit::new(TOMBSTONE_LIMIT),
+                }
+                .into());
+            }
+            for (_, hash) in evictable.into_iter().take(excess) {
+                tombstones.remove(&hash);
+                self.delete_raw(batch, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, hash.0)?;
+            }
+        }
+
+        self.put_value(
+            batch,
+            HEADER_ENGINE_META,
+            TOMBSTONE_COUNT_KEY,
+            &HeaderRowCountDisk(u64::try_from(tombstones.len()).map_err(|_| {
+                HeaderChainStoreError::Incoherent("tombstone count does not fit u64")
+            })?),
+        )?;
+        Ok(())
     }
 
     /// Return the exact context-table delta for one authenticated finalized-parent advance.
@@ -4048,6 +4342,13 @@ impl HeaderChainStore {
             .ok_or(StoreError::Unavailable("header-chain metadata is absent"))
     }
 
+    #[cfg(test)]
+    fn aux_deliveries(&self, hash: block::Hash) -> Result<Vec<AuxDelivery>, StoreError> {
+        load_transition_engine(self)
+            .map(|engine| engine.aux_deliveries(hash).to_vec())
+            .map_err(store_error)
+    }
+
     fn header_node(&self, hash: block::Hash) -> Result<Option<HeaderNode>, StoreError> {
         let value = self
             .get_value::<HeaderNodeDisk>(HEADER_NODE_BY_HASH, hash.0)
@@ -4063,6 +4364,31 @@ impl HeaderChainStore {
                     .map_err(|_| StoreError::Incoherent("invalid durable node"))
             })
             .transpose()
+    }
+
+    fn untrusted_aux_deliveries(
+        &self,
+        hash: block::Hash,
+    ) -> Result<Vec<UntrustedAuxDeliveryRow>, StoreError> {
+        let mut deliveries = Vec::new();
+        for (key, value) in self
+            .scan_prefix(HEADER_AUX_DELIVERY, &hash.0)
+            .map_err(store_error)?
+        {
+            if key.len() != 64 {
+                return Err(StoreError::Incoherent("invalid auxiliary key width"));
+            }
+            let delivery = decode_untrusted_aux_delivery(&value)
+                .map_err(|_| StoreError::Incoherent("invalid auxiliary value"))?;
+            if delivery.delivery().header_hash != hash
+                || key[32..] != delivery.delivery().delivery_id.digest()
+            {
+                return Err(StoreError::Incoherent("auxiliary key/value mismatch"));
+            }
+            deliveries.push(delivery);
+        }
+        deliveries.sort_unstable_by_key(|delivery| delivery.delivery().delivery_id);
+        Ok(deliveries)
     }
 
     fn selected_hash(&self, height: block::Height) -> Result<Option<block::Hash>, StoreError> {
@@ -4101,27 +4427,101 @@ impl HeaderChainStore {
         ))
     }
 
-    fn aux_deliveries(
+    fn load_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
+        let snapshot = self.audit_snapshot()?;
+        let mut nodes = Vec::new();
+        snapshot.visit_header_nodes(
+            RowLimit::new(zakura_header_chain::MAX_NON_FINALIZED_NODES_V1 + 1),
+            &mut |node| {
+                nodes.push(node);
+                Ok(())
+            },
+        )?;
+        Ok(nodes)
+    }
+
+    fn load_consensus_invalid_body_tombstones(
         &self,
-        hash: block::Hash,
-    ) -> Result<Vec<zakura_header_chain::AuxDelivery>, StoreError> {
-        let mut deliveries = Vec::new();
-        for (key, value) in self
-            .scan_prefix(HEADER_AUX_DELIVERY, &hash.0)
-            .map_err(store_error)?
-        {
-            if key.len() != 64 {
-                return Err(StoreError::Incoherent("invalid auxiliary key width"));
-            }
-            let delivery = AuxDelivery::decode(&value)
-                .map_err(|_| StoreError::Incoherent("invalid auxiliary value"))?;
-            if delivery.header_hash != hash || key[32..] != delivery.delivery_id.digest() {
-                return Err(StoreError::Incoherent("auxiliary key/value mismatch"));
-            }
-            deliveries.push(delivery);
-        }
-        deliveries.sort_unstable_by_key(|delivery| delivery.delivery_id);
-        Ok(deliveries)
+    ) -> Result<Vec<zakura_header_chain::ConsensusInvalidBodyTombstone>, StoreError> {
+        let snapshot = self.audit_snapshot()?;
+        let mut rows = Vec::new();
+        snapshot.visit_consensus_invalid_body_tombstones(RowLimit::new(65_536), &mut |row| {
+            rows.push(row);
+            Ok(())
+        })?;
+        Ok(rows)
+    }
+
+    fn header_child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError> {
+        let snapshot = self.audit_snapshot()?;
+        let mut rows = Vec::new();
+        snapshot.visit_header_child_edges(
+            RowLimit::new(zakura_header_chain::MAX_NON_FINALIZED_NODES_V1 + 1),
+            &mut |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )?;
+        Ok(rows)
+    }
+
+    pub(in crate::service) fn selected_projection(&self) -> Result<Vec<Frontier>, StoreError> {
+        let snapshot = self.audit_snapshot()?;
+        let mut rows = Vec::new();
+        snapshot.visit_selected_projection(
+            RowLimit::new(zakura_header_chain::MAX_NON_FINALIZED_NODES_V1 + 1),
+            &mut |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )?;
+        Ok(rows)
+    }
+
+    fn verified_projection(&self) -> Result<Vec<Frontier>, StoreError> {
+        let snapshot = self.audit_snapshot()?;
+        let mut rows = Vec::new();
+        snapshot.visit_verified_projection(
+            RowLimit::new(zakura_header_chain::MAX_NON_FINALIZED_NODES_V1 + 1),
+            &mut |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )?;
+        Ok(rows)
+    }
+
+    fn deferred_entries(&self) -> Result<Vec<(DateTime<Utc>, block::Hash)>, StoreError> {
+        let snapshot = self.audit_snapshot()?;
+        let mut rows = Vec::new();
+        snapshot.visit_deferred_entries(
+            RowLimit::new(zakura_header_chain::MAX_NON_FINALIZED_NODES_V1 + 1),
+            &mut |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )?;
+        Ok(rows)
+    }
+
+    fn load_aux_deliveries(&self) -> Result<Vec<UntrustedAuxDeliveryRow>, StoreError> {
+        let snapshot = self.audit_snapshot()?;
+        let mut rows = Vec::new();
+        snapshot.visit_aux_deliveries(
+            RowLimit::new(zakura_header_chain::MAX_AUX_DELIVERIES_TOTAL_V1),
+            &mut |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )?;
+        Ok(rows)
+    }
+
+    fn authenticated_canonical_hash(
+        &self,
+        height: block::Height,
+    ) -> Result<Option<block::Hash>, StoreError> {
+        self.audit_snapshot()?.authenticated_canonical_hash(height)
     }
 
     fn is_migrated_finality_pin(&self, pin: Frontier) -> Result<bool, StoreError> {
@@ -4132,204 +4532,6 @@ impl HeaderChainStore {
             Ok(())
         })?;
         Ok(found)
-    }
-}
-
-impl StoreAuditRead for HeaderChainStore {
-    fn snapshot(&self) -> Result<EngineSnapshot, StoreError> {
-        HeaderChainStore::snapshot(self)
-    }
-
-    fn metadata(&self) -> Result<EngineMetadata, StoreError> {
-        HeaderChainStore::metadata(self)
-    }
-
-    fn all_header_nodes(&self) -> Result<Vec<HeaderNode>, StoreError> {
-        let mut reasons_by_hash: HashMap<block::Hash, Vec<EligibilityReason>> = HashMap::new();
-        for (hash, reason) in self.all_reason_rows()? {
-            reasons_by_hash.entry(hash).or_default().push(reason);
-        }
-        let mut nodes = Vec::new();
-        for (key, value) in self.scan_raw(HEADER_NODE_BY_HASH).map_err(store_error)? {
-            if key.len() != 32 {
-                return Err(StoreError::Incoherent("invalid node key width"));
-            }
-            let hash = block::Hash(
-                key.as_slice()
-                    .try_into()
-                    .map_err(|_| StoreError::Incoherent("invalid node hash key"))?,
-            );
-            let disk = HeaderNodeDisk::decode(&value)
-                .map_err(|_| StoreError::Incoherent("invalid durable node value"))?;
-            if disk.hash != hash {
-                return Err(StoreError::Incoherent("node key/hash mismatch"));
-            }
-            let node = disk
-                .into_domain(reasons_by_hash.remove(&hash).unwrap_or_default())
-                .map_err(|_| StoreError::Incoherent("invalid durable node"))?;
-            nodes.push(node);
-        }
-        if !reasons_by_hash.is_empty() {
-            return Err(StoreError::Incoherent("eligibility root has no node"));
-        }
-        Ok(nodes)
-    }
-
-    fn all_consensus_invalid_body_tombstones(
-        &self,
-    ) -> Result<Vec<zakura_header_chain::ConsensusInvalidBodyTombstone>, StoreError> {
-        let mut tombstones = Vec::new();
-        for (key, value) in self
-            .scan_raw(HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE)
-            .map_err(store_error)?
-        {
-            if key.len() != 32 {
-                return Err(StoreError::Incoherent("invalid tombstone key width"));
-            }
-            let tombstone = zakura_header_chain::ConsensusInvalidBodyTombstone::decode(&value)
-                .map_err(|_| StoreError::Incoherent("invalid tombstone value"))?;
-            if key.as_slice() != tombstone.hash.0 {
-                return Err(StoreError::Incoherent("tombstone key/hash mismatch"));
-            }
-            tombstones.push(tombstone);
-        }
-        Ok(tombstones)
-    }
-
-    fn full_state_attests_to_body_validation_state(
-        &self,
-        header_hash: block::Hash,
-        body_validation_state: &zakura_header_chain::BodyValidationState,
-    ) -> Result<bool, StoreError> {
-        let authority = self
-            .get_value::<FullStateBodyValidationEvidenceAuthorityDisk>(
-                HEADER_BODY_EVIDENCE_AUTHORITY,
-                header_hash.0,
-            )
-            .map_err(store_error)?;
-        Ok(authority.is_some_and(|authority| {
-            authority.attests_to_body_validation_state(header_hash, body_validation_state)
-        }))
-    }
-
-    fn header_child_edges(&self) -> Result<Vec<(block::Hash, block::Hash)>, StoreError> {
-        let mut edges = Vec::new();
-        for (key, value) in self.scan_raw(HEADER_CHILD).map_err(store_error)? {
-            if key.len() != 64 || !value.is_empty() {
-                return Err(StoreError::Incoherent("invalid child-index row"));
-            }
-            let key = HeaderChildKey::from_bytes(&key);
-            edges.push((key.parent, key.child));
-        }
-        Ok(edges)
-    }
-
-    fn selected_projection(&self) -> Result<Vec<Frontier>, StoreError> {
-        self.projection_entries(HEADER_SELECTED)
-    }
-
-    fn verified_projection(&self) -> Result<Vec<Frontier>, StoreError> {
-        self.projection_entries(HEADER_VERIFIED)
-    }
-
-    fn deferred_entries(&self) -> Result<Vec<(chrono::DateTime<Utc>, block::Hash)>, StoreError> {
-        let mut entries = Vec::new();
-        for (key, value) in self.scan_raw(HEADER_DEFERRED).map_err(store_error)? {
-            if key.len() != 44 || !value.is_empty() {
-                return Err(StoreError::Incoherent("invalid deferred-index row"));
-            }
-            let key = HeaderDeferredKey::try_from_bytes(&key)
-                .map_err(|_| StoreError::Incoherent("invalid deferred-index key"))?;
-            let until = Utc
-                .timestamp_opt(key.seconds, key.nanoseconds)
-                .single()
-                .ok_or(StoreError::Incoherent("invalid deferred-index timestamp"))?;
-            entries.push((until, key.hash));
-        }
-        Ok(entries)
-    }
-
-    fn eligibility_roots(&self) -> Result<Vec<(block::Hash, EligibilityReason)>, StoreError> {
-        self.all_reason_rows()
-    }
-
-    fn all_aux_deliveries(&self) -> Result<Vec<AuxDelivery>, StoreError> {
-        let mut deliveries = Vec::new();
-        for (key, value) in self.scan_raw(HEADER_AUX_DELIVERY).map_err(store_error)? {
-            if key.len() != 64 {
-                return Err(StoreError::Incoherent("invalid auxiliary key width"));
-            }
-            let key = HeaderAuxDeliveryKey::from_bytes(&key);
-            let delivery = AuxDelivery::decode(&value)
-                .map_err(|_| StoreError::Incoherent("invalid auxiliary value"))?;
-            if delivery.header_hash != key.header || delivery.delivery_id != key.delivery {
-                return Err(StoreError::Incoherent("auxiliary key/value mismatch"));
-            }
-            deliveries.push(delivery);
-        }
-        Ok(deliveries)
-    }
-
-    fn validation_context_records(&self) -> Result<Vec<ValidationContextRecord>, StoreError> {
-        let mut records = Vec::new();
-        for (key, value) in self
-            .scan_raw(HEADER_VALIDATION_CONTEXT)
-            .map_err(store_error)?
-        {
-            if key.len() != 32 {
-                return Err(StoreError::Incoherent(
-                    "invalid validation-context key width",
-                ));
-            }
-            let hash = block::Hash(
-                key.as_slice()
-                    .try_into()
-                    .map_err(|_| StoreError::Incoherent("invalid validation-context key"))?,
-            );
-            let record = HeaderValidationContextDisk::decode(&value)
-                .map_err(|_| StoreError::Incoherent("invalid validation-context value"))?;
-            if record.header.hash() != hash {
-                return Err(StoreError::Incoherent(
-                    "validation-context key/hash mismatch",
-                ));
-            }
-            records.push(ValidationContextRecord {
-                header: record.header,
-                height: record.height,
-            });
-        }
-        Ok(records)
-    }
-
-    fn authenticated_canonical_hash(
-        &self,
-        height: block::Height,
-    ) -> Result<Option<block::Hash>, StoreError> {
-        let finalized = self.cf("hash_by_height").map_err(store_error)?;
-        let hash: Option<block::Hash> = self.db.zs_get(&finalized, &height);
-        if hash.is_some() {
-            return Ok(hash);
-        }
-        let headers = self
-            .cf("zakura_header_hash_by_height")
-            .map_err(store_error)?;
-        let hash: Option<block::Hash> = self.db.zs_get(&headers, &height);
-        #[cfg(test)]
-        if hash.is_none() {
-            return Ok(self
-                .all_header_nodes()?
-                .into_iter()
-                .find(|node| node.height == height)
-                .map(|node| node.hash));
-        }
-        Ok(hash)
-    }
-
-    fn visit_finality_history(
-        &self,
-        visitor: &mut dyn FnMut(FinalityRecord) -> Result<(), StoreError>,
-    ) -> Result<(), StoreError> {
-        self.visit_finality_records(visitor)
     }
 }
 
@@ -4407,27 +4609,6 @@ impl HeaderChainStore {
             .single()
             .ok_or(StoreError::Incoherent("invalid deferred-index timestamp"))
             .map(Some)
-    }
-
-    fn all_reason_rows(&self) -> Result<Vec<(block::Hash, EligibilityReason)>, StoreError> {
-        let mut reasons = Vec::new();
-        for (key, value) in self
-            .scan_raw(HEADER_ELIGIBILITY_ROOT)
-            .map_err(store_error)?
-        {
-            let key = HeaderEligibilityRootKey::try_from_bytes(&key)
-                .map_err(|_| StoreError::Incoherent("invalid eligibility-root key"))?;
-            let reason = HeaderEligibilityReasonDisk::decode(&value)
-                .map_err(|_| StoreError::Incoherent("invalid eligibility-root value"))?;
-            let reason = reason.into_domain();
-            if reason_kind(&reason) != key.kind || reason_evidence(&reason) != key.evidence {
-                return Err(StoreError::Incoherent(
-                    "eligibility-root key/value mismatch",
-                ));
-            }
-            reasons.push((key.root, reason));
-        }
-        Ok(reasons)
     }
 
     fn projection_entries(&self, family: &'static str) -> Result<Vec<Frontier>, StoreError> {

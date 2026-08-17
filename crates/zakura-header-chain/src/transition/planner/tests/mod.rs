@@ -70,7 +70,7 @@ impl TestStore {
             .header_chain_score(frontier.hash)
             .expect("the anchor is retained");
         let metadata = EngineMetadata {
-            disk_format: HeaderChainDiskVersion(1),
+            disk_format: HeaderChainDiskVersion::CURRENT,
             mode,
             network_id: config.network.kind(),
             anchor_manifest_digest: config.trust_anchor_digest(),
@@ -264,14 +264,46 @@ fn context<'a>(
 }
 
 fn test_engine(store: &TestStore) -> crate::HeaderChainEngine {
-    crate::HeaderChainEngine::from_audited_state(
+    crate::HeaderChainEngine::from_untrusted_durable_state(
         store.graph.clone(),
         store.metadata.clone(),
         store.selected.clone(),
         store.verified.clone(),
-        store.aux.clone(),
+        untrusted_aux_rows(store),
     )
     .expect("the planner fixture is coherent before transition")
+}
+
+fn untrusted_aux_rows(store: &TestStore) -> Vec<crate::UntrustedAuxDeliveryRow> {
+    store
+        .aux
+        .iter()
+        .map(|delivery| {
+            let status = match delivery.outcome().status() {
+                crate::AuxOutcomeStatus::Unauthenticated => 0,
+                crate::AuxOutcomeStatus::Authenticated => 1,
+                crate::AuxOutcomeStatus::Rejected => 2,
+                crate::AuxOutcomeStatus::Disputed => 3,
+            };
+            let observations = delivery
+                .observation_ids()
+                .map(|id| id.map(|id| id.digest()));
+            let base = crate::AuxDelivery::new(
+                delivery.delivery_id,
+                delivery.header_hash,
+                delivery.source,
+                delivery.owner,
+                delivery.body_size,
+                delivery.tree_aux,
+            );
+            crate::UntrustedAuxDeliveryRow::new(
+                base,
+                status,
+                observations,
+                delivery.outcome_boundary_hash(),
+            )
+        })
+        .collect()
 }
 
 fn fixture_transition_input(store: &TestStore, request: TransitionRequest) -> TransitionInput {
@@ -352,12 +384,12 @@ fn apply_transition(
     request: TransitionRequest,
     context: &TransitionContext<'_>,
 ) -> Result<EngineTransition, TransitionFailure> {
-    let engine = crate::HeaderChainEngine::from_audited_state(
+    let engine = crate::HeaderChainEngine::from_untrusted_durable_state(
         store.graph.clone(),
         store.metadata.clone(),
         store.selected.clone(),
         store.verified.clone(),
-        store.aux.clone(),
+        untrusted_aux_rows(store),
     )
     .expect("the planner fixture is coherent before transition");
     let input = fixture_transition_input(store, request);

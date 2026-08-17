@@ -24,9 +24,9 @@ use zakura_chain::{
     work::{difficulty::ParameterDifficulty as _, equihash},
 };
 use zakura_header_chain::{
-    AuxAuthentication, AuxDelivery, BodySizeHint, EvidenceId, HeaderBatchInput, HeaderRules,
-    InsertHeaders, SourceId, SystemClock, TargetCompletion, TransitionContext, TransitionEvent,
-    TransitionRequest, VctRootRepairState, VctRootRepairStatus,
+    AuxDelivery, BodySizeHint, EvidenceId, HeaderBatchInput, HeaderRules, InsertHeaders, SourceId,
+    SystemClock, TargetCompletion, TransitionContext, TransitionEvent, TransitionRequest,
+    VctRootRepairState, VctRootRepairStatus,
 };
 
 use super::*;
@@ -43,6 +43,26 @@ use crate::{
 
 /// Heartwood activates here, so the running MMR is created at this height.
 const HEARTWOOD: u32 = 5;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TestAuxStatus {
+    Unauthenticated,
+    Authenticated,
+    Rejected,
+    Disputed,
+}
+
+fn aux_status(delivery: AuxDelivery) -> TestAuxStatus {
+    if delivery.is_unauthenticated() {
+        TestAuxStatus::Unauthenticated
+    } else if delivery.is_authenticated() {
+        TestAuxStatus::Authenticated
+    } else if delivery.is_rejected() {
+        TestAuxStatus::Rejected
+    } else {
+        TestAuxStatus::Disputed
+    }
+}
 /// NU5 activates here, so headers from this height commit to an authorizing-data root and the
 /// sweep's boundary check needs the successor delivery, not just the successor header.
 const NU5: u32 = 10;
@@ -408,15 +428,14 @@ impl Fixture {
                 let record = self.aux_record(height)?;
                 let mut delivery_id = [0x60; 32];
                 delivery_id[..4].copy_from_slice(&height.0.to_le_bytes());
-                Some(AuxDelivery {
-                    delivery_id: EvidenceId::from_digest(delivery_id),
-                    header_hash: block.hash(),
+                Some(AuxDelivery::new(
+                    EvidenceId::from_digest(delivery_id),
+                    block.hash(),
                     source,
                     owner,
-                    body_size: BodySizeHint::Unknown,
-                    tree_aux: Some(record),
-                    authentication: AuxAuthentication::Unauthenticated,
-                })
+                    BodySizeHint::Unknown,
+                    Some(record),
+                ))
             })
             .collect();
 
@@ -500,15 +519,14 @@ impl Fixture {
         }
         let mut delivery_id = [marker; 32];
         delivery_id[..4].copy_from_slice(&height.0.to_le_bytes());
-        let delivery = AuxDelivery {
-            delivery_id: EvidenceId::from_digest(delivery_id),
-            header_hash: target.hash(),
+        let delivery = AuxDelivery::new(
+            EvidenceId::from_digest(delivery_id),
+            target.hash(),
             source,
             owner,
-            body_size: BodySizeHint::Unknown,
-            tree_aux: Some(record),
-            authentication: AuxAuthentication::Unauthenticated,
-        };
+            BodySizeHint::Unknown,
+            Some(record),
+        );
         let result = self
             .writer
             .runtime
@@ -542,7 +560,7 @@ impl Fixture {
         assert!(matches!(result, ApplyResult::Committed));
     }
 
-    fn authentications(&self, height: Height) -> Vec<AuxAuthentication> {
+    fn authentications(&self, height: Height) -> Vec<TestAuxStatus> {
         let hash = self.chain[height.0 as usize].hash();
         let window = self
             .writer
@@ -554,7 +572,7 @@ impl Fixture {
             .delivery_header
             .auxiliary_deliveries
             .into_iter()
-            .map(|delivery| delivery.authentication)
+            .map(aux_status)
             .collect()
     }
 
@@ -578,14 +596,18 @@ impl Fixture {
     }
 
     /// The authentication state currently recorded for the selected delivery at `height`.
-    fn authentication(&self, height: Height) -> Option<AuxAuthentication> {
+    fn outcome(&self, height: Height) -> Option<AuxDelivery> {
         let hash = self.chain[height.0 as usize].hash();
         match self.writer.vct_auxiliary_window(height, hash) {
-            Ok(VctAuxiliaryWindowRead::Ready(window)) => Some(window.delivery.authentication),
+            Ok(VctAuxiliaryWindowRead::Ready(window)) => Some(window.delivery),
             // Every delivery at this height is rejected, or none was ever supplied.
             Ok(VctAuxiliaryWindowRead::Missing { .. }) => None,
             Err(error) => panic!("the fixture auxiliary read is coherent: {error}"),
         }
+    }
+
+    fn authentication(&self, height: Height) -> Option<TestAuxStatus> {
+        self.outcome(height).map(aux_status)
     }
 
     fn is_selected(&self, height: Height) -> bool {
@@ -672,14 +694,14 @@ fn authenticates_every_supplied_delivery_ahead_of_its_body() {
         assert!(
             matches!(
                 fixture.authentication(height),
-                Some(AuxAuthentication::Authenticated { .. })
+                Some(TestAuxStatus::Authenticated)
             ),
             "the sweep authenticates {height:?} from its successor header, far below its body"
         );
     }
     assert_eq!(
         fixture.authentication(Height(TOP)),
-        Some(AuxAuthentication::Unauthenticated),
+        Some(TestAuxStatus::Unauthenticated),
         "the header tip has no successor, so nothing proves its roots yet"
     );
     assert_eq!(
@@ -712,7 +734,7 @@ fn queued_commit_work_yields_before_authentication() {
     assert_eq!(fixture.writer.runtime.publisher().snapshot(), before);
     assert_eq!(
         fixture.authentication(Height(BODY_TIP + 1)),
-        Some(AuxAuthentication::Unauthenticated)
+        Some(TestAuxStatus::Unauthenticated)
     );
 }
 
@@ -732,14 +754,14 @@ fn stops_below_a_height_with_no_supplied_metadata() {
         assert!(
             matches!(
                 fixture.authentication(height),
-                Some(AuxAuthentication::Authenticated { .. })
+                Some(TestAuxStatus::Authenticated)
             ),
             "{height:?} is below the hole and still provable"
         );
     }
     assert_eq!(
         fixture.authentication(Height(hole.0 - 1)),
-        Some(AuxAuthentication::Unauthenticated),
+        Some(TestAuxStatus::Unauthenticated),
         "nothing proves the delivery directly below the hole"
     );
     assert_eq!(
@@ -750,7 +772,7 @@ fn stops_below_a_height_with_no_supplied_metadata() {
     for height in (hole.0 + 1..=LAST_PROVABLE).map(Height) {
         assert_eq!(
             fixture.authentication(height),
-            Some(AuxAuthentication::Unauthenticated),
+            Some(TestAuxStatus::Unauthenticated),
             "the running history tree cannot skip {hole:?}, so {height:?} stays unproven"
         );
     }
@@ -768,7 +790,7 @@ fn disputes_an_ambiguous_note_commitment_boundary_and_arms_repair() {
 
     assert!(matches!(
         fixture.authentication(bad),
-        Some(AuxAuthentication::Disputed { .. })
+        Some(TestAuxStatus::Disputed)
     ));
     assert!(
         fixture.is_selected(bad),
@@ -804,20 +826,20 @@ fn an_ambiguous_boundary_disputes_both_deliveries_without_rejecting_them() {
     fixture.sweep(&mut sweeper);
 
     let bad_authentication = fixture
-        .authentication(bad)
+        .outcome(bad)
         .expect("the corrupt successor remains available as disputed evidence");
     let predecessor_authentication = fixture
-        .authentication(predecessor)
+        .outcome(predecessor)
         .expect("the honest predecessor remains available as disputed evidence");
-    assert!(matches!(
-        (bad_authentication, predecessor_authentication),
-        (
-            AuxAuthentication::Disputed { evidence: bad_evidence },
-            AuxAuthentication::Disputed {
-                evidence: predecessor_evidence
-            }
-        ) if bad_evidence == predecessor_evidence
-    ));
+    assert_eq!(aux_status(bad_authentication), TestAuxStatus::Disputed);
+    assert_eq!(
+        aux_status(predecessor_authentication),
+        TestAuxStatus::Disputed
+    );
+    assert_eq!(
+        bad_authentication.observation_ids(),
+        predecessor_authentication.observation_ids()
+    );
     assert!(fixture.is_selected(bad) && fixture.is_selected(predecessor));
     assert_eq!(
         fixture.repair_state(),
@@ -844,15 +866,11 @@ fn a_replacement_successor_preserves_and_authenticates_the_honest_predecessor() 
 
     assert!(matches!(
         fixture.authentication(predecessor),
-        Some(AuxAuthentication::Authenticated { .. })
+        Some(TestAuxStatus::Authenticated)
     ));
     let successor_states = fixture.authentications(bad);
-    assert!(successor_states
-        .iter()
-        .any(|state| matches!(state, AuxAuthentication::Disputed { .. })));
-    assert!(successor_states
-        .iter()
-        .any(|state| matches!(state, AuxAuthentication::Authenticated { .. })));
+    assert!(successor_states.contains(&TestAuxStatus::Disputed));
+    assert!(successor_states.contains(&TestAuxStatus::Authenticated));
     assert_eq!(fixture.repair_state(), VctRootRepairState::Idle);
 }
 
@@ -870,15 +888,11 @@ fn a_replacement_predecessor_preserves_the_honest_successor() {
     fixture.sweep(&mut sweeper);
 
     let predecessor_states = fixture.authentications(bad);
-    assert!(predecessor_states
-        .iter()
-        .any(|state| matches!(state, AuxAuthentication::Disputed { .. })));
-    assert!(predecessor_states
-        .iter()
-        .any(|state| matches!(state, AuxAuthentication::Authenticated { .. })));
+    assert!(predecessor_states.contains(&TestAuxStatus::Disputed));
+    assert!(predecessor_states.contains(&TestAuxStatus::Authenticated));
     assert!(matches!(
         fixture.authentication(successor),
-        Some(AuxAuthentication::Authenticated { .. })
+        Some(TestAuxStatus::Authenticated)
     ));
     assert_eq!(fixture.repair_state(), VctRootRepairState::Idle);
 }
@@ -1000,7 +1014,7 @@ fn a_fresh_sweeper_resumes_from_the_durable_authentication_marks() {
     for height in (BODY_TIP + 1..=LAST_PROVABLE).map(Height) {
         assert!(matches!(
             fixture.authentication(height),
-            Some(AuxAuthentication::Authenticated { .. })
+            Some(TestAuxStatus::Authenticated)
         ));
     }
 }
@@ -1023,7 +1037,7 @@ fn does_nothing_outside_the_fast_path() {
     assert_eq!(fixture.writer.runtime.publisher().snapshot(), before);
     assert_eq!(
         fixture.authentication(Height(BODY_TIP + 1)),
-        Some(AuxAuthentication::Unauthenticated)
+        Some(TestAuxStatus::Unauthenticated)
     );
 }
 
@@ -1160,7 +1174,7 @@ proptest! {
         prop_assert!(
             !matches!(
                 fixture.authentication(bad),
-                Some(AuxAuthentication::Authenticated { .. })
+                Some(TestAuxStatus::Authenticated)
             ),
             "a corrupted delivery at {bad:?} must never be authenticated"
         );
@@ -1172,7 +1186,7 @@ proptest! {
             prop_assert!(
                 matches!(
                     fixture.authentication(height),
-                    Some(AuxAuthentication::Authenticated { .. })
+                    Some(TestAuxStatus::Authenticated)
                 ),
                 "{height:?} is below the corruption and must stay usable"
             );
@@ -1182,7 +1196,7 @@ proptest! {
         for height in (BODY_TIP + 1..=LAST_PROVABLE).map(Height) {
             if matches!(
                 fixture.authentication(height),
-                Some(AuxAuthentication::Authenticated { .. })
+                Some(TestAuxStatus::Authenticated)
             ) {
                 prop_assert!(
                     fixture.committer_accepts(height),
@@ -1195,7 +1209,7 @@ proptest! {
             prop_assert!(
                 !matches!(
                     fixture.authentication(height),
-                    Some(AuxAuthentication::Authenticated { .. })
+                    Some(TestAuxStatus::Authenticated)
                 ),
                 "the run stops at the corruption, so {height:?} cannot be proven"
             );

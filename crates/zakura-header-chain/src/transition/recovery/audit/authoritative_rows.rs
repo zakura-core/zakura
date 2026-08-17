@@ -5,15 +5,16 @@ use std::collections::{HashMap, HashSet};
 use zakura_chain::block;
 
 use crate::{
-    EngineConfig, EngineMetadata, EngineMode, FinalityRecord, FinalitySource, HeaderNode,
+    EngineConfig, EngineMetadata, EngineMode, FinalityRecord, FinalitySource, HeaderNode, RowLimit,
     StoreError,
 };
 
-use super::super::contracts::{AuditViolation, StoreAuditRead, ValidationContextRecord};
+use super::super::contracts::{AuditViolation, StoreAuditSnapshot, ValidationContextRecord};
 
-pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
+pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
     store: &S,
     nodes: &[HeaderNode],
+    deliveries: &[crate::AuxDelivery],
     validation_contexts: &[ValidationContextRecord],
     metadata: &EngineMetadata,
     config: &EngineConfig,
@@ -29,7 +30,17 @@ pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
                 .map(move |reason| (node.hash, reason))
         })
         .collect();
-    let mut actual = store.eligibility_roots()?;
+    let reason_limit = nodes
+        .len()
+        .checked_mul(crate::MAX_DIRECT_ELIGIBILITY_REASONS_V1)
+        .ok_or(StoreError::Incoherent(
+            "eligibility-reason recovery limit overflow",
+        ))?;
+    let mut actual = Vec::with_capacity(reason_limit.min(expected.len()));
+    store.visit_eligibility_roots(RowLimit::new(reason_limit), &mut |reason| {
+        actual.push(reason);
+        Ok(())
+    })?;
     expected.sort_by_key(|(hash, reason)| (hash.0, reason.clone()));
     actual.sort_by_key(|(hash, reason)| (hash.0, reason.clone()));
     if expected != actual {
@@ -49,7 +60,6 @@ pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
     }
 
     let by_hash: HashMap<_, _> = nodes.iter().map(|node| (node.hash, node)).collect();
-    let deliveries = store.all_aux_deliveries()?;
     if deliveries.len() > config.limits.max_aux_deliveries_total.get() {
         violations.push(AuditViolation::Limits);
     }
@@ -57,7 +67,7 @@ pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
     if delivery_ids.len() != deliveries.len() {
         violations.push(AuditViolation::Auxiliary(block::Hash([0; 32])));
     }
-    for delivery in &deliveries {
+    for delivery in deliveries {
         if by_hash
             .get(&delivery.header_hash)
             .is_none_or(|node| !node.aux_delivery_ids.contains(&delivery.delivery_id))
@@ -112,8 +122,22 @@ pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
     let mut first = None;
     let mut last = None;
     let mut invalid_history = false;
-    let mut work_origin_seen = metadata.work_origin == config.bootstrap_anchor().frontier;
-    store.visit_finality_history(&mut |record| {
+    let expected_history_count = store.finality_history_count()?;
+    let mut history_count = 0_usize;
+    let checkpoint = store.finality_history_checkpoint()?;
+    if let Some(checkpoint) = checkpoint {
+        if checkpoint.frontier.height > metadata.frontiers.finalized.height
+            || store.authenticated_canonical_hash(checkpoint.frontier.height)?
+                != Some(checkpoint.frontier.hash)
+        {
+            violations.push(AuditViolation::Finality);
+        }
+    }
+    let mut work_origin_seen = metadata.work_origin == config.bootstrap_anchor().frontier
+        || checkpoint
+            .is_some_and(|checkpoint| metadata.work_origin.height <= checkpoint.frontier.height);
+    store.visit_finality_history(RowLimit::new(65_536), &mut |record| {
+        history_count = history_count.saturating_add(1);
         first.get_or_insert(record);
         if previous.is_some_and(|previous: FinalityRecord| {
             previous.current != record.previous
@@ -128,23 +152,26 @@ pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
         work_origin_seen |= record.current == metadata.work_origin;
         Ok(())
     })?;
-    if first.is_none_or(|record| {
-        record.epoch != crate::FinalityEpoch::new(0)
-            || record.previous != config.bootstrap_anchor().frontier
-            || record.current.height < record.previous.height
-            || record.current.height == record.previous.height && record.current != record.previous
-    }) || metadata
-        .headers_only_migration_epoch
-        .is_some_and(|boundary| {
-            metadata.mode != EngineMode::Integrated || boundary > metadata.finality_epoch
-        })
-        || invalid_history
-        || last.is_some_and(|record| {
-            record.current != metadata.frontiers.finalized
-                || record.epoch != metadata.finality_epoch
-        })
-        || last.is_none()
-    {
+    let history_has_expected_count = history_count == expected_history_count;
+    let history_has_valid_start = first.is_some_and(|record| {
+        finality_history_starts_validly(record, checkpoint, config.bootstrap_anchor().frontier)
+    });
+    let migration_boundary_is_valid =
+        metadata
+            .headers_only_migration_epoch
+            .is_none_or(|boundary| {
+                metadata.mode == EngineMode::Integrated && boundary <= metadata.finality_epoch
+            });
+    let history_rows_are_valid = !invalid_history;
+    let history_has_valid_end = last.is_some_and(|record| {
+        record.current == metadata.frontiers.finalized && record.epoch == metadata.finality_epoch
+    });
+    let history_is_valid = history_has_expected_count
+        && history_has_valid_start
+        && migration_boundary_is_valid
+        && history_rows_are_valid
+        && history_has_valid_end;
+    if !history_is_valid {
         violations.push(AuditViolation::Finality);
     }
     let work_origin_is_authenticated = metadata.work_origin == config.bootstrap_anchor().frontier
@@ -171,6 +198,25 @@ pub(super) fn check_authoritative_rows<S: StoreAuditRead>(
         }
     }
     Ok(())
+}
+
+fn finality_history_starts_validly(
+    record: FinalityRecord,
+    checkpoint: Option<crate::FinalityHistoryCheckpoint>,
+    bootstrap_frontier: crate::Frontier,
+) -> bool {
+    let follows_starting_frontier = match checkpoint {
+        Some(checkpoint) => {
+            checkpoint.epoch.get().checked_add(1) == Some(record.epoch.get())
+                && record.previous == checkpoint.frontier
+        }
+        None => {
+            record.epoch == crate::FinalityEpoch::new(0) && record.previous == bootstrap_frontier
+        }
+    };
+    let preserves_frontier_order =
+        record.current.height > record.previous.height || record.current == record.previous;
+    follows_starting_frontier && preserves_frontier_order
 }
 
 fn source_matches_mode(

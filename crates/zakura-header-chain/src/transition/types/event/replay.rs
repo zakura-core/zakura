@@ -8,7 +8,7 @@ use crate::{
     HeaderValidationState,
 };
 
-use super::super::auxiliary::{AuxAuthentication, AuxDelivery, BodySizeHint};
+use super::super::auxiliary::{AuxDelivery, AuxOutcomeStatus, BodySizeHint};
 use super::super::preparation::hash_network_policy;
 use super::body::{BodyCommitmentKind, BodyEvidence, TransientBodyFailureKind};
 use super::header::TargetCompletion;
@@ -280,13 +280,13 @@ pub(super) fn hash_transition_payload(hasher: &mut Sha256, event: &TransitionEve
             hash_frontier(hasher, event.invalid_header);
             hash_bytes(hasher, event.rule.as_str().as_bytes());
         }
-        TransitionEvent::AuxEvidence(event) => {
-            hash_body_owner(hasher, event.owner);
-            for delivery in &event.deliveries {
-                hash_aux_delivery(hasher, *delivery);
+        TransitionEvent::AuxEvidence(event) => match event.observation() {
+            Some(observation) => {
+                hasher.update([1]);
+                hasher.update(observation.observation_id().digest());
             }
-            hash_aux_authentication(hasher, event.authentication);
-        }
+            None => hasher.update([0]),
+        },
         TransitionEvent::ReevaluateDeferred => {}
     }
 }
@@ -396,27 +396,32 @@ fn hash_aux_delivery(hasher: &mut Sha256, delivery: AuxDelivery) {
             hasher.update(<[u8; 32]>::from(aux.auth_data_root));
         }
     }
-    hash_aux_authentication(hasher, delivery.authentication);
+    hash_aux_outcome(hasher, delivery.outcome());
 }
 
-fn hash_aux_authentication(hasher: &mut Sha256, authentication: AuxAuthentication) {
-    match authentication {
-        AuxAuthentication::Unauthenticated => hasher.update([0]),
-        AuxAuthentication::Authenticated {
-            evidence,
-            boundary_hash,
-        } => {
+fn hash_aux_outcome(hasher: &mut Sha256, outcome: crate::AuxOutcome) {
+    match outcome.status() {
+        AuxOutcomeStatus::Unauthenticated => hasher.update([0]),
+        AuxOutcomeStatus::Authenticated => {
             hasher.update([1]);
-            hasher.update(evidence.digest());
-            hasher.update(boundary_hash.0);
         }
-        AuxAuthentication::Rejected { evidence } => {
+        AuxOutcomeStatus::Rejected => {
             hasher.update([2]);
-            hasher.update(evidence.digest());
         }
-        AuxAuthentication::Disputed { evidence } => {
+        AuxOutcomeStatus::Disputed => {
             hasher.update([3]);
-            hasher.update(evidence.digest());
         }
+    }
+    for observation_id in outcome.observation_ids() {
+        match observation_id {
+            Some(observation_id) => {
+                hasher.update([1]);
+                hasher.update(observation_id.digest());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    if let Some(boundary_hash) = outcome.boundary_hash() {
+        hasher.update(boundary_hash.0);
     }
 }

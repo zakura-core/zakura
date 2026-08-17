@@ -22,12 +22,12 @@ use zakura_chain::{
     parallel::tree::NoteCommitmentTrees,
 };
 use zakura_header_chain::{
-    ApplyResult, AuxAuthentication, AuxEvidence, BodyWorkAuthority, CheckpointSet, Clock,
-    EngineConfig, EngineConfigError, EngineMode, EngineSnapshot, EvidenceId, Frontier,
-    FullStateEvidenceAuthority, FullStateFinalized, OperatorInvalidate, OperatorInvalidationId,
-    OperatorReconsider, StateVersion, StoreError, SystemClock, TransitionContext, TransitionEvent,
-    TransitionRequest, TrustedAnchor, VerifiedBlockAccepted, VerifiedChainChanged,
-    VerifiedChangeCause, VerifiedHeaderRef,
+    ApplyResult, AuxEvidence, AuxObservationV1, AuxVerificationFactV1, BodyWorkAuthority,
+    CheckpointSet, Clock, EngineConfig, EngineConfigError, EngineMode, EngineSnapshot, EvidenceId,
+    Frontier, FullStateEvidenceAuthority, FullStateFinalized, OperatorInvalidate,
+    OperatorInvalidationId, OperatorReconsider, StateVersion, StoreError, SystemClock,
+    TransitionContext, TransitionEvent, TransitionRequest, TrustedAnchor, VerifiedBlockAccepted,
+    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -66,6 +66,25 @@ use vct_authentication_sweep::VctAuthenticationSweeper;
 use vct_write_retry::{VctWriteRetryCause, VctWriteRetryManager};
 pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
 
+fn missing_vct_successor_retry(
+    auxiliary_window: &VctAuxiliaryWindow,
+    current_height: Height,
+) -> (Height, VctWriteRetryCause) {
+    if let Some(successor_height) = auxiliary_window.successor_height {
+        return (
+            successor_height,
+            VctWriteRetryCause::MissingRoot {
+                replacement_required: true,
+            },
+        );
+    }
+
+    (
+        current_height.next().unwrap_or(current_height),
+        VctWriteRetryCause::MissingSuccessor,
+    )
+}
+
 /// A full-state mutation staged until its matching header transition commits durably.
 #[allow(dead_code)] // Constructed when the dark header engine is attached to the writer task.
 pub struct PreparedFullStateTransition {
@@ -87,22 +106,41 @@ pub struct PreparedFullStateTransition {
     header_request: TransitionRequest,
 }
 
-struct PreparedAuthority(zakura_header_chain::TransitionFingerprint);
+struct PreparedAuthority {
+    transition: zakura_header_chain::TransitionFingerprint,
+    retention_references: Vec<block::Hash>,
+}
 
 impl PreparedAuthority {
     fn for_event(event: &TransitionEvent) -> Result<Self, HeaderChainStoreError> {
         event
             .fingerprint()
-            .map(Self)
+            .map(|transition| Self {
+                transition,
+                retention_references: Vec::new(),
+            })
             .ok_or(HeaderChainStoreError::Incoherent(
                 "prepared full-state event has no stable identity",
             ))
+    }
+
+    fn for_event_with_retention(
+        event: &TransitionEvent,
+        retention_references: Vec<block::Hash>,
+    ) -> Result<Self, HeaderChainStoreError> {
+        let mut authority = Self::for_event(event)?;
+        authority.retention_references = retention_references;
+        Ok(authority)
     }
 }
 
 impl FullStateEvidenceAuthority for PreparedAuthority {
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
-        event.fingerprint() == Some(self.0)
+        event.fingerprint() == Some(self.transition)
+    }
+
+    fn authorizes_retention_reference(&self, reference: block::Hash) -> bool {
+        self.retention_references.contains(&reference)
     }
 }
 
@@ -206,7 +244,10 @@ impl PreparedFullStateTransition {
             header_request,
             ..
         } = self;
-        let authority = PreparedAuthority::for_event(&header_request.event)?;
+        let authority = PreparedAuthority::for_event_with_retention(
+            &header_request.event,
+            staged_tips.clone(),
+        )?;
         let mut retention_references = context.retention_references.to_vec();
         retention_references.extend(staged_tips);
         retention_references.sort_unstable_by_key(|hash| hash.0);
@@ -468,6 +509,7 @@ impl HeaderChainWriter {
         let restored_path = verified_path(non_finalized_state);
         let restored_side_paths = verified_side_paths(non_finalized_state, &restored_path);
         let store = HeaderChainStore::new(finalized_state.db.header_chain_disk_db());
+        store.migrate_v1_to_current(&config)?;
         let runtime = if store.is_initialized()? {
             let persisted_finalized = store.snapshot()?.frontiers.finalized;
             let (full_state_height, full_state_hash) = finalized_state
@@ -712,18 +754,18 @@ impl HeaderChainWriter {
         if deliveries.is_empty() {
             return Ok(None);
         }
+        let Some(boundary_witness) = auxiliary_window
+            .successor
+            .as_ref()
+            .and_then(|successor| successor.auth_data_root)
+        else {
+            return Ok(None);
+        };
 
-        let mut hasher = Sha256::new();
-        hasher.update(b"zakura.vct.aux.rejection.v1");
-        hasher.update([match failure {
+        let failure_code = match failure {
             crate::error::VctCommitFailure::CurrentRoots => 1,
             crate::error::VctCommitFailure::SuccessorBoundary => 2,
-        }]);
-        for delivery in &deliveries {
-            hasher.update(delivery.delivery_id.digest());
-            hasher.update(delivery.header_hash.0);
-        }
-        let evidence = EvidenceId::from_digest(hasher.finalize().into());
+        };
         let first_delivery = deliveries
             .first()
             .expect("the empty auxiliary rejection returned above");
@@ -731,18 +773,26 @@ impl HeaderChainWriter {
             first_delivery.owner.session_id(),
             first_delivery.owner.request_id(),
         );
-        let authentication = if attribution.requires_dispute() {
-            AuxAuthentication::Disputed { evidence }
-        } else {
-            AuxAuthentication::Rejected { evidence }
+        let verification = match attribution {
+            VctAuxiliaryFailureAttribution::CurrentDelivery => {
+                AuxVerificationFactV1::current_delivery_failed(failure_code)
+            }
+            VctAuxiliaryFailureAttribution::SuccessorDelivery => {
+                AuxVerificationFactV1::successor_delivery_failed(failure_code)
+            }
+            VctAuxiliaryFailureAttribution::AmbiguousDeliveries => {
+                AuxVerificationFactV1::ambiguous_deliveries_failed(failure_code)
+            }
+            VctAuxiliaryFailureAttribution::NoDelivery => return Ok(None),
         };
+        let observation =
+            AuxObservationV1::from_vct(owner, deliveries, verification, Some(boundary_witness))
+                .ok_or(HeaderChainStoreError::Incoherent(
+                    "invalid VCT auxiliary observation",
+                ))?;
         let request = TransitionRequest {
             expected_version: auxiliary_window.engine_snapshot.state_version,
-            event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence {
-                owner,
-                deliveries,
-                authentication,
-            })),
+            event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence::observed(observation))),
         };
         let authority = PreparedAuthority::for_event(&request.event)?;
         let mut context = self.context();
@@ -761,7 +811,8 @@ impl HeaderChainWriter {
         auxiliary_window: &VctAuxiliaryWindow,
         proof: VctAuthenticationProof,
     ) -> Result<Option<ApplyResult>, HeaderChainStoreError> {
-        let Some((_evidence, request)) = Self::vct_authentication_request(auxiliary_window, proof)
+        let Some((_observation_id, request)) =
+            Self::vct_authentication_request(auxiliary_window, proof)
         else {
             return Ok(None);
         };
@@ -775,11 +826,10 @@ impl HeaderChainWriter {
     fn vct_authentication_request(
         auxiliary_window: &VctAuxiliaryWindow,
         proof: VctAuthenticationProof,
-    ) -> Option<(EvidenceId, TransitionRequest)> {
-        if !matches!(
-            auxiliary_window.delivery.authentication,
-            AuxAuthentication::Unauthenticated | AuxAuthentication::Disputed { .. }
-        ) {
+    ) -> Option<(zakura_header_chain::AuxObservationId, TransitionRequest)> {
+        if !auxiliary_window.delivery.is_unauthenticated()
+            && !auxiliary_window.delivery.is_disputed()
+        {
             return None;
         }
         let VctAuthenticationProof::Successor {
@@ -793,34 +843,31 @@ impl HeaderChainWriter {
         };
         if delivery_id != auxiliary_window.delivery.delivery_id
             || delivery_header_hash != auxiliary_window.delivery.header_hash
+            || auxiliary_window
+                .successor
+                .as_ref()
+                .is_none_or(|successor| successor.hash != boundary_hash)
         {
             return None;
         }
-
-        let mut hasher = Sha256::new();
-        hasher.update(b"zakura.vct.aux.authentication.v1");
-        hasher.update(delivery_id.digest());
-        hasher.update(delivery_header_hash.0);
-        hasher.update(boundary_hash.0);
-        hasher.update(<[u8; 32]>::from(boundary_auth_data_root));
-        let evidence = EvidenceId::from_digest(hasher.finalize().into());
         let owner = BodyWorkAuthority::for_snapshot(&auxiliary_window.engine_snapshot).bind(
             auxiliary_window.delivery.owner.session_id(),
             auxiliary_window.delivery.owner.request_id(),
         );
 
+        let observation = AuxObservationV1::from_vct(
+            owner,
+            vec![auxiliary_window.delivery],
+            AuxVerificationFactV1::current_delivery_verified(),
+            Some(boundary_auth_data_root),
+        )?;
+        let observation_id = observation.observation_id();
+
         Some((
-            evidence,
+            observation_id,
             TransitionRequest {
                 expected_version: auxiliary_window.engine_snapshot.state_version,
-                event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence {
-                    owner,
-                    deliveries: vec![auxiliary_window.delivery],
-                    authentication: AuxAuthentication::Authenticated {
-                        evidence,
-                        boundary_hash,
-                    },
-                })),
+                event: TransitionEvent::AuxEvidence(Box::new(AuxEvidence::observed(observation))),
             },
         ))
     }
@@ -1675,7 +1722,11 @@ impl BlockWriteSender {
     }
 }
 
-trait DeferredHeaderMaintenance {
+trait HeaderChainMaintenance {
+    fn resource_stalled_version(&self) -> Option<StateVersion> {
+        None
+    }
+
     fn earliest_deferred(
         &self,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, HeaderChainStoreError>;
@@ -1683,7 +1734,15 @@ trait DeferredHeaderMaintenance {
     fn reevaluate_deferred(&self) -> Result<(), HeaderChainStoreError>;
 }
 
-impl DeferredHeaderMaintenance for HeaderChainWriter {
+impl HeaderChainMaintenance for HeaderChainWriter {
+    fn resource_stalled_version(&self) -> Option<StateVersion> {
+        let snapshot = self.runtime.publisher().snapshot();
+        snapshot
+            .alarms
+            .resource_stalled
+            .then_some(snapshot.state_version)
+    }
+
     fn earliest_deferred(
         &self,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, HeaderChainStoreError> {
@@ -1699,7 +1758,7 @@ impl DeferredHeaderMaintenance for HeaderChainWriter {
     }
 }
 
-fn receive_until_deferred_deadline<M: DeferredHeaderMaintenance>(
+fn receive_until_deferred_deadline<M: HeaderChainMaintenance>(
     receiver: &mut UnboundedReceiver<NonFinalizedWriteMessage>,
     maintenance: Option<&M>,
     deadline_runtime: &tokio::runtime::Runtime,
@@ -1732,6 +1791,30 @@ fn receive_until_deferred_deadline<M: DeferredHeaderMaintenance>(
             Err(_) => maintenance.reevaluate_deferred()?,
         }
     }
+}
+
+fn recover_resource_stall<M: HeaderChainMaintenance>(
+    maintenance: Option<&M>,
+    last_recovery: &mut Option<StateVersion>,
+) -> Result<(), HeaderChainStoreError> {
+    let Some(maintenance) = maintenance else {
+        *last_recovery = None;
+        return Ok(());
+    };
+    let Some(version) = maintenance.resource_stalled_version() else {
+        *last_recovery = None;
+        return Ok(());
+    };
+    if *last_recovery == Some(version) {
+        return Ok(());
+    }
+
+    *last_recovery = Some(version);
+    maintenance.reevaluate_deferred()?;
+    if maintenance.resource_stalled_version().is_none() {
+        *last_recovery = None;
+    }
+    Ok(())
 }
 
 fn handle_header_chain_control_message(
@@ -2036,16 +2119,13 @@ impl WriteBlockWorkerTask {
                     .and_then(|auxiliary_window| auxiliary_window.successor.as_ref())
                     .is_none()
             {
-                let height = vct_auxiliary_window
+                let auxiliary_window = vct_auxiliary_window
                     .as_ref()
-                    .and_then(|auxiliary_window| auxiliary_window.successor_height)
-                    .or_else(|| ordered_block.0.height.next().ok())
-                    .unwrap_or(ordered_block.0.height);
-                let wait = vct_write_retry_manager.on_retryable_error(
-                    height,
-                    VctWriteRetryCause::MissingSuccessor,
-                    ordered_block,
-                );
+                    .expect("exact VCT roots require an auxiliary window");
+                let (height, retry_cause) =
+                    missing_vct_successor_retry(auxiliary_window, ordered_block.0.height);
+                let wait =
+                    vct_write_retry_manager.on_retryable_error(height, retry_cause, ordered_block);
                 std::thread::park_timeout(wait);
                 continue;
             }
@@ -2263,8 +2343,23 @@ impl WriteBlockWorkerTask {
         // Track rejected ancestors so queued descendants can be rejected without
         // attributing the ancestor's validation failure to the descendant's peer.
         let mut rejected_ancestor_map: IndexMap<block::Hash, block::Hash> = IndexMap::new();
+        let mut last_resource_stall_recovery = None;
 
         loop {
+            if let Err(error) =
+                recover_resource_stall(header_chain.as_ref(), &mut last_resource_stall_recovery)
+            {
+                tracing::error!(
+                    ?error,
+                    "stopping state writer after resource-stall recovery failure"
+                );
+                return BlockWriteTaskExit::HeaderChainRuntimeFailed(
+                    BlockWriteTaskFailure::runtime(
+                        "resource-stall recovery stopped the state writer",
+                        error,
+                    ),
+                );
+            }
             let msg = match deferred_non_finalized_messages.pop_front() {
                 Some(msg) => Some(msg),
                 None => match receive_until_deferred_deadline(

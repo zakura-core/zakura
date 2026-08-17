@@ -12,6 +12,21 @@ use crate::{
     HeaderNode, HeaderValidationState, OperatorInvalidationId, WorkCoordinate, WorkCoordinateError,
 };
 
+#[cfg(test)]
+thread_local! {
+    static OVERLAY_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_overlay_construction_count() {
+    OVERLAY_CONSTRUCTIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn overlay_construction_count() -> usize {
+    OVERLAY_CONSTRUCTIONS.with(std::cell::Cell::get)
+}
+
 /// The work-coordinate semantics of an opaque graph transition.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(super) enum WorkCoordinateTransition {
@@ -131,6 +146,8 @@ pub(crate) struct GraphOverlay<'a> {
 
 impl<'a> GraphOverlay<'a> {
     pub(crate) fn new(base_graph: &'a MemHeaderStore) -> Self {
+        #[cfg(test)]
+        OVERLAY_CONSTRUCTIONS.with(|count| count.set(count.get().saturating_add(1)));
         Self {
             base_graph,
             base_revision: base_graph.graph_revision,
@@ -627,11 +644,6 @@ impl<'a> GraphOverlay<'a> {
             )
     }
 
-    /// Return every retained header hash.
-    pub(crate) fn retained_header_hashes(&self) -> impl Iterator<Item = block::Hash> + '_ {
-        self.header_nodes().map(|node| node.hash)
-    }
-
     /// Return base-graph and staged header hashes at the exact height.
     pub(crate) fn header_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
         let mut hashes: HashSet<_> = self
@@ -766,6 +778,12 @@ impl<'a> GraphOverlay<'a> {
         }
 
         let direct_reasons: BTreeSet<_> = direct_reasons.into_iter().collect();
+        if direct_reasons.len() > super::MAX_DIRECT_ELIGIBILITY_REASONS_V1 {
+            return Err(GraphError::DirectEligibilityReasonLimit {
+                header: hash,
+                limit: super::MAX_DIRECT_ELIGIBILITY_REASONS_V1,
+            });
+        }
 
         let node = HeaderNode {
             header,
@@ -815,8 +833,7 @@ impl<'a> GraphOverlay<'a> {
         let changed = self
             .stage_header_node(hash)?
             .eligibility
-            .direct_reasons
-            .insert(reason);
+            .try_insert_direct_reason(hash, reason)?;
         if changed {
             self.recompute_descendant_eligibility(hash)?;
         }
@@ -858,10 +875,15 @@ impl<'a> GraphOverlay<'a> {
         hash: block::Hash,
         body_validation_state: BodyValidationState,
     ) -> Result<bool, GraphError> {
+        let height = self
+            .header_node(hash)
+            .ok_or(GraphError::UnknownHeaderNode(hash))?
+            .height;
         let tombstone = match &body_validation_state {
             BodyValidationState::ConsensusInvalid { evidence, rule } => {
                 Some(ConsensusInvalidBodyTombstone {
                     hash,
+                    height,
                     evidence: *evidence,
                     rule: rule.clone(),
                 })
@@ -1293,8 +1315,8 @@ impl HeaderGraphView for GraphOverlay<'_> {
         self.header_nodes().collect()
     }
 
-    fn view_retained_header_hashes(&self) -> Vec<block::Hash> {
-        self.retained_header_hashes().collect()
+    fn visit_header_nodes(&self, visitor: &mut dyn FnMut(&HeaderNode)) {
+        self.header_nodes().for_each(visitor);
     }
 
     fn view_header_hashes_at_height(&self, height: block::Height) -> Vec<block::Hash> {
@@ -1305,8 +1327,39 @@ impl HeaderGraphView for GraphOverlay<'_> {
         self.header_children(parent)
     }
 
+    fn view_header_has_children(&self, parent: block::Hash) -> bool {
+        self.base_graph
+            .children
+            .get(&parent)
+            .into_iter()
+            .flatten()
+            .any(|child| {
+                !self.deleted_header_hashes.contains(child)
+                    && self
+                        .removed_header_children
+                        .get(&parent)
+                        .is_none_or(|removed| !removed.contains(child))
+            })
+            || self
+                .added_header_children
+                .get(&parent)
+                .is_some_and(|children| {
+                    children
+                        .iter()
+                        .any(|child| !self.deleted_header_hashes.contains(child))
+                })
+    }
+
     fn view_eligible_header_tips(&self) -> Vec<Frontier> {
         self.eligible_header_tips()
+    }
+
+    fn view_eligible_header_tip_count(&self) -> usize {
+        self.eligible_header_tips.len()
+    }
+
+    fn view_is_eligible_header_tip(&self, hash: block::Hash) -> bool {
+        self.eligible_header_tips.contains(&hash)
     }
 
     fn view_select_best_header_chain(&self) -> Result<(Frontier, ChainScore), GraphError> {
@@ -1526,6 +1579,7 @@ mod tests {
             .new_consensus_invalid_body_tombstones
             .push(ConsensusInvalidBodyTombstone {
                 hash: child.hash,
+                height: child.height,
                 evidence: EvidenceId::from_digest([9; 32]),
                 rule: crate::BodyRuleId::new("test.sparse-tombstone"),
             });

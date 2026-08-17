@@ -2,6 +2,7 @@
 
 mod input;
 mod install;
+mod recovery;
 
 use std::collections::{HashMap, HashSet};
 
@@ -10,11 +11,12 @@ use zakura_chain::block;
 
 use crate::{
     AuxDelivery, EngineMetadata, EngineSnapshot, EngineTransition, GraphError, MemHeaderStore,
-    TransitionContext, TransitionFailure,
+    TransitionContext, TransitionFailure, UntrustedAuxDeliveryRow,
 };
 
 use super::planner::derive_transition_plan;
 use install::{merge_auxiliary_delivery_changes, merge_projection_delta, verify_projection};
+pub(crate) use recovery::validate_recovered_auxiliary_rows;
 
 pub use input::{HeaderInsertionFacts, HeaderValidationFacts, TransitionInput};
 
@@ -60,6 +62,8 @@ pub struct HeaderChainEngine {
     verified_projection: Vec<crate::Frontier>,
     /// Auxiliary deliveries keyed by retained header hash.
     aux_deliveries: HashMap<block::Hash, Vec<AuxDelivery>>,
+    /// Retained header hash keyed by globally unique delivery identity.
+    aux_delivery_index: HashMap<crate::EvidenceId, block::Hash>,
 }
 
 impl HeaderChainEngine {
@@ -82,6 +86,41 @@ impl HeaderChainEngine {
         selected: Vec<crate::Frontier>,
         verified: Vec<crate::Frontier>,
         deliveries: impl IntoIterator<Item = AuxDelivery>,
+    ) -> Result<Self, EngineHydrationError> {
+        let deliveries: Vec<_> = deliveries.into_iter().collect();
+        if deliveries
+            .iter()
+            .any(|delivery| !delivery.is_unauthenticated())
+        {
+            return Err(EngineHydrationError::Incoherent(
+                "authoritative auxiliary outcomes require recovery validation",
+            ));
+        }
+        Self::from_validated_state(graph, metadata, selected, verified, deliveries)
+    }
+
+    /// Validate untrusted durable auxiliary rows and hydrate one recovered engine.
+    ///
+    /// The decoder cannot construct an authoritative auxiliary outcome. This recovery entry point
+    /// checks row structure, global delivery identity, retained-header ownership, replay identity,
+    /// and derived-boundary topology before it promotes any outcome.
+    pub fn from_untrusted_durable_state(
+        graph: MemHeaderStore,
+        metadata: EngineMetadata,
+        selected: Vec<crate::Frontier>,
+        verified: Vec<crate::Frontier>,
+        deliveries: impl IntoIterator<Item = UntrustedAuxDeliveryRow>,
+    ) -> Result<Self, EngineHydrationError> {
+        let deliveries = validate_recovered_auxiliary_rows(&graph, deliveries)?;
+        Self::from_validated_state(graph, metadata, selected, verified, deliveries)
+    }
+
+    fn from_validated_state(
+        graph: MemHeaderStore,
+        metadata: EngineMetadata,
+        selected: Vec<crate::Frontier>,
+        verified: Vec<crate::Frontier>,
+        deliveries: Vec<AuxDelivery>,
     ) -> Result<Self, EngineHydrationError> {
         if graph.finalized_frontier() != metadata.frontiers.finalized {
             return Err(EngineHydrationError::Incoherent(
@@ -121,6 +160,7 @@ impl HeaderChainEngine {
 
         let mut aux_deliveries: HashMap<_, Vec<_>> = HashMap::new();
         let mut delivery_ids = HashSet::new();
+        let mut aux_delivery_index = HashMap::new();
         for delivery in deliveries {
             let node =
                 graph
@@ -139,6 +179,7 @@ impl HeaderChainEngine {
                 .entry(delivery.header_hash)
                 .or_default()
                 .push(delivery);
+            aux_delivery_index.insert(delivery.delivery_id, delivery.header_hash);
         }
         for node in graph.header_nodes() {
             if node.aux_delivery_ids.iter().any(|delivery_id| {
@@ -161,6 +202,7 @@ impl HeaderChainEngine {
             selected_projection: selected,
             verified_projection: verified,
             aux_deliveries,
+            aux_delivery_index,
         })
     }
 
@@ -236,7 +278,11 @@ impl HeaderChainEngine {
             &mut self.verified_projection,
             &plan.change_set().verified_projection,
         );
-        merge_auxiliary_delivery_changes(&mut self.aux_deliveries, &plan.change_set().aux_changes);
+        merge_auxiliary_delivery_changes(
+            &mut self.aux_deliveries,
+            &mut self.aux_delivery_index,
+            &plan.change_set().aux_changes,
+        );
         Ok(())
     }
 
@@ -273,14 +319,16 @@ impl HeaderChainEngine {
             .unwrap_or_default()
     }
 
+    /// Return the total number of retained auxiliary deliveries.
     pub(crate) fn aux_delivery_count(&self) -> usize {
         self.aux_deliveries.values().map(Vec::len).sum()
     }
 
+    /// Return the retained auxiliary delivery with the exact global identity.
     pub(crate) fn aux_delivery(&self, delivery_id: crate::EvidenceId) -> Option<&AuxDelivery> {
-        self.aux_deliveries
-            .values()
-            .flatten()
+        let header_hash = self.aux_delivery_index.get(&delivery_id)?;
+        self.aux_deliveries(*header_hash)
+            .iter()
             .find(|delivery| delivery.delivery_id == delivery_id)
     }
 }
@@ -296,8 +344,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AlarmSet, AuxAuthentication, BodySizeHint, BodyValidationState, BranchId, EngineMode,
-        EvidenceId, FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderGeneration,
+        AlarmSet, BodySizeHint, BodyValidationState, BranchId, EngineMode, EvidenceId,
+        FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderGeneration,
         HeaderValidationState, HeaderWorkAuthority, InsertResult, SourceId, StateVersion,
         VerifiedGeneration,
     };
@@ -343,7 +391,7 @@ mod tests {
         AuditedView {
             graph,
             metadata: EngineMetadata {
-                disk_format: HeaderChainDiskVersion(1),
+                disk_format: HeaderChainDiskVersion::CURRENT,
                 mode: EngineMode::Integrated,
                 network_id: NetworkKind::Testnet,
                 anchor_manifest_digest: [1; 32],
@@ -378,15 +426,14 @@ mod tests {
             1,
             NonZeroU64::new(1).expect("the fixture request ID is nonzero"),
         );
-        AuxDelivery {
-            delivery_id: EvidenceId::from_digest([id; 32]),
+        AuxDelivery::new(
+            EvidenceId::from_digest([id; 32]),
             header_hash,
-            source: SourceId::from_digest([id.saturating_add(1); 32]),
-            owner: owner.into(),
-            body_size: BodySizeHint::Unknown,
-            tree_aux: None,
-            authentication: AuxAuthentication::Unauthenticated,
-        }
+            SourceId::from_digest([id.saturating_add(1); 32]),
+            owner.into(),
+            BodySizeHint::Unknown,
+            None,
+        )
     }
 
     fn finality_disagrees(view: &mut AuditedView) {
@@ -576,5 +623,52 @@ mod tests {
         .expect("the matching audited views are coherent");
 
         assert_eq!(engine.aux_deliveries(child.hash), &[first, second]);
+    }
+
+    #[test]
+    fn durable_auxiliary_outcomes_require_checked_recovery_promotion() {
+        let mut view = audited_view();
+        let child = view.metadata.frontiers.header_best;
+        let row = delivery(3, child.hash);
+        view.graph
+            .record_auxiliary_evidence_delivery(child.hash, row.delivery_id)
+            .expect("the child is retained");
+        let caller_selected = row
+            .promote_recovered_outcome(
+                1,
+                [Some([4; 32]), None],
+                Some(view.metadata.frontiers.finalized.hash),
+            )
+            .expect("the raw outcome has a structurally valid shape");
+
+        assert!(matches!(
+            HeaderChainEngine::from_audited_state(
+                view.graph.clone(),
+                view.metadata.clone(),
+                view.selected.clone(),
+                view.verified.clone(),
+                [caller_selected],
+            ),
+            Err(EngineHydrationError::Incoherent(
+                "authoritative auxiliary outcomes require recovery validation"
+            ))
+        ));
+        assert!(matches!(
+            HeaderChainEngine::from_untrusted_durable_state(
+                view.graph,
+                view.metadata,
+                view.selected,
+                view.verified,
+                [UntrustedAuxDeliveryRow::new(
+                    row,
+                    1,
+                    [Some([4; 32]), None],
+                    Some(block::Hash([0xf4; 32])),
+                )],
+            ),
+            Err(EngineHydrationError::Incoherent(
+                "derived auxiliary boundary is not retained"
+            ))
+        ));
     }
 }

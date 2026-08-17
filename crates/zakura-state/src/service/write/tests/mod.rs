@@ -42,10 +42,10 @@ use crate::{
         non_finalized_state::NonFinalizedState,
         write::{
             classify_verified_change, commit_contextual_finalization, commit_operator_change,
-            receive_until_deferred_deadline, verified_request, BlockWriteSender,
-            BlockWriteTaskExit, DeferredHeaderMaintenance, HeaderChainAttachmentError,
-            HeaderChainObservers, HeaderChainWriter, NonFinalizedWriteMessage,
-            PreparedFullStateTransition,
+            receive_until_deferred_deadline, recover_resource_stall, verified_request,
+            BlockWriteSender, BlockWriteTaskExit, HeaderChainAttachmentError,
+            HeaderChainMaintenance, HeaderChainObservers, HeaderChainWriter,
+            NonFinalizedWriteMessage, PreparedFullStateTransition,
         },
         ChainTipSender,
     },
@@ -53,15 +53,15 @@ use crate::{
     CheckpointVerifiedBlock, Config,
 };
 use zakura_header_chain::{
-    AdjustedDifficulty, AlarmSet, ApplyResult, AuxAuthentication, BodyRuleId,
-    BodyUnavailableSummary, BodyValidationState, BodyViolation, ChainScore, CheckpointSet,
-    ConsensusBodyInvalid, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId,
-    FinalityEpoch, Frontier, FrontierSet, HeaderBatchInput, HeaderChainDiskVersion,
-    HeaderGeneration, HeaderNode, HeaderRules, HeaderValidationState, InsertHeaders,
-    InvalidTransitionEvidence, SourceId, StateVersion, SuffixWork, SystemClock, TargetCompletion,
-    TransientBodyFailure, TransientBodyFailureKind, TransitionContext, TransitionEvent,
-    TransitionFailure, TransitionRequest, TrustedAnchor, VerifiedChangeCause, VerifiedGeneration,
-    VerifiedHeaderRef, WorkCoordinate, POW_ADJUSTMENT_BLOCK_SPAN,
+    AdjustedDifficulty, AlarmSet, ApplyResult, BodyRuleId, BodyUnavailableSummary,
+    BodyValidationState, BodyViolation, ChainScore, CheckpointSet, ConsensusBodyInvalid,
+    EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId, FinalityEpoch, Frontier,
+    FrontierSet, HeaderBatchInput, HeaderChainDiskVersion, HeaderGeneration, HeaderNode,
+    HeaderRules, HeaderValidationState, InsertHeaders, InvalidTransitionEvidence, SourceId,
+    StateVersion, SuffixWork, SystemClock, TargetCompletion, TransientBodyFailure,
+    TransientBodyFailureKind, TransitionContext, TransitionEvent, TransitionFailure,
+    TransitionRequest, TrustedAnchor, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef,
+    WorkCoordinate, POW_ADJUSTMENT_BLOCK_SPAN,
 };
 
 fn header_owner(
@@ -84,7 +84,7 @@ struct TestDeferredMaintenance {
     reevaluations: AtomicUsize,
 }
 
-impl DeferredHeaderMaintenance for TestDeferredMaintenance {
+impl HeaderChainMaintenance for TestDeferredMaintenance {
     fn earliest_deferred(
         &self,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, HeaderChainStoreError> {
@@ -155,7 +155,7 @@ fn header_writer(
     )
     .expect("the anchor node fields agree");
     let metadata = EngineMetadata {
-        disk_format: HeaderChainDiskVersion(1),
+        disk_format: HeaderChainDiskVersion::CURRENT,
         mode: EngineMode::Integrated,
         network_id: config.network.kind(),
         anchor_manifest_digest: config.trust_anchor_digest(),

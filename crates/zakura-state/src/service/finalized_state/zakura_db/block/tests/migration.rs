@@ -9,7 +9,8 @@ use zakura_chain::{
 };
 use zakura_header_chain::{
     prepare_headers, CheckpointSet, EngineConfig, EngineMode, Frontier, HeaderBatchInput,
-    HeaderRules, StoreAuditRead, SystemClock, TrustedAnchor,
+    HeaderRules, RowLimit, StoreAuditRead, StoreAuditSnapshot, SystemClock, TrustedAnchor,
+    MAX_NON_FINALIZED_NODES_V1,
 };
 
 use super::{
@@ -64,14 +65,23 @@ fn clean_store_initializes_only_from_finalized_full_state() {
     assert_eq!(report.startup.current.frontiers.header_best, anchor);
     assert_eq!(runtime.publisher().snapshot(), report.startup.current);
     let store = HeaderChainStore::new(state.header_chain_disk_db());
-    let metadata = StoreAuditRead::metadata(&store).expect("the initialized metadata decodes");
+    let audit = store.audit_snapshot().expect("the audit snapshot opens");
+    let metadata = audit.metadata().expect("the initialized metadata decodes");
     assert_eq!(metadata.work_origin, anchor);
-    let nodes = StoreAuditRead::all_header_nodes(&store).expect("the initialized node decodes");
+    let mut nodes = Vec::new();
+    audit
+        .visit_header_nodes(RowLimit::new(MAX_NON_FINALIZED_NODES_V1 + 1), &mut |node| {
+            nodes.push(node);
+            Ok(())
+        })
+        .expect("the initialized node decodes");
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].work_coordinate().origin_hash(), anchor.hash);
     assert_eq!(nodes[0].work_coordinate().cumulative_work(), U256::zero());
     assert_eq!(
-        StoreAuditRead::selected_projection(&store).expect("the initialized selection decodes"),
+        store
+            .selected_projection()
+            .expect("the initialized selection decodes"),
         vec![anchor]
     );
 
@@ -148,7 +158,8 @@ fn predecessor_overlay_is_atomically_replaced_from_finalized_state() {
     assert_eq!(runtime.publisher().snapshot(), report.startup.current);
     assert_eq!(state.hash(Height(1)), Some(block1.hash()));
     assert_eq!(
-        StoreAuditRead::selected_projection(&HeaderChainStore::new(state.header_chain_disk_db()))
+        HeaderChainStore::new(state.header_chain_disk_db())
+            .selected_projection()
             .expect("the initialized selection decodes"),
         vec![anchor]
     );
@@ -231,9 +242,9 @@ fn predecessor_overlay_is_preserved_when_full_state_authentication_fails() {
         initialize_header_chain_reconciled(&state, &config, Vec::new()),
         Err(HeaderChainInitializationError::AnchorMismatch)
     ));
-    assert!(
-        StoreAuditRead::metadata(&HeaderChainStore::new(state.header_chain_disk_db())).is_err()
-    );
+    assert!(HeaderChainStore::new(state.header_chain_disk_db())
+        .metadata()
+        .is_err());
     assert_eq!(
         state
             .db
@@ -277,9 +288,9 @@ fn initialization_rejects_finalized_tip_header_mismatch_before_cleanup() {
         initialize_header_chain_reconciled(&state, &config, Vec::new()),
         Err(HeaderChainInitializationError::AnchorMismatch)
     ));
-    assert!(
-        StoreAuditRead::metadata(&HeaderChainStore::new(state.header_chain_disk_db())).is_err()
-    );
+    assert!(HeaderChainStore::new(state.header_chain_disk_db())
+        .metadata()
+        .is_err());
     assert_eq!(
         state
             .db
@@ -343,9 +354,9 @@ fn initialization_does_not_fill_finalized_gaps_from_legacy_overlay() {
         initialize_header_chain_reconciled(&state, &config, Vec::new()),
         Err(HeaderChainInitializationError::AnchorMismatch)
     ));
-    assert!(
-        StoreAuditRead::metadata(&HeaderChainStore::new(state.header_chain_disk_db())).is_err()
-    );
+    assert!(HeaderChainStore::new(state.header_chain_disk_db())
+        .metadata()
+        .is_err());
     for (family, before) in [
         ZAKURA_HEADER_BY_HEIGHT,
         ZAKURA_HEADER_HASH_BY_HEIGHT,

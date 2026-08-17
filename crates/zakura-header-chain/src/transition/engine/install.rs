@@ -92,6 +92,7 @@ pub(super) fn merge_projection_delta(projection: &mut Vec<Frontier>, delta: &Pro
 /// delivery-ID uniqueness.
 pub(super) fn merge_auxiliary_delivery_changes(
     aux: &mut HashMap<block::Hash, Vec<AuxDelivery>>,
+    index: &mut HashMap<crate::EvidenceId, block::Hash>,
     changes: &[AuxDelta],
 ) {
     for change in changes {
@@ -101,6 +102,7 @@ pub(super) fn merge_auxiliary_delivery_changes(
                 rows.retain(|row| row.delivery_id != delivery.delivery_id);
                 rows.push(**delivery);
                 rows.sort_unstable_by_key(|row| row.delivery_id);
+                index.insert(delivery.delivery_id, delivery.header_hash);
             }
             AuxDelta::Delete {
                 header_hash,
@@ -112,6 +114,7 @@ pub(super) fn merge_auxiliary_delivery_changes(
                         aux.remove(header_hash);
                     }
                 }
+                index.remove(delivery_id);
             }
         }
     }
@@ -126,8 +129,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AuxAuthentication, BodySizeHint, BodyValidationState, BranchId, HeaderGeneration,
-        HeaderValidationState, HeaderWorkAuthority, InsertResult, SourceId,
+        BodySizeHint, BodyValidationState, BranchId, HeaderGeneration, HeaderValidationState,
+        HeaderWorkAuthority, InsertResult, SourceId,
     };
 
     fn graph_with_child() -> (MemHeaderStore, Frontier) {
@@ -171,15 +174,14 @@ mod tests {
             1,
             NonZeroU64::new(1).expect("the fixture request ID is nonzero"),
         );
-        AuxDelivery {
+        AuxDelivery::new(
             delivery_id,
             header_hash,
             source,
-            owner: owner.into(),
-            body_size: BodySizeHint::Unknown,
-            tree_aux: None,
-            authentication: AuxAuthentication::Unauthenticated,
-        }
+            owner.into(),
+            BodySizeHint::Unknown,
+            None,
+        )
     }
 
     #[test]
@@ -255,9 +257,11 @@ mod tests {
         let replacement = delivery(first_id, hash, SourceId::from_digest([4; 32]));
         let second = delivery(second_id, hash, SourceId::from_digest([5; 32]));
         let mut aux = HashMap::from([(hash, vec![original])]);
+        let mut index = HashMap::from([(first_id, hash)]);
 
         merge_auxiliary_delivery_changes(
             &mut aux,
+            &mut index,
             &[
                 AuxDelta::Put(Box::new(second)),
                 AuxDelta::Put(Box::new(replacement)),
@@ -267,6 +271,7 @@ mod tests {
 
         merge_auxiliary_delivery_changes(
             &mut aux,
+            &mut index,
             &[
                 AuxDelta::Delete {
                     header_hash: hash,
@@ -279,5 +284,6 @@ mod tests {
             ],
         );
         assert!(!aux.contains_key(&hash));
+        assert!(index.is_empty());
     }
 }

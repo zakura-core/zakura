@@ -1,11 +1,9 @@
 //! Tests for TLS PEM parsing.
 
-use std::time::Duration;
-
 use rustls::pki_types::{pem::PemObject, CertificateDer};
 
 use super::super::{
-    certificate_dates, parse_tls_cert_chain, parse_tls_private_key, CertificateDates,
+    certificate_validity, parse_tls_cert_chain, parse_tls_private_key, CertificateValidity,
 };
 
 /// A self-signed test certificate whose `notBefore` and `notAfter` are both before 2050, so
@@ -39,14 +37,32 @@ EVH9mWqX5H2mIDsHB02Nw+Iebwao5A==
 ";
 
 /// 2025-01-01 00:00:00 UTC, the `notBefore` of both test certificates.
-const NOT_BEFORE: Duration = Duration::from_secs(1_735_689_600);
+const NOT_BEFORE: i64 = 1_735_689_600;
 /// 2025-02-01 00:00:00 UTC, the `notAfter` of [`UTC_TIME_CERT`].
-const UTC_TIME_NOT_AFTER: Duration = Duration::from_secs(1_738_368_000);
+const UTC_TIME_NOT_AFTER: i64 = 1_738_368_000;
 /// 2060-01-01 00:00:00 UTC, the `notAfter` of [`GENERALIZED_TIME_CERT`].
-const GENERALIZED_TIME_NOT_AFTER: Duration = Duration::from_secs(2_840_140_800);
+const GENERALIZED_TIME_NOT_AFTER: i64 = 2_840_140_800;
+/// 1960-01-01 00:00:00 UTC, before the Unix epoch but valid in an X.509 `UTCTime`.
+const PRE_UNIX_EPOCH_NOT_BEFORE: i64 = -315_619_200;
 
 fn certificate(pem: &str) -> CertificateDer<'static> {
     CertificateDer::from_pem_slice(pem.as_bytes()).expect("test certificate should be valid PEM")
+}
+
+/// Replaces the test certificate's `notBefore` without re-signing it.
+///
+/// [`certificate_validity`] only parses the validity fields, so the unchanged
+/// signature is irrelevant to this focused test.
+fn certificate_with_not_before(not_before: &[u8; 13]) -> CertificateDer<'static> {
+    let mut certificate = certificate(UTC_TIME_CERT).as_ref().to_vec();
+    let original_not_before = b"250101000000Z";
+    let offset = certificate
+        .windows(original_not_before.len())
+        .position(|window| window == original_not_before)
+        .expect("test certificate should contain its notBefore value");
+
+    certificate[offset..offset + not_before.len()].copy_from_slice(not_before);
+    CertificateDer::from(certificate)
 }
 
 #[test]
@@ -90,22 +106,22 @@ fn reads_utc_time_validity_dates() {
     let certificate = certificate(UTC_TIME_CERT);
 
     assert_eq!(
-        certificate_dates(&certificate, NOT_BEFORE - Duration::from_secs(1)),
-        Ok(CertificateDates::NotYetValid {
+        certificate_validity(&certificate, NOT_BEFORE - 1),
+        Ok(CertificateValidity::NotYetValid {
             not_before: NOT_BEFORE
         }),
     );
     assert_eq!(
-        certificate_dates(&certificate, NOT_BEFORE),
-        Ok(CertificateDates::Current),
+        certificate_validity(&certificate, NOT_BEFORE),
+        Ok(CertificateValidity::Current),
     );
     assert_eq!(
-        certificate_dates(&certificate, UTC_TIME_NOT_AFTER),
-        Ok(CertificateDates::Current),
+        certificate_validity(&certificate, UTC_TIME_NOT_AFTER),
+        Ok(CertificateValidity::Current),
     );
     assert_eq!(
-        certificate_dates(&certificate, UTC_TIME_NOT_AFTER + Duration::from_secs(1)),
-        Ok(CertificateDates::Expired {
+        certificate_validity(&certificate, UTC_TIME_NOT_AFTER + 1),
+        Ok(CertificateValidity::Expired {
             not_after: UTC_TIME_NOT_AFTER
         }),
     );
@@ -116,16 +132,35 @@ fn reads_generalized_time_validity_dates() {
     let certificate = certificate(GENERALIZED_TIME_CERT);
 
     assert_eq!(
-        certificate_dates(&certificate, NOT_BEFORE),
-        Ok(CertificateDates::Current),
+        certificate_validity(&certificate, NOT_BEFORE),
+        Ok(CertificateValidity::Current),
     );
     assert_eq!(
-        certificate_dates(
-            &certificate,
-            GENERALIZED_TIME_NOT_AFTER + Duration::from_secs(1)
-        ),
-        Ok(CertificateDates::Expired {
+        certificate_validity(&certificate, GENERALIZED_TIME_NOT_AFTER + 1),
+        Ok(CertificateValidity::Expired {
             not_after: GENERALIZED_TIME_NOT_AFTER
+        }),
+    );
+}
+
+#[test]
+fn reads_pre_unix_epoch_utc_time() {
+    let certificate = certificate_with_not_before(b"600101000000Z");
+
+    assert_eq!(
+        certificate_validity(&certificate, PRE_UNIX_EPOCH_NOT_BEFORE - 1),
+        Ok(CertificateValidity::NotYetValid {
+            not_before: PRE_UNIX_EPOCH_NOT_BEFORE,
+        }),
+    );
+    assert_eq!(
+        certificate_validity(&certificate, 0),
+        Ok(CertificateValidity::Current),
+    );
+    assert_eq!(
+        certificate_validity(&certificate, UTC_TIME_NOT_AFTER + 1),
+        Ok(CertificateValidity::Expired {
+            not_after: UTC_TIME_NOT_AFTER,
         }),
     );
 }
@@ -136,5 +171,5 @@ fn ignores_certificates_that_are_not_valid_der() {
     // rustls accepts them at config time, so reading their dates must fail without panicking.
     let certificate = CertificateDer::from(vec![1, 2, 3]);
 
-    assert!(certificate_dates(&certificate, NOT_BEFORE).is_err());
+    assert!(certificate_validity(&certificate, NOT_BEFORE).is_err());
 }

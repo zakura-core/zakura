@@ -7,21 +7,11 @@
 //! See the full list of
 //! [Differences between JSON-RPC 1.0 and 2.0.](https://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0)
 
-use std::{
-    fmt,
-    fs::File,
-    io::Read,
-    panic,
-    path::Path,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{fmt, fs::File, io::Read, panic, path::Path, sync::Arc};
 
+use chrono::{TimeZone, Utc};
 use cookie::Cookie;
-use der::{
-    asn1::{GeneralizedTime, UtcTime},
-    Decode, Header, Reader, SliceReader, Tag,
-};
+use der::{asn1::GeneralizedTime, Decode, Header, Reader, SliceReader, Tag};
 use jsonrpsee::server::{
     middleware::rpc::RpcServiceBuilder, serve_with_graceful_shutdown, stop_channel, Server,
     ServerHandle,
@@ -367,25 +357,25 @@ fn parse_tls_private_key(
 
 /// Whether a certificate is inside its validity window.
 #[derive(Debug, Eq, PartialEq)]
-enum CertificateDates {
+enum CertificateValidity {
     /// The certificate can be used now.
     Current,
 
     /// The certificate's `notBefore` field is in the future.
     NotYetValid {
-        /// The `notBefore` field, as a duration since the Unix epoch.
-        not_before: Duration,
+        /// The `notBefore` field, as Unix seconds.
+        not_before: i64,
     },
 
     /// The certificate's `notAfter` field is in the past.
     Expired {
-        /// The `notAfter` field, as a duration since the Unix epoch.
-        not_after: Duration,
+        /// The `notAfter` field, as Unix seconds.
+        not_after: i64,
     },
 }
 
-/// Logs a warning for every certificate in `cert_chain` that clients will reject because it is
-/// outside its validity window.
+/// Logs a warning for every certificate in `cert_chain` that is outside its
+/// validity window and may cause clients to reject the TLS handshake.
 ///
 /// This warns and keeps running, rather than refusing to start:
 /// - an RPC certificate that expired while the node was down must not stop the node from
@@ -393,30 +383,28 @@ enum CertificateDates {
 /// - a `notBefore` in the future is usually an unsynchronised clock, which resolves itself
 ///   without a restart.
 ///
-/// Certificates whose dates can't be read are ignored, because rustls doesn't require the
-/// certificate to be well-formed either: only the peer validates it.
+/// Certificates whose dates can't be read are ignored because validity checks
+/// are best-effort diagnostics; TLS peers remain responsible for validation.
 fn warn_if_certificates_are_not_current(cert_chain: &[CertificateDer<'static>], cert_file: &Path) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = Utc::now().timestamp();
 
     for (position, certificate) in cert_chain.iter().enumerate() {
-        match certificate_dates(certificate, now) {
-            Ok(CertificateDates::Current) => {}
-            Ok(CertificateDates::NotYetValid { not_before }) => warn!(
+        match certificate_validity(certificate, now) {
+            Ok(CertificateValidity::Current) => {}
+            Ok(CertificateValidity::NotYetValid { not_before }) => warn!(
                 cert_file = %cert_file.display(),
                 position,
-                not_before = not_before.as_secs(),
-                now = now.as_secs(),
+                not_before,
+                now,
                 "RPC TLS certificate is not valid yet, \
-                 clients will reject the TLS handshake until its notBefore date",
+                 clients may reject the TLS handshake until its notBefore date",
             ),
-            Ok(CertificateDates::Expired { not_after }) => warn!(
+            Ok(CertificateValidity::Expired { not_after }) => warn!(
                 cert_file = %cert_file.display(),
                 position,
-                not_after = not_after.as_secs(),
-                now = now.as_secs(),
-                "RPC TLS certificate has expired, clients will reject the TLS handshake",
+                not_after,
+                now,
+                "RPC TLS certificate has expired, clients may reject the TLS handshake",
             ),
             Err(error) => debug!(
                 ?error,
@@ -443,10 +431,10 @@ fn warn_if_certificates_are_not_current(cert_chain: &[CertificateDer<'static>], 
 ///     ... }
 /// Validity ::= SEQUENCE { notBefore Time, notAfter Time }
 /// ```
-fn certificate_dates(
+fn certificate_validity(
     certificate: &CertificateDer<'_>,
-    now: Duration,
-) -> Result<CertificateDates, der::Error> {
+    now: i64,
+) -> Result<CertificateValidity, der::Error> {
     let mut reader = SliceReader::new(certificate.as_ref())?;
     let (tag, certificate) = read_der_value(&mut reader)?;
     tag.assert_eq(Tag::Sequence)?;
@@ -468,15 +456,15 @@ fn certificate_dates(
     tag.assert_eq(Tag::Sequence)?;
 
     let mut reader = SliceReader::new(validity)?;
-    let not_before = read_der_time(&mut reader)?;
-    let not_after = read_der_time(&mut reader)?;
+    let not_before = read_x509_time(&mut reader)?;
+    let not_after = read_x509_time(&mut reader)?;
 
     Ok(if now < not_before {
-        CertificateDates::NotYetValid { not_before }
+        CertificateValidity::NotYetValid { not_before }
     } else if now > not_after {
-        CertificateDates::Expired { not_after }
+        CertificateValidity::Expired { not_after }
     } else {
-        CertificateDates::Current
+        CertificateValidity::Current
     })
 }
 
@@ -488,14 +476,77 @@ fn read_der_value<'a>(reader: &mut SliceReader<'a>) -> Result<(Tag, &'a [u8]), d
     Ok((header.tag, value))
 }
 
-/// Reads an X.509 `Time`, which RFC 5280 section 4.1.2.5 encodes as a `UTCTime` through 2049,
-/// and as a `GeneralizedTime` from 2050.
-fn read_der_time(reader: &mut SliceReader<'_>) -> Result<Duration, der::Error> {
+/// Reads an X.509 `Time` as Unix seconds.
+///
+/// RFC 5280 section 4.1.2.5 encodes years from 1950 through 2049 as
+/// `UTCTime`, and later years as `GeneralizedTime`.
+fn read_x509_time(reader: &mut SliceReader<'_>) -> Result<i64, der::Error> {
     match reader.peek_header()?.tag {
-        Tag::UtcTime => Ok(UtcTime::decode(reader)?.to_unix_duration()),
-        Tag::GeneralizedTime => Ok(GeneralizedTime::decode(reader)?.to_unix_duration()),
+        Tag::UtcTime => read_utc_time(reader),
+        Tag::GeneralizedTime => i64::try_from(
+            GeneralizedTime::decode(reader)?
+                .to_unix_duration()
+                .as_secs(),
+        )
+        .map_err(|_| Tag::GeneralizedTime.value_error()),
         tag => Err(tag.value_error()),
     }
+}
+
+/// Reads an RFC 5280 `UTCTime`, including dates before the Unix epoch.
+///
+/// The [`der::asn1::UtcTime`] decoder only supports years from 1970 onward,
+/// while RFC 5280 requires support for the full 1950–2049 range.
+fn read_utc_time(reader: &mut SliceReader<'_>) -> Result<i64, der::Error> {
+    let (tag, value) = read_der_value(reader)?;
+    tag.assert_eq(Tag::UtcTime)?;
+
+    let Some(digits) = value.strip_suffix(b"Z").filter(|digits| digits.len() == 12) else {
+        return Err(Tag::UtcTime.value_error());
+    };
+
+    let short_year = decode_two_digits_at(Tag::UtcTime, digits, 0)?;
+    let year = if short_year >= 50 {
+        1900 + i32::from(short_year)
+    } else {
+        2000 + i32::from(short_year)
+    };
+    let month = decode_two_digits_at(Tag::UtcTime, digits, 2)?;
+    let day = decode_two_digits_at(Tag::UtcTime, digits, 4)?;
+    let hour = decode_two_digits_at(Tag::UtcTime, digits, 6)?;
+    let minute = decode_two_digits_at(Tag::UtcTime, digits, 8)?;
+    let second = decode_two_digits_at(Tag::UtcTime, digits, 10)?;
+
+    Utc.with_ymd_and_hms(
+        year,
+        u32::from(month),
+        u32::from(day),
+        u32::from(hour),
+        u32::from(minute),
+        u32::from(second),
+    )
+    .single()
+    .map(|date_time| date_time.timestamp())
+    .ok_or_else(|| Tag::UtcTime.value_error())
+}
+
+/// Decodes two ASCII decimal digits at `offset`.
+fn decode_two_digits_at(tag: Tag, value: &[u8], offset: usize) -> Result<u8, der::Error> {
+    let Some(&[tens, ones]) = value.get(offset..offset.saturating_add(2)) else {
+        return Err(tag.value_error());
+    };
+
+    decode_two_digits(tag, tens, ones)
+}
+
+/// Decodes two validated ASCII decimal digits.
+fn decode_two_digits(tag: Tag, tens: u8, ones: u8) -> Result<u8, der::Error> {
+    if !tens.is_ascii_digit() || !ones.is_ascii_digit() {
+        return Err(tag.value_error());
+    }
+
+    // Each operand is at most 9, so the result fits in a `u8`.
+    Ok((tens - b'0') * 10 + (ones - b'0'))
 }
 
 impl Drop for RpcServer {

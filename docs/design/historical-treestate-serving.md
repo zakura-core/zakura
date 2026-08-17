@@ -7,7 +7,7 @@ Status: proposed
 A verified-commitment-trees (VCT) fast-synced node never builds the per-height
 Sapling/Orchard/Ironwood note-commitment trees below the checkpoint handoff. That is
 deliberate and consensus-safe (see
-[verified-commitment-trees.md](verified-commitment-trees.md) §2, §7), but it removes the
+[verified-commitment-trees.md](verified-commitment-trees.md)), but it removes the
 data behind `z_gettreestate`, `z_getsubtreesbyindex`, and the `trees` field of `getblock`
 for that band. Wallets that sync against a fast-synced archive snapshot cannot start.
 
@@ -18,9 +18,11 @@ entry, caching what it derives. Every frontier the node accepts, whether read fr
 artifact or derived locally, is checked by comparing its root against the already
 authenticated root in `commitment_roots_by_height`. That check makes the frontier
 artifact carry **no trust weight**, which is what lets it be coarse, small, and
-distributed outside the binary. Completed **subtree roots** cannot ride the same check
-(§4.6), so they ship separately, as a small reviewed artifact in the committed bundle at
-the same trust level as the checkpoint list.
+distributed outside the binary.
+
+
+Completed **subtree roots** have different trust property:
+Similar to checkpoints, they ship as an artifact in the committed bundle.
 
 This replaces increments 7 and 8 of the VCT roadmap (an indexing follower that reruns the
 full per-block recompute off the critical path) with something roughly two orders of
@@ -307,7 +309,8 @@ replays block bodies and checks each grid entry against the authenticated roots 
 `commitment_roots_by_height`, rather than reading stored per-height trees. Any **archive**
 node can therefore generate the artifact, fast-synced included — which is how the current
 Mainnet artifacts were produced. A pruned node still cannot, because replay needs retained
-bodies.
+bodies. When a database upgraded to VCT above genesis, generation anchors on the stored
+per-pool trees at `U - 1` and replays only the absent band `[U, H)`.
 
 This remains the design's central trade: the ordered pass happens once, on one host, and is
 verified independently by every consumer.

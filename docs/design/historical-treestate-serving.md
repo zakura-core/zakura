@@ -304,16 +304,9 @@ The trade-off to weigh: the node's sizes currently act as a loose cross-check on
 client's tree position. It is a weak check, since those sizes are unauthenticated on every
 backend, but dropping it should be a deliberate decision rather than a silent side effect.
 
-## 7. Open questions
+## 7. FAQ
 
-~~**Replay cost is unmeasured.**~~ **Answered (2026-08-03).** Measured on a Mainnet
-fast-synced archive snapshot: ~1.9 ms/block mean across the band, varying ~50x by height
+**How expensive is on-demand replay?** Measured on a Mainnet fast-synced archive
+snapshot (2026-08-03): ~1.9 ms/block mean across the band, varying ~50x by height
 (0.28 ms median below 400k, 3.6 ms median through 1.6M-2.0M). Slow enough that the §4.1
 recommendation inverts — see the measured note there.
-
-**Subtree boundary alignment** is resolved by §4.6: subtree roots are published, not
-derived on demand, so no replay ever needs to stop at a mid-block position. The complete
-subtree artifact is proven directly against the final frontier.
-
-**Cache sizing and persistence** are unspecified. Whether derived frontiers should be
-persisted or held in a bounded in-memory cache depends on the same benchmark.

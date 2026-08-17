@@ -119,6 +119,9 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
     store
         .delete_raw(&mut batch, HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
         .expect("the version-one fixture omits the current tombstone count");
+    store
+        .delete_raw(&mut batch, HEADER_ENGINE_META, FINALITY_HISTORY_COUNT_KEY)
+        .expect("the version-one fixture omits the current finality count");
     store.db.write(batch).expect("the legacy fixture commits");
 
     assert!(store
@@ -145,10 +148,23 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
             .expect("the migrated tombstone count is readable"),
         Some(HeaderRowCountDisk(0))
     );
+    assert_eq!(
+        store
+            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, FINALITY_HISTORY_COUNT_KEY)
+            .expect("the migrated finality count is readable"),
+        Some(HeaderRowCountDisk(1))
+    );
     let mut interrupted = DiskWriteBatch::new();
     store
         .delete_raw(&mut interrupted, HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
         .expect("the interrupted migration omits the tombstone count");
+    store
+        .delete_raw(
+            &mut interrupted,
+            HEADER_ENGINE_META,
+            FINALITY_HISTORY_COUNT_KEY,
+        )
+        .expect("the interrupted migration omits the finality count");
     let mut interrupted_authority = store
         .db
         .raw_get_cf(&authority_cf, &anchor.hash.0)
@@ -175,6 +191,12 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
             .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
             .expect("the recovered tombstone count is readable"),
         Some(HeaderRowCountDisk(0))
+    );
+    assert_eq!(
+        store
+            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, FINALITY_HISTORY_COUNT_KEY)
+            .expect("the recovered finality count is readable"),
+        Some(HeaderRowCountDisk(1))
     );
     assert_eq!(
         store

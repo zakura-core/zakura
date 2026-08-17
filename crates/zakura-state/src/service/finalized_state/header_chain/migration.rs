@@ -32,7 +32,8 @@ use crate::service::finalized_state::{
         ZakuraDb,
     },
     DiskWriteBatch, HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY,
-    HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_ENGINE_META, HEADER_VALIDATION_CONTEXT,
+    HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
+    HEADER_VALIDATION_CONTEXT,
 };
 
 impl HeaderChainStore {
@@ -61,10 +62,17 @@ impl HeaderChainStore {
             let tombstone_count_exists = self
                 .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, super::TOMBSTONE_COUNT_KEY)?
                 .is_some();
+            let finality_count_exists = self
+                .get_value::<HeaderRowCountDisk>(
+                    HEADER_ENGINE_META,
+                    super::FINALITY_HISTORY_COUNT_KEY,
+                )?
+                .is_some();
             let v1_authorities = self.first_row_has_version(HEADER_BODY_EVIDENCE_AUTHORITY, 1)?;
             let v1_tombstones =
                 self.first_row_has_version(HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, 1)?;
-            if tombstone_count_exists && !v1_authorities && !v1_tombstones {
+            if tombstone_count_exists && finality_count_exists && !v1_authorities && !v1_tombstones
+            {
                 return Ok(false);
             }
             let mut batch = DiskWriteBatch::new();
@@ -74,10 +82,12 @@ impl HeaderChainStore {
                 0
             };
             let tombstone_rows = self.stage_tombstone_count(&mut batch)?;
+            let finality_rows = self.stage_finality_history_count(&mut batch)?;
             self.db.write(batch)?;
             tracing::info!(
                 authority_rows,
                 tombstone_rows,
+                finality_rows,
                 disk_format = HeaderChainDiskVersion::CURRENT.0,
                 "completed an interrupted durable header-chain migration"
             );
@@ -126,6 +136,7 @@ impl HeaderChainStore {
         metadata.last_transition = None;
         let authority_rows = self.stage_v1_body_evidence_authorities(config, &mut batch)?;
         let tombstone_rows = self.stage_tombstone_count(&mut batch)?;
+        let finality_rows = self.stage_finality_history_count(&mut batch)?;
         self.put_value(
             &mut batch,
             HEADER_ENGINE_META,
@@ -137,6 +148,7 @@ impl HeaderChainStore {
             auxiliary_rows = rows,
             authority_rows,
             tombstone_rows,
+            finality_rows,
             from_version = 1,
             to_version = HeaderChainDiskVersion::CURRENT.0,
             "migrated the durable header-chain format"
@@ -221,6 +233,41 @@ impl HeaderChainStore {
                 RawVisitError::RocksDb(error) => HeaderChainStoreError::RocksDb(error),
                 RawVisitError::Visitor(error) => error,
             })?;
+        Ok(rows)
+    }
+
+    fn stage_finality_history_count(
+        &self,
+        batch: &mut DiskWriteBatch,
+    ) -> Result<usize, HeaderChainStoreError> {
+        let finality_cf = self.cf(HEADER_FINALITY_HISTORY)?;
+        let limit = zakura_header_chain::RowLimit::new(super::FINALITY_HISTORY_LIMIT);
+        let mut rows = 0;
+        self.db
+            .raw_visit_cf(&finality_cf, &mut |_, _| {
+                if rows == limit.get() {
+                    return Err(HeaderChainStoreError::Store(
+                        zakura_header_chain::StoreError::LimitExceeded {
+                            collection: zakura_header_chain::StoreCollection::FinalityHistory,
+                            limit,
+                        },
+                    ));
+                }
+                rows += 1;
+                Ok(())
+            })
+            .map_err(|error| match error {
+                RawVisitError::RocksDb(error) => HeaderChainStoreError::RocksDb(error),
+                RawVisitError::Visitor(error) => error,
+            })?;
+        self.put_value(
+            batch,
+            HEADER_ENGINE_META,
+            super::FINALITY_HISTORY_COUNT_KEY,
+            &HeaderRowCountDisk(u64::try_from(rows).map_err(|_| {
+                HeaderChainStoreError::Incoherent("finality history count does not fit u64")
+            })?),
+        )?;
         Ok(rows)
     }
 

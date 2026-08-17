@@ -725,6 +725,67 @@ fn headers_only_finality_is_strictly_deeper_than_the_configured_depth() {
 }
 
 #[test]
+fn depth_finality_above_the_old_selected_tip_classifies_by_lineage() {
+    let (mut store, mut config) = TestStore::new(EngineMode::HeadersOnly);
+    config.limits.local_finality_depth = std::num::NonZeroU32::new(2).expect("two is nonzero");
+    let clock = ManualClock(Utc::now());
+    let anchor = store.metadata.frontiers.finalized;
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .expect("the anchor is retained")
+        .header
+        .difficulty_threshold;
+
+    // Two equal branches leave the graph at the finality depth, so the fixture commits
+    // no finality and one of them is the selected lineage.
+    let incumbent = insert_verified_branch(&mut store.graph, anchor, 2, difficulty, 0x81);
+    let rival = insert_verified_branch(&mut store.graph, anchor, 2, difficulty, 0x82);
+    synchronize_fixture(&mut store, anchor);
+    assert_eq!(store.metadata.frontiers.finalized, anchor);
+    let (incumbent, rival) = if store.metadata.frontiers.header_best == incumbent {
+        (incumbent, rival)
+    } else {
+        (rival, incumbent)
+    };
+    assert_eq!(store.metadata.frontiers.header_best, incumbent);
+
+    // Extending either branch by three carries depth finality one height above the old
+    // selected tip, so the finality trim empties the retained selected projection and
+    // only the finalized frontier's lineage separates the two outcomes.
+    let plan_for = |tip: Frontier, evidence: u8| {
+        let mut fixture = store.clone();
+        fixture.lease = validation_lease_for(&fixture, tip);
+        apply_transition(
+            &fixture,
+            insertion(&fixture, 3, EvidenceId::from_digest([evidence; 32])),
+            &context(&config, &clock, None),
+        )
+    };
+    let extension = plan_for(incumbent, 0x83).expect("the incumbent accepts its own extension");
+    let replacement = plan_for(rival, 0x84).expect("the rival branch outscores the incumbent");
+
+    for (plan, label) in [(&extension, "extension"), (&replacement, "replacement")] {
+        let record = plan
+            .change_set
+            .finality_append
+            .unwrap_or_else(|| panic!("the {label} advances depth finality"));
+        assert!(
+            record.current.height > incumbent.height,
+            "the {label} finalizes above the incumbent tip",
+        );
+        assert_eq!(
+            plan.change_set.selected_projection.remove_before,
+            Some(record.current.height),
+            "the {label} trims every prior selected entry",
+        );
+    }
+
+    assert!(!extension.effect().invalidates_body_work());
+    assert!(replacement.effect().invalidates_body_work());
+}
+
+#[test]
 fn full_state_finality_rejects_proof_mismatch_and_unverified_frontier() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());

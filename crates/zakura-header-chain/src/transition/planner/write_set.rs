@@ -13,6 +13,7 @@ use crate::{
 use super::admission::validate_authority;
 use super::projected_state::SettledProjectedState;
 use super::retention::RetentionPlan;
+use super::settlement::FinalityLineage;
 use super::{
     InvalidTransitionEvidence, PlanCandidate, PlannerCoherenceViolation, ProjectionKind,
     TransitionFailure,
@@ -28,6 +29,7 @@ pub(super) struct DerivePlanInputs<'a> {
     pub(super) old_verified: &'a [Frontier],
     pub(super) selected: Cow<'a, [Frontier]>,
     pub(super) finality_append: Option<crate::FinalityRecord>,
+    pub(super) finality_lineage: FinalityLineage,
     pub(super) retention: RetentionPlan,
     pub(super) fingerprint: Option<TransitionFingerprint>,
     pub(super) domain: TransitionDomain,
@@ -49,6 +51,7 @@ pub(super) fn derive_plan(
         old_verified,
         selected,
         finality_append,
+        finality_lineage,
         retention,
         fingerprint,
         domain,
@@ -81,6 +84,7 @@ pub(super) fn derive_plan(
         old_verified,
         &verified,
         finality_append,
+        finality_lineage,
     );
     let header_topology_changed = !delete_nodes.is_empty()
         || put_nodes
@@ -300,10 +304,19 @@ pub(super) fn body_work_effect(
     old_verified: &[Frontier],
     new_verified: &[Frontier],
     finality_append: Option<crate::FinalityRecord>,
+    finality_lineage: FinalityLineage,
 ) -> BodyWorkEffect {
-    if projection_retains_path(old_selected, new_selected, finality_append)
-        && projection_retains_path(old_verified, new_verified, finality_append)
-    {
+    if projection_retains_path(
+        old_selected,
+        new_selected,
+        finality_append,
+        finality_lineage.continues_selected,
+    ) && projection_retains_path(
+        old_verified,
+        new_verified,
+        finality_append,
+        finality_lineage.continues_verified,
+    ) {
         BodyWorkEffect::Preserved
     } else {
         BodyWorkEffect::Invalidated
@@ -314,11 +327,20 @@ fn projection_retains_path(
     old: &[Frontier],
     new: &[Frontier],
     finality_append: Option<crate::FinalityRecord>,
+    finality_continues_old: bool,
 ) -> bool {
-    let retained_old = finality_append.map_or(old, |record| {
-        &old[old.partition_point(|frontier| frontier.height < record.current.height)..]
-    });
-
+    let Some(record) = finality_append else {
+        return new.starts_with(old);
+    };
+    let retained_old =
+        &old[old.partition_point(|frontier| frontier.height < record.current.height)..];
+    if retained_old.is_empty() {
+        // The finality append trims away every prior entry, so `starts_with` compares
+        // against an empty prefix and holds for any new path, including one on an
+        // unrelated branch. Only the captured ancestry distinguishes a lineage the
+        // finalized frontier continues from one it replaces.
+        return finality_continues_old;
+    }
     new.starts_with(retained_old)
 }
 
@@ -354,14 +376,29 @@ mod body_work_epoch_tests {
         }
     }
 
+    /// The finalized frontier descends from both prior projection tips.
+    fn continues() -> FinalityLineage {
+        FinalityLineage {
+            continues_selected: true,
+            continues_verified: true,
+        }
+    }
+
+    /// The finalized frontier descends from neither prior projection tip.
+    fn replaces() -> FinalityLineage {
+        FinalityLineage::default()
+    }
+
     #[test]
     fn selected_extension_and_finalized_trim_preserve_body_work_epoch() {
         let old = path(&[1, 2, 3]);
         let extended = path(&[1, 2, 3, 4]);
         assert_eq!(
-            body_work_effect(&old, &extended, &old, &old, None),
+            body_work_effect(&old, &extended, &old, &old, None, replaces()),
             BodyWorkEffect::Preserved
         );
+        // The trim retains a prefix of both projections, so that prefix carries the
+        // continuation evidence and the classifier never consults the ancestry.
         assert_eq!(
             body_work_effect(
                 &old,
@@ -369,6 +406,7 @@ mod body_work_epoch_tests {
                 &old,
                 &old[1..],
                 Some(finality(extended[1])),
+                replaces(),
             ),
             BodyWorkEffect::Preserved
         );
@@ -378,7 +416,7 @@ mod body_work_epoch_tests {
     fn side_branch_changes_preserve_body_work_epoch() {
         let selected = path(&[1, 2, 3]);
         assert_eq!(
-            body_work_effect(&selected, &selected, &selected, &selected, None),
+            body_work_effect(&selected, &selected, &selected, &selected, None, replaces()),
             BodyWorkEffect::Preserved
         );
     }
@@ -393,7 +431,7 @@ mod body_work_epoch_tests {
             path(&[1, 2]),
         ] {
             assert_eq!(
-                body_work_effect(&old, &replacement, &old, &old, None),
+                body_work_effect(&old, &replacement, &old, &old, None, replaces()),
                 BodyWorkEffect::Invalidated
             );
         }
@@ -405,11 +443,25 @@ mod body_work_epoch_tests {
         let old_verified = path(&[1, 2]);
         let grown_verified = path(&[1, 2, 3]);
         assert_eq!(
-            body_work_effect(&selected, &selected, &old_verified, &grown_verified, None,),
+            body_work_effect(
+                &selected,
+                &selected,
+                &old_verified,
+                &grown_verified,
+                None,
+                replaces(),
+            ),
             BodyWorkEffect::Preserved
         );
         assert_eq!(
-            body_work_effect(&selected, &selected, &old_verified, &path(&[1, 9]), None,),
+            body_work_effect(
+                &selected,
+                &selected,
+                &old_verified,
+                &path(&[1, 9]),
+                None,
+                replaces(),
+            ),
             BodyWorkEffect::Invalidated
         );
     }
@@ -418,25 +470,70 @@ mod body_work_epoch_tests {
     fn invalid_body_advances_epoch_only_when_selection_changes() {
         let selected = path(&[1, 2, 3]);
         assert_eq!(
-            body_work_effect(&selected, &path(&[1, 8, 9]), &selected, &selected, None,),
+            body_work_effect(
+                &selected,
+                &path(&[1, 8, 9]),
+                &selected,
+                &selected,
+                None,
+                replaces(),
+            ),
             BodyWorkEffect::Invalidated
         );
         assert_eq!(
-            body_work_effect(&selected, &selected, &selected, &selected, None),
+            body_work_effect(&selected, &selected, &selected, &selected, None, replaces()),
             BodyWorkEffect::Preserved
         );
     }
 
     #[test]
-    fn authoritative_finality_can_retire_the_complete_old_projection() {
+    fn authoritative_finality_retires_a_complete_old_projection_it_continues() {
         let old = vec![frontier(4, 4), frontier(5, 5)];
         let new = vec![frontier(8, 8), frontier(9, 9)];
         let record = finality(new[0]);
 
         assert_eq!(
-            body_work_effect(&old, &new, &old, &new, Some(record)),
+            body_work_effect(&old, &new, &old, &new, Some(record), continues()),
             BodyWorkEffect::Preserved
         );
+    }
+
+    #[test]
+    fn finality_above_the_old_tip_invalidates_a_replaced_lineage() {
+        let old = vec![frontier(4, 4), frontier(5, 5)];
+        let unrelated = vec![frontier(8, 0x88), frontier(9, 0x99)];
+        let record = finality(unrelated[0]);
+
+        // The trim empties both retained projections, so the paths alone cannot tell a
+        // continuation from a replacement. Without ancestry back to the old tips the
+        // classifier must retire the epoch.
+        assert_eq!(
+            body_work_effect(&old, &unrelated, &old, &unrelated, Some(record), replaces()),
+            BodyWorkEffect::Invalidated
+        );
+    }
+
+    #[test]
+    fn finality_invalidates_when_it_continues_only_one_projection() {
+        let old = vec![frontier(4, 4), frontier(5, 5)];
+        let new = vec![frontier(8, 8), frontier(9, 9)];
+        let record = finality(new[0]);
+
+        for lineage in [
+            FinalityLineage {
+                continues_selected: true,
+                continues_verified: false,
+            },
+            FinalityLineage {
+                continues_selected: false,
+                continues_verified: true,
+            },
+        ] {
+            assert_eq!(
+                body_work_effect(&old, &new, &old, &new, Some(record), lineage),
+                BodyWorkEffect::Invalidated
+            );
+        }
     }
 
     #[test]
@@ -446,7 +543,7 @@ mod body_work_epoch_tests {
         let record = finality(new[0]);
 
         assert_eq!(
-            body_work_effect(&old, &new, &old, &new, Some(record)),
+            body_work_effect(&old, &new, &old, &new, Some(record), replaces()),
             BodyWorkEffect::Preserved
         );
     }
@@ -458,7 +555,14 @@ mod body_work_epoch_tests {
         let record = finality(reanchored[0]);
 
         assert_eq!(
-            body_work_effect(&old, &reanchored, &old, &reanchored, Some(record)),
+            body_work_effect(
+                &old,
+                &reanchored,
+                &old,
+                &reanchored,
+                Some(record),
+                continues()
+            ),
             BodyWorkEffect::Invalidated
         );
     }
@@ -469,7 +573,14 @@ mod body_work_epoch_tests {
         let arbitrary_suffix = &old[1..];
 
         assert_eq!(
-            body_work_effect(&old, arbitrary_suffix, &old, arbitrary_suffix, None),
+            body_work_effect(
+                &old,
+                arbitrary_suffix,
+                &old,
+                arbitrary_suffix,
+                None,
+                continues()
+            ),
             BodyWorkEffect::Invalidated
         );
     }

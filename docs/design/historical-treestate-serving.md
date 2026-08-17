@@ -194,8 +194,8 @@ Two properties make a coarse grid viable:
 
 **Wallet access is sequential.** Scan batches are contiguous: a wallet's next request is
 for the block immediately preceding the range it just finished, which is the block it just
-scanned to. A node that memoizes its most recently derived frontier replays *forward by
-one batch*, not from a distant grid point.
+scanned to. A node that memoizes its most recently derived frontier replays _forward by
+one batch_, not from a distant grid point.
 
 **Therefore spacing only costs the first request of a sweep.** Steady-state replay cost is
 bounded by the client's batch size, independent of grid spacing. This is why the

@@ -173,6 +173,12 @@ permission:
    workflow run and the dispatch commit on `main` (the OIDC `sha` claim),
    and `Install zakurad from crates.io` installs and runs the published binary.
 
+Both post-publish jobs run after the uploads are already irreversible, so a
+failure there reports a problem rather than preventing one. `Install zakurad
+from crates.io` in particular is a cold release build of the whole node and can
+exhaust its timeout on a slow runner; re-run the job before concluding the
+published crates are broken.
+
 Publishing to crates.io has historically been a separate decision from
 tagging — `v1.0.3-rc1`, `v1.1.0-rc0`, and `v1.2.0-rc0` were tagged but
 intentionally never published — and the environment reviewer is where that

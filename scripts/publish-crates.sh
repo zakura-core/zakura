@@ -64,6 +64,11 @@ done
 #
 # `sort -V` cannot answer this: it orders 1.0.0 before 1.0.0-rc1, the reverse of
 # semver, which would hide exactly the stale-prerelease case this warns about.
+#
+# Zakura's `-rcN` tags are a single alphanumeric identifier, which semver (and
+# so crates.io) compares lexically: 1.0.0-rc10 ranks below 1.0.0-rc2. Past rc9
+# the advisory can fire on a version that is newest by tag order. That matches
+# how the registry itself orders them; `-rc.N` would sort numerically.
 version_precedes() {
   python3 -c '
 import sys

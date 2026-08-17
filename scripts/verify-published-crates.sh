@@ -14,6 +14,9 @@
 #   ./scripts/verify-published-crates.sh --plan PATH \
 #     --repository OWNER/NAME --run-id ID --sha COMMIT
 #
+# --timeout SECONDS bounds the wait for each version to reach the index
+# (default 300).
+#
 # Without the attestation triple, this checks only that each selected version
 # exists and is not yanked, which is what an operator wants after a manual
 # publish.
@@ -47,7 +50,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$plan_path" ] || { echo "Usage: $0 --plan PATH [--repository OWNER/NAME --run-id ID --sha COMMIT]" >&2; exit 1; }
+[ -n "$plan_path" ] || { echo "Usage: $0 --plan PATH [--repository OWNER/NAME --run-id ID --sha COMMIT] [--timeout SECONDS]" >&2; exit 1; }
 [ -f "$plan_path" ] || { echo "No publish plan at ${plan_path}." >&2; exit 1; }
 
 attest=false
@@ -95,8 +98,11 @@ while IFS=$'\t' read -r crate version; do
   done
   crates_index_has_version "$crate" "$version" || continue
 
+  # --fail turns an HTTP error into a non-zero exit instead of an error body
+  # that would parse to a null `yanked` and be reported as a yank. This runs
+  # right after an irreversible publish, where a wrong diagnosis is expensive.
   version_json="$(
-    curl -sS --retry 4 --retry-connrefused \
+    curl -sS --fail --retry 4 --retry-connrefused \
       -H 'User-Agent: zakura-release-tooling (https://github.com/zakura-core/zakura)' \
       "${CRATES_API_URL}/crates/${crate}/${version}"
   )" || {

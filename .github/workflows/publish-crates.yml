@@ -262,7 +262,9 @@ jobs:
 
   verify-published:
     name: Verify the published versions
-    needs: [plan-verify, publish]
+    # `publish` already depends on plan-verify, and the attestation comes from
+    # the OIDC claims rather than the resolved tag, so nothing here needs it.
+    needs: [publish]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

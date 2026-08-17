@@ -615,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn f_225520_live_headers_only_witness_must_descend_to_the_new_frontier() {
+    fn live_headers_only_witness_must_descend_to_the_new_frontier() {
         let fixture = fixture(EngineMode::HeadersOnly);
         let mut overlay = GraphOverlay::new(fixture.engine.graph());
         overlay

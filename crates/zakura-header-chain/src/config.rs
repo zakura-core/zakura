@@ -590,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn f_225509_network_policy_digest_binds_every_validation_parameter() {
+    fn network_policy_digest_binds_every_validation_parameter() {
         let network = |name: &str| {
             Parameters::build()
                 .with_network_name(name)
@@ -665,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn f_225510_engine_config_rejects_conflicting_trust_sources() {
+    fn engine_config_rejects_conflicting_trust_sources() {
         let regtest_block = regtest_genesis_block();
         let regtest_network = Network::new_regtest(RegtestParameters::default());
         let regtest_anchor = TrustedAnchor {

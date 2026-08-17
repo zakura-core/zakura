@@ -79,7 +79,7 @@ fn apply_with_header_rebase_facts(
 }
 
 #[test]
-fn f_225522_finality_consumed_header_work_precedes_replay_conflict() {
+fn finality_consumed_header_work_precedes_replay_conflict() {
     for finalized_count in 1..=3_u32 {
         let (mut store, config) = TestStore::new(EngineMode::Integrated);
         let clock = ManualClock(Utc::now());
@@ -851,7 +851,7 @@ fn integrated_finality_requires_authority_and_exact_verified_path() {
 }
 
 #[test]
-fn f_225521_empty_checkpoint_growth_has_no_finality_effect() {
+fn empty_checkpoint_growth_has_no_finality_effect() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let old_tip = store.metadata.frontiers.verified_best;
@@ -981,7 +981,7 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
 }
 
 #[test]
-fn f_225514_finality_install_consumes_the_source_revision() {
+fn finality_install_consumes_the_source_revision() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;

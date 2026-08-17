@@ -4,15 +4,15 @@ This document maps nine V12 security findings to their corrections and primary r
 
 | Finding | Correction | Primary regression |
 | --- | --- | --- |
-| F-225509 | Durable metadata stores the complete network-policy digest. Recovery checks it before collection reads. | `f_225509_network_policy_digest_binds_every_validation_parameter` |
-| F-225510 | Configuration rejects conflicting bootstrap, release, and local trust pins. | `f_225510_engine_config_rejects_conflicting_trust_sources` |
-| F-225511 | Full-state events reject deferred and ineligible retained path members. | `f_225511_verified_chain_change_rejects_inherited_ineligibility` |
-| F-225512 | Recovery preserves elapsed deferrals. Startup settles them through one normal planner transition before publication. | `f_225512_startup_commits_deferred_reevaluation_before_publication` |
-| F-225514 | Each transition binds to one process-local engine capability and one source revision. | `f_225514_transition_installs_only_on_its_exact_source_engine` |
-| F-225516 | Full-state path acceptance validates and updates every retained path member. | `f_225516_accepted_side_path_verifies_every_retained_member` |
-| F-225520 | Recovery authenticates each headers-only selected-tip witness: a settled witness through the independent canonical index, an above-finalized witness through the audited header rows. | `f_225520_rocksdb_recovery_rejects_a_forged_headers_only_witness` |
-| F-225521 | The planner reports checkpoint finality only when it appends a finality record. | `f_225521_empty_checkpoint_growth_has_no_finality_effect` |
-| F-225522 | Finality-consumed work returns `AlreadyApplied` before mutable replay-conflict checks. | `f_225522_finality_consumed_header_work_precedes_replay_conflict` |
+| F-225509 | Durable metadata stores the complete network-policy digest. Recovery checks it before collection reads. | `network_policy_digest_binds_every_validation_parameter` |
+| F-225510 | Configuration rejects conflicting bootstrap, release, and local trust pins. | `engine_config_rejects_conflicting_trust_sources` |
+| F-225511 | Full-state events reject deferred and ineligible retained path members. | `verified_chain_change_rejects_inherited_ineligibility` |
+| F-225512 | Recovery preserves elapsed deferrals. Startup settles them through one normal planner transition before publication. | `startup_commits_deferred_reevaluation_before_publication` |
+| F-225514 | Each transition binds to one process-local engine capability and one source revision. | `transition_installs_only_on_its_exact_source_engine` |
+| F-225516 | Full-state path acceptance validates and updates every retained path member. | `accepted_side_path_verifies_every_retained_member` |
+| F-225520 | Recovery authenticates each headers-only selected-tip witness: a settled witness through the independent canonical index, an above-finalized witness through the audited header rows. | `rocksdb_recovery_rejects_a_forged_headers_only_witness` |
+| F-225521 | The planner reports checkpoint finality only when it appends a finality record. | `empty_checkpoint_growth_has_no_finality_effect` |
+| F-225522 | Finality-consumed work returns `AlreadyApplied` before mutable replay-conflict checks. | `finality_consumed_header_work_precedes_replay_conflict` |
 
 ## Durable format
 

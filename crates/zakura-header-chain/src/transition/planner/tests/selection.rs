@@ -159,7 +159,7 @@ fn committed_transition_reports_a_stale_source_without_panicking() {
 }
 
 #[test]
-fn f_225514_source_revision_exhaustion_is_typed_and_atomic() {
+fn source_revision_exhaustion_is_typed_and_atomic() {
     let (store, config) = TestStore::new(EngineMode::HeadersOnly);
     let clock = ManualClock(Utc::now());
     let request = insertion(&store, 1, EvidenceId::from_digest([0xe1; 32]));
@@ -328,7 +328,7 @@ fn full_state_insertion_rejects_a_contextually_invalid_header() {
 }
 
 #[test]
-fn f_225511_verified_chain_change_rejects_an_operator_invalid_retained_header() {
+fn verified_chain_change_rejects_an_operator_invalid_retained_header() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
@@ -390,7 +390,7 @@ fn f_225511_verified_chain_change_rejects_an_operator_invalid_retained_header() 
 }
 
 #[test]
-fn f_225511_verified_chain_change_rejects_a_deferred_retained_header() {
+fn verified_chain_change_rejects_a_deferred_retained_header() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
@@ -448,7 +448,7 @@ fn f_225511_verified_chain_change_rejects_a_deferred_retained_header() {
 }
 
 #[test]
-fn f_225511_verified_chain_change_rejects_inherited_ineligibility() {
+fn verified_chain_change_rejects_inherited_ineligibility() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
@@ -527,7 +527,7 @@ fn f_225511_verified_chain_change_rejects_inherited_ineligibility() {
 }
 
 #[test]
-fn f_225516_accepted_side_path_verifies_every_retained_member() {
+fn accepted_side_path_verifies_every_retained_member() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
@@ -588,7 +588,7 @@ fn f_225516_accepted_side_path_verifies_every_retained_member() {
 }
 
 #[test]
-fn f_225516_invalid_intermediate_rejects_the_complete_path_before_mutation() {
+fn invalid_intermediate_rejects_the_complete_path_before_mutation() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
     let authority = Authority;
@@ -671,7 +671,7 @@ fn f_225516_invalid_intermediate_rejects_the_complete_path_before_mutation() {
 }
 
 #[test]
-fn f_225514_transition_installs_only_on_its_exact_source_engine() {
+fn transition_installs_only_on_its_exact_source_engine() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let mut engine = test_engine(&store);
     let clock = ManualClock(Utc::now());

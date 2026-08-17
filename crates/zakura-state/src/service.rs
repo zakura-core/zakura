@@ -386,12 +386,19 @@ impl StateService {
     ///
     /// Returns the read-write and read-only state services,
     /// and read-only watch channels for its best chain tip.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateInitError`] if historical tree derivation is misconfigured or its
+    /// frontier artifact cannot be loaded.
     pub async fn new(
         config: Config,
         network: &Network,
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
-    ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
+    ) -> Result<(Self, ReadStateService, LatestChainTip, ChainTipChange), StateInitError> {
+        let historical_trees = load_historical_frontier_artifact(network, &config)?;
+
         let (finalized_state, finalized_tip, timer) = {
             let config = config.clone();
             let network = network.clone();
@@ -523,6 +530,7 @@ impl StateService {
                 runtime_status: header_runtime_status_receiver,
                 reader: header_chain_reader_receiver,
             },
+            historical_trees,
         );
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
@@ -603,7 +611,7 @@ impl StateService {
             }
         });
 
-        (state, read_service, latest_chain_tip, chain_tip_change)
+        Ok((state, read_service, latest_chain_tip, chain_tip_change))
     }
 
     /// Call read only state service to log rocksdb database metrics.
@@ -1234,13 +1242,10 @@ impl ReadStateService {
         non_finalized_state_receiver: WatchReceiver<NonFinalizedState>,
         vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
         header_chain: HeaderChainSubscriptions,
+        historical_trees: Arc<Mutex<read::HistoricalTreeCache>>,
     ) -> Self {
         let historical_subtrees =
             finalized_state::embedded_historical_subtrees(&finalized_state.network()).map(Arc::new);
-        let historical_trees = load_historical_frontier_artifact(
-            &finalized_state.network(),
-            finalized_state.db.config(),
-        );
 
         let read_service = Self {
             network: finalized_state.network(),
@@ -1965,67 +1970,45 @@ fn subtrees_with_published_fallback<Node, Error>(
 fn load_historical_frontier_artifact(
     network: &Network,
     config: &Config,
-) -> Arc<Mutex<read::HistoricalTreeCache>> {
-    let frontiers =
-        config
-            .historical_frontier_artifact
-            .as_ref()
-            .and_then(|path| match std::fs::read(path) {
-                Ok(bytes) => match finalized_state::FrontierArtifact::decode(&bytes, network) {
-                    Ok(artifact) => {
-                        tracing::info!(
-                            ?path,
-                            entries = artifact.entries.len(),
-                            spacing = artifact.spacing,
-                            "loaded historical frontier artifact"
-                        );
-                        Some(Arc::new(artifact))
-                    }
-                    Err(error) => fail_or_ignore_historical_frontier_artifact(
-                        config.derive_historical_trees,
-                        path,
-                        error,
-                    ),
-                },
-                Err(error) => fail_or_ignore_historical_frontier_artifact(
-                    config.derive_historical_trees,
-                    path,
-                    error,
-                ),
-            });
+) -> Result<Arc<Mutex<read::HistoricalTreeCache>>, StateInitError> {
+    let Some(path) = config.historical_frontier_artifact.as_ref() else {
+        if config.derive_historical_trees {
+            return Err(StateInitError::HistoricalFrontierArtifactRequired);
+        }
 
-    if config.derive_historical_trees {
-        let artifact = frontiers.expect(
-            "derive_historical_trees is true only together with a configured artifact path, \
-             and a configured path that fails to load already panicked",
-        );
-        return Arc::new(Mutex::new(read::HistoricalTreeCache::with_artifact(
-            artifact,
-        )));
+        return Ok(Arc::new(Mutex::new(read::HistoricalTreeCache::default())));
+    };
+
+    let artifact = std::fs::read(path)
+        .map_err(|error| Box::new(error) as BoxError)
+        .and_then(|bytes| {
+            finalized_state::FrontierArtifact::decode(&bytes, network)
+                .map_err(|error| Box::new(error) as BoxError)
+        });
+
+    match artifact {
+        Ok(artifact) => {
+            tracing::info!(
+                ?path,
+                entries = artifact.entries.len(),
+                spacing = artifact.spacing,
+                "loaded historical frontier artifact"
+            );
+            Ok(Arc::new(Mutex::new(
+                read::HistoricalTreeCache::with_artifact(Arc::new(artifact)),
+            )))
+        }
+        Err(source) if config.derive_historical_trees => {
+            Err(StateInitError::HistoricalFrontierArtifact {
+                path: path.clone(),
+                source,
+            })
+        }
+        Err(error) => {
+            tracing::warn!(?path, %error, "ignoring historical frontier artifact");
+            Ok(Arc::new(Mutex::new(read::HistoricalTreeCache::default())))
+        }
     }
-
-    Arc::new(Mutex::new(match frontiers {
-        Some(artifact) => read::HistoricalTreeCache::with_artifact(artifact),
-        None => read::HistoricalTreeCache::default(),
-    }))
-}
-
-/// Returns `None` after warning, or panics when derivation is enabled and the artifact is unusable.
-fn fail_or_ignore_historical_frontier_artifact(
-    derive_historical_trees: bool,
-    path: &std::path::Path,
-    error: impl std::fmt::Display,
-) -> Option<Arc<finalized_state::FrontierArtifact>> {
-    if derive_historical_trees {
-        panic!(
-            "state.derive_historical_trees = true but the historical frontier artifact at {} \
-             could not be loaded: {error}",
-            path.display()
-        );
-    }
-
-    tracing::warn!(?path, %error, "ignoring historical frontier artifact");
-    None
 }
 
 /// Derives the note commitment frontiers for `hash_or_height`, whose stored per-height trees are
@@ -2982,17 +2965,25 @@ impl Service<ReadRequest> for ReadStateService {
 /// It's possible to construct multiple state services in the same application (as
 /// long as they, e.g., use different storage locations), but doing so is
 /// probably not what you want.
+///
+/// # Errors
+///
+/// Returns a [`StateInitError`] if historical tree derivation is misconfigured or its frontier
+/// artifact cannot be loaded.
 pub async fn init(
     config: Config,
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
-) -> (
-    BoxService<Request, Response, BoxError>,
-    ReadStateService,
-    LatestChainTip,
-    ChainTipChange,
-) {
+) -> Result<
+    (
+        BoxService<Request, Response, BoxError>,
+        ReadStateService,
+        LatestChainTip,
+        ChainTipChange,
+    ),
+    StateInitError,
+> {
     let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
         StateService::new(
             config,
@@ -3000,44 +2991,52 @@ pub async fn init(
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
         )
-        .await;
+        .await?;
 
-    (
+    Ok((
         BoxService::new(state_service),
         read_only_state_service,
         latest_chain_tip,
         chain_tip_change,
-    )
+    ))
 }
 
 /// Initialize state and return the separate capability used to seal completion-gated body
 /// evidence before it enters the general-purpose state request service.
+///
+/// # Errors
+///
+/// Returns a [`StateInitError`] if historical tree derivation is misconfigured or its frontier
+/// artifact cannot be loaded.
 pub async fn init_with_header_chain_body_evidence(
     config: Config,
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
-) -> (
-    BoxService<Request, Response, BoxError>,
-    ReadStateService,
-    LatestChainTip,
-    ChainTipChange,
-    crate::HeaderChainBodyEvidenceAuthority,
-) {
+) -> Result<
+    (
+        BoxService<Request, Response, BoxError>,
+        ReadStateService,
+        LatestChainTip,
+        ChainTipChange,
+        crate::HeaderChainBodyEvidenceAuthority,
+    ),
+    StateInitError,
+> {
     let (state, read_state, latest_chain_tip, chain_tip_change) = init(
         config,
         network,
         max_checkpoint_height,
         checkpoint_verify_concurrency_limit,
     )
-    .await;
-    (
+    .await?;
+    Ok((
         state,
         read_state,
         latest_chain_tip,
         chain_tip_change,
         crate::HeaderChainBodyEvidenceAuthority::new(),
-    )
+    ))
 }
 
 /// Initialize a read state service from the provided [`Config`].
@@ -3057,6 +3056,7 @@ pub fn init_read_only(
     ),
     StateInitError,
 > {
+    let historical_trees = load_historical_frontier_artifact(network, &config)?;
     let finalized_state = FinalizedState::new_with_debug(&config, network, true, true)?;
     let (non_finalized_state_sender, non_finalized_state_receiver) =
         tokio::sync::watch::channel(NonFinalizedState::new(network));
@@ -3088,6 +3088,7 @@ pub fn init_read_only(
                 runtime_status: header_runtime_status_receiver,
                 reader: header_chain_reader_receiver,
             },
+            historical_trees,
         ),
         finalized_state.db.clone(),
         non_finalized_state_sender,
@@ -3127,7 +3128,9 @@ pub async fn init_test(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, _, _, _) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
     Buffer::new(BoxService::new(state_service), 1)
 }
@@ -3148,7 +3151,9 @@ pub async fn init_test_services(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, read_state_service, latest_chain_tip, chain_tip_change) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
 

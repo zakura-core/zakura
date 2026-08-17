@@ -132,6 +132,22 @@ pub enum HistoricalSubtreeUnavailableReason {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
+    /// Historical tree derivation was enabled without configuring its required frontier artifact.
+    #[error("state.derive_historical_trees = true requires state.historical_frontier_artifact")]
+    HistoricalFrontierArtifactRequired,
+
+    /// The configured historical frontier artifact could not be read or decoded.
+    #[error(
+        "state.derive_historical_trees = true but the historical frontier artifact at {path:?} \
+         could not be loaded: {source}"
+    )]
+    HistoricalFrontierArtifact {
+        /// Artifact path that failed to load.
+        path: PathBuf,
+        /// Underlying I/O or artifact decoding error.
+        source: BoxError,
+    },
+
     /// State could not read or parse the on-disk semantic format version.
     #[error(
         "cannot read state database format version at {path:?}. Hint: check the cache directory permissions and version file contents"

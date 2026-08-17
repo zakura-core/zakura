@@ -2998,6 +2998,11 @@ fn read_service_over(finalized_state: &FinalizedState) -> crate::ReadStateServic
             runtime_status: header_runtime_status_receiver,
             reader: header_chain_reader_receiver,
         },
+        crate::service::load_historical_frontier_artifact(
+            &finalized_state.network(),
+            finalized_state.db.config(),
+        )
+        .expect("the test historical frontier artifact loads"),
     )
 }
 

@@ -27,10 +27,59 @@ use crate::{
     service::{arbitrary::populated_state, chain_tip::TipAction, StateService},
     tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
     BoxError, CheckpointVerifiedBlock, Config, Request, Response, SemanticallyVerifiedBlock,
-    CHAIN_TIP_UPDATE_WAIT_LIMIT,
+    StateInitError, CHAIN_TIP_UPDATE_WAIT_LIMIT,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+#[tokio::test]
+async fn historical_frontier_configuration_errors_are_returned_from_state_init() {
+    let network = Network::Mainnet;
+    let config = Config {
+        derive_historical_trees: true,
+        ..Config::ephemeral()
+    };
+
+    assert!(matches!(
+        super::init_read_only(config.clone(), &network),
+        Err(StateInitError::HistoricalFrontierArtifactRequired)
+    ));
+    assert!(matches!(
+        super::init(config, &network, Height::MAX, 0).await,
+        Err(StateInitError::HistoricalFrontierArtifactRequired)
+    ));
+}
+
+#[tokio::test]
+async fn historical_frontier_load_errors_are_returned_from_state_init() {
+    let network = Network::Mainnet;
+    let temp_dir = tempfile::tempdir().expect("temporary directory is created");
+    let missing_path = temp_dir.path().join("missing.bin");
+    let missing_config = Config {
+        derive_historical_trees: true,
+        historical_frontier_artifact: Some(missing_path.clone()),
+        ..Config::ephemeral()
+    };
+
+    assert!(matches!(
+        super::init_read_only(missing_config, &network),
+        Err(StateInitError::HistoricalFrontierArtifact { path, .. }) if path == missing_path
+    ));
+
+    let corrupt_path = temp_dir.path().join("corrupt.bin");
+    std::fs::write(&corrupt_path, b"not a frontier artifact")
+        .expect("corrupt test artifact is written");
+    let corrupt_config = Config {
+        derive_historical_trees: true,
+        historical_frontier_artifact: Some(corrupt_path.clone()),
+        ..Config::ephemeral()
+    };
+
+    assert!(matches!(
+        super::init(corrupt_config, &network, Height::MAX, 0).await,
+        Err(StateInitError::HistoricalFrontierArtifact { path, .. }) if path == corrupt_path
+    ));
+}
 
 #[test]
 fn block_sync_body_anchor_rolls_back_to_the_selected_fork_intersection() {
@@ -333,7 +382,9 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     // The fixture has no network-supplied auxiliary root.
     config.vct_fast_sync = false;
     let (mut state_service, read, _tip, _tip_change) =
-        StateService::new(config, &network, max_checkpoint_height, 0).await;
+        StateService::new(config, &network, max_checkpoint_height, 0)
+            .await
+            .expect("test state initialization succeeds");
 
     // Commit blocks 0 and 1 to the finalized state and wait for each write to land on disk, so the
     // finalized tip catches up to the maximum checkpoint height and the last block hash we sent.
@@ -446,7 +497,9 @@ async fn legacy_mode_handoff_keeps_header_runtime_detached() -> Result<()> {
         .zcash_deserialize_into::<Arc<Block>>()?;
 
     let (mut state, read, _tip, _tip_change) =
-        StateService::new(Config::ephemeral(), &network, Height(0), 0).await;
+        StateService::new(Config::ephemeral(), &network, Height(0), 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
     let result = state
         .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis))
         .await;
@@ -514,7 +567,9 @@ async fn handoff_trigger_microbench() -> Result<()> {
     // Use `Height::MAX` so the height condition is never met: the helper runs its full guard but
     // never transitions, which is exactly the non-transitioning path we want to measure.
     let (mut state_service, _read, _tip, _tip_change) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
     for block in &blocks[0..=1] {
         let checkpoint = CheckpointVerifiedBlock::from(block.clone());
@@ -706,7 +761,7 @@ proptest! {
         let (mut state_service, _, _, _) = Runtime::new().unwrap().block_on(async {
             // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
             StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await
-        });
+        }).expect("ephemeral state initialization succeeds");
 
         prop_assert_eq!(state_service.read_service.db.finalized_value_pool(), ValueBalance::zero());
         prop_assert_eq!(
@@ -801,7 +856,7 @@ proptest! {
         let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change) = runtime.block_on(async {
             // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
             StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await
-        });
+        }).expect("ephemeral state initialization succeeds");
 
         prop_assert_eq!(latest_chain_tip.best_tip_height(), None);
         prop_assert_eq!(chain_tip_change.last_tip_change(), None);

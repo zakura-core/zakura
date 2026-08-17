@@ -6,7 +6,7 @@ use tower::ServiceExt;
 use zakura_chain::{
     block::{Block, Height},
     ironwood, orchard,
-    parameters::Network::*,
+    parameters::{Network, Network::*},
     serialization::ZcashDeserializeInto,
     subtree::{
         NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex,
@@ -25,17 +25,21 @@ use crate::{
     init_test_services, populated_state,
     response::MinedTx,
     service::{
-        finalized_state::{DiskWriteBatch, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE},
+        finalized_state::{
+            DiskWriteBatch, SubtreeArtifact, SubtreeRecord, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE,
+        },
         non_finalized_state::Chain,
         read::{
-            ironwood_subtrees, orchard_subtrees, sapling_subtrees,
+            contiguous_subtrees_from, ironwood_subtrees, merge_published_subtrees,
+            orchard_subtrees, retain_subtrees_completed_at_or_below, sapling_subtrees,
             tree::{
                 first_missing_subtree_index, is_syncing_below_last_checkpoint,
-                subtree_completed_by_last_checkpoint,
+                sapling_subtrees_with_gaps, subtree_completed_by_last_checkpoint,
             },
         },
     },
-    Config, HistoricalSubtreeUnavailableReason, ReadRequest, ReadResponse,
+    Config, HistoricalSubtreeUnavailable, HistoricalSubtreeUnavailableReason, ReadRequest,
+    ReadResponse,
 };
 
 /// Test that ReadStateService responds correctly when empty.
@@ -897,6 +901,184 @@ async fn pre_activation_tree_requests_return_empty_frontiers() {
     );
 }
 
+/// An artifact-backed subtree response must be checked through the end of its contiguous run.
+#[tokio::test]
+async fn artifact_subtree_gaps_return_typed_errors_for_every_pool() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, mut read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+    let last_checkpoint = Height(10);
+
+    let records = |root| {
+        [0u16, 1, 3]
+            .into_iter()
+            .map(|index| SubtreeRecord {
+                index: NoteCommitmentSubtreeIndex(index),
+                // Availability checks the skip-band union, then serving drops records above the
+                // verified tip. Keep every height eligible so the index gap, not the tip clip,
+                // truncates the run.
+                end_height: Height::MIN,
+                root,
+            })
+            .collect()
+    };
+    read_state.historical_subtrees = Some(Arc::new(SubtreeArtifact {
+        last_checkpoint,
+        sapling: records([0; 32]),
+        orchard: records([3; 32]),
+        ironwood: records([3; 32]),
+    }));
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, last_checkpoint);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding a future last checkpoint succeeds");
+
+    let requests = [
+        (
+            "sapling",
+            ReadRequest::SaplingSubtrees {
+                start_index: NoteCommitmentSubtreeIndex(0),
+                limit: None,
+            },
+        ),
+        (
+            "orchard",
+            ReadRequest::OrchardSubtrees {
+                start_index: NoteCommitmentSubtreeIndex(0),
+                limit: None,
+            },
+        ),
+        (
+            "ironwood",
+            ReadRequest::IronwoodSubtrees {
+                start_index: NoteCommitmentSubtreeIndex(0),
+                limit: None,
+            },
+        ),
+    ];
+
+    for (pool, request) in requests {
+        let error = read_state
+            .clone()
+            .oneshot(request)
+            .await
+            .expect_err("an artifact gap must not return the short prefix [0, 1]");
+        let error = error
+            .downcast_ref::<HistoricalSubtreeUnavailable>()
+            .expect("subtree gaps return HistoricalSubtreeUnavailable");
+
+        assert_eq!(error.pool, pool);
+        assert_eq!(error.index, NoteCommitmentSubtreeIndex(2));
+        assert_eq!(error.last_checkpoint, last_checkpoint);
+        assert_eq!(
+            error.reason,
+            HistoricalSubtreeUnavailableReason::Indeterminate
+        );
+    }
+}
+
+/// A published subtree that completes above the verified tip is not a permanent hole.
+///
+/// The skip-band union still contains it, so availability succeeds; serving then drops it and
+/// returns the prefix completed at this tip. Treating it as `NotStored` would tell a client that
+/// continuing to sync cannot restore a subtree the artifact will serve once the tip reaches its
+/// end height.
+#[tokio::test]
+async fn published_subtrees_above_verified_tip_return_the_completed_prefix() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, mut read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+    let last_checkpoint = Mainnet.checkpoint_list().max_height();
+    let verified_tip = read_state
+        .db
+        .finalized_tip_height()
+        .expect("the populated state has a finalized tip");
+
+    assert!(
+        verified_tip < last_checkpoint,
+        "the regression requires a finalized tip below the Mainnet last checkpoint"
+    );
+
+    let above_tip = Height(
+        verified_tip
+            .0
+            .checked_add(1)
+            .expect("the populated tip is far below Height::MAX"),
+    );
+
+    read_state.historical_subtrees = Some(Arc::new(SubtreeArtifact {
+        last_checkpoint,
+        sapling: vec![
+            SubtreeRecord {
+                index: NoteCommitmentSubtreeIndex(0),
+                end_height: verified_tip,
+                root: [0; 32],
+            },
+            SubtreeRecord {
+                index: NoteCommitmentSubtreeIndex(1),
+                end_height: above_tip,
+                root: [0; 32],
+            },
+        ],
+        orchard: Vec::new(),
+        ironwood: Vec::new(),
+    }));
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, last_checkpoint);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding the Mainnet VCT last checkpoint succeeds");
+
+    let response = read_state
+        .clone()
+        .oneshot(ReadRequest::SaplingSubtrees {
+            start_index: NoteCommitmentSubtreeIndex(0),
+            limit: Some(NoteCommitmentSubtreeIndex(2)),
+        })
+        .await
+        .expect("a not-yet-reached published subtree must not fail as a permanent hole");
+
+    let ReadResponse::SaplingSubtrees(subtrees) = response else {
+        panic!("unexpected response to a sapling subtrees request: {response:?}");
+    };
+    assert_eq!(
+        subtrees.keys().copied().collect::<Vec<_>>(),
+        vec![NoteCommitmentSubtreeIndex(0)],
+        "the served run is the prefix completed at this tip"
+    );
+
+    let response = read_state
+        .oneshot(ReadRequest::SaplingSubtrees {
+            start_index: NoteCommitmentSubtreeIndex(1),
+            limit: Some(NoteCommitmentSubtreeIndex(1)),
+        })
+        .await
+        .expect("asking for a published subtree above the tip is an empty list, not NotStored");
+
+    let ReadResponse::SaplingSubtrees(subtrees) = response else {
+        panic!("unexpected response to a sapling subtrees request: {response:?}");
+    };
+    assert!(
+        subtrees.is_empty(),
+        "a start index that completes above this tip is not yet available"
+    );
+}
+
 /// The served run must be checked to its end, not just at its start.
 ///
 /// `z_getsubtreesbyindex` returns one contiguous run, so a gap anywhere truncates the response.
@@ -968,4 +1150,369 @@ fn first_missing_subtree_index_finds_the_end_of_the_run() {
         None,
         "the final index must not overflow into a phantom gap"
     );
+}
+
+/// Merging the node's own subtree rows with published ones must still serve a continuous list.
+///
+/// The gated read drops everything when it has no row at the requested start, so a node holding
+/// rows only *above* the last checkpoint contributes nothing until the published records below it are
+/// merged in. A client doing spend-before-sync asks from index 0 and needs one list spanning both
+/// halves; serving only the published half would silently truncate its witness data.
+#[test]
+fn contiguous_subtrees_spans_published_and_stored_rows() {
+    let data = |height: u32| {
+        NoteCommitmentSubtreeData::new(
+            Height(height),
+            sapling_crypto::Node::from_bytes([0; 32]).unwrap(),
+        )
+    };
+
+    let merged: std::collections::BTreeMap<_, _> = [0u16, 1, 2, 3]
+        .into_iter()
+        .map(|index| (NoteCommitmentSubtreeIndex(index), data(index as u32 + 1)))
+        .collect();
+
+    let served = contiguous_subtrees_from(merged.clone(), NoteCommitmentSubtreeIndex(0));
+    assert_eq!(served.len(), 4, "a gapless union is served whole");
+
+    // A gap makes everything past it unusable, so it is dropped rather than served.
+    let mut holed = merged.clone();
+    holed.remove(&NoteCommitmentSubtreeIndex(2));
+    let served = contiguous_subtrees_from(holed, NoteCommitmentSubtreeIndex(0));
+    assert_eq!(
+        served.keys().copied().collect::<Vec<_>>(),
+        vec![NoteCommitmentSubtreeIndex(0), NoteCommitmentSubtreeIndex(1)],
+        "the run stops at the first gap"
+    );
+
+    // A missing start index means there is nothing to serve, not a list starting later.
+    let mut no_start = merged.clone();
+    no_start.remove(&NoteCommitmentSubtreeIndex(0));
+    assert!(
+        contiguous_subtrees_from(no_start, NoteCommitmentSubtreeIndex(0)).is_empty(),
+        "a missing start index serves nothing"
+    );
+
+    // Indexes below the request are not served.
+    let served = contiguous_subtrees_from(merged, NoteCommitmentSubtreeIndex(2));
+    assert_eq!(
+        served.keys().copied().collect::<Vec<_>>(),
+        vec![NoteCommitmentSubtreeIndex(2), NoteCommitmentSubtreeIndex(3)],
+        "the run starts at the requested index"
+    );
+}
+
+/// Artifact fallback merging must retain verified rows from the non-finalized best chain.
+#[test]
+fn published_subtree_merge_includes_non_finalized_rows() {
+    let node = |root: u8| {
+        NoteCommitmentSubtreeData::new(
+            Height(11),
+            sapling_crypto::Node::from_bytes([root; 32]).unwrap(),
+        )
+    };
+
+    let mut chain = Chain::default();
+    chain.insert_sapling_subtree(NoteCommitmentSubtree::new(1, Height(11), node(2).root));
+
+    let db = new_ephemeral_db();
+    let mut merged = sapling_subtrees_with_gaps(
+        Some(Arc::new(chain)),
+        &db,
+        NoteCommitmentSubtreeIndex(0)..NoteCommitmentSubtreeIndex(2),
+    );
+
+    merge_published_subtrees(
+        &mut merged,
+        [
+            (NoteCommitmentSubtreeIndex(0), node(1)),
+            (NoteCommitmentSubtreeIndex(1), node(3)),
+        ],
+        Height(11),
+    );
+    let served = contiguous_subtrees_from(merged, NoteCommitmentSubtreeIndex(0));
+
+    assert_eq!(served.len(), 2);
+    assert_eq!(
+        served[&NoteCommitmentSubtreeIndex(1)].root,
+        node(2).root,
+        "the verified best-chain row must win over the artifact"
+    );
+}
+
+/// A published subtree record must never displace the node's own row.
+///
+/// The node computed and verified its rows; a published record is trusted only after a digest the
+/// artifact carries itself, which is not a signature. A correct artifact never overlaps, so an
+/// overlap is exactly the corrupt-or-hostile case where precedence decides whether a wrong root
+/// reaches a client and builds a wrong witness.
+#[test]
+fn published_subtrees_never_displace_the_nodes_own_rows() {
+    let node = |root: u8| {
+        NoteCommitmentSubtreeData::new(
+            Height(11),
+            sapling_crypto::Node::from_bytes([root; 32]).unwrap(),
+        )
+    };
+
+    let mut stored = std::collections::BTreeMap::new();
+    stored.insert(NoteCommitmentSubtreeIndex(0), node(1));
+    stored.insert(NoteCommitmentSubtreeIndex(1), node(2));
+
+    merge_published_subtrees(
+        &mut stored,
+        [
+            // Collides with a row the node holds.
+            (NoteCommitmentSubtreeIndex(1), node(4)),
+            // Fills a genuine gap, which is what the artifact is for.
+            (NoteCommitmentSubtreeIndex(2), node(3)),
+        ],
+        Height(11),
+    );
+
+    assert_eq!(
+        stored[&NoteCommitmentSubtreeIndex(1)].root,
+        node(2).root,
+        "the node's own row wins on collision"
+    );
+    assert_eq!(
+        stored[&NoteCommitmentSubtreeIndex(2)].root,
+        node(3).root,
+        "a published record still fills an index the node lacks"
+    );
+    assert_eq!(stored.len(), 3);
+}
+
+/// Serving drops published records completed above the node's verified tip.
+///
+/// Availability still sees those records in the skip-band union; this helper is what prevents
+/// them from reaching a client.
+#[test]
+fn published_subtrees_are_bounded_by_the_verified_tip() {
+    let node = |height: u32| {
+        NoteCommitmentSubtreeData::new(
+            Height(height),
+            sapling_crypto::Node::from_bytes([0; 32]).unwrap(),
+        )
+    };
+    let mut stored = std::collections::BTreeMap::new();
+
+    merge_published_subtrees(
+        &mut stored,
+        [
+            (NoteCommitmentSubtreeIndex(0), node(9)),
+            (NoteCommitmentSubtreeIndex(1), node(10)),
+            (NoteCommitmentSubtreeIndex(2), node(11)),
+        ],
+        Height(100),
+    );
+    assert_eq!(
+        stored.len(),
+        3,
+        "the skip-band union keeps records above the verified tip"
+    );
+
+    retain_subtrees_completed_at_or_below(&mut stored, Height(10));
+
+    assert_eq!(
+        stored.keys().copied().collect::<Vec<_>>(),
+        vec![NoteCommitmentSubtreeIndex(0), NoteCommitmentSubtreeIndex(1)],
+        "records at the verified tip are eligible, but records above it are not"
+    );
+}
+
+/// A newer artifact may fill history skipped at an older fast-sync marker, but not heights the
+/// node synced itself.
+#[test]
+fn newer_artifact_fills_only_the_skipped_band() {
+    let node = |height: u32, root: u8| {
+        NoteCommitmentSubtreeData::new(
+            Height(height),
+            sapling_crypto::Node::from_bytes([root; 32]).unwrap(),
+        )
+    };
+    let mut stored = std::collections::BTreeMap::new();
+    stored.insert(NoteCommitmentSubtreeIndex(1), node(12, 2));
+
+    merge_published_subtrees(
+        &mut stored,
+        [
+            (NoteCommitmentSubtreeIndex(0), node(5, 1)),
+            (NoteCommitmentSubtreeIndex(1), node(12, 9)),
+            (NoteCommitmentSubtreeIndex(2), node(18, 3)),
+        ],
+        Height(10),
+    );
+
+    assert_eq!(
+        stored[&NoteCommitmentSubtreeIndex(0)].root,
+        node(5, 1).root,
+        "the H1 skip band comes from the newer H2 artifact"
+    );
+    assert_eq!(
+        stored[&NoteCommitmentSubtreeIndex(1)].root,
+        node(12, 2).root,
+        "a local row after H1 wins over the H2 artifact"
+    );
+    assert!(
+        !stored.contains_key(&NoteCommitmentSubtreeIndex(2)),
+        "a post-H1 hole is not filled from the H2 artifact"
+    );
+    assert_eq!(stored.len(), 2);
+}
+
+/// The embedded artifact may fill this database's skip band when it is at least as new as the
+/// durable fast-sync marker.
+#[tokio::test]
+async fn historical_subtrees_accept_a_newer_artifact_for_an_older_fast_sync_marker() {
+    let _init_guard = zakura_test::init();
+    let (_state, mut read_state, _latest_chain_tip, _chain_tip_change) =
+        init_test_services(&Network::new_default_testnet()).await;
+    let artifact_checkpoint = Height(10);
+
+    read_state.historical_subtrees = Some(Arc::new(SubtreeArtifact {
+        last_checkpoint: artifact_checkpoint,
+        ..SubtreeArtifact::default()
+    }));
+
+    assert!(
+        read_state
+            .historical_subtrees_at_last_checkpoint()
+            .is_none(),
+        "an ordinary database without a fast-sync marker must not use the artifact"
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, Height(11));
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding a newer last checkpoint succeeds");
+    assert!(
+        read_state
+            .historical_subtrees_at_last_checkpoint()
+            .is_none(),
+        "an older artifact cannot cover a newer skip band"
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, artifact_checkpoint);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding the matching last checkpoint succeeds");
+    assert_eq!(
+        read_state
+            .historical_subtrees_at_last_checkpoint()
+            .map(|(_, vct_applied_below)| vct_applied_below),
+        Some(artifact_checkpoint),
+        "the artifact is eligible once its checkpoint matches the durable last checkpoint"
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, Height(9));
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding an older last checkpoint succeeds");
+    assert_eq!(
+        read_state
+            .historical_subtrees_at_last_checkpoint()
+            .map(|(_, vct_applied_below)| vct_applied_below),
+        Some(Height(9)),
+        "a newer artifact may fill the skip band of an older fast-sync marker"
+    );
+}
+
+/// An H1-fast-synced database may use a newer H2 artifact only for history skipped at H1.
+#[tokio::test]
+async fn older_fast_sync_marker_uses_newer_artifact_only_for_skipped_history() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_TESTNET_BLOCKS
+        .values()
+        .take(5)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, mut read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Network::new_default_testnet()).await;
+
+    let vct_applied_below = Height(2);
+    let artifact_checkpoint = Height(10);
+    let skipped_root = sapling_crypto::Node::from_bytes([1; 32]).unwrap();
+    let local_root = sapling_crypto::Node::from_bytes([2; 32]).unwrap();
+    let post_handoff_root = sapling_crypto::Node::from_bytes([3; 32]).unwrap();
+
+    read_state.historical_subtrees = Some(Arc::new(SubtreeArtifact {
+        last_checkpoint: artifact_checkpoint,
+        sapling: vec![
+            SubtreeRecord {
+                index: NoteCommitmentSubtreeIndex(0),
+                end_height: Height(1),
+                root: skipped_root.to_bytes(),
+            },
+            SubtreeRecord {
+                index: NoteCommitmentSubtreeIndex(1),
+                end_height: Height(3),
+                root: post_handoff_root.to_bytes(),
+            },
+            SubtreeRecord {
+                index: NoteCommitmentSubtreeIndex(2),
+                end_height: Height(3),
+                root: post_handoff_root.to_bytes(),
+            },
+        ],
+        ..SubtreeArtifact::default()
+    }));
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, vct_applied_below);
+    batch.insert_sapling_subtree(
+        &read_state.db,
+        &NoteCommitmentSubtree::new(1, Height(3), local_root),
+    );
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding an older marker and a post-handoff row succeeds");
+
+    let ReadResponse::SaplingSubtrees(served) = read_state
+        .clone()
+        .oneshot(ReadRequest::SaplingSubtrees {
+            start_index: NoteCommitmentSubtreeIndex(0),
+            limit: Some(NoteCommitmentSubtreeIndex(2)),
+        })
+        .await
+        .expect("the H1 skip band plus the local post-H1 row are servable")
+    else {
+        panic!("SaplingSubtrees must return SaplingSubtrees");
+    };
+
+    assert_eq!(
+        served[&NoteCommitmentSubtreeIndex(0)].root,
+        skipped_root,
+        "the H2 artifact fills history skipped at H1"
+    );
+    assert_eq!(
+        served[&NoteCommitmentSubtreeIndex(1)].root,
+        local_root,
+        "the node's own row after H1 wins over the H2 artifact"
+    );
+    assert_eq!(served.len(), 2);
+
+    let post_handoff = read_state
+        .oneshot(ReadRequest::SaplingSubtrees {
+            start_index: NoteCommitmentSubtreeIndex(2),
+            limit: Some(NoteCommitmentSubtreeIndex(1)),
+        })
+        .await;
+    match post_handoff {
+        Ok(ReadResponse::SaplingSubtrees(subtrees)) => {
+            assert!(
+                subtrees.is_empty(),
+                "a post-H1 hole must not be filled from the H2 artifact"
+            );
+        }
+        Err(_) => {}
+        Ok(other) => panic!("unexpected response for a post-H1 hole: {other:?}"),
+    }
 }

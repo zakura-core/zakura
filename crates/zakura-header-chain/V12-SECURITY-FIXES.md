@@ -18,9 +18,12 @@ This document maps nine V12 security findings to their corrections and primary r
 
 The network-policy field changes the provisional header-chain format from version 2 to version 3.
 
-Release v1.2.0 predates the header-chain durable format. No release tag contains version 2 of this provisional format.
-The change therefore updates the schema directly. A version 2 store must rebuild because recovery cannot infer its
-complete network policy from a network identifier.
+No release tag contains version 2 of this provisional format. The change therefore updates the schema directly.
+A version 2 store must rebuild because recovery cannot infer its complete network policy from a network identifier.
+
+Startup still migrates a released version 1 store. Version 1 recorded the network identifier but no policy digest,
+so the migration binds the configured policy to the upgraded rows, and recovery continues to hold those rows to the
+network identifier that version 1 durably recorded.
 
 ## Performance contracts
 

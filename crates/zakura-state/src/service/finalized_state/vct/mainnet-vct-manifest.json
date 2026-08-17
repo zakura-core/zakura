@@ -8,5 +8,7 @@
   "checkpoints_sha256": "afdd07b6bc7fc1e543d595a726a03df1ff31f552226c4d2f06ce557feb0d8a36",
   "frontier_sha256": "5e256bb2efb529d2d922a16fe70170787976ed6e4731cd34d37815f3eb306073",
   "frontier_size": 1654,
+  "subtrees_sha256": "d5b5d9f47ed6601e9bfa82270b144131a21ad657c492684e8646a3de4ec4be5b",
+  "subtrees_size": 72107,
   "meta_sha256": "25323a422adb5c6f9423fe9becda28bdcc05a74c0b393a81bf34f3f93f3d467e"
 }

@@ -80,66 +80,109 @@ elsewhere. Every release is initially a pre-release; see
 [Promotion and the "Latest" release](#promotion-and-the-latest-release) for
 when and how a release is promoted.
 
-## Crates.io Trusted Publishing Dry Run
+## Crates.io Trusted Publishing
 
 The manually dispatched
-[`Dry-run crate publishing`](../.github/workflows/publish-crates.yml) workflow
-is a no-upload proof of concept. It checks out an existing published release
-tag, computes the exact workspace versions absent from crates.io, and runs
-Cargo's complete dry-run publishing checks. A separate checkout-free job then
-exchanges GitHub's OIDC identity for a short-lived production crates.io token
-and immediately revokes it. The token is never passed to repository code, and
-the workflow contains no registry upload command.
+[`Publish crates`](../.github/workflows/publish-crates.yml) workflow publishes
+Zakura's crates from a published release tag, authenticated by short-lived
+tokens crates.io mints against this repository's GitHub OIDC identity. No
+registry credential is stored anywhere.
 
-One-time setup requires two distinct permission levels:
+The workflow takes a `mode`:
+
+- **`verify`** (default) checks out the release tag, computes the exact
+  workspace versions absent from crates.io, runs the publish-graph check and
+  Cargo's complete dry-run publishing checks, and then exchanges and
+  immediately revokes a real token in a checkout-free job. Nothing is
+  uploaded. This is the pre-flight: run it before a release to confirm the
+  crate selection and that the trusted-publisher configuration still works.
+- **`publish`** repeats the plan and uploads. It is irreversible — a crates.io
+  version can be yanked but never replaced or reused.
+
+Verification and publication are separate jobs on purpose. The verify builds
+take much longer than the 30-minute token lifetime, so they run before any
+token exists; the publish job packages with `--no-verify` and only its single
+`cargo publish` step sees the token, which the action revokes when the job
+ends.
+
+Publishing is resumable. The plan excludes every crate already on the index at
+its workspace version, so a run that fails partway through is recovered by
+dispatching it again: the crates that landed are skipped and the rest are
+published. Fix forward — never try to repair a partial publish by yanking and
+re-uploading the same version.
+
+### One-time setup
+
+This requires two distinct permission levels:
 
 1. A repository administrator creates a GitHub Actions environment named
-   `crates-io`, restricts its deployment branch to `main`, configures a
-   required reviewer, and disables administrator bypass of protection rules.
-   Add no environment secrets or variables. The environment constrains the
-   OIDC identity; manually dispatching the workflow is the POC's only trigger,
-   and the `oidc-smoke` job waits for that reviewer before exchanging a token.
-2. An owner of each existing crate opens that crate's **Settings > Trusted
+   `crates-io`, restricts its deployment branch to `main`, configures required
+   reviewers, and disables administrator bypass of protection rules. Add no
+   environment secrets or variables. The environment constrains the OIDC
+   identity, and its reviewers are the human gate on an irreversible upload.
+2. An owner of **each** crate opens that crate's **Settings > Trusted
    Publishing** page on crates.io and adds a GitHub Actions publisher with:
    - repository owner `zakura-core`
    - repository name `zakura`
    - workflow filename `publish-crates.yml`
    - environment `crates-io`
 
-Only a crates.io owner can configure a crate's trusted publisher. An existing
-owner can grant another maintainer access from the crate's Owners settings or
-with `cargo owner`. A crate that has never been published must first be
-published manually with a narrowly scoped token from a trusted maintainer
-machine; never store that bootstrap token in GitHub.
+Only a crates.io owner can configure a crate's trusted publisher, and Zakura's
+crates do not all share one owner. An existing owner can grant another
+maintainer access from the crate's Owners settings or with `cargo owner`.
 
-After setup, an operator needs repository Write access or higher, but no
-crates.io account permission:
+Configure every publishable crate, and audit the list when adding one. A
+crate missing its entry is not an error at exchange time: crates.io scopes the
+minted token to whichever crates did match, the run starts publishing, and the
+unconfigured crate fails with a permission error partway through — a partial,
+irreversible publish. There is no way to read another owner's configuration,
+so this audit is a checklist, backed by the resumable retry above.
 
-1. Open **Actions > Dry-run crate publishing > Run workflow**.
-2. Select `main`, enter the existing release tag, and dispatch the run.
-3. Ask a `crates-io` environment reviewer to approve the pending
-   `oidc-smoke` deployment.
-4. Review the crate/version/status table in the workflow summary and confirm
-   both jobs pass.
+A crate that has never been published cannot be bootstrapped this way, because
+its trusted-publisher configuration lives on a crate that does not yet exist.
+Reserve the name manually with a narrowly scoped token from a trusted
+maintainer machine, add the configuration, and only then let CI publish it;
+never store that bootstrap token in GitHub. `publish` mode refuses to run when
+the plan contains an unpublished crate name, rather than discovering it
+mid-upload.
 
-A successful OIDC exchange proves that at least one trusted-publisher
-configuration matches; Cargo dry-run does not exercise registry upload
-authorization for every crate. Audit every crate's configuration before adding
-real publication in a later change. Continue to use the manual crates.io
-publishing procedure during this POC.
+The workflow filename is part of the crates.io configuration: it is matched
+against the OIDC `workflow_ref` claim, which names the workflow a run _starts
+from_. A reusable workflow does not change it — `create-release.yml` calling
+this file would present `create-release.yml`. That is why release automation
+dispatches this workflow instead of calling it, and why renaming this file
+means reconfiguring every crate.
 
-The `crates-io` environment has a required reviewer from day one, and
-administrator bypass of protection rules is disabled. Publishing to crates.io
-has historically been a separate decision from tagging — `v1.0.3-rc1`,
-`v1.1.0-rc0`, and `v1.2.0-rc0` were tagged but intentionally never published —
-so the reviewer preserves that decision point once this POC graduates to a
-real upload path. For the dry-run workflow, the `oidc-smoke` job pauses at
-"Review pending deployments" until a reviewer approves; ping a reviewer after
-dispatching. When trusted publishing is folded into the release CI, keep the
-reviewer on `crates-io` and move the trusted publisher's workflow filename to
-whichever workflow actually publishes. Until then the trusted-publisher
-entries grant only what the POC exercises — minting and revoking a token — so
-remove them if this POC is abandoned rather than wired into the release path.
+### Publishing a release
+
+An operator needs repository Write access or higher, but no crates.io account
+permission:
+
+1. Open **Actions > Publish crates > Run workflow**.
+2. Select `main`, enter the published release tag, choose the mode, and
+   dispatch. Always dispatch from `main`, including for a hotfix release: the
+   tag is resolved by name and checked out on its own, so the `crates-io`
+   environment stays restricted to `main`.
+3. Ask a `crates-io` environment reviewer to approve the pending deployment,
+   after reviewing the crate/version/status table in the run summary. Watch
+   for rows flagged as below the newest published version: expected for a
+   hotfix on an older release line, and otherwise a sign the run is publishing
+   from a stale tag.
+4. Confirm every job passes. After a `publish` run, `Verify the published
+   versions` asserts that each new version's crates.io record names this
+   workflow run and the dispatch commit on `main` (the OIDC `sha` claim),
+   and `Install zakurad from crates.io` installs and runs the published binary.
+
+Both post-publish jobs run after the uploads are already irreversible, so a
+failure there reports a problem rather than preventing one. `Install zakurad
+from crates.io` in particular is a cold release build of the whole node and can
+exhaust its timeout on a slow runner; re-run the job before concluding the
+published crates are broken.
+
+Publishing to crates.io has historically been a separate decision from
+tagging — `v1.0.3-rc1`, `v1.1.0-rc0`, and `v1.2.0-rc0` were tagged but
+intentionally never published — and the environment reviewer is where that
+decision is now recorded.
 
 ## Promotion and the "Latest" Release
 

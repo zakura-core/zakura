@@ -35,6 +35,7 @@ use crate::{
         serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
     subtree::{NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
+    subtree_verify::{self, SubtreeRootsError},
 };
 
 pub mod legacy;
@@ -637,6 +638,19 @@ impl NoteCommitmentTree {
         let root = self.frontier()?.root(Some(TRACKED_SUBTREE_HEIGHT.into()));
 
         Some((index, root))
+    }
+
+    /// Checks `roots`, the completed subtree roots in index order, against this tree's frontier.
+    ///
+    /// Returns how many roots were checked. See
+    /// [`subtree_verify`](crate::subtree_verify) for what this proves.
+    ///
+    /// Ironwood re-exports this module, so this also serves Ironwood trees.
+    pub fn verify_completed_subtree_roots(
+        &self,
+        roots: &[Node],
+    ) -> Result<usize, SubtreeRootsError> {
+        subtree_verify::verify_completed_subtree_roots(self.frontier(), roots, MERKLE_DEPTH)
     }
 
     /// Returns the current root of the tree, used as an anchor in Orchard

@@ -122,10 +122,14 @@ fn unauthenticated_retention_reference_is_rejected() {
 
 #[test]
 fn retention_references_are_bounded_before_ancestry_walks() {
-    let (store, config) = TestStore::new(EngineMode::HeadersOnly);
+    let (store, mut config) = TestStore::new(EngineMode::HeadersOnly);
+    config.limits.max_retention_references =
+        std::num::NonZeroUsize::new(1).expect("one is nonzero");
     let clock = ManualClock(Utc::now());
-    let references =
-        vec![store.metadata.frontiers.finalized.hash; crate::POW_PREDECESSOR_CONTEXT_SPAN + 1];
+    let references = vec![
+        store.metadata.frontiers.finalized.hash;
+        config.limits.max_retention_references.get() + 1
+    ];
     let result = apply_transition(
         &store,
         TransitionRequest {

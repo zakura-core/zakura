@@ -1,4 +1,4 @@
-# Refresh the embedded Mainnet checkpoint list and VCT frontier from one
+# Refresh the embedded Mainnet checkpoint list, VCT frontier, and subtree roots from one
 # immutable, digest-verified R2 bundle produced by the release-state publisher
 # (deploy/release-state/), and open a draft PR for human review. Checkpoints
 # are consensus-critical: nothing merges or ships from this workflow directly,
@@ -58,7 +58,28 @@ jobs:
             --metadata-out "$RUNNER_TEMP/release-state-resolution.json" \
             --max-age-hours "$MAX_AGE_HOURS"
 
-      - name: Import checkpoints, frontier, and provenance
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: ./.github/actions/setup-zakura-build
+
+      # Subtree roots are interior tree nodes, so framing and append-only checks cannot prove their
+      # values. Prove every required subtree artifact against its matching bundle frontier before
+      # importing either file.
+      - name: Prove the bundle's subtree roots against its own frontier
+        env:
+          BUNDLE: ${{ runner.temp }}/release-state-bundle
+        run: |
+          set -euo pipefail
+          cargo run --release --locked -p zakura --bin zakurad -- \
+            verify-historical-treestates \
+            --network Mainnet \
+            --subtree-input "$BUNDLE/mainnet-treestate-subtrees.bin" \
+            --frontier-input "$BUNDLE/mainnet-frontier.bin"
+
+      - name: Import checkpoints, frontier, subtrees, and provenance
         id: import
         env:
           BUNDLE: ${{ runner.temp }}/release-state-bundle
@@ -86,15 +107,6 @@ jobs:
             crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
           ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=0 scripts/check-release-state.sh
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
-        if: steps.import.outputs.has_changes == 'true'
-        with:
-          toolchain: stable
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - uses: ./.github/actions/setup-zakura-build
-        if: steps.import.outputs.has_changes == 'true'
-
       - name: Re-prove the checkpoint/frontier pairing in cargo
         if: steps.import.outputs.has_changes == 'true'
         run: |
@@ -111,7 +123,8 @@ jobs:
           sort > "$RUNNER_TEMP/allowed-files" <<'EOF'
           crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
           crates/zakurad/src/components/sync/end_of_support.rs
           EOF
           UNEXPECTED=$(comm -23 "$RUNNER_TEMP/actual-files" "$RUNNER_TEMP/allowed-files")
@@ -152,9 +165,9 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           branch: ${{ steps.update-branch.outputs.name }}
           base: main
-          title: "chore(chain): update Mainnet checkpoints and VCT frontier"
+          title: "chore(chain): update Mainnet release state"
           body: |
-            Updates the embedded Mainnet checkpoint list, matching VCT frontier, and provenance record from one immutable release-state bundle, and floors the end-of-support estimate.
+            Updates the embedded Mainnet checkpoint list, matching VCT frontier, subtree roots, and provenance record from one immutable release-state bundle. It also floors the end-of-support estimate.
 
             - Finalized height: `${{ steps.import.outputs.height }}`
             - Finalized hash: `${{ steps.import.outputs.block_hash }}`
@@ -169,7 +182,7 @@ jobs:
           labels: |
             A-release
             A-release-state
-          commit-message: "chore(chain): update Mainnet checkpoints and VCT frontier"
+          commit-message: "chore(chain): update Mainnet release state"
           sign-commits: true
           draft: always-true
           delete-branch: true

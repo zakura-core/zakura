@@ -101,9 +101,9 @@ pub enum HeaderChainValueError {
     HeaderHashMismatch,
     /// The singleton metadata used an unsupported disk format.
     #[error(
-        "unsupported header-chain disk format {found}: this build stores format {current}, and \
-         the provisional header-chain format has no migration path, so the state directory must \
-         be deleted and resynchronized",
+        "unsupported header-chain disk format {found}: this build stores format {current} and \
+         startup found no migration to it, so the state directory must be deleted and \
+         resynchronized",
         found = .0,
         current = HeaderChainDiskVersion::CURRENT.0
     )]
@@ -1055,6 +1055,11 @@ impl FallibleDiskValue for AuxDelivery {
 }
 
 fn put_aux(encoder: &mut Encoder, value: AuxDelivery) {
+    put_aux_base(encoder, value);
+    put_aux_outcome(encoder, value);
+}
+
+fn put_aux_base(encoder: &mut Encoder, value: AuxDelivery) {
     encoder.fixed(&value.delivery_id.digest());
     encoder.fixed(&value.header_hash.0);
     encoder.fixed(&value.source.digest());
@@ -1073,6 +1078,9 @@ fn put_aux(encoder: &mut Encoder, value: AuxDelivery) {
         encoder.u64(aux.ironwood_tx_count);
         encoder.fixed(&<[u8; 32]>::from(aux.auth_data_root));
     });
+}
+
+fn put_aux_outcome(encoder: &mut Encoder, value: AuxDelivery) {
     let status_code = if value.is_unauthenticated() {
         0
     } else if value.is_authenticated() {
@@ -1098,7 +1106,7 @@ fn put_aux(encoder: &mut Encoder, value: AuxDelivery) {
     }
 }
 
-fn get_aux(decoder: &mut Decoder<'_>) -> Result<UntrustedAuxDeliveryRow, HeaderChainValueError> {
+fn get_aux_base(decoder: &mut Decoder<'_>) -> Result<AuxDelivery, HeaderChainValueError> {
     let delivery_id = EvidenceId::from_digest(decoder.array()?);
     let header_hash = block::Hash(decoder.array()?);
     let source = SourceId::from_digest(decoder.array()?);
@@ -1123,6 +1131,18 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<UntrustedAuxDeliveryRow, HeaderC
             auth_data_root: AuthDataRoot::from(decoder.array()?),
         })
     })?;
+    Ok(AuxDelivery::new(
+        delivery_id,
+        header_hash,
+        source,
+        owner,
+        body_size,
+        tree_aux,
+    ))
+}
+
+fn get_aux(decoder: &mut Decoder<'_>) -> Result<UntrustedAuxDeliveryRow, HeaderChainValueError> {
+    let delivery = get_aux_base(decoder)?;
     let status_code = match decoder.u8()? {
         value @ 0..=3 => value,
         value => {
@@ -1139,7 +1159,6 @@ fn get_aux(decoder: &mut Decoder<'_>) -> Result<UntrustedAuxDeliveryRow, HeaderC
         let second = decoder.optional(|decoder| decoder.array())?;
         ([first, second], Some(block::Hash(decoder.array()?)))
     };
-    let delivery = AuxDelivery::new(delivery_id, header_hash, source, owner, body_size, tree_aux);
     Ok(UntrustedAuxDeliveryRow::new(
         delivery,
         status_code,
@@ -1155,6 +1174,30 @@ pub(crate) fn decode_untrusted_aux_delivery(
     let row = get_aux(&mut decoder)?;
     decoder.finish()?;
     Ok(row)
+}
+
+/// Decode a version-one delivery and discard its caller-selected outcome.
+pub(crate) fn decode_v1_aux_delivery(bytes: &[u8]) -> Result<AuxDelivery, HeaderChainValueError> {
+    let mut decoder = Decoder::new(bytes);
+    let delivery = get_aux_base(&mut decoder)?;
+    match decoder.u8()? {
+        0 => {}
+        1 => {
+            let _evidence = decoder.array::<32>()?;
+            let _boundary_hash = decoder.array::<32>()?;
+        }
+        2 | 3 => {
+            let _evidence = decoder.array::<32>()?;
+        }
+        value => {
+            return Err(HeaderChainValueError::UnknownDiscriminant {
+                field: "aux_authentication",
+                value,
+            });
+        }
+    }
+    decoder.finish()?;
+    Ok(delivery)
 }
 
 fn put_owner(encoder: &mut Encoder, owner: HeaderSyncWorkOwner) {
@@ -1409,93 +1452,119 @@ impl FallibleDiskValue for EngineMetadata {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
-        let mut decoder = Decoder::new(bytes);
-        let disk_format = decoder.u32()?;
-        if disk_format != HeaderChainDiskVersion::CURRENT.0 {
-            return Err(HeaderChainValueError::UnsupportedDiskFormat(disk_format));
-        }
-        let disk_format = HeaderChainDiskVersion(disk_format);
-        let mode = match decoder.u8()? {
-            0 => EngineMode::Integrated,
-            1 => EngineMode::HeadersOnly,
-            value => {
-                return Err(HeaderChainValueError::UnknownDiscriminant {
-                    field: "engine_mode",
-                    value,
-                })
-            }
-        };
-        let network_id = match decoder.u8()? {
-            0 => NetworkKind::Mainnet,
-            1 => NetworkKind::Testnet,
-            2 => NetworkKind::Regtest,
-            value => {
-                return Err(HeaderChainValueError::UnknownDiscriminant {
-                    field: "network_kind",
-                    value,
-                })
-            }
-        };
-        let network_policy_digest = decoder.array()?;
-        let anchor_manifest_digest = decoder.array()?;
-        let work_origin = get_frontier(&mut decoder)?;
-        let state_version = StateVersion::new(decoder.u64()?);
-        let header_generation = HeaderGeneration::new(decoder.u64()?);
-        let verified_generation = VerifiedGeneration::new(decoder.u64()?);
-        let finality_epoch = FinalityEpoch::new(decoder.u64()?);
-        let headers_only_migration_epoch =
-            decoder.optional(|decoder| Ok(FinalityEpoch::new(decoder.u64()?)))?;
-        let frontiers = FrontierSet {
-            finalized: get_frontier(&mut decoder)?,
-            header_best: get_frontier(&mut decoder)?,
-            verified_best: get_frontier(&mut decoder)?,
-        };
-        let header_best_score = ChainScore::new(
-            SuffixWork::new(U256::from_big_endian(&decoder.array::<32>()?)),
-            block::Hash(decoder.array()?),
-        );
-        let oldest_retained_height = block::Height(decoder.u32()?);
-        let resource_stalled = decoder.bool()?;
-        let header_best_body_unavailable = decoder.optional(get_unavailable)?;
-        let last_transition = decoder.optional(|decoder| {
-            let code = decoder.u8()?;
-            let domain = TransitionDomain::from_code(code).ok_or(
-                HeaderChainValueError::UnknownDiscriminant {
-                    field: "transition_domain",
-                    value: code,
-                },
-            )?;
-            Ok(TransitionFingerprint::from_parts(
-                domain,
-                EvidenceId::from_digest(decoder.array()?),
-                decoder.array()?,
-            ))
-        })?;
-        let migrated_pin_refuted = decoder.optional(get_frontier)?;
-        decoder.finish()?;
-        Ok(EngineMetadata {
-            disk_format,
-            mode,
-            network_id,
-            network_policy_digest,
-            anchor_manifest_digest,
-            work_origin,
-            state_version,
-            header_generation,
-            verified_generation,
-            finality_epoch,
-            headers_only_migration_epoch,
-            frontiers,
-            header_best_score,
-            oldest_retained_height,
-            alarms: AlarmSet {
-                resource_stalled,
-                header_best_body_unavailable,
-                migrated_pin_refuted,
-            },
-            last_transition,
-        })
+        decode_engine_metadata(bytes, None)
     }
+}
+
+/// Decode metadata that carries the released version-one marker.
+///
+/// Version one predates the durable network policy, so the caller passes the digest that the
+/// migration binds into the upgraded row.
+pub(crate) fn decode_v1_engine_metadata(
+    bytes: &[u8],
+    network_policy_digest: [u8; 32],
+) -> Result<EngineMetadata, HeaderChainValueError> {
+    decode_engine_metadata(bytes, Some(network_policy_digest))
+}
+
+/// Decode metadata, reading the network policy digest unless the caller supplies a version-one one.
+fn decode_engine_metadata(
+    bytes: &[u8],
+    v1_network_policy_digest: Option<[u8; 32]>,
+) -> Result<EngineMetadata, HeaderChainValueError> {
+    let expected_disk_format = match v1_network_policy_digest {
+        Some(_) => HeaderChainDiskVersion(1),
+        None => HeaderChainDiskVersion::CURRENT,
+    };
+    let mut decoder = Decoder::new(bytes);
+    let disk_format = decoder.u32()?;
+    if disk_format != expected_disk_format.0 {
+        return Err(HeaderChainValueError::UnsupportedDiskFormat(disk_format));
+    }
+    let disk_format = HeaderChainDiskVersion(disk_format);
+    let mode = match decoder.u8()? {
+        0 => EngineMode::Integrated,
+        1 => EngineMode::HeadersOnly,
+        value => {
+            return Err(HeaderChainValueError::UnknownDiscriminant {
+                field: "engine_mode",
+                value,
+            })
+        }
+    };
+    let network_id = match decoder.u8()? {
+        0 => NetworkKind::Mainnet,
+        1 => NetworkKind::Testnet,
+        2 => NetworkKind::Regtest,
+        value => {
+            return Err(HeaderChainValueError::UnknownDiscriminant {
+                field: "network_kind",
+                value,
+            })
+        }
+    };
+    let network_policy_digest = match v1_network_policy_digest {
+        Some(digest) => digest,
+        None => decoder.array()?,
+    };
+    let anchor_manifest_digest = decoder.array()?;
+    let work_origin = get_frontier(&mut decoder)?;
+    let state_version = StateVersion::new(decoder.u64()?);
+    let header_generation = HeaderGeneration::new(decoder.u64()?);
+    let verified_generation = VerifiedGeneration::new(decoder.u64()?);
+    let finality_epoch = FinalityEpoch::new(decoder.u64()?);
+    let headers_only_migration_epoch =
+        decoder.optional(|decoder| Ok(FinalityEpoch::new(decoder.u64()?)))?;
+    let frontiers = FrontierSet {
+        finalized: get_frontier(&mut decoder)?,
+        header_best: get_frontier(&mut decoder)?,
+        verified_best: get_frontier(&mut decoder)?,
+    };
+    let header_best_score = ChainScore::new(
+        SuffixWork::new(U256::from_big_endian(&decoder.array::<32>()?)),
+        block::Hash(decoder.array()?),
+    );
+    let oldest_retained_height = block::Height(decoder.u32()?);
+    let resource_stalled = decoder.bool()?;
+    let header_best_body_unavailable = decoder.optional(get_unavailable)?;
+    let last_transition = decoder.optional(|decoder| {
+        let code = decoder.u8()?;
+        let domain = TransitionDomain::from_code(code).ok_or(
+            HeaderChainValueError::UnknownDiscriminant {
+                field: "transition_domain",
+                value: code,
+            },
+        )?;
+        Ok(TransitionFingerprint::from_parts(
+            domain,
+            EvidenceId::from_digest(decoder.array()?),
+            decoder.array()?,
+        ))
+    })?;
+    let migrated_pin_refuted = decoder.optional(get_frontier)?;
+    decoder.finish()?;
+    Ok(EngineMetadata {
+        disk_format,
+        mode,
+        network_id,
+        network_policy_digest,
+        anchor_manifest_digest,
+        work_origin,
+        state_version,
+        header_generation,
+        verified_generation,
+        finality_epoch,
+        headers_only_migration_epoch,
+        frontiers,
+        header_best_score,
+        oldest_retained_height,
+        alarms: AlarmSet {
+            resource_stalled,
+            header_best_body_unavailable,
+            migrated_pin_refuted,
+        },
+        last_transition,
+    })
 }
 
 #[cfg(test)]
@@ -1722,7 +1791,30 @@ mod tests {
             decode_untrusted_aux_delivery(&malformed_aux),
             Err(HeaderChainValueError::TreeAuxRoot("Sapling"))
         );
-
+        let legacy_outcome = |status_code, evidence: [u8; 32], boundary: Option<[u8; 32]>| {
+            let mut bytes = base_aux.encode().expect("base auxiliary delivery encodes");
+            *bytes
+                .last_mut()
+                .expect("the encoded delivery ends in its status code") = status_code;
+            bytes.extend(evidence);
+            if let Some(boundary) = boundary {
+                bytes.extend(boundary);
+            }
+            bytes
+        };
+        for bytes in [
+            legacy_outcome(1, [17; 32], Some([18; 32])),
+            legacy_outcome(2, [19; 32], None),
+            legacy_outcome(3, [20; 32], None),
+        ] {
+            assert_eq!(decode_v1_aux_delivery(&bytes), Ok(base_aux));
+        }
+        let mut truncated_legacy = legacy_outcome(2, [21; 32], None);
+        truncated_legacy.pop();
+        assert_eq!(
+            decode_v1_aux_delivery(&truncated_legacy),
+            Err(HeaderChainValueError::Truncated)
+        );
         let finality = FinalityRecord {
             previous: frontier(10, 1),
             current: frontier(11, 2),
@@ -1785,11 +1877,21 @@ mod tests {
         let bytes = metadata.encode().expect("metadata encodes");
         assert_eq!(&bytes[..6], &[0, 0, 0, 3, 1, 2]);
         assert_eq!(EngineMetadata::decode(&bytes), Ok(metadata.clone()));
+        // Version one wrote no network policy digest, so its row is the current row with the
+        // marker rolled back and that field removed.
         let mut version_one_bytes = bytes.clone();
         version_one_bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
+        version_one_bytes.drain(6..38);
         assert_eq!(
             EngineMetadata::decode(&version_one_bytes),
             Err(HeaderChainValueError::UnsupportedDiskFormat(1))
+        );
+        assert_eq!(
+            decode_v1_engine_metadata(&version_one_bytes, metadata.network_policy_digest),
+            Ok(EngineMetadata {
+                disk_format: HeaderChainDiskVersion(1),
+                ..metadata.clone()
+            })
         );
         let mut legacy_bytes = bytes.clone();
         legacy_bytes.truncate(
@@ -1804,7 +1906,7 @@ mod tests {
         );
         // These digests pin the on-disk encodings. Regenerate a digest only together with a
         // deliberate encoding change; an unexplained change means a value's layout drifted.
-        // The metadata digest last moved when the header-chain disk version advanced to 2.
+        // The metadata digest last moved when the header-chain disk version advanced to 3.
         assert_eq!(
             [
                 digest(&aux.encode().expect("aux encodes")),

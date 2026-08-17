@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Build the pinned offline exporter and install the snapshot-host hook.
+# Build the offline exporter from this checkout's pinned commit and install the snapshot-host hook.
 # This script does not restart either Zakura container or start a snapshot job.
 set -euo pipefail
 
 TARGET=${1:-root@45.55.96.29}
 EXPECTED_TARGET=root@45.55.96.29
 EXPECTED_HOST=zakura-snapshot
-EXPORTER_REVISION=d1fed3e6e0e420571ecacb9e1984dea6353cc7a3
 REPOSITORY=https://github.com/zakura-core/zakura.git
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SOURCE_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
+EXPORTER_REVISION=$(git -C "$SOURCE_ROOT" rev-parse HEAD)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/zakura-release-state-deploy.XXXXXX")
 BUILD_TARGET=${ZAKURA_RELEASE_STATE_BUILD_TARGET:-"$HOME/.cache/zakura-release-state-target"}
 REMOTE_STAGE="/tmp/zakura-release-state-deploy-$$"
@@ -47,11 +48,11 @@ CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --locked --release \
 install -d "$WORK/stage/bin" "$WORK/stage/systemd"
 install -m 0755 "$BUILD_TARGET/release/zakura-checkpoints" \
     "$WORK/stage/bin/zakura-checkpoints"
-install -m 0755 "$SCRIPT_DIR/publish-release-state.sh" \
+install -m 0755 "$WORK/source/deploy/release-state/publish-release-state.sh" \
     "$WORK/stage/bin/publish-release-state.sh"
-install -m 0755 "$SCRIPT_DIR/publish-from-snapshot-host.sh" \
+install -m 0755 "$WORK/source/deploy/release-state/publish-from-snapshot-host.sh" \
     "$WORK/stage/bin/publish-from-snapshot-host.sh"
-install -m 0644 "$SCRIPT_DIR/zakura-snapshot-pruned-release-state.conf" \
+install -m 0644 "$WORK/source/deploy/release-state/zakura-snapshot-pruned-release-state.conf" \
     "$WORK/stage/systemd/release-state.conf"
 printf '%s\n' "$EXPORTER_REVISION" > "$WORK/stage/EXPORTER_REVISION"
 

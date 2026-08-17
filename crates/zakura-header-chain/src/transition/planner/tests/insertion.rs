@@ -32,8 +32,8 @@ fn ordinary_header_insertion_rejects_body_repair_authority() {
 }
 
 #[test]
-fn resource_bound_refusal_commits_only_the_alarm_and_recovers() {
-    let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
+fn headers_only_resource_bound_refusal_commits_only_the_alarm_and_recovers() {
+    let (mut store, mut config) = TestStore::new(EngineMode::HeadersOnly);
     config.limits.max_non_finalized_nodes = std::num::NonZeroUsize::new(1).expect("one is nonzero");
     let clock = ManualClock(Utc::now());
 

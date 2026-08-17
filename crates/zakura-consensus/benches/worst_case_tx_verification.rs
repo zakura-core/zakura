@@ -57,6 +57,7 @@ use zakura_chain::{
     transparent,
 };
 use zakura_consensus::{
+    clear_shielded_verification_caches,
     error::TransactionError,
     transaction::{self as tx, Request},
     BoxError,
@@ -284,6 +285,13 @@ fn worst_case_tx_verification(c: &mut Criterion) {
                     let start = Instant::now();
 
                     for _ in 0..iterations {
+                        // Every iteration replays the same workload, and every shielded bundle
+                        // verified once is remembered process-wide. Without this the first
+                        // iteration measures verification and the rest measure cache hits — the
+                        // opposite of the worst case these numbers size the block limits
+                        // against, which is a block of transactions the node has never seen.
+                        clear_shielded_verification_caches();
+
                         let verified = runtime.block_on(async {
                             let verifier =
                                 make_transaction_verifier(requests.len().saturating_add(1));

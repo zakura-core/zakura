@@ -42,10 +42,10 @@ use crate::{
         non_finalized_state::NonFinalizedState,
         write::{
             classify_verified_change, commit_contextual_finalization, commit_operator_change,
-            receive_until_deferred_deadline, verified_request, BlockWriteSender,
-            BlockWriteTaskExit, DeferredHeaderMaintenance, HeaderChainAttachmentError,
-            HeaderChainObservers, HeaderChainWriter, NonFinalizedWriteMessage,
-            PreparedFullStateTransition,
+            receive_until_deferred_deadline, recover_resource_stall, verified_request,
+            BlockWriteSender, BlockWriteTaskExit, HeaderChainAttachmentError,
+            HeaderChainMaintenance, HeaderChainObservers, HeaderChainWriter,
+            NonFinalizedWriteMessage, PreparedFullStateTransition,
         },
         ChainTipSender,
     },
@@ -84,7 +84,7 @@ struct TestDeferredMaintenance {
     reevaluations: AtomicUsize,
 }
 
-impl DeferredHeaderMaintenance for TestDeferredMaintenance {
+impl HeaderChainMaintenance for TestDeferredMaintenance {
     fn earliest_deferred(
         &self,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, HeaderChainStoreError> {

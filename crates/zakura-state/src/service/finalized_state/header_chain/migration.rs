@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use zakura_chain::block;
+use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{
     AlarmSet, BodyValidationState, ChainScore, ChangeSet, EngineConfig, EngineMetadata, EngineMode,
     EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
@@ -14,15 +14,110 @@ use zakura_header_chain::{
 
 use super::{HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError, StartupReport};
 use crate::service::finalized_state::{
-    disk_format::{header_chain_values::HeaderValidationContextDisk, RawBytes},
+    disk_db::{RawVisitError, ReadDisk, WriteDisk},
+    disk_format::{
+        header_chain::HeaderAuxDeliveryKey,
+        header_chain_values::{
+            decode_v1_aux_delivery, decode_v1_engine_metadata, HeaderChainValueError,
+            HeaderValidationContextDisk,
+        },
+        FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
+    },
     zakura_db::{
         block::{
             ZAKURA_HEADER_BY_HEIGHT, ZAKURA_HEADER_HASH_BY_HEIGHT, ZAKURA_HEADER_HEIGHT_BY_HASH,
         },
         ZakuraDb,
     },
-    HEADER_VALIDATION_CONTEXT,
+    DiskWriteBatch, HEADER_AUX_DELIVERY, HEADER_ENGINE_META, HEADER_VALIDATION_CONTEXT,
 };
+
+impl HeaderChainStore {
+    /// Atomically migrate released version-one rows to the current format.
+    pub(in crate::service) fn migrate_v1_to_current(
+        &self,
+        config: &EngineConfig,
+    ) -> Result<bool, HeaderChainStoreError> {
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let metadata_cf = self.cf(HEADER_ENGINE_META)?;
+        let Some(metadata_bytes) = self.db.raw_get_cf(&metadata_cf, super::METADATA_KEY)? else {
+            return Ok(false);
+        };
+        let mut version_bytes = [0; 4];
+        version_bytes.copy_from_slice(
+            metadata_bytes
+                .get(..4)
+                .ok_or(HeaderChainValueError::Truncated)?,
+        );
+        let version = u32::from_be_bytes(version_bytes);
+        if version == HeaderChainDiskVersion::CURRENT.0 {
+            EngineMetadata::decode(&metadata_bytes)?;
+            return Ok(false);
+        }
+
+        // Version one recorded the network kind but not the full policy, so the migration binds
+        // the configured policy. The recovery audit still holds the migrated row to the network
+        // kind that version one durably recorded.
+        let mut metadata =
+            decode_v1_engine_metadata(&metadata_bytes, config.network_policy_digest())?;
+        let limit =
+            zakura_header_chain::RowLimit::new(config.limits.max_aux_deliveries_total.get());
+        let aux_cf = self.cf(HEADER_AUX_DELIVERY)?;
+        let mut batch = DiskWriteBatch::new();
+        let mut rows = 0;
+        self.db
+            .raw_visit_cf(&aux_cf, &mut |key, value| {
+                if rows == limit.get() {
+                    return Err(HeaderChainStoreError::Store(
+                        zakura_header_chain::StoreError::LimitExceeded {
+                            collection: zakura_header_chain::StoreCollection::AuxiliaryDeliveries,
+                            limit,
+                        },
+                    ));
+                }
+                rows += 1;
+                if key.len() != 64 {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "invalid version-one auxiliary key width",
+                    ));
+                }
+                let key = HeaderAuxDeliveryKey::from_bytes(key);
+                let delivery = decode_v1_aux_delivery(value)?;
+                if delivery.header_hash != key.header || delivery.delivery_id != key.delivery {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "version-one auxiliary key/value mismatch",
+                    ));
+                }
+                self.put_value(&mut batch, HEADER_AUX_DELIVERY, key.as_bytes(), &delivery)?;
+                Ok(())
+            })
+            .map_err(|error| match error {
+                RawVisitError::RocksDb(error) => HeaderChainStoreError::RocksDb(error),
+                RawVisitError::Visitor(error) => error,
+            })?;
+
+        metadata.disk_format = HeaderChainDiskVersion::CURRENT;
+        metadata.state_version = metadata.state_version.checked_next()?;
+        metadata.last_transition = None;
+        self.put_value(
+            &mut batch,
+            HEADER_ENGINE_META,
+            super::METADATA_KEY,
+            &metadata,
+        )?;
+        self.db.write(batch)?;
+        tracing::info!(
+            auxiliary_rows = rows,
+            from_version = 1,
+            to_version = HeaderChainDiskVersion::CURRENT.0,
+            "migrated the durable header-chain format"
+        );
+        Ok(true)
+    }
+}
 
 /// Successful initialization from authenticated full-state facts.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,19 +136,14 @@ pub enum HeaderChainInitializationError {
     /// The new schema already has its format-complete metadata marker.
     #[error("fork-aware header-chain schema is already initialized")]
     AlreadyInitialized,
-    /// Predecessor overlay rows require an explicit database resync.
-    #[error(
-        "incompatible predecessor header overlay found; resync this database before starting Zakura"
-    )]
-    IncompatibleLegacyOverlay,
     /// Full state has no finalized tip to authenticate initialization.
     #[error("header-chain initialization requires a finalized full-state anchor")]
     MissingFinalizedAnchor,
-    /// The engine bootstrap is not an exact full-state ancestor of the finalized tip.
-    #[error("engine bootstrap anchor is not an exact finalized full-state ancestor")]
+    /// The engine bootstrap is above the finalized tip, or the finalized anchor is incoherent.
+    #[error("engine bootstrap or finalized full-state anchor is incoherent")]
     AnchorMismatch,
-    /// Exact work construction failed.
-    #[error("authenticated full-state path could not form an exact work coordinate")]
+    /// Exact finalized-anchor work construction failed.
+    #[error("authenticated finalized anchor could not form an exact work coordinate")]
     Work,
     /// Authenticated full-state context is missing or incoherent.
     #[error("authenticated full-state header context is incoherent: {0}")]
@@ -61,15 +151,15 @@ pub enum HeaderChainInitializationError {
     /// The durable initialization or mandatory startup audit failed.
     #[error(transparent)]
     Store(#[from] HeaderChainStoreError),
-    /// RocksDB failed while checking predecessor columns.
-    #[error("predecessor header overlay check failed: {0}")]
+    /// RocksDB rejected the atomic legacy-overlay replacement.
+    #[error("header-chain initialization database write failed: {0}")]
     RocksDb(#[from] rocksdb::Error),
 }
 
 /// Initialize an absent DAG only from authenticated full-state facts.
 ///
-/// Initialization checks the predecessor overlay before it writes any DAG row.
-/// Initialization never decodes, deletes, or reinterprets predecessor overlay rows.
+/// Initialization discards obsolete predecessor overlay rows in the same atomic
+/// batch that publishes the replacement DAG.
 pub(in crate::service) fn initialize_header_chain_reconciled(
     source: &ZakuraDb,
     config: &EngineConfig,
@@ -78,9 +168,6 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
     let store = HeaderChainStore::new(source.header_chain_disk_db());
     if store.metadata_row()?.is_some() {
         return Err(HeaderChainInitializationError::AlreadyInitialized);
-    }
-    if legacy_overlay_has_rows(source)? {
-        return Err(HeaderChainInitializationError::IncompatibleLegacyOverlay);
     }
 
     let (anchor_height, anchor_hash) = source
@@ -127,7 +214,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
         network_id: config.network().kind(),
         network_policy_digest: config.network_policy_digest(),
         anchor_manifest_digest: config.trust_anchor_digest(),
-        work_origin: config.bootstrap_anchor().frontier,
+        work_origin: anchor,
         state_version: StateVersion::new(1),
         header_generation: HeaderGeneration::new(1),
         verified_generation: VerifiedGeneration::new(1),
@@ -168,6 +255,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
     };
     let contexts = validation_context(source, anchor, anchor_header.previous_block_hash)?;
     let mut base_batch = super::super::DiskWriteBatch::new();
+    clear_legacy_overlay(source, &mut base_batch);
     for context in &contexts {
         store.put_value(
             &mut base_batch,
@@ -190,7 +278,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
     ))
 }
 
-fn legacy_overlay_has_rows(source: &ZakuraDb) -> Result<bool, HeaderChainInitializationError> {
+fn clear_legacy_overlay(source: &ZakuraDb, batch: &mut super::super::DiskWriteBatch) {
     let db = source.header_chain_disk_db();
     for family in [
         ZAKURA_HEADER_BY_HEIGHT,
@@ -200,15 +288,15 @@ fn legacy_overlay_has_rows(source: &ZakuraDb) -> Result<bool, HeaderChainInitial
         let Some(cf) = db.cf_handle(family) else {
             continue;
         };
-        if db
-            .zs_forward_range_iter::<_, RawBytes, RawBytes, _>(&cf, ..)
-            .next()
-            .is_some()
-        {
-            return Ok(true);
-        }
+        let Some((first, _)) = db.zs_first_key_value::<_, RawBytes, RawBytes>(&cf) else {
+            continue;
+        };
+        let (last, _) = db
+            .zs_last_key_value::<_, RawBytes, RawBytes>(&cf)
+            .expect("last legacy overlay row exists because the first row exists");
+        batch.zs_delete_range(&cf, &first, &last);
+        batch.zs_delete(&cf, &last);
     }
-    Ok(false)
 }
 
 fn finalized_anchor(
@@ -220,43 +308,23 @@ fn finalized_anchor(
     if bootstrap.height > finalized.height {
         return Err(HeaderChainInitializationError::AnchorMismatch);
     }
-    let (stored_bootstrap_hash, stored_bootstrap) = source
-        .header_by_height(bootstrap.height)
-        .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
+    let (stored_bootstrap_hash, stored_bootstrap) =
+        finalized_header_by_height(source, bootstrap.height)
+            .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
     if stored_bootstrap_hash != bootstrap.hash
         || stored_bootstrap.as_ref() != config.bootstrap_anchor().header.as_ref()
     {
         return Err(HeaderChainInitializationError::AnchorMismatch);
     }
-    let bootstrap_work = stored_bootstrap
-        .difficulty_threshold
-        .to_work()
-        .ok_or(HeaderChainInitializationError::Work)?;
-    let mut coordinate = WorkCoordinate::new(bootstrap.hash, bootstrap_work.as_u256());
-    let mut header = stored_bootstrap;
-    let mut height = bootstrap.height;
-    while height < finalized.height {
-        height = height
-            .next()
-            .map_err(|_| HeaderChainInitializationError::Work)?;
-        let (hash, next) = source
-            .header_by_height(height)
-            .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
-        if next.hash() != hash || next.previous_block_hash != header.hash() {
-            return Err(HeaderChainInitializationError::AnchorMismatch);
-        }
-        let work = next
-            .difficulty_threshold
-            .to_work()
-            .ok_or(HeaderChainInitializationError::Work)?;
-        coordinate = coordinate
-            .checked_add(work)
-            .map_err(|_| HeaderChainInitializationError::Work)?;
-        header = next;
-    }
+    let header = source
+        .block_header(finalized.height.into())
+        .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
     if header.hash() != finalized.hash {
         return Err(HeaderChainInitializationError::AnchorMismatch);
     }
+    // Every selectable branch descends from finality, so pre-finality work is a
+    // shared constant. Rebasing here avoids rescanning the complete finalized chain.
+    let coordinate = WorkCoordinate::new(finalized.hash, U256::zero());
     Ok((header, coordinate))
 }
 
@@ -266,8 +334,17 @@ fn validation_context(
     expected_hash: block::Hash,
 ) -> Result<Vec<HeaderValidationContextDisk>, HeaderChainInitializationError> {
     linked_validation_context(anchor, expected_hash, |height| {
-        source.header_by_height(height)
+        finalized_header_by_height(source, height)
     })
+}
+
+fn finalized_header_by_height(
+    source: &ZakuraDb,
+    height: block::Height,
+) -> Option<(block::Hash, Arc<block::Header>)> {
+    let hash = source.hash(height)?;
+    let header = source.block_header(height.into())?;
+    Some((hash, header))
 }
 
 fn linked_validation_context(

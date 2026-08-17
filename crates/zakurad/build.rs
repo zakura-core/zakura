@@ -6,7 +6,7 @@
 //! When compiling the `lightwalletd` gRPC tests, also builds a gRPC client
 //! Rust API for `lightwalletd`.
 
-use vergen_git2::{CargoBuilder, Emitter, Git2Builder, RustcBuilder};
+use vergen_gitcl::{CargoBuilder, Emitter, GitclBuilder, RustcBuilder};
 
 /// Process entry point for `zakurad`'s build script
 #[allow(clippy::print_stderr)]
@@ -41,7 +41,7 @@ fn main() {
 
     // Get git information. This is used by e.g. ZakuradApp::register_components()
     // to log the commit hash
-    let all_git = Git2Builder::default()
+    let all_git = GitclBuilder::default()
         .branch(true)
         .commit_author_email(true)
         .commit_author_name(true)
@@ -62,7 +62,7 @@ fn main() {
         // proceed with the build.
         // Note that this won't be printed unless in cargo very verbose mode (-vv).
         // We could emit a build warning, but that might scare users.
-        println!("git error in vergen build script: skipping git env vars: {e:?}",);
+        eprintln!("git error in vergen build script: skipping git env vars: {e:?}",);
     }
 
     emitter.emit().expect("base emit should succeed");

@@ -25,7 +25,7 @@ pub(super) struct RetentionPlan {
 pub(super) struct RetentionWork {
     /// Retained nodes visited while building the shared protected-path union.
     pub(super) protected_path_visits: usize,
-    /// Retained nodes visited by the single candidate-index construction pass.
+    /// Retained nodes visited while building eviction candidate indexes.
     pub(super) candidate_nodes_scanned: usize,
     /// Retained nodes removed by deterministic eviction.
     pub(super) evicted_nodes: usize,
@@ -77,7 +77,7 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
     let mut candidates = RetentionCandidates::build(store)?;
     plan.work.candidate_nodes_scanned = candidates.header_nodes_scanned;
     plan.work.graph_workspaces = plan.work.graph_workspaces.saturating_add(1);
-    evict_permanently_ineligible(
+    let permanently_evicted = evict_permanently_ineligible(
         store,
         &protected_header_hashes,
         &mut candidates,
@@ -87,6 +87,15 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
         && store.view_header_node_count().saturating_sub(1) <= limits.max_non_finalized_nodes.get()
     {
         return Ok(plan);
+    }
+
+    if permanently_evicted {
+        candidates = RetentionCandidates::build(store)?;
+        plan.work.candidate_nodes_scanned = plan
+            .work
+            .candidate_nodes_scanned
+            .saturating_add(candidates.header_nodes_scanned);
+        plan.work.graph_workspaces = plan.work.graph_workspaces.saturating_add(1);
     }
 
     if store.view_eligible_header_tip_count() > limits.max_candidate_tips.get() {
@@ -217,7 +226,8 @@ fn evict_permanently_ineligible<G: HeaderGraphEdit>(
     protected_header_hashes: &HashSet<block::Hash>,
     candidates: &mut RetentionCandidates,
     retention_work: &mut RetentionWork,
-) -> Result<(), GraphError> {
+) -> Result<bool, GraphError> {
+    let mut evicted = false;
     while let Some((_, raw_hash)) = candidates.permanently_ineligible_roots.pop_first() {
         let root = block::Hash(raw_hash);
         if protected_header_hashes.contains(&root) {
@@ -231,9 +241,10 @@ fn evict_permanently_ineligible<G: HeaderGraphEdit>(
         for hash in descendants.drain(..) {
             store.edit_remove_header_leaf(hash)?;
             retention_work.evicted_nodes = retention_work.evicted_nodes.saturating_add(1);
+            evicted = true;
         }
     }
-    Ok(())
+    Ok(evicted)
 }
 
 fn subtree_postorder<G: HeaderGraphView>(store: &G, root: block::Hash) -> Vec<block::Hash> {

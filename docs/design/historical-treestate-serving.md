@@ -291,15 +291,3 @@ would shrink the artifact further if it ever mattered.
 The residual tail above the budget is variance rather than a missing model term. It does
 not correlate with block bytes (r = -0.10) or with replay length, so tightening it costs
 entries, not modelling.
-
-## Appendix B: revisions
-
-- **2026-08-03.** §3.2 originally recommended a coarse uniform grid, on the argument that
-  spacing only costs the first request of a sweep. That argument holds, but its magnitude
-  does not: at ~1.9 ms/block a 50,000-block cold replay runs into minutes. Replaced with
-  the cost-weighted grid.
-- **2026-08-03.** Generation originally required an archive **legacy-synced** publisher
-  host, because the exporter read stored per-height trees. It now replays and root-checks
-  instead, so any archive node qualifies.
-- **2026-08-17.** Subtree generation moved out of the exporter pass and into the
-  release-state pipeline, making the two generators independent.

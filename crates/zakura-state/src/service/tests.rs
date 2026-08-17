@@ -155,6 +155,150 @@ fn historical_frontier_artifact_must_cover_the_database_vct_handoff() {
 }
 
 #[test]
+fn frontier_grid_coverage_is_incomparable_until_both_sides_exist() {
+    assert_eq!(
+        super::frontier_grid_ends_before_vct_handoff(None, None),
+        None,
+        "neither side is comparable"
+    );
+    assert_eq!(
+        super::frontier_grid_ends_before_vct_handoff(Some(Height(9)), None),
+        None,
+        "an unmarked database cannot fail coverage"
+    );
+    assert_eq!(
+        super::frontier_grid_ends_before_vct_handoff(None, Some(Height(10))),
+        None,
+        "an unloaded grid cannot fail coverage"
+    );
+    assert_eq!(
+        super::frontier_grid_ends_before_vct_handoff(Some(Height(9)), Some(Height(10))),
+        Some((Height(9), Height(10))),
+        "a grid that ends below the handoff is uncovered"
+    );
+    assert_eq!(
+        super::frontier_grid_ends_before_vct_handoff(Some(Height(10)), Some(Height(10))),
+        None,
+        "a grid that ends on the handoff covers the band"
+    );
+    assert_eq!(
+        super::frontier_grid_ends_before_vct_handoff(Some(Height(11)), Some(Height(10))),
+        None,
+        "a newer grid may cover an older handoff"
+    );
+}
+
+#[test]
+fn historical_frontier_coverage_is_rechecked_once_the_vct_marker_exists() {
+    use std::sync::OnceLock;
+
+    use zakura_node_services::sync_lifecycle::{
+        HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+    };
+
+    use crate::service::{
+        non_finalized_state::NonFinalizedState, watch_receiver::WatchReceiver,
+        HeaderChainSubscriptions, ReadStateService, VctRootRepairStatus,
+    };
+
+    let network = Network::Mainnet;
+    let temp_dir = tempfile::tempdir().expect("temporary directory is created");
+    let artifact_path = temp_dir.path().join("frontiers.bin");
+    let artifact = FrontierArtifact {
+        spacing: 1,
+        last_checkpoint: Height(9),
+        entries: vec![FrontierEntry {
+            height: Height(9),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
+        }],
+    };
+    std::fs::write(&artifact_path, artifact.encode(&network))
+        .expect("historical frontier artifact is written");
+
+    let config = Config {
+        derive_historical_trees: true,
+        historical_frontier_artifact: Some(artifact_path),
+        ..Config::ephemeral()
+    };
+    let finalized_state =
+        FinalizedState::new(&config, &network).expect("ephemeral finalized state opens");
+    let historical_trees = super::load_historical_frontier_artifact(&network, &config)
+        .and_then(|artifact| artifact.require_vct_handoff_coverage(&config, &finalized_state.db))
+        .expect("an unmarked database must start: the handoff marker is written during fast-sync");
+
+    let (_non_finalized_sender, non_finalized_receiver) =
+        tokio::sync::watch::channel(NonFinalizedState::new(&network));
+    let (_repair_sender, repair_receiver) =
+        tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+        tokio::sync::watch::channel(None);
+    let (_header_chain_view_sender, header_chain_view_receiver) = tokio::sync::watch::channel(None);
+    let (_header_runtime_status_sender, header_runtime_status_receiver) =
+        tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+            epoch: LifecycleEpoch::INITIAL,
+            reason: HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+        });
+    let (_header_chain_reader_sender, header_chain_reader_receiver) =
+        tokio::sync::watch::channel(None);
+
+    let read_state = ReadStateService::new(
+        &finalized_state,
+        None,
+        Arc::new(OnceLock::new()),
+        WatchReceiver::new(non_finalized_receiver),
+        repair_receiver,
+        HeaderChainSubscriptions {
+            snapshots: header_chain_snapshot_receiver,
+            views: header_chain_view_receiver,
+            runtime_status: header_runtime_status_receiver,
+            reader: header_chain_reader_receiver,
+        },
+        historical_trees,
+    );
+
+    assert!(
+        read_state
+            .require_historical_frontier_handoff_coverage()
+            .is_ok(),
+        "coverage cannot fail before the durable marker exists"
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&finalized_state.db, Height(10));
+    finalized_state
+        .db
+        .write_batch(batch)
+        .expect("a newer VCT handoff marker is written");
+    assert!(
+        matches!(
+            read_state.require_historical_frontier_handoff_coverage(),
+            Err(
+                crate::service::read::historical_tree::HistoricalTreeDerivationError::ArtifactBeforeVctHandoff {
+                    artifact_checkpoint: Height(9),
+                    vct_handoff: Height(10),
+                }
+            )
+        ),
+        "serving must refuse a grid that ends below a marker written after construction"
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&finalized_state.db, Height(9));
+    finalized_state
+        .db
+        .write_batch(batch)
+        .expect("a matching VCT handoff marker is written");
+    assert!(
+        read_state
+            .require_historical_frontier_handoff_coverage()
+            .is_ok(),
+        "a grid that ends on the handoff covers the band"
+    );
+}
+
+#[test]
 fn block_sync_body_anchor_rolls_back_to_the_selected_fork_intersection() {
     let shared = block::Hash([1; 32]);
     let body_fork = block::Hash([2; 32]);

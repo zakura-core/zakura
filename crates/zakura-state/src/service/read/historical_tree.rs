@@ -179,6 +179,21 @@ pub enum HistoricalTreeDerivationError {
         /// The underlying tree error, rendered because it is not `PartialEq`.
         error: String,
     },
+
+    /// The published frontier grid ends below this database's VCT handoff.
+    ///
+    /// A request in the uncovered suffix would replay from a distant anchor rather than a nearby
+    /// grid entry. Serving refuses that path rather than falling through to the replay backstop.
+    #[error(
+        "historical frontier artifact ends at {artifact_checkpoint:?}, below this database's VCT \
+         handoff {vct_handoff:?}; configure an artifact generated at or after the database handoff"
+    )]
+    ArtifactBeforeVctHandoff {
+        /// Last checkpoint encoded in the artifact.
+        artifact_checkpoint: Height,
+        /// Durable VCT handoff recorded by this database.
+        vct_handoff: Height,
+    },
 }
 
 /// A bounded in-memory cache of frontiers this node has already derived and root-checked.
@@ -207,6 +222,13 @@ impl HistoricalTreeCache {
             frontiers: BTreeMap::new(),
             artifact: Some(artifact),
         }
+    }
+
+    /// The last checkpoint encoded in the published grid, if one is loaded.
+    pub(crate) fn last_checkpoint(&self) -> Option<Height> {
+        self.artifact
+            .as_ref()
+            .map(|artifact| artifact.last_checkpoint)
     }
 
     /// Returns the highest published grid entry at or below `height`, if any.

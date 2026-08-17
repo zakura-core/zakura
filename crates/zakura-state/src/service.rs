@@ -1297,6 +1297,34 @@ impl ReadStateService {
         (artifact.last_checkpoint >= vct_applied_below).then_some((artifact, vct_applied_below))
     }
 
+    /// Refuses a frontier grid that ends below this database's durable VCT handoff.
+    ///
+    /// Construction already makes this comparison, but the durable marker can be written after the
+    /// read service starts — the same reason [`Self::historical_subtrees_at_last_checkpoint`]
+    /// checks when serving. A same-run fast-sync would otherwise serve the absent band against a
+    /// grid that was never compared to the handoff.
+    fn require_historical_frontier_handoff_coverage(
+        &self,
+    ) -> Result<(), read::historical_tree::HistoricalTreeDerivationError> {
+        let artifact_checkpoint = self
+            .historical_trees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_checkpoint();
+        if let Some((artifact_checkpoint, vct_handoff)) =
+            frontier_grid_ends_before_vct_handoff(artifact_checkpoint, self.db.vct_synced_below())
+        {
+            return Err(
+                read::historical_tree::HistoricalTreeDerivationError::ArtifactBeforeVctHandoff {
+                    artifact_checkpoint,
+                    vct_handoff,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
     /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.
     pub fn subscribe_vct_root_repairs(&self) -> tokio::sync::watch::Receiver<VctRootRepairStatus> {
         self.vct_root_repair_receiver.clone()
@@ -1970,16 +1998,19 @@ struct LoadedHistoricalFrontierArtifact {
 }
 
 impl LoadedHistoricalFrontierArtifact {
+    /// Refuses a frontier grid that ends below this database's durable VCT handoff.
+    ///
+    /// When the handoff marker is not written yet, the comparison cannot be made and this check
+    /// passes. Serving repeats it, because the marker is written during ordinary fast-sync commits
+    /// after the read service starts.
     fn require_vct_handoff_coverage(
         self,
         config: &Config,
         db: &ZakuraDb,
     ) -> Result<Arc<Mutex<read::HistoricalTreeCache>>, StateInitError> {
         if config.derive_historical_trees {
-            if let Some((artifact_checkpoint, vct_handoff)) = self
-                .last_checkpoint
-                .zip(db.vct_synced_below())
-                .filter(|(artifact_checkpoint, vct_handoff)| artifact_checkpoint < vct_handoff)
+            if let Some((artifact_checkpoint, vct_handoff)) =
+                frontier_grid_ends_before_vct_handoff(self.last_checkpoint, db.vct_synced_below())
             {
                 return Err(StateInitError::HistoricalFrontierArtifactBeforeVctHandoff {
                     path: config
@@ -1994,6 +2025,20 @@ impl LoadedHistoricalFrontierArtifact {
 
         Ok(self.cache)
     }
+}
+
+/// Returns the artifact checkpoint and database handoff when the published grid ends below this
+/// database's skip band.
+///
+/// `None` means the comparison cannot be made yet — the grid is unloaded, or the durable last
+/// checkpoint marker has not been written — or the grid already covers the band.
+fn frontier_grid_ends_before_vct_handoff(
+    artifact_checkpoint: Option<block::Height>,
+    vct_handoff: Option<block::Height>,
+) -> Option<(block::Height, block::Height)> {
+    artifact_checkpoint
+        .zip(vct_handoff)
+        .filter(|(artifact_checkpoint, vct_handoff)| artifact_checkpoint < vct_handoff)
 }
 
 /// Loads the configured frontier grid into a fresh derivation cache.
@@ -2079,6 +2124,10 @@ fn historical_frontiers(
     if config.pruning_config().is_some() {
         return Err(unavailable.into());
     }
+
+    // The durable last-checkpoint marker can be written after construction, so coverage is
+    // checked here rather than only at startup.
+    state.require_historical_frontier_handoff_coverage()?;
 
     let Some(height) = hash_or_height.height_or_else(|hash| state.db.height(hash)) else {
         // The absent-band check resolved this block to a height, so failing to resolve it again

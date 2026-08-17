@@ -31,12 +31,24 @@ pub enum AuxiliaryEffect {
     Authentication,
 }
 
+/// Effect of one committed transition on in-flight body work.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum BodyWorkEffect {
+    /// The transition retained every selected and verified path entry.
+    #[default]
+    Preserved,
+    /// The transition retired a selected or verified path entry.
+    Invalidated,
+}
+
 /// Orthogonal effects produced by one planned transition.
 ///
 /// The submitted [`crate::TransitionDomain`] identifies the input. This record describes
 /// the resulting admission transformations and side effects, which may coexist.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct TransitionEffect {
+    /// Compatibility of existing body work with the resulting selected lineage.
+    pub body_work: BodyWorkEffect,
     /// Ordinary header-work rebase or already-applied classification.
     pub header_work: Option<HeaderWorkEffect>,
     /// Optional finality advancement produced while settling.
@@ -51,6 +63,7 @@ impl TransitionEffect {
     /// Construct an empty effect record for an ordinary event admission.
     pub const fn none() -> Self {
         Self {
+            body_work: BodyWorkEffect::Preserved,
             header_work: None,
             finality: None,
             auxiliary: None,
@@ -66,6 +79,7 @@ impl TransitionEffect {
     /// Construct an already-applied header-work effect.
     pub const fn header_work_already_applied() -> Self {
         Self {
+            body_work: BodyWorkEffect::Preserved,
             header_work: Some(HeaderWorkEffect::AlreadyApplied),
             finality: None,
             auxiliary: None,
@@ -76,6 +90,7 @@ impl TransitionEffect {
     /// Construct a committed resource-stall refusal.
     pub const fn resource_stalled() -> Self {
         Self {
+            body_work: BodyWorkEffect::Preserved,
             header_work: None,
             finality: None,
             auxiliary: None,
@@ -86,6 +101,11 @@ impl TransitionEffect {
     /// True when retention refused admission.
     pub const fn is_resource_stalled(self) -> bool {
         self.resource_stalled
+    }
+
+    /// True when this transition retired selected or verified path entries.
+    pub const fn invalidates_body_work(self) -> bool {
+        matches!(self.body_work, BodyWorkEffect::Invalidated)
     }
 
     /// True when checkpoint finality advanced on the retained selected path.

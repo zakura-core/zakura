@@ -288,6 +288,7 @@ mod tests {
                 branch: BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
             },
             verified_generation: VerifiedGeneration::new(6),
+            body_work_epoch: crate::BodyWorkEpoch::default(),
         }
         .bind(
             7,

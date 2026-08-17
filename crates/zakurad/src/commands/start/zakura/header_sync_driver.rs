@@ -76,6 +76,7 @@ where
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
     let committed_snapshots = read_state.subscribe_header_chain_snapshots();
+    let committed_views = read_state.subscribe_header_chain_views();
     let mut header_runtime_status = read_state.subscribe_header_runtime_status();
     wait_for_header_runtime(&mut header_runtime_status).await?;
     coordinator
@@ -108,6 +109,7 @@ where
         best_header_tip: Some(best_header_tip),
         verified_block_tip_hash: verified_block_tip.1,
         committed_snapshots,
+        committed_views,
         service_demand: coordinator.subscribe_service_demand(),
         vct_root_repairs: Some(vct_root_repairs),
         header_chain_port: Arc::new(HeaderChainServicePort::new(

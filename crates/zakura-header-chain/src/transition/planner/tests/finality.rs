@@ -573,6 +573,10 @@ fn finality_atomic_prune_rebase_projection_generation() {
     )
     .expect("authenticated full-state finality transitions both histories atomically");
 
+    assert!(
+        plan.effect().invalidates_body_work(),
+        "full-state finality invalidates body work when it retains conflicting old selected entries at the new boundary"
+    );
     let changes = plan.change_set();
     assert_eq!(changes.metadata.frontiers.finalized, new_finalized);
     assert_eq!(changes.metadata.frontiers.header_best, verified_tip);
@@ -884,6 +888,10 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
     assert_eq!(plan.change_set.metadata.frontiers.verified_best, checkpoint);
     assert_eq!(plan.change_set.metadata.frontiers.finalized, checkpoint);
     assert!(plan.effect().is_checkpoint_finality());
+    assert!(
+        !plan.effect().invalidates_body_work(),
+        "checkpoint finality retires only the authoritative finalized prefix"
+    );
     assert_eq!(plan.domain(), TransitionDomain::VerifiedChainChanged);
     assert!(
         super::super::super::invariants::is_incremental_checkpoint_finality(

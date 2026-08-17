@@ -71,6 +71,7 @@ struct WorkQueueInner {
     pending: std::collections::BTreeMap<block::Height, WorkItem>,
     in_flight: std::collections::BTreeMap<block::Height, WorkItem>,
     floor: block::Height,
+    current_authority: Option<zakura_header_chain::BodyWorkAuthority>,
     /// Floor clamp for size estimates (overridable for tests).
     floor_estimate_bytes: u64,
     /// Running sum of `reserved_charge()` across every `pending` + `in_flight`
@@ -111,6 +112,7 @@ impl WorkQueue {
                 pending: std::collections::BTreeMap::new(),
                 in_flight: std::collections::BTreeMap::new(),
                 floor,
+                current_authority: None,
                 floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
                 reserved_bytes: 0,
             }),
@@ -142,6 +144,7 @@ impl WorkQueue {
         let mut inserted = 0usize;
         {
             let mut inner = self.lock();
+            inner.current_authority = Some(scope);
             for (height, hash, size) in items {
                 if height <= inner.floor
                     || inner.pending.contains_key(&height)
@@ -169,53 +172,14 @@ impl WorkQueue {
         inserted
     }
 
-    /// Retire every item not owned by `current`, returning still-reserved bytes.
-    ///
-    /// The scheduler calls this method before it processes a newly committed snapshot.
-    /// Retirement prevents obsolete work from suppressing its replacement.
-    pub(super) fn retire_obsolete_scope(
-        &self,
-        current: zakura_header_chain::BodyWorkAuthority,
-    ) -> u64 {
+    /// Reauthorize queued work while in-flight requests retain their registered owners.
+    pub(super) fn refresh_authority(&self, authority: zakura_header_chain::BodyWorkAuthority) {
         let mut inner = self.lock();
-        let mut released = 0u64;
-        inner.pending.retain(|_, item| {
-            if item.scope == current {
-                true
-            } else {
-                released = released.saturating_add(item.budget.release_reserved());
-                false
-            }
-        });
-        inner.in_flight.retain(|_, item| {
-            if item.scope == current {
-                true
-            } else {
-                released = released.saturating_add(item.budget.release_reserved());
-                false
-            }
-        });
-        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
-        released
-    }
-
-    /// Retire all queued and requested work when no authenticated snapshot exists.
-    pub(super) fn retire_all(&self) -> u64 {
-        let mut inner = self.lock();
-        let pending_released = inner
-            .pending
-            .values_mut()
-            .map(|item| item.budget.release_reserved())
-            .fold(0u64, u64::saturating_add);
-        let released = inner
-            .in_flight
-            .values_mut()
-            .map(|item| item.budget.release_reserved())
-            .fold(pending_released, u64::saturating_add);
-        inner.pending.clear();
-        inner.in_flight.clear();
-        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
-        released
+        inner.current_authority = Some(authority);
+        for item in inner.pending.values_mut() {
+            item.scope = authority;
+        }
+        self.available.notify_waiters();
     }
 
     /// Move up to `max` contiguous-ascending `pending` heights within
@@ -256,6 +220,11 @@ impl WorkQueue {
             match height.0.checked_add(1) {
                 Some(raw) => next_expected = Some(block::Height(raw)),
                 None => break,
+            }
+        }
+        if let Some(authority) = inner.current_authority {
+            for (_, item) in &mut taken {
+                item.scope = authority;
             }
         }
         for (height, item) in &taken {
@@ -321,6 +290,11 @@ impl WorkQueue {
             match height.0.checked_add(1) {
                 Some(raw) => next_expected = Some(block::Height(raw)),
                 None => break,
+            }
+        }
+        if let Some(authority) = inner.current_authority {
+            for (_, item) in &mut taken {
+                item.scope = authority;
             }
         }
         for (height, item) in &taken {

@@ -131,6 +131,7 @@ impl SessionAdmission {
 struct BodyRetryKey {
     header_generation: zakura_header_chain::HeaderGeneration,
     branch: zakura_header_chain::BranchId,
+    body_work_epoch: zakura_header_chain::BodyWorkEpoch,
     hash: block::Hash,
 }
 
@@ -139,6 +140,7 @@ impl BodyRetryKey {
         Self {
             header_generation: scope.header_generation,
             branch: scope.branch,
+            body_work_epoch: scope.body_work_epoch,
             hash,
         }
     }
@@ -276,14 +278,37 @@ impl PeerRegistry {
     ) {
         self.body_retry_lock().retain(|(_, key), _| {
             current.is_some_and(|scope| {
-                key.header_generation == scope.header_generation && key.branch == scope.branch
+                key.header_generation == scope.header_generation
+                    && key.branch == scope.branch
+                    && key.body_work_epoch == scope.body_work_epoch
             })
         });
         self.body_retry_all_lock().retain(|key, _| {
             current.is_some_and(|scope| {
-                key.header_generation == scope.header_generation && key.branch == scope.branch
+                key.header_generation == scope.header_generation
+                    && key.branch == scope.branch
+                    && key.body_work_epoch == scope.body_work_epoch
             })
         });
+    }
+
+    pub(super) fn refresh_body_retry_scope(&self, current: zakura_header_chain::BodyWorkAuthority) {
+        let retries = std::mem::take(&mut *self.body_retry_lock());
+        self.body_retry_lock()
+            .extend(retries.into_iter().map(|((source, mut key), deadline)| {
+                key.header_generation = current.header_generation;
+                key.branch = current.branch;
+                key.body_work_epoch = current.body_work_epoch;
+                ((source, key), deadline)
+            }));
+        let retries = std::mem::take(&mut *self.body_retry_all_lock());
+        self.body_retry_all_lock()
+            .extend(retries.into_iter().map(|(mut key, deadline)| {
+                key.header_generation = current.header_generation;
+                key.branch = current.branch;
+                key.body_work_epoch = current.body_work_epoch;
+                (key, deadline)
+            }));
     }
 
     pub(super) fn is_body_retry_avoided(

@@ -155,6 +155,7 @@ pub fn spawn_bench_sequencer(
             ),
         },
         verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+        body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
     }
     .bind(
         1,
@@ -311,7 +312,7 @@ impl BenchCommitter {
             }),
             eligible_sources: std::collections::BTreeSet::new(),
             persisted_availability: None,
-            semantic_current: true,
+            semantic_completion: Some((self.owner, zakura_header_chain::StateVersion::default())),
         });
         let _ = self.control.send(SequencerControlInput::FrontierAdvance {
             frontiers,

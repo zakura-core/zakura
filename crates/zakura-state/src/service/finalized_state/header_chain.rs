@@ -16,15 +16,16 @@ use tokio::{sync::watch, time::Instant};
 use zakura_chain::{block, parallel::commitment_aux::BlockCommitmentRoots, parameters::Network};
 use zakura_header_chain::{
     audit_store, audit_store_for_trust_anchor_update, ApplyResult, AuxDelivery, AuxDelta,
-    BodyWorkAuthority, BodyWorkOwner, ChangeSet, CommittedStallReceipt, CounterExhausted,
-    EligibilityReason, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot, EvidenceId,
-    FinalityRecord, FinalitySource, Frontier, FullStateEvidenceAuthority, FullStateFinalized,
-    HeaderChainEngine, HeaderInsertionFacts, HeaderLocator, HeaderNode, HeaderSyncWorkOwner,
-    HeaderValidationFacts, HeaderWorkAuthority, MemHeaderStore, NoChangeReceipt, RecoveryFailure,
-    RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt, StateVersion, StoreAuditRead, StoreError,
-    SystemClock, TransitionContext, TransitionEvent, TransitionFailure, TransitionInput,
-    TransitionRequest, ValidationContextRecord, ValidationLease, VerifiedChainChanged,
-    VerifiedChangeCause, VerifiedHeaderRef,
+    BodyWorkAuthority, BodyWorkOwner, ChangeSet, CommittedHeaderChainView, CommittedStallReceipt,
+    CounterExhausted, EligibilityReason, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
+    EvidenceId, FinalityRecord, FinalitySource, Frontier, FullStateEvidenceAuthority,
+    FullStateFinalized, HeaderChainEngine, HeaderInsertionFacts, HeaderLocator, HeaderNode,
+    HeaderSyncWorkOwner, HeaderValidationFacts, HeaderWorkAuthority, MemHeaderStore,
+    NoChangeReceipt, RecoveryFailure, RecoveryPlan, RecoveryRepair, SourceId, StaleReceipt,
+    StateVersion, StoreAuditRead, StoreError, SystemClock, TransitionContext, TransitionEffect,
+    TransitionEvent, TransitionFailure, TransitionInput, TransitionRequest,
+    ValidationContextRecord, ValidationLease, VerifiedChainChanged, VerifiedChangeCause,
+    VerifiedHeaderRef,
 };
 
 use crate::{
@@ -261,16 +262,24 @@ pub struct StartupReport {
 #[derive(Clone, Debug)]
 pub struct Publisher {
     sender: watch::Sender<EngineSnapshot>,
+    views: watch::Sender<CommittedHeaderChainView>,
     mirrors: Arc<Mutex<Vec<watch::Sender<Option<EngineSnapshot>>>>>,
+    view_mirrors: Arc<Mutex<Vec<watch::Sender<Option<CommittedHeaderChainView>>>>>,
 }
 
 impl Publisher {
     fn new(snapshot: EngineSnapshot) -> Self {
         record_published_snapshot(&snapshot);
-        let (sender, _) = watch::channel(snapshot);
+        let (sender, _) = watch::channel(snapshot.clone());
+        let (views, _) = watch::channel(CommittedHeaderChainView::new(
+            snapshot,
+            zakura_header_chain::BodyWorkEpoch::default(),
+        ));
         Self {
             sender,
+            views,
             mirrors: Arc::new(Mutex::new(Vec::new())),
+            view_mirrors: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -284,6 +293,16 @@ impl Publisher {
         self.sender.subscribe()
     }
 
+    /// Return the latest atomic snapshot and body-work epoch.
+    pub fn view(&self) -> CommittedHeaderChainView {
+        self.views.borrow().clone()
+    }
+
+    /// Subscribe to atomic snapshots and body-work epochs.
+    pub fn subscribe_views(&self) -> watch::Receiver<CommittedHeaderChainView> {
+        self.views.subscribe()
+    }
+
     /// Mirror committed snapshots into a channel that can predate runtime attachment.
     pub(crate) fn mirror_to(&self, sender: watch::Sender<Option<EngineSnapshot>>) {
         sender.send_replace(Some(self.snapshot()));
@@ -293,9 +312,28 @@ impl Publisher {
             .push(sender);
     }
 
-    fn publish(&self, snapshot: EngineSnapshot) {
+    /// Mirror atomic committed views into a channel that can predate runtime attachment.
+    pub(crate) fn mirror_views_to(&self, sender: watch::Sender<Option<CommittedHeaderChainView>>) {
+        sender.send_replace(Some(self.view()));
+        self.view_mirrors
+            .lock()
+            .expect("header-chain publisher view mirror mutex is never poisoned")
+            .push(sender);
+    }
+
+    fn publish(&self, snapshot: EngineSnapshot, effect: TransitionEffect) {
+        let previous_epoch = self.views.borrow().body_work_epoch;
+        let body_work_epoch = if effect.invalidates_body_work() {
+            previous_epoch
+                .checked_next()
+                .expect("a process cannot commit u64::MAX body-work invalidations")
+        } else {
+            previous_epoch
+        };
+        let view = CommittedHeaderChainView::new(snapshot.clone(), body_work_epoch);
         record_published_snapshot(&snapshot);
         self.sender.send_replace(snapshot.clone());
+        self.views.send_replace(view.clone());
         self.mirrors
             .lock()
             .expect("header-chain publisher mirror mutex is never poisoned")
@@ -304,6 +342,17 @@ impl Publisher {
                     false
                 } else {
                     mirror.send_replace(Some(snapshot.clone()));
+                    true
+                }
+            });
+        self.view_mirrors
+            .lock()
+            .expect("header-chain publisher view mirror mutex is never poisoned")
+            .retain(|mirror| {
+                if mirror.receiver_count() == 0 {
+                    false
+                } else {
+                    mirror.send_replace(Some(view.clone()));
                     true
                 }
             });
@@ -2077,6 +2126,7 @@ impl HeaderChainRuntime {
             );
             return Err(error);
         }
+        let checkpoint_effect = checkpoint.effect();
 
         let current = checkpoint.snapshot_after_commit();
         let batch = match self
@@ -2110,7 +2160,7 @@ impl HeaderChainRuntime {
             return Err(error);
         }
         memory_swap();
-        self.publisher.publish(current);
+        self.publisher.publish(current, checkpoint_effect);
         Ok(ApplyResult::Committed)
     }
 
@@ -2371,7 +2421,7 @@ impl HeaderChainRuntime {
             transition_engine.install_committed_transition(transition)?;
             #[cfg(test)]
             fault(FaultPoint::AfterCommit)?;
-            self.publisher.publish(current);
+            self.publisher.publish(current, transition_effect);
             #[cfg(test)]
             fault(FaultPoint::AfterPublish)?;
             return Ok(ApplyResult::ResourceStalled(receipt));
@@ -2447,7 +2497,7 @@ impl HeaderChainRuntime {
         memory_swap();
         #[cfg(test)]
         fault(FaultPoint::AfterMemorySwap)?;
-        self.publisher.publish(current);
+        self.publisher.publish(current, transition_effect);
         #[cfg(test)]
         fault(FaultPoint::AfterPublish)?;
         Ok(ApplyResult::Committed)

@@ -273,6 +273,10 @@ pub struct ReadStateService {
     header_chain_snapshot_receiver:
         tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
 
+    /// Atomic committed header views used by body-work coordinators.
+    header_chain_view_receiver:
+        tokio::sync::watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>,
+
     /// Explicit durable header-runtime attachment and readiness lifecycle.
     header_runtime_status_receiver:
         tokio::sync::watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
@@ -285,6 +289,7 @@ pub struct ReadStateService {
 #[derive(Clone, Debug)]
 struct HeaderChainSubscriptions {
     snapshots: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+    views: tokio::sync::watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>,
     runtime_status:
         tokio::sync::watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
     reader: tokio::sync::watch::Receiver<Option<finalized_state::header_chain::HeaderChainReader>>,
@@ -456,6 +461,8 @@ impl StateService {
         let sync_backup_dir_path = backup_dir_path.filter(|_| skip_backup_task);
         let (header_chain_snapshot_sender, header_chain_snapshot_receiver) =
             tokio::sync::watch::channel(None);
+        let (header_chain_view_sender, header_chain_view_receiver) =
+            tokio::sync::watch::channel(None);
         let durable_header_runtime_exists =
             HeaderChainStore::new(finalized_state.db.header_chain_disk_db())
                 .is_initialized()
@@ -489,6 +496,7 @@ impl StateService {
             sync_backup_dir_path,
             write::HeaderChainObservers::new(
                 header_chain_snapshot_sender,
+                header_chain_view_sender,
                 header_chain_reader_sender,
                 header_runtime_status_sender,
             ),
@@ -502,6 +510,7 @@ impl StateService {
             vct_root_repair_receiver,
             HeaderChainSubscriptions {
                 snapshots: header_chain_snapshot_receiver,
+                views: header_chain_view_receiver,
                 runtime_status: header_runtime_status_receiver,
                 reader: header_chain_reader_receiver,
             },
@@ -1229,6 +1238,7 @@ impl ReadStateService {
             historical_subtrees,
             vct_root_repair_receiver,
             header_chain_snapshot_receiver: header_chain.snapshots,
+            header_chain_view_receiver: header_chain.views,
             header_runtime_status_receiver: header_chain.runtime_status,
             header_chain_reader_receiver: header_chain.reader,
         };
@@ -1275,6 +1285,13 @@ impl ReadStateService {
         &self,
     ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>> {
         self.header_chain_snapshot_receiver.clone()
+    }
+
+    /// Subscribe to atomic snapshots and body-work epochs after durable commits.
+    pub fn subscribe_header_chain_views(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>> {
+        self.header_chain_view_receiver.clone()
     }
 
     /// Subscribe to explicit durable header-runtime attachment and readiness state.
@@ -2913,6 +2930,7 @@ pub fn init_read_only(
         tokio::sync::watch::channel(VctRootRepairStatus::default());
     let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
         tokio::sync::watch::channel(None);
+    let (_header_chain_view_sender, header_chain_view_receiver) = tokio::sync::watch::channel(None);
     let (_header_runtime_status_sender, header_runtime_status_receiver) =
         tokio::sync::watch::channel(
             zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Detached {
@@ -2932,6 +2950,7 @@ pub fn init_read_only(
             vct_root_repair_receiver,
             HeaderChainSubscriptions {
                 snapshots: header_chain_snapshot_receiver,
+                views: header_chain_view_receiver,
                 runtime_status: header_runtime_status_receiver,
                 reader: header_chain_reader_receiver,
             },

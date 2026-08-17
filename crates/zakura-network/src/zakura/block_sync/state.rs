@@ -35,8 +35,9 @@ pub struct BlockSyncStartup {
     pub best_header_tip: (block::Height, block::Hash),
     /// Header-sync best-tip watch used as the moving body-download target.
     pub header_tip: Option<watch::Receiver<(block::Height, block::Hash)>>,
-    /// Atomic durable header-engine snapshots used to own body work.
-    pub committed_snapshots: Option<watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>>,
+    /// Atomic durable header-engine views used to own body work.
+    pub committed_views:
+        Option<watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>>,
     /// Local stream-6 configuration.
     pub config: ZakuraBlockSyncConfig,
     /// Shared shutdown signal owned by the embedding endpoint or test harness.
@@ -59,7 +60,7 @@ impl BlockSyncStartup {
             frontiers,
             best_header_tip,
             header_tip: Some(header_tip),
-            committed_snapshots: None,
+            committed_views: None,
             config,
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
@@ -68,17 +69,17 @@ impl BlockSyncStartup {
     }
 
     /// Build production block sync from the sole committed frontier publisher.
-    pub fn new_with_committed_snapshots(
+    pub fn new_with_committed_views(
         frontiers: BlockSyncFrontiers,
         best_header_tip: (block::Height, block::Hash),
-        committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        committed_views: watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>,
         config: ZakuraBlockSyncConfig,
     ) -> Self {
         Self {
             frontiers,
             best_header_tip,
             header_tip: None,
-            committed_snapshots: Some(committed_snapshots),
+            committed_views: Some(committed_views),
             config,
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
@@ -95,7 +96,7 @@ impl BlockSyncStartup {
             },
             best_header_tip: (block::Height::MIN, block::Hash([0; 32])),
             header_tip: None,
-            committed_snapshots: None,
+            committed_views: None,
             config,
             shutdown: CancellationToken::new(),
             state_queries_enabled: false,

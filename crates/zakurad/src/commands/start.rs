@@ -1587,6 +1587,7 @@ mod zakura_header_sync_driver_tests {
                     ),
                 },
                 verified_generation: zakura_header_chain::VerifiedGeneration::new(query_id),
+                body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
             },
         }
     }
@@ -1919,6 +1920,7 @@ mod zakura_header_sync_driver_tests {
                 ),
             },
             verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+            body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
         }
         .bind(
             1,
@@ -1955,7 +1957,7 @@ mod zakura_header_sync_driver_tests {
             header_tip,
             config,
         );
-        startup.committed_snapshots = Some(test_committed_snapshots(frontiers, best_header_tip));
+        startup.committed_views = Some(test_committed_views(frontiers, best_header_tip));
         startup
     }
 
@@ -1975,10 +1977,10 @@ mod zakura_header_sync_driver_tests {
         )
     }
 
-    fn test_committed_snapshots(
+    fn test_committed_views(
         frontiers: BlockSyncFrontiers,
         best_header_tip: (block::Height, block::Hash),
-    ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>> {
+    ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>> {
         let finalized = zakura_header_chain::Frontier::new(
             frontiers.finalized_height,
             frontiers.verified_block_hash,
@@ -1988,24 +1990,28 @@ mod zakura_header_sync_driver_tests {
             frontiers.verified_block_hash,
         );
         let header_best = zakura_header_chain::Frontier::new(best_header_tip.0, best_header_tip.1);
+        let snapshot = zakura_header_chain::EngineSnapshot {
+            mode: zakura_header_chain::EngineMode::Integrated,
+            state_version: zakura_header_chain::StateVersion::new(1),
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+            frontiers: zakura_header_chain::FrontierSet {
+                finalized,
+                header_best,
+                verified_best: verified,
+            },
+            header_best_score: zakura_header_chain::ChainScore::new(
+                zakura_header_chain::SuffixWork::zero(),
+                header_best.hash,
+            ),
+            oldest_retained_height: finalized.height,
+            alarms: Default::default(),
+        };
         let (snapshot_tx, snapshot_rx) =
-            tokio::sync::watch::channel(Some(zakura_header_chain::EngineSnapshot {
-                mode: zakura_header_chain::EngineMode::Integrated,
-                state_version: zakura_header_chain::StateVersion::new(1),
-                header_generation: zakura_header_chain::HeaderGeneration::new(1),
-                verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
-                frontiers: zakura_header_chain::FrontierSet {
-                    finalized,
-                    header_best,
-                    verified_best: verified,
-                },
-                header_best_score: zakura_header_chain::ChainScore::new(
-                    zakura_header_chain::SuffixWork::zero(),
-                    header_best.hash,
-                ),
-                oldest_retained_height: finalized.height,
-                alarms: Default::default(),
-            }));
+            tokio::sync::watch::channel(Some(zakura_header_chain::CommittedHeaderChainView::new(
+                snapshot,
+                zakura_header_chain::BodyWorkEpoch::default(),
+            )));
         drop(snapshot_tx);
         snapshot_rx
     }

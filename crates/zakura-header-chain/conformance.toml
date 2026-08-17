@@ -128,7 +128,7 @@ id = "LC-FRONTIER-04"
 name = "Durable frontier publication"
 status = "implemented"
 owner = "zakura_state::HeaderChainRuntime"
-tests = ["DG-03::every_crash_boundary_reopens_to_complete_transition", "AUD-15::committed_snapshots_are_the_sole_production_frontier_source", "DF-02::get_blockchain_info_response_with_an_arbitrary_chain_tip"]
+tests = ["DG-03::every_crash_boundary_reopens_to_complete_transition", "AUD-15::committed_views_are_the_sole_production_frontier_source", "DF-02::get_blockchain_info_response_with_an_arbitrary_chain_tip"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -177,7 +177,7 @@ status = "implemented"
 owner = "zakura_state::Publisher"
 tests = [
     "IN-05::state_is_only_frontier_publisher",
-    "AUD-15::committed_snapshots_are_the_sole_production_frontier_source",
+    "AUD-15::committed_views_are_the_sole_production_frontier_source",
 ]
 networks = ["mainnet", "testnet", "custom"]
 
@@ -540,8 +540,8 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-INT-05"
 name = "Owner-qualified freshness"
 status = "implemented"
-owner = "zakura_header_chain::transition::planner::derive_transition_plan"
-tests = ["DF-02::typed_header_authority_ignores_global_version_but_binds_branch_freshness", "DF-02::typed_body_authority_ignores_global_version_but_rejects_stale_generation", "IN-01::all_owner_mismatches_have_zero_effects"]
+owner = "zakura_header_chain::Gate::check + zakura_header_chain::Gate::check_body"
+tests = ["DF-02::typed_header_authority_ignores_global_version_but_binds_branch_freshness", "DF-02::typed_body_authority_ignores_global_version_but_rejects_stale_generation", "IN-01::all_owner_mismatches_have_zero_effects", "IN-05::compatible_body_completion_rebases_to_current_authority"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -581,7 +581,7 @@ id = "LC-BODY-02"
 name = "Consensus-invalid body feedback"
 status = "implemented"
 owner = "zakura_state::service::write::HeaderChainWriter::record_body_invalid"
-tests = ["IN-02::consensus_invalidity_persists_and_scores_only_exact_supplier", "IN-02::header_valid_body_invalidity_reselects_after_authenticated_evidence", "IN-02::reactor_scores_exact_supplier_for_commitment_matching_consensus_invalidity", "IN-02::body_apply_evidence_is_canonical_or_attempt_scoped_by_outcome_kind", "DF-02::full_state_failure_classes_match_header_engine_contract", "AUD-03::body_evidence_matrix_preserves_typed_effect_boundaries", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+tests = ["IN-02::body_invalid_after_header_extension_reaches_header_dag", "IN-02::header_valid_body_invalidity_reselects_after_authenticated_evidence", "IN-02::reactor_scores_exact_supplier_for_commitment_matching_consensus_invalidity", "IN-02::body_apply_evidence_is_canonical_or_attempt_scoped_by_outcome_kind", "DF-02::full_state_failure_classes_match_header_engine_contract", "AUD-03::body_evidence_matrix_preserves_typed_effect_boundaries", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -597,7 +597,7 @@ id = "LC-BODY-04"
 name = "Evidence-bound peer scoring"
 status = "implemented"
 owner = "zakura_header_chain::Attribution"
-tests = ["IN-02::supplier_evidence_attribution_matrix_distinguishes_header_body_and_advertiser", "IN-02::each_commitment_mismatch_scores_only_body_delivery", "IN-02::consensus_invalidity_persists_and_scores_only_exact_supplier", "IN-02::reactor_scores_exact_supplier_for_commitment_matching_consensus_invalidity", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "IN-02::unexpected_verifier_hash_is_retryable_without_supplier_blame"]
+tests = ["IN-02::supplier_evidence_attribution_matrix_distinguishes_header_body_and_advertiser", "IN-02::each_commitment_mismatch_scores_only_body_delivery", "IN-02::body_invalid_after_header_extension_reaches_header_dag", "IN-02::reactor_scores_exact_supplier_for_commitment_matching_consensus_invalidity", "PW-04::wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable", "IN-02::unexpected_verifier_hash_is_retryable_without_supplier_blame"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -645,7 +645,7 @@ id = "LC-WORK-01"
 name = "Generation-scoped forward work"
 status = "implemented"
 owner = "zakura_header_chain::HeaderWorkAuthority + zakura_header_chain::BodyWorkAuthority"
-tests = ["AUD-08::completed_target_is_scoped_to_exact_generation_and_branch", "IN-05::generation_or_anchor_change_retires_retry_work_before_reuse", "IN-05::generation_change_retires_unstarted_targets_before_new_scheduling", "AUD-06::committed_snapshot_retires_in_flight_state_results", "AUD-09::generation_change_retires_every_repair_state", "IN-05::generation_change_retires_served_path_before_late_page_completion", "IN-05::work_queue_separates_scopes_and_retires_obsolete_reservations", "IN-05::reactor_reset_mid_download_drops_stale_anchors_and_releases_budget", "IN-05::committed_reanchor_releases_stale_submitted_bodies", "IN-05::stale_retry_completion_releases_only_exact_infrastructure"]
+tests = ["AUD-08::completed_target_is_scoped_to_exact_generation_and_branch", "IN-05::generation_or_anchor_change_retires_retry_work_before_reuse", "IN-05::generation_change_retires_unstarted_targets_before_new_scheduling", "AUD-06::committed_snapshot_retires_in_flight_state_results", "AUD-09::generation_change_retires_every_repair_state", "IN-05::generation_change_retires_served_path_before_late_page_completion", "IN-05::work_queue_refreshes_queued_authority_and_preserves_registered_requests", "IN-05::reactor_reset_mid_download_drops_stale_anchors_and_releases_budget", "IN-05::committed_reanchor_releases_stale_submitted_bodies", "IN-05::stale_retry_completion_releases_only_exact_infrastructure", "IN-05::compatible_body_completion_rebases_to_current_authority"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

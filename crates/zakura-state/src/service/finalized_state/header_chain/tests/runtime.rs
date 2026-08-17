@@ -73,7 +73,7 @@ fn publisher_mirror_stays_absent_until_attachment_then_tracks_commits() {
 
     let mut committed = initial;
     committed.state_version = StateVersion::new(2);
-    publisher.publish(committed.clone());
+    publisher.publish(committed.clone(), TransitionEffect::none());
     assert_eq!(*mirror_receiver.borrow(), Some(committed));
 }
 

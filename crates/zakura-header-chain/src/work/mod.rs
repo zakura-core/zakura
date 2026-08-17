@@ -6,4 +6,6 @@ mod completion;
 pub use authority::{
     BodyWorkAuthority, BodyWorkOwner, HeaderSyncWorkOwner, HeaderWorkAuthority, HeaderWorkOwner,
 };
-pub use completion::{CompletionDecision, CompletionOwner, Gate, PendingOwners, StaleReason};
+pub use completion::{
+    BodyCompletionDecision, CompletionDecision, CompletionOwner, Gate, PendingOwners, StaleReason,
+};

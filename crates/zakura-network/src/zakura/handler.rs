@@ -552,6 +552,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
     /// Durable header snapshots.
     /// The watch value remains absent until semantic handoff succeeds.
     pub committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+    /// Atomic committed snapshots and body-work epochs.
+    pub committed_views: watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>,
     /// Coordinator-owned capability and ordered-service demand epochs.
     pub service_demand: watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
     /// VCT metadata repair needs published by the finalized writer.
@@ -3332,14 +3334,14 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let (block_sync, block_sync_actions, block_sync_task) =
         if let Some(driver_startup) = header_sync_driver_startup.as_ref() {
             let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
-            let mut startup = BlockSyncStartup::new_with_committed_snapshots(
+            let mut startup = BlockSyncStartup::new_with_committed_views(
                 BlockSyncFrontiers {
                     finalized_height: driver_startup.frontiers.finalized_height,
                     verified_block_tip: driver_startup.frontiers.verified_block_tip,
                     verified_block_hash: driver_startup.verified_block_tip_hash,
                 },
                 best_header_tip,
-                driver_startup.committed_snapshots.clone(),
+                driver_startup.committed_views.clone(),
                 config.zakura.block_sync.clone(),
             );
             startup.shutdown = header_sync_shutdown.clone();

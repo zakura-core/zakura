@@ -331,6 +331,22 @@ impl BodyRetryQueue {
             key.generation == generation && key.branch.anchor_hash == finalized_hash
         });
     }
+
+    /// Reauthorize every retained hash-specific episode under compatible authority.
+    pub fn refresh_scope(&mut self, generation: HeaderGeneration, branch: BranchId) {
+        let episodes: Vec<_> = self
+            .0
+            .drain()
+            .map(|(_, mut episode)| {
+                episode.generation = generation;
+                episode.branch = branch;
+                episode
+            })
+            .collect();
+        for episode in episodes {
+            self.insert(episode);
+        }
+    }
 }
 
 #[cfg(test)]

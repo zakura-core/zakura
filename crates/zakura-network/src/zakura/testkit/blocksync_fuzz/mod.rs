@@ -89,17 +89,21 @@ pub(crate) async fn run_scenario(
         zakura_header_chain::Frontier::new(initial_verified, initial_verified_hash),
         zakura_header_chain::Frontier::new(initial_header, initial_header_hash),
     );
-    let (snapshots, committed_snapshots) = watch::channel(Some(initial));
+    let (snapshots, committed_views) =
+        watch::channel(Some(zakura_header_chain::CommittedHeaderChainView::new(
+            initial,
+            zakura_header_chain::BodyWorkEpoch::default(),
+        )));
 
     let shutdown = CancellationToken::new();
-    let mut startup = crate::zakura::BlockSyncStartup::new_with_committed_snapshots(
+    let mut startup = crate::zakura::BlockSyncStartup::new_with_committed_views(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: initial_verified,
             verified_block_hash: initial_verified_hash,
         },
         (initial_header, initial_header_hash),
-        committed_snapshots,
+        committed_views,
         scenario.config.clone(),
     );
     startup.trace = trace.clone();
@@ -361,7 +365,7 @@ fn spawn_action_driver(
 
 /// Publishes the scenario's timed committed snapshots, driving the node's download target.
 fn spawn_timeline_driver(
-    snapshots: watch::Sender<Option<zakura_header_chain::EngineSnapshot>>,
+    snapshots: watch::Sender<Option<zakura_header_chain::CommittedHeaderChainView>>,
     corpus: SyntheticBlockCorpus,
     apply: MockApplyFrontier,
     mut timeline: Vec<TipEvent>,
@@ -383,10 +387,11 @@ fn spawn_timeline_driver(
             } else {
                 apply.frontiers()
             };
-            let mut current = snapshots
+            let current_view = snapshots
                 .borrow()
                 .clone()
                 .expect("the fuzz harness starts after semantic handoff");
+            let mut current = current_view.snapshot;
             current.state_version =
                 zakura_header_chain::StateVersion::new(current.state_version.get() + 1);
             current.frontiers.finalized = zakura_header_chain::Frontier::new(
@@ -398,8 +403,22 @@ fn spawn_timeline_driver(
                 apply_frontiers.verified_block_hash,
             );
             apply_tip_event(&corpus, &mut current, event.kind);
+            let body_work_epoch = if matches!(
+                event.kind,
+                TipEventKind::HeaderReanchor(_) | TipEventKind::VerifiedReset(_)
+            ) {
+                current_view
+                    .body_work_epoch
+                    .checked_next()
+                    .expect("the fuzz timeline cannot exhaust its body-work epoch")
+            } else {
+                current_view.body_work_epoch
+            };
             snapshots
-                .send(Some(current))
+                .send(Some(zakura_header_chain::CommittedHeaderChainView::new(
+                    current,
+                    body_work_epoch,
+                )))
                 .expect("the fuzz reactor keeps its committed-snapshot receiver");
         }
     })

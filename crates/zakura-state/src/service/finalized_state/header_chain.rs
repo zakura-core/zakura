@@ -455,11 +455,19 @@ fn load_transition_engine(
     .map_err(|_| HeaderChainStoreError::Incoherent("audited engine state is invalid"))
 }
 
+/// Return true when a recovered deferral is due, comparing every entry against one instant.
+fn any_deferral_is_due(plan: &zakura_header_chain::RecoveryPlan) -> bool {
+    let now = Utc::now();
+    plan.deferred_entries.iter().any(|(until, _)| *until <= now)
+}
+
 /// Reevaluate due recovered deferrals before constructing a publisher.
 ///
 /// The function uses the normal planner and durable commit path. It leaves the recovered engine
-/// unchanged when no deferral is due or the planner derives no change. On success, the returned
-/// engine matches the durable state that the caller may publish.
+/// unchanged when no deferral is due, when the planner derives no change, and when the planner
+/// fails: the runtime reevaluates deferrals again at the next deadline, so a planner failure must
+/// not keep the database closed. On success, the returned engine matches the durable state that
+/// the caller may publish.
 fn settle_deferred_before_publication(
     store: &HeaderChainStore,
     config: &EngineConfig,
@@ -476,12 +484,21 @@ fn settle_deferred_before_publication(
         full_state_authority: None,
         retention_references: &[],
     };
-    let transition = engine.plan_transition(
+    let transition = match engine.plan_transition(
         TransitionInput::ReevaluateDeferred {
             expected_version: before.state_version,
         },
         &context,
-    )?;
+    ) {
+        Ok(transition) => transition,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "startup left due deferrals unsettled; the runtime reevaluates them at the next deadline"
+            );
+            return Ok(engine);
+        }
+    };
     if transition.is_no_change() {
         return Ok(engine);
     }
@@ -2690,10 +2707,7 @@ impl HeaderChainStore {
             #[cfg(test)]
             fault(FaultPoint::AfterCommit)?;
         }
-        let has_due_deferred = plan
-            .deferred_entries
-            .iter()
-            .any(|(until, _)| *until <= Utc::now());
+        let has_due_deferred = any_deferral_is_due(&plan);
         let transition_engine =
             settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
@@ -2778,10 +2792,7 @@ impl HeaderChainStore {
         if !target.is_clean() {
             self.db.write(self.recovery_batch(&target)?)?;
         }
-        let has_due_deferred = target
-            .deferred_entries
-            .iter()
-            .any(|(until, _)| *until <= Utc::now());
+        let has_due_deferred = any_deferral_is_due(&target);
         let transition_engine =
             settle_deferred_before_publication(&self, integrated_config, has_due_deferred)?;
         let current = transition_engine.snapshot();
@@ -2859,10 +2870,7 @@ impl HeaderChainStore {
         if !final_audit.is_clean() {
             self.db.write(self.recovery_batch(&final_audit)?)?;
         }
-        let has_due_deferred = final_audit
-            .deferred_entries
-            .iter()
-            .any(|(until, _)| *until <= Utc::now());
+        let has_due_deferred = any_deferral_is_due(&final_audit);
         let transition_engine =
             settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
@@ -3078,10 +3086,7 @@ impl HeaderChainStore {
             self.db.write(self.recovery_batch(&final_audit)?)?;
         }
         self.clear_reconstruction_progress()?;
-        let has_due_deferred = final_audit
-            .deferred_entries
-            .iter()
-            .any(|(until, _)| *until <= Utc::now());
+        let has_due_deferred = any_deferral_is_due(&final_audit);
         let transition_engine =
             settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();

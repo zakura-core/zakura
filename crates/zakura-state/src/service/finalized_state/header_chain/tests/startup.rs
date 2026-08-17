@@ -1,7 +1,9 @@
 use super::*;
 
-#[test]
-fn startup_commits_deferred_reevaluation_before_publication() {
+/// Commit one header whose deferral has already elapsed, and return the closed database.
+fn commit_elapsed_deferral(
+    header_generation: HeaderGeneration,
+) -> (DiskDb, EngineConfig, Frontier) {
     #[derive(Copy, Clone)]
     struct FixedClock(DateTime<Utc>);
 
@@ -12,7 +14,8 @@ fn startup_commits_deferred_reevaluation_before_publication() {
     }
 
     let db_config = Config::ephemeral();
-    let (engine_config, anchor, metadata) = fixture();
+    let (engine_config, anchor, mut metadata) = fixture();
+    metadata.header_generation = header_generation;
     let db = open(&db_config, &engine_config.network);
     let store = HeaderChainStore::new(db.clone());
     store
@@ -82,6 +85,12 @@ fn startup_commits_deferred_reevaluation_before_publication() {
         Frontier::new(anchor.height, anchor.hash)
     );
     drop(runtime);
+    (db, engine_config, child)
+}
+
+#[test]
+fn startup_commits_deferred_reevaluation_before_publication() {
+    let (db, engine_config, child) = commit_elapsed_deferral(HeaderGeneration::new(1));
 
     let (reopened, report) = HeaderChainStore::new(db)
         .startup(&engine_config)
@@ -104,6 +113,40 @@ fn startup_commits_deferred_reevaluation_before_publication() {
             .deferred_entries()
             .expect("the deferred index is readable"),
         Vec::new()
+    );
+}
+
+#[test]
+fn startup_publishes_when_deferred_settlement_fails() {
+    // The insertion consumes the last header generation, so startup cannot plan the elapsed
+    // deferral. The runtime reevaluates it at the next deadline, so the database still opens.
+    let (db, engine_config, child) =
+        commit_elapsed_deferral(HeaderGeneration::new(u64::MAX.saturating_sub(1)));
+
+    let (reopened, report) = HeaderChainStore::new(db)
+        .startup(&engine_config)
+        .expect("an unsettled deferral does not keep the database closed");
+    assert!(report.repairs.is_empty());
+    assert_eq!(
+        report.current.frontiers.header_best,
+        reopened.publisher().snapshot().frontiers.header_best
+    );
+    assert!(matches!(
+        reopened
+            .store
+            .header_node(child.hash)
+            .expect("the child row is readable")
+            .expect("the child remains retained")
+            .validation,
+        HeaderValidationState::DeferredUntil(_)
+    ));
+    assert_eq!(
+        reopened
+            .store
+            .deferred_entries()
+            .expect("the deferred index is readable")
+            .len(),
+        1
     );
 }
 

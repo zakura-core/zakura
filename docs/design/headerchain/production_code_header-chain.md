@@ -5,6 +5,27 @@ This guide explains how PR #586 implements the
 Each linked property names the behavior that the code implements. The specification
 remains authoritative.
 
+## Engine modes
+
+[`EngineMode`](../../../crates/zakura-header-chain/src/config.rs) has two values. A
+deployment picks one, and the durable store records it. Startup fails closed when the
+configured mode disagrees with the stored mode.
+
+**Integrated** is the mode `zakurad` runs. Full state downloads and validates block
+bodies. Only that evidence advances the verified path and finality.
+
+**Headers-only** is the mode a deployment runs when it validates headers but never
+downloads bodies. It has no body evidence, so it has no verified path to advance and no
+proof to finalize with. It instead finalizes the selected header 1,000 blocks behind the
+tip. That depth rule is a local trust decision, not a consensus rule: an eclipsed node
+can pin the wrong branch, and it then rejects the real one. See
+[headers-only finality disclosure (`LC-SCOPE-08`)](../../specs/fork-aware-header-chain-engine.md#lc-scope-08).
+
+The mode changes two things: what advances the verified path, and what advances
+finality. The rest of this document applies to both. Migrating a headers-only store to
+integrated mode imports its pins as header trust anchors only, and the
+[migration guide](../../header-chain-v1.4-migration.md) covers that path.
+
 ## Single-planner fork choice
 
 Several inputs can change the selected header chain. New headers extend the DAG.
@@ -32,29 +53,66 @@ header tip. The verified path ends at the tip whose blocks full state has accept
 Each path is stored as an ordered list of frontiers, so readers can answer height queries
 without walking the graph.
 
-Integrated mode advances the verified path only when full state accepts blocks. In
-headers-only mode, the verified path contains only the finalized frontier.
+The two paths can end on different branches:
+
+```text
+finalized ── A ── B ── C          verified path (bodies already applied)
+              ╲
+               D ── E ── F        selected path (more work, headers only)
+```
+
+Header sync follows the selected path. Full state verifies bodies along that path, and
+the verified path advances behind it. In headers-only mode the verified path holds only
+the finalized frontier, because full state never verifies a body.
 
 A node is eligible when its header is valid, it has no direct exclusion reason, and its
-ancestors are eligible. The graph stores exclusion reasons instead of one boolean flag.
-This lets independent causes coexist and lets `reconsiderblock` remove one manual
-exclusion without removing a consensus-invalid body result.
+ancestors are eligible. The graph stores a set of
+[`EligibilityReason`](../../../crates/zakura-header-chain/src/graph/header_node.rs) values
+per node instead of one boolean flag:
+
+- `SettledUpgradeConflict`: the header contradicts a compiled settled-upgrade pin.
+- `CheckpointConflict`: the header contradicts an authenticated local checkpoint.
+- `FinalityConflict`: the header contradicts the current finality anchor.
+- `ConsensusBodyInvalid`: a full-state verifier proved that the body failed a consensus
+  rule.
+- `OperatorInvalid`: an `invalidateblock` call excluded the header.
+
+Only `OperatorInvalid` is reversible. A set lets independent causes coexist, so
+`reconsiderblock` removes one manual exclusion without removing a consensus-invalid body
+result that also excludes the same header.
 
 Selection takes the maximum score over all eligible tips. This implements
 [deterministic selection (`LC-SELECT-04`)](../../specs/fork-aware-header-chain-engine.md#lc-select-04):
 the same eligible DAG selects the same tip regardless of header arrival order.
 
-Integrated mode advances finality only from authenticated full-state evidence.
-Headers-only mode advances finality with a 1,000-block local depth rule. This local rule
-does not verify block bodies. When finality advances, the engine removes old ancestors
-and competing sibling subtrees. It rebases retained work onto the new root.
+When finality advances, the engine removes old ancestors and competing sibling subtrees.
+It rebases retained work onto the new root.
 
 ## Header admission and validation
 
 The header-sync driver prepares a downloaded batch before it takes the state writer
-lock. It obtains a validation lease for the common ancestor and checks properties that
-need no candidate ancestry, including encoding, proof of work, and commitment format.
-CPU-heavy checks run on a blocking thread.
+lock. It first asks state for a validation lease.
+
+A validation lease is the durable header context, sealed. `zakura-header-chain` performs
+no I/O, so it cannot read that context itself. State reads it once and hands it over as a
+[`ValidationLease`](../../../crates/zakura-header-chain/src/transition/types/preparation.rs):
+the exact parent frontier, up to 28 headers in reverse height order beginning with the
+parent, the network parameters, and a digest of the trust anchors, with one context
+digest binding all of it. Twenty-eight is the span that the difficulty and median-time
+rules need.
+
+The lease reserves nothing and blocks nobody. It is a consistency token, not a lock. The
+driver uses it to run contextual checks off the writer lock. The planner accepts it as a
+substitute for predecessor context that retention has already pruned from the graph, but
+only when the lease is internally consistent, meaning each fact hash-links to the next
+and the context digest recomputes, and when the state writer vouches for it through
+`authorizes_validation_lease`. A caller therefore cannot supply its own ancestry. A lease
+whose context has moved fails preparation as `InvalidLease`, and the caller prepares the
+batch again. The separate retained-path lease that the driver holds over a download range
+is a different mechanism with the same word in its name.
+
+The driver then checks properties that need no candidate ancestry, including encoding,
+proof of work, and commitment format. CPU-heavy checks run on a blocking thread.
 
 The full-block and checkpoint verifiers call the same context-free checks. This prevents
 an in-memory or locally constructed block from bypassing header-version and timestamp
@@ -76,8 +134,7 @@ staged graph. It admits a header only after every required check passes. This im
 [validation before admission (`LC-VAL-11`)](../../specs/fork-aware-header-chain-engine.md#lc-val-11).
 The engine calculates cumulative work with full 256-bit values and rejects cumulative
 overflow. Its difficulty calculation requires the complete predecessor window. It caps
-target scaling before multiplication can overflow. It reads Testnet's maximum-time
-activation height from network parameters.
+target scaling before multiplication can overflow.
 
 After planning,
 [`verify_candidate`](../../../crates/zakura-header-chain/src/transition/invariants/mod.rs)
@@ -92,6 +149,20 @@ and records staged changes without mutating it.
 [`HeaderChainEngine`](../../../crates/zakura-header-chain/src/transition/engine/mod.rs)
 extracts those changes as a `GraphDelta`. The runtime applies the delta to
 `MemHeaderStore` only after the durable write succeeds.
+
+The overlay exists because the engine cannot know whether the durable write will succeed.
+A single mutable in-memory graph would have to change before that write. Undoing a
+partial change after a RocksDB failure needs a second, inverse mutation path, and that
+path would run exactly when something has already gone wrong. Staging removes the
+problem. `MemHeaderStore` stays untouched until the write returns success, so a failed
+write leaves memory identical to what disk still holds. Recovery keeps what it has
+instead of rolling anything back.
+
+Staging also gives the engine a complete result to check before it commits anything.
+`verify_candidate` runs against the staged graph, so an invalid plan reaches neither disk
+nor memory. The extracted `GraphDelta` records the graph revision it was staged against,
+and `MemHeaderStore` rejects a delta whose base revision no longer matches. That check
+makes the gap between planning and installation safe.
 
 ```mermaid
 sequenceDiagram
@@ -262,10 +333,28 @@ work. It ignores `state_version` because unrelated transitions increment that co
 and would cancel valid requests. The scheduler uses the same branch and generation to
 retire stale work.
 
-The engine advances `header_generation` when a change makes header work stale. It
-advances `verified_generation` when a verified-path or finality change makes body-forward
-work stale. Prepared headers have a separate stale result when their durable validation
-context changes. The caller must prepare and validate those headers again.
+The engine keeps four monotonic counters in
+[`counters.rs`](../../../crates/zakura-header-chain/src/identity/counters.rs). Each one
+answers a different question about whether work is still current, and each fails closed
+at `u64::MAX` instead of wrapping.
+
+- `state_version` versions the complete durable header-chain state.
+- `header_generation` advances when a change makes selected-header work stale.
+- `verified_generation` advances when a verified-path or finality change makes
+  body-forward work stale.
+- `finality_epoch` counts irreversible finality advances.
+  `headers_only_migration_epoch` records the last epoch that a headers-only to integrated
+  migration imported, so the startup audit can separate imported trust pins from
+  full-state finality.
+
+Two more values answer the same question about position instead of time. `GraphRevision`
+identifies one committed in-memory graph, so a staged delta cannot apply to a graph that
+has moved underneath it. `WorkCoordinate` is cumulative work measured from an immutable
+origin, and finality rebases every retained coordinate onto the new root rather than
+advancing a counter.
+
+Prepared headers have a separate stale result when their durable validation context
+changes. The caller must prepare and validate those headers again.
 
 Finality can advance while a header request is active. The planner can remove an
 already-finalized prefix and bind the remaining headers to the new root. It rejects the

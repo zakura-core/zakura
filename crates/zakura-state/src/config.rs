@@ -156,18 +156,21 @@ pub struct Config {
     /// node already stores. Derived frontiers are cached, so a wallet scanning forward pays for
     /// one batch of replay per request rather than one sweep of the band.
     ///
-    /// The first request of a sweep can be expensive: it replays from the bottom of the band.
-    /// [`Self::max_historical_tree_replay_blocks`] bounds that cost. Replay reads block bodies, so
-    /// this has no effect in [`StorageMode::Pruned`].
+    /// Enabling this requires [`Self::historical_frontier_artifact`]: without a grid, a cold
+    /// request on a from-scratch snapshot replays the entire absent band. Startup fails closed
+    /// rather than serving that path. [`Self::max_historical_tree_replay_blocks`] then bounds
+    /// replay from the nearest grid entry. Replay reads block bodies, so this has no effect in
+    /// [`StorageMode::Pruned`].
     pub derive_historical_trees: bool,
 
     /// Path to a frontier artifact used to anchor historical tree derivation.
     ///
-    /// Set to `None` by default. The artifact holds note commitment frontiers at a sparse height
-    /// grid, so a cold request replays from the nearest grid entry instead of from genesis. Every
-    /// entry is checked against the authenticated root this node already stores before it is used,
-    /// so a corrupt or hostile artifact is rejected rather than absorbed, and the file needs no
-    /// trust of its own. Only consulted when [`Self::derive_historical_trees`] is set.
+    /// Set to `None` by default. Required when [`Self::derive_historical_trees`] is `true`:
+    /// startup refuses that pairing so a cold request cannot fall through to a full-band replay.
+    /// The artifact holds note commitment frontiers at a sparse height grid, so a cold request
+    /// replays from the nearest grid entry instead of from genesis. Every entry is checked against
+    /// the authenticated root this node already stores before it is used, so a corrupt or hostile
+    /// artifact is rejected rather than absorbed, and the file needs no trust of its own.
     ///
     /// Completed subtree roots need no equivalent setting: they ship embedded in the binary and
     /// are loaded without operator configuration.
@@ -328,6 +331,26 @@ impl Config {
                 )
                 .into());
             }
+        }
+
+        Ok(())
+    }
+
+    /// Validates historical tree derivation settings.
+    ///
+    /// Derivation without a frontier grid can replay the entire absent band on a from-scratch
+    /// snapshot, so [`Self::derive_historical_trees`] is refused unless
+    /// [`Self::historical_frontier_artifact`] is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when derivation is enabled and no artifact path is configured.
+    pub fn validate_historical_tree_derivation(&self) -> Result<(), BoxError> {
+        if self.derive_historical_trees && self.historical_frontier_artifact.is_none() {
+            return Err(
+                "state.derive_historical_trees = true requires state.historical_frontier_artifact"
+                    .into(),
+            );
         }
 
         Ok(())
@@ -548,6 +571,42 @@ mod tests {
         assert!(
             !serialized.contains("vct_fast_sync"),
             "vct_fast_sync is configured under [consensus], not [state]"
+        );
+    }
+
+    #[test]
+    fn derive_historical_trees_requires_frontier_artifact() {
+        assert!(
+            Config::default()
+                .validate_historical_tree_derivation()
+                .is_ok(),
+            "the default (derivation off, no artifact) must stay valid"
+        );
+
+        let derive_without_artifact = Config {
+            derive_historical_trees: true,
+            ..Config::default()
+        };
+        let error = derive_without_artifact
+            .validate_historical_tree_derivation()
+            .expect_err("derivation without an artifact must fail closed");
+        assert!(
+            error.to_string().contains(
+                "state.derive_historical_trees = true requires state.historical_frontier_artifact"
+            ),
+            "unexpected error: {error}"
+        );
+
+        let derive_with_artifact = Config {
+            derive_historical_trees: true,
+            historical_frontier_artifact: Some(PathBuf::from("/tmp/frontiers.bin")),
+            ..Config::default()
+        };
+        assert!(
+            derive_with_artifact
+                .validate_historical_tree_derivation()
+                .is_ok(),
+            "derivation with an artifact path configured must be accepted"
         );
     }
 }

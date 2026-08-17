@@ -265,7 +265,8 @@ pub struct ReadStateService {
     /// verified-commitment-trees fast-synced database's absent band.
     ///
     /// Shared across clones so a wallet's sequential scan anchors each request on the previous
-    /// one. Empty, and never written, unless `derive_historical_trees` is configured.
+    /// one. Empty, and never written, unless `derive_historical_trees` is configured with a
+    /// frontier artifact.
     historical_trees: Arc<Mutex<read::HistoricalTreeCache>>,
 
     /// Published completed subtree roots for heights below the last checkpoint.
@@ -1956,42 +1957,75 @@ fn subtrees_with_published_fallback<Node, Error>(
 
 /// Loads the configured frontier grid into a fresh derivation cache.
 ///
-/// A missing, unreadable, or invalid artifact is a warning rather than a startup failure. The grid
-/// carries no trust weight — every entry is root-checked before it anchors anything — so a node
-/// without one is not less correct, only slower on a cold request, and refusing to start over an
-/// optional optimization would be the wrong trade.
+/// When [`Config::derive_historical_trees`] is off, a missing, unreadable, or invalid artifact is
+/// a warning: the grid is unused. When derivation is on, the same failure is fatal. The grid
+/// carries no trust weight — every entry is root-checked before it anchors anything — but without
+/// one a cold request on a from-scratch snapshot replays the entire absent band, so serving
+/// refuses to start rather than take that path.
 fn load_historical_frontier_artifact(
     network: &Network,
     config: &Config,
 ) -> Arc<Mutex<read::HistoricalTreeCache>> {
-    let frontiers = config.historical_frontier_artifact.as_ref().and_then(
-        |path| match std::fs::read(path) {
-            Ok(bytes) => match finalized_state::FrontierArtifact::decode(&bytes, network) {
-                Ok(artifact) => {
-                    tracing::info!(
-                        ?path,
-                        entries = artifact.entries.len(),
-                        spacing = artifact.spacing,
-                        "loaded historical frontier artifact"
-                    );
-                    Some(Arc::new(artifact))
-                }
-                Err(error) => {
-                    tracing::warn!(?path, %error, "ignoring invalid historical frontier artifact");
-                    None
-                }
-            },
-            Err(error) => {
-                tracing::warn!(?path, %error, "cannot read historical frontier artifact");
-                None
-            }
-        },
-    );
+    let frontiers =
+        config
+            .historical_frontier_artifact
+            .as_ref()
+            .and_then(|path| match std::fs::read(path) {
+                Ok(bytes) => match finalized_state::FrontierArtifact::decode(&bytes, network) {
+                    Ok(artifact) => {
+                        tracing::info!(
+                            ?path,
+                            entries = artifact.entries.len(),
+                            spacing = artifact.spacing,
+                            "loaded historical frontier artifact"
+                        );
+                        Some(Arc::new(artifact))
+                    }
+                    Err(error) => fail_or_ignore_historical_frontier_artifact(
+                        config.derive_historical_trees,
+                        path,
+                        error,
+                    ),
+                },
+                Err(error) => fail_or_ignore_historical_frontier_artifact(
+                    config.derive_historical_trees,
+                    path,
+                    error,
+                ),
+            });
+
+    if config.derive_historical_trees {
+        let artifact = frontiers.expect(
+            "derive_historical_trees is true only together with a configured artifact path, \
+             and a configured path that fails to load already panicked",
+        );
+        return Arc::new(Mutex::new(read::HistoricalTreeCache::with_artifact(
+            artifact,
+        )));
+    }
 
     Arc::new(Mutex::new(match frontiers {
         Some(artifact) => read::HistoricalTreeCache::with_artifact(artifact),
         None => read::HistoricalTreeCache::default(),
     }))
+}
+
+/// Returns `None` after warning, or panics when derivation is enabled and the artifact is unusable.
+fn fail_or_ignore_historical_frontier_artifact(
+    derive_historical_trees: bool,
+    path: &std::path::Path,
+    error: impl std::fmt::Display,
+) -> Option<Arc<finalized_state::FrontierArtifact>> {
+    if derive_historical_trees {
+        panic!(
+            "state.derive_historical_trees = true but the historical frontier artifact at {} \
+             could not be loaded: {error}",
+            path.display()
+        );
+    }
+
+    tracing::warn!(?path, %error, "ignoring historical frontier artifact");
+    None
 }
 
 /// Derives the note commitment frontiers for `hash_or_height`, whose stored per-height trees are

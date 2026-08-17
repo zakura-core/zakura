@@ -2647,7 +2647,15 @@ impl HeaderChainStore {
     }
 
     pub(in crate::service) fn is_initialized(&self) -> Result<bool, HeaderChainStoreError> {
-        Ok(self.metadata_row()?.is_some())
+        match self.metadata_row() {
+            Ok(metadata) => Ok(metadata.is_some()),
+            // Service construction classifies the durable runtime before the block writer
+            // migrates released version-one rows to the current format.
+            Err(HeaderChainStoreError::Codec(HeaderChainValueError::UnsupportedDiskFormat(1))) => {
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Exhaustively audit, atomically repair reconstructible caches, then enable publication.

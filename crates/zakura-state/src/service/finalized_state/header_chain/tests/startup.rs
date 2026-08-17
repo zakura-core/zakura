@@ -99,6 +99,9 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
     store.db.write(batch).expect("the legacy fixture commits");
 
     assert!(store
+        .is_initialized()
+        .expect("released version-one metadata identifies an initialized store"));
+    assert!(store
         .migrate_v1_to_current(&engine_config)
         .expect("the version-one store migrates"));
     let migrated_metadata = store.metadata().expect("the metadata remains readable");

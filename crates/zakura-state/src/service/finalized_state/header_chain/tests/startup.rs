@@ -17,6 +17,45 @@ fn mark_metadata_as_v1(metadata: &EngineMetadata) -> Vec<u8> {
     bytes
 }
 
+fn v1_bounded_rule(rule: &str) -> Vec<u8> {
+    let rule_bytes = rule.as_bytes();
+    let mut bytes = Vec::with_capacity(4 + rule_bytes.len());
+    bytes.extend(
+        u32::try_from(rule_bytes.len())
+            .expect("fixture rule IDs fit u32")
+            .to_be_bytes(),
+    );
+    bytes.extend(rule_bytes);
+    bytes
+}
+
+fn v1_consensus_invalid_tombstone_bytes(
+    hash: block::Hash,
+    evidence: EvidenceId,
+    rule: &str,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(1);
+    bytes.extend(hash.0);
+    bytes.extend(evidence.digest());
+    bytes.extend(v1_bounded_rule(rule));
+    bytes
+}
+
+fn v1_consensus_invalid_authority_bytes(
+    hash: block::Hash,
+    evidence: EvidenceId,
+    rule: &str,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(1);
+    bytes.push(1);
+    bytes.extend(hash.0);
+    bytes.extend(evidence.digest());
+    bytes.extend(v1_bounded_rule(rule));
+    bytes
+}
+
 #[test]
 fn rocksdb_snapshot_stops_at_the_first_extra_row_without_decoding() {
     let db_config = Config::ephemeral();
@@ -227,6 +266,91 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
     assert!(!HeaderChainStore::new(db)
         .migrate_v1_to_current(&engine_config)
         .expect("reopening the migrated store is a no-op"));
+}
+
+#[test]
+fn version_one_migration_drops_pruned_consensus_invalid_rows() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    store
+        .initialize(metadata.clone(), anchor)
+        .expect("the current fixture initializes");
+
+    let pruned = block::Hash([0xab; 32]);
+    let evidence = EvidenceId::from_digest([0xcd; 32]);
+    let rule = "body-consensus-invalid";
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            mark_metadata_as_v1(&metadata),
+        )
+        .expect("the version-one metadata stages");
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+            pruned.0,
+            v1_consensus_invalid_tombstone_bytes(pruned, evidence, rule),
+        )
+        .expect("the version-one pruned tombstone stages");
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_BODY_EVIDENCE_AUTHORITY,
+            pruned.0,
+            v1_consensus_invalid_authority_bytes(pruned, evidence, rule),
+        )
+        .expect("the version-one pruned authority stages");
+    store
+        .delete_raw(&mut batch, HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
+        .expect("the version-one fixture omits the current tombstone count");
+    store
+        .delete_raw(&mut batch, HEADER_ENGINE_META, FINALITY_HISTORY_COUNT_KEY)
+        .expect("the version-one fixture omits the current finality count");
+    store
+        .db
+        .write(batch)
+        .expect("the pruned v1 fixture commits");
+
+    assert!(store
+        .header_node(pruned)
+        .expect("a missing pruned header is readable")
+        .is_none());
+    assert!(store
+        .migrate_v1_to_current(&engine_config)
+        .expect("the version-one store migrates without the pruned header node"));
+
+    let tombstone_cf = store
+        .cf(HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE)
+        .expect("the tombstone column family exists");
+    assert!(store
+        .db
+        .raw_get_cf(&tombstone_cf, &pruned.0)
+        .expect("the pruned tombstone family is readable")
+        .is_none());
+    let authority_cf = store
+        .cf(HEADER_BODY_EVIDENCE_AUTHORITY)
+        .expect("the body-evidence authority column family exists");
+    assert!(store
+        .db
+        .raw_get_cf(&authority_cf, &pruned.0)
+        .expect("the pruned authority family is readable")
+        .is_none());
+    assert_eq!(
+        store
+            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
+            .expect("the migrated tombstone count is readable"),
+        Some(HeaderRowCountDisk(0))
+    );
+
+    let (_, report) = store
+        .startup(&engine_config)
+        .expect("startup audits the store after dropping pruned v1 invalid-body rows");
+    assert!(report.publication_allowed);
 }
 
 #[test]

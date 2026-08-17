@@ -194,13 +194,13 @@ impl HeaderChainStore {
                 })?);
                 let authority = match value.first() {
                     Some(1) => {
-                        let height = self
-                            .header_node(hash)?
-                            .ok_or(HeaderChainStoreError::Incoherent(
-                                "version-one body-evidence authority has no header node",
-                            ))?
-                            .height;
-                        decode_v1_full_state_body_validation_evidence_authority(value, height)?
+                        // v1 omitted height. Pruned consensus-invalid headers keep authority
+                        // rows after the node is deleted, so there is no height to recover.
+                        let Some(node) = self.header_node(hash)? else {
+                            self.delete_raw(batch, HEADER_BODY_EVIDENCE_AUTHORITY, hash.0)?;
+                            return Ok(());
+                        };
+                        decode_v1_full_state_body_validation_evidence_authority(value, node.height)?
                     }
                     _ => FullStateBodyValidationEvidenceAuthorityDisk::decode(value)?,
                 };
@@ -296,13 +296,18 @@ impl HeaderChainStore {
                 })?);
                 let tombstone = match value.first() {
                     Some(1) => {
-                        let height = self
-                            .header_node(hash)?
-                            .ok_or(HeaderChainStoreError::Incoherent(
-                                "version-one consensus-invalid tombstone has no header node",
-                            ))?
-                            .height;
-                        decode_v1_consensus_invalid_body_tombstone(value, height)?
+                        // v1 omitted height. Tombstones are append-only evidence for pruned
+                        // headers, so a missing node is a legal v1 layout, not corruption.
+                        let Some(node) = self.header_node(hash)? else {
+                            self.delete_raw(
+                                batch,
+                                HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+                                hash.0,
+                            )?;
+                            tombstone_rows -= 1;
+                            return Ok(());
+                        };
+                        decode_v1_consensus_invalid_body_tombstone(value, node.height)?
                     }
                     _ => zakura_header_chain::ConsensusInvalidBodyTombstone::decode(value)?,
                 };

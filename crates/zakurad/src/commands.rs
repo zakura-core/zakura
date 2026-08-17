@@ -13,7 +13,7 @@ pub use self::{entry_point::EntryPoint, start::StartCmd};
 use self::{
     audit_historical_treestates::AuditHistoricalTreestatesCmd, copy_state::CopyStateCmd,
     generate::GenerateCmd, prune_state::PruneStateCmd, rollback_state::RollbackStateCmd,
-    tip_height::TipHeightCmd,
+    tip_height::TipHeightCmd, verify_historical_treestates::VerifyHistoricalTreestatesCmd,
 };
 
 pub mod start;
@@ -25,6 +25,7 @@ mod generate;
 pub mod prune_state;
 pub mod rollback_state;
 mod tip_height;
+mod verify_historical_treestates;
 
 #[cfg(test)]
 mod tests;
@@ -42,6 +43,9 @@ const LEGACY_CONFIG_FILE: &str = "zebrad.toml";
 pub enum ZakuradCmd {
     /// Audit historical note commitment treestate serving in the state database
     AuditHistoricalTreestates(AuditHistoricalTreestatesCmd),
+
+    /// Prove a historical subtree-root artifact against a note commitment frontier
+    VerifyHistoricalTreestates(VerifyHistoricalTreestatesCmd),
 
     /// The `copy-state` subcommand, used to debug cached chain state (expert users only)
     // TODO: hide this command from users in release builds (#3279)
@@ -80,7 +84,8 @@ impl ZakuradCmd {
             | Generate(_)
             | PruneState(_)
             | RollbackState(_)
-            | TipHeight(_) => false,
+            | TipHeight(_)
+            | VerifyHistoricalTreestates(_) => false,
         }
     }
 
@@ -99,7 +104,8 @@ impl ZakuradCmd {
             | Generate(_)
             | PruneState(_)
             | RollbackState(_)
-            | TipHeight(_) => false,
+            | TipHeight(_)
+            | VerifyHistoricalTreestates(_) => false,
         }
     }
 
@@ -122,7 +128,8 @@ impl ZakuradCmd {
             | Generate(_)
             | PruneState(_)
             | RollbackState(_)
-            | TipHeight(_) => true,
+            | TipHeight(_)
+            | VerifyHistoricalTreestates(_) => true,
 
             // Commands that generate informative logging output by default.
             CopyState(_) | Start(_) => false,
@@ -148,6 +155,7 @@ impl Runnable for ZakuradCmd {
             RollbackState(cmd) => cmd.run(),
             Start(cmd) => cmd.run(),
             TipHeight(cmd) => cmd.run(),
+            VerifyHistoricalTreestates(cmd) => cmd.run(),
         }
     }
 }

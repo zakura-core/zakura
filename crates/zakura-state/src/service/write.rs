@@ -509,6 +509,7 @@ impl HeaderChainWriter {
         let restored_path = verified_path(non_finalized_state);
         let restored_side_paths = verified_side_paths(non_finalized_state, &restored_path);
         let store = HeaderChainStore::new(finalized_state.db.header_chain_disk_db());
+        store.migrate_v1_to_current(&config)?;
         let runtime = if store.is_initialized()? {
             let persisted_finalized = store.snapshot()?.frontiers.finalized;
             let (full_state_height, full_state_hash) = finalized_state

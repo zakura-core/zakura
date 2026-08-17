@@ -19,7 +19,7 @@ on:
       - crates/**
       - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
       - .cargo/config.toml
       - .config/nextest.toml
       - rust-toolchain.toml

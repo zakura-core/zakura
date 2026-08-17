@@ -36,6 +36,7 @@ META_MAX_BYTES = 64 * 1024
 FILE_LIMITS = {
     "main-checkpoints.txt": 4 * 1024 * 1024,
     "mainnet-frontier.bin": 1 * 1024 * 1024,
+    "mainnet-treestate-subtrees.bin": 8 * 1024 * 1024,
 }
 LATEST_REQUIRED_KEYS = {
     "schema_version",
@@ -287,6 +288,7 @@ def _self_test() -> int:
     latest_url = f"https://{host}/release-state/latest.json"
     checkpoints = b"0 00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08\n"
     frontier = b"\x36\x3d\x33\x00frontier"
+    subtrees = b"subtree roots"
     now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
 
     def build(
@@ -295,6 +297,11 @@ def _self_test() -> int:
         latest_mutate: Callable[[dict[str, Any]], None] = lambda latest: None,
         file_overrides: dict[str, bytes] | None = None,
     ) -> dict[str, bytes]:
+        data_files = {
+            "main-checkpoints.txt": checkpoints,
+            "mainnet-frontier.bin": frontier,
+            "mainnet-treestate-subtrees.bin": subtrees,
+        }
         meta = {
             "schema_version": 1,
             "network": "Mainnet",
@@ -306,10 +313,7 @@ def _self_test() -> int:
                     "size": len(data),
                     "sha256": hashlib.sha256(data).hexdigest(),
                 }
-                for name, data in {
-                    "main-checkpoints.txt": checkpoints,
-                    "mainnet-frontier.bin": frontier,
-                }.items()
+                for name, data in data_files.items()
             },
         }
         meta_mutate(meta)
@@ -330,6 +334,7 @@ def _self_test() -> int:
             f"{base}meta.json": meta_bytes,
             f"{base}main-checkpoints.txt": checkpoints,
             f"{base}mainnet-frontier.bin": frontier,
+            f"{base}mainnet-treestate-subtrees.bin": subtrees,
         }
         responses.update(file_overrides or {})
         return responses
@@ -358,6 +363,17 @@ def _self_test() -> int:
         def test_happy_path(self):
             resolution = self.resolve(build())
             self.assertEqual(resolution["height"], 3415600)
+
+        def test_subtree_artifact_is_downloaded(self):
+            resolution = self.resolve(build())
+            self.assertEqual(resolution["height"], 3415600)
+
+        def test_missing_subtree_artifact_is_rejected(self):
+            def remove_subtrees(meta: dict[str, Any]) -> None:
+                del meta["files"]["mainnet-treestate-subtrees.bin"]
+
+            with self.assertRaisesRegex(BundleError, "missing keys"):
+                self.resolve(build(meta_mutate=remove_subtrees))
 
         def test_wrong_host_rejected(self):
             with self.assertRaisesRegex(BundleError, "host"):

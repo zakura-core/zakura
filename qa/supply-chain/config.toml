@@ -70,2557 +70,264 @@ audit-as-crates-io = false
 [policy.zakura-utils]
 audit-as-crates-io = false
 
-[[exemptions.abscissa_core]]
-version = "0.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.abscissa_derive]]
-version = "0.7.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.addr2line]]
 version = "0.21.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.aead]]
-version = "0.5.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.aes]]
-version = "0.8.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.ahash]]
-version = "0.8.12"
-criteria = "safe-to-deploy"
-
-[[exemptions.aho-corasick]]
-version = "1.1.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.anstream]]
-version = "1.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.anstyle]]
-version = "1.0.14"
-criteria = "safe-to-deploy"
-
-[[exemptions.anstyle-parse]]
-version = "1.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.anstyle-query]]
-version = "1.1.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.anstyle-wincon]]
-version = "3.0.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.arc-swap]]
-version = "1.9.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.arrayvec]]
-version = "0.7.8"
-criteria = "safe-to-deploy"
-
-[[exemptions.async-compat]]
-version = "0.2.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.async-compression]]
-version = "0.4.42"
-criteria = "safe-to-deploy"
-
-[[exemptions.async-trait]]
-version = "0.1.88"
 criteria = "safe-to-deploy"
 
 [[exemptions.async_io_stream]]
 version = "0.3.3"
 criteria = "safe-to-deploy"
-
-[[exemptions.atomic-polyfill]]
-version = "1.0.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.attohttpc]]
-version = "0.30.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.autocfg]]
-version = "1.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.aws-lc-rs]]
-version = "1.17.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.aws-lc-sys]]
-version = "0.42.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.axum]]
-version = "0.8.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.axum-core]]
-version = "0.5.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.backon]]
-version = "1.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.backtrace]]
-version = "0.3.76"
-criteria = "safe-to-deploy"
-
-[[exemptions.base16ct]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.base32]]
-version = "0.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.base64ct]]
-version = "1.8.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.bech32]]
-version = "0.11.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.bellman]]
-version = "0.14.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.bincode]]
-version = "1.3.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.bip32]]
-version = "0.6.0-pre.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.bitflags]]
-version = "2.13.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.bitflags-serde-legacy]]
-version = "0.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.bitvec]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.blake2b_simd]]
-version = "1.0.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.blake2s_simd]]
-version = "1.0.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.blake3]]
-version = "1.8.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.block-buffer]]
-version = "0.11.0-rc.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.bls12_381]]
-version = "0.8.0"
-criteria = "safe-to-deploy"
+notes = "Audit held: AsyncBufRead::poll_fill_buf accepts an empty chunk from the wrapped TryStream but leaves its internal state unset, then reaches unreachable!(). A valid empty stream item can therefore panic safe callers; retain this exemption pending an upstream fix or replacement."
 
 [[exemptions.bounded-integer]]
 version = "0.5.8"
 criteria = "safe-to-deploy"
-
-[[exemptions.bs58]]
-version = "0.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.btparse]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.byte-slice-cast]]
-version = "1.2.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.bytemuck]]
-version = "1.25.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.bytes]]
-version = "1.12.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.bzip2-sys]]
-version = "0.1.13+1.0.8"
-criteria = "safe-to-deploy"
-
-[[exemptions.camino]]
-version = "1.2.4"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the optional bytemuck1 feature implements unsafe Contiguous for every const MIN and MAX without enforcing MIN <= MAX. Bounded<5, 4> therefore violates Bytemuck's explicit inhabited-range contract. Zakura enables only the types feature, so this path is not currently deployed; retain the exemption pending an upstream bound or feature-scoped audit policy."
 
 [[exemptions.canonical-path]]
 version = "2.0.2"
 criteria = "safe-to-deploy"
-
-[[exemptions.cargo-platform]]
-version = "0.3.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.cargo_metadata]]
-version = "0.23.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.cbc]]
-version = "0.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.cc]]
-version = "1.2.66"
-criteria = "safe-to-deploy"
-
-[[exemptions.chacha20]]
-version = "0.9.1"
-criteria = "safe-to-deploy"
+notes = "Audit held: safe set_file_name and set_extension methods mutate the wrapped path without re-canonicalizing it, breaking the advertised canonical-path invariant; is_dir also delegates to is_file. A version-wide safe-to-deploy certification is deferred pending an upstream fix."
 
 [[exemptions.chacha20]]
 version = "0.10.1"
 criteria = "safe-to-deploy"
-
-[[exemptions.chacha20poly1305]]
-version = "0.10.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.chrono]]
-version = "0.4.45"
-criteria = "safe-to-deploy"
-
-[[exemptions.clang-sys]]
-version = "1.8.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.clap]]
-version = "4.6.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.clap_builder]]
-version = "4.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.clap_derive]]
-version = "4.6.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.clap_lex]]
-version = "1.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.cmake]]
-version = "0.1.58"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.color-backtrace]]
-version = "0.7.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.color-eyre]]
-version = "0.6.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.color-spantrace]]
-version = "0.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.colorchoice]]
-version = "1.0.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.combine]]
-version = "4.6.7"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.compression-codecs]]
-version = "0.4.38"
-criteria = "safe-to-deploy"
-
-[[exemptions.compression-core]]
-version = "0.4.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.config]]
-version = "0.15.25"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the public RNG get_block_pos method subtracts the four-block buffer width without wrapping. After set_block_pos(u64::MAX) followed by one generated word, the internal counter wraps to 3 and get_block_pos panics on 3 - 4 in debug builds. Reproduced with ChaCha20Rng; retain the exemption pending wrapping arithmetic or an upstream fix."
 
 [[exemptions.console]]
 version = "0.15.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.console]]
-version = "0.16.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.console-api]]
-version = "0.8.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.console-subscriber]]
 version = "0.4.1"
 criteria = "safe-to-deploy"
 
-[[exemptions.const-crc32-nostd]]
-version = "1.3.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.const-oid]]
-version = "0.9.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.const-random]]
-version = "0.1.18"
-criteria = "safe-to-deploy"
-
-[[exemptions.const-random-macro]]
-version = "0.1.16"
-criteria = "safe-to-deploy"
-
-[[exemptions.const_format]]
-version = "0.2.36"
-criteria = "safe-to-deploy"
-
-[[exemptions.const_format_proc_macros]]
-version = "0.2.34"
-criteria = "safe-to-deploy"
-
-[[exemptions.constant_time_eq]]
-version = "0.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.convert_case]]
-version = "0.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.convert_case]]
-version = "0.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.convert_case]]
-version = "0.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.cordyceps]]
-version = "0.3.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.core-foundation]]
-version = "0.10.1"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.corez]]
-version = "0.1.1"
-criteria = "safe-to-deploy"
-notes = "Replacement for the yanked core2 crate; pulled in transitively by librustzcash 2026-04 release wave."
-
-[[exemptions.cpufeatures]]
-version = "0.2.12"
-criteria = "safe-to-deploy"
-
-[[exemptions.crc]]
-version = "3.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.crc-catalog]]
-version = "2.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.crc32fast]]
-version = "1.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.criterion]]
-version = "0.5.1"
-criteria = "safe-to-run"
-
-[[exemptions.criterion-plot]]
-version = "0.5.0"
-criteria = "safe-to-run"
-
-[[exemptions.critical-section]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.crossbeam-channel]]
-version = "0.5.16"
-criteria = "safe-to-deploy"
-
-[[exemptions.crossbeam-deque]]
-version = "0.8.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.crossbeam-epoch]]
-version = "0.9.20"
-criteria = "safe-to-deploy"
-notes = "Security patch for RUSTSEC-2026-0204; diff reviewed from 0.9.18."
-
-[[exemptions.crossbeam-utils]]
-version = "0.8.22"
-criteria = "safe-to-deploy"
-
-[[exemptions.crypto-common]]
-version = "0.1.7"
-criteria = "safe-to-deploy"
-
 [[exemptions.crypto-common]]
 version = "0.2.0-rc.1"
 criteria = "safe-to-deploy"
+notes = "Audit deferred: hazmat::SerializableState uses an 8-byte element width for [u128; N], causing serialize() to panic; reproduced with [u128; 1]."
 
 [[exemptions.crypto_box]]
 version = "0.9.1"
 criteria = "safe-to-deploy"
-
-[[exemptions.crypto_secretbox]]
-version = "0.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.curve25519-dalek]]
-version = "4.1.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.curve25519-dalek-derive]]
-version = "0.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.darling]]
-version = "0.20.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.darling]]
-version = "0.23.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.darling_core]]
-version = "0.20.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.darling_core]]
-version = "0.23.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.darling_macro]]
-version = "0.20.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.darling_macro]]
-version = "0.23.0"
-criteria = "safe-to-deploy"
+notes = "Audit held: the high-level CryptoBox constructor accepts any 32-byte peer public key and derives a key without rejecting a non-contributory X25519 result. A low-order peer key can therefore produce a predictable all-zero shared secret; retain the exemption until the API enforces contributory behavior or clearly delegates that validation to callers."
 
 [[exemptions.data-encoding]]
 version = "2.11.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.der_derive]]
-version = "0.7.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.derive-getters]]
-version = "0.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.derive_builder]]
-version = "0.20.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.derive_builder_core]]
-version = "0.20.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.derive_builder_macro]]
-version = "0.20.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.derive_more]]
-version = "1.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.derive_more]]
-version = "2.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.derive_more-impl]]
-version = "1.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.derive_more-impl]]
-version = "2.1.1"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the doc-hidden Encoding tuple field and Encoding::internal_new are safe public APIs that accept arbitrary implementation bytes. A caller can safely supply non-ASCII symbols with an otherwise valid table shape, after which encode_mut_str and encode use unchecked UTF-8 construction. Retain the exemption pending upstream validation or an unsafe constructor boundary."
 
 [[exemptions.diatomic-waker]]
 version = "0.2.3"
 criteria = "safe-to-deploy"
-
-[[exemptions.digest]]
-version = "0.10.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.digest]]
-version = "0.11.0-pre.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.dirs]]
-version = "5.0.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.dirs-sys]]
-version = "0.4.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.dispatch2]]
-version = "0.3.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.displaydoc]]
-version = "0.2.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.dlopen2]]
-version = "0.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.dlv-list]]
-version = "0.5.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.documented]]
-version = "0.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.documented-macros]]
-version = "0.9.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.dyn-clone]]
-version = "1.0.19"
-criteria = "safe-to-deploy"
-
-[[exemptions.ed25519]]
-version = "2.2.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.ed25519-dalek]]
-version = "2.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.ed25519-zebra]]
-version = "4.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.encode_unicode]]
-version = "0.3.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.enum-as-inner]]
-version = "0.6.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.enumflags2]]
-version = "0.7.12"
-criteria = "safe-to-deploy"
-
-[[exemptions.enumflags2_derive]]
-version = "0.7.12"
-criteria = "safe-to-deploy"
-
-[[exemptions.env_logger]]
-version = "0.7.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.equihash]]
-version = "0.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.erased-serde]]
-version = "0.4.10"
-criteria = "safe-to-deploy"
-
-[[exemptions.eyre]]
-version = "0.6.12"
-criteria = "safe-to-deploy"
-
-[[exemptions.f4jumble]]
-version = "0.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.fastrand]]
-version = "2.4.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.ff]]
-version = "0.13.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.filetime]]
-version = "0.2.29"
-criteria = "safe-to-deploy"
-
-[[exemptions.find-msvc-tools]]
-version = "0.1.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.fixed-hash]]
-version = "0.8.0"
-criteria = "safe-to-deploy"
+notes = "Audit deferred: the safe single-sink wrappers preserve the documented exclusivity contract and ordinary tests pass, but the crate's core is a custom unsafe lock-free two-slot Waker state machine. Its published higher-bound Loom slot-reuse exploration did not complete within the batch review window; retain the exemption pending a dedicated concurrency review or completed model run."
 
 [[exemptions.fixedbitset]]
 version = "0.5.7"
 criteria = "safe-to-deploy"
-
-[[exemptions.flate2]]
-version = "1.1.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.flume]]
-version = "0.10.14"
-criteria = "safe-to-deploy"
-
-[[exemptions.fpe]]
-version = "0.6.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.frost-core]]
-version = "3.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.frost-rerandomized]]
-version = "3.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.fs-err]]
-version = "2.11.0"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the safe grow_and_insert(usize::MAX) path adds one without checked arithmetic. In release builds the length wraps to zero, grow does not allocate, and the method then performs an unchecked out-of-bounds write through get_unchecked_mut. Retain the exemption pending checked overflow handling before the raw write."
 
 [[exemptions.fs_extra]]
 version = "1.3.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.funty]]
-version = "2.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures-buffered]]
-version = "0.2.13"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures-channel]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures-core]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures-executor]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures-io]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures-lite]]
-version = "2.6.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures-macro]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures-sink]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures-task]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.futures-util]]
-version = "0.3.32"
-criteria = "safe-to-deploy"
-
-[[exemptions.generator]]
-version = "0.8.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.generic-array]]
-version = "0.14.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.getrandom]]
-version = "0.1.16"
-criteria = "safe-to-deploy"
-
-[[exemptions.getrandom]]
-version = "0.2.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.getrandom]]
-version = "0.2.17"
-criteria = "safe-to-deploy"
-
-[[exemptions.getrandom]]
-version = "0.4.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.getset]]
-version = "0.1.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.git2]]
-version = "0.20.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.gloo-timers]]
-version = "0.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.group]]
-version = "0.13.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.h2]]
-version = "0.4.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.half]]
-version = "2.7.1"
-criteria = "safe-to-run"
-
-[[exemptions.halo2_gadgets]]
-version = "0.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.halo2_legacy_pdqsort]]
-version = "0.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.halo2_poseidon]]
-version = "0.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.halo2_proofs]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
+notes = "Audit hold: recursive directory enumeration follows directory symlinks, and move_dir then moves and deletes files reached through them. A local reproduction with source/link pointing outside the source tree returned success, removed the external sentinel, and copied it under the destination. Retain the exemption until traversal uses symlink_metadata or otherwise confines moves to the requested tree."
 
 [[exemptions.hash32]]
 version = "0.2.1"
 criteria = "safe-to-deploy"
-
-[[exemptions.hashbrown]]
-version = "0.14.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.hashlink]]
-version = "0.11.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.hdrhistogram]]
-version = "7.5.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.heapless]]
-version = "0.7.17"
-criteria = "safe-to-deploy"
-
-[[exemptions.hermit-abi]]
-version = "0.3.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.hex-literal]]
-version = "0.4.1"
-criteria = "safe-to-deploy"
+notes = "Audit held: the safe default constructor for the public Murmur3 hasher creates its [u8; 4] buffer with deprecated mem::uninitialized, which is undefined behavior because integer bytes must be initialized even when the current index prevents an immediate read. Retain the exemption pending replacement with initialized storage or MaybeUninit with a proven initialization boundary."
 
 [[exemptions.hickory-proto]]
 version = "0.25.2"
 criteria = "safe-to-deploy"
-
-[[exemptions.hickory-resolver]]
-version = "0.25.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.hmac]]
-version = "0.13.0-pre.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.hmac-sha1]]
-version = "0.2.2"
-criteria = "safe-to-deploy"
+notes = "Audit hold: two RustSec advisories are open against this version and cargo audit reports both for this workspace. RUSTSEC-2026-0119 is CPU exhaustion during message encoding from O(n squared) name compression, fixed in 0.26.1; RUSTSEC-2026-0118 is an unbounded loop in NSEC3 closest-encloser proof validation on cross-zone responses, for which no fixed release is listed. Both are reachable from untrusted DNS responses. The crate reaches this tree through hickory-resolver under iroh and iroh-relay, so clearing the exemption means moving past the Iroh 0.92 pin to hickory 0.26 or later. Retain the exemption until then."
 
 [[exemptions.hmac-sha256]]
 version = "1.1.14"
 criteria = "safe-to-deploy"
-
-[[exemptions.home]]
-version = "0.5.12"
-criteria = "safe-to-deploy"
-
-[[exemptions.hostname]]
-version = "0.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.hostname-validator]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.howudoin]]
-version = "0.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.http]]
-version = "1.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.http-body-util]]
-version = "0.1.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.httparse]]
-version = "1.10.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.human_bytes]]
-version = "0.4.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.humantime]]
-version = "2.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.humantime-serde]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.hybrid-array]]
-version = "0.2.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.hyper]]
-version = "1.10.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.hyper-rustls]]
-version = "0.27.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.hyper-timeout]]
-version = "0.5.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.hyper-util]]
-version = "0.1.20"
-criteria = "safe-to-deploy"
-
-[[exemptions.iana-time-zone]]
-version = "0.1.65"
-criteria = "safe-to-deploy"
-
-[[exemptions.icu_collections]]
-version = "2.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.icu_locale_core]]
-version = "2.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.icu_normalizer]]
-version = "2.2.0"
-criteria = "safe-to-deploy"
+notes = "Audit held: HKDF::expand documents a maximum of 8160 output bytes, but rejects exactly 8160 and increments a u8 counter after the final block, which panics with overflow checks for supported lengths 8129 through 8159. A version-wide safe-to-deploy certification is deferred pending an upstream fix."
 
 [[exemptions.icu_normalizer_data]]
 version = "2.2.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.icu_properties]]
-version = "2.2.0"
-criteria = "safe-to-deploy"
+notes = "Audit held: the generated data package embeds 18 unsafe unchecked zerovec and ICU trie/list constructors across 7 opaque .rs.data files. Compilation checks syntax and types but does not establish the byte-layout invariants required by those constructors; retain the exemption pending generator provenance or independent blob validation."
 
 [[exemptions.icu_properties_data]]
 version = "2.2.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.icu_provider]]
-version = "2.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.idna_adapter]]
-version = "1.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.igd-next]]
-version = "0.16.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.impl-codec]]
-version = "0.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.impl-trait-for-tuples]]
-version = "0.2.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.incrementalmerkletree]]
-version = "0.8.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.indenter]]
-version = "0.3.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.indexmap]]
-version = "1.9.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.indexmap]]
-version = "2.14.0"
-criteria = "safe-to-deploy"
+notes = "Audit held: the generated data package embeds 249 unsafe unchecked zerovec and ICU trie/list constructors across 137 opaque .rs.data files. Compilation checks syntax and types but does not establish the byte-layout invariants required by those constructors; retain the exemption pending generator provenance or independent blob validation."
 
 [[exemptions.indicatif]]
 version = "0.17.11"
 criteria = "safe-to-deploy"
 
-[[exemptions.inferno]]
-version = "0.12.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.insta]]
-version = "1.48.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.ipconfig]]
-version = "0.3.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.ipnet]]
-version = "2.12.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.iroh]]
-version = "0.92.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.iroh-base]]
-version = "0.92.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.iroh-metrics]]
 version = "0.35.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.iroh-metrics-derive]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.iroh-quinn]]
-version = "0.14.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.iroh-quinn-proto]]
-version = "0.13.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.iroh-quinn-udp]]
-version = "0.5.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.iroh-relay]]
-version = "0.92.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.is-terminal]]
-version = "0.4.16"
-criteria = "safe-to-run"
-
-[[exemptions.is_terminal_polyfill]]
-version = "1.70.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.itertools]]
-version = "0.10.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.itertools]]
-version = "0.13.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.itoa]]
-version = "1.0.18"
-criteria = "safe-to-deploy"
-
-[[exemptions.jni]]
-version = "0.22.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.jni-macros]]
-version = "0.22.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.jni-sys]]
-version = "0.4.1"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.jni-sys-macros]]
-version = "0.4.1"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.jobserver]]
-version = "0.1.35"
-criteria = "safe-to-deploy"
-
-[[exemptions.js-sys]]
-version = "0.3.103"
-criteria = "safe-to-deploy"
-
-[[exemptions.json5]]
-version = "0.4.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.jsonrpsee]]
-version = "0.24.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.jsonrpsee-core]]
-version = "0.24.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.jsonrpsee-proc-macros]]
-version = "0.24.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.jsonrpsee-server]]
-version = "0.24.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.jsonrpsee-types]]
-version = "0.24.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.jubjub]]
-version = "0.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.known-folders]]
-version = "1.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.konst]]
-version = "0.2.20"
-criteria = "safe-to-deploy"
-
-[[exemptions.konst_macro_rules]]
-version = "0.2.19"
-criteria = "safe-to-deploy"
-
-[[exemptions.libc]]
-version = "0.2.186"
-criteria = "safe-to-deploy"
-
-[[exemptions.libgit2-sys]]
-version = "0.18.5+1.9.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.libloading]]
-version = "0.8.9"
-criteria = "safe-to-deploy"
+notes = "Audit held: start_metrics_exporter unwraps reading the body of any non-success response from the remote exporter endpoint. A network/body read failure can therefore panic the exporter task; retain the exemption pending fallible error propagation."
 
 [[exemptions.libm]]
 version = "0.2.16"
 criteria = "safe-to-deploy"
+notes = "Audit hold: the internal u256 Shr masks the shift amount instead of saturating, so with debug assertions off, u256::MAX >> 256 evaluates to u256::MAX rather than zero. The crate's own release-mode test asserts zero and fails, reproduced here: cargo test --lib passes 115 tests in debug, where the debug_assert turns the over-shift into the expected panic, and fails shr_u256_overflow in release with 114 passing. Every in-crate caller is expected to keep the shift below the width, which is what the debug assertion encodes, so this is a wrong value in an internal helper rather than a memory-safety problem. Retain the exemption pending an upstream fix or a check that no caller can over-shift."
 
 [[exemptions.libredox]]
 version = "0.1.18"
 criteria = "safe-to-deploy"
-
-[[exemptions.librocksdb-sys]]
-version = "0.17.3+10.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.libz-sys]]
-version = "1.1.29"
-criteria = "safe-to-deploy"
-
-[[exemptions.libzcash_script]]
-version = "0.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.linux-raw-sys]]
-version = "0.12.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.litemap]]
-version = "0.8.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.litrs]]
-version = "1.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.lock_api]]
-version = "0.4.14"
-criteria = "safe-to-deploy"
-
-[[exemptions.log]]
-version = "0.4.33"
-criteria = "safe-to-deploy"
-
-[[exemptions.loom]]
-version = "0.7.2"
-criteria = "safe-to-deploy"
+notes = "Audit hold: Fd::new is a safe public ownership constructor for an arbitrary raw descriptor, while Drop always closes it. Safe code can construct duplicate owners for one descriptor and, after descriptor reuse, close an unrelated resource. Retain the exemption until raw ownership construction is unsafe or uses a borrowing or duplication model."
 
 [[exemptions.lru]]
 version = "0.13.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.lru-slab]]
-version = "0.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.lz4-sys]]
-version = "1.11.1+lz4-1.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.matchit]]
-version = "0.8.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.md5]]
-version = "0.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.memchr]]
-version = "2.8.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.memuse]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.metrics]]
-version = "0.24.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.metrics-exporter-prometheus]]
-version = "0.16.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.metrics-util]]
-version = "0.19.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.mime]]
-version = "0.3.17"
-criteria = "safe-to-deploy"
-
-[[exemptions.minimal-lexical]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.mio]]
-version = "1.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.moka]]
-version = "0.12.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.mset]]
-version = "0.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.multimap]]
-version = "0.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.n0-future]]
-version = "0.1.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.n0-snafu]]
-version = "0.2.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.n0-watcher]]
-version = "0.3.0"
-criteria = "safe-to-deploy"
+notes = "Audit hold: two RustSec advisories are open against this version and cargo audit reports both for this workspace. RUSTSEC-2026-0253 is a potential use-after-free from the lack of panic safety in LruCache::pop, and RUSTSEC-2026-0002 is an IterMut Stacked Borrows violation that invalidates an internal pointer. Both are classified unsound rather than exploitable, and the crate reaches this tree only through pkarr and iroh-relay, so clearing the exemption means moving past the Iroh 0.92 pin or an upstream release. Retain the exemption until then."
 
 [[exemptions.nanorand]]
 version = "0.7.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.nested_enum_utils]]
-version = "0.2.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.netdev]]
-version = "0.36.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.netdev]]
-version = "0.37.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.netlink-packet-core]]
-version = "0.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.netlink-packet-route]]
-version = "0.22.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.netlink-packet-route]]
-version = "0.24.0"
-criteria = "safe-to-deploy"
+notes = "Audit held: without the optional getrandom dependency, constructors ignore the success result from direct system-entropy calls; Linux also treats a short getrandom read as success, and Windows reports RtlGenRandom success as false. The public rdseed helper additionally writes full eight-byte chunks into arbitrary output lengths and can panic on a non-multiple-of-eight slice. Zakura currently enables the getrandom feature, but retain the version-wide exemption pending upstream fixes."
 
 [[exemptions.netlink-packet-utils]]
 version = "0.5.2"
 criteria = "safe-to-deploy"
+notes = "Audit held: the public Nla trait permits value_len values above u16::MAX, but Emitable truncates value_len to u16 before constructing the value slice. A large safe custom Nla can therefore panic during emit or produce a truncated header; retain this exemption pending an enforced length bound."
 
 [[exemptions.netlink-proto]]
 version = "0.11.5"
 criteria = "safe-to-deploy"
+notes = "Audit hold: Connection::forward_responses calls unimplemented! for a NetlinkPayload::Overrun response. The kernel can legitimately report an overrun when messages are lost, so valid external input can panic the connection future. Retain the exemption pending fallible handling or forwarding of overrun messages."
 
 [[exemptions.netlink-sys]]
 version = "0.8.8"
 criteria = "safe-to-deploy"
-
-[[exemptions.netwatch]]
-version = "0.9.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.nix]]
-version = "0.31.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.no-std-net]]
-version = "0.6.0"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the public Socket derives Clone over a bare owned RawFd while every clone closes that descriptor in Drop. Safe cloning can therefore double-close the descriptor and, after descriptor reuse, close an unrelated resource. Retain the exemption pending a dup-based Clone implementation, shared ownership, or removal of Clone."
 
 [[exemptions.ntimestamp]]
 version = "1.0.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.num-bigint]]
-version = "0.4.8"
-criteria = "safe-to-deploy"
-
-[[exemptions.num-conv]]
-version = "0.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.num-format]]
-version = "0.4.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.num_cpus]]
-version = "1.16.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.num_enum]]
-version = "0.7.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.num_enum_derive]]
-version = "0.7.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.num_threads]]
-version = "0.1.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.objc2]]
-version = "0.6.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.objc2-cloud-kit]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.objc2-core-data]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.objc2-core-image]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.objc2-core-location]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.objc2-core-text]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.objc2-ui-kit]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.objc2-user-notifications]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
+notes = "Audit held: with the base32 feature disabled, TryFrom<String> slices malformed input and can panic instead of returning InvalidEncoding. Zakura currently enables base32 through pkarr, but a version-wide safe-to-deploy certification is deferred pending an upstream fix."
 
 [[exemptions.object]]
 version = "0.36.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.once_cell]]
-version = "1.19.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.once_cell_polyfill]]
-version = "1.70.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.openrpsee]]
-version = "0.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.openssl-probe]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.opentelemetry]]
-version = "0.31.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.opentelemetry-http]]
-version = "0.31.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.opentelemetry-otlp]]
-version = "0.31.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.opentelemetry-proto]]
-version = "0.31.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.opentelemetry_sdk]]
-version = "0.31.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.optfield]]
-version = "0.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.orchard]]
-version = "0.15.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.ordered-map]]
-version = "0.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.ordered-multimap]]
-version = "0.7.3"
-criteria = "safe-to-deploy"
-
 [[exemptions.os_info]]
 version = "3.15.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.owo-colors]]
-version = "4.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.pairing]]
-version = "0.23.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.parity-scale-codec]]
-version = "3.7.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.parity-scale-codec-derive]]
-version = "3.7.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.parking_lot]]
-version = "0.12.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.parking_lot_core]]
-version = "0.9.12"
-criteria = "safe-to-deploy"
-
-[[exemptions.pasta_curves]]
-version = "0.5.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.paste]]
-version = "1.0.10"
-criteria = "safe-to-deploy"
-
-[[exemptions.pathdiff]]
-version = "0.2.3"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the Windows get_proc_address helper wraps GetProcAddress's nullable FARPROC in another Some, so a missing optional API is treated as present and then transmuted from a null Option<fn> into a non-null callable function pointer. Safe os_info::get() can therefore reach undefined behavior on affected Windows versions. Retain the exemption until the inner FARPROC is flattened and checked."
 
 [[exemptions.pest]]
 version = "2.8.7"
 criteria = "safe-to-deploy"
+notes = "Audit hold: an empty-stack PEEK_ALL succeeds without consuming input, while ParserState::repeat checks its call limit only before entering the loop. A grammar such as PEEK_ALL* can therefore hang indefinitely. Retain the exemption pending a runtime progress guard or complete grammar validation."
 
 [[exemptions.pest_derive]]
 version = "2.8.7"
 criteria = "safe-to-deploy"
+notes = "Audit hold: the derive stack accepts repetitions around empty-stack PEEK_ALL and emits a runtime parser loop that never consumes input or reaches the call limit. Retain the exemption pending a fix in pest and pest_meta."
 
 [[exemptions.pest_generator]]
 version = "2.8.7"
 criteria = "safe-to-deploy"
+notes = "Audit hold: code generation can emit ParserState::repeat around PEEK_ALL after pest_meta misclassifies that empty-stack operation as progressing, producing an unbounded runtime loop. Retain the exemption pending upstream validation or a runtime progress guard."
 
 [[exemptions.pest_meta]]
 version = "2.8.7"
 criteria = "safe-to-deploy"
-
-[[exemptions.petgraph]]
-version = "0.8.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.pharos]]
-version = "0.5.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.phf]]
-version = "0.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.phf_generator]]
-version = "0.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.phf_macros]]
-version = "0.12.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.phf_shared]]
-version = "0.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.pin-project]]
-version = "1.1.13"
-criteria = "safe-to-deploy"
-
-[[exemptions.pin-project-internal]]
-version = "1.1.13"
-criteria = "safe-to-deploy"
-
-[[exemptions.pin-project-lite]]
-version = "0.2.17"
-criteria = "safe-to-deploy"
-
-[[exemptions.pkarr]]
-version = "3.10.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.pkcs8]]
-version = "0.10.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.pkg-config]]
-version = "0.3.33"
-criteria = "safe-to-deploy"
-
-[[exemptions.plotters]]
-version = "0.3.7"
-criteria = "safe-to-run"
-
-[[exemptions.plotters-backend]]
-version = "0.3.7"
-criteria = "safe-to-run"
-
-[[exemptions.plotters-svg]]
-version = "0.3.7"
-criteria = "safe-to-run"
-
-[[exemptions.pnet_base]]
-version = "0.34.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.pnet_macros]]
-version = "0.34.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.pnet_macros_support]]
-version = "0.34.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.pnet_packet]]
-version = "0.34.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.poly1305]]
-version = "0.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.portable-atomic]]
-version = "1.13.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.portmapper]]
-version = "0.9.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.postcard-derive]]
-version = "0.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.potential_utf]]
-version = "0.1.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.ppv-lite86]]
-version = "0.2.21"
-criteria = "safe-to-deploy"
-
-[[exemptions.precis-core]]
-version = "0.1.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.precis-profiles]]
-version = "0.1.13"
-criteria = "safe-to-deploy"
-
-[[exemptions.precis-tools]]
-version = "0.1.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.prettyplease]]
-version = "0.2.37"
-criteria = "safe-to-deploy"
-
-[[exemptions.primitive-types]]
-version = "0.12.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.proc-macro-crate]]
-version = "3.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.proptest]]
-version = "1.11.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.proptest-derive]]
-version = "0.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.prost]]
-version = "0.14.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.prost-build]]
-version = "0.14.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.prost-derive]]
-version = "0.14.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.prost-types]]
-version = "0.14.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.pulldown-cmark]]
-version = "0.13.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.pulldown-cmark-to-cmark]]
-version = "22.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.quanta]]
-version = "0.12.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.quick-error]]
-version = "1.2.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.quick-xml]]
-version = "0.41.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.quickcheck]]
-version = "0.9.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.quickcheck_macros]]
-version = "0.9.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.quinn]]
-version = "0.11.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.quinn-proto]]
-version = "0.11.16"
-criteria = "safe-to-deploy"
-
-[[exemptions.quinn-udp]]
-version = "0.5.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.quote]]
-version = "1.0.46"
-criteria = "safe-to-deploy"
-
-[[exemptions.quoted-string-parser]]
-version = "0.1.0"
-criteria = "safe-to-deploy"
+notes = "Audit hold: validator.rs explicitly notes that empty-stack PEEK_ALL is non-progressing but classifies it as progressing. Repetitions such as PEEK_ALL* can pass validation and generate a parser that hangs indefinitely. Retain the exemption pending complete progress analysis."
 
 [[exemptions.r-efi]]
 version = "5.2.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.r-efi]]
-version = "6.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.radium]]
-version = "0.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand]]
-version = "0.7.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand]]
-version = "0.10.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_chacha]]
-version = "0.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_core]]
-version = "0.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_core]]
-version = "0.10.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_hc]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_pcg]]
-version = "0.10.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.rand_xoshiro]]
-version = "0.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.rapidhash]]
-version = "4.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.raw-cpuid]]
-version = "11.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.rayon]]
-version = "1.12.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.reddsa]]
-version = "0.5.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.redox_syscall]]
-version = "0.5.18"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the UEFI protocol tables expose firmware operations that accept and dereference raw pointers as safe extern function pointers. Safe Rust can therefore invoke them with invalid pointers; version 6.0.0 corrected this by making every firmware callback unsafe. Retain the 5.2.0 exemption until its dependents upgrade."
 
 [[exemptions.redox_users]]
 version = "0.4.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.ref-cast]]
-version = "1.0.25"
-criteria = "safe-to-deploy"
-
-[[exemptions.ref-cast-impl]]
-version = "1.0.25"
-criteria = "safe-to-deploy"
-
-[[exemptions.regex]]
-version = "1.13.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.regex-automata]]
-version = "0.4.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.regex-lite]]
-version = "0.1.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.regex-syntax]]
-version = "0.8.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.reqwest]]
-version = "0.12.28"
-criteria = "safe-to-deploy"
-
-[[exemptions.reqwest]]
-version = "0.13.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.resolv-conf]]
-version = "0.7.6"
-criteria = "safe-to-deploy"
-
 [[exemptions.rgb]]
 version = "0.8.53"
 criteria = "safe-to-deploy"
-
-[[exemptions.ring]]
-version = "0.17.14"
-criteria = "safe-to-deploy"
-
-[[exemptions.ripemd]]
-version = "0.1.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.ripemd]]
-version = "0.2.0-pre.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.rlimit]]
-version = "0.10.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.rocksdb]]
-version = "0.24.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.ron]]
-version = "0.12.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.route-recognizer]]
-version = "0.3.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.rust-ini]]
-version = "0.21.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustc-demangle]]
-version = "0.1.28"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustc-hash]]
-version = "2.1.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustc-hex]]
-version = "2.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustix]]
-version = "1.1.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustls]]
-version = "0.23.41"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustls-native-certs]]
-version = "0.8.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustls-pemfile]]
-version = "2.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustls-pki-types]]
-version = "1.15.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustls-platform-verifier]]
-version = "0.7.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.rustls-platform-verifier-android]]
-version = "0.1.1"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.rustls-webpki]]
-version = "0.103.13"
-criteria = "safe-to-deploy"
-
-[[exemptions.rustversion]]
-version = "1.0.23"
-criteria = "safe-to-deploy"
-
-[[exemptions.rusty-fork]]
-version = "0.3.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.ryu]]
-version = "1.0.23"
-criteria = "safe-to-deploy"
-
-[[exemptions.salsa20]]
-version = "0.10.2"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the default as-bytes feature explicitly provides unsound Pod implementations for mixed-component RGBA, BGRA, ARGB, ABGR, and GrayAlpha types. repr(C) may insert padding between independently chosen Pod component types, but the Pod contract permits that padding to be read as bytes. Retain the exemption until those implementations are removed or constrained to padding-free layouts."
 
 [[exemptions.same-file]]
 version = "1.0.6"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.sapling-crypto]]
-version = "0.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.schannel]]
-version = "0.1.29"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.schemars]]
-version = "1.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.schemars_derive]]
-version = "1.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.scoped-tls]]
-version = "1.0.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.scopeguard]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.secp256k1]]
-version = "0.29.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.secp256k1-sys]]
-version = "0.10.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.secrecy]]
-version = "0.8.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.security-framework]]
-version = "3.7.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.security-framework-sys]]
-version = "2.17.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
+notes = "Sentry 0.47 upgrade. Audit held: on Unix, IntoRawFd for a standard-stream Handle removes the File and then Drop unconditionally unwraps the now-empty Option, so the safe consuming conversion panics. A version-wide safe-to-deploy certification is deferred pending an upstream fix."
 
 [[exemptions.self_cell]]
 version = "1.2.2"
 criteria = "safe-to-deploy"
-
-[[exemptions.semver]]
-version = "1.0.28"
-criteria = "safe-to-deploy"
-
-[[exemptions.send_wrapper]]
-version = "0.6.0"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the optional old_rust feature deliberately uses a pre-1.51 field-pointer projection that the crate documents as technically undefined behavior. Zakura's MSRV does not execute that branch, but retain the version-wide exemption until the legacy UB path is removed or excluded by feature-scoped policy."
 
 [[exemptions.sentry]]
 version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.sentry-backtrace]]
-version = "0.47.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.sentry-contexts]]
-version = "0.47.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
+notes = "Audit hold: the Retry-After and X-Sentry-Rate-Limits parsers accept unbounded floating-point seconds, cast values such as 1e300 to u64::MAX, and add that duration to SystemTime with panicking arithmetic. Both remote-header paths were reproduced panicking the transport code. Retain the exemption pending finite bounded parsing and checked time addition."
 
 [[exemptions.sentry-core]]
 version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.sentry-log]]
-version = "0.47.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.sentry-tracing]]
-version = "0.47.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
+notes = "Audit hold: on non-main threads, safe Hub::with exposes &Arc<Hub> from a thread-local UnsafeCell while safe HubSwitchGuard::new can mutably swap that same Arc before the callback borrow ends. This permits overlapping shared and mutable access to the Arc storage. Retain the exemption pending a cloned callback value or another design that prevents mutation during the shared borrow."
 
 [[exemptions.sentry-types]]
 version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.serde-big-array]]
-version = "0.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde-untagged]]
-version = "0.1.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_bytes]]
-version = "0.11.19"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_derive_internals]]
-version = "0.29.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_json]]
-version = "1.0.150"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_spanned]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_urlencoded]]
-version = "0.7.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_with]]
-version = "3.21.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.serde_with_macros]]
-version = "3.21.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.serdect]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.sha1]]
-version = "0.10.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.sha2]]
-version = "0.11.0-pre.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.shlex]]
-version = "2.0.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.signal-hook-registry]]
-version = "1.4.8"
-criteria = "safe-to-deploy"
-
-[[exemptions.simd-adler32]]
-version = "0.3.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.simd_cesu8]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.simdutf8]]
-version = "0.1.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.simple-dns]]
-version = "0.9.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.sinsemilla]]
-version = "0.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.siphasher]]
-version = "1.0.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.sketches-ddsketch]]
-version = "0.3.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.slab]]
-version = "0.4.12"
-criteria = "safe-to-deploy"
-
-[[exemptions.snafu]]
-version = "0.8.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.snafu-derive]]
-version = "0.8.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.socket2]]
-version = "0.5.10"
-criteria = "safe-to-deploy"
-
-[[exemptions.socket2]]
-version = "0.6.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.soketto]]
-version = "0.8.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.spandoc]]
-version = "0.2.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.spandoc-attribute]]
-version = "0.1.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.spin]]
-version = "0.9.9"
-criteria = "safe-to-deploy"
-
-[[exemptions.spin]]
-version = "0.10.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.spki]]
-version = "0.7.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.stable_deref_trait]]
-version = "1.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.str_stack]]
-version = "0.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.stun-rs]]
-version = "0.1.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.surge-ping]]
-version = "0.8.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.symlink]]
-version = "0.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.syn]]
-version = "2.0.118"
-criteria = "safe-to-deploy"
-
-[[exemptions.sync_wrapper]]
-version = "0.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.system-configuration]]
-version = "0.6.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.system-configuration-sys]]
-version = "0.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.tagptr]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
+notes = "Audit hold: Attachment::to_writer interpolates caller-controlled filename, custom attachment type, and content type directly into a JSON envelope header without escaping. A safe filename containing a quote was reproduced producing invalid JSON, and newline-bearing values can alter envelope framing. Retain the exemption pending serde-based header serialization or validated field characters."
 
 [[exemptions.tar]]
 version = "0.4.45"
 criteria = "safe-to-deploy"
 
-[[exemptions.tempfile]]
-version = "3.27.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.termcolor]]
-version = "1.4.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.thiserror]]
-version = "2.0.17"
-criteria = "safe-to-deploy"
-
-[[exemptions.thiserror-impl]]
-version = "2.0.17"
-criteria = "safe-to-deploy"
-
-[[exemptions.thread-priority]]
-version = "1.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.thread_local]]
-version = "1.1.10"
-criteria = "safe-to-deploy"
-
-[[exemptions.time]]
-version = "0.3.53"
-criteria = "safe-to-deploy"
-
-[[exemptions.time-core]]
-version = "0.1.9"
-criteria = "safe-to-deploy"
-
 [[exemptions.time-macros]]
 version = "0.2.31"
 criteria = "safe-to-deploy"
+notes = "Audit held: timestamp parsing rounds arbitrary fractional precision to nanoseconds before calling Timestamp::__new_unchecked. timestamp!(0.9999999999) reproducibly produces 1_000_000_000 nanoseconds and fails the ranged-integer invariant during compilation instead of yielding a valid value or a normal macro diagnostic. Retain the exemption pending explicit carry or truncation handling."
 
-[[exemptions.tiny-keccak]]
-version = "2.0.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.tinystr]]
-version = "0.8.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.tinyvec]]
-version = "1.12.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.tokio]]
-version = "1.52.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.tokio-macros]]
-version = "2.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.tokio-rustls]]
-version = "0.26.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.tokio-stream]]
-version = "0.1.18"
-criteria = "safe-to-deploy"
-
-[[exemptions.tokio-test]]
-version = "0.4.5"
-criteria = "safe-to-run"
-
-[[exemptions.tokio-util]]
-version = "0.7.18"
-criteria = "safe-to-deploy"
-
-[[exemptions.tokio-websockets]]
-version = "0.12.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.toml]]
-version = "0.5.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.toml]]
-version = "1.1.2+spec-1.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.toml_datetime]]
-version = "1.1.1+spec-1.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.toml_edit]]
-version = "0.25.12+spec-1.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.toml_parser]]
-version = "1.1.2+spec-1.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.toml_writer]]
-version = "1.1.1+spec-1.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.tonic]]
-version = "0.14.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.tonic-build]]
-version = "0.14.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.tonic-prost]]
-version = "0.14.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.tonic-prost-build]]
-version = "0.14.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.tonic-reflection]]
-version = "0.14.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.tower]]
-version = "0.4.13"
-criteria = "safe-to-deploy"
-
-[[exemptions.tower]]
-version = "0.5.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.tower-http]]
-version = "0.6.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.tower-layer]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.tower-service]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.tower-test]]
-version = "0.4.0"
-criteria = "safe-to-run"
-
-[[exemptions.tracing]]
-version = "0.1.44"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-appender]]
-version = "0.2.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-attributes]]
-version = "0.1.31"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-core]]
-version = "0.1.36"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-error]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-flame]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-futures]]
-version = "0.2.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-journald]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-log]]
-version = "0.1.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-opentelemetry]]
-version = "0.32.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-subscriber]]
-version = "0.3.23"
-criteria = "safe-to-deploy"
-
-[[exemptions.tracing-test]]
-version = "0.2.6"
-criteria = "safe-to-run"
-
-[[exemptions.tracing-test-macro]]
-version = "0.2.6"
-criteria = "safe-to-run"
-
-[[exemptions.typeid]]
-version = "1.0.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.typenum]]
-version = "1.20.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.ucd-parse]]
-version = "0.1.13"
-criteria = "safe-to-deploy"
-
-[[exemptions.ucd-trie]]
-version = "0.1.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.uint]]
-version = "0.9.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.unicase]]
-version = "2.9.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.unicode-ident]]
-version = "1.0.24"
-criteria = "safe-to-deploy"
-
-[[exemptions.untrusted]]
-version = "0.9.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.ureq]]
-version = "3.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.ureq-proto]]
-version = "0.6.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.url]]
-version = "2.5.8"
-criteria = "safe-to-deploy"
-
-[[exemptions.utf8-zero]]
-version = "0.8.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.uuid]]
-version = "1.23.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.vergen]]
+[[exemptions.vergen-gitcl]]
 version = "9.1.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.vergen-git2]]
-version = "9.1.0"
-criteria = "safe-to-deploy"
+suggest = false
+notes = "Audit deferred in #691: the crate executes the shell and Git selected from the ambient build environment, and Git operations can invoke configured helpers such as core.fsmonitor. PR #619 keeps a fixed describe pattern and writes Git errors to stderr rather than Cargo directives, but that does not remove the broader SHELL, PATH, and Git-configuration authority. Retain this exemption until #691 chooses and verifies a constrained CLI backend, a patched git2 backend, or a reasonably auditable gix backend."
 
 [[exemptions.vergen-lib]]
 version = "9.1.0"
 criteria = "safe-to-deploy"
+notes = "Audit held: the optional emit_and_set feature exposes a safe method that calls unsafe process-environment mutation without requiring callers to guarantee that no other thread reads or writes the environment. Zakura does not enable that feature, but a version-wide safe-to-deploy certification is deferred pending an unsafe API boundary or internal synchronization."
 
 [[exemptions.wait-timeout]]
 version = "0.2.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.walkdir]]
-version = "2.5.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Sentry 0.47 upgrade"
-
-[[exemptions.wasi]]
-version = "0.9.0+wasi-snapshot-preview1"
-criteria = "safe-to-deploy"
-
-[[exemptions.wasi]]
-version = "0.11.0+wasi-snapshot-preview1"
-criteria = "safe-to-deploy"
-
-[[exemptions.wasm-bindgen]]
-version = "0.2.126"
-criteria = "safe-to-deploy"
-
-[[exemptions.wasm-bindgen-futures]]
-version = "0.4.76"
-criteria = "safe-to-deploy"
-
-[[exemptions.wasm-bindgen-macro]]
-version = "0.2.126"
-criteria = "safe-to-deploy"
-
-[[exemptions.wasm-bindgen-macro-support]]
-version = "0.2.126"
-criteria = "safe-to-deploy"
-
-[[exemptions.wasm-bindgen-shared]]
-version = "0.2.126"
-criteria = "safe-to-deploy"
-
-[[exemptions.wasm-streams]]
-version = "0.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.web-sys]]
-version = "0.3.103"
-criteria = "safe-to-deploy"
-
-[[exemptions.web-time]]
-version = "1.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.webpki-root-certs]]
-version = "1.0.8"
-criteria = "safe-to-deploy"
-
-[[exemptions.webpki-roots]]
-version = "0.26.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.webpki-roots]]
-version = "1.0.8"
-criteria = "safe-to-deploy"
-
-[[exemptions.which]]
-version = "8.0.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.widestring]]
-version = "1.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.winapi]]
-version = "0.3.9"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the Unix initializer installs the SIGCHLD handler before publishing the global STATE pointer, so a signal in that window dereferences null. The handler also treats any nonzero previous sa_sigaction as callable, including the SIG_IGN sentinel. Current wait-timeout 0.2.1 retains this design, but its imported delta audit depends on this legacy baseline, so direct replacement review or upstream remediation is required before removing the exemption."
 
 [[exemptions.winapi-i686-pc-windows-gnu]]
 version = "0.4.0"
 criteria = "safe-to-deploy"
+notes = "Audit hold: the package is 1387 prebuilt binary import libraries totalling roughly 50 MB, plus a build script and a src/lib.rs whose entire content is a license header and a no_std attribute. There is nothing reviewable in the source, so certifying it safe-to-deploy would be attesting to binaries that cannot be inspected from the package. The build script adds the bundled lib directory to the linker search path only when the target is i686-pc-windows-gnu, which this workspace does not build, and the bundling can be disabled entirely by setting WINAPI_NO_BUNDLED_LIBRARIES. Retain the exemption; it comes in through winapi 0.3, so it clears when that dependency does."
 
 [[exemptions.winapi-util]]
 version = "0.1.9"
 criteria = "safe-to-deploy"
+notes = "Audit hold: the safe HandleRef::from_file constructor returns a borrowed Windows handle without tying its lifetime to the source File. Safe code can retain the HandleRef after the File closes and then operate on a stale or reused handle. Retain the exemption pending a lifetime-bound borrowed-handle representation."
 
 [[exemptions.winapi-x86_64-pc-windows-gnu]]
 version = "0.4.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.windows]]
-version = "0.61.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows]]
-version = "0.62.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-collections]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-collections]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-core]]
-version = "0.61.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-core]]
-version = "0.62.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-future]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-future]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
+notes = "Audit hold: the package is 1416 prebuilt binary import libraries totalling roughly 53 MB, plus a build script and a src/lib.rs whose entire content is a license header and a no_std attribute. There is nothing reviewable in the source, so certifying it safe-to-deploy would be attesting to binaries that cannot be inspected from the package. The build script adds the bundled lib directory to the linker search path only when the target is x86_64-pc-windows-gnu, which this workspace does not build, and the bundling can be disabled entirely by setting WINAPI_NO_BUNDLED_LIBRARIES. Retain the exemption; it comes in through winapi 0.3, so it clears when that dependency does."
 
 [[exemptions.windows-implement]]
 version = "0.60.2"
 criteria = "safe-to-deploy"
-
-[[exemptions.windows-interface]]
-version = "0.59.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-numerics]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-numerics]]
-version = "0.3.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-registry]]
-version = "0.6.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-result]]
-version = "0.3.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-result]]
-version = "0.4.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-strings]]
-version = "0.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-strings]]
-version = "0.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-sys]]
-version = "0.52.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-sys]]
-version = "0.61.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.windows-targets]]
-version = "0.52.5"
-criteria = "safe-to-deploy"
+notes = "Audit hold: #[implement] generates a safe into_outer method in the caller's module even though the crate states safe code must never own the generated COM outer type. Same-module code can create a stack outer, obtain an owned interface through ComObjectInterface::as_interface_ref(...).to_owned(), then drop or move the outer and leave the interface pointing at dead storage. Retain the exemption until outer construction is inaccessible or pinned behind a lifetime-safe wrapper."
 
 [[exemptions.windows-threading]]
 version = "0.1.0"
 criteria = "safe-to-deploy"
-
-[[exemptions.windows-threading]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
+notes = "Audit held: Pool::submit binds a non-'static closure to a freely inferred temporary borrow of &self, then submits it asynchronously. Safe code can therefore let captured borrowed data expire while the pool and callback remain live. Version 0.2.1 replaces this API with 'static submission plus an invariant scoped API that joins before borrowed data can expire."
 
 [[exemptions.windows_aarch64_gnullvm]]
 version = "0.52.5"
@@ -2654,114 +361,12 @@ criteria = "safe-to-deploy"
 version = "0.52.5"
 criteria = "safe-to-deploy"
 
-[[exemptions.winnow]]
-version = "1.0.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.wmi]]
-version = "0.17.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.writeable]]
-version = "0.6.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.ws_stream_wasm]]
-version = "0.7.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.wyz]]
-version = "0.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.x25519-dalek]]
-version = "2.0.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.xdg]]
-version = "3.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.xml-rs]]
-version = "0.8.28"
-criteria = "safe-to-deploy"
-
-[[exemptions.xmltree]]
-version = "0.10.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.yaml-rust2]]
-version = "0.11.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.yoke]]
-version = "0.8.3"
-criteria = "safe-to-deploy"
-
-[[exemptions.yoke-derive]]
-version = "0.8.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.z32]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zcash_encoding]]
-version = "0.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zcash_note_encryption]]
-version = "0.4.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.zcash_script]]
-version = "0.4.5"
-criteria = "safe-to-deploy"
-
-[[exemptions.zcash_spec]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.zerocopy]]
-version = "0.8.54"
-criteria = "safe-to-deploy"
-
-[[exemptions.zerocopy-derive]]
-version = "0.8.54"
-criteria = "safe-to-deploy"
-
-[[exemptions.zerofrom]]
-version = "0.1.8"
-criteria = "safe-to-deploy"
-
-[[exemptions.zerofrom-derive]]
-version = "0.1.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.zeroize]]
-version = "1.9.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zeroize_derive]]
-version = "1.5.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zerotrie]]
-version = "0.2.4"
-criteria = "safe-to-deploy"
-
 [[exemptions.zerovec]]
 version = "0.11.6"
 criteria = "safe-to-deploy"
+notes = "Audit hold: in an optimized build, collecting into ZeroVec<(u32, char)> produces a buffer of zeros instead of the encoded data. Reproduced two ways: the crate's own ule::tuple::test_pairule_validate passes in debug, where all 77 library tests pass, and fails in release, and a standalone program shows as_bytes() returning 21 zero bytes for three collected tuples in release against the correct bytes in debug. The failure is specific to that shape, the 7-byte Tuple2ULE over RawBytesULE<4> and CharULE; (u16, char), (char, char), (u32, u32), (u32, char, i8), and the plain u32 and char vectors were all correct in both profiles. Because the bytes come back zeroed, validating them as a differently constrained tuple then wrongly succeeds, which is what the upstream test is asserting against. A profile-dependent result in a crate whose whole purpose is unchecked casts over validated bytes should not be certified. Retain the exemption pending an upstream fix."
 
 [[exemptions.zerovec-derive]]
 version = "0.11.3"
 criteria = "safe-to-deploy"
-
-[[exemptions.zip32]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.zmij]]
-version = "1.0.21"
-criteria = "safe-to-deploy"
+notes = "Audit hold: make_ule permits some nonzero-starting or gapped repr(u8) enums, but its generated byte validator treats every value between min and max as valid and new_from_u8 checks only the maximum before transmuting. Safe generated APIs can therefore transmute an invalid discriminant. Retain the exemption pending complete discriminant validation."

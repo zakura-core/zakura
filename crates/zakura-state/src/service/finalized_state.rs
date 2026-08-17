@@ -82,6 +82,8 @@ pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
 pub(super) mod header_chain;
+pub mod treestate_artifact;
+pub mod treestate_export;
 mod vct;
 pub mod vct_treestate_audit;
 mod zakura_db;
@@ -111,6 +113,14 @@ pub use disk_format::{
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use header_chain::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
+pub(crate) use treestate_artifact::embedded_historical_subtrees;
+pub use treestate_artifact::{
+    verify_subtree_artifact, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
+    VerifiedSubtreeCounts,
+};
+pub use treestate_export::{
+    produce_release_treestate_artifacts, ReleaseTreestateArtifacts, ReleaseTreestateArtifactsError,
+};
 pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, VctSuccessorWitness};
 pub(crate) use vct::{VctAuthenticationProof, VctAuxiliaryFailureAttribution, VctAuxiliaryWindow};
 pub use vct_treestate_audit::{

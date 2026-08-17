@@ -181,6 +181,9 @@ skip-tree = [
     { name = "hmac", version = "=0.12.1" },
     { name = "netdev", version = "=0.36.0" },
     { name = "netwatch", version = "=0.9.0" },
+    # OpenTelemetry 0.32 uses reqwest 0.13; iroh 0.92 remains on 0.12.
+    # Remove this once the iroh 1.x upgrade unifies Zakura on reqwest 0.13.
+    { name = "reqwest", version = "=0.12.28" },
     { name = "socket2", version = "=0.5.10" },
     { name = "spin", version = "=0.10.1" },
     { name = "webpki-roots", version = "=0.26.11" },

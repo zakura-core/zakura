@@ -93,8 +93,6 @@ pub struct Builder {
     version: Version,
     /// The maximum allowable message length.
     max_len: usize,
-    /// An optional address label, to use for reporting metrics.
-    metrics_addr_label: Option<String>,
 }
 
 impl Codec {
@@ -104,7 +102,6 @@ impl Codec {
             network: Network::Mainnet,
             version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
             max_len: MAX_HANDSHAKE_BODY_LEN,
-            metrics_addr_label: None,
         }
     }
 
@@ -152,12 +149,6 @@ impl Builder {
         self.max_len = len;
         self
     }
-
-    /// Configure the codec with a label corresponding to the peer address.
-    pub fn with_metrics_addr_label(mut self, metrics_addr_label: String) -> Self {
-        self.metrics_addr_label = Some(metrics_addr_label);
-        self
-    }
 }
 
 // ======== Encoding =========
@@ -174,11 +165,9 @@ impl Encoder<Message> for Codec {
             return Err(Parse("body length exceeded maximum size"));
         }
 
-        if let Some(addr_label) = self.builder.metrics_addr_label.clone() {
-            metrics::counter!("zcash.net.out.bytes.total",
-                              "addr" => addr_label)
-            .increment((body_length + HEADER_LEN) as u64);
-        }
+        // Aggregate totals only: per-addr labels are never pruned by the Prometheus
+        // exporter and grow without bound on public listeners.
+        metrics::counter!("zcash.net.out.bytes.total").increment((body_length + HEADER_LEN) as u64);
 
         use Message::*;
         // Note: because all match arms must have
@@ -455,10 +444,8 @@ impl Decoder for Codec {
                     return Err(Parse("Zakura p2pv2up payload exceeds the hard prelude cap"));
                 }
 
-                if let Some(label) = self.builder.metrics_addr_label.clone() {
-                    metrics::counter!("zcash.net.in.bytes.total", "addr" =>  label)
-                        .increment((body_len + HEADER_LEN) as u64);
-                }
+                metrics::counter!("zcash.net.in.bytes.total")
+                    .increment((body_len + HEADER_LEN) as u64);
 
                 // Reserve buffer space for the expected body and the following header.
                 src.reserve(body_len + HEADER_LEN);

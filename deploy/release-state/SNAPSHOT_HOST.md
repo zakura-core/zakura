@@ -2,9 +2,9 @@
 
 ## Purpose and topology
 
-The production release-state publisher generates a trusted, coupled Mainnet
-checkpoint list and VCT frontier from Zakura's finalized pruned database. It
-runs on the production snapshot host against:
+The production release-state publisher generates a trusted, coupled Mainnet checkpoint list, VCT
+frontier, and completed-subtree artifact from Zakura's finalized pruned database. It runs on the
+production snapshot host against:
 
 - container: `zakura-pruned`
 - cache: `/mnt/zec_snapshot/zakura-cache-pruned`
@@ -40,13 +40,11 @@ From a trusted checkout of this repository:
 deploy/release-state/deploy-snapshot-host.sh <snapshot-host-ssh-target>
 ```
 
-The script builds `zakura-checkpoints` with
-`zakura-checkpoints-offline` from pinned Mainnet commit
-`d1fed3e6e0e420571ecacb9e1984dea6353cc7a3`, installs the binary and
-publisher scripts under `/opt/zakura-release-state`, installs the
-`zakura-snapshot-pruned.service` drop-in, runs `systemctl daemon-reload`, and
-verifies the unit. It refuses to install while either snapshot publisher is
-active and does not restart either live node.
+The script builds `zakura-checkpoints` with `zakura-checkpoints-offline` at the commit checked out
+in the trusted source tree. It verifies that commit is on `origin/main`, then installs the binary
+and publisher scripts under `/opt/zakura-release-state`, installs the
+`zakura-snapshot-pruned.service` drop-in, runs `systemctl daemon-reload`, and verifies the unit. It
+refuses to install while either snapshot publisher is active and does not restart either live node.
 
 The host's existing Infisical Universal Auth identity uses project
 `c57a6889-6a7c-4d05-a54a-e4a4c0b14ee7`, environment `prod`.
@@ -92,8 +90,8 @@ curl -fsS https://zakura-release.valargroup.dev/release-state/latest.json | jq .
 
 Confirm the pointer height advanced, fetch its `meta_url`, verify
 `meta_sha256`, and verify the listed size and SHA-256 for
-`main-checkpoints.txt` and `mainnet-frontier.bin`. The publisher keeps the
-newest four immutable `release-state/v1/<height>/` bundles by default.
+`main-checkpoints.txt`, `mainnet-frontier.bin`, and `mainnet-treestate-subtrees.bin`. The publisher
+keeps the newest four immutable `release-state/v1/<height>/` bundles by default.
 
 Direct hook invocation is an incident diagnostic only. First ensure both
 snapshot publishers are inactive, stop `zakura-pruned`, invoke the hook

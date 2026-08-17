@@ -313,7 +313,7 @@ pub fn derive_historical_frontiers_measured(
     let frontiers = anchor.map_or_else(DerivedFrontiers::empty, |(_, frontiers)| {
         (*frontiers).clone()
     });
-    let frontiers = replay(db, height, replay_from, frontiers)?;
+    let frontiers = replay_with_subtrees(db, height, replay_from, frontiers, |_, _| {})?;
 
     verify_against_index(db, height, &frontiers)?;
 
@@ -375,16 +375,6 @@ fn anchor_for(
             ironwood,
         }),
     )))
-}
-
-/// Appends the note commitments of blocks `replay_from..=height` to `frontiers`.
-fn replay(
-    db: &ZakuraDb,
-    height: Height,
-    replay_from: u32,
-    frontiers: DerivedFrontiers,
-) -> Result<DerivedFrontiers, HistoricalTreeDerivationError> {
-    replay_with_subtrees(db, height, replay_from, frontiers, |_, _| {})
 }
 
 /// Appends the note commitments of blocks `replay_from..=height` to `frontiers`, reporting every

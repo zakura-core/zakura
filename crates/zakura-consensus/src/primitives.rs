@@ -10,6 +10,7 @@ use tokio::sync::oneshot::error::RecvError;
 
 use crate::BoxError;
 
+mod cache;
 pub mod ed25519;
 pub mod groth16;
 pub mod halo2;
@@ -138,7 +139,7 @@ fn flush_block_verifier_batches() {
     }
 
     if let Some(verifier) = Lazy::get(&sapling::VERIFIER) {
-        queue_batch_flush("sapling", verifier.primary().clone().try_flush());
+        queue_batch_flush(sapling::VERIFIER_NAME, sapling::try_flush(verifier));
     }
 
     if let Some(verifier) = Lazy::get(&halo2::VERIFIER_PRE_NU6_2) {
@@ -169,6 +170,36 @@ fn queue_batch_flush(verifier: &'static str, result: Result<bool, BoxError>) {
                 "could not queue explicit block verifier batch flush"
             );
         }
+    }
+}
+
+/// Forgets every shielded bundle verification this process has cached.
+///
+/// # Benchmarks only
+///
+/// The worst case Zakura is sized against is a block full of transactions the node has never
+/// seen, so a benchmark that replays one workload must start each iteration with cold caches or
+/// it measures cache hits instead of proof and signature verification. Nothing in the node calls
+/// this.
+///
+/// It is always safe to call: forgetting a key costs a re-verification and can never accept a
+/// bundle that was not verified.
+#[doc(hidden)]
+pub fn clear_shielded_verification_caches() {
+    if let Some(verifier) = Lazy::get(&sapling::VERIFIER) {
+        verifier.clear();
+    }
+
+    if let Some(verifier) = Lazy::get(&halo2::VERIFIER_PRE_NU6_2) {
+        verifier.clear();
+    }
+
+    if let Some(verifier) = Lazy::get(&halo2::VERIFIER_NU6_2) {
+        verifier.clear();
+    }
+
+    if let Some(verifier) = Lazy::get(&halo2::VERIFIER_NU6_3_ONWARD) {
+        verifier.clear();
     }
 }
 

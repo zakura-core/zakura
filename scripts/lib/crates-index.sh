@@ -58,6 +58,15 @@ crates_index_fetch() {
   printf '%s\n' "$cache"
 }
 
+# crates_index_forget NAME — drop NAME's cached response so the next query
+# refetches it. Only polling callers need this: the index is the moving part
+# they are waiting on, while every other caller wants one stable answer for
+# the lifetime of the process.
+crates_index_forget() {
+  [ -n "$_crates_index_cache_dir" ] || return 0
+  rm -f "${_crates_index_cache_dir}/${1}"
+}
+
 # crates_index_versions NAME — echo every published version of NAME, one per
 # line (yanked included: the version number stays taken), or nothing when
 # the crate has never been published. Returns 2 on transport failure.

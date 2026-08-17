@@ -912,22 +912,16 @@ where
             "disconnecting from peer with obsolete network protocol version",
         );
 
-        // the value is the number of rejected handshakes, by peer IP and protocol version
+        // Handshake rejects by protocol version. Not labeled by peer address or
+        // user-agent: the Prometheus exporter never prunes series.
         metrics::counter!(
             "zcash.net.peers.obsolete",
-            "remote_ip" => addr_label.clone(),
             "remote_version" => remote.version.to_string(),
             "min_version" => min_version.to_string(),
-            "user_agent" => remote.user_agent.clone(),
         )
         .increment(1);
 
-        // the value is the remote version of the most recent rejected handshake from each peer
-        metrics::gauge!(
-            "zcash.net.peers.version.obsolete",
-            "remote_ip" => addr_label.clone(),
-        )
-        .set(remote.version.0 as f64);
+        metrics::gauge!("zcash.net.peers.version.obsolete").set(remote.version.0 as f64);
 
         // Disconnect if peer is using an obsolete version.
         return Err(HandshakeError::ObsoleteVersion(remote.version));
@@ -953,23 +947,18 @@ where
         "negotiated network protocol version with peer",
     );
 
-    // the value is the number of connected handshakes, by peer IP and protocol version
+    // Handshake count by protocol version. Not labeled by peer address or
+    // user-agent: the Prometheus exporter never prunes series.
     metrics::counter!(
         "zcash.net.peers.connected",
-        "remote_ip" => addr_label.clone(),
         "remote_version" => connection_info.remote.version.to_string(),
         "negotiated_version" => negotiated_version.to_string(),
         "min_version" => min_version.to_string(),
-        "user_agent" => connection_info.remote.user_agent.clone(),
     )
     .increment(1);
 
-    // the value is the remote version of the most recent connected handshake from each peer
-    metrics::gauge!(
-        "zcash.net.peers.version.connected",
-        "remote_ip" => addr_label,
-    )
-    .set(connection_info.remote.version.0 as f64);
+    metrics::gauge!("zcash.net.peers.version.connected")
+        .set(connection_info.remote.version.0 as f64);
 
     peer_conn.send(Message::Verack).await?;
 
@@ -1500,10 +1489,7 @@ where
 
             let mut peer_conn = Framed::new(
                 data_stream,
-                Codec::builder()
-                    .for_network(&config.network)
-                    .with_metrics_addr_label(addr_label.clone())
-                    .finish(),
+                Codec::builder().for_network(&config.network).finish(),
             );
             let mut connection_tracker = connection_tracker;
 
@@ -1639,14 +1625,12 @@ where
             // Instrument the peer's rx and tx streams.
 
             let inner_conn_span = connection_span.clone();
-            let outbound_addr_label = addr_label.clone();
             let peer_tx = peer_tx.with(move |msg: Message| {
                 let span = debug_span!(parent: inner_conn_span.clone(), "outbound_metric");
                 // Add a metric for outbound messages.
                 metrics::counter!(
                     "zcash.net.out.messages",
                     "command" => msg.command(),
-                    "addr" => outbound_addr_label.clone(),
                 )
                 .increment(1);
                 // We need to use future::ready rather than an async block here,
@@ -1669,13 +1653,11 @@ where
             let inbound_inv_collector = inv_collector.clone();
             let ts_inner_conn_span = connection_span.clone();
             let inv_inner_conn_span = connection_span.clone();
-            let inbound_addr_label = addr_label.clone();
             let peer_rx = peer_rx
                 .then(move |msg| {
                     // Add a metric for inbound messages and errors.
                     // Fire a timestamp or failure event.
                     let inbound_ts_collector = inbound_ts_collector.clone();
-                    let addr_label = inbound_addr_label.clone();
                     let span =
                         debug_span!(parent: ts_inner_conn_span.clone(), "inbound_ts_collector");
 
@@ -1685,7 +1667,6 @@ where
                                 metrics::counter!(
                                     "zcash.net.in.messages",
                                     "command" => msg.command(),
-                                    "addr" => addr_label.clone(),
                                 )
                                 .increment(1);
 
@@ -1698,7 +1679,6 @@ where
                                 metrics::counter!(
                                     "zakura.net.in.errors",
                                     "error" => err.to_string(),
-                                    "addr" => addr_label.clone(),
                                 )
                                 .increment(1);
 

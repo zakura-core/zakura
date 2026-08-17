@@ -643,14 +643,55 @@ pub struct FrontierGridExport {
     pub replayed_blocks: u64,
 }
 
+/// Next on-grid height at or below `last`, or `None` if only a partial cell remains.
+///
+/// A partial cell is not published. Clamping it to `last` would place a tip-local entry that a
+/// later export, at a higher `last`, would replace with the unclamped grid point — rewriting the
+/// seam and breaking the append-only prefix contract. Serving still covers that tail: it replays
+/// from the previous on-grid entry, which is already within one grid step.
+fn next_grid_target(
+    spacing: GridSpacing,
+    next: Height,
+    last: Height,
+    accrued_cost: &mut u64,
+    mut block_commitments: impl FnMut(Height) -> usize,
+) -> Option<Height> {
+    match spacing {
+        GridSpacing::Uniform { blocks } => {
+            let target = Height(next.0.saturating_add(blocks));
+            (target <= last).then_some(target)
+        }
+        GridSpacing::Adaptive { budget_us } => {
+            let mut candidate = next;
+            while candidate <= last {
+                let counts = block_commitments(candidate);
+                *accrued_cost = accrued_cost
+                    .saturating_add(COST_PER_BLOCK_US)
+                    // The count is bounded by a block's own commitments, so it fits in u64.
+                    .saturating_add(COST_PER_COMMITMENT_US.saturating_mul(counts as u64));
+                if *accrued_cost >= budget_us {
+                    *accrued_cost = 0;
+                    return Some(candidate);
+                }
+                if candidate == last {
+                    return None;
+                }
+                candidate = Height(candidate.0 + 1);
+            }
+            None
+        }
+    }
+}
+
 /// Generates the frontier grid for `db`'s absent band at the given `spacing`.
 ///
 /// Replays contiguously across the absent band, starting from stored trees at `U - 1` when
 /// available or from empty frontiers when `U == 0`, and emits an entry every `spacing` heights.
-/// Each emitted entry is root-checked against `commitment_roots_by_height`, and generation stops
-/// at the first height that fails, so a returned artifact is one whose every entry matched. That
-/// is what lets the grid ship without trust: a consumer re-runs the same check before anchoring on
-/// an entry.
+/// A partial cell at the current tip is omitted, so a later export at a higher tip is a prefix of
+/// this one plus new on-grid entries. Each emitted entry is root-checked against
+/// `commitment_roots_by_height`, and generation stops at the first height that fails, so a
+/// returned artifact is one whose every entry matched. That is what lets the grid ship without
+/// trust: a consumer re-runs the same check before anchoring on an entry.
 ///
 /// Completed subtree roots are not collected here. The release pipeline
 /// ([`produce_release_treestate_artifacts`]) owns that artifact, and it does not need historical
@@ -700,40 +741,19 @@ pub fn export_frontier_grid(
     let mut next = upgrade;
     let mut accrued_cost: u64 = 0;
 
-    loop {
-        // Under a uniform grid the next entry is a fixed number of blocks ahead. Under an adaptive
-        // one it is wherever the estimated cost budget runs out, which needs a block-by-block scan
-        // of the commitment counts to find.
-        let target = match spacing {
-            GridSpacing::Uniform { blocks } => Height(next.0.saturating_add(blocks).min(last.0)),
-            GridSpacing::Adaptive { budget_us } => {
-                let mut candidate = next;
-                while candidate < last {
-                    let counts = db
-                        .block(candidate.into())
-                        .map(|block| {
-                            block.sapling_note_commitments().count()
-                                + block.orchard_note_commitments().count()
-                                + block.ironwood_note_commitments().count()
-                        })
-                        .unwrap_or(0);
-
-                    accrued_cost = accrued_cost
-                        .saturating_add(COST_PER_BLOCK_US)
-                        // The count is bounded by a block's own commitments, so it fits in u64.
-                        .saturating_add(COST_PER_COMMITMENT_US.saturating_mul(counts as u64));
-
-                    if accrued_cost >= budget_us {
-                        accrued_cost = 0;
-                        break;
-                    }
-
-                    candidate = Height(candidate.0 + 1);
-                }
-                candidate
-            }
-        };
-
+    // Under a uniform grid the next entry is a fixed number of blocks ahead. Under an adaptive
+    // one it is wherever the estimated cost budget runs out, which needs a block-by-block scan
+    // of the commitment counts to find. Either way, a target past `last` is a partial cell and
+    // is not published.
+    while let Some(target) = next_grid_target(spacing, next, last, &mut accrued_cost, |height| {
+        db.block(height.into())
+            .map(|block| {
+                block.sapling_note_commitments().count()
+                    + block.orchard_note_commitments().count()
+                    + block.ironwood_note_commitments().count()
+            })
+            .unwrap_or(0)
+    }) {
         frontiers = replay_with_subtrees(db, target, next_replay_from, frontiers, |_, _| {})
             .map_err(|source| FrontierGridExportError::Derivation {
                 height: target,
@@ -779,4 +799,95 @@ pub fn export_frontier_grid(
         elapsed: start.elapsed(),
         replayed_blocks,
     })
+}
+
+#[cfg(test)]
+mod grid_target_tests {
+    use super::*;
+
+    fn published_grid_heights(
+        spacing: GridSpacing,
+        start: Height,
+        last: Height,
+        mut commitments: impl FnMut(Height) -> usize,
+    ) -> Vec<u32> {
+        let mut heights = Vec::new();
+        let mut next = start;
+        let mut accrued_cost = 0;
+        while let Some(target) =
+            next_grid_target(spacing, next, last, &mut accrued_cost, &mut commitments)
+        {
+            heights.push(target.0);
+            if target == last {
+                break;
+            }
+            next = Height(target.0 + 1);
+        }
+        heights
+    }
+
+    #[test]
+    fn uniform_grid_omits_a_partial_final_cell() {
+        let spacing = GridSpacing::Uniform { blocks: 10 };
+
+        assert_eq!(
+            published_grid_heights(spacing, Height(0), Height(25), |_| 0),
+            vec![10, 21],
+            "the cell that would clamp to 25 is not published"
+        );
+        assert_eq!(
+            published_grid_heights(spacing, Height(0), Height(10), |_| 0),
+            vec![10],
+            "a target that lands exactly on last is on-grid and is published"
+        );
+        assert!(
+            published_grid_heights(spacing, Height(0), Height(9), |_| 0).is_empty(),
+            "a band shorter than one step publishes nothing rather than a clamped entry"
+        );
+    }
+
+    #[test]
+    fn uniform_grid_heights_are_prefix_compatible_across_tips() {
+        let spacing = GridSpacing::Uniform { blocks: 10 };
+        let earlier = published_grid_heights(spacing, Height(0), Height(25), |_| 0);
+        let later = published_grid_heights(spacing, Height(0), Height(35), |_| 0);
+
+        assert_eq!(&later[..earlier.len()], earlier.as_slice());
+        assert_eq!(later, vec![10, 21, 32]);
+        assert!(
+            !later.contains(&25),
+            "the height a clamp would have published at the earlier tip is not a later grid point"
+        );
+    }
+
+    #[test]
+    fn adaptive_grid_omits_a_partial_final_cell() {
+        // Three empty blocks cost 4_500 µs, so a 4_000 µs budget fires every third height.
+        let spacing = GridSpacing::Adaptive { budget_us: 4_000 };
+
+        assert_eq!(
+            published_grid_heights(spacing, Height(0), Height(10), |_| 0),
+            vec![2, 5, 8],
+            "the incomplete cell ending at last is omitted"
+        );
+        assert_eq!(
+            published_grid_heights(spacing, Height(0), Height(11), |_| 0),
+            vec![2, 5, 8, 11],
+            "last is published when it is a real budget boundary"
+        );
+    }
+
+    #[test]
+    fn adaptive_grid_heights_are_prefix_compatible_across_tips() {
+        let spacing = GridSpacing::Adaptive { budget_us: 4_000 };
+        let earlier = published_grid_heights(spacing, Height(0), Height(10), |_| 0);
+        let later = published_grid_heights(spacing, Height(0), Height(11), |_| 0);
+
+        assert_eq!(&later[..earlier.len()], earlier.as_slice());
+        assert_eq!(later, vec![2, 5, 8, 11]);
+        assert!(
+            !later.contains(&10),
+            "the height a clamp would have published at the earlier tip is not a later grid point"
+        );
+    }
 }

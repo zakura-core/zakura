@@ -1659,10 +1659,19 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 |_, _| {},
             )
             .expect("a genesis-start VCT database exports its absent band");
+            let last_published = genesis_export
+                .frontiers
+                .entries
+                .last()
+                .expect("a genesis-start band of this length publishes at least one on-grid entry");
+            prop_assert!(
+                last_published.height < handoff,
+                "published heights stay inside the absent band [0, H)"
+            );
             prop_assert_eq!(
                 genesis_export.replayed_blocks,
-                u64::from(handoff.0),
-                "a genesis-start export replays every block in [0, H)"
+                u64::from(last_published.height.0) + 1,
+                "a genesis-start export replays from empty frontiers through the last on-grid entry"
             );
 
             // Consensus state (anchor sets + history root) matches the legacy recompute.
@@ -2815,10 +2824,19 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 |_, _| {},
             )
             .expect("a mid-chain VCT database exports from its stored predecessor");
+            let last_published = anchored_export
+                .frontiers
+                .entries
+                .last()
+                .expect("the absent band [U, H) publishes at least one on-grid entry");
+            prop_assert!(
+                last_published.height >= upgrade && last_published.height < last_height,
+                "published heights stay inside the absent band [U, H)"
+            );
             prop_assert_eq!(
                 anchored_export.replayed_blocks,
-                u64::from(last_height.0 - upgrade.0),
-                "the exporter replays only [U, H), not [0, H)"
+                u64::from(last_published.height.0 - upgrade.0) + 1,
+                "the exporter replays only [U, last on-grid entry], not [0, H)"
             );
             let stitched = serve_block_roots(&legacy.db, serve_range);
             prop_assert_eq!(

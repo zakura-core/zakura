@@ -100,8 +100,11 @@ Non-goals:
 ### 4.1 The frontier anchor artifact
 
 A new artifact in the release-state bundle: Sapling, Orchard, and Ironwood frontiers at a
-sparse grid of heights spanning `[genesis, H]`, ending exactly on the bundle's checkpoint
-height so it abuts the existing embedded final frontier.
+sparse on-grid of heights across the absent band. A partial cell at the current tip is
+omitted rather than clamped, so a later export is a prefix-append of an earlier one.
+Requests in that tail replay from the previous grid entry, which is already within the
+designed cold-replay bound. The header records the bundle checkpoint; the embedded final
+frontier remains at that height.
 
 Grid spacing is a tunable, not a fixed part of the format. Sizing, using the measured
 1,489-byte `mainnet-frontier.bin` as a conservative per-entry upper bound (it includes
@@ -271,9 +274,9 @@ per-pool trees at `U - 1` and replays only the absent band `[U, H)`.
 This remains the design's central trade: the ordered pass happens once, on one host, and is
 verified independently by every consumer.
 
-Artifact entries should follow the same append-only grid contract as the checkpoint list,
-so successive bundles remain byte-for-byte prefix-compatible and the import workflow can
-verify updates as pure appends.
+Artifact entries follow the same append-only grid contract as the checkpoint list: only
+on-grid heights are published, so successive bundles remain byte-for-byte prefix-compatible
+and the import workflow can verify updates as pure appends.
 
 ~~The same exporter pass emits the subtree-root artifact (§4.6).~~ **Superseded
 (2026-08-17):** subtree generation moved to the release-state pipeline, where

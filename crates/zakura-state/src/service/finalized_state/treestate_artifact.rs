@@ -1139,13 +1139,17 @@ mod tests {
         );
     }
 
-    /// A later export must extend an earlier one, never rewrite it, so the release workflow can
-    /// verify updates as pure appends.
+    /// Encoding a nested entry list is a byte prefix of encoding the longer list. The exporter
+    /// omits partial final cells so real successive exports produce nested lists; this test is
+    /// the encoder half of that append-only contract.
     #[test]
     fn frontier_encoding_is_prefix_compatible_across_tips() {
-        let mut earlier = sample_frontiers();
-        let later = earlier.clone();
-        earlier.entries.pop();
+        let later = sample_frontiers();
+        let earlier = FrontierArtifact {
+            spacing: later.spacing,
+            last_checkpoint: later.last_checkpoint,
+            entries: later.entries[..later.entries.len() - 1].to_vec(),
+        };
 
         let earlier_bytes = earlier.encode(&Network::Mainnet);
         let later_bytes = later.encode(&Network::Mainnet);

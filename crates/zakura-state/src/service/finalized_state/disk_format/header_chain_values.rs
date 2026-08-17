@@ -100,7 +100,13 @@ pub enum HeaderChainValueError {
     #[error("header-node hash does not match its canonical header")]
     HeaderHashMismatch,
     /// The singleton metadata used an unsupported disk format.
-    #[error("unsupported header-chain disk format {0}")]
+    #[error(
+        "unsupported header-chain disk format {found}: this build stores format {current}, and \
+         the provisional header-chain format has no migration path, so the state directory must \
+         be deleted and resynchronized",
+        found = .0,
+        current = HeaderChainDiskVersion::CURRENT.0
+    )]
     UnsupportedDiskFormat(u32),
     /// Chrono cannot represent the UTC seconds and nanoseconds pair.
     #[error("invalid UTC timestamp")]

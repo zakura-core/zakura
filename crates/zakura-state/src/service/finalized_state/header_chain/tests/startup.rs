@@ -662,10 +662,9 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
 #[test]
 fn version_one_migration_drops_pruned_consensus_invalid_rows() {
     let db_config = Config::ephemeral();
-    let (mut engine_config, anchor, metadata) = fixture();
+    let (mut engine_config, anchor, metadata) = mainnet_fixture();
     engine_config.limits.max_non_finalized_nodes = NonZeroUsize::new(1).expect("one is nonzero");
-    let network = Network::new_regtest(RegtestParameters::default());
-    let store = HeaderChainStore::new(open(&db_config, &network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata.clone(), anchor)
         .expect("the current fixture initializes");

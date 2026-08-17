@@ -343,6 +343,32 @@ impl PeerRegistry {
             .is_some_and(|until| *until > now)
     }
 
+    /// Return whether this peer still has a live backoff for `hash` under any authority.
+    ///
+    /// Production lookups are authority-keyed. A concurrent rekey moves the deadline
+    /// from one authority to another, so two successive
+    /// [`is_body_retry_avoided`](Self::is_body_retry_avoided) calls can both miss
+    /// even when the deadline never left the maps.
+    #[cfg(test)]
+    fn has_live_body_retry_deadline(
+        &self,
+        peer: &ZakuraPeerId,
+        hash: block::Hash,
+        now: Instant,
+    ) -> bool {
+        let source = zakura_header_chain::SourceId::from_digest(peer.digest());
+        let mut all_retries = self.body_retry_all_lock();
+        all_retries.retain(|_, until| *until > now);
+        if all_retries.keys().any(|key| key.hash == hash) {
+            return true;
+        }
+        let mut retries = self.body_retry_lock();
+        retries.retain(|_, until| *until > now);
+        retries
+            .keys()
+            .any(|(candidate, key)| *candidate == source && key.hash == hash)
+    }
+
     pub(super) fn next_body_retry_deadline(
         &self,
         peer: &ZakuraPeerId,
@@ -1139,24 +1165,27 @@ mod floor_bias_tests {
         );
         assert_eq!(reg.next_body_retry_deadline(&peer, now), Some(until));
 
-        // A routine reads the suppression maps while the sequencer rekeys them. The
-        // rewrite holds both guards, so the reader observes the complete map at one
-        // authority and never a window in which the deadline has vanished. Each map
-        // carries the deadline alone in its own phase, so neither can mask a gap in
-        // the other.
+        // A routine reads the suppression maps while the sequencer rekeys them
+        // between two same-epoch authorities. The rewrite holds both guards, so
+        // the reader observes the complete map at one authority and never a
+        // window in which the deadline has vanished. Each map carries the
+        // deadline alone in its own phase, so neither can mask a gap in the other.
+        // The reader snapshots by hash rather than calling `is_body_retry_avoided`
+        // twice: production lookups are authority-keyed, and two successive calls
+        // can both miss while the deadline moves from one authority to the other.
         for phase in ["per supplier", "all suppliers"] {
             reg.clear_body_retry(refreshed, hash);
             if phase == "per supplier" {
                 reg.defer_body_retry(
                     [zakura_header_chain::SourceId::from_digest(peer.digest())],
-                    refreshed,
+                    scope,
                     hash,
                     until,
                 );
             } else {
-                reg.set_persisted_body_alarm(Some((refreshed, hash, until)));
+                reg.set_persisted_body_alarm(Some((scope, hash, until)));
             }
-            assert!(reg.is_body_retry_avoided(&peer, refreshed, hash, now));
+            assert!(reg.is_body_retry_avoided(&peer, scope, hash, now));
 
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let reader = std::thread::spawn({
@@ -1166,15 +1195,16 @@ mod floor_bias_tests {
                 move || {
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                         assert!(
-                            reg.is_body_retry_avoided(&peer, refreshed, hash, now),
+                            reg.has_live_body_retry_deadline(&peer, hash, now),
                             "a concurrent rekey must never expose an unsuppressed body \
                              through the {phase} map"
                         );
                     }
                 }
             });
-            for _ in 0..20_000 {
-                reg.refresh_body_retry_scope(refreshed);
+            for round in 0..20_000 {
+                let current = if round % 2 == 0 { refreshed } else { scope };
+                reg.refresh_body_retry_scope(current);
             }
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             reader.join().expect("the reader thread observes no gap");

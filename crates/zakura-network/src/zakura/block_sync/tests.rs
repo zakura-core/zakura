@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future,
 };
 
@@ -16,7 +16,7 @@ use super::{
         DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
         MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
-    peer_registry::PeerRegistry,
+    peer_registry::{OutstandingMeta, PeerRegistry},
     reactor::{
         node_id_from_block_peer_id, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
         EMPTY_STATE_HEADER_QUIET_PERIOD,
@@ -2074,6 +2074,95 @@ fn work_queue_refreshes_queued_authority_and_preserves_registered_requests() {
         std::num::NonZeroU64::new(14).expect("fourteen is nonzero"),
     );
     assert_eq!(replacement_owner.authority(), current);
+}
+
+/// Same-epoch refresh leaves live GetBlocks on the issuing authority. After
+/// `reset_above` drops that height from the WorkQueue, the producer still sees
+/// the request by height and hash, so it does not extend the height again.
+#[test]
+fn producer_filter_keeps_live_requests_after_same_epoch_refresh() {
+    let scope = test_work_scope();
+    let refreshed = zakura_header_chain::BodyWorkAuthority {
+        header: zakura_header_chain::HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(
+                scope.header_generation.get().saturating_add(1),
+            ),
+            branch: zakura_header_chain::BranchId::new(
+                scope.branch.anchor_hash,
+                block::Hash([7; 32]),
+            ),
+        },
+        ..scope
+    };
+    assert_ne!(refreshed, scope);
+    assert_eq!(refreshed.body_work_epoch, scope.body_work_epoch);
+
+    let owner = test_work_owner();
+    let height = block::Height(1);
+    let hash = block::Hash([1; 32]);
+    let queue = WorkQueue::new(block::Height(0));
+    queue.set_estimate_floor_for_tests(1);
+    assert_eq!(
+        queue.extend(scope, [needed(1, BlockSizeEstimate::Advertised(100))]),
+        1
+    );
+    assert_eq!(queue.take_in_range(height, height, 1).len(), 1);
+    assert_eq!(queue.mark_reserved_for_owner(owner, [height]), 100);
+
+    let config = ZakuraBlockSyncConfig::default();
+    let registry = PeerRegistry::new();
+    let peer = peer(1);
+    let generation = registry
+        .admit_session(
+            &peer,
+            ServicePeerDirection::Outbound,
+            &config,
+            0,
+            Instant::now(),
+        )
+        .generation();
+    registry.set_outstanding(
+        &peer,
+        generation,
+        BTreeMap::from([(
+            height,
+            OutstandingMeta {
+                owner,
+                hash,
+                estimated_bytes: 100,
+                queued_at: Instant::now(),
+                deadline: Instant::now(),
+            },
+        )]),
+    );
+
+    queue.refresh_authority(refreshed);
+    assert!(queue.in_flight_contains(height));
+    assert_eq!(queue.owner_for_height(height), Some(owner));
+
+    queue.reset_above(block::Height(0));
+    assert!(!queue.in_flight_contains(height));
+    assert!(!queue.pending_contains(height));
+    assert!(
+        registry.has_outstanding_request(height, hash),
+        "outstanding entries keep the issuing authority across a same-epoch refresh"
+    );
+    assert_eq!(registry.total_unreceived(), 1);
+
+    let request_floor = block::Height(0);
+    let producer_would_enqueue = height > request_floor
+        && !queue.in_flight_contains(height)
+        && !registry.has_outstanding_request(height, hash);
+    assert!(
+        !producer_would_enqueue,
+        "the producer filter must keep a live request from being extended again"
+    );
+
+    assert_eq!(
+        queue.extend(refreshed, [needed(1, BlockSizeEstimate::Advertised(100))]),
+        1,
+        "the height is absent from the queue, so only the outstanding filter prevents a duplicate fetch"
+    );
 }
 
 #[test]

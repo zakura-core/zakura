@@ -1,7 +1,7 @@
 # Release-state publisher
 
-Publishes Mainnet release-state bundles — the coupled checkpoint list and VCT
-frontier — from the snapshot host to R2, where the
+Publishes Mainnet release-state bundles — the coupled checkpoint list, VCT
+frontier, and completed-subtree roots — from the snapshot host to R2, where the
 `update-release-state.yml` workflow imports them into reviewable draft PRs.
 Design: `docs/design/verified-commitment-trees.md`, section 16.
 Production host wiring, operations, and rollback:
@@ -13,7 +13,8 @@ Production host wiring, operations, and rollback:
   has stopped its synced Mainnet node,
   `publish-release-state.sh <stopped-node-cache-dir>` runs
   the offline export and uploads one immutable bundle
-  (`release-state/v1/<height>/{meta.json, main-checkpoints.txt, mainnet-frontier.bin}`),
+  (`meta.json`, `main-checkpoints.txt`, `mainnet-frontier.bin`, and
+  `mainnet-treestate-subtrees.bin`),
   then atomically replaces `release-state/latest.json`. Bundles are retained
   newest-4 by default (`RELEASE_STATE_KEEP`).
 - **GitHub (repository):** the workflow resolves `latest.json` over a pinned

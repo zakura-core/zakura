@@ -126,20 +126,26 @@ pub struct Args {
     #[arg(long)]
     pub state_cache_dir: Option<PathBuf>,
 
-    /// Offline mode: also write the VCT final-frontier artifact for the last
+    /// Offline mode: write the VCT final-frontier artifact for the last
     /// emitted checkpoint height to this path.
     ///
-    /// Requires `--state-cache-dir`.
+    /// Requires `--state-cache-dir` and `--mainnet-subtree-output`.
     #[arg(long)]
     pub mainnet_frontier_output: Option<PathBuf>,
+
+    /// Offline mode: write the completed-subtree artifact for the last emitted
+    /// checkpoint height to this path.
+    ///
+    /// Requires `--state-cache-dir` and `--mainnet-frontier-output`.
+    #[arg(long)]
+    pub mainnet_subtree_output: Option<PathBuf>,
 
     /// Offline mode: print the embedded Mainnet checkpoint list before the
     /// newly generated checkpoints, so stdout is a complete replacement
     /// `main-checkpoints.txt`.
     ///
-    /// Requires `--state-cache-dir` and `--mainnet-frontier-output` (a
-    /// replacement list must ship with its coupled frontier); incompatible
-    /// with `--last-checkpoint`.
+    /// Requires `--state-cache-dir`, `--mainnet-frontier-output`, and
+    /// `--mainnet-subtree-output`; incompatible with `--last-checkpoint`.
     #[arg(long)]
     pub full_list: bool,
 
@@ -174,16 +180,37 @@ impl Args {
                         .to_string(),
                 );
             }
+            if self.mainnet_frontier_output.is_some() != self.mainnet_subtree_output.is_some() {
+                return Err(
+                    "release-state frontiers and subtree roots are one pair: provide both \
+                     --mainnet-frontier-output and --mainnet-subtree-output"
+                        .to_string(),
+                );
+            }
+            let artifact_output_paths_match = self
+                .mainnet_frontier_output
+                .as_ref()
+                .zip(self.mainnet_subtree_output.as_ref())
+                .is_some_and(|(frontier, subtrees)| frontier == subtrees);
+            if artifact_output_paths_match {
+                return Err(
+                    "--mainnet-frontier-output and --mainnet-subtree-output must use different paths"
+                        .to_string(),
+                );
+            }
             if self.full_list && self.mainnet_frontier_output.is_none() {
                 return Err(
                     "--full-list emits a replacement main-checkpoints.txt, which must ship with \
-                     its coupled frontier: add --mainnet-frontier-output"
+                     its coupled frontier and subtree roots: add both artifact output flags"
                         .to_string(),
                 );
             }
         } else {
             if self.mainnet_frontier_output.is_some() {
                 return Err("--mainnet-frontier-output requires --state-cache-dir".to_string());
+            }
+            if self.mainnet_subtree_output.is_some() {
+                return Err("--mainnet-subtree-output requires --state-cache-dir".to_string());
             }
             if self.full_list {
                 return Err("--full-list requires --state-cache-dir".to_string());
@@ -208,6 +235,7 @@ mod tests {
             last_checkpoint: None,
             state_cache_dir: None,
             mainnet_frontier_output: None,
+            mainnet_subtree_output: None,
             full_list: false,
             zcli_args: Vec::new(),
         }
@@ -243,6 +271,10 @@ mod tests {
         frontier_without_state.mainnet_frontier_output = Some(PathBuf::from("frontier.bin"));
         assert!(frontier_without_state.validate_mode().is_err());
 
+        let mut subtrees_without_state = rpc_args();
+        subtrees_without_state.mainnet_subtree_output = Some(PathBuf::from("subtrees.bin"));
+        assert!(subtrees_without_state.validate_mode().is_err());
+
         let mut full_list_without_state = rpc_args();
         full_list_without_state.full_list = true;
         assert!(full_list_without_state.validate_mode().is_err());
@@ -253,6 +285,7 @@ mod tests {
         let mut offline = rpc_args();
         offline.state_cache_dir = Some(PathBuf::from("state"));
         offline.mainnet_frontier_output = Some(PathBuf::from("frontier.bin"));
+        offline.mainnet_subtree_output = Some(PathBuf::from("subtrees.bin"));
         offline.full_list = true;
         assert_eq!(offline.validate_mode(), Ok(()));
 
@@ -272,7 +305,25 @@ mod tests {
         full_list_without_frontier.mainnet_frontier_output = None;
         assert!(
             full_list_without_frontier.validate_mode().is_err(),
-            "a replacement checkpoint list must ship with its coupled frontier"
+            "a replacement checkpoint list must ship with both coupled artifacts"
+        );
+
+        let mut full_list_without_subtrees = offline.clone();
+        full_list_without_subtrees.mainnet_subtree_output = None;
+        assert!(
+            full_list_without_subtrees.validate_mode().is_err(),
+            "a replacement checkpoint list must ship with both coupled artifacts"
+        );
+
+        let mut matching_artifact_paths = offline.clone();
+        matching_artifact_paths.mainnet_subtree_output =
+            matching_artifact_paths.mainnet_frontier_output.clone();
+        assert_eq!(
+            matching_artifact_paths.validate_mode(),
+            Err(
+                "--mainnet-frontier-output and --mainnet-subtree-output must use different paths"
+                    .to_string()
+            )
         );
 
         let mut resume_without_full_list = offline;

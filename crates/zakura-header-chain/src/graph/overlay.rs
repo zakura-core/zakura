@@ -50,6 +50,15 @@ pub(crate) struct GraphDelta {
     pub(super) finalized_frontier: Option<Frontier>,
     pub(super) updated_header_nodes: Vec<HeaderNode>,
     pub(super) deleted_header_hashes: Vec<block::Hash>,
+    /// Finalized-path nodes this transition inserted and then retired.
+    ///
+    /// A finality advance deletes every header below the new finalized frontier, including
+    /// headers the same transition inserted. Such a header cancels out: it reaches neither
+    /// [`Self::updated_header_nodes`] nor [`Self::deleted_header_hashes`], because the live
+    /// graph never stores it. The delta must still prove the new finalized frontier descends
+    /// from the base frontier, so it carries exactly the retired nodes that proof reads.
+    /// Delta application ignores this evidence.
+    pub(super) retired_finalized_path_nodes: Vec<HeaderNode>,
     pub(super) new_consensus_invalid_body_tombstones: Vec<ConsensusInvalidBodyTombstone>,
 }
 
@@ -79,6 +88,7 @@ impl GraphDelta {
             finalized_frontier: None,
             updated_header_nodes: Vec::new(),
             deleted_header_hashes: Vec::new(),
+            retired_finalized_path_nodes: Vec::new(),
             new_consensus_invalid_body_tombstones: Vec::new(),
         }
     }
@@ -104,6 +114,15 @@ impl GraphDelta {
     /// Return removed header hashes in deterministic order.
     pub(crate) fn deleted_header_hashes(&self) -> &[block::Hash] {
         &self.deleted_header_hashes
+    }
+
+    /// Return the retired finalized-path evidence in deterministic order.
+    ///
+    /// Delta validation reads the field directly. This accessor exists so tests outside this
+    /// module can assert that the evidence stays out of the durable write set.
+    #[cfg(test)]
+    pub(crate) fn retired_finalized_path_nodes(&self) -> &[HeaderNode] {
+        &self.retired_finalized_path_nodes
     }
 
     /// Return newly created append-only consensus-invalid body tombstones.
@@ -135,6 +154,12 @@ pub(crate) struct GraphOverlay<'a> {
     finalized_frontier: Frontier,
     updated_header_nodes_by_hash: HashMap<block::Hash, HeaderNode>,
     deleted_header_hashes: HashSet<block::Hash>,
+    /// Nodes this overlay inserted and then deleted, kept only as delta evidence.
+    ///
+    /// Every overlay read hides these, because the projected graph does not contain them.
+    /// They survive here so [`GraphOverlay::delta`] can prove finalized descendancy across
+    /// headers one transition both inserted and retired.
+    retired_inserted_nodes: HashMap<block::Hash, HeaderNode>,
     added_header_children: HashMap<block::Hash, HashSet<block::Hash>>,
     removed_header_children: HashMap<block::Hash, HashSet<block::Hash>>,
     eligible_header_tips: HashSet<block::Hash>,
@@ -154,6 +179,7 @@ impl<'a> GraphOverlay<'a> {
             finalized_frontier: base_graph.finalized_frontier,
             updated_header_nodes_by_hash: HashMap::new(),
             deleted_header_hashes: HashSet::new(),
+            retired_inserted_nodes: HashMap::new(),
             added_header_children: HashMap::new(),
             removed_header_children: HashMap::new(),
             eligible_header_tips: base_graph.eligible_header_tips.clone(),
@@ -215,6 +241,31 @@ impl<'a> GraphOverlay<'a> {
                 return Err(GraphError::UnknownHeaderNode(*hash));
             }
         }
+        let retired_inserted_nodes = delta
+            .retired_finalized_path_nodes
+            .iter()
+            .cloned()
+            .map(|node| (node.hash, node))
+            .collect::<HashMap<_, _>>();
+        if retired_inserted_nodes.len() != delta.retired_finalized_path_nodes.len() {
+            let mut seen = HashSet::new();
+            let duplicate = delta
+                .retired_finalized_path_nodes
+                .iter()
+                .find_map(|node| (!seen.insert(node.hash)).then_some(node.hash))
+                .expect("different map and sequence lengths imply a duplicate hash");
+            return Err(GraphError::DuplicateHeaderNode(duplicate));
+        }
+        for hash in retired_inserted_nodes.keys() {
+            // A retired node never reaches the live graph. A base-graph node is a real
+            // deletion instead, and an updated node is a real insertion, so either overlap
+            // means the delta describes one header two ways.
+            if base_graph.nodes.contains_key(hash)
+                || updated_header_nodes_by_hash.contains_key(hash)
+            {
+                return Err(GraphError::DuplicateHeaderNode(*hash));
+            }
+        }
         let new_consensus_invalid_body_tombstones_by_hash = delta
             .new_consensus_invalid_body_tombstones
             .iter()
@@ -238,7 +289,14 @@ impl<'a> GraphOverlay<'a> {
         let mut added_header_children: HashMap<_, HashSet<_>> = HashMap::new();
         let mut removed_header_children: HashMap<_, HashSet<_>> = HashMap::new();
         for node in updated_header_nodes_by_hash.values() {
-            if !base_graph.nodes.contains_key(&node.hash) {
+            // A finality advance deletes the new frontier's parent, and a transition may
+            // retire a parent it also inserted. Recording a child edge under a parent the
+            // projected graph does not retain would strand that entry in the child index,
+            // because nothing deletes the parent again.
+            let parent_retained = updated_header_nodes_by_hash.contains_key(&node.parent_hash)
+                || (base_graph.nodes.contains_key(&node.parent_hash)
+                    && !deleted_header_hashes.contains(&node.parent_hash));
+            if !base_graph.nodes.contains_key(&node.hash) && parent_retained {
                 added_header_children
                     .entry(node.parent_hash)
                     .or_default()
@@ -279,6 +337,7 @@ impl<'a> GraphOverlay<'a> {
             finalized_frontier,
             updated_header_nodes_by_hash,
             deleted_header_hashes,
+            retired_inserted_nodes,
             added_header_children,
             removed_header_children,
             eligible_header_tips: base_graph.eligible_header_tips.clone(),
@@ -339,7 +398,9 @@ impl<'a> GraphOverlay<'a> {
 
     /// Require the projected finalized frontier to be an exact descendant of the base frontier.
     ///
-    /// The ancestry walk may cross nodes deleted by the same finality transition.
+    /// The ancestry walk may cross nodes deleted by the same finality transition. A node the
+    /// same transition also inserted survives in neither the base graph nor the updated set,
+    /// so the walk reads it from the retired finalized-path evidence the delta carries.
     fn validate_finalized_descendant(&self) -> Result<(), GraphError> {
         if self.finalized_frontier == self.base_graph.finalized_frontier {
             return Ok(());
@@ -350,6 +411,7 @@ impl<'a> GraphOverlay<'a> {
                 .updated_header_nodes_by_hash
                 .get(&cursor.hash)
                 .or_else(|| self.base_graph.nodes.get(&cursor.hash))
+                .or_else(|| self.retired_inserted_nodes.get(&cursor.hash))
                 .ok_or(GraphError::UnknownHeaderNode(cursor.hash))?;
             if node.height != cursor.height {
                 return Err(GraphError::UnknownHeaderNode(cursor.hash));
@@ -806,6 +868,8 @@ impl<'a> GraphOverlay<'a> {
 
         self.deleted_header_hashes.remove(&hash);
 
+        self.retired_inserted_nodes.remove(&hash);
+
         self.record_header_child_addition(parent_hash, hash);
 
         self.header_node_count = self.header_node_count.saturating_add(1);
@@ -1154,6 +1218,7 @@ impl<'a> GraphOverlay<'a> {
             self.deleted_header_hashes.iter().copied().collect();
         deleted_header_hashes.sort_unstable_by_key(|hash| hash.0);
         GraphDelta {
+            retired_finalized_path_nodes: self.retired_finalized_path_nodes(),
             base_revision: self.base_revision,
             work_coordinate_transition: if self.work_coordinates_rebased {
                 WorkCoordinateTransition::RebaseToFinalizedFrontier
@@ -1177,6 +1242,44 @@ impl<'a> GraphOverlay<'a> {
         }
     }
 
+    /// Collect the finalized-path nodes this transition inserted and then retired.
+    ///
+    /// The walk mirrors [`Self::validate_finalized_descendant`] and emits only the hashes that
+    /// walk cannot otherwise resolve, so the evidence stays as small as the proof requires. It
+    /// spans the heights the finality advance already traversed, so it adds no new bound.
+    ///
+    /// An unresolvable or inconsistent hash stops the walk and leaves the evidence short.
+    /// The staged frontier is then incoherent, and delta validation reports it.
+    fn retired_finalized_path_nodes(&self) -> Vec<HeaderNode> {
+        let mut retired = Vec::new();
+        if self.finalized_frontier == self.base_graph.finalized_frontier {
+            return retired;
+        }
+        let mut cursor = self.finalized_frontier;
+        while cursor.height > self.base_graph.finalized_frontier.height {
+            let node = match self
+                .updated_header_nodes_by_hash
+                .get(&cursor.hash)
+                .or_else(|| self.base_graph.nodes.get(&cursor.hash))
+            {
+                Some(node) => node,
+                None => {
+                    let Some(node) = self.retired_inserted_nodes.get(&cursor.hash) else {
+                        break;
+                    };
+                    retired.push(node.clone());
+                    node
+                }
+            };
+            if node.height != cursor.height {
+                break;
+            }
+            cursor = Frontier::new(block::Height(cursor.height.0 - 1), node.parent_hash);
+        }
+        retired.sort_unstable_by_key(|node| (node.height, node.hash.0));
+        retired
+    }
+
     /// Removes a node from the overlay.
     fn delete_header_node(&mut self, hash: block::Hash) -> Result<(), GraphError> {
         let node = self
@@ -1186,6 +1289,10 @@ impl<'a> GraphOverlay<'a> {
         self.updated_header_nodes_by_hash.remove(&hash);
         if self.base_graph.nodes.contains_key(&hash) {
             self.deleted_header_hashes.insert(hash);
+        } else {
+            // This deletion cancels an insertion from the same transition, so the delta
+            // records neither. Keep the node as evidence for the finalized-descendant proof.
+            self.retired_inserted_nodes.insert(hash, node.clone());
         }
         self.record_header_child_removal(node.parent_hash, hash);
         self.eligible_header_tips.remove(&hash);
@@ -1966,5 +2073,159 @@ mod tests {
         assert!(eligibility
             .header_node(right_child.hash)
             .is_some_and(HeaderNode::is_eligible));
+    }
+
+    /// Insert a chain of `length` children onto `parent` in one overlay.
+    fn insert_overlay_chain(
+        overlay: &mut GraphOverlay<'_>,
+        parent: Frontier,
+        length: u8,
+    ) -> Vec<Frontier> {
+        let mut chain = vec![parent];
+        let mut cursor = parent;
+        for marker in 1..=length {
+            cursor = match overlay
+                .insert(
+                    header(cursor.hash, marker),
+                    HeaderValidationState::Valid,
+                    [],
+                    BodyValidationState::Unknown,
+                )
+                .expect("the fixture child inserts")
+            {
+                InsertResult::Inserted(frontier) | InsertResult::AlreadyPresent(frontier) => {
+                    frontier
+                }
+            };
+            chain.push(cursor);
+        }
+        chain
+    }
+
+    #[test]
+    fn finality_across_same_transition_headers_applies_and_carries_its_evidence() {
+        // Finalizing two above the base anchor retires a header this same transition inserted.
+        // That header cancels out of both delta sets, so only the carried evidence proves the
+        // new frontier descends from the base frontier.
+        for advance in 1..=3usize {
+            let base_graph = store();
+            let anchor = base_graph.finalized_frontier();
+            let mut overlay = GraphOverlay::new(&base_graph);
+            let chain = insert_overlay_chain(&mut overlay, anchor, 4);
+            let new_anchor = chain[advance];
+            overlay
+                .advance_finalized_frontier(new_anchor)
+                .expect("the eligible descendant becomes the new anchor");
+
+            let delta = overlay.delta();
+            let retired: Vec<_> = delta
+                .retired_finalized_path_nodes
+                .iter()
+                .map(|node| Frontier::new(node.height, node.hash))
+                .collect();
+            assert_eq!(
+                retired,
+                chain[1..advance].to_vec(),
+                "the evidence is exactly the inserted headers below the new anchor"
+            );
+            for node in &delta.retired_finalized_path_nodes {
+                assert!(
+                    !delta
+                        .updated_header_nodes
+                        .iter()
+                        .any(|updated| updated.hash == node.hash),
+                    "retired evidence never doubles as a durable write"
+                );
+                assert!(
+                    !delta.deleted_header_hashes.contains(&node.hash),
+                    "retired evidence never doubles as a durable deletion"
+                );
+            }
+
+            let projected = MemHeaderStore::reconstruct(crate::HeaderGraphReconstruction::new(
+                new_anchor,
+                overlay.header_nodes().cloned(),
+                base_graph.consensus_invalid_body_tombstones().cloned(),
+            ))
+            .expect("the overlay materializes as a coherent graph");
+            let mut applied = base_graph.clone();
+            applied
+                .apply_delta(&delta)
+                .expect("the delta proves descendancy across the retired headers");
+
+            assert_eq!(applied.finalized_frontier, projected.finalized_frontier);
+            assert_eq!(applied.nodes, projected.nodes);
+            assert_eq!(applied.heights, projected.heights);
+            assert_eq!(applied.eligible_header_tips, projected.eligible_header_tips);
+            // The retired anchor keeps no child entry: nothing would ever delete it again.
+            assert_eq!(applied.children, projected.children);
+        }
+    }
+
+    #[test]
+    fn retired_evidence_conflicting_with_a_live_node_is_rejected() {
+        let base_graph = store();
+        let anchor = base_graph.finalized_frontier();
+        let mut overlay = GraphOverlay::new(&base_graph);
+        let chain = insert_overlay_chain(&mut overlay, anchor, 3);
+        overlay
+            .advance_finalized_frontier(chain[2])
+            .expect("the eligible descendant becomes the new anchor");
+        let delta = overlay.delta();
+        let retired = delta
+            .retired_finalized_path_nodes
+            .first()
+            .expect("finalizing two above the anchor retires one inserted header")
+            .clone();
+
+        let mut duplicated = delta.clone();
+        duplicated
+            .retired_finalized_path_nodes
+            .push(retired.clone());
+        assert!(matches!(
+            GraphOverlay::from_delta(&base_graph, &duplicated),
+            Err(GraphError::DuplicateHeaderNode(hash)) if hash == retired.hash
+        ));
+
+        let mut also_updated = delta.clone();
+        also_updated.updated_header_nodes.push(retired.clone());
+        assert!(matches!(
+            GraphOverlay::from_delta(&base_graph, &also_updated),
+            Err(GraphError::DuplicateHeaderNode(hash)) if hash == retired.hash
+        ));
+
+        let mut claims_a_base_node = delta.clone();
+        claims_a_base_node.retired_finalized_path_nodes = vec![base_graph
+            .nodes
+            .get(&anchor.hash)
+            .expect("the live graph retains its finalized frontier")
+            .clone()];
+        assert!(matches!(
+            GraphOverlay::from_delta(&base_graph, &claims_a_base_node),
+            Err(GraphError::DuplicateHeaderNode(hash)) if hash == anchor.hash
+        ));
+    }
+
+    #[test]
+    fn missing_retired_evidence_fails_the_finalized_descendant_proof() {
+        let base_graph = store();
+        let anchor = base_graph.finalized_frontier();
+        let mut overlay = GraphOverlay::new(&base_graph);
+        let chain = insert_overlay_chain(&mut overlay, anchor, 3);
+        overlay
+            .advance_finalized_frontier(chain[2])
+            .expect("the eligible descendant becomes the new anchor");
+        let mut delta = overlay.delta();
+        let retired = delta
+            .retired_finalized_path_nodes
+            .first()
+            .expect("finalizing two above the anchor retires one inserted header")
+            .hash;
+        delta.retired_finalized_path_nodes.clear();
+
+        assert!(matches!(
+            GraphOverlay::from_delta(&base_graph, &delta),
+            Err(GraphError::UnknownHeaderNode(hash)) if hash == retired
+        ));
     }
 }

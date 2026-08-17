@@ -1283,3 +1283,56 @@ fn validate_finality_rebase_path_table() {
         "first-record predecessor height is intentionally ignored when it does not retreat"
     );
 }
+
+#[test]
+fn one_insertion_finalizes_past_the_headers_it_inserted() {
+    // Depth finality lands at `tip - depth`, so a batch longer than the depth finalizes above
+    // headers the same transition inserted. Those headers cancel out of the delta: the
+    // insertion never reaches the graph and the deletion has nothing durable to remove. The
+    // transition commits only because the delta carries them as descendancy evidence.
+    let depth = 2u32;
+    let (mut store, mut config) = TestStore::new(EngineMode::HeadersOnly);
+    config.limits.local_finality_depth = std::num::NonZeroU32::new(depth).expect("two is nonzero");
+    let clock = ManualClock(Utc::now());
+    let anchor = store.metadata.frontiers.finalized;
+    store.lease = validation_lease_for(&store, anchor);
+
+    let count = depth + 3;
+    let plan = apply_transition(
+        &store,
+        insertion(&store, count, EvidenceId::from_digest([0xb1; 32])),
+        &context(&config, &clock, None),
+    )
+    .expect("a batch longer than the finality depth commits");
+
+    let record = plan
+        .change_set
+        .finality_append
+        .expect("the batch advances depth finality");
+    assert_eq!(record.previous, anchor);
+    assert_eq!(
+        record.current.height,
+        block::Height(anchor.height.0 + count - depth),
+        "depth finality lands the configured depth below the new tip"
+    );
+
+    let retired = plan.graph_delta().retired_finalized_path_nodes();
+    let expected: Vec<_> = ((anchor.height.0 + 1)..record.current.height.0)
+        .map(block::Height)
+        .collect();
+    assert_eq!(
+        retired.iter().map(|node| node.height).collect::<Vec<_>>(),
+        expected,
+        "every inserted header between the old and new anchors is carried as evidence"
+    );
+    for node in retired {
+        assert!(
+            !plan
+                .graph_delta()
+                .updated_header_nodes()
+                .iter()
+                .any(|updated| updated.hash == node.hash),
+            "evidence for a retired header is never a durable write"
+        );
+    }
+}

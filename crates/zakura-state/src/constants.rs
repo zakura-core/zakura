@@ -39,13 +39,15 @@ pub const STATE_DATABASE_KIND: &str = "state";
 /// get the network-specific floor.
 pub const MIN_PRUNING_RETENTION: u32 = 10_000;
 
-/// The default bound on how many blocks one historical note commitment tree derivation may
-/// replay. Used as the `audit-historical-treestates` CLI default until the config knob lands.
+/// The default backstop on how many blocks one historical note commitment tree derivation may
+/// replay.
 ///
-/// Sized to cover a cold request anywhere in a from-genesis fast-synced node's absent band on
-/// Mainnet, so the first request of a wallet sweep succeeds rather than failing at a limit. Later
-/// requests in the sweep replay only from the previous cached frontier, so the bound applies to
-/// the cold case alone.
+/// Grid spacing is the operative bound on request cost: serving requires a frontier artifact, so
+/// a cold request replays from the nearest grid entry rather than across the absent band. This
+/// default is intentionally larger than any reasonable grid gap, so it does not become the bound
+/// in normal serving. It is a safety backstop: a gappy artifact or a missed grid load cannot
+/// occupy a thread indefinitely. The `audit-historical-treestates` walk uses the same constant so
+/// a grid-free measurement can still cover the band.
 pub const DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS: u64 = 4_000_000;
 
 /// The minimum retention window allowed in pruned storage mode on `network`.

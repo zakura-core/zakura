@@ -158,9 +158,9 @@ pub struct Config {
     ///
     /// Enabling this requires [`Self::historical_frontier_artifact`]: without a grid, a cold
     /// request on a from-scratch snapshot replays the entire absent band. Startup fails closed
-    /// rather than serving that path. [`Self::max_historical_tree_replay_blocks`] then bounds
-    /// replay from the nearest grid entry. Replay reads block bodies, so this has no effect in
-    /// [`StorageMode::Pruned`]: those queries still return the typed archive-mode error.
+    /// rather than serving that path. [`Self::max_historical_tree_replay_blocks`] is then a
+    /// backstop on replay from the nearest grid entry. Replay reads block bodies, so this has no
+    /// effect in [`StorageMode::Pruned`]: those queries still return the typed archive-mode error.
     pub derive_historical_trees: bool,
 
     /// Path to a frontier artifact used to anchor historical tree derivation.
@@ -178,11 +178,12 @@ pub struct Config {
 
     /// The most blocks one historical tree derivation may replay.
     ///
-    /// Set to [`DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS`] by default, which is large enough to
-    /// cover the whole absent band on Mainnet. This bounds what a single RPC request can cost when
-    /// [`Self::derive_historical_trees`] is enabled; a request needing a longer replay fails
-    /// instead of occupying a thread indefinitely. Raise it to serve heights further from any
-    /// frontier the node holds, at the cost of a slower worst-case request.
+    /// Set to [`DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS`] by default. Grid spacing is the
+    /// operative bound: derivation requires [`Self::historical_frontier_artifact`], so a cold
+    /// request replays from the nearest grid entry. This limit is a backstop above that spacing,
+    /// so a gappy artifact or a bug cannot occupy a thread indefinitely. A request needing a
+    /// longer replay fails instead. Lower it to cap cost more tightly than the grid; raising it
+    /// is only useful if the artifact has gaps larger than the default.
     pub max_historical_tree_replay_blocks: u64,
 
     /// Whether to delete the old database directories when present.

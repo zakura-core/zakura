@@ -2,7 +2,12 @@
 //!
 //! For usage please refer to the program help: `zakura-checkpoints --help`
 
-use std::{net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{
+    env, fs,
+    net::SocketAddr,
+    path::{Component, Path, PathBuf},
+    str::FromStr,
+};
 
 use clap::Parser;
 use thiserror::Error;
@@ -187,11 +192,14 @@ impl Args {
                         .to_string(),
                 );
             }
-            let artifact_output_paths_match = self
-                .mainnet_frontier_output
-                .as_ref()
-                .zip(self.mainnet_subtree_output.as_ref())
-                .is_some_and(|(frontier, subtrees)| frontier == subtrees);
+            let artifact_output_paths_match =
+                match (&self.mainnet_frontier_output, &self.mainnet_subtree_output) {
+                    (Some(frontier), Some(subtrees)) => {
+                        resolved_output_destination(frontier)?
+                            == resolved_output_destination(subtrees)?
+                    }
+                    _ => false,
+                };
             if artifact_output_paths_match {
                 return Err(
                     "--mainnet-frontier-output and --mainnet-subtree-output must use different paths"
@@ -219,6 +227,48 @@ impl Args {
 
         Ok(())
     }
+}
+
+/// Resolve the directory aliases that [`zakura_chain::common::atomic_write`] follows.
+fn resolved_output_destination(path: &Path) -> Result<PathBuf, String> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("artifact output path has no file name: {}", path.display()))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let absolute_parent = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|error| format!("resolving {}: {error}", path.display()))?
+            .join(parent)
+    };
+
+    let mut resolved_parent = PathBuf::new();
+    for component in absolute_parent.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                resolved_parent.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved_parent.pop();
+            }
+            Component::Normal(name) => {
+                let candidate = resolved_parent.join(name);
+                match fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved_parent = canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        resolved_parent.push(name);
+                    }
+                    Err(error) => {
+                        return Err(format!("resolving {}: {error}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(resolved_parent.join(file_name))
 }
 
 #[cfg(test)]
@@ -330,5 +380,47 @@ mod tests {
         resume_without_full_list.full_list = false;
         resume_without_full_list.last_checkpoint = Some(Height(100));
         assert_eq!(resume_without_full_list.validate_mode(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_artifact_output_path_aliases() {
+        let mut offline = rpc_args();
+        offline.state_cache_dir = Some(PathBuf::from("state"));
+        offline.mainnet_frontier_output = Some(PathBuf::from("frontier.bin"));
+        offline.mainnet_subtree_output = Some(
+            env::current_dir()
+                .expect("current directory is available")
+                .join("frontier.bin"),
+        );
+        assert!(offline.validate_mode().is_err());
+
+        let temp = tempfile::tempdir().expect("temporary directory is created");
+        offline.mainnet_frontier_output = Some(temp.path().join("frontier.bin"));
+        offline.mainnet_subtree_output = Some(
+            temp.path()
+                .join("missing-directory")
+                .join("..")
+                .join("frontier.bin"),
+        );
+        assert!(offline.validate_mode().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_artifact_outputs_through_symlinked_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temporary directory is created");
+        let real_directory = temp.path().join("real");
+        fs::create_dir(&real_directory).expect("real output directory is created");
+        let alias_directory = temp.path().join("alias");
+        symlink(&real_directory, &alias_directory).expect("directory symlink is created");
+
+        let mut offline = rpc_args();
+        offline.state_cache_dir = Some(PathBuf::from("state"));
+        offline.mainnet_frontier_output = Some(real_directory.join("artifact.bin"));
+        offline.mainnet_subtree_output = Some(alias_directory.join("artifact.bin"));
+
+        assert!(offline.validate_mode().is_err());
     }
 }

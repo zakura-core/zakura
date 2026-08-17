@@ -72,7 +72,8 @@ impl TestStore {
         let metadata = EngineMetadata {
             disk_format: HeaderChainDiskVersion::CURRENT,
             mode,
-            network_id: config.network.kind(),
+            network_id: config.network().kind(),
+            network_policy_digest: config.network_policy_digest(),
             anchor_manifest_digest: config.trust_anchor_digest(),
             work_origin: frontier,
             state_version: StateVersion::new(0),
@@ -96,7 +97,7 @@ impl TestStore {
                 frontier,
                 header: block.header.clone(),
             }],
-            network: config.network.clone(),
+            network: config.network().clone(),
             trust_anchor_digest: config.trust_anchor_digest(),
             context_digest: [7; 32],
         };

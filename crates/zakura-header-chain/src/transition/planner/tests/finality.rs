@@ -79,7 +79,7 @@ fn apply_with_header_rebase_facts(
 }
 
 #[test]
-fn header_insert_rebases_and_trims_across_each_monotone_finality_position() {
+fn replay_conflict_precedes_finality_consumed_header_work() {
     for finalized_count in 1..=3_u32 {
         let (mut store, config) = TestStore::new(EngineMode::Integrated);
         let clock = ManualClock(Utc::now());
@@ -192,6 +192,34 @@ fn header_insert_rebases_and_trims_across_each_monotone_finality_position() {
                 ),
                 Err(TransitionFailure::Counter(_))
             ));
+        }
+        if finalized_count == 3 {
+            // A conflicting replay key outranks fully consumed header work: the same batch
+            // evidence carrying a different payload is a distinct request. Replay identity binds
+            // the rebased batch, so the conflicting key carries the rebased evidence.
+            let mut rebased_batch = prepared.clone();
+            rebased_batch
+                .rebase_after(verified_tip)
+                .expect("the prepared batch rebases onto the finalized frontier");
+            let mut conflicted = store.clone();
+            conflicted.metadata.last_transition = Some(crate::TransitionFingerprint::from_parts(
+                crate::TransitionDomain::InsertHeaders,
+                rebased_batch.evidence(),
+                [0x87; 32],
+            ));
+            assert!(matches!(
+                apply_with_header_rebase_facts(
+                    &conflicted,
+                    held.clone(),
+                    &config,
+                    &clock,
+                    rebased_validation.clone(),
+                ),
+                Err(TransitionFailure::ConflictingReplay)
+            ));
+
+            // Reproduce an adjacent replay key whose original payload finality fully consumed.
+            store.metadata.last_transition = held.event.fingerprint();
         }
 
         let plan =
@@ -912,6 +940,30 @@ fn integrated_finality_requires_authority_and_exact_verified_path() {
 }
 
 #[test]
+fn empty_checkpoint_growth_has_no_finality_effect() {
+    let (store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let old_tip = store.metadata.frontiers.verified_best;
+    let request = TransitionRequest {
+        expected_version: store.metadata.state_version,
+        event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+            full_state_transition_id: EvidenceId::from_digest([0x90; 32]),
+            old_tip,
+            new_path: Vec::new(),
+            cause: crate::VerifiedChangeCause::CheckpointFinalizedGrow,
+        }),
+    };
+
+    let plan = apply_transition(&store, request, &context(&config, &clock, Some(&Authority)))
+        .expect("empty checkpoint growth is a valid no-change");
+
+    assert!(plan.is_no_change());
+    assert!(!plan.effect().is_checkpoint_finality());
+    assert!(plan.change_set.finality_append.is_none());
+    assert_eq!(plan.change_set.metadata, store.metadata);
+}
+
+#[test]
 fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
@@ -1018,6 +1070,61 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
     assert_eq!(
         verify_plan(&test_engine(&store), &pin_conflict),
         Err(InvariantViolation::TrustPin(checkpoint.height))
+    );
+}
+
+#[test]
+fn finality_install_consumes_the_source_revision() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let authority = Authority;
+    let insert = insertion(&store, 2, EvidenceId::from_digest([0xa1; 32]));
+    let insert_plan = apply_transition(&store, insert, &context(&config, &clock, None))
+        .expect("network insertion retains the checkpoint header");
+    store.commit(&insert_plan);
+
+    let old_tip = store.metadata.frontiers.verified_best;
+    let checkpoint = store.selected[1];
+    let header = store
+        .graph
+        .header_node(checkpoint.hash)
+        .expect("the checkpoint header is retained")
+        .header
+        .clone();
+    let request = TransitionRequest {
+        expected_version: store.metadata.state_version,
+        event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+            full_state_transition_id: EvidenceId::from_digest([0xa2; 32]),
+            old_tip,
+            new_path: vec![crate::VerifiedHeaderRef {
+                height: checkpoint.height,
+                hash: checkpoint.hash,
+                header,
+            }],
+            cause: crate::VerifiedChangeCause::CheckpointFinalizedGrow,
+        }),
+    };
+    let mut engine = test_engine(&store);
+    let first = engine
+        .plan_transition(
+            fixture_transition_input(&store, request.clone()),
+            &context(&config, &clock, Some(&authority)),
+        )
+        .expect("the first checkpoint transition plans");
+    let stale = engine
+        .plan_transition(
+            fixture_transition_input(&store, request),
+            &context(&config, &clock, Some(&authority)),
+        )
+        .expect("the unchanged source can plan the same checkpoint transition");
+
+    engine
+        .install_committed_transition(first)
+        .expect("the checkpoint transition installs on its source");
+    assert_eq!(engine.snapshot().frontiers.finalized, checkpoint);
+    assert_eq!(
+        engine.install_committed_transition(stale),
+        Err(crate::CommittedTransitionError::StaleSource),
     );
 }
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use zakura_chain::{block, work::difficulty::U256};
+use zakura_chain::{block, parameters::NetworkKind, work::difficulty::U256};
 use zakura_header_chain::{
     AlarmSet, BodyValidationState, ChainScore, ChangeSet, EngineConfig, EngineMetadata, EngineMode,
     EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
@@ -94,7 +94,18 @@ impl HeaderChainStore {
             return Ok(true);
         }
 
-        let mut metadata = decode_v1_engine_metadata(&metadata_bytes)?;
+        let mut metadata =
+            decode_v1_engine_metadata(&metadata_bytes, config.network_policy_digest())?;
+        if metadata.network_id != config.network().kind() {
+            return Err(HeaderChainStoreError::Incoherent(
+                "version-one network kind does not match the configured network",
+            ));
+        }
+        if metadata.network_id != NetworkKind::Mainnet {
+            return Err(HeaderChainStoreError::Incoherent(
+                "version-one network policy is ambiguous; rebuild the header-chain database",
+            ));
+        }
         let limit =
             zakura_header_chain::RowLimit::new(config.limits.max_aux_deliveries_total.get());
         let aux_cf = self.cf(HEADER_AUX_DELIVERY)?;
@@ -445,7 +456,8 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
     let metadata = EngineMetadata {
         disk_format: HeaderChainDiskVersion::CURRENT,
         mode: config.mode,
-        network_id: config.network.kind(),
+        network_id: config.network().kind(),
+        network_policy_digest: config.network_policy_digest(),
         anchor_manifest_digest: config.trust_anchor_digest(),
         work_origin: anchor,
         state_version: StateVersion::new(1),

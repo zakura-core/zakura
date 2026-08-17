@@ -161,7 +161,8 @@ impl Harness {
         let metadata = EngineMetadata {
             disk_format: HeaderChainDiskVersion::CURRENT,
             mode: EngineMode::Integrated,
-            network_id: config.network.kind(),
+            network_id: config.network().kind(),
+            network_policy_digest: config.network_policy_digest(),
             anchor_manifest_digest: config.trust_anchor_digest(),
             work_origin: frontier,
             state_version: StateVersion::new(1),
@@ -179,7 +180,7 @@ impl Harness {
             alarms: AlarmSet::default(),
             last_transition: None,
         };
-        let db = open(&db_config, &config.network);
+        let db = open(&db_config, config.network());
         let store = HeaderChainStore::new(db);
         store
             .initialize(metadata, anchor)
@@ -570,6 +571,24 @@ impl Harness {
             .expect("authenticated full-state finality reaches the writer");
         assert!(matches!(result, ApplyResult::Committed));
 
+        let mut canonical = DiskWriteBatch::new();
+        for frontier in &self.verified_path[..=advance] {
+            self.runtime()
+                .store
+                .put_raw(
+                    &mut canonical,
+                    "hash_by_height",
+                    frontier.height.as_bytes(),
+                    frontier.hash.0,
+                )
+                .expect("the full-state canonical fact stages");
+        }
+        self.runtime()
+            .store
+            .db
+            .write(canonical)
+            .expect("the full-state canonical facts commit");
+
         let retained: HashSet<_> = self
             .model
             .keys()
@@ -644,7 +663,7 @@ impl Harness {
                 .take()
                 .expect("the coherence runtime is present before reopen"),
         );
-        let store = HeaderChainStore::new(open(&self.db_config, &self.config.network));
+        let store = HeaderChainStore::new(open(&self.db_config, self.config.network()));
         let (runtime, report) = store
             .startup(&self.config)
             .expect("the coherent persistent store reopens");

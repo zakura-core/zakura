@@ -24,8 +24,8 @@ impl HeaderRules {
     /// Derive rules only from the validated engine configuration.
     pub fn from_engine_config(config: &EngineConfig) -> Result<Self, PowPolicyError> {
         Ok(Self {
-            network: config.network.clone(),
-            pow_policy: PowPolicy::for_network(&config.network)?,
+            network: config.network().clone(),
+            pow_policy: PowPolicy::for_network(config.network())?,
             trust_anchor_digest: config.trust_anchor_digest(),
         })
     }

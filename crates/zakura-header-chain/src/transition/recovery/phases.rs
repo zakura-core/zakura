@@ -36,11 +36,11 @@ pub(super) struct AuditedSource {
 
 /// Deterministic derived views reconstructed only from an audited source.
 pub(super) struct ReconstructedDerivedViews {
-    /// Source rows after elapsed-deferral promotion and before eligibility recompute.
+    /// Audited source rows before inherited-eligibility recomputation.
     ///
-    /// Repair classification compares this image to [`Self::header_nodes`] so promotion
-    /// itself does not look like an inherited-eligibility cache repair.
-    pub(super) promoted_source_nodes: Vec<HeaderNode>,
+    /// Repair classification compares this image to [`Self::header_nodes`] so only
+    /// reconstructed inherited-eligibility differences are classified as cache repairs.
+    pub(super) source_nodes: Vec<HeaderNode>,
     pub(super) header_nodes: Vec<HeaderNode>,
     pub(super) header_child_edges: Vec<(block::Hash, block::Hash)>,
     pub(super) selected_projection: Vec<Frontier>,
@@ -48,7 +48,6 @@ pub(super) struct ReconstructedDerivedViews {
     pub(super) deferred_entries: Vec<(DateTime<Utc>, block::Hash)>,
     pub(super) selected_tip: Frontier,
     pub(super) selected_score: ChainScore,
-    pub(super) elapsed_deferrals: bool,
     pub(super) oldest_retained_height: block::Height,
     pub(super) body_unavailable_alarm: Option<crate::BodyUnavailableSummary>,
 }
@@ -65,7 +64,8 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
     if snapshot_before_repair != metadata.snapshot()
         || metadata.disk_format != crate::HeaderChainDiskVersion::CURRENT
         || metadata.mode != config.mode
-        || metadata.network_id != config.network.kind()
+        || metadata.network_id != config.network().kind()
+        || metadata.network_policy_digest != config.network_policy_digest()
         || trust_anchor_changed && !allow_trust_anchor_update
     {
         return Err(source_failure(AuditViolation::Configuration));

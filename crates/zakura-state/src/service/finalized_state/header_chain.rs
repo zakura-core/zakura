@@ -504,6 +504,55 @@ fn load_transition_engine(
     .map_err(|_| HeaderChainStoreError::Incoherent("audited engine state is invalid"))
 }
 
+/// Return true when a recovered deferral is due, comparing every entry against one instant.
+fn any_deferral_is_due(plan: &zakura_header_chain::RecoveryPlan) -> bool {
+    let now = Utc::now();
+    plan.deferred_entries.iter().any(|(until, _)| *until <= now)
+}
+
+/// Reevaluate due recovered deferrals before constructing a publisher.
+///
+/// The function uses the normal planner and durable commit path. It leaves the recovered engine
+/// unchanged when no deferral is due or when the planner derives no change. It propagates planner
+/// failures because the runtime would immediately repeat the due transition. Any retryable
+/// planning failure needs an explicit classification and a bounded retry policy. On success, the
+/// returned engine matches the durable state that the caller may publish.
+fn settle_deferred_before_publication(
+    store: &HeaderChainStore,
+    config: &EngineConfig,
+    has_due_deferred: bool,
+) -> Result<HeaderChainEngine, HeaderChainStoreError> {
+    let mut engine = load_transition_engine(store)?;
+    if !has_due_deferred {
+        return Ok(engine);
+    }
+    let before = engine.snapshot();
+    let context = TransitionContext {
+        config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    let transition = engine.plan_transition(
+        TransitionInput::ReevaluateDeferred {
+            expected_version: before.state_version,
+        },
+        &context,
+    )?;
+    if transition.is_no_change() {
+        return Ok(engine);
+    }
+
+    let migrated_pin_refuted = transition.change_set().metadata.alarms.migrated_pin_refuted;
+    let batch = store.batch_for(transition.change_set())?;
+    store.db.write(batch)?;
+    engine.install_committed_transition(transition)?;
+    if let Some(pin) = migrated_pin_refuted {
+        return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
+    }
+    Ok(engine)
+}
+
 fn restore_transition_engine_after_staging_error(
     store: &HeaderChainStore,
     engine: &mut HeaderChainEngine,
@@ -1157,7 +1206,7 @@ impl HeaderChainReader {
             return Ok(None);
         }
         self.store
-            .validation_context(parent_hash, &self.config.network)
+            .validation_context(parent_hash, self.config.network())
             .map(Some)
             .map_err(HeaderChainStoreError::Store)
     }
@@ -2110,7 +2159,7 @@ impl HeaderChainRuntime {
         } else {
             vec![self
                 .store
-                .validation_context(checkpoint_parent.hash, &self.config.network)?]
+                .validation_context(checkpoint_parent.hash, self.config.network())?]
         };
         let checkpoint_authority = StateIssuedAuthority {
             inner: checkpoint_context.full_state_authority,
@@ -2428,7 +2477,7 @@ impl HeaderChainRuntime {
             .map(HeaderSyncWorkOwner::header_authority)
             .map(|authority| authority.branch)
             .or_else(|| request.event.body_owner().map(|owner| owner.branch));
-        let input = self.build_transition_input(request, &before, &base_context.config.network)?;
+        let input = self.build_transition_input(request, &before, base_context.config.network())?;
         let validation_leases = input
             .header_validation_facts()
             .map(|facts| facts.validation_leases.clone())
@@ -2707,8 +2756,11 @@ impl HeaderChainStore {
             #[cfg(test)]
             fault(FaultPoint::AfterCommit)?;
         }
-        let transition_engine = Arc::new(Mutex::new(load_transition_engine(&self)?));
-        let current = plan.metadata.snapshot();
+        let has_due_deferred = any_deferral_is_due(&plan);
+        let transition_engine =
+            settle_deferred_before_publication(&self, config, has_due_deferred)?;
+        let current = transition_engine.snapshot();
+        let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
             current: current.clone(),
@@ -2789,8 +2841,11 @@ impl HeaderChainStore {
         if !target.is_clean() {
             self.db.write(self.recovery_batch(&target)?)?;
         }
-        let transition_engine = Arc::new(Mutex::new(load_transition_engine(&self)?));
-        let current = target.metadata.snapshot();
+        let has_due_deferred = any_deferral_is_due(&target);
+        let transition_engine =
+            settle_deferred_before_publication(&self, integrated_config, has_due_deferred)?;
+        let current = transition_engine.snapshot();
+        let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
             current: current.clone(),
@@ -2864,8 +2919,11 @@ impl HeaderChainStore {
         if !final_audit.is_clean() {
             self.db.write(self.recovery_batch(&final_audit)?)?;
         }
-        let transition_engine = Arc::new(Mutex::new(load_transition_engine(&self)?));
-        let current = final_audit.metadata.snapshot();
+        let has_due_deferred = any_deferral_is_due(&final_audit);
+        let transition_engine =
+            settle_deferred_before_publication(&self, config, has_due_deferred)?;
+        let current = transition_engine.snapshot();
+        let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
             current: current.clone(),
@@ -2924,7 +2982,7 @@ impl HeaderChainStore {
             ));
         }
         let base = snapshot.frontiers.finalized;
-        let network = config.network.kind();
+        let network = config.network().kind();
         let mut progress = match self.reconstruction_progress()? {
             Some(mut progress) => {
                 if progress.network != network
@@ -3077,8 +3135,11 @@ impl HeaderChainStore {
             self.db.write(self.recovery_batch(&final_audit)?)?;
         }
         self.clear_reconstruction_progress()?;
-        let transition_engine = Arc::new(Mutex::new(load_transition_engine(&self)?));
-        let current = final_audit.metadata.snapshot();
+        let has_due_deferred = any_deferral_is_due(&final_audit);
+        let transition_engine =
+            settle_deferred_before_publication(&self, config, has_due_deferred)?;
+        let current = transition_engine.snapshot();
+        let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
             current: current.clone(),
@@ -3145,7 +3206,7 @@ impl HeaderChainStore {
             cause: VerifiedChangeCause::Reset,
         });
         let validation_context =
-            self.validation_context(snapshot.frontiers.finalized.hash, &config.network)?;
+            self.validation_context(snapshot.frontiers.finalized.hash, config.network())?;
         let authority = Authority {
             event: event
                 .fingerprint()
@@ -3899,9 +3960,7 @@ impl HeaderChainStore {
 
     fn recovery_batch(&self, plan: &RecoveryPlan) -> Result<DiskWriteBatch, HeaderChainStoreError> {
         let mut batch = DiskWriteBatch::new();
-        if plan.repairs.contains(&RecoveryRepair::InheritedEligibility)
-            || plan.repairs.contains(&RecoveryRepair::ElapsedDeferrals)
-        {
+        if plan.repairs.contains(&RecoveryRepair::InheritedEligibility) {
             for node in &plan.header_nodes {
                 self.put_value(
                     &mut batch,

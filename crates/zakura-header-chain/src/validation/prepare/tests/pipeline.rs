@@ -43,7 +43,7 @@ fn fixture() -> (HeaderRules, ValidationLease, Arc<block::Header>) {
             frontier: anchor,
             header: anchor_header.clone(),
         }],
-        config.network.clone(),
+        config.network().clone(),
         config.trust_anchor_digest(),
     );
     (rules, lease, anchor_header)

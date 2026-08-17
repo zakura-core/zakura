@@ -71,7 +71,7 @@ struct LogicalRow {
 /// Replay bounded raw row mutations through the production startup audit and repair path.
 pub fn replay_recovery_rows_bytes(data: &[u8]) -> RecoveryRowsReplaySummary {
     let (config, anchor, metadata) = fixture();
-    let db = open(&config.network);
+    let db = open(config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata.clone(), anchor)
@@ -200,7 +200,7 @@ fn replay_mode_operations(operations: &[[u8; 4]]) -> (usize, usize, usize) {
         headers_only_config.mode = EngineMode::HeadersOnly;
         metadata.mode = EngineMode::HeadersOnly;
         let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
-        let db = open(&integrated_config.network);
+        let db = open(integrated_config.network());
         let store = HeaderChainStore::new(db.clone());
         store
             .initialize(metadata, anchor)
@@ -496,7 +496,8 @@ fn fixture() -> (EngineConfig, HeaderNode, EngineMetadata) {
     let metadata = EngineMetadata {
         disk_format: HeaderChainDiskVersion::CURRENT,
         mode: EngineMode::Integrated,
-        network_id: config.network.kind(),
+        network_id: config.network().kind(),
+        network_policy_digest: config.network_policy_digest(),
         anchor_manifest_digest: config.trust_anchor_digest(),
         work_origin: frontier,
         state_version: StateVersion::new(1),

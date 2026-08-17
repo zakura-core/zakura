@@ -40,7 +40,7 @@ pub(super) fn admit_prepared_headers(
         })?;
     let parent_frontier = Frontier::new(parent_node.height, parent_node.hash);
     if receipt.parent() != parent_frontier
-        || receipt.network() != &context.config.network
+        || receipt.network() != context.config.network()
         || receipt.trust_anchor_digest() != context.config.trust_anchor_digest()
     {
         return Err(TransitionFailure::StalePreparation);
@@ -99,7 +99,7 @@ pub(super) fn admit_prepared_headers(
             prepared.header.time,
             prepared.header.difficulty_threshold,
             parent.height,
-            &context.config.network,
+            context.config.network(),
             contextual.iter().copied(),
             crate::HeaderValidationSource::Prepared,
         )?;

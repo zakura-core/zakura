@@ -84,6 +84,18 @@ pub struct FinalityRecord {
     pub epoch: FinalityEpoch,
 }
 
+impl FinalityRecord {
+    /// Return the selected-tip witness when this record has the exact headers-only depth shape.
+    pub(crate) fn headers_only_depth_witness(self, depth: u32) -> Option<Frontier> {
+        let FinalitySource::HeadersOnlyDepth { selected_tip } = self.source else {
+            return None;
+        };
+        (self.current.height > self.previous.height
+            && selected_tip.height.0.checked_sub(self.current.height.0) == Some(depth))
+        .then_some(selected_tip)
+    }
+}
+
 /// Authenticated frontier immediately before the retained finality-history window.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct FinalityHistoryCheckpoint {

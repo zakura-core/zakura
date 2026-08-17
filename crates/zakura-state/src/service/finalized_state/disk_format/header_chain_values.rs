@@ -100,7 +100,13 @@ pub enum HeaderChainValueError {
     #[error("header-node hash does not match its canonical header")]
     HeaderHashMismatch,
     /// The singleton metadata used an unsupported disk format.
-    #[error("unsupported header-chain disk format {0}")]
+    #[error(
+        "unsupported header-chain disk format {found}: this build stores format {current} and \
+         startup found no migration to it, so the state directory must be deleted and \
+         resynchronized",
+        found = .0,
+        current = HeaderChainDiskVersion::CURRENT.0
+    )]
     UnsupportedDiskFormat(u32),
     /// Chrono cannot represent the UTC seconds and nanoseconds pair.
     #[error("invalid UTC timestamp")]
@@ -1479,6 +1485,7 @@ impl FallibleDiskValue for EngineMetadata {
             NetworkKind::Testnet => 1,
             NetworkKind::Regtest => 2,
         });
+        encoder.fixed(&value.network_policy_digest);
         encoder.fixed(&value.anchor_manifest_digest);
         put_frontier(&mut encoder, value.work_origin);
         encoder.u64(value.state_version.get());
@@ -1512,21 +1519,30 @@ impl FallibleDiskValue for EngineMetadata {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
-        decode_engine_metadata(bytes, HeaderChainDiskVersion::CURRENT)
+        decode_engine_metadata(bytes, None)
     }
 }
 
 /// Decode metadata that carries the released version-one marker.
+///
+/// Version one predates the durable network policy. The migration accepts this decoded metadata
+/// only when the recorded network kind identifies one fixed policy.
 pub(crate) fn decode_v1_engine_metadata(
     bytes: &[u8],
+    network_policy_digest: [u8; 32],
 ) -> Result<EngineMetadata, HeaderChainValueError> {
-    decode_engine_metadata(bytes, HeaderChainDiskVersion(1))
+    decode_engine_metadata(bytes, Some(network_policy_digest))
 }
 
+/// Decode metadata, reading the network policy digest unless the caller supplies a version-one one.
 fn decode_engine_metadata(
     bytes: &[u8],
-    expected_disk_format: HeaderChainDiskVersion,
+    v1_network_policy_digest: Option<[u8; 32]>,
 ) -> Result<EngineMetadata, HeaderChainValueError> {
+    let expected_disk_format = match v1_network_policy_digest {
+        Some(_) => HeaderChainDiskVersion(1),
+        None => HeaderChainDiskVersion::CURRENT,
+    };
     let mut decoder = Decoder::new(bytes);
     let disk_format = decoder.u32()?;
     if disk_format != expected_disk_format.0 {
@@ -1553,6 +1569,10 @@ fn decode_engine_metadata(
                 value,
             })
         }
+    };
+    let network_policy_digest = match v1_network_policy_digest {
+        Some(digest) => digest,
+        None => decoder.array()?,
     };
     let anchor_manifest_digest = decoder.array()?;
     let work_origin = get_frontier(&mut decoder)?;
@@ -1594,6 +1614,7 @@ fn decode_engine_metadata(
         disk_format,
         mode,
         network_id,
+        network_policy_digest,
         anchor_manifest_digest,
         work_origin,
         state_version,
@@ -1879,6 +1900,7 @@ mod tests {
             disk_format: HeaderChainDiskVersion::CURRENT,
             mode: EngineMode::HeadersOnly,
             network_id: NetworkKind::Regtest,
+            network_policy_digest: [12; 32],
             anchor_manifest_digest: [13; 32],
             work_origin: frontier(0, 1),
             state_version: StateVersion::new(2),
@@ -1921,16 +1943,19 @@ mod tests {
             )),
         };
         let bytes = metadata.encode().expect("metadata encodes");
-        assert_eq!(&bytes[..6], &[0, 0, 0, 2, 1, 2]);
+        assert_eq!(&bytes[..6], &[0, 0, 0, 3, 1, 2]);
         assert_eq!(EngineMetadata::decode(&bytes), Ok(metadata.clone()));
+        // Version one wrote no network policy digest, so its row is the current row with the
+        // marker rolled back and that field removed.
         let mut version_one_bytes = bytes.clone();
         version_one_bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
+        version_one_bytes.drain(6..38);
         assert_eq!(
             EngineMetadata::decode(&version_one_bytes),
             Err(HeaderChainValueError::UnsupportedDiskFormat(1))
         );
         assert_eq!(
-            decode_v1_engine_metadata(&version_one_bytes),
+            decode_v1_engine_metadata(&version_one_bytes, metadata.network_policy_digest),
             Ok(EngineMetadata {
                 disk_format: HeaderChainDiskVersion(1),
                 ..metadata.clone()
@@ -1949,7 +1974,7 @@ mod tests {
         );
         // These digests pin the on-disk encodings. Regenerate a digest only together with a
         // deliberate encoding change; an unexplained change means a value's layout drifted.
-        // The metadata digest last moved when the header-chain disk version advanced to 2.
+        // The metadata digest last moved when the header-chain disk version advanced to 3.
         assert_eq!(
             [
                 digest(&aux.encode().expect("aux encodes")),
@@ -1959,7 +1984,7 @@ mod tests {
             [
                 "c041fc819cc43fcd28dd3ba7fe296271ae0c7225c9bbcdf1dd38152dc313346a",
                 "b887bf384510dfb1a255221a8c97066617cb145eaf3e272ad70dc94cd17a3802",
-                "3f4965a634583e651b4904de0601c44e934719dbcb4e22a783bf052b7c21e9eb",
+                "a57d37f3cadf2a983019c448ab61b130b1a2230af1e8206b6020c759d37984dc",
             ]
         );
     }
@@ -2036,13 +2061,13 @@ mod tests {
                 ..
             })
         ));
-        let mut metadata = vec![0, 0, 0, 3];
+        let mut metadata = vec![0, 0, 0, 4];
         metadata.resize(512, 0);
         assert_eq!(
             EngineMetadata::decode(&metadata),
-            Err(HeaderChainValueError::UnsupportedDiskFormat(3))
+            Err(HeaderChainValueError::UnsupportedDiskFormat(4))
         );
-        metadata[3] = 2;
+        metadata[3] = 3;
         metadata[4] = 9;
         assert!(matches!(
             EngineMetadata::decode(&metadata),

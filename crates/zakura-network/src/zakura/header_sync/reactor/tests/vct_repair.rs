@@ -218,7 +218,7 @@ async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
             frontier: anchor,
             header: regtest_genesis_block().header.clone(),
         }],
-        engine_config.network.clone(),
+        engine_config.network().clone(),
         engine_config.trust_anchor_digest(),
     );
     let rules = zakura_header_chain::HeaderRules::for_validation_lease(&lease)

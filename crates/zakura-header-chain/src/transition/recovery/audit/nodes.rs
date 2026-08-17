@@ -70,7 +70,7 @@ fn header_consensus_is_valid(
 ) -> bool {
     if crate::validation::validate_trusted_anchor_observables(
         &node.header,
-        &config.network,
+        config.network(),
         node.height,
     ) != Ok(node.hash)
     {
@@ -98,7 +98,7 @@ fn header_consensus_is_valid(
     let Ok(adjustment) = crate::AdjustedDifficulty::new_from_header_time(
         node.header.time,
         parent_height,
-        &config.network,
+        config.network(),
         context,
     ) else {
         return false;

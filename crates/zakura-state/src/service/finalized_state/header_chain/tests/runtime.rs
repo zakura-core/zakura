@@ -4,7 +4,7 @@ use super::*;
 fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the empty schema initializes");
@@ -81,7 +81,7 @@ fn publisher_mirror_stays_absent_until_attachment_then_tracks_commits() {
 fn coherent_reader_builds_locator_from_the_durable_selected_projection() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the empty schema initializes");
@@ -107,7 +107,7 @@ fn coherent_reader_builds_locator_from_the_durable_selected_projection() {
 fn body_refill_snapshot_holds_the_complete_transition_barrier() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the empty schema initializes");
@@ -135,7 +135,7 @@ fn body_refill_snapshot_holds_the_complete_transition_barrier() {
 fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the empty schema initializes");
@@ -192,7 +192,7 @@ fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
 async fn retained_path_serves_a_locator_before_the_header_retention_window() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let db = open(&db_config, &engine_config.network);
+    let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata, anchor.clone())
@@ -408,7 +408,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the empty schema initializes");

@@ -19,6 +19,23 @@ use zakura_chain::{
 
 use crate::Frontier;
 
+/// Digest of every network parameter used by header validation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct NetworkPolicyDigest([u8; 32]);
+
+impl NetworkPolicyDigest {
+    fn for_network(network: &Network) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-header-chain-network-policy-v1");
+        crate::transition::hash_network_policy(&mut hasher, network);
+        Self(hasher.finalize().into())
+    }
+
+    const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
 /// Exact v1 maximum number of retained non-finalized header nodes.
 pub const MAX_NON_FINALIZED_NODES_V1: usize = 65_536;
 /// Exact v1 maximum number of staged unknown targets across all peers.
@@ -195,8 +212,8 @@ impl SettledUpgradeManifest {
 pub struct EngineConfig {
     /// Finality authority mode.
     pub mode: EngineMode,
-    /// Authenticated network parameters.
-    pub network: Network,
+    /// Authenticated network parameters, closed over by the cached policy digest.
+    network: Network,
     /// Exact trusted bootstrap anchor.
     bootstrap_anchor: TrustedAnchor,
     /// Optional authenticated local checkpoints.
@@ -207,6 +224,8 @@ pub struct EngineConfig {
     pub limits: EngineLimits,
     /// Cached digest of the immutable trust-anchor fields.
     trust_anchor_digest: [u8; 32],
+    /// Cached digest of every immutable network validation parameter.
+    network_policy_digest: NetworkPolicyDigest,
     /// Transition verification uses these cached, sorted, immutable trust pins.
     trust_pins: Arc<[Frontier]>,
 }
@@ -237,8 +256,15 @@ impl EngineConfig {
                 .pin_for_network(&network)
                 .ok_or(EngineConfigError::MissingSettledPin(network.kind()))?;
         }
+        validate_trust_pin_consistency(
+            &settled_manifest,
+            &network,
+            bootstrap_anchor.frontier,
+            &local_checkpoints,
+        )?;
         let trust_anchor_digest =
             trust_anchor_digest(&settled_manifest, &bootstrap_anchor, &local_checkpoints);
+        let network_policy_digest = NetworkPolicyDigest::for_network(&network);
         let trust_pins = trust_pins(&settled_manifest, &network, &local_checkpoints);
         Ok(Self {
             mode,
@@ -248,6 +274,7 @@ impl EngineConfig {
             settled_manifest,
             limits: EngineLimits::v1(),
             trust_anchor_digest,
+            network_policy_digest,
             trust_pins,
         })
     }
@@ -270,6 +297,16 @@ impl EngineConfig {
     /// Digest binding every absolute trust anchor used by validation and startup.
     pub const fn trust_anchor_digest(&self) -> [u8; 32] {
         self.trust_anchor_digest
+    }
+
+    /// Authenticated network parameters that [`Self::network_policy_digest`] binds.
+    pub const fn network(&self) -> &Network {
+        &self.network
+    }
+
+    /// Digest binding every network parameter used by header validation.
+    pub const fn network_policy_digest(&self) -> [u8; 32] {
+        self.network_policy_digest.bytes()
     }
 
     /// This method returns the cached trust pins for transition verification.
@@ -315,14 +352,56 @@ fn trust_pins(
     network: &Network,
     local_checkpoints: &CheckpointSet,
 ) -> Arc<[Frontier]> {
-    let mut pins: Vec<_> = local_checkpoints.iter().collect();
+    let mut pins: BTreeMap<_, _> = local_checkpoints
+        .iter()
+        .map(|pin| (pin.height, pin.hash))
+        .collect();
     if let Some(pin) = settled_manifest.pin_for_network(network) {
-        let key = (pin.activation.height, pin.activation.hash.0);
-        if let Err(index) = pins.binary_search_by_key(&key, |pin| (pin.height, pin.hash.0)) {
-            pins.insert(index, pin.activation);
+        pins.entry(pin.activation.height)
+            .or_insert(pin.activation.hash);
+    }
+    pins.into_iter()
+        .map(|(height, hash)| Frontier::new(height, hash))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// Ensure independent trust sources agree whenever they pin the same height.
+///
+/// Exact duplicate frontiers are valid. Different hashes at one height are
+/// rejected because no canonical chain can satisfy both trust requirements.
+fn validate_trust_pin_consistency(
+    settled_manifest: &SettledUpgradeManifest,
+    network: &Network,
+    bootstrap_anchor: Frontier,
+    local_checkpoints: &CheckpointSet,
+) -> Result<(), EngineConfigError> {
+    let settled = settled_manifest
+        .pin_for_network(network)
+        .into_iter()
+        .map(|pin| (pin.activation, "release pin"));
+    let mut pins_by_height: BTreeMap<block::Height, (block::Hash, &'static str)> = BTreeMap::new();
+    for (pin, source) in std::iter::once((bootstrap_anchor, "bootstrap anchor"))
+        .chain(settled)
+        .chain(
+            local_checkpoints
+                .iter()
+                .map(|pin| (pin, "local checkpoint")),
+        )
+    {
+        if let Some((expected, expected_source)) = pins_by_height.get(&pin.height) {
+            if *expected != pin.hash {
+                return Err(EngineConfigError::ConflictingTrustPin {
+                    height: pin.height,
+                    first_source: expected_source,
+                    second_source: source,
+                });
+            }
+        } else {
+            pins_by_height.insert(pin.height, (pin.hash, source));
         }
     }
-    pins.into()
+    Ok(())
 }
 
 /// Invalid immutable engine or trust-anchor configuration.
@@ -342,6 +421,16 @@ pub enum EngineConfigError {
     /// Two local checkpoints name different hashes at one height.
     #[error("conflicting local checkpoint at {0:?}")]
     ConflictingCheckpoint(block::Height),
+    /// Two independently authenticated trust sources name different hashes at one height.
+    #[error("conflicting trust pin at {height:?} between {first_source} and {second_source}")]
+    ConflictingTrustPin {
+        /// Height pinned to different hashes.
+        height: block::Height,
+        /// Source that supplied the first hash.
+        first_source: &'static str,
+        /// Source that supplied the second hash.
+        second_source: &'static str,
+    },
     /// A compiled settled hash failed canonical parsing.
     #[error("malformed compiled settled pin for {0:?}")]
     MalformedSettledPin(NetworkKind),
@@ -419,8 +508,9 @@ mod tests {
     use super::*;
     use zakura_chain::{
         block::{genesis::regtest_genesis_block, Block},
-        parameters::testnet::RegtestParameters,
+        parameters::testnet::{ConfiguredActivationHeights, Parameters, RegtestParameters},
         serialization::ZcashDeserialize,
+        work::difficulty::U256,
     };
 
     #[test]
@@ -502,6 +592,209 @@ mod tests {
             .expect("the production genesis anchor passes every direct check");
             assert!(config.settled_manifest.pin_for_network(&network).is_some());
         }
+    }
+
+    #[test]
+    fn network_policy_digest_binds_every_validation_parameter() {
+        let network = |name: &str| {
+            Parameters::build()
+                .with_network_name(name)
+                .expect("the custom network name is valid")
+                .clear_funding_streams()
+        };
+        let baseline = network("PolicyBaseline")
+            .to_network()
+            .expect("the baseline policy is valid");
+        let pow_disabled = network("PolicyPowDisabled")
+            .with_disable_pow(true)
+            .to_network()
+            .expect("the disabled-PoW policy is valid");
+        let different_limit = network("PolicyDifficulty")
+            .with_target_difficulty_limit(U256::from(0x1234_u32))
+            .expect("the target limit is valid")
+            .to_network()
+            .expect("the difficulty policy is valid");
+        let activation_ten = network("PolicyActivationTen")
+            .with_activation_heights(ConfiguredActivationHeights {
+                canopy: Some(10),
+                ..Default::default()
+            })
+            .expect("the activation policy is ordered")
+            .to_network()
+            .expect("the activation policy is valid");
+        let activation_eleven = network("PolicyActivationEleven")
+            .with_activation_heights(ConfiguredActivationHeights {
+                canopy: Some(11),
+                ..Default::default()
+            })
+            .expect("the activation policy is ordered")
+            .to_network()
+            .expect("the activation policy is valid");
+        let different_branch = network("PolicyBranch")
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu5: Some(10),
+                ..Default::default()
+            })
+            .expect("the branch policy is ordered")
+            .to_network()
+            .expect("the branch policy is valid");
+        let different_max_time = network("PolicyMaxTime")
+            .with_max_block_time_start_height(block::Height(7))
+            .to_network()
+            .expect("the maximum-time policy is valid");
+
+        let digest = |network| NetworkPolicyDigest::for_network(&network);
+        assert_ne!(digest(baseline.clone()), digest(pow_disabled));
+        assert_ne!(digest(baseline.clone()), digest(different_limit));
+        assert_ne!(digest(activation_ten.clone()), digest(activation_eleven));
+        assert_ne!(digest(activation_ten), digest(different_branch));
+        assert_ne!(digest(baseline), digest(different_max_time));
+    }
+
+    #[test]
+    fn network_policy_digest_production_vectors_are_stable() {
+        assert_eq!(
+            NetworkPolicyDigest::for_network(&Network::Mainnet).bytes(),
+            [
+                194, 57, 177, 97, 206, 155, 29, 146, 54, 0, 199, 228, 234, 86, 92, 5, 64, 147, 209,
+                14, 202, 8, 85, 60, 63, 148, 123, 33, 130, 251, 214, 146,
+            ],
+        );
+        assert_eq!(
+            NetworkPolicyDigest::for_network(&Network::new_default_testnet()).bytes(),
+            [
+                142, 170, 84, 198, 97, 138, 9, 46, 120, 73, 23, 105, 58, 135, 75, 69, 51, 1, 2,
+                176, 60, 219, 147, 52, 105, 73, 48, 188, 172, 74, 57, 181,
+            ],
+        );
+    }
+
+    #[test]
+    fn engine_config_rejects_conflicting_trust_sources() {
+        let regtest_block = regtest_genesis_block();
+        let regtest_network = Network::new_regtest(RegtestParameters::default());
+        let regtest_anchor = TrustedAnchor {
+            frontier: Frontier::new(block::Height(0), regtest_block.hash()),
+            header: regtest_block.header.clone(),
+        };
+        EngineConfig::new(
+            EngineMode::HeadersOnly,
+            regtest_network.clone(),
+            regtest_anchor.clone(),
+            CheckpointSet::new([regtest_anchor.frontier])
+                .expect("the matching bootstrap checkpoint is unique"),
+        )
+        .expect("identical bootstrap and local trust pins agree");
+        assert_eq!(
+            EngineConfig::new(
+                EngineMode::HeadersOnly,
+                regtest_network,
+                regtest_anchor,
+                CheckpointSet::new([Frontier::new(block::Height(0), block::Hash([9; 32]))])
+                    .expect("the conflicting bootstrap checkpoint is unique"),
+            ),
+            Err(EngineConfigError::ConflictingTrustPin {
+                height: block::Height(0),
+                first_source: "bootstrap anchor",
+                second_source: "local checkpoint",
+            })
+        );
+
+        let mainnet_block = Arc::<Block>::zcash_deserialize(
+            zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
+        )
+        .expect("the mainnet genesis vector is canonical");
+        let mainnet_anchor = TrustedAnchor {
+            frontier: Frontier::new(block::Height(0), mainnet_block.hash()),
+            header: mainnet_block.header.clone(),
+        };
+        let manifest = SettledUpgradeManifest::for_release().expect("compiled pins are valid");
+        let settled = manifest
+            .pin_for_network(&Network::Mainnet)
+            .expect("mainnet has a settled pin")
+            .activation;
+        let matching = EngineConfig::new(
+            EngineMode::Integrated,
+            Network::Mainnet,
+            mainnet_anchor.clone(),
+            CheckpointSet::new([settled]).expect("the matching settled checkpoint is unique"),
+        )
+        .expect("identical settled and local trust pins agree");
+        assert_eq!(
+            matching
+                .trust_pins()
+                .iter()
+                .filter(|pin| pin.height == settled.height)
+                .count(),
+            1,
+            "the effective trust pins contain one hash per height"
+        );
+
+        let conflicting_hash = block::Hash([0x5c; 32]);
+        assert_ne!(conflicting_hash, settled.hash);
+        assert_eq!(
+            EngineConfig::new(
+                EngineMode::Integrated,
+                Network::Mainnet,
+                mainnet_anchor,
+                CheckpointSet::new([Frontier::new(settled.height, conflicting_hash)])
+                    .expect("the conflicting settled checkpoint is unique"),
+            ),
+            Err(EngineConfigError::ConflictingTrustPin {
+                height: settled.height,
+                first_source: "release pin",
+                second_source: "local checkpoint",
+            })
+        );
+
+        validate_trust_pin_consistency(
+            &manifest,
+            &Network::Mainnet,
+            settled,
+            &CheckpointSet::default(),
+        )
+        .expect("identical bootstrap and settled trust pins agree");
+        assert_eq!(
+            validate_trust_pin_consistency(
+                &manifest,
+                &Network::Mainnet,
+                Frontier::new(settled.height, conflicting_hash),
+                &CheckpointSet::default(),
+            ),
+            Err(EngineConfigError::ConflictingTrustPin {
+                height: settled.height,
+                first_source: "bootstrap anchor",
+                second_source: "release pin",
+            })
+        );
+
+        let first = Frontier::new(block::Height(2), block::Hash([0x21; 32]));
+        let second = Frontier::new(block::Height(3), block::Hash([0x22; 32]));
+        let ordered = EngineConfig::new(
+            EngineMode::HeadersOnly,
+            Network::new_regtest(RegtestParameters::default()),
+            TrustedAnchor {
+                frontier: Frontier::new(block::Height(0), regtest_block.hash()),
+                header: regtest_block.header.clone(),
+            },
+            CheckpointSet::new([first, second]).expect("the ordered checkpoints are unique"),
+        )
+        .expect("the ordered trust pins agree");
+        let reversed = EngineConfig::new(
+            EngineMode::HeadersOnly,
+            Network::new_regtest(RegtestParameters::default()),
+            TrustedAnchor {
+                frontier: Frontier::new(block::Height(0), regtest_block.hash()),
+                header: regtest_block.header.clone(),
+            },
+            CheckpointSet::new([second, first]).expect("the reversed checkpoints are unique"),
+        )
+        .expect("the reversed trust pins agree");
+        assert_eq!(ordered.trust_pins(), reversed.trust_pins());
+        assert_eq!(
+            ordered.trust_anchor_digest(),
+            reversed.trust_anchor_digest()
+        );
     }
 
     #[test]

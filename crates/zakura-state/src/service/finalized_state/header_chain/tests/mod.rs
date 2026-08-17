@@ -24,7 +24,11 @@ use crate::{
 };
 use zakura_chain::{
     block::genesis::regtest_genesis_block,
-    parameters::{testnet::RegtestParameters, Network},
+    parameters::{
+        testnet::{ConfiguredActivationHeights, RegtestParameters},
+        Network,
+    },
+    serialization::ZcashDeserializeInto,
 };
 use zakura_header_chain::{
     AlarmSet, BodyCommitmentKind, BodyEvidence, BodyPayloadMismatch, BodyRuleId,
@@ -91,6 +95,20 @@ fn open(config: &Config, network: &Network) -> DiskDb {
 fn fixture() -> (EngineConfig, HeaderNode, EngineMetadata) {
     let network = Network::new_regtest(RegtestParameters::default());
     let block = regtest_genesis_block();
+    fixture_for_network(network, block)
+}
+
+fn mainnet_fixture() -> (EngineConfig, HeaderNode, EngineMetadata) {
+    let block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the Mainnet genesis fixture deserializes");
+    fixture_for_network(Network::Mainnet, block)
+}
+
+fn fixture_for_network(
+    network: Network,
+    block: Arc<block::Block>,
+) -> (EngineConfig, HeaderNode, EngineMetadata) {
     let frontier = Frontier::new(block::Height(0), block.hash());
     let config = EngineConfig::new(
         EngineMode::Integrated,
@@ -101,12 +119,12 @@ fn fixture() -> (EngineConfig, HeaderNode, EngineMetadata) {
         },
         CheckpointSet::default(),
     )
-    .expect("the regtest engine configuration is coherent");
+    .expect("the engine configuration is coherent");
     let work = block
         .header
         .difficulty_threshold
         .to_work()
-        .expect("the regtest genesis target has exact work");
+        .expect("the genesis target has exact work");
     let node = HeaderNode::from_durable_parts(
         block.header.clone(),
         frontier.hash,
@@ -123,7 +141,8 @@ fn fixture() -> (EngineConfig, HeaderNode, EngineMetadata) {
     let metadata = EngineMetadata {
         disk_format: HeaderChainDiskVersion::CURRENT,
         mode: EngineMode::Integrated,
-        network_id: config.network.kind(),
+        network_id: config.network().kind(),
+        network_policy_digest: config.network_policy_digest(),
         anchor_manifest_digest: config.trust_anchor_digest(),
         work_origin: frontier,
         state_version: StateVersion::new(1),

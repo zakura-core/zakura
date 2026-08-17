@@ -24,6 +24,10 @@ requirements. The [conformance manifest](../../conformance.toml) maps those requ
 - `EngineMetadata` holds the frontiers, score, retention floor, alarms, replay fingerprint, configuration identity,
   and counters.
 
+The configuration identity includes the complete fixed network-policy field set. Recovery compares that digest
+before it visits any durable collection. Configuration construction also rejects conflicting bootstrap, release,
+and local trust pins at the same height.
+
 The counters describe different kinds of change:
 
 - `state_version` advances for every actual header-chain effect.
@@ -42,7 +46,9 @@ configuration, time, authenticated capabilities, and active retention references
 
 The planner never mutates the source engine. It builds a `PlanCandidate` over a graph overlay that stages edits without
 changing the source graph. The resulting `EngineTransition` exposes the before and after snapshots, exact `ChangeSet`,
-domain, and effects through a crate-private verified `TransitionPlan`.
+domain, and effects through a crate-private verified `TransitionPlan`. The plan also retains a private engine-instance
+capability and the exact source revision. Installation compares both values in constant time before it mutates the
+engine.
 
 Planning has six phases:
 
@@ -95,12 +101,13 @@ finishes.
 - Fork choice selects the deterministic greatest-work eligible tip.
 - Integrated finality must lie on the verified projection and must come from
   authenticated full-state evidence.
+- Full-state path admission checks every supplied member against its retained hash, parent, height, validation,
+  eligibility, and permanent body-invalid state.
 - Headers-only finality advances a local depth pin when the selected path
   exceeds the configured depth.
 - Finality removes old ancestors and competing sibling subtrees. It also
   rebases retained work coordinates to the new anchor.
-- Retention protects selected and verified paths, every retained full-state-verified body path, and active retention
-  references.
+- Retention protects the selected and verified paths plus authenticated active validation-context references.
 - Retention evicts only weaker unprotected branches.
 
 When protected paths alone exceed the limits, settlement discards the event's projected effects. It returns a verified
@@ -156,8 +163,9 @@ node identity, ancestry, work, validation, body authority, trust pins, eligibili
 finality, configuration, protected paths, or limits.
 
 After that audit, recovery reconstructs derived views. These views include
-indexes, projections, inherited eligibility, retention metadata, elapsed time
-deferrals, and the selected-tip body-unavailability alarm.
+indexes, projections, inherited eligibility, retention metadata, the deferred
+index, and the selected-tip body-unavailability alarm. Recovery preserves each
+deferred node's authoritative validation state, even after its deadline.
 
 The audit returns a `RecoveryPlan`. The plan contains corrected metadata, graph
 rows, indexes, projections, deferred entries, and an exact set of
@@ -165,8 +173,15 @@ rows, indexes, projections, deferred entries, and an exact set of
 needs a repair.
 
 For a fixed store snapshot, configuration, and recovery time, the audit returns
-the same plan. `audit_store_for_trust_anchor_update` permits only the audited
-manifest-digest rebind in addition to ordinary reconstructible repairs.
+the same plan without performing a time-based state transition.
+`audit_store_for_trust_anchor_update` permits only the audited manifest-digest
+rebind in addition to ordinary reconstructible repairs. The startup adapter
+runs one normal `ReevaluateDeferred` transition before it constructs the
+publisher. Recovery authenticates each settled headers-only selected-tip witness
+through the independent canonical index. Recovery authenticates each witness
+above the finalized frontier through a bounded retained-row parent walk to the
+current finalized frontier. Recovery authenticates every historical current
+frontier through the linked predecessor context or the canonical index.
 
 ## Changing the transition model
 

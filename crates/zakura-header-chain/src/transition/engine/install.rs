@@ -40,13 +40,14 @@ pub(super) fn verify_projection(
             ))?;
         if require_verified_bodies
             && *frontier != graph.finalized_frontier()
-            && !matches!(
-                node.body_validation_state,
-                crate::BodyValidationState::Verified { .. }
-            )
+            && (!node.is_eligible()
+                || !matches!(
+                    node.body_validation_state,
+                    crate::BodyValidationState::Verified { .. }
+                ))
         {
             return Err(EngineHydrationError::Incoherent(
-                "verified projection contains an unverified body",
+                "verified projection contains an ineligible or unverified header",
             ));
         }
     }
@@ -213,7 +214,7 @@ mod tests {
         assert_eq!(
             verify_projection(&graph, &[anchor, child], child, true),
             Err(EngineHydrationError::Incoherent(
-                "verified projection contains an unverified body"
+                "verified projection contains an ineligible or unverified header"
             ))
         );
     }

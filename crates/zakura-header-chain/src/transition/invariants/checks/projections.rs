@@ -77,15 +77,56 @@ pub(crate) fn verify_verified<G: HeaderGraphView>(
     }
     if mode == EngineMode::Integrated {
         for frontier in projection.iter().skip(1) {
-            if !matches!(
-                graph
-                    .view_header_node(frontier.hash)
-                    .map(|node| node.body_validation_state.clone()),
-                Some(BodyValidationState::Verified { .. })
-            ) {
+            if graph.view_header_node(frontier.hash).is_none_or(|node| {
+                !node.is_eligible()
+                    || !matches!(
+                        node.body_validation_state,
+                        BodyValidationState::Verified { .. }
+                    )
+            }) {
                 return Err(InvariantViolation::VerifiedProjection(frontier.hash));
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EligibilityReason, EvidenceId};
+
+    #[test]
+    fn integrated_verified_projection_rejects_an_ineligible_header() {
+        let fixture = super::super::super::test_support::fixture(EngineMode::Integrated);
+        let mut graph = fixture.engine.graph().clone();
+        graph
+            .set_body_validation_state(
+                fixture.child.hash,
+                BodyValidationState::Verified {
+                    evidence: EvidenceId::from_digest([0x63; 32]),
+                },
+            )
+            .expect("the fixture child accepts verified body state");
+        graph
+            .add_eligibility_reason(
+                fixture.child.hash,
+                EligibilityReason::operator_invalid(
+                    fixture.child.hash,
+                    crate::OperatorInvalidationId::new([0x64; 16]),
+                    EvidenceId::from_digest([0x65; 32]),
+                ),
+            )
+            .expect("the fixture child becomes ineligible");
+
+        assert_eq!(
+            verify_verified(
+                &graph,
+                EngineMode::Integrated,
+                &[fixture.anchor, fixture.child],
+                fixture.child,
+            ),
+            Err(InvariantViolation::VerifiedProjection(fixture.child.hash))
+        );
+    }
 }

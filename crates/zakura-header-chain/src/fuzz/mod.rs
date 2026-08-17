@@ -104,7 +104,8 @@ impl FuzzStore {
         let metadata = EngineMetadata {
             disk_format: HeaderChainDiskVersion::CURRENT,
             mode,
-            network_id: config.network.kind(),
+            network_id: config.network().kind(),
+            network_policy_digest: config.network_policy_digest(),
             anchor_manifest_digest: config.trust_anchor_digest(),
             work_origin: frontier,
             state_version: StateVersion::new(0),
@@ -207,7 +208,7 @@ impl FuzzStore {
         ValidationLease::new(
             parent,
             predecessors,
-            self.config.network.clone(),
+            self.config.network().clone(),
             self.config.trust_anchor_digest(),
         )
     }
@@ -1319,7 +1320,7 @@ fn assert_block_spec_mutations(parameters: &[u8]) -> [u8; 32] {
             frontier: anchor,
             header: anchor_node.header.clone(),
         }],
-        store.config.network.clone(),
+        store.config.network().clone(),
         store.config.trust_anchor_digest(),
     );
     let rules = HeaderRules::from_engine_config(&store.config)

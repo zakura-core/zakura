@@ -235,7 +235,7 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
     matching_store.lease = ValidationLease::new(
         matching_store.lease.parent,
         matching_store.lease.predecessors.clone(),
-        matching_config.network.clone(),
+        matching_config.network().clone(),
         matching_config.trust_anchor_digest(),
     );
     let matching_request = insertion(&matching_store, 1, EvidenceId::from_digest([0x44; 32]));
@@ -264,7 +264,7 @@ fn insertion_enforces_every_immutable_configured_checkpoint() {
     conflicting_store.lease = ValidationLease::new(
         conflicting_store.lease.parent,
         conflicting_store.lease.predecessors.clone(),
-        conflicting_config.network.clone(),
+        conflicting_config.network().clone(),
         conflicting_config.trust_anchor_digest(),
     );
     let conflicting_request = insertion(&conflicting_store, 1, EvidenceId::from_digest([0x44; 32]));

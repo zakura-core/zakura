@@ -1,5 +1,394 @@
 use super::*;
 
+/// Commit one deferred header at `insertion_time`, then return the closed database.
+fn commit_deferral(
+    header_generation: HeaderGeneration,
+    insertion_time: DateTime<Utc>,
+) -> (DiskDb, EngineConfig, Frontier) {
+    #[derive(Copy, Clone)]
+    struct FixedClock(DateTime<Utc>);
+
+    impl zakura_header_chain::Clock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
+
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, mut metadata) = fixture();
+    metadata.header_generation = header_generation;
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the valid anchor initializes the fixture");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("the initial store audits");
+    let before = runtime.publisher().snapshot();
+    let insertion_clock = FixedClock(insertion_time);
+    let mut child_header = *anchor.header;
+    child_header.previous_block_hash = anchor.hash;
+    child_header.time = insertion_clock.0 + chrono::Duration::hours(3);
+    child_header.nonce.0[0] = 0x51;
+    let child_header = Arc::new(child_header);
+    let child = Frontier::new(
+        anchor
+            .height
+            .next()
+            .expect("the anchor has a successor height"),
+        child_header.hash(),
+    );
+    let lease = runtime
+        .reader()
+        .validation_context(anchor.hash)
+        .expect("the anchor validation context is coherent")
+        .expect("the anchor is retained");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the authenticated network policy is valid");
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&child_header)),
+        lease.parent(),
+        &rules,
+        &insertion_clock,
+    )
+    .expect("the future header prepares as deferred");
+    assert!(matches!(
+        batch.headers()[0].validation,
+        HeaderValidationState::DeferredUntil(_)
+    ));
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner: header_owner(&before, child.hash, 0x51, 0x52),
+                    source: SourceId::from_digest([0x51; 32]),
+                    parent_hash: anchor.hash,
+                    target_tip_hash: child.hash,
+                    completion: TargetCompletion::TargetComplete {
+                        common_ancestor: Frontier::new(anchor.height, anchor.hash),
+                    },
+                    batch,
+                    aux: Vec::new(),
+                })),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &insertion_clock,
+                full_state_authority: None,
+                retention_references: &[],
+            },
+        )
+        .expect("the deferred header insertion commits");
+    assert_eq!(
+        runtime.publisher().snapshot().frontiers.header_best,
+        Frontier::new(anchor.height, anchor.hash)
+    );
+    drop(runtime);
+    (db, engine_config, child)
+}
+
+#[test]
+fn startup_commits_deferred_reevaluation_before_publication() {
+    let (db, engine_config, child) = commit_deferral(
+        HeaderGeneration::new(1),
+        Utc::now() - chrono::Duration::hours(3),
+    );
+
+    let (reopened, report) = HeaderChainStore::new(db)
+        .startup(&engine_config)
+        .expect("startup reevaluates the elapsed deferral before publication");
+    assert!(report.repairs.is_empty());
+    assert_eq!(report.current.frontiers.header_best, child);
+    assert_eq!(reopened.publisher().snapshot(), report.current);
+    assert_eq!(
+        reopened
+            .store
+            .header_node(child.hash)
+            .expect("the child row is readable")
+            .expect("the child remains retained")
+            .validation,
+        HeaderValidationState::Valid
+    );
+    assert_eq!(
+        reopened
+            .store
+            .deferred_entries()
+            .expect("the deferred index is readable"),
+        Vec::new()
+    );
+}
+
+#[test]
+fn startup_rejects_a_due_deferral_when_settlement_cannot_plan() {
+    // The insertion consumes the last header generation. Startup must reject the database because
+    // the runtime would repeat the same exhausted transition as soon as its writer starts.
+    let (db, engine_config, _) = commit_deferral(
+        HeaderGeneration::new(u64::MAX.saturating_sub(1)),
+        Utc::now() - chrono::Duration::hours(3),
+    );
+
+    assert!(matches!(
+        HeaderChainStore::new(db).startup(&engine_config),
+        Err(HeaderChainStoreError::Transition(
+            TransitionFailure::Counter(_)
+        ))
+    ));
+}
+
+#[test]
+fn startup_preserves_a_future_deferral_without_settlement() {
+    let (db, engine_config, child) = commit_deferral(HeaderGeneration::new(1), Utc::now());
+
+    let (reopened, report) = HeaderChainStore::new(db)
+        .startup(&engine_config)
+        .expect("a future deferral does not require startup settlement");
+    assert!(report.repairs.is_empty());
+    assert_eq!(
+        report.current.frontiers.header_best,
+        engine_config.bootstrap_anchor().frontier
+    );
+    assert!(matches!(
+        reopened
+            .store
+            .header_node(child.hash)
+            .expect("the child row is readable")
+            .expect("the child remains retained")
+            .validation,
+        HeaderValidationState::DeferredUntil(until) if until > Utc::now()
+    ));
+    assert_eq!(
+        reopened
+            .store
+            .deferred_entries()
+            .expect("the deferred index is readable")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn startup_rejects_an_ineligible_verified_projection_before_publication() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the header schema initializes");
+
+    let mut child_header = *anchor.header;
+    child_header.previous_block_hash = anchor.hash;
+    child_header.time += chrono::Duration::seconds(1);
+    child_header.nonce.0[0] = 0x71;
+    let child_header = Arc::new(child_header);
+    let child = VerifiedHeaderRef {
+        height: anchor
+            .height
+            .next()
+            .expect("the genesis anchor has a successor"),
+        hash: child_header.hash(),
+        header: child_header,
+    };
+    let (runtime, _) = store
+        .startup_reconciled(
+            &engine_config,
+            anchor_frontier,
+            Vec::new(),
+            vec![child.clone()],
+        )
+        .expect("the verified child reconciles before the corruption");
+
+    let evidence = EvidenceId::from_digest([0x72; 32]);
+    let id = OperatorInvalidationId::new([0x73; 16]);
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest as _;
+    hasher.update(b"zakura-operator-invalidation-v1");
+    hasher.update(child.hash.0);
+    hasher.update(id.bytes());
+    let before = runtime.publisher().snapshot();
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::OperatorInvalidate(OperatorInvalidate {
+                    target: child.hash,
+                    id,
+                    operator_reason_digest: hasher.finalize().into(),
+                    evidence,
+                }),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&Authority(evidence)),
+                retention_references: &[],
+            },
+        )
+        .expect("the operator invalidation removes the child from active projections");
+    assert_eq!(
+        runtime.publisher().snapshot().frontiers.verified_best,
+        anchor_frontier
+    );
+
+    let child_frontier = Frontier::new(child.height, child.hash);
+    let mut corrupt_metadata = runtime
+        .store
+        .metadata()
+        .expect("the post-invalidation metadata is readable");
+    corrupt_metadata.frontiers.verified_best = child_frontier;
+    let mut corrupt = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_value(
+            &mut corrupt,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            &corrupt_metadata,
+        )
+        .expect("the corrupt metadata encodes");
+    runtime
+        .store
+        .put_raw(
+            &mut corrupt,
+            HEADER_VERIFIED,
+            HeaderHeightKey(child.height).as_bytes(),
+            child.hash.0,
+        )
+        .expect("the corrupt verified projection row encodes");
+    db.write(corrupt)
+        .expect("the ineligible verified projection reaches RocksDB");
+    drop(runtime);
+
+    assert!(matches!(
+        HeaderChainStore::new(db).startup(&engine_config),
+        Err(HeaderChainStoreError::Recovery(RecoveryFailure::Source { violations }))
+            if violations == vec![zakura_header_chain::AuditViolation::ProtectedPath(child.hash)]
+    ));
+}
+
+#[test]
+fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
+    let db_config = Config::ephemeral();
+    let (mut engine_config, anchor, mut metadata) = fixture();
+    engine_config.mode = EngineMode::HeadersOnly;
+    engine_config.limits.local_finality_depth =
+        std::num::NonZeroU32::new(1).expect("one is nonzero");
+    metadata.mode = EngineMode::HeadersOnly;
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the headers-only anchor initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("the initial headers-only store audits");
+    let before = runtime.publisher().snapshot();
+    let lease = runtime
+        .reader()
+        .validation_context(anchor.hash)
+        .expect("the anchor validation context is coherent")
+        .expect("the anchor is retained");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the authenticated network policy is valid");
+    let mut headers = Vec::new();
+    let mut parent = anchor.hash;
+    let mut parent_header = anchor.header;
+    for nonce in [0x61, 0x62] {
+        let mut header = *parent_header;
+        header.previous_block_hash = parent;
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[0] = nonce;
+        let header = Arc::new(header);
+        parent = header.hash();
+        parent_header = header.clone();
+        headers.push(header);
+    }
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&headers),
+        lease.parent(),
+        &rules,
+        &SystemClock,
+    )
+    .expect("the two-header branch prepares");
+    let selected_tip = Frontier::new(block::Height(2), headers[1].hash());
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner: header_owner(&before, selected_tip.hash, 0x61, 0x62),
+                    source: SourceId::from_digest([0x61; 32]),
+                    parent_hash: anchor.hash,
+                    target_tip_hash: selected_tip.hash,
+                    completion: TargetCompletion::TargetComplete {
+                        common_ancestor: Frontier::new(anchor.height, anchor.hash),
+                    },
+                    batch,
+                    aux: Vec::new(),
+                })),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: None,
+                retention_references: &[],
+            },
+        )
+        .expect("the headers-only finality transition commits");
+    let finalized = runtime.publisher().snapshot().frontiers.finalized;
+    assert_eq!(finalized.height, block::Height(1));
+
+    // The selected tip sits above the finalized frontier, where no canonical index reaches, so
+    // only the finalized frontier needs an independent row.
+    let mut canonical = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_raw(
+            &mut canonical,
+            "zakura_header_hash_by_height",
+            HeaderHeightKey(finalized.height).as_bytes(),
+            finalized.hash.0,
+        )
+        .expect("the independent canonical finalized row encodes");
+    db.write(canonical)
+        .expect("the independent canonical finalized row commits");
+    audit_store(&runtime.store, &engine_config)
+        .expect("the exact headers-only selected-tip witness recovers");
+
+    let mut forged = runtime
+        .store
+        .finality_history()
+        .expect("the finality history is readable")
+        .last()
+        .copied()
+        .expect("the depth transition appended a finality record");
+    forged.source = FinalitySource::HeadersOnlyDepth {
+        selected_tip: Frontier::new(selected_tip.height, block::Hash([0x63; 32])),
+    };
+    let mut corruption = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_value(
+            &mut corruption,
+            HEADER_FINALITY_HISTORY,
+            HeaderFinalityKey(forged.epoch).as_bytes(),
+            &forged,
+        )
+        .expect("the forged finality row encodes");
+    db.write(corruption)
+        .expect("the forged finality row reaches RocksDB");
+    drop(runtime);
+
+    assert!(matches!(
+        HeaderChainStore::new(db).startup(&engine_config),
+        Err(HeaderChainStoreError::Recovery(RecoveryFailure::Source { violations }))
+            if violations.contains(&zakura_header_chain::AuditViolation::Finality)
+    ));
+}
+
 fn legacy_rejected_aux_bytes(delivery: AuxDelivery, evidence: [u8; 32]) -> Vec<u8> {
     let mut bytes = delivery
         .encode()
@@ -14,6 +403,8 @@ fn legacy_rejected_aux_bytes(delivery: AuxDelivery, evidence: [u8; 32]) -> Vec<u
 fn mark_metadata_as_v1(metadata: &EngineMetadata) -> Vec<u8> {
     let mut bytes = metadata.encode().expect("the metadata fixture encodes");
     bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
+    // Version one wrote the network kind but no network policy digest.
+    bytes.drain(6..38);
     bytes
 }
 
@@ -60,7 +451,7 @@ fn v1_consensus_invalid_authority_bytes(
 fn rocksdb_snapshot_stops_at_the_first_extra_row_without_decoding() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor)
         .expect("the valid anchor initializes the fixture");
@@ -90,7 +481,7 @@ fn rocksdb_snapshot_stops_at_the_first_extra_row_without_decoding() {
 #[test]
 fn version_one_migration_downgrades_legacy_verdicts_atomically() {
     let db_config = Config::ephemeral();
-    let (engine_config, mut anchor, mut metadata) = fixture();
+    let (engine_config, mut anchor, mut metadata) = mainnet_fixture();
     metadata.last_transition = Some(zakura_header_chain::TransitionFingerprint::from_parts(
         zakura_header_chain::TransitionDomain::AuxEvidence,
         EvidenceId::from_digest([0x30; 32]),
@@ -109,7 +500,7 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
         evidence: EvidenceId::from_digest([0x34; 32]),
     };
     anchor.aux_delivery_ids.push(delivery.delivery_id);
-    let db = open(&db_config, &engine_config.network);
+    let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata.clone(), anchor.clone())
@@ -358,7 +749,7 @@ fn version_one_migration_drops_pruned_consensus_invalid_rows() {
 #[test]
 fn version_one_migration_limit_leaves_every_row_unchanged() {
     let db_config = Config::ephemeral();
-    let (mut engine_config, mut anchor, metadata) = fixture();
+    let (mut engine_config, mut anchor, metadata) = mainnet_fixture();
     engine_config.limits.max_aux_deliveries_total = NonZeroUsize::new(1).expect("one is nonzero");
     let deliveries = [0x41, 0x42].map(|marker| {
         AuxDelivery::new(
@@ -373,7 +764,7 @@ fn version_one_migration_limit_leaves_every_row_unchanged() {
     anchor
         .aux_delivery_ids
         .extend(deliveries.iter().map(|delivery| delivery.delivery_id));
-    let db = open(&db_config, &engine_config.network);
+    let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db);
     store
         .initialize(metadata.clone(), anchor)
@@ -448,19 +839,84 @@ fn version_one_migration_limit_leaves_every_row_unchanged() {
 }
 
 #[test]
+fn version_one_migration_rejects_an_ambiguous_network_policy_without_writing() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let changed_network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            canopy: Some(10),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let changed_config = EngineConfig::new(
+        engine_config.mode,
+        changed_network,
+        engine_config.bootstrap_anchor().clone(),
+        CheckpointSet::default(),
+    )
+    .expect("the changed policy accepts the same bootstrap anchor");
+    assert_eq!(
+        engine_config.network().kind(),
+        changed_config.network().kind()
+    );
+    assert_eq!(
+        engine_config.trust_anchor_digest(),
+        changed_config.trust_anchor_digest()
+    );
+    assert_ne!(
+        engine_config.network_policy_digest(),
+        changed_config.network_policy_digest()
+    );
+    let metadata_value = mark_metadata_as_v1(&metadata);
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db);
+    store
+        .initialize(metadata, anchor)
+        .expect("the current fixture initializes");
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            &metadata_value,
+        )
+        .expect("the version-one metadata stages");
+    store.db.write(batch).expect("the legacy fixture commits");
+
+    assert!(matches!(
+        store.migrate_v1_to_current(&changed_config),
+        Err(HeaderChainStoreError::Incoherent(
+            "version-one network policy is ambiguous; rebuild the header-chain database"
+        ))
+    ));
+    let metadata_cf = store
+        .cf(HEADER_ENGINE_META)
+        .expect("the metadata column family exists");
+    assert_eq!(
+        store
+            .db
+            .raw_get_cf(&metadata_cf, METADATA_KEY)
+            .expect("the metadata row is readable"),
+        Some(metadata_value)
+    );
+}
+
+#[test]
 fn startup_atomically_rebinds_an_extended_checkpoint_manifest() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let previous_state_version = metadata.state_version;
     let updated_config = EngineConfig::new(
         engine_config.mode,
-        engine_config.network.clone(),
+        engine_config.network().clone(),
         engine_config.bootstrap_anchor().clone(),
         CheckpointSet::new([Frontier::new(block::Height(10), block::Hash([0x93; 32]))])
             .expect("the extension checkpoint is unique"),
     )
     .expect("the updated engine configuration is coherent");
-    let db = open(&db_config, &engine_config.network);
+    let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata, anchor)
@@ -498,7 +954,7 @@ fn startup_reconciles_restored_full_state_before_first_publication() {
     };
     let (engine_config, anchor, metadata) = fixture();
     let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
-    let db = open(&db_config, &engine_config.network);
+    let db = open(&db_config, engine_config.network());
     let store = HeaderChainStore::new(db.clone());
     store
         .initialize(metadata, anchor.clone())
@@ -582,7 +1038,7 @@ fn startup_reconciliation_chunks_finalized_gaps_at_the_node_limit() {
     let db_config = Config::ephemeral();
     let (mut engine_config, anchor, metadata) = fixture();
     engine_config.limits.max_non_finalized_nodes = NonZeroUsize::new(2).expect("two is nonzero");
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the header schema initializes");
@@ -645,7 +1101,7 @@ fn streaming_reconstruction_resumes_from_the_last_atomic_chunk() {
     let db_config = Config::ephemeral();
     let (mut engine_config, anchor, metadata) = fixture();
     engine_config.limits.max_non_finalized_nodes = NonZeroUsize::new(2).expect("two is nonzero");
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the header schema initializes");
@@ -742,7 +1198,7 @@ fn malformed_reconstruction_progress_fails_closed() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor)
         .expect("the header schema initializes");
@@ -778,7 +1234,7 @@ fn malformed_reconstruction_progress_fails_closed() {
 
     let target = Frontier::new(block::Height(1), block::Hash([0x91; 32]));
     let contradictory = HeaderReconstructionProgressDisk {
-        network: engine_config.network.kind(),
+        network: engine_config.network().kind(),
         target,
         next_height: block::Height(1),
         phase: HeaderReconstructionPhaseDisk::FinalAudit,
@@ -811,7 +1267,7 @@ fn startup_repairs_every_reconstructible_index_atomically_before_publication() {
         ..Config::default()
     };
     let (engine_config, anchor, metadata) = fixture();
-    let network = engine_config.network.clone();
+    let network = engine_config.network().clone();
     let db = open(&db_config, &network);
     let store = HeaderChainStore::new(db.clone());
     store
@@ -964,7 +1420,7 @@ fn startup_repairs_every_reconstructible_index_atomically_before_publication() {
 fn authoritative_corruption_fails_before_publisher_construction() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the empty schema initializes");
@@ -991,7 +1447,7 @@ fn startup_rejects_verified_projection_without_exact_body_authority() {
     let (engine_config, mut anchor, metadata) = fixture();
     let evidence = EvidenceId::from_digest([0xa5; 32]);
     anchor.body_validation_state = BodyValidationState::Verified { evidence };
-    let store = HeaderChainStore::new(open(&db_config, &engine_config.network));
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
         .initialize(metadata, anchor.clone())
         .expect("the verified fixture initializes with body authority");

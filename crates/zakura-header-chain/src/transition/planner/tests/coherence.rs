@@ -2,7 +2,10 @@
 
 use super::super::admission::validate_snapshot;
 use super::*;
-use zakura_chain::parameters::NetworkKind;
+use zakura_chain::parameters::{
+    testnet::{ConfiguredActivationHeights, RegtestParameters},
+    Network, NetworkKind,
+};
 
 #[test]
 fn hydration_rejects_metadata_work_origin_that_disagrees_with_graph() {
@@ -49,6 +52,11 @@ fn validate_snapshot_rejects_configuration_and_metadata_mismatches() {
             metadata.network_id = NetworkKind::Mainnet;
             (snapshot.clone(), metadata)
         }),
+        ("network policy", {
+            let mut metadata = metadata.clone();
+            metadata.network_policy_digest = [0xcd; 32];
+            (snapshot.clone(), metadata)
+        }),
         ("trust-anchor digest", {
             let mut metadata = metadata.clone();
             metadata.anchor_manifest_digest = [0xab; 32];
@@ -76,6 +84,44 @@ fn validate_snapshot_rejects_configuration_and_metadata_mismatches() {
 
     validate_snapshot(&snapshot, &metadata, &ctx)
         .expect("the coherent fixture snapshot must be accepted");
+}
+
+#[test]
+fn validate_snapshot_rejects_same_kind_network_policy_changes() {
+    let (store, config) = TestStore::new(EngineMode::Integrated);
+    let changed_network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            canopy: Some(10),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let changed_config = EngineConfig::new(
+        config.mode,
+        changed_network,
+        config.bootstrap_anchor().clone(),
+        CheckpointSet::default(),
+    )
+    .expect("the changed activation policy accepts the same bootstrap anchor");
+    assert_eq!(config.network().kind(), changed_config.network().kind());
+    assert_eq!(
+        config.trust_anchor_digest(),
+        changed_config.trust_anchor_digest()
+    );
+    assert_ne!(
+        config.network_policy_digest(),
+        changed_config.network_policy_digest()
+    );
+
+    let clock = ManualClock(Utc::now());
+    assert_eq!(
+        validate_snapshot(
+            &store.snapshot(),
+            &store.metadata,
+            &context(&changed_config, &clock, None),
+        ),
+        Err(TransitionFailure::ConfigurationMismatch)
+    );
 }
 
 #[test]

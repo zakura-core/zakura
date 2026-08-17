@@ -139,13 +139,44 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
     store.visit_finality_history(RowLimit::new(65_536), &mut |record| {
         history_count = history_count.saturating_add(1);
         first.get_or_insert(record);
+        let source_matches = source_matches_mode(&record, metadata, config);
         if previous.is_some_and(|previous: FinalityRecord| {
             previous.current != record.previous
                 || previous.epoch.get().checked_add(1) != Some(record.epoch.get())
                 || record.current.height <= record.previous.height
-        }) || !source_matches_mode(&record, metadata, config)
+        }) || !source_matches
         {
             invalid_history = true;
+        }
+        if source_matches {
+            let context_authenticates_current = contexts
+                .binary_search_by_key(&record.current.height, |context| context.height)
+                .is_ok_and(|index| contexts[index].header.hash() == record.current.hash);
+            let current_is_authentic = record.current == metadata.frontiers.finalized
+                || record.current == config.bootstrap_anchor().frontier
+                || context_authenticates_current
+                || store.authenticated_canonical_hash(record.current.height)?
+                    == Some(record.current.hash);
+            if !current_is_authentic {
+                invalid_history = true;
+            }
+            if let Some(selected_tip) =
+                record.headers_only_depth_witness(config.limits.local_finality_depth.get())
+            {
+                // The canonical index authenticates settled witnesses. Retained rows authenticate
+                // an above-finalized witness against the current finalized frontier. Recovery
+                // authenticates the record's historical current frontier independently above.
+                let witness_is_authentic =
+                    if selected_tip.height <= metadata.frontiers.finalized.height {
+                        store.authenticated_canonical_hash(selected_tip.height)?
+                            == Some(selected_tip.hash)
+                    } else {
+                        witness_descends_to(&by_hash, selected_tip, metadata.frontiers.finalized)
+                    };
+                if !witness_is_authentic {
+                    invalid_history = true;
+                }
+            }
         }
         previous = Some(record);
         last = Some(record);
@@ -187,7 +218,7 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
     {
         violations.push(AuditViolation::Finality);
     }
-    let settled = config.settled_manifest().pin_for_network(&config.network);
+    let settled = config.settled_manifest().pin_for_network(config.network());
     let pins = config
         .local_checkpoints()
         .iter()
@@ -198,6 +229,35 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
         }
     }
     Ok(())
+}
+
+/// Return true when the audited header rows prove `witness` descends to `frontier`.
+///
+/// Retention keeps the current finalized frontier and every descendant. The walk therefore
+/// avoids a historical frontier that retention may have pruned.
+fn witness_descends_to(
+    by_hash: &HashMap<block::Hash, &HeaderNode>,
+    witness: crate::Frontier,
+    frontier: crate::Frontier,
+) -> bool {
+    let Some(mut node) = by_hash.get(&witness.hash).copied() else {
+        return false;
+    };
+    if node.height != witness.height {
+        return false;
+    }
+    while node.height > frontier.height {
+        let Some(parent) = by_hash.get(&node.parent_hash).copied() else {
+            return false;
+        };
+        // Reject a parent link that does not descend exactly one height, which also bounds
+        // this walk on a store whose height rows contradict its parent rows.
+        if parent.height.next().ok() != Some(node.height) {
+            return false;
+        }
+        node = parent;
+    }
+    node.hash == frontier.hash && node.height == frontier.height
 }
 
 fn finality_history_starts_validly(
@@ -239,14 +299,9 @@ fn source_matches_mode(
         (EngineMode::HeadersOnly, None, FinalitySource::MigratedHeadersOnly) => {
             record.epoch == crate::FinalityEpoch::new(0)
         }
-        (EngineMode::HeadersOnly, None, FinalitySource::HeadersOnlyDepth { selected_tip }) => {
-            record.current.height > record.previous.height
-                && selected_tip
-                    .height
-                    .0
-                    .saturating_sub(record.current.height.0)
-                    == config.limits.local_finality_depth.get()
-        }
+        (EngineMode::HeadersOnly, None, FinalitySource::HeadersOnlyDepth { .. }) => record
+            .headers_only_depth_witness(config.limits.local_finality_depth.get())
+            .is_some(),
         _ => false,
     }
 }

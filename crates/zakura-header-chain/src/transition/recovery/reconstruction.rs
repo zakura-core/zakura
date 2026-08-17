@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use zakura_chain::block;
 
 use crate::{
@@ -13,26 +12,15 @@ use crate::{
 use super::contracts::{source_failure, AuditViolation, RecoveryFailure};
 use super::phases::{AuditedSource, ReconstructedDerivedViews};
 
-/// Promote elapsed deferrals and reconstruct every derived view.
+/// Reconstruct every derived view without changing authoritative node state.
 pub(super) fn reconstruct_derived_views(
     audited: &AuditedSource,
     config: &EngineConfig,
-    now: DateTime<Utc>,
 ) -> Result<ReconstructedDerivedViews, RecoveryFailure> {
-    let mut promoted_source_nodes = audited.source_header_nodes.clone();
-    let mut elapsed_deferrals = false;
-    for node in &mut promoted_source_nodes {
-        if matches!(node.validation, crate::HeaderValidationState::DeferredUntil(until) if until <= now)
-        {
-            node.validation = crate::HeaderValidationState::Valid;
-            elapsed_deferrals = true;
-        }
-    }
-
     let finalized = audited.metadata.frontiers.finalized;
     let mut graph = MemHeaderStore::reconstruct(crate::HeaderGraphReconstruction::new(
         finalized,
-        promoted_source_nodes.clone(),
+        audited.source_header_nodes.clone(),
         audited.consensus_invalid_body_tombstones.clone(),
     ))
     .map_err(|_| RecoveryFailure::Source {
@@ -70,6 +58,12 @@ pub(super) fn reconstruct_derived_views(
     let (selected_tip, selected_score) = graph
         .select_best_header_chain()
         .map_err(|_| source_failure(AuditViolation::ProtectedPath(finalized.hash)))?;
+    if config.mode == EngineMode::HeadersOnly
+        && selected_tip.height.0.saturating_sub(finalized.height.0)
+            > config.limits.local_finality_depth.get()
+    {
+        return Err(source_failure(AuditViolation::Finality));
+    }
     let selected_projection = path_to(&header_nodes_by_hash, finalized, selected_tip)?;
     let verified_projection = verified_path(&header_nodes_by_hash, &audited.metadata)?;
     let oldest_retained_height = header_nodes
@@ -86,7 +80,7 @@ pub(super) fn reconstruct_derived_views(
         _ => None,
     };
     Ok(ReconstructedDerivedViews {
-        promoted_source_nodes,
+        source_nodes: audited.source_header_nodes.clone(),
         header_nodes,
         header_child_edges,
         selected_projection,
@@ -94,7 +88,6 @@ pub(super) fn reconstruct_derived_views(
         deferred_entries,
         selected_tip,
         selected_score,
-        elapsed_deferrals,
         oldest_retained_height,
         body_unavailable_alarm,
     })
@@ -119,10 +112,11 @@ fn verified_path(
     )?;
     if path.iter().skip(1).any(|frontier| {
         nodes.get(&frontier.hash).is_none_or(|node| {
-            !matches!(
-                node.body_validation_state,
-                BodyValidationState::Verified { .. }
-            )
+            !node.is_eligible()
+                || !matches!(
+                    node.body_validation_state,
+                    BodyValidationState::Verified { .. }
+                )
         })
     }) {
         return Err(source_failure(AuditViolation::ProtectedPath(

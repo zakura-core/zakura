@@ -3,7 +3,13 @@
 mod authority;
 mod repair;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use chrono::{DateTime, Duration, Utc};
 use zakura_chain::{
@@ -77,6 +83,7 @@ pub(super) struct AuditStore {
     pub(super) aux: Vec<AuxDelivery>,
     pub(super) contexts: Vec<ValidationContextRecord>,
     pub(super) canonical: HashMap<block::Height, block::Hash>,
+    pub(super) canonical_reads: Arc<AtomicUsize>,
     pub(super) finality_checkpoint: Option<crate::FinalityHistoryCheckpoint>,
     pub(super) finality: Vec<FinalityRecord>,
     pub(super) failed_read: Option<AuditRead>,
@@ -302,6 +309,7 @@ impl StoreAuditSnapshot for &AuditStore {
         height: block::Height,
     ) -> Result<Option<block::Hash>, StoreError> {
         self.check_read(AuditRead::CanonicalHash)?;
+        self.canonical_reads.fetch_add(1, Ordering::Relaxed);
         Ok(self.canonical.get(&height).copied())
     }
 
@@ -395,7 +403,8 @@ pub(super) fn fixture() -> (AuditStore, EngineConfig) {
     let metadata = EngineMetadata {
         disk_format: HeaderChainDiskVersion::CURRENT,
         mode: EngineMode::Integrated,
-        network_id: config.network.kind(),
+        network_id: config.network().kind(),
+        network_policy_digest: config.network_policy_digest(),
         anchor_manifest_digest: config.trust_anchor_digest(),
         work_origin: anchor,
         state_version: StateVersion::new(1),
@@ -428,6 +437,7 @@ pub(super) fn fixture() -> (AuditStore, EngineConfig) {
             aux: Vec::new(),
             contexts: Vec::new(),
             canonical: HashMap::from([(anchor.height, anchor.hash), (child.height, child.hash)]),
+            canonical_reads: Arc::new(AtomicUsize::new(0)),
             finality_checkpoint: None,
             finality: vec![FinalityRecord {
                 previous: anchor,

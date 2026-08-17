@@ -26,9 +26,10 @@ pub struct ValidationContextRecord {
 /// # Contract
 ///
 /// - **Cross-row `state_version` consistency.** Every method on one audit pass
-///   must observe the same durable version as [`Self::snapshot`] /
-///   [`Self::metadata`]. Mixing rows from concurrent commits is undefined and
-///   must surface as [`StoreError::Incoherent`] or fail closed in the audit.
+///   must observe the same durable version as [`StoreAuditSnapshot::snapshot`]
+///   and [`StoreAuditSnapshot::metadata`]. Mixing rows from concurrent commits
+///   is undefined and must surface as [`StoreError::Incoherent`] or fail closed
+///   in the audit.
 /// - **Visit ordering.** [`StoreAuditSnapshot::visit_finality_history`] yields records in
 ///   ascending finality-epoch order, contiguous from the bootstrap epoch.
 /// - **No side effects.** Implementations are read-only: no writes, no
@@ -177,8 +178,6 @@ pub enum RecoveryRepair {
     ChildIndex,
     /// Recovery rebuilds the future-time index from node states.
     DeferredIndex,
-    /// Recovery promotes elapsed future-time deferrals before publication.
-    ElapsedDeferrals,
     /// Recovery replaces the selected projection and frontier with recomputed values.
     SelectedProjection,
     /// Recovery rebuilds the verified projection from its authoritative frontier.

@@ -21,7 +21,7 @@ pub(super) fn crash_fixture_deferred_header_reevaluation_reopens_complete_before
             ..Config::default()
         };
         let (engine_config, anchor, metadata) = fixture();
-        let network = engine_config.network.clone();
+        let network = engine_config.network().clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
         store
@@ -164,7 +164,6 @@ pub(super) fn crash_fixture_deferred_header_reevaluation_reopens_complete_before
 
         let allowed_startup_repairs = BTreeSet::from([
             RecoveryRepair::DeferredIndex,
-            RecoveryRepair::ElapsedDeferrals,
             RecoveryRepair::SelectedProjection,
         ]);
         let observation = observe_transition_crash_with_allowed_startup_repairs(
@@ -278,7 +277,7 @@ pub(super) fn crash_fixture_migrated_pin_refutation_fails_closed_at_every_reacha
         headers_only_config.mode = EngineMode::HeadersOnly;
         metadata.mode = EngineMode::HeadersOnly;
         let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
-        let network = integrated_config.network.clone();
+        let network = integrated_config.network().clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
         store
@@ -450,7 +449,7 @@ pub(super) fn crash_fixture_no_change_crash_points_preserve_the_paired_full_stat
             ..Config::default()
         };
         let (engine_config, anchor, metadata) = fixture();
-        let network = engine_config.network.clone();
+        let network = engine_config.network().clone();
         let db = open(&db_config, &network);
         let store = HeaderChainStore::new(db.clone());
         store

@@ -145,6 +145,11 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         }
     }
 
+    let checkpoint_finality = matches!(
+        event,
+        TransitionEvent::VerifiedChainChanged(ref event)
+            if event.cause == crate::VerifiedChangeCause::CheckpointFinalizedGrow
+    );
     let mut effect = TransitionEffect::none();
     debug_assert_ne!(
         header_rebase,
@@ -152,13 +157,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         "already-applied header work returns during replay binding before settlement"
     );
     effect.header_work = settlement_header_work_effect(work_rebased, header_rebase);
-    if matches!(
-        event,
-        TransitionEvent::VerifiedChainChanged(ref event)
-            if event.cause == crate::VerifiedChangeCause::CheckpointFinalizedGrow
-    ) {
-        effect.finality = Some(FinalityEffect::Checkpoint);
-    } else if matches!(event, TransitionEvent::AuxEvidence(_)) {
+    if matches!(event, TransitionEvent::AuxEvidence(_)) {
         effect.auxiliary = Some(AuxiliaryEffect::Authentication);
     } else if matches!(event, TransitionEvent::FullStateFinalized(_)) {
         // Finality effect is set when a record is actually appended below.
@@ -195,9 +194,11 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                     effect.finality = Some(FinalityEffect::HeadersOnlyDepth);
                 }
                 FinalitySource::FullState { .. } => {
-                    if effect.finality.is_none() {
-                        effect.finality = Some(FinalityEffect::FullState);
-                    }
+                    effect.finality = Some(if checkpoint_finality {
+                        FinalityEffect::Checkpoint
+                    } else {
+                        FinalityEffect::FullState
+                    });
                 }
                 FinalitySource::MigratedHeadersOnly => {}
             }

@@ -140,6 +140,7 @@ fn immutable_metadata_changed(
 ) -> bool {
     projected.disk_format != source.disk_format
         || projected.network_id != source.network_id
+        || projected.network_policy_digest != source.network_policy_digest
         || projected.anchor_manifest_digest != source.anchor_manifest_digest
 }
 
@@ -250,11 +251,8 @@ fn verify_plan_against_graph<G: HeaderGraphView>(
             FinalitySource::FullState { .. } => metadata.mode == EngineMode::Integrated,
             FinalitySource::HeadersOnlyDepth { selected_tip } => {
                 metadata.mode == EngineMode::HeadersOnly
-                    && selected_tip
-                        .height
-                        .0
-                        .saturating_sub(record.current.height.0)
-                        == plan.limits.local_finality_depth.get()
+                    && record.headers_only_depth_witness(plan.limits.local_finality_depth.get())
+                        == Some(selected_tip)
                     && graph
                         .view_header_ancestor(selected_tip.hash, record.current.height)
                         .ok()
@@ -618,6 +616,39 @@ mod tests {
     }
 
     #[test]
+    fn live_headers_only_witness_must_descend_to_the_new_frontier() {
+        let fixture = fixture(EngineMode::HeadersOnly);
+        let mut overlay = GraphOverlay::new(fixture.engine.graph());
+        overlay
+            .advance_finalized_frontier(fixture.child)
+            .expect("the selected child is a valid finality candidate");
+        let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
+        plan.change_set.metadata.frontiers.finalized = fixture.child;
+        plan.change_set.metadata.frontiers.verified_best = fixture.child;
+        plan.change_set.metadata.finality_epoch = plan
+            .change_set
+            .metadata
+            .finality_epoch
+            .checked_next()
+            .expect("the fixture finality epoch can advance");
+        plan.change_set.finality_append = Some(crate::FinalityRecord {
+            previous: fixture.anchor,
+            current: fixture.child,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: Frontier::new(block::Height(1_001), hash(0x52)),
+            },
+            epoch: plan.change_set.metadata.finality_epoch,
+        });
+
+        for mode in [VerificationMode::Production, VerificationMode::Exhaustive] {
+            assert_eq!(
+                verify_plan_with_mode(&fixture.engine, &plan, mode),
+                Err(InvariantViolation::Protected(fixture.child.hash))
+            );
+        }
+    }
+
+    #[test]
     fn immutable_metadata_drift_fails_closed_in_both_verifiers() {
         let fixture = fixture(EngineMode::HeadersOnly);
         let mut cases = Vec::new();
@@ -630,6 +661,10 @@ mod tests {
         let mut network = no_change_candidate(&fixture.engine);
         network.change_set.metadata.network_id = Network::Mainnet.kind();
         cases.push(network);
+
+        let mut network_policy = no_change_candidate(&fixture.engine);
+        network_policy.change_set.metadata.network_policy_digest = [0xfe; 32];
+        cases.push(network_policy);
 
         let mut manifest = no_change_candidate(&fixture.engine);
         manifest.change_set.metadata.anchor_manifest_digest = [0xff; 32];

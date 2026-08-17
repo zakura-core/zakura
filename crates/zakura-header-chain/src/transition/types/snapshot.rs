@@ -16,7 +16,7 @@ pub struct HeaderChainDiskVersion(pub u32);
 
 impl HeaderChainDiskVersion {
     /// Current durable header-chain schema version.
-    pub const CURRENT: Self = Self(2);
+    pub const CURRENT: Self = Self(3);
 }
 
 /// Persistent externally visible engine alarms.
@@ -121,6 +121,8 @@ pub struct EngineMetadata {
     pub mode: EngineMode,
     /// Persisted authenticated network identity.
     pub network_id: NetworkKind,
+    /// Digest of every network parameter used by header validation.
+    pub network_policy_digest: [u8; 32],
     /// Digest of the release-authenticated settled manifest.
     pub anchor_manifest_digest: [u8; 32],
     /// Immutable work-coordinate origin.

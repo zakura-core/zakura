@@ -31,7 +31,7 @@ use crate::{
         non_finalized_state::Chain,
         read::{
             contiguous_subtrees_from, ironwood_subtrees, merge_published_subtrees,
-            orchard_subtrees, sapling_subtrees,
+            orchard_subtrees, retain_subtrees_completed_at_or_below, sapling_subtrees,
             tree::{
                 first_missing_subtree_index, is_syncing_below_last_checkpoint,
                 sapling_subtrees_with_gaps, subtree_completed_by_last_checkpoint,
@@ -919,8 +919,9 @@ async fn artifact_subtree_gaps_return_typed_errors_for_every_pool() {
             .into_iter()
             .map(|index| SubtreeRecord {
                 index: NoteCommitmentSubtreeIndex(index),
-                // Tip-bound serving only merges records completed at or below the verified tip.
-                // Keep every height eligible so the index gap, not the tip filter, truncates the run.
+                // Availability checks the skip-band union, then serving drops records above the
+                // verified tip. Keep every height eligible so the index gap, not the tip clip,
+                // truncates the run.
                 end_height: Height::MIN,
                 root,
             })
@@ -982,6 +983,100 @@ async fn artifact_subtree_gaps_return_typed_errors_for_every_pool() {
             HistoricalSubtreeUnavailableReason::Indeterminate
         );
     }
+}
+
+/// A published subtree that completes above the verified tip is not a permanent hole.
+///
+/// The skip-band union still contains it, so availability succeeds; serving then drops it and
+/// returns the prefix completed at this tip. Treating it as `NotStored` would tell a client that
+/// continuing to sync cannot restore a subtree the artifact will serve once the tip reaches its
+/// end height.
+#[tokio::test]
+async fn published_subtrees_above_verified_tip_return_the_completed_prefix() {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, mut read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+    let last_checkpoint = Mainnet.checkpoint_list().max_height();
+    let verified_tip = read_state
+        .db
+        .finalized_tip_height()
+        .expect("the populated state has a finalized tip");
+
+    assert!(
+        verified_tip < last_checkpoint,
+        "the regression requires a finalized tip below the Mainnet last checkpoint"
+    );
+
+    let above_tip = Height(
+        verified_tip
+            .0
+            .checked_add(1)
+            .expect("the populated tip is far below Height::MAX"),
+    );
+
+    read_state.historical_subtrees = Some(Arc::new(SubtreeArtifact {
+        last_checkpoint,
+        sapling: vec![
+            SubtreeRecord {
+                index: NoteCommitmentSubtreeIndex(0),
+                end_height: verified_tip,
+                root: [0; 32],
+            },
+            SubtreeRecord {
+                index: NoteCommitmentSubtreeIndex(1),
+                end_height: above_tip,
+                root: [0; 32],
+            },
+        ],
+        orchard: Vec::new(),
+        ironwood: Vec::new(),
+    }));
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&read_state.db, last_checkpoint);
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("seeding the Mainnet VCT last checkpoint succeeds");
+
+    let response = read_state
+        .clone()
+        .oneshot(ReadRequest::SaplingSubtrees {
+            start_index: NoteCommitmentSubtreeIndex(0),
+            limit: Some(NoteCommitmentSubtreeIndex(2)),
+        })
+        .await
+        .expect("a not-yet-reached published subtree must not fail as a permanent hole");
+
+    let ReadResponse::SaplingSubtrees(subtrees) = response else {
+        panic!("unexpected response to a sapling subtrees request: {response:?}");
+    };
+    assert_eq!(
+        subtrees.keys().copied().collect::<Vec<_>>(),
+        vec![NoteCommitmentSubtreeIndex(0)],
+        "the served run is the prefix completed at this tip"
+    );
+
+    let response = read_state
+        .oneshot(ReadRequest::SaplingSubtrees {
+            start_index: NoteCommitmentSubtreeIndex(1),
+            limit: Some(NoteCommitmentSubtreeIndex(1)),
+        })
+        .await
+        .expect("asking for a published subtree above the tip is an empty list, not NotStored");
+
+    let ReadResponse::SaplingSubtrees(subtrees) = response else {
+        panic!("unexpected response to a sapling subtrees request: {response:?}");
+    };
+    assert!(
+        subtrees.is_empty(),
+        "a start index that completes above this tip is not yet available"
+    );
 }
 
 /// The served run must be checked to its end, not just at its start.
@@ -1134,7 +1229,6 @@ fn published_subtree_merge_includes_non_finalized_rows() {
             (NoteCommitmentSubtreeIndex(1), node(3)),
         ],
         Height(11),
-        Height(11),
     );
     let served = contiguous_subtrees_from(merged, NoteCommitmentSubtreeIndex(0));
 
@@ -1174,7 +1268,6 @@ fn published_subtrees_never_displace_the_nodes_own_rows() {
             (NoteCommitmentSubtreeIndex(2), node(3)),
         ],
         Height(11),
-        Height(11),
     );
 
     assert_eq!(
@@ -1190,7 +1283,10 @@ fn published_subtrees_never_displace_the_nodes_own_rows() {
     assert_eq!(stored.len(), 3);
 }
 
-/// Published records cannot grant authority over blocks above the node's verified tip.
+/// Serving drops published records completed above the node's verified tip.
+///
+/// Availability still sees those records in the skip-band union; this helper is what prevents
+/// them from reaching a client.
 #[test]
 fn published_subtrees_are_bounded_by_the_verified_tip() {
     let node = |height: u32| {
@@ -1208,9 +1304,15 @@ fn published_subtrees_are_bounded_by_the_verified_tip() {
             (NoteCommitmentSubtreeIndex(1), node(10)),
             (NoteCommitmentSubtreeIndex(2), node(11)),
         ],
-        Height(10),
         Height(100),
     );
+    assert_eq!(
+        stored.len(),
+        3,
+        "the skip-band union keeps records above the verified tip"
+    );
+
+    retain_subtrees_completed_at_or_below(&mut stored, Height(10));
 
     assert_eq!(
         stored.keys().copied().collect::<Vec<_>>(),
@@ -1239,7 +1341,6 @@ fn newer_artifact_fills_only_the_skipped_band() {
             (NoteCommitmentSubtreeIndex(1), node(12, 9)),
             (NoteCommitmentSubtreeIndex(2), node(18, 3)),
         ],
-        Height(20),
         Height(10),
     );
 

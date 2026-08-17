@@ -119,22 +119,33 @@ pub fn contiguous_subtrees_from<Node>(
 /// overlap is precisely the corrupt-or-hostile case where precedence decides whether a wrong root
 /// reaches a client.
 ///
-/// Two height bounds keep that authority inside this node's skip band. `verified_tip` prevents the
-/// artifact from answering for blocks this node has not verified yet. `vct_applied_below` is the
-/// durable fast-sync marker: a newer artifact still contains those skipped roots, but its extra
-/// suffix must not fill heights this node synced itself.
+/// `vct_applied_below` is the durable fast-sync marker: a newer artifact still contains those
+/// skipped roots, but its extra suffix must not fill heights this node synced itself. Records that
+/// complete above the verified tip stay in this union so availability can see the full skip-band
+/// run; [`retain_subtrees_completed_at_or_below`] drops them before serving.
 pub fn merge_published_subtrees<Node>(
     stored: &mut BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
     published: impl IntoIterator<Item = (NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>)>,
-    verified_tip: block::Height,
     vct_applied_below: block::Height,
 ) {
     for (index, data) in published
         .into_iter()
-        .filter(|(_, data)| data.end_height <= verified_tip.min(vct_applied_below))
+        .filter(|(_, data)| data.end_height <= vct_applied_below)
     {
         stored.entry(index).or_insert(data);
     }
+}
+
+/// Drops subtree records completed above `verified_tip`.
+///
+/// Availability checks the skip-band union, which may include published records this node has not
+/// reached yet. Serving must not return a root for a height this node has not verified; those
+/// records are "not yet completed at this tip", the same as asking past the chain tip.
+pub fn retain_subtrees_completed_at_or_below<Node>(
+    subtrees: &mut BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
+    verified_tip: block::Height,
+) {
+    subtrees.retain(|_, data| data.end_height <= verified_tip);
 }
 
 /// Returns `true` if the subtree at `start_index` completed at or below the last checkpoint,

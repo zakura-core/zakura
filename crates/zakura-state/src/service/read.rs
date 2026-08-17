@@ -53,7 +53,8 @@ pub(crate) use tree::{
 };
 pub use tree::{
     contiguous_subtrees_from, ironwood_subtrees, ironwood_tree, merge_published_subtrees,
-    orchard_subtrees, orchard_tree, sapling_subtrees, sapling_tree,
+    orchard_subtrees, orchard_tree, retain_subtrees_completed_at_or_below, sapling_subtrees,
+    sapling_tree,
 };
 
 #[cfg(any(test, feature = "proptest-impl"))]

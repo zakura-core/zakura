@@ -1882,13 +1882,17 @@ fn range_for(
 /// Uses published subtrees when the node's own rows do not cover `start_index`.
 ///
 /// The read result already applies the continuity contract and reports the absent band, so it
-/// stands on its own when it covers `start_index`. Otherwise, this helper tries the union supplied
-/// by `merge_published`, rechecks availability over the whole union, and reapplies continuity.
-/// If that union still does not reach `start_index`, the original result stands, including its
-/// typed absent-band error.
+/// stands on its own when it covers `start_index`. Otherwise, this helper tries the skip-band
+/// union supplied by `merge_published` and rechecks availability over that whole union — including
+/// published records that complete above `verified_tip`. Serving then drops those not-yet-reached
+/// records so a mid-sync prefix is returned instead of a permanent hole. If `start_index` is in
+/// the union but not yet completed at this tip, the answer is an empty list, the same as asking
+/// past the tip. If the union still does not contain `start_index`, the original result stands,
+/// including its typed absent-band error.
 fn subtrees_with_published_fallback<Node, Error>(
     stored: Result<BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>, Error>,
     start_index: NoteCommitmentSubtreeIndex,
+    verified_tip: Option<block::Height>,
     merge_published: impl FnOnce() -> Option<
         BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<Node>>,
     >,
@@ -1899,15 +1903,22 @@ fn subtrees_with_published_fallback<Node, Error>(
     match stored {
         Ok(subtrees) if subtrees.contains_key(&start_index) => Ok(subtrees),
         result => {
-            let Some(merged) = merge_published() else {
+            let Some(verified_tip) = verified_tip else {
+                return result;
+            };
+            let Some(mut merged) = merge_published() else {
                 return result;
             };
 
             check_available(&merged)?;
+            let start_in_skip_band = merged.contains_key(&start_index);
+            read::retain_subtrees_completed_at_or_below(&mut merged, verified_tip);
             let merged = read::contiguous_subtrees_from(merged, start_index);
 
             if merged.contains_key(&start_index) {
                 Ok(merged)
+            } else if start_in_skip_band {
+                Ok(BTreeMap::new())
             } else {
                 result
             }
@@ -2498,22 +2509,21 @@ impl Service<ReadRequest> for ReadStateService {
                 let sapling_subtrees = subtrees_with_published_fallback(
                     sapling_subtrees,
                     start_index,
+                    verified_tip,
                     || {
-                        state
-                            .historical_subtrees_at_last_checkpoint()
-                            .zip(verified_tip)
-                            .map(|((artifact, vct_applied_below), verified_tip)| {
+                        state.historical_subtrees_at_last_checkpoint().map(
+                            |(artifact, vct_applied_below)| {
                                 let range = range_for(start_index, end_index);
                                 let mut merged =
                                     read::sapling_subtrees_with_gaps(best_chain, &state.db, range);
                                 read::merge_published_subtrees(
                                     &mut merged,
                                     artifact.sapling_range(range),
-                                    verified_tip,
                                     vct_applied_below,
                                 );
                                 merged
-                            })
+                            },
+                        )
                     },
                     |merged| {
                         read::check_historical_sapling_subtrees_available(
@@ -2548,22 +2558,21 @@ impl Service<ReadRequest> for ReadStateService {
                 let orchard_subtrees = subtrees_with_published_fallback(
                     orchard_subtrees,
                     start_index,
+                    verified_tip,
                     || {
-                        state
-                            .historical_subtrees_at_last_checkpoint()
-                            .zip(verified_tip)
-                            .map(|((artifact, vct_applied_below), verified_tip)| {
+                        state.historical_subtrees_at_last_checkpoint().map(
+                            |(artifact, vct_applied_below)| {
                                 let range = range_for(start_index, end_index);
                                 let mut merged =
                                     read::orchard_subtrees_with_gaps(best_chain, &state.db, range);
                                 read::merge_published_subtrees(
                                     &mut merged,
                                     artifact.orchard_range(range),
-                                    verified_tip,
                                     vct_applied_below,
                                 );
                                 merged
-                            })
+                            },
+                        )
                     },
                     |merged| {
                         read::check_historical_orchard_subtrees_available(
@@ -2594,22 +2603,21 @@ impl Service<ReadRequest> for ReadStateService {
                 let ironwood_subtrees = subtrees_with_published_fallback(
                     ironwood_subtrees,
                     start_index,
+                    verified_tip,
                     || {
-                        state
-                            .historical_subtrees_at_last_checkpoint()
-                            .zip(verified_tip)
-                            .map(|((artifact, vct_applied_below), verified_tip)| {
+                        state.historical_subtrees_at_last_checkpoint().map(
+                            |(artifact, vct_applied_below)| {
                                 let range = range_for(start_index, end_index);
                                 let mut merged =
                                     read::ironwood_subtrees_with_gaps(best_chain, &state.db, range);
                                 read::merge_published_subtrees(
                                     &mut merged,
                                     artifact.ironwood_range(range),
-                                    verified_tip,
                                     vct_applied_below,
                                 );
                                 merged
-                            })
+                            },
+                        )
                     },
                     |merged| {
                         read::check_historical_ironwood_subtrees_available(

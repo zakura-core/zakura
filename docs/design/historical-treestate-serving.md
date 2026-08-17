@@ -20,13 +20,8 @@ authenticated root in `commitment_roots_by_height`. That check makes the frontie
 artifact carry **no trust weight**, which is what lets it be coarse, small, and
 distributed outside the binary.
 
-
-Completed **subtree roots** have different trust property:
-Similar to checkpoints, they ship as an artifact in the committed bundle.
-
-This replaces increments 7 and 8 of the VCT roadmap (an indexing follower that reruns the
-full per-block recompute off the critical path) with something roughly two orders of
-magnitude smaller in both artifact size and node-side work.
+Completed **subtree roots** ship separately in the committed bundle for efficient serving,
+but carry no additional trust weight either. Subtree roots are likewise verified against the corresponding authenticated final frontier during export, independently before publication, and once per process when a node loads the embedded artifact.
 
 ## 2. Problem
 
@@ -95,10 +90,9 @@ Goals:
 
 - Restore `z_gettreestate`, `z_getsubtreesbyindex`, and verbose `getblock`/`getblockheader`
   across the absent band on an archive-mode fast-synced node.
-- Add no **new** trust surface. Everything served is either verified against
-  `commitment_roots_by_height` or rests on the review-based trust the node already
-  extends to the committed bundle (checkpoint list, embedded frontier). Nothing rests on
-  an unverified runtime artifact.
+- Add no **new** trust surface. Every served frontier and subtree root is
+  cryptographically pinned by an authenticated frontier or root. Nothing rests on an
+  unverified runtime artifact.
 - Keep the artifact small enough to distribute through the existing release-state
   pipeline, without embedding it in the binary.
 - Keep the consensus commit path untouched.
@@ -177,10 +171,9 @@ truncated, or hostile artifact is rejected rather than absorbed.
 
 Three consequences:
 
-1. The frontier artifact needs no review-based trust, unlike the checkpoint list, the
-   Sprout history artifact, and the subtree-root artifact (§4.6). It does not need to be
-   committed source or embedded in the binary. This is also why the two artifacts are
-   split: only the entries that can be root-checked belong in the unverified one.
+1. The frontier artifact needs no review-based trust. It does not need to be committed
+   source or embedded in the binary. The subtree-root artifact is embedded for its release
+   and serving lifecycle, not because its roots are trusted without verification (§4.6).
 2. It can be fetched at runtime from any source, including eventually a peer, without
    weakening anything. That is a natural fit for the cross-client spec work in roadmap
    increment 9.
@@ -232,36 +225,21 @@ that typed error immediately rather than walking the range until the first missi
 
 ### 4.6 The subtree-root artifact
 
-**Superseded (2026-08-17).** Everything below describes the artifact as it was designed
-here, and the trust story it rests on has since been replaced by a stronger one. A
-frontier's ommers at levels at or above the tracked subtree height _are_ the pairwise
-hashes of the subtrees already complete, so folding a candidate set of roots must
-reproduce them — which means subtree roots can be proven offline against the frontier that
-pins them, with no replay. That proof shipped in the subtree-artifact PR, along with the
-embedded Mainnet artifact and the release-state pipeline that refreshes it. Consequences
-for what follows: the artifact is no longer runtime-configured (it ships embedded), no
-longer needs the "reviewed, trusted" framing, and no longer depends on the opportunistic
-convergence described in the second bullet below. This section is kept because it records
-why the problem looked unsolvable, which is the context for the solution that replaced it.
+A completed subtree root is an interior node rather than a complete frontier, so it cannot
+be checked by comparing it directly with `commitment_roots_by_height`. It is nevertheless
+pinned by the final frontier. Ommers at levels at or above the tracked subtree height are
+pairwise hashes of the completed subtrees they span. Folding the candidate roots in index
+order must reproduce every corresponding ommer; the frontier's own subtree-level root
+checks the boundary case where it ends exactly at a subtree completion. A wrong, missing,
+or extra root therefore fails verification without replaying any of the subtree's 65,536
+leaves.
 
-Subtree roots need their own artifact and their own trust story, because the §4.2 check
-does not extend to them. A completed subtree root is an interior node of the tree: every
-authenticated root in `commitment_roots_by_height` commits to it, but extracting or
-confirming it from a root requires replaying the subtree's 65,536 leaves, which is the
-work being avoided. Nor is there a supplied-and-verified channel as there is for
-per-block roots: headers commit to tree roots through the chain history tree, but nothing
-in the protocol commits to subtree roots. They exist only as a local by-product of the
-tree maintenance the fast path deliberately skips, which is why they cannot be recorded
-during fast sync at all.
-
-**Qualified (2026-08-03).** The first sentence holds for a _serving_ node, which is why the
-artifact still ships at review-level trust. It does not hold for the **publisher**, which
-replays the band regardless: subtree roots fall out of that replay as interior nodes, pinned
-between two root-checked grid entries. Verified against ground truth — above a fast-synced
-node's handoff the database does store subtree rows, and replaying `(3,358,006, 3,432,538]`
-reproduces all 5 of them exactly. So the generator can verify what it publishes, which is
-stronger than the reproducibility gate below; what is unchanged is that a _consumer_ still
-cannot check a record cheaply, except opportunistically as §4.6's second bullet describes.
+The release-state pipeline extends the embedded prefix with retained database rows and
+verifies the complete result against the newly produced final frontier before returning
+either artifact. The `verify-historical-treestates` command can repeat that proof offline
+for a candidate bundle. A consuming node verifies the embedded artifact once per process
+against its embedded frontier before exposing it to the read service; RPC requests do not
+repeat the proof.
 
 The set is small and static. Decoding the embedded final frontier at the handoff
 (3,418,406) gives the pool positions directly:
@@ -278,18 +256,9 @@ the 2026-08-02 snapshot, whose handoff is the earlier 3,358,006: 1,127 Sapling a
 Orchard records, 71,879 bytes framed — close enough to confirm the estimate. It grows
 append-only by a handful of subtrees per month at current usage.
 
-Because it cannot be self-verified, this artifact ships in the **reviewed, committed
-bundle**, at the same trust level as the checkpoint list and the embedded frontier, not
-in the runtime-fetched frontier artifact. Two qualifications on that trust:
-
-- At ~1,900 records, "review" cannot mean eyeballing hashes. The real gate is
-  reproducibility: two independent exporter runs must agree byte-for-byte, the same
-  determinism gate phase C applies to the frontier artifact.
-- Replay crosses subtree boundaries anyway. Whenever an on-demand derivation (§4.3)
-  passes a completion position, the derived root is compared against the embedded one and
-  a mismatch is treated as artifact corruption (§4.5). Wallet sweeps cross every boundary
-  in the band, so the list converges from trusted to verified over a node's lifetime at
-  no dedicated cost.
+The artifact ships in the committed bundle rather than the runtime-fetched frontier
+artifact because it is a small, append-only serving index coupled to the release
+checkpoint. Its location is an operational choice, not a source of trust.
 
 ## 5. Generation
 
@@ -353,9 +322,8 @@ fast-synced archive snapshot: ~1.9 ms/block mean across the band, varying ~50x b
 recommendation inverts — see the measured note there.
 
 **Subtree boundary alignment** is resolved by §4.6: subtree roots are published, not
-derived on demand, so no replay ever needs to stop at a mid-block position. The only
-remaining boundary work is the opportunistic check, which compares against the frontier's
-level-16 node as a derivation happens to cross a completion position.
+derived on demand, so no replay ever needs to stop at a mid-block position. The complete
+subtree artifact is proven directly against the final frontier.
 
 **Cache sizing and persistence** are unspecified. Whether derived frontiers should be
 persisted or held in a bounded in-memory cache depends on the same benchmark.
@@ -444,17 +412,16 @@ what grid is needed to fix that.
 ### 8.3 Phase C — re-indexing
 
 1. Promote the A2 pass into an exporter subcommand emitting the frontier artifact at the
-   chosen grid, plus the subtree-root artifact read from the publisher's subtree column
-   families (§4.6, §5). Requires the new below-tip pool-frontier producer described in §5.
+   chosen grid. The independent release-state pipeline extends the subtree-root artifact
+   from retained database rows and proves it against the new final frontier (§4.6, §5).
 2. Determinism gates for both artifacts: two runs byte-identical, and an export at a
    later tip is a pure prefix-append of the earlier one, matching the checkpoint grid
-   contract. For the subtree-root artifact this gate carries the trust argument, so it is
-   not optional.
+   contract.
 3. Node-side load and verification: every frontier entry checked against stored roots and
-   rejected on mismatch; the subtree-root artifact validated for framing and digest, and
+   rejected on mismatch; the subtree-root artifact proven against the final frontier and
    wired into `z_getsubtreesbyindex`.
 4. Anchor selection and caching of derived frontiers, replacing the phase B genesis
-   replay, including the opportunistic subtree-root check at completion positions.
+   replay.
 
 Exit criteria: a cold `z_gettreestate` anywhere in the band completes within the RPC
 budget, and a sequential sweep runs at cache speed.

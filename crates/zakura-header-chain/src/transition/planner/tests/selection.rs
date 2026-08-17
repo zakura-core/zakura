@@ -671,6 +671,46 @@ fn invalid_intermediate_rejects_the_complete_path_before_mutation() {
 }
 
 #[test]
+fn public_transition_api_plans_then_installs_one_verified_dag_change() {
+    let (store, config) = TestStore::new(EngineMode::Integrated);
+    let mut engine = test_engine(&store);
+    let clock = ManualClock(Utc::now());
+    let request = insertion(&store, 3, EvidenceId::from_digest([0x92; 32]));
+    let before = engine.snapshot();
+    let transition = engine
+        .plan_transition(
+            fixture_transition_input(&store, request),
+            &context(&config, &clock, None),
+        )
+        .expect("the stateful engine plans the insertion");
+
+    assert_eq!(transition.snapshot_before_commit(), &before);
+    assert_ne!(
+        transition.snapshot_after_commit().state_version,
+        before.state_version,
+        "a state-changing insertion advances the durable version"
+    );
+    assert!(
+        !transition.is_no_change() && !transition.graph_delta.is_empty(),
+        "the public API admits one verified DAG mutation rather than a no-change receipt"
+    );
+    assert_eq!(
+        engine.snapshot(),
+        before,
+        "planning must leave the source engine unchanged"
+    );
+    let expected = transition.snapshot_after_commit();
+    engine
+        .install_committed_transition(transition)
+        .expect("the transition still has its exact source");
+    assert_eq!(engine.snapshot(), expected);
+    assert_eq!(
+        engine.selected_projection().last().copied(),
+        Some(expected.frontiers.header_best)
+    );
+}
+
+#[test]
 fn transition_installs_only_on_its_exact_source_engine() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let mut engine = test_engine(&store);

@@ -32,15 +32,14 @@ The fast commit path writes anchors, the history tree, and the
 or subtrees (`zakura-state/.../zakura_db/shielded.rs`, the `fast_write.anchor_roots`
 branch). The result is a half-open band `[U, H)` where those column families are empty:
 
-- `U` is `vct_upgrade_height`, the first height this binary committed. For a snapshot
+- `U` is `vct_upgrade_height`, the first height this binary vct-committed. For a snapshot
   synced from scratch it is effectively genesis.
-- `H` is `vct_synced_below`, the checkpoint handoff. The currently embedded Mainnet
+- `H` is `vct_synced_below`, the last checkpoint. The currently embedded Mainnet
   frontier puts it at 3,418,406, which is also the last entry in
   `main-checkpoints.txt`. Shipped snapshots can carry an older marker: the
   2026-08-02 Mainnet archive snapshot records `H = 3,358,006`, because it was built
   by a binary whose handoff was earlier. `H` is read from the database, never
-  assumed, so this only matters when reasoning about a particular snapshot — as it
-  does for the §4.6 table below.
+  assumed, so this only matters when reasoning about a particular snapshot.
 
 Heights at or above `H` get trees again from semantic sync, so the gap is exactly the
 checkpointed band.
@@ -71,18 +70,6 @@ already exists (`ZakuraDb::vct_historical_tree_unavailable`) but has no non-test
 
 `z_getsubtreesbyindex` sits in between: the read path returns an empty list when the
 starting index is absent, so a client seeds nothing and fails later, without a clear cause.
-
-### 2.3 Why the indexing-follower lane is the wrong size
-
-Roadmap increments 7 and 8 propose relocating the per-height trees and subtree column
-families onto an async follower that reruns the full per-block recompute off the consensus
-path. That restores everything, but it pays back in full the cost fast sync was built to
-avoid, on every node, and it does so before knowing which heights anyone will ask for.
-
-Measured against actual demand it is heavily oversized. A wallet issues one treestate
-request per scan batch. At librustzcash-driven batch sizes that is a few hundred requests
-across an entire from-activation Mainnet scan, at heights that are sparse and, critically,
-sequential.
 
 ## 3. Goals and non-goals
 

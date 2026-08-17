@@ -18,7 +18,8 @@ use zakura_chain::{
 };
 
 use crate::service::read::historical_tree::{
-    replay_with_subtrees, verify_against_index, DerivedFrontiers, HistoricalTreeDerivationError,
+    replay_with_subtrees, stored_frontier_before_absent_band, verify_against_index,
+    DerivedFrontiers, HistoricalTreeDerivationError,
 };
 
 use super::{
@@ -644,10 +645,12 @@ pub struct FrontierGridExport {
 
 /// Generates the frontier grid for `db`'s absent band at the given `spacing`.
 ///
-/// Replays contiguously from genesis, emitting an entry every `spacing` heights. Each emitted
-/// entry is root-checked against `commitment_roots_by_height`, and generation stops at the first
-/// height that fails, so a returned artifact is one whose every entry matched. That is what lets
-/// the grid ship without trust: a consumer re-runs the same check before anchoring on an entry.
+/// Replays contiguously across the absent band, starting from stored trees at `U - 1` when
+/// available or from empty frontiers when `U == 0`, and emits an entry every `spacing` heights.
+/// Each emitted entry is root-checked against `commitment_roots_by_height`, and generation stops
+/// at the first height that fails, so a returned artifact is one whose every entry matched. That
+/// is what lets the grid ship without trust: a consumer re-runs the same check before anchoring on
+/// an entry.
 ///
 /// Completed subtree roots are not collected here. The release pipeline
 /// ([`produce_release_treestate_artifacts`]) owns that artifact, and it does not need historical
@@ -683,8 +686,16 @@ pub fn export_frontier_grid(
 
     // Each grid step is one root-checked replay anchored on the previous step, so the whole band
     // is covered by a chain of verified endpoints rather than one unverified sweep.
-    let mut frontiers = DerivedFrontiers::empty();
-    let mut next_replay_from = 0u32;
+    let (mut frontiers, mut next_replay_from) =
+        match stored_frontier_before_absent_band(db, upgrade).map_err(|source| {
+            FrontierGridExportError::Derivation {
+                height: upgrade,
+                source,
+            }
+        })? {
+            Some((anchor, frontiers)) => (frontiers, anchor.0 + 1),
+            None => (DerivedFrontiers::empty(), 0),
+        };
 
     let mut next = upgrade;
     let mut accrued_cost: u64 = 0;

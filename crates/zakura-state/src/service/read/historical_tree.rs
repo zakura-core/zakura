@@ -424,6 +424,19 @@ fn anchor_for(
         return Ok(cached);
     }
 
+    stored_frontier_before_absent_band(db, height)
+        .map(|anchor| anchor.map(|(height, frontiers)| (height, Arc::new(frontiers))))
+}
+
+/// Returns the stored frontier immediately before the absent band, if the band starts above
+/// genesis.
+///
+/// `height` identifies the derivation or export that needs the anchor in any returned error.
+/// `None` means the absent band starts at genesis, so replay must start from empty frontiers.
+pub(crate) fn stored_frontier_before_absent_band(
+    db: &ZakuraDb,
+    height: Height,
+) -> Result<Option<(Height, DerivedFrontiers)>, HistoricalTreeDerivationError> {
     // Below the upgrade height `U` this binary did not run, so per-height trees are present. The
     // tree at `U - 1` is therefore the last stored frontier before the absent band starts.
     let Some(upgrade) = db.vct_upgrade_height().filter(|upgrade| upgrade.0 > 0) else {
@@ -452,11 +465,11 @@ fn anchor_for(
 
     Ok(Some((
         anchor,
-        Arc::new(DerivedFrontiers {
+        DerivedFrontiers {
             sapling,
             orchard,
             ironwood,
-        }),
+        },
     )))
 }
 
@@ -737,6 +750,25 @@ mod tests {
         assert!(!published_is_nearer(Some(HIGH), Some(HIGH)));
         assert!(!published_is_nearer(Some(LOW), None));
         assert!(!published_is_nearer(None, None));
+    }
+
+    #[test]
+    fn genesis_absent_band_has_no_stored_predecessor() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_db();
+
+        assert!(stored_frontier_before_absent_band(&db, Height(0))
+            .expect("an unset upgrade marker starts replay at genesis")
+            .is_none());
+
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_upgrade_marker(&db, Height(0));
+        db.write_batch(batch)
+            .expect("seeding a genesis upgrade marker succeeds");
+
+        assert!(stored_frontier_before_absent_band(&db, Height(0))
+            .expect("a genesis upgrade starts replay at genesis")
+            .is_none());
     }
 
     /// The bug: a cache hit at or below the target used to win unconditionally, so a later high

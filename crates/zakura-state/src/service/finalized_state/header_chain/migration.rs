@@ -56,7 +56,21 @@ impl HeaderChainStore {
         let version = u32::from_be_bytes(version_bytes);
         if version == HeaderChainDiskVersion::CURRENT.0 {
             EngineMetadata::decode(&metadata_bytes)?;
-            return Ok(false);
+            if self
+                .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, super::TOMBSTONE_COUNT_KEY)?
+                .is_some()
+            {
+                return Ok(false);
+            }
+            let mut batch = DiskWriteBatch::new();
+            let tombstone_rows = self.stage_tombstone_count(&mut batch)?;
+            self.db.write(batch)?;
+            tracing::info!(
+                tombstone_rows,
+                disk_format = HeaderChainDiskVersion::CURRENT.0,
+                "completed an interrupted durable header-chain migration"
+            );
+            return Ok(true);
         }
 
         let mut metadata = decode_v1_engine_metadata(&metadata_bytes)?;
@@ -99,6 +113,28 @@ impl HeaderChainStore {
         metadata.disk_format = HeaderChainDiskVersion::CURRENT;
         metadata.state_version = metadata.state_version.checked_next()?;
         metadata.last_transition = None;
+        let tombstone_rows = self.stage_tombstone_count(&mut batch)?;
+        self.put_value(
+            &mut batch,
+            HEADER_ENGINE_META,
+            super::METADATA_KEY,
+            &metadata,
+        )?;
+        self.db.write(batch)?;
+        tracing::info!(
+            auxiliary_rows = rows,
+            tombstone_rows,
+            from_version = 1,
+            to_version = HeaderChainDiskVersion::CURRENT.0,
+            "migrated the durable header-chain format"
+        );
+        Ok(true)
+    }
+
+    fn stage_tombstone_count(
+        &self,
+        batch: &mut DiskWriteBatch,
+    ) -> Result<usize, HeaderChainStoreError> {
         let tombstone_cf = self.cf(HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE)?;
         let mut tombstone_rows = 0;
         self.db
@@ -120,28 +156,14 @@ impl HeaderChainStore {
                 RawVisitError::Visitor(error) => error,
             })?;
         self.put_value(
-            &mut batch,
+            batch,
             HEADER_ENGINE_META,
             super::TOMBSTONE_COUNT_KEY,
             &HeaderRowCountDisk(u64::try_from(tombstone_rows).map_err(|_| {
                 HeaderChainStoreError::Incoherent("tombstone count does not fit u64")
             })?),
         )?;
-        self.put_value(
-            &mut batch,
-            HEADER_ENGINE_META,
-            super::METADATA_KEY,
-            &metadata,
-        )?;
-        self.db.write(batch)?;
-        tracing::info!(
-            auxiliary_rows = rows,
-            tombstone_rows,
-            from_version = 1,
-            to_version = HeaderChainDiskVersion::CURRENT.0,
-            "migrated the durable header-chain format"
-        );
-        Ok(true)
+        Ok(tombstone_rows)
     }
 }
 

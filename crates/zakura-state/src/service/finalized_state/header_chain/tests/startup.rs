@@ -125,6 +125,23 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
             .expect("the migrated tombstone count is readable"),
         Some(HeaderRowCountDisk(0))
     );
+    let mut interrupted = DiskWriteBatch::new();
+    store
+        .delete_raw(&mut interrupted, HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
+        .expect("the interrupted migration omits the tombstone count");
+    store
+        .db
+        .write(interrupted)
+        .expect("the interrupted migration fixture commits");
+    assert!(store
+        .migrate_v1_to_current(&engine_config)
+        .expect("the interrupted current-format migration completes"));
+    assert_eq!(
+        store
+            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
+            .expect("the recovered tombstone count is readable"),
+        Some(HeaderRowCountDisk(0))
+    );
     assert_eq!(
         store
             .load_aux_deliveries()

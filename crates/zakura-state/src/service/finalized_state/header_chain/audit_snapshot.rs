@@ -354,8 +354,12 @@ impl StoreAuditSnapshot for HeaderChainAuditSnapshot<'_> {
             return Ok(hash);
         }
         let hash = read_hash("zakura_header_hash_by_height")?;
+        // Tests build header rows without a canonical index. Answer from those rows only at
+        // settled heights, where the production index answers too. Above the finalized frontier
+        // the index holds nothing, so answering there would let a test authenticate a height that
+        // a release build leaves unauthenticated.
         #[cfg(test)]
-        if hash.is_none() {
+        if hash.is_none() && height <= self.metadata()?.frontiers.finalized.height {
             let mut found = None;
             self.visit_header_nodes(
                 RowLimit::new(zakura_header_chain::MAX_NON_FINALIZED_NODES_V1 + 1),

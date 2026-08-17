@@ -55,9 +55,16 @@ const FRONTIER_HEADER_LEN: usize = 8 + 2 + 1 + 4 + 4 + 4 + 32;
 /// The most frontier entries an artifact may declare.
 ///
 /// A one-block grid across a chain far longer than any real one still fits well inside this, so a
-/// declared count above it is a corrupt or hostile header rather than a legitimate artifact. The
-/// bound is what stops a bad count from driving a huge allocation before any bytes are validated.
+/// declared count above it is a corrupt or hostile header rather than a legitimate artifact. This
+/// is a coarse sanity cap; the payload-length check in [`FrontierArtifact::decode`] is what stops
+/// a still-legal count from driving a huge allocation.
 const MAX_FRONTIER_ENTRIES: usize = 16_000_000;
+
+/// Minimum encoded size of one frontier entry: a height and three `u32` length prefixes.
+///
+/// Empty tree blobs are legal in the framing, so this is the floor. Decode rejects a count that
+/// cannot fit in the payload at this size before allocating the entry vector.
+const MIN_FRONTIER_ENTRY_LEN: usize = 4 + 4 + 4 + 4;
 
 /// Reviewed completed-subtree roots shipped with the Mainnet last checkpoint.
 pub(super) const MAINNET_SUBTREES: &[u8] = include_bytes!("vct/mainnet-subtrees.bin");
@@ -471,6 +478,17 @@ impl FrontierArtifact {
         // bytes are known to be the ones the generator wrote.
         if Sha256::digest(payload).as_slice() != digest {
             return Err(TreestateArtifactError::DigestMismatch { kind });
+        }
+
+        // The digest does not cover the declared count, so a hostile header can pair a huge
+        // count with a matching digest over a tiny payload. Reject that before allocating.
+        let min_payload_len = count.saturating_mul(MIN_FRONTIER_ENTRY_LEN);
+        if min_payload_len > payload.len() {
+            return Err(TreestateArtifactError::Truncated {
+                kind,
+                offset: FRONTIER_HEADER_LEN,
+                needed: min_payload_len - payload.len(),
+            });
         }
 
         let mut entries = Vec::with_capacity(count);
@@ -1192,6 +1210,48 @@ mod tests {
         assert!(matches!(
             FrontierArtifact::decode(&bytes, &Network::Mainnet),
             Err(TreestateArtifactError::TooManyRecords { .. })
+        ));
+    }
+
+    /// `MAX_FRONTIER_ENTRIES` is only a sanity cap. A still-legal count must also fit in the
+    /// payload at `MIN_FRONTIER_ENTRY_LEN` bytes each, or `Vec::with_capacity(count)` would
+    /// allocate hundreds of megabytes before the first truncated read.
+    #[test]
+    fn frontier_artifact_rejects_count_that_cannot_fit_in_payload() {
+        let count_bytes = |count: usize| {
+            u32::try_from(count)
+                .expect("test counts fit in the u32 count field")
+                .to_le_bytes()
+        };
+
+        // Empty payload, digest of that empty payload, count at the sanity cap: the ~55-byte
+        // file the report describes.
+        let mut empty = FrontierArtifact {
+            spacing: 10,
+            last_checkpoint: Height(31),
+            entries: Vec::new(),
+        }
+        .encode(&Network::Mainnet);
+        assert_eq!(empty.len(), FRONTIER_HEADER_LEN);
+        empty[19..23].copy_from_slice(&count_bytes(MAX_FRONTIER_ENTRIES));
+        assert!(matches!(
+            FrontierArtifact::decode(&empty, &Network::Mainnet),
+            Err(TreestateArtifactError::Truncated { .. })
+        ));
+
+        // A real artifact with only the count field patched. The digest still matches because
+        // it does not cover the header.
+        let mut patched = sample_frontiers().encode(&Network::Mainnet);
+        let payload_len = patched.len() - FRONTIER_HEADER_LEN;
+        let impossible_count = payload_len / MIN_FRONTIER_ENTRY_LEN + 1;
+        assert!(
+            impossible_count <= MAX_FRONTIER_ENTRIES,
+            "the sample payload must be smaller than the sanity cap so this hits the size check"
+        );
+        patched[19..23].copy_from_slice(&count_bytes(impossible_count));
+        assert!(matches!(
+            FrontierArtifact::decode(&patched, &Network::Mainnet),
+            Err(TreestateArtifactError::Truncated { .. })
         ));
     }
 

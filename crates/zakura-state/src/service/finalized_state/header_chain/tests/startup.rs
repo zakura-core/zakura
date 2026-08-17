@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn f_225512_startup_commits_deferred_reevaluation_before_publication() {
+fn startup_commits_deferred_reevaluation_before_publication() {
     #[derive(Copy, Clone)]
     struct FixedClock(DateTime<Utc>);
 
@@ -108,7 +108,7 @@ fn f_225512_startup_commits_deferred_reevaluation_before_publication() {
 }
 
 #[test]
-fn f_225520_rocksdb_recovery_rejects_a_forged_headers_only_witness() {
+fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
     let db_config = Config::ephemeral();
     let (mut engine_config, anchor, mut metadata) = fixture();
     engine_config.mode = EngineMode::HeadersOnly;
@@ -179,20 +179,20 @@ fn f_225520_rocksdb_recovery_rejects_a_forged_headers_only_witness() {
     let finalized = runtime.publisher().snapshot().frontiers.finalized;
     assert_eq!(finalized.height, block::Height(1));
 
+    // The selected tip sits above the finalized frontier, where no canonical index reaches, so
+    // only the finalized frontier needs an independent row.
     let mut canonical = DiskWriteBatch::new();
-    for frontier in [finalized, selected_tip] {
-        runtime
-            .store
-            .put_raw(
-                &mut canonical,
-                "zakura_header_hash_by_height",
-                HeaderHeightKey(frontier.height).as_bytes(),
-                frontier.hash.0,
-            )
-            .expect("the independent canonical witness row encodes");
-    }
+    runtime
+        .store
+        .put_raw(
+            &mut canonical,
+            "zakura_header_hash_by_height",
+            HeaderHeightKey(finalized.height).as_bytes(),
+            finalized.hash.0,
+        )
+        .expect("the independent canonical finalized row encodes");
     db.write(canonical)
-        .expect("the independent canonical witness rows commit");
+        .expect("the independent canonical finalized row commits");
     audit_store(&runtime.store, &engine_config)
         .expect("the exact headers-only selected-tip witness recovers");
 

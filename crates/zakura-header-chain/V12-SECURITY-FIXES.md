@@ -10,7 +10,7 @@ This document maps nine V12 security findings to their corrections and primary r
 | F-225512 | Recovery preserves elapsed deferrals. Startup settles them through one normal planner transition before publication. | `f_225512_startup_commits_deferred_reevaluation_before_publication` |
 | F-225514 | Each transition binds to one process-local engine capability and one source revision. | `f_225514_transition_installs_only_on_its_exact_source_engine` |
 | F-225516 | Full-state path acceptance validates and updates every retained path member. | `f_225516_accepted_side_path_verifies_every_retained_member` |
-| F-225520 | Recovery authenticates each headers-only selected-tip witness through the independent canonical index. | `f_225520_rocksdb_recovery_rejects_a_forged_headers_only_witness` |
+| F-225520 | Recovery authenticates each headers-only selected-tip witness: a settled witness through the independent canonical index, an above-finalized witness through the audited header rows. | `f_225520_rocksdb_recovery_rejects_a_forged_headers_only_witness` |
 | F-225521 | The planner reports checkpoint finality only when it appends a finality record. | `f_225521_empty_checkpoint_growth_has_no_finality_effect` |
 | F-225522 | Finality-consumed work returns `AlreadyApplied` before mutable replay-conflict checks. | `f_225522_finality_consumed_header_work_precedes_replay_conflict` |
 
@@ -32,7 +32,9 @@ The corrections preserve these path-specific budgets:
 - Source-engine installation performs a constant-time capability and revision comparison.
 - Finality-effect and replay decisions perform constant work without allocation.
 - Startup deferred settlement performs one bounded recovery pass and one normal transition.
-- Recovery performs one canonical-index lookup for each accepted headers-only finality witness.
+- Recovery performs one canonical-index lookup for each settled headers-only finality witness, and
+  one bounded parent walk of at most `local_finality_depth` retained lookups for each witness above
+  the finalized frontier.
 
 Ordinary header admission adds no finding-related graph scan. These corrections do not clone the complete graph or
 sort all retained nodes or candidate tips.

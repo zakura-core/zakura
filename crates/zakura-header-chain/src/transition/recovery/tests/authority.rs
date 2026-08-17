@@ -44,7 +44,7 @@ fn canonical_work_and_recovery_time_are_authoritative() {
 }
 
 #[test]
-fn f_225512_recovery_preserves_elapsed_deferrals_for_normal_reevaluation() {
+fn recovery_preserves_elapsed_deferrals_for_normal_reevaluation() {
     let (base, config) = fixture();
     let child_hash = base.nodes[1].hash;
     let mut elapsed = base.clone();
@@ -581,7 +581,7 @@ fn fatal_configuration_mismatch_fails_before_collection_visit() {
 }
 
 #[test]
-fn f_225509_policy_mismatch_fails_before_collection_visit() {
+fn policy_mismatch_fails_before_collection_visit() {
     let (mut store, config) = fixture();
     store.metadata.network_policy_digest[0] ^= 1;
     store.snapshot = store.metadata.snapshot();
@@ -620,45 +620,48 @@ fn bounded_finality_history_continues_from_an_authenticated_checkpoint() {
     assert!(violations(&store, &config).contains(&AuditViolation::Finality));
 }
 
+fn extend(parent: &HeaderNode, nonce: u8) -> HeaderNode {
+    let mut header = *parent.header;
+    header.previous_block_hash = parent.hash;
+    header.time += Duration::seconds(1);
+    header.nonce = [nonce; 32].into();
+    let header = Arc::new(header);
+    let hash = header.hash();
+    let block_work = header
+        .difficulty_threshold
+        .to_work()
+        .expect("the fixture chain target has work");
+    HeaderNode::from_durable_parts(
+        header,
+        hash,
+        parent.hash,
+        parent
+            .height
+            .next()
+            .expect("the fixture chain height has a successor"),
+        block_work,
+        parent
+            .work_coordinate()
+            .checked_add(block_work)
+            .expect("the fixture chain work fits"),
+        HeaderValidationState::Valid,
+        EligibilityState::default(),
+        BodyValidationState::Unknown,
+        Vec::new(),
+    )
+    .expect("the fixture chain fields agree")
+}
+
+/// Build a headers-only history whose depth witness sits above the finalized frontier.
 fn headers_only_depth_history_fixture() -> (AuditStore, EngineConfig, Frontier) {
     let (mut store, mut config) = fixture();
     let anchor_node = store.nodes[0].clone();
     let child_node = store.nodes[1].clone();
     let anchor = Frontier::new(anchor_node.height, anchor_node.hash);
     let child = Frontier::new(child_node.height, child_node.hash);
-    let mut tip_header = *child_node.header;
-    tip_header.previous_block_hash = child.hash;
-    tip_header.time += Duration::seconds(1);
-    tip_header.nonce = [0x52; 32].into();
-    let tip_header = Arc::new(tip_header);
-    let tip_hash = tip_header.hash();
-    let tip_work = tip_header
-        .difficulty_threshold
-        .to_work()
-        .expect("the fixture tip target has work");
-    let tip = Frontier::new(
-        child
-            .height
-            .next()
-            .expect("the fixture child has a successor height"),
-        tip_hash,
-    );
-    let tip_node = HeaderNode::from_durable_parts(
-        tip_header,
-        tip.hash,
-        child.hash,
-        tip.height,
-        tip_work,
-        child_node
-            .work_coordinate()
-            .checked_add(tip_work)
-            .expect("the fixture tip work fits"),
-        HeaderValidationState::Valid,
-        EligibilityState::default(),
-        BodyValidationState::Unknown,
-        Vec::new(),
-    )
-    .expect("the fixture tip fields agree");
+    let tip_node = extend(&child_node, 0x52);
+    let tip_work = tip_node.block_work;
+    let tip = Frontier::new(tip_node.height, tip_node.hash);
 
     config.mode = EngineMode::HeadersOnly;
     config.limits.local_finality_depth = std::num::NonZeroU32::new(1).expect("one is nonzero");
@@ -683,39 +686,130 @@ fn headers_only_depth_history_fixture() -> (AuditStore, EngineConfig, Frontier) 
         source: FinalitySource::HeadersOnlyDepth { selected_tip: tip },
         epoch: FinalityEpoch::new(0),
     }];
-    store.canonical.insert(tip.height, tip.hash);
     store.snapshot = store.metadata.snapshot();
     (store, config, tip)
 }
 
-#[test]
-fn f_225520_recovery_authenticates_headers_only_selected_tip_witness() {
-    use std::sync::atomic::Ordering;
+/// Build a headers-only history whose oldest depth witness is already finalized.
+fn settled_headers_only_depth_history_fixture() -> (AuditStore, EngineConfig, Frontier) {
+    let (mut store, mut config) = fixture();
+    let anchor_node = store.nodes[0].clone();
+    let first_node = store.nodes[1].clone();
+    let second_node = extend(&first_node, 0x55);
+    let third_node = extend(&second_node, 0x56);
+    let fourth_node = extend(&third_node, 0x57);
+    let anchor = Frontier::new(anchor_node.height, anchor_node.hash);
+    let first = Frontier::new(first_node.height, first_node.hash);
+    let second = Frontier::new(second_node.height, second_node.hash);
+    let third = Frontier::new(third_node.height, third_node.hash);
+    let fourth = Frontier::new(fourth_node.height, fourth_node.hash);
 
-    let (store, config, _) = headers_only_depth_history_fixture();
-    audit_store(&store, &config).expect("the canonical selected-tip witness recovers");
-    assert_eq!(store.canonical_reads.load(Ordering::Relaxed), 2);
+    config.mode = EngineMode::HeadersOnly;
+    config.limits.local_finality_depth = std::num::NonZeroU32::new(1).expect("one is nonzero");
+    store.metadata.mode = EngineMode::HeadersOnly;
+    store.metadata.finality_epoch = FinalityEpoch::new(1);
+    store.metadata.frontiers.finalized = third;
+    store.metadata.frontiers.header_best = fourth;
+    store.metadata.frontiers.verified_best = third;
+    store.metadata.header_best_score = ChainScore::new(
+        SuffixWork::new(fourth_node.block_work.as_u256()),
+        fourth.hash,
+    );
+    store.metadata.oldest_retained_height = third.height;
+    store.nodes = vec![third_node, fourth_node];
+    store.children = vec![(third.hash, fourth.hash)];
+    store.selected = vec![third, fourth];
+    store.verified = vec![third];
+    store.contexts = vec![
+        ValidationContextRecord {
+            header: anchor_node.header,
+            height: anchor.height,
+        },
+        ValidationContextRecord {
+            header: first_node.header,
+            height: first.height,
+        },
+        ValidationContextRecord {
+            header: second_node.header,
+            height: second.height,
+        },
+    ];
+    store.finality = vec![
+        FinalityRecord {
+            previous: anchor,
+            current: first,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: second,
+            },
+            epoch: FinalityEpoch::new(0),
+        },
+        FinalityRecord {
+            previous: first,
+            current: third,
+            source: FinalitySource::HeadersOnlyDepth {
+                selected_tip: fourth,
+            },
+            epoch: FinalityEpoch::new(1),
+        },
+    ];
+    store.canonical.insert(second.height, second.hash);
+    store.canonical.insert(third.height, third.hash);
+    store.snapshot = store.metadata.snapshot();
+    (store, config, second)
 }
 
 #[test]
-fn f_225520_recovery_rejects_missing_or_forged_selected_tip_witness() {
-    let (base, config, tip) = headers_only_depth_history_fixture();
+fn recovery_authenticates_headers_only_selected_tip_witness() {
+    use std::sync::atomic::Ordering;
+
+    let (store, config, _) = headers_only_depth_history_fixture();
+    audit_store(&store, &config).expect("the retained selected-tip witness recovers");
+    // The witness sits above the finalized frontier, so only the frontier itself is read from
+    // the canonical index, which does not cover unsettled heights.
+    assert_eq!(store.canonical_reads.load(Ordering::Relaxed), 1);
+
+    let (settled, settled_config, _) = settled_headers_only_depth_history_fixture();
+    audit_store(&settled, &settled_config).expect("the canonical selected-tip witness recovers");
+    assert_eq!(settled.canonical_reads.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn recovery_rejects_missing_or_forged_settled_selected_tip_witness() {
+    let (base, config, witness) = settled_headers_only_depth_history_fixture();
 
     let mut missing = base.clone();
-    missing.canonical.remove(&tip.height);
+    missing.canonical.remove(&witness.height);
     assert!(violations(&missing, &config).contains(&AuditViolation::Finality));
 
     let mut forged_index = base.clone();
     forged_index
         .canonical
-        .insert(tip.height, block::Hash([0x53; 32]));
+        .insert(witness.height, block::Hash([0x53; 32]));
     assert!(violations(&forged_index, &config).contains(&AuditViolation::Finality));
 
     let mut forged_record = base;
     forged_record.finality[0].source = FinalitySource::HeadersOnlyDepth {
-        selected_tip: Frontier::new(tip.height, block::Hash([0x54; 32])),
+        selected_tip: Frontier::new(witness.height, block::Hash([0x54; 32])),
     };
     assert!(violations(&forged_record, &config).contains(&AuditViolation::Finality));
+}
+
+#[test]
+fn recovery_rejects_an_unprovable_above_finalized_witness() {
+    let (base, config, tip) = headers_only_depth_history_fixture();
+
+    let mut unretained = base.clone();
+    unretained.finality[0].source = FinalitySource::HeadersOnlyDepth {
+        selected_tip: Frontier::new(tip.height, block::Hash([0x54; 32])),
+    };
+    assert!(violations(&unretained, &config).contains(&AuditViolation::Finality));
+
+    let mut wrong_height = base;
+    let finalized = wrong_height.metadata.frontiers.finalized;
+    wrong_height.finality[0].source = FinalitySource::HeadersOnlyDepth {
+        selected_tip: Frontier::new(tip.height, finalized.hash),
+    };
+    assert!(violations(&wrong_height, &config).contains(&AuditViolation::Finality));
 }
 
 #[test]

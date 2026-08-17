@@ -3,20 +3,21 @@
 //! Reads canonical block hashes and `BlockInfo` sizes straight from a finalized
 //! state database, so it works on pruned databases and needs no running node.
 //! The emitted checkpoints continue the deterministic selection sequence started
-//! at the embedded Mainnet checkpoint list, and the optional frontier artifact
-//! is captured at the last emitted checkpoint height. See the "Mainnet
-//! release-state" section of `docs/design/verified-commitment-trees.md`.
+//! at the embedded Mainnet checkpoint list. The optional frontier and completed-subtree
+//! artifacts are produced together at the last emitted checkpoint height. See the
+//! "Mainnet release-state" section of `docs/design/verified-commitment-trees.md`.
 
 // This is a CLI module: checkpoint lines go to stdout, status goes to stderr,
 // and argument invariants established by `Args::validate_mode` use `expect`.
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::unwrap_in_result)]
 
-use std::{fs, io::Write, path::Path};
+use std::{io::Write, path::Path};
 
 use color_eyre::eyre::{ensure, eyre, Context, Result};
 
 use zakura_chain::{
     block::{self, Height, MAX_BLOCK_BYTES},
+    common::atomic_write,
     parameters::Network,
 };
 use zakura_node_services::constants::{MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};
@@ -102,9 +103,9 @@ fn validate_header_link(
 /// Run the offline export selected by `--state-cache-dir`.
 ///
 /// Prints checkpoint lines to stdout (optionally prefixed with the embedded
-/// Mainnet list under `--full-list`) and writes the frontier artifact for the
-/// last emitted checkpoint when `--mainnet-frontier-output` is supplied. All
-/// status output goes to stderr so stdout stays a clean checkpoint list.
+/// Mainnet list under `--full-list`) and writes the frontier and completed-subtree
+/// artifacts for the last emitted checkpoint when their output paths are supplied.
+/// All status output goes to stderr so stdout stays a clean checkpoint list.
 pub fn run_offline(args: &Args) -> Result<()> {
     let state_cache_dir = args
         .state_cache_dir
@@ -215,12 +216,12 @@ pub fn run_offline(args: &Args) -> Result<()> {
         .last()
         .expect("selection was checked to be non-empty");
 
-    // Produce the frontier before any checkpoint output: a frontier failure
-    // (Sprout change in the window, unretained body, filesystem error) must
-    // not leave a caller's redirected stdout holding an advanced checkpoint
-    // list without its coupled frontier artifact.
-    if let Some(frontier_path) = &args.mainnet_frontier_output {
-        write_frontier(&db, last_height, frontier_path)?;
+    // Produce and persist both artifacts before any checkpoint output. A failure must not leave a
+    // caller's redirected stdout holding an advanced list without its coupled release state.
+    if let (Some(frontier_path), Some(subtree_path)) =
+        (&args.mainnet_frontier_output, &args.mainnet_subtree_output)
+    {
+        write_release_treestate_artifacts(&db, last_height, frontier_path, subtree_path)?;
     }
 
     // Lock stdout once: the full list is ~14k lines and per-line locking is slow.
@@ -245,29 +246,37 @@ pub fn run_offline(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Produce, validate, and atomically write the frontier artifact for `height`.
-///
-/// `height` is the last emitted checkpoint, which sits below the finalized tip,
-/// so this uses the settled-Sprout producer: it fails closed if any retained
-/// block above `height` appended Sprout note commitments, and the next daily
-/// export self-heals once the checkpoint sequence passes that block.
-fn write_frontier(db: &zakura_state::ZakuraDb, height: Height, path: &Path) -> Result<()> {
-    let bytes = zakura_state::produce_settled_final_frontiers_bytes(db, height)
-        .wrap_err("producing the Mainnet final frontiers")?;
-    zakura_state::validate_final_frontiers_bytes(&bytes, height)
-        .wrap_err("validating the produced frontier bytes")?;
-
-    let temporary_path = path.with_extension("tmp");
-    fs::write(&temporary_path, &bytes)
-        .wrap_err_with(|| format!("writing frontier artifact to {}", temporary_path.display()))?;
-    fs::rename(&temporary_path, path)
-        .wrap_err_with(|| format!("renaming frontier artifact to {}", path.display()))?;
+/// Produce and atomically write the coupled treestate artifacts for `height`.
+fn write_release_treestate_artifacts(
+    db: &zakura_state::ZakuraDb,
+    height: Height,
+    frontier_path: &Path,
+    subtree_path: &Path,
+) -> Result<()> {
+    let artifacts = zakura_state::produce_release_treestate_artifacts(db, height)
+        .wrap_err("producing the Mainnet release treestate artifacts")?;
+    zakura_state::validate_final_frontiers_bytes(&artifacts.final_frontiers, height)
+        .wrap_err("validating the Mainnet release frontier bytes")?;
+    atomic_write(frontier_path.to_path_buf(), &artifacts.final_frontiers)
+        .wrap_err_with(|| format!("writing {}", frontier_path.display()))?
+        .wrap_err_with(|| format!("persisting {}", frontier_path.display()))?;
+    atomic_write(subtree_path.to_path_buf(), &artifacts.historical_subtrees)
+        .wrap_err_with(|| format!("writing {}", subtree_path.display()))?
+        .wrap_err_with(|| format!("persisting {}", subtree_path.display()))?;
 
     eprintln!(
-        "wrote {}-byte frontier artifact for checkpoint {} to {}",
-        bytes.len(),
-        height.0,
-        path.display()
+        "wrote checkpoint {} artifacts: {}-byte frontier to {}, {}-byte subtree roots to {}",
+        artifacts.last_checkpoint.0,
+        artifacts.final_frontiers.len(),
+        frontier_path.display(),
+        artifacts.historical_subtrees.len(),
+        subtree_path.display(),
+    );
+    eprintln!(
+        "extended checkpoint {} roots with {} local rows; verified {} roots total",
+        artifacts.previous_last_checkpoint.0,
+        artifacts.added_subtree_roots,
+        artifacts.verified_subtree_roots,
     );
     Ok(())
 }

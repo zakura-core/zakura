@@ -14,12 +14,11 @@ use once_cell::sync::Lazy;
 use orchard::{
     bundle::{BatchError, BatchValidator},
     circuit::{OrchardCircuitVersion, VerifyingKey},
-    ValuePool,
 };
 use rand::thread_rng;
 use zakura_chain::{
     parameters::NetworkUpgrade,
-    transaction::{SigHash, WtxId},
+    transaction::{SigHash, UnminedTxId, WtxId},
 };
 use zcash_protocol::value::ZatBalance;
 
@@ -32,12 +31,10 @@ use tower_fallback::Fallback;
 
 use super::spawn_fifo;
 
-mod cache;
-
 #[cfg(test)]
 mod tests;
 
-use cache::Cached;
+use super::cache::{CacheKey, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
 
 /// Adjusted batch size for halo2 batches.
 ///
@@ -48,34 +45,6 @@ use cache::Cached;
 /// To compensate for larger proofs, we process the batch once there are over
 /// [`HALO2_MAX_BATCH_SIZE`] total actions among pending items in the queue.
 const HALO2_MAX_BATCH_SIZE: usize = super::MAX_BATCH_SIZE;
-
-/// The number of verified-proof keys retained per Orchard circuit era.
-///
-/// Sized to hold several blocks of history plus a full mempool, so that a
-/// transaction gossiped well before the block that mines it is still
-/// remembered. The witnessed transaction ID, sighash, and pool tag use about
-/// 2 MB per era before collection overhead.
-const CACHE_CAPACITY: usize = 20_000;
-
-/// A witnessed transaction, sighash, and value pool whose Halo2 bundle has
-/// verified.
-///
-/// [`WtxId`] contains both the transaction ID, which commits to the bundle's
-/// effecting data, and the authorizing-data digest, which commits to its proof
-/// and signatures. The pool distinguishes the Orchard and Ironwood bundles in
-/// a v6 transaction, because they share one [`WtxId`].
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct CacheKey {
-    /// The witnessed transaction ID containing the txid and authorizing-data
-    /// digest.
-    wtx_id: WtxId,
-
-    /// The signature digest used to verify the bundle's signatures.
-    sighash: [u8; 32],
-
-    /// The bundle slot verified for this transaction.
-    pool: ValuePool,
-}
 
 /// The type of verification results.
 type VerifyResult = bool;
@@ -195,16 +164,16 @@ impl Item {
         sighash: SigHash,
         wtx_id: WtxId,
     ) -> Self {
-        let pool = bundle.bundle_version().value_pool();
+        let pool = ShieldedPool::from(bundle.bundle_version().value_pool());
 
         Self {
             bundle: Arc::new(bundle),
             sighash,
-            cache_key: Some(CacheKey {
-                wtx_id,
-                sighash: sighash.0,
+            cache_key: Some(CacheKey::new(
+                UnminedTxId::Witnessed(wtx_id),
+                sighash.0,
                 pool,
-            }),
+            )),
         }
     }
 
@@ -220,7 +189,9 @@ impl Item {
         }
         batch.validate(thread_rng())
     }
+}
 
+impl CachedItem for Item {
     /// Returns this item's cache key, if it was constructed with a witnessed
     /// transaction ID.
     ///
@@ -331,9 +302,10 @@ type VerifierService = Cached<BatchFallbackService>;
 /// The stack is wrapped in a [`Cached`] so that a proof gossiped into the mempool does not have
 /// to be verified again when the block that mines it arrives. Because each era builds its own
 /// verifier here, each era also gets its own cache, which is what binds a remembered result to the
-/// `vk` it was produced under.
-fn batch_verifier(vk: &'static ItemVerifyingKey) -> VerifierService {
-    Cached::new(batch_fallback_verifier(vk), CACHE_CAPACITY)
+/// `vk` it was produced under. `verifier_name` is the era's `verifier` metrics label, so each
+/// era's cache reports its own hit rate.
+fn batch_verifier(vk: &'static ItemVerifyingKey, verifier_name: &'static str) -> VerifierService {
+    Cached::new(batch_fallback_verifier(vk), CACHE_CAPACITY, verifier_name)
 }
 
 /// Builds the uncached batching-and-fallback stack for `vk`.
@@ -358,7 +330,7 @@ fn batch_fallback_verifier(vk: &'static ItemVerifyingKey) -> BatchFallbackServic
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
 pub static VERIFIER_PRE_NU6_2: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_PRE_NU6_2));
+    Lazy::new(|| batch_verifier(&VERIFYING_KEY_PRE_NU6_2, "halo2_pre_nu6_2"));
 
 /// Global batch verification context for **NU6.2-until-NU6.3** Halo2 Action proofs.
 ///
@@ -369,7 +341,7 @@ pub static VERIFIER_PRE_NU6_2: Lazy<VerifierService> =
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
 pub static VERIFIER_NU6_2: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_2));
+    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_2, "halo2_nu6_2"));
 
 /// Global batch verification context for **NU6.3-onward** Halo2 Action proofs.
 ///
@@ -382,7 +354,7 @@ pub static VERIFIER_NU6_2: Lazy<VerifierService> =
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
 pub static VERIFIER_NU6_3_ONWARD: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_3_ONWARD));
+    Lazy::new(|| batch_verifier(&VERIFYING_KEY_NU6_3_ONWARD, "halo2_nu6_3_onward"));
 
 /// Selects the lazily initialized Halo2 verifier for `network_upgrade`.
 ///

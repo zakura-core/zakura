@@ -106,7 +106,9 @@ zcash_net_peers_connected{user_agent="/Gone:1.0/",remote_version="170160"} 0
 """
 
     def setUp(self):
-        exposition = self.EXPOSITION
+        self.exposition = self.EXPOSITION
+        self.rpc_results = {}
+        outer = self
 
         class StubHandler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -120,12 +122,30 @@ zcash_net_peers_connected{user_agent="/Gone:1.0/",remote_version="170160"} 0
 
             def do_GET(self):
                 if self.path == "/metrics":
-                    return self.reply(200, exposition)
+                    return self.reply(200, outer.exposition)
                 if self.path == "/healthy":
                     return self.reply(200, b"ok")
                 if self.path == "/ready":
                     return self.reply(503, b"lag=47 blocks")
                 return self.reply(404, b"nope")
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode())
+                method = payload.get("method")
+                if method in outer.rpc_results:
+                    body = json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id"),
+                        "result": outer.rpc_results[method],
+                    }).encode()
+                    return self.reply(200, body)
+                body = json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id"),
+                    "error": {"code": -32601, "message": method},
+                }).encode()
+                return self.reply(200, body)
 
         self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), StubHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -201,8 +221,8 @@ zcash_net_peers_connected{user_agent="/Gone:1.0/",remote_version="170160"} 0
         )
 
     def test_peer_versions_come_from_the_user_agent_label(self):
-        # zakurad's getpeerinfo omits subver, so the exporter label is the only
-        # source for a peer version breakdown.
+        # Legacy fallback: older zakurad omits getpeerinfo.subver, so the
+        # exporter label still fills the panel until that RPC field exists.
         probe = self.run_probe(metrics_endpoint=self.endpoint)
 
         self.assertEqual(
@@ -210,6 +230,40 @@ zcash_net_peers_connected{user_agent="/Gone:1.0/",remote_version="170160"} 0
             [["/Zakura:1.1.0/", 42], ["/MagicBean:6.2.0/", 33]],
         )
         self.assertNotIn("zcash_net_peers_connected", probe["metrics"])
+
+    def test_peer_versions_are_absent_without_user_agent_labels(self):
+        self.exposition = b"""zakura_build_info{version="1.1.0-rc1"} 1
+zcash_net_peers 74
+zcash_net_in_bytes_total 12345
+"""
+        probe = self.run_probe(metrics_endpoint=self.endpoint)
+
+        self.assertNotIn("peer_user_agents", probe)
+
+    def test_peer_versions_come_from_getpeerinfo_subver(self):
+        # Durable source: once zakurad exposes subver, the panel restores
+        # from RPC even when the exporter no longer labels by user_agent.
+        self.rpc_results = {
+            "getblockchaininfo": {
+                "blocks": 10,
+                "headers": 10,
+                "bestblockhash": "aa",
+                "chain": "test",
+            },
+            "getpeerinfo": [
+                {"addr": "127.0.0.1:1", "inbound": False, "subver": "/Zakura:1.1.0/"},
+                {"addr": "127.0.0.1:2", "inbound": True, "subver": "/Zakura:1.1.0/"},
+                {"addr": "127.0.0.1:3", "inbound": False, "subver": "/MagicBean:6.2.0/"},
+                {"addr": "127.0.0.1:4", "inbound": False},
+            ],
+        }
+        probe = self.run_probe(rpc_url=f"http://{self.endpoint}/")
+
+        self.assertEqual(
+            probe["peer_subversions"],
+            [["/Zakura:1.1.0/", 2], ["/MagicBean:6.2.0/", 1], ["unknown", 1]],
+        )
+        self.assertNotIn("peer_user_agents", probe)
 
     def test_metrics_scrape_can_be_skipped(self):
         probe = self.run_probe(metrics_endpoint=self.endpoint, want_metrics="")
@@ -300,6 +354,18 @@ class IronwoodStatusTests(unittest.TestCase):
         self.assertIn('blockchain_info.get("headers")', status.REMOTE_PROBE)
         self.assertIn('"getblockhash"', status.REMOTE_PROBE)
         self.assertIn('rpc_call("getblockheader"', status.REMOTE_PROBE)
+
+    def test_peer_version_panel_prefers_rpc_subver(self):
+        # When getpeerinfo.subver is present, the live RPC mix wins over the
+        # legacy exporter user_agent label.
+        self.assertIn(
+            "(row.peer_subversions || []).length",
+            status.PAGE,
+        )
+        self.assertLess(
+            status.PAGE.find("(row.peer_subversions || []).length"),
+            status.PAGE.find("(row.peer_user_agents || [])"),
+        )
 
     def test_success_response_has_the_stable_public_shape(self):
         subject = collector()

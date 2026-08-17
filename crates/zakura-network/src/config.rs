@@ -337,9 +337,9 @@ pub struct Config {
     /// outbound connections are also limited to a multiple of `peerset_initial_target_size`.
     pub max_connections_per_ip: usize,
 
-    /// Exposes legacy peer IP addresses in peer activity logs, structured trace files, and
-    /// Prometheus metric labels. This includes connected peers and candidate or address book
-    /// entries.
+    /// Exposes legacy peer IP addresses in peer activity logs and structured trace files.
+    /// This includes connected peers and candidate or address book entries.
+    /// Seed and peer-cache Prometheus metrics also use this setting for `remote_ip` labels.
     ///
     /// Literal addresses supplied in the node configuration can appear in startup logs and
     /// `seed` labels regardless of this setting.
@@ -348,9 +348,8 @@ pub struct Config {
     ///
     /// # Security
     ///
-    /// Enabling this setting reveals peer topology in logs and trace files, and can create
-    /// high-cardinality metric series. Restrict access to logs, trace directories, the metrics
-    /// endpoint, and downstream monitoring systems.
+    /// Enabling this setting reveals peer topology in logs and trace files. Restrict access
+    /// to logs, trace directories, and downstream monitoring systems.
     pub expose_peer_addresses: bool,
 }
 

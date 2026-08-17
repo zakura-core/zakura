@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import re
+import struct
 import sys
 import tempfile
 import unittest
@@ -15,9 +16,16 @@ from typing import Any
 
 CHECKPOINTS = Path("crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt")
 FRONTIER = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin")
-PROVENANCE = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json")
+PROVENANCE = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json")
+SUBTREES = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin")
 EOS_FILE = Path("crates/zakurad/src/components/sync/end_of_support.rs")
 EOS_PATTERN = re.compile(r"(ESTIMATED_RELEASE_HEIGHT: u32 = )([0-9_]+)")
+SUBTREE_BUNDLE_NAME = "mainnet-treestate-subtrees.bin"
+SUBTREE_HEADER_PREFIX = struct.Struct("<8sHBIIII")
+SUBTREE_HEADER_LEN = SUBTREE_HEADER_PREFIX.size + 32
+SUBTREE_RECORD_LEN = 2 + 4 + 32
+SUBTREE_VERSION = 1
+MAX_SUBTREE_RECORDS = 2**16
 RESOLUTION_KEYS = {
     "height",
     "block_hash",
@@ -64,6 +72,82 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _subtree_digest(prefix: bytes, payload: bytes) -> bytes:
+    digest = hashlib.sha256()
+    digest.update(prefix)
+    digest.update(payload)
+    return digest.digest()
+
+
+def _subtree_pools(data: bytes, label: str) -> tuple[int, bytes, bytes, bytes]:
+    if len(data) < SUBTREE_HEADER_LEN:
+        raise BundleImportError(f"{label} is a truncated subtree-root artifact")
+
+    magic, version, network, last_checkpoint, *counts = SUBTREE_HEADER_PREFIX.unpack_from(data)
+    if magic != b"ZKVCTST1":
+        raise BundleImportError(f"{label} is not a subtree-root artifact")
+    if version != SUBTREE_VERSION:
+        raise BundleImportError(f"{label} has unsupported subtree-root version {version}")
+    if network != 1:
+        raise BundleImportError(f"{label} is not a Mainnet subtree-root artifact")
+    if any(count > MAX_SUBTREE_RECORDS for count in counts):
+        raise BundleImportError(f"{label} declares too many subtree-root records")
+
+    payload = data[SUBTREE_HEADER_LEN:]
+    expected_payload_len = sum(counts) * SUBTREE_RECORD_LEN
+    if len(payload) != expected_payload_len:
+        raise BundleImportError(f"{label} has invalid subtree-root framing")
+    expected_digest = data[SUBTREE_HEADER_PREFIX.size:SUBTREE_HEADER_LEN]
+    if _subtree_digest(data[:SUBTREE_HEADER_PREFIX.size], payload) != expected_digest:
+        raise BundleImportError(f"{label} has an invalid subtree-root digest")
+
+    pools = []
+    offset = 0
+    for count in counts:
+        end = offset + count * SUBTREE_RECORD_LEN
+        pools.append(payload[offset:end])
+        offset = end
+    return last_checkpoint, pools[0], pools[1], pools[2]
+
+
+def _prepare_subtree_import(
+    repo_root: Path,
+    bundle: Path,
+    expected_last_checkpoint: int,
+) -> bytes:
+    committed_path = repo_root / SUBTREES
+    bundle_path = bundle / SUBTREE_BUNDLE_NAME
+
+    try:
+        bundle_bytes = bundle_path.read_bytes()
+    except OSError as error:
+        raise BundleImportError(f"cannot read {SUBTREE_BUNDLE_NAME}: {error}") from error
+    bundle_last_checkpoint, *bundle_pools = _subtree_pools(bundle_bytes, SUBTREE_BUNDLE_NAME)
+    if bundle_last_checkpoint != expected_last_checkpoint:
+        raise BundleImportError(
+            f"{SUBTREE_BUNDLE_NAME} last_checkpoint {bundle_last_checkpoint} does not match "
+            f"checkpoint height {expected_last_checkpoint}"
+        )
+
+    if committed_path.exists():
+        try:
+            committed_bytes = committed_path.read_bytes()
+        except OSError as error:
+            raise BundleImportError(f"cannot read {SUBTREES}: {error}") from error
+        _, *committed_pools = _subtree_pools(committed_bytes, str(SUBTREES))
+        for name, old, new in zip(
+            ("sapling", "orchard", "ironwood"),
+            committed_pools,
+            bundle_pools,
+        ):
+            if not new.startswith(old):
+                raise BundleImportError(
+                    f"bundle rewrites committed {name} subtree roots"
+                )
+
+    return bundle_bytes
+
+
 def import_bundle(
     repo_root: Path,
     bundle: Path,
@@ -77,6 +161,7 @@ def import_bundle(
     checkpoint_path = repo_root / CHECKPOINTS
     frontier_path = repo_root / FRONTIER
     provenance_path = repo_root / PROVENANCE
+    subtree_path = repo_root / SUBTREES
 
     try:
         committed_checkpoints = checkpoint_path.read_bytes()
@@ -105,8 +190,14 @@ def import_bundle(
     if _checkpoint_height(bundle_checkpoints, "bundle checkpoint list") != bundle_height:
         raise BundleImportError("bundle checkpoint height does not match the resolution")
 
+    subtree_bytes = _prepare_subtree_import(repo_root, bundle, bundle_height)
+
     checkpoint_path.write_bytes(bundle_checkpoints)
     frontier_path.write_bytes(bundle_frontier)
+    subtree_path.parent.mkdir(parents=True, exist_ok=True)
+    subtree_path.write_bytes(subtree_bytes)
+    print("imported subtree-root artifact")
+
     _write_json(
         provenance_path,
         {
@@ -119,6 +210,8 @@ def import_bundle(
             "checkpoints_sha256": hashlib.sha256(bundle_checkpoints).hexdigest(),
             "frontier_sha256": hashlib.sha256(bundle_frontier).hexdigest(),
             "frontier_size": len(bundle_frontier),
+            "subtrees_sha256": hashlib.sha256(subtree_bytes).hexdigest(),
+            "subtrees_size": len(subtree_bytes),
             "meta_sha256": resolution["meta_sha256"],
         },
     )
@@ -148,6 +241,17 @@ def import_bundle(
 
 
 def _self_test() -> int:
+    def subtree_artifact(last_checkpoint: int, *pools: bytes) -> bytes:
+        payload = b"".join(pools)
+        prefix = SUBTREE_HEADER_PREFIX.pack(
+            b"ZKVCTST1",
+            SUBTREE_VERSION,
+            1,
+            last_checkpoint,
+            *(len(pool) // SUBTREE_RECORD_LEN for pool in pools),
+        )
+        return prefix + _subtree_digest(prefix, payload) + payload
+
     class SelfTest(unittest.TestCase):
         def setUp(self) -> None:
             self.scratch = tempfile.TemporaryDirectory()
@@ -156,6 +260,7 @@ def _self_test() -> int:
                 (self.root / relative).parent.mkdir(parents=True, exist_ok=True)
             (self.root / CHECKPOINTS).write_text("1 aa\n", encoding="utf-8")
             (self.root / FRONTIER).write_bytes(b"old")
+            (self.root / SUBTREES).write_bytes(subtree_artifact(1, b"", b"", b""))
             (self.root / EOS_FILE).write_text(
                 "const ESTIMATED_RELEASE_HEIGHT: u32 = 1_000;\n",
                 encoding="utf-8",
@@ -164,6 +269,9 @@ def _self_test() -> int:
             self.bundle.mkdir()
             (self.bundle / CHECKPOINTS.name).write_text("1 aa\n2 bb\n", encoding="utf-8")
             (self.bundle / FRONTIER.name).write_bytes(b"new")
+            (self.bundle / SUBTREE_BUNDLE_NAME).write_bytes(
+                subtree_artifact(2, b"", b"", b"")
+            )
             self.resolution = self.root / "resolution.json"
             self.resolution.write_text(
                 json.dumps(
@@ -206,6 +314,41 @@ def _self_test() -> int:
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(BundleImportError, "does not match"):
+                import_bundle(self.root, self.bundle, self.resolution)
+
+        def test_subtree_roots_are_imported_append_only(self) -> None:
+            old = subtree_artifact(1, b"a" * SUBTREE_RECORD_LEN, b"", b"")
+            new = subtree_artifact(
+                2,
+                b"a" * SUBTREE_RECORD_LEN + b"b" * SUBTREE_RECORD_LEN,
+                b"c" * SUBTREE_RECORD_LEN,
+                b"",
+            )
+            (self.root / SUBTREES).write_bytes(old)
+            (self.bundle / SUBTREE_BUNDLE_NAME).write_bytes(new)
+
+            import_bundle(self.root, self.bundle, self.resolution)
+
+            self.assertEqual((self.root / SUBTREES).read_bytes(), new)
+            provenance = json.loads((self.root / PROVENANCE).read_text())
+            self.assertEqual(
+                provenance["subtrees_sha256"],
+                hashlib.sha256(new).hexdigest(),
+            )
+            self.assertEqual(provenance["subtrees_size"], len(new))
+
+        def test_rewritten_subtree_roots_are_rejected(self) -> None:
+            old = subtree_artifact(1, b"a" * SUBTREE_RECORD_LEN, b"", b"")
+            rewritten = subtree_artifact(2, b"b" * SUBTREE_RECORD_LEN, b"", b"")
+            (self.root / SUBTREES).write_bytes(old)
+            (self.bundle / SUBTREE_BUNDLE_NAME).write_bytes(rewritten)
+
+            with self.assertRaisesRegex(BundleImportError, "rewrites committed sapling"):
+                import_bundle(self.root, self.bundle, self.resolution)
+
+        def test_missing_subtree_artifact_is_rejected(self) -> None:
+            (self.bundle / SUBTREE_BUNDLE_NAME).unlink()
+            with self.assertRaisesRegex(BundleImportError, SUBTREE_BUNDLE_NAME):
                 import_bundle(self.root, self.bundle, self.resolution)
 
         def test_import_can_leave_eos_for_release_preparation(self) -> None:

@@ -41,10 +41,16 @@ use zcash_protocol::value::ZatBalance;
 use crate::{error::TransactionError, BoxError};
 
 use super::{
-    lazy_verifier_for, BatchFallbackService, CacheKey, Cached, Item, ItemVerifyingKey,
+    lazy_verifier_for, BatchFallbackService, CacheKey, Cached, CachedItem, Item, ItemVerifyingKey,
     OrchardFallback, Verifier, VERIFIER_NU6_2, VERIFIER_NU6_3_ONWARD, VERIFIER_PRE_NU6_2,
     VERIFYING_KEY_NU6_2, VERIFYING_KEY_NU6_3_ONWARD, VERIFYING_KEY_PRE_NU6_2,
 };
+
+/// The `verifier` label the test caches report their metrics under.
+///
+/// Test caches use their own label so their counts never land in the series
+/// the production verifiers report.
+const TEST_CACHE_VERIFIER_LABEL: &str = "halo2_test";
 
 const EXPLICIT_FLUSH_TEST_MAX_BATCH_WEIGHT: usize = 10_000;
 const EXPLICIT_FLUSH_TEST_LATENCY: Duration = Duration::from_secs(1000);
@@ -517,7 +523,7 @@ impl Service<Item> for CountingVerifier {
 async fn cache_skips_the_inner_service_for_an_already_verified_item() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let inner = CountingVerifier::new(true);
-    let mut verifier = Cached::new(inner.clone(), 8);
+    let mut verifier = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
 
     for _ in 0..3 {
         verifier
@@ -540,7 +546,7 @@ async fn cache_skips_the_inner_service_for_an_already_verified_item() {
 async fn items_without_a_wtxid_are_not_cached() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let inner = CountingVerifier::new(true);
-    let mut verifier = Cached::new(inner.clone(), 8);
+    let mut verifier = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
 
     for _ in 0..2 {
         verifier
@@ -564,7 +570,7 @@ async fn cache_does_not_reuse_a_result_across_items() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
 
     let inner = CountingVerifier::new(true);
-    let mut verifier = Cached::new(inner.clone(), 8);
+    let mut verifier = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
 
     for wtx_id in [test_wtx_id(1), test_wtx_id(2)] {
         verifier
@@ -592,7 +598,7 @@ async fn cache_does_not_reuse_a_result_across_items() {
 async fn cache_does_not_remember_failures() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let inner = CountingVerifier::new(false);
-    let mut verifier = Cached::new(inner.clone(), 8);
+    let mut verifier = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
 
     for _ in 0..3 {
         verifier
@@ -630,7 +636,7 @@ where
 async fn cache_evicts_in_insertion_order_and_stays_correct_when_full() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let inner = CountingVerifier::new(true);
-    let mut verifier = Cached::new(inner.clone(), 2);
+    let mut verifier = Cached::new(inner.clone(), 2, TEST_CACHE_VERIFIER_LABEL);
 
     let wtx_ids = [test_wtx_id(1), test_wtx_id(2), test_wtx_id(3)];
 
@@ -654,6 +660,34 @@ async fn cache_evicts_in_insertion_order_and_stays_correct_when_full() {
     assert_eq!(inner.calls(), 4, "an evicted entry must be re-verified");
 }
 
+/// A remembered result is never visible to another era's cache.
+///
+/// The cache key deliberately does not name the verifying key. What binds an entry to the key it
+/// was produced under is which era's cache holds it — [`batch_verifier`](super::batch_verifier)
+/// builds one per era, and [`verifier_routes_each_network_upgrade_to_the_correct_key`] pins the
+/// routing. This pins the other half: two cache instances share no state, so an item verified
+/// under the pre-NU6.2 insecure key can never be answered from that entry when it is later
+/// routed to a different era's verifier.
+#[tokio::test]
+async fn a_result_cached_under_one_era_is_not_visible_to_another() {
+    let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
+    let item = cacheable_item(&bundle, sighash, test_wtx_id(9));
+
+    let inner = CountingVerifier::new(true);
+    let mut one_era = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
+    let mut another_era = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
+
+    verify_through(&mut one_era, item.clone()).await;
+    assert_eq!(inner.calls(), 1, "the first verification must be a miss");
+
+    verify_through(&mut another_era, item).await;
+    assert_eq!(
+        inner.calls(),
+        2,
+        "another era's cache must not answer from an entry this one never recorded"
+    );
+}
+
 /// Clones of a cache answer from the same set of verified proofs.
 ///
 /// Production never calls a global verifier directly: [`super::verifier_for`] hands out a
@@ -666,7 +700,7 @@ async fn cache_is_shared_between_clones() {
     let item = cacheable_item(&bundle, sighash, test_wtx_id(1));
 
     let inner = CountingVerifier::new(true);
-    let verifier = Cached::new(inner.clone(), 8);
+    let verifier = Cached::new(inner.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
 
     let mut warming_clone = verifier.clone();
     verify_through(&mut warming_clone, item.clone()).await;
@@ -726,7 +760,7 @@ async fn cancelling_a_verification_does_not_populate_the_cache() {
     let item = cacheable_item(&bundle, sighash, test_wtx_id(1));
 
     let hanging = PendingVerifier::new();
-    let mut verifier = Cached::new(hanging.clone(), 8);
+    let mut verifier = Cached::new(hanging.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
 
     // Start a verification and drop it before the inner service can answer.
     let in_flight = verifier
@@ -804,7 +838,7 @@ async fn cache_hit_survives_an_inner_service_that_never_becomes_ready() {
 
     // Warm the cache through a healthy inner service.
     let healthy = CountingVerifier::new(true);
-    let mut verifier = Cached::new(healthy.clone(), 8);
+    let mut verifier = Cached::new(healthy.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
     verify_through(&mut verifier, item.clone()).await;
     assert_eq!(healthy.calls(), 1, "the first verification must be a miss");
 
@@ -836,7 +870,7 @@ async fn cache_hit_survives_an_inner_service_that_never_becomes_ready() {
 async fn cache_miss_propagates_an_inner_readiness_failure() {
     let (bundle, sighash) = pre_nu6_2_bundle_and_sighash();
     let dead = UnreadyVerifier::new();
-    let mut verifier = Cached::new(dead.clone(), 8);
+    let mut verifier = Cached::new(dead.clone(), 8, TEST_CACHE_VERIFIER_LABEL);
 
     verifier
         .ready()

@@ -1,26 +1,43 @@
-# No-upload proof of concept for crates.io Trusted Publishing.
+# Publish Zakura's crates to crates.io using Trusted Publishing.
 #
-# This workflow performs Cargo dry-run publishing before it requests an OIDC
-# token. The token is never exported to repository code, and there is
-# deliberately no registry upload command.
-name: Dry-run crate publishing
+# Verification and publication are deliberately separate jobs. The packaging
+# and compile checks run before any registry token exists, because they take
+# far longer than the 30-minute Trusted Publishing token lifetime; only the
+# publish job holds a token, and only the single cargo step that needs it sees
+# it. `mode: verify` stops after those checks and proves the OIDC exchange
+# without an upload path, which is the pre-flight to run before a release.
+#
+# This is a dispatched workflow rather than one create-release.yml calls:
+# crates.io matches its Trusted Publisher configuration against the OIDC
+# `workflow_ref` claim, which names the *top-level* workflow file, so a
+# `workflow_call` would present create-release.yml as the publishing identity
+# instead of this file.
+name: Publish crates
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Published release tag to inspect, for example v1.0.3"
+        description: "Published release tag to publish crates for, for example v1.0.3"
         required: true
         type: string
+      mode:
+        description: "verify: run the checks and prove the OIDC exchange without uploading. publish: upload to crates.io (irreversible)"
+        required: false
+        default: verify
+        type: choice
+        options:
+          - verify
+          - publish
 
 permissions: {}
 
 concurrency:
-  group: publish-crates-poc-${{ inputs.release_tag }}
+  group: publish-crates-${{ inputs.release_tag }}
   cancel-in-progress: false
 
 jobs:
-  dry-run:
+  plan-verify:
     name: Plan and verify crate publication
     runs-on: ubuntu-latest
     timeout-minutes: 180
@@ -111,26 +128,32 @@ jobs:
           ZAKURA_REPO_ROOT: ${{ github.workspace }}/release
         run: ./scripts/publish-crates.sh verify --output "$RUNNER_TEMP/publish-plan.json"
 
-      - name: Summarize the dry-run
+      - name: Summarize the plan
         if: ${{ !cancelled() }}
         env:
           PLAN: ${{ runner.temp }}/publish-plan.json
           RELEASE_TAG: ${{ inputs.release_tag }}
           TARGET_SHA: ${{ steps.release.outputs.target_sha }}
+          MODE: ${{ inputs.mode }}
         run: |
           if [ ! -f "$PLAN" ]; then
             echo "No publish plan was produced." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           {
-            echo "## Crates.io dry-run"
+            echo "## Crates.io plan (mode: ${MODE})"
             echo
             echo "- Release: \`${RELEASE_TAG}\`"
             echo "- Commit: \`${TARGET_SHA}\`"
             echo
             echo "| Crate | Version | Status |"
             echo "| --- | --- | --- |"
-            jq -r '.packages[] | "| `\(.name)` | `\(.version)` | `\(.status)` |"' "$PLAN"
+            jq -r '
+              .packages[]
+              | "| `\(.name)` | `\(.version)` | `\(.status)`"
+                + (if .below_newest_published then " — below the newest published version" else "" end)
+                + " |"
+            ' "$PLAN"
             echo
             jq -r '
               "Selected: \(.counts.to_publish + .counts.initial_publish_required); " +
@@ -141,7 +164,8 @@ jobs:
 
   oidc-smoke:
     name: Exchange and revoke crates.io OIDC token
-    needs: [dry-run]
+    needs: [plan-verify]
+    if: ${{ inputs.mode == 'verify' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: crates-io
@@ -152,3 +176,171 @@ jobs:
       # short-lived production token returned by the action.
       - name: Authenticate with crates.io
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+  publish:
+    name: Publish crates to crates.io
+    needs: [plan-verify]
+    # The repository guard matches release-binaries.yml: the private staging
+    # repo used for release dress rehearsals must never reach the real
+    # registry. crates.io would reject the exchange there anyway, since the
+    # `repository` claim would match no publisher, but failing before the
+    # attempt keeps the rehearsal's logs honest.
+    if: ${{ inputs.mode == 'publish' && github.repository == 'zakura-core/zakura' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      published_zakura: ${{ steps.plan-facts.outputs.published_zakura }}
+    steps:
+      - name: Checkout publishing tools from the dispatched commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Checkout the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.plan-verify.outputs.target_sha }}
+          path: release
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          # This job packages crates with --no-verify but never compiles them,
+          # so it needs no build environment and nothing a cache could carry.
+          cache: false
+
+      - name: Confirm the tag matches the zakura package
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ZAKURA_REPO_ROOT: ${{ github.workspace }}/release
+        run: ./scripts/check-release-version.sh "$RELEASE_TAG"
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      # The token is scoped to this step alone, and the action's post step
+      # revokes it when the job ends. Everything slow already ran in
+      # plan-verify, so the token is live for as long as packaging and upload
+      # take rather than for a full workspace build.
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          ZAKURA_REPO_ROOT: ${{ github.workspace }}/release
+        run: ./scripts/publish-crates.sh publish --output "$RUNNER_TEMP/publish-plan.json"
+
+      # The plan is written before the first upload, so it survives a partial
+      # publish and is what the verification job checks against.
+      - name: Upload the publish plan
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: crates-publish-plan
+          path: ${{ runner.temp }}/publish-plan.json
+          if-no-files-found: error
+
+      - name: Record plan facts
+        id: plan-facts
+        if: ${{ !cancelled() }}
+        env:
+          PLAN: ${{ runner.temp }}/publish-plan.json
+        run: |
+          set -euo pipefail
+          published_zakura=false
+          if [ -f "$PLAN" ] && [ "$(
+            jq -r '[.packages[] | select(.name == "zakura" and .status != "already_published")] | length' "$PLAN"
+          )" != "0" ]; then
+            published_zakura=true
+          fi
+          echo "published_zakura=${published_zakura}" >> "$GITHUB_OUTPUT"
+
+  verify-published:
+    name: Verify the published versions
+    # `publish` already depends on plan-verify, and the attestation comes from
+    # the OIDC claims rather than the resolved tag, so nothing here needs it.
+    needs: [publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout publishing tools from the dispatched commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Download the publish plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crates-publish-plan
+          path: ${{ runner.temp }}/plan
+
+      # crates.io records the repository, run ID, and OIDC commit claim behind
+      # every Trusted Publishing upload and serves them publicly. Asserting
+      # they name this run proves the release pipeline published these
+      # versions, rather than only that something with the right version number
+      # exists.
+      - name: Confirm every selected version came from this run
+        env:
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          OIDC_SHA: ${{ github.sha }}
+        run: |
+          ./scripts/verify-published-crates.sh \
+            --plan "$RUNNER_TEMP/plan/publish-plan.json" \
+            --repository "$REPOSITORY" \
+            --run-id "$RUN_ID" \
+            --sha "$OIDC_SHA"
+
+  install-check:
+    name: Install zakurad from crates.io
+    needs: [publish, verify-published]
+    if: ${{ needs.publish.outputs.published_zakura == 'true' }}
+    runs-on: ubuntu-latest
+    # A cold build of the whole node from the registry, which is the point: it
+    # is the only check that the published crates resolve and compile as a
+    # consumer receives them, rather than as this workspace resolves them.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          # The published tag is compiled with a current stable toolchain, so
+          # the action's default `-D warnings` would fail the install on
+          # new-since-the-tag warnings.
+          rustflags: ""
+          cache: false
+
+      - name: Checkout publishing tools from the dispatched commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - uses: ./.github/actions/setup-zakura-build
+
+      - name: Install and run the published zakurad
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          cargo install --locked --force --version "$version" zakura
+          "$HOME/.cargo/bin/zakurad" --version | tee "$RUNNER_TEMP/zakurad-version.txt"
+          grep -Fq -- "$version" "$RUNNER_TEMP/zakurad-version.txt"
+          {
+            echo "## Installed from crates.io"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/zakurad-version.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

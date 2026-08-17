@@ -806,7 +806,7 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
 | Verify-before-commit logic | `crates/zakura-state/src/service/finalized_state/commitment_aux_verify.rs` |
 | Embedded frontier plumbing, `select_source_mode`, counters | `crates/zakura-state/src/service/finalized_state/vct.rs` |
 | `checkpoint_sync` mirror field (mode input) | `crates/zakura-state/src/config.rs`; set in `crates/zakurad/src/commands/start.rs` |
-| Embedded Mainnet frontier and provenance | `crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin`, `.../mainnet-frontier.json` |
+| Embedded Mainnet VCT state and manifest | `crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin`, `.../mainnet-subtrees.bin`, `.../mainnet-vct-manifest.json` |
 | Commit-path hook, last checkpoint height, frozen-frontier policy | `crates/zakura-state/src/service/finalized_state.rs` |
 | `BlockRoots` serving read (authoritative index) | `crates/zakura-state/src/service.rs` |
 | Root-index lifecycle (`commitment_roots_by_height`, authentication frontier, body-commit/rollback policies) | `crates/zakura-state/src/service/finalized_state/zakura_db/commitment_roots_db.rs`, `.../block.rs`, `.../rollback.rs` |
@@ -818,12 +818,11 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
 
 ## 16. Mainnet release-state pipeline
 
-The embedded Mainnet frontier is a release artifact coupled to the terminal Mainnet checkpoint:
-whenever `main-checkpoints.txt`'s max height advances, the matching
-`crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin` must be regenerated from a
-synced Zakura state at the new max height, and both must land in the same PR. The offline
-exporter below produces that coupled pair; the publisher, refresh workflow, and release gate
-below consume it.
+The embedded Mainnet frontier and completed-subtree roots are release artifacts coupled to the
+terminal Mainnet checkpoint. Whenever `main-checkpoints.txt`'s max height advances, the matching
+`mainnet-frontier.bin` and `mainnet-subtrees.bin` must advance to the same height, and all three
+must land in the same PR. The offline exporter below produces the coupled set; the publisher,
+refresh workflow, and release gate below consume it.
 
 ### 16.1 Offline export (`zakura-checkpoints --state-cache-dir`)
 
@@ -834,7 +833,9 @@ The publisher host runs the `zakura-checkpoints` utility (built with
 zakura-checkpoints \
   --state-cache-dir /path/to/quiesced-zakura-cache \
   --full-list \
-  --mainnet-frontier-output /out/mainnet-frontier.bin > /out/main-checkpoints.txt
+  --mainnet-frontier-output /out/mainnet-frontier.bin \
+  --mainnet-subtree-output /out/mainnet-treestate-subtrees.bin \
+  > /out/main-checkpoints.txt
 ```
 
 - Offline mode reads canonical hashes and `BlockInfo` sizes straight from the finalized
@@ -862,29 +863,35 @@ zakura-checkpoints \
   historical transaction bodies. The parser validates framing and height, not the tree roots'
   provenance. This deliberate trust model keeps the exporter compatible with pruned databases;
   operators must only export from a quiesced state produced by a trusted Zakura node.
+- The subtree artifact starts with the reviewed roots already embedded in the binary, then appends
+  subtree rows the database retained after that checkpoint. Any overlapping database row must
+  match the embedded record. The new frontier supplies the exact number of roots needed, and the
+  complete result is proven against it before either artifact is returned. This one path works for
+  legacy and VCT databases and does not need old block bodies or skipped per-height frontiers.
 - Checkpoint lines go to stdout; all status goes to stderr. RPC mode remains for Testnet
   updates and diagnostics.
 
 ### 16.2 Bundle, pointer, and refresh workflow
 
-The publisher (`deploy/release-state/`) uploads each export to R2 as an immutable bundle
-`release-state/v1/<height>/{meta.json, main-checkpoints.txt, mainnet-frontier.bin}` — where
-`meta.json` binds the network, terminal height/hash, an RFC 3339 generation time, and each
-file's size and SHA-256 — then atomically replaces the mutable `release-state/latest.json`
-pointer (height, hash, `meta_url`, `meta_sha256`), keeping the newest few bundles.
+The publisher (`deploy/release-state/`) uploads each export to R2 as an immutable bundle containing
+`meta.json`, `main-checkpoints.txt`, `mainnet-frontier.bin`, and
+`mainnet-treestate-subtrees.bin`. `meta.json` binds the network, terminal height/hash, an RFC 3339
+generation time, and each file's size and SHA-256. The publisher then atomically replaces the
+mutable `release-state/latest.json` pointer (height, hash, `meta_url`, `meta_sha256`), keeping the
+newest few bundles.
 
 The `update-release-state.yml` workflow (manual dispatch plus a weekly cron) and
 `prepare-release-pr.yml` both resolve the pointer once over a pinned HTTPS host with no
 redirects, bounded reads, digest verification at every hop, and a maximum bundle age. They
 exit green without release-state changes when the bundle does not advance the committed
 list. Otherwise their shared importer verifies the committed `main-checkpoints.txt` is a
-byte-identical prefix of the bundle's list, replaces the checkpoint file and frontier, and
-writes `vct/mainnet-frontier.json` provenance (source `release-state-bundle`, heights,
-digests, bundle binding).
+byte-identical prefix of the bundle's list, requires each pool's subtree bytes to retain the
+committed prefix, replaces all three artifacts, and writes `vct/mainnet-vct-manifest.json`
+provenance (source `release-state-bundle`, heights, digests, bundle binding).
 
 The standalone update workflow also floors `ESTIMATED_RELEASE_HEIGHT`, validates everything
-— including `cargo test -p zakura-state --lib -- frontier` — restricts the diff to exactly
-those four files, and opens a signed **draft PR** for human review. During release
+— including proving the candidate subtree roots against its frontier — restricts the diff to
+exactly those five files, and opens a signed **draft PR** for human review. During release
 preparation, the importer leaves that constant unchanged so `prepare-release.sh` remains the
 sole owner of its projected value and summary. The release workflow re-proves the imported
 checkpoint/frontier pairing and includes the import in its draft release PR. Checkpoints are
@@ -893,7 +900,7 @@ digests only prove faithful transport from our own publisher.
 
 ### 16.3 Committed provenance and the release gate
 
-`vct/mainnet-frontier.json` is committed next to the frontier. The
+`vct/mainnet-vct-manifest.json` is committed next to the frontier and subtree artifact. The
 `embedded_mainnet_final_frontiers_parse` unit test re-derives its digests from the embedded
 checkpoint list and frontier bytes on every PR, so a desynced checkpoint/frontier/provenance
 combination fails ordinary CI. The current frontier predates the pipeline and is recorded
@@ -917,6 +924,7 @@ are:
 
 ```text
 cargo test -p zakura-state --lib -- frontier sprout_change
+cargo test -p zakura-state --lib treestate_export
 cargo test -p zakura-utils --features zakura-checkpoints-offline
 ```
 

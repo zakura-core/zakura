@@ -281,7 +281,7 @@ derive-new.workspace = true
 hex.workspace = true
 
 [build-dependencies]
-vergen-git2 = { workspace = true, features = ["cargo", "rustc"] }
+vergen-gitcl = { workspace = true, features = ["cargo", "rustc"] }
 
 # test feature lightwalletd-grpc-tests
 tonic-prost-build = { workspace = true, optional = true }

@@ -604,7 +604,7 @@ where
     #[allow(dead_code)]
     pub(super) connection_tracker: ConnectionTracker,
 
-    /// The configured log and metrics label for this peer. Usually the remote IP and port.
+    /// The configured log label for this peer. Usually the remote IP and port.
     pub(super) addr_label: String,
 
     /// The state for this peer, when the metrics were last updated.
@@ -809,7 +809,6 @@ where
                             metrics::counter!(
                                 "zakura.net.in.responses",
                                 "command" => response.command(),
-                                "addr" => self.addr_label.clone(),
                             )
                             .increment(1);
                         } else {
@@ -993,7 +992,6 @@ where
             metrics::counter!(
                 "zakura.net.out.requests.canceled",
                 "command" => request.command(),
-                "addr" => self.addr_label.clone(),
             )
             .increment(1);
             self.update_state_metrics(format!("Out::Req::Canceled::{}", request.command()));
@@ -1007,7 +1005,6 @@ where
         metrics::counter!(
             "zakura.net.out.requests",
             "command" => request.command(),
-            "addr" => self.addr_label.clone(),
         )
         .increment(1);
         self.update_state_metrics(format!("Out::Req::{}", request.command()));
@@ -1419,7 +1416,6 @@ where
         metrics::counter!(
             "zakura.net.in.requests",
             "command" => req.command(),
-            "addr" => self.addr_label.clone(),
         )
         .increment(1);
         self.update_state_metrics(format!("In::Req::{}", req.command()));
@@ -1490,7 +1486,6 @@ where
         metrics::counter!(
             "zakura.net.out.responses",
             "command" => rsp.command(),
-            "addr" => self.addr_label.clone(),
         )
         .increment(1);
         self.update_state_metrics(format!("In::Rsp::{}", rsp.command()));

@@ -415,38 +415,3 @@ what grid is needed to fix that.
 
 Exit criteria: a cold `z_gettreestate` anywhere in the band completes within the RPC
 budget, and a sequential sweep runs at cache speed.
-
-### 8.4 Phase D — end-to-end proof
-
-The decision noted above: either invest in letting regtest produce an absent band (a
-test-only source and a synthetic frontier), or prove only against Mainnet snapshots.
-
-The recommendation is the regtest investment. It is the difference between proving this
-once by hand and holding it with a CI regression test, and the wallet side already has a
-regtest harness to drive.
-
-1. **Regtest loop.** Produce a small absent band, run wallet init and a full scan against
-   it, assert success.
-2. **Differential test.** The same wallet and birthday, deep in the band, synced against a
-   fast-synced snapshot and against a legacy archive node. Assert identical resulting
-   wallet state: notes, balances, and witnesses.
-
-Exit criteria: identical wallet state from both backends.
-
-The differential test is what actually proves this design, because it catches subtly wrong
-frontiers that a "does it start" test would pass.
-
-### 8.5 Sequencing
-
-A1 gates A2. A2 gates the grid choice and therefore all of phase C. Phase B step 1 and the
-client-side change in §6 depend on none of this and can proceed in parallel.
-
-A1 and A3 are short. A2 is the long pole in derisking, and phase C should not be committed
-to before A2 reports.
-
-## 9. Relationship to the VCT roadmap
-
-This supersedes increments 7 and 8 as specified. Increment 9 (cross-client spec) gains a
-natural extension: because the artifact is self-verifying, its format and verification rule
-are publishable alongside the root payload schema, and any client can serve or consume it
-without a trust relationship.

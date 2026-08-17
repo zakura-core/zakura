@@ -224,7 +224,9 @@ When the artifact is absent, or an entry covering the requested height is missin
 derived root fails its check, the RPC must return the typed archive-mode error via
 `vct_historical_tree_unavailable`, never a `null` treestate or an empty subtree list. This
 should be wired up regardless of whether the rest of this design proceeds, since it
-converts today's silent-corruption path into a diagnosable one (§2.2).
+converts today's silent-corruption path into a diagnosable one (§2.2). A pruned node with
+derivation enabled is the same failure: it cannot replay retained bodies, so it returns
+that typed error immediately rather than walking the range until the first missing body.
 
 ### 4.6 The subtree-root artifact
 
@@ -320,6 +322,10 @@ verify updates as pure appends.
 after the previous checkpoint and proves the result against the new frontier. It needs
 neither historical block bodies nor a shared pass with the grid, so the two generators are
 now independent: `zakurad export-historical-treestates` emits only the frontier grid.
+
+The command defaults to a cost-weighted grid at a 2 s per-entry budget
+(`--target-cost-ms 2000`). `--spacing` still produces a uniform grid; that mode cannot
+bound the worst-case cold request at a sane size and is not recommended.
 
 ## 6. Client-side change
 

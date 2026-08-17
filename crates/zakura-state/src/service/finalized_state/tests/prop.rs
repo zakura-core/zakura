@@ -28,7 +28,7 @@ use zakura_chain::{
 use zakura_test::prelude::*;
 
 use crate::{
-    config::Config,
+    config::{Config, PruningConfig, StorageMode},
     error::HistoricalTreeUnavailable,
     service::{
         arbitrary::PreparedChain,
@@ -2956,11 +2956,11 @@ fn write_genesis_frontier_artifact(
 }
 
 /// The read service must serve absent-band treestates when derivation is enabled, and report the
-/// typed archive-mode error when it is not.
+/// typed archive-mode error when it is not, including when the node is pruned.
 ///
-/// This exercises the handler itself — config gating, derivation, and the fallback to
-/// [`HistoricalTreeUnavailable`] — rather than the helpers underneath it, because that handler is
-/// what a wallet's `z_gettreestate` actually reaches.
+/// This exercises the handler itself — config gating, derivation, the pruned-mode short-circuit,
+/// and the fallback to [`HistoricalTreeUnavailable`] — rather than the helpers underneath it,
+/// because that handler is what a wallet's `z_gettreestate` actually reaches.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loops index blocks[i + 1] for the successor witness
 fn vct_read_service_serves_or_refuses_absent_band_treestates() -> Result<()> {
@@ -3086,6 +3086,36 @@ fn vct_read_service_serves_or_refuses_absent_band_treestates() -> Result<()> {
             tree.root(),
             legacy.db.orchard_tree_by_height(&probe).expect("legacy stores every tree").root(),
             "the served Orchard treestate matches the legacy node"
+        );
+
+        // Pruned mode with derivation on: bodies in the retention window may still be present on
+        // this short chain, but a pruned node cannot serve historical treestates. Fail with the
+        // typed archive-mode error rather than walking the replay until a missing body.
+        let pruned = Config {
+            derive_historical_trees: true,
+            historical_frontier_artifact: Some(artifact_file.path().to_path_buf()),
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            ..Config::ephemeral()
+        };
+        let fast = commit_fast(pruned);
+        let read_state = read_service_over(&fast);
+        let sapling_error = runtime
+            .block_on(read_state.clone().oneshot(ReadRequest::SaplingTree(probe.into())))
+            .expect_err("pruned mode must not derive historical treestates");
+        prop_assert!(
+            sapling_error.to_string().contains("fast-synced"),
+            "pruned mode reports the typed archive-mode error, got: {sapling_error}"
+        );
+        prop_assert!(
+            !sapling_error.to_string().contains("not retained"),
+            "pruned mode must not surface a per-height missing-body replay failure, got: {sapling_error}"
+        );
+        let orchard_error = runtime
+            .block_on(read_state.oneshot(ReadRequest::OrchardTree(probe.into())))
+            .expect_err("pruned mode must not derive historical treestates");
+        prop_assert!(
+            orchard_error.to_string().contains("fast-synced"),
+            "pruned mode reports the typed archive-mode error, got: {orchard_error}"
         );
 
         // Derivation disabled: the handler reports the typed archive-mode error rather than a

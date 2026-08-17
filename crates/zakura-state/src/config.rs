@@ -160,7 +160,7 @@ pub struct Config {
     /// request on a from-scratch snapshot replays the entire absent band. Startup fails closed
     /// rather than serving that path. [`Self::max_historical_tree_replay_blocks`] then bounds
     /// replay from the nearest grid entry. Replay reads block bodies, so this has no effect in
-    /// [`StorageMode::Pruned`].
+    /// [`StorageMode::Pruned`]: those queries still return the typed archive-mode error.
     pub derive_historical_trees: bool,
 
     /// Path to a frontier artifact used to anchor historical tree derivation.

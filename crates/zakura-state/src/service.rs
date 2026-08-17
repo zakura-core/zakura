@@ -2032,16 +2032,23 @@ fn fail_or_ignore_historical_frontier_artifact(
 /// absent because this is a verified-commitment-trees fast-synced database.
 ///
 /// Callers reach this only once a tree read has already reported the absent band, so `unavailable`
-/// is the error that stands if derivation is switched off. Inside the band the request either
-/// derives a root-checked frontier or fails: an absent tree there must never reach a client as an
-/// empty treestate (see [`crate::HistoricalTreeUnavailable`]).
+/// is the error that stands if derivation is switched off or this node is pruned. Inside the band
+/// the request either derives a root-checked frontier or fails: an absent tree there must never
+/// reach a client as an empty treestate (see [`crate::HistoricalTreeUnavailable`]).
 fn historical_frontiers(
     state: &ReadStateService,
     hash_or_height: HashOrHeight,
     unavailable: HistoricalTreeUnavailable,
-) -> Result<Option<Arc<read::DerivedFrontiers>>, BoxError> {
+) -> Result<Arc<read::DerivedFrontiers>, BoxError> {
     let config = state.db.config();
     if !config.derive_historical_trees {
+        return Err(unavailable.into());
+    }
+
+    // Replay needs every block body from the selected anchor through the requested height.
+    // Pruned mode does not guarantee that range, so fail with the typed archive-mode error rather
+    // than walking it until the first missing body.
+    if config.pruning_config().is_some() {
         return Err(unavailable.into());
     }
 
@@ -2058,7 +2065,6 @@ fn historical_frontiers(
         height,
         config.max_historical_tree_replay_blocks,
     )
-    .map(Some)
     .map_err(BoxError::from)
 }
 
@@ -2595,8 +2601,11 @@ impl Service<ReadRequest> for ReadStateService {
                     hash_or_height,
                 ) {
                     Ok(tree) => tree,
-                    Err(unavailable) => historical_frontiers(&state, hash_or_height, unavailable)?
-                        .map(|frontiers| frontiers.sapling.clone()),
+                    Err(unavailable) => Some(
+                        historical_frontiers(&state, hash_or_height, unavailable)?
+                            .sapling
+                            .clone(),
+                    ),
                 };
                 Ok(ReadResponse::SaplingTree(tree))
             }
@@ -2608,8 +2617,11 @@ impl Service<ReadRequest> for ReadStateService {
                     hash_or_height,
                 ) {
                     Ok(tree) => tree,
-                    Err(unavailable) => historical_frontiers(&state, hash_or_height, unavailable)?
-                        .map(|frontiers| frontiers.orchard.clone()),
+                    Err(unavailable) => Some(
+                        historical_frontiers(&state, hash_or_height, unavailable)?
+                            .orchard
+                            .clone(),
+                    ),
                 };
                 Ok(ReadResponse::OrchardTree(tree))
             }
@@ -2619,10 +2631,11 @@ impl Service<ReadRequest> for ReadStateService {
                     match read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height)
                     {
                         Ok(tree) => tree,
-                        Err(unavailable) => {
+                        Err(unavailable) => Some(
                             historical_frontiers(&state, hash_or_height, unavailable)?
-                                .map(|frontiers| frontiers.ironwood.clone())
-                        }
+                                .ironwood
+                                .clone(),
+                        ),
                     };
                 Ok(ReadResponse::IronwoodTree(tree))
             }

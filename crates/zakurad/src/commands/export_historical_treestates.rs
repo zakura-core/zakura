@@ -18,6 +18,12 @@ use zakura_chain::{common::atomic_write, parameters::Network};
 
 use crate::prelude::APPLICATION;
 
+/// Default per-entry replay budget for the cost-weighted grid.
+///
+/// Matches the 2 s budget measured in the historical-treestate serving design: a uniform
+/// 50,000-block grid leaves a cold request that runs into minutes.
+const DEFAULT_TARGET_COST_MS: u64 = 2_000;
+
 /// Generate the historical frontier grid from an existing state database
 #[derive(Command, Debug, Default, Parser)]
 pub struct ExportHistoricalTreestatesCmd {
@@ -40,17 +46,27 @@ pub struct ExportHistoricalTreestatesCmd {
 
     /// Uniform height spacing of the frontier grid, in blocks.
     ///
-    /// Ignored when `--target-cost-ms` is given. A uniform grid leaves a long tail, because replay
-    /// cost varies by more than an order of magnitude across the chain.
-    #[clap(long, default_value = "50000", help = "uniform grid spacing in blocks")]
-    spacing: u32,
+    /// Not recommended. Replay cost varies by more than an order of magnitude across Mainnet, so a
+    /// uniform grid cannot bound the worst-case cold request at a sane size. Prefer the default
+    /// cost-weighted grid.
+    #[clap(
+        long,
+        conflicts_with = "target_cost_ms",
+        help = "uniform grid spacing in blocks (not recommended; prefer --target-cost-ms)"
+    )]
+    spacing: Option<u32>,
 
     /// Per-entry replay budget in milliseconds, producing a cost-weighted grid.
     ///
-    /// Places entries densely where blocks are expensive to replay and sparsely where they are
-    /// cheap, so it bounds the *worst* cold request rather than the average. The estimate is a
-    /// deterministic function of the chain, so generator runs stay byte-identical.
-    #[clap(long, help = "per-entry replay budget in ms (cost-weighted grid)")]
+    /// Defaults to 2000 ms when `--spacing` is omitted. Places entries densely where blocks are
+    /// expensive to replay and sparsely where they are cheap, so it bounds the *worst* cold
+    /// request rather than the average. The estimate is a deterministic function of the chain, so
+    /// generator runs stay byte-identical.
+    #[clap(
+        long,
+        conflicts_with = "spacing",
+        help = "per-entry replay budget in ms (default: 2000; cost-weighted grid)"
+    )]
     target_cost_ms: Option<u64>,
 }
 
@@ -75,20 +91,18 @@ impl ExportHistoricalTreestatesCmd {
         let (_read_state, db, _non_finalized_sender) =
             zakura_state::init_read_only(state_config, &self.network)?;
 
-        let spacing = match self.target_cost_ms {
-            Some(budget_ms) => {
-                println!("generating with a cost-weighted grid, {budget_ms} ms per entry");
-                zakura_state::GridSpacing::Adaptive {
-                    budget_us: budget_ms.saturating_mul(1000),
-                }
+        let spacing = self.grid_spacing();
+        match spacing {
+            zakura_state::GridSpacing::Adaptive { budget_us } => {
+                println!(
+                    "generating with a cost-weighted grid, {} ms per entry",
+                    budget_us / 1000
+                );
             }
-            None => {
-                println!("generating with uniform grid spacing {}", self.spacing);
-                zakura_state::GridSpacing::Uniform {
-                    blocks: self.spacing,
-                }
+            zakura_state::GridSpacing::Uniform { blocks } => {
+                println!("generating with uniform grid spacing {blocks}");
             }
-        };
+        }
 
         // Time each grid step. One step is exactly the replay a serving node performs for a cold
         // request at this spacing, so the run doubles as the measurement that sizes the grid.
@@ -130,5 +144,109 @@ impl ExportHistoricalTreestatesCmd {
         );
 
         Ok(())
+    }
+
+    /// Chooses the grid layout from the CLI flags.
+    ///
+    /// Adaptive at [`DEFAULT_TARGET_COST_MS`] is the default: a uniform grid cannot bound the
+    /// worst-case cold request at a sane size.
+    fn grid_spacing(&self) -> zakura_state::GridSpacing {
+        match self.spacing {
+            Some(blocks) => zakura_state::GridSpacing::Uniform { blocks },
+            None => zakura_state::GridSpacing::Adaptive {
+                budget_us: self
+                    .target_cost_ms
+                    .unwrap_or(DEFAULT_TARGET_COST_MS)
+                    .saturating_mul(1000),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    fn parse_export(args: &[&str]) -> ExportHistoricalTreestatesCmd {
+        let mut full = vec![
+            "export-historical-treestates",
+            "--network",
+            "mainnet",
+            "--frontier-output",
+            "out.bin",
+        ];
+        full.extend(args);
+        ExportHistoricalTreestatesCmd::try_parse_from(full).expect("args should parse")
+    }
+
+    #[test]
+    fn default_grid_is_cost_weighted_at_two_seconds() {
+        let cmd = parse_export(&[]);
+        assert_eq!(
+            cmd.grid_spacing(),
+            zakura_state::GridSpacing::Adaptive {
+                budget_us: 2_000_000
+            }
+        );
+    }
+
+    #[test]
+    fn target_cost_ms_selects_adaptive() {
+        let cmd = parse_export(&["--target-cost-ms", "1500"]);
+        assert_eq!(
+            cmd.grid_spacing(),
+            zakura_state::GridSpacing::Adaptive {
+                budget_us: 1_500_000
+            }
+        );
+    }
+
+    #[test]
+    fn spacing_selects_uniform() {
+        let cmd = parse_export(&["--spacing", "50000"]);
+        assert_eq!(
+            cmd.grid_spacing(),
+            zakura_state::GridSpacing::Uniform { blocks: 50_000 }
+        );
+    }
+
+    #[test]
+    fn spacing_conflicts_with_target_cost_ms() {
+        let err = ExportHistoricalTreestatesCmd::try_parse_from([
+            "export-historical-treestates",
+            "--network",
+            "mainnet",
+            "--frontier-output",
+            "out.bin",
+            "--spacing",
+            "50000",
+            "--target-cost-ms",
+            "2000",
+        ])
+        .expect_err("uniform and cost-weighted flags cannot be combined");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("cannot be used with"), "{rendered}");
+    }
+
+    #[test]
+    fn help_says_uniform_is_not_recommended() {
+        let long = ExportHistoricalTreestatesCmd::try_parse_from([
+            "export-historical-treestates",
+            "--help",
+        ])
+        .expect_err("help exits")
+        .to_string();
+        assert!(long.contains("Not recommended"), "{long}");
+        assert!(long.contains("Defaults to 2000 ms"), "{long}");
+
+        let short =
+            ExportHistoricalTreestatesCmd::try_parse_from(["export-historical-treestates", "-h"])
+                .expect_err("help exits")
+                .to_string();
+        assert!(short.contains("not recommended"), "{short}");
+        assert!(short.contains("default: 2000"), "{short}");
     }
 }

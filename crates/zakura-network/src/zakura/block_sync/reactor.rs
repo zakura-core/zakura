@@ -1115,16 +1115,22 @@ impl BlockSyncReactor {
         // timeout). The hash is checked so a reanchor (different hash) still
         // re-queues. The registry's outstanding is routine-owned, so this clause is
         // now backed by per-peer state independent of `work.in_flight`.
+        //
+        // The clause matches on height and hash, never on the full
+        // `BodyWorkAuthority`. Outstanding entries are routine-owned and keep the
+        // authority that issued them, so a same-epoch authority refresh would make
+        // every live request look absent and admit a duplicate fetch. Height and hash
+        // are sufficient: `BodyWorkEpochChanged` bumps `reset_epoch`, and every
+        // routine clears its outstanding in place on that bump, so no entry from an
+        // invalidated lineage survives into the current epoch.
         let blocks: Vec<_> = blocks
             .into_iter()
             .filter(|block| {
                 block.height > self.request_floor
                     && !self.state.work_queue.in_flight_contains(block.height)
-                    && !self.registry.has_outstanding_request_in_scope(
-                        scope,
-                        block.height,
-                        block.hash,
-                    )
+                    && !self
+                        .registry
+                        .has_outstanding_request(block.height, block.hash)
             })
             .collect();
 
@@ -1766,9 +1772,11 @@ impl BlockSyncReactor {
         // The unreceived in-flight heights live in the routines, mirrored into the
         // registry's per-peer outstanding set (per-request granularity: each entry
         // is one still-unreceived requested height). `total_unreceived` sums them.
-        let outstanding = self
-            .body_work_scope()
-            .map_or(0, |scope| self.registry.total_unreceived_in_scope(scope));
+        // The sum ignores the entries' issuing authority for the same reason the
+        // producer filter does: a same-epoch refresh leaves live requests on their
+        // older authority, and counting them by authority would undercount the
+        // pipeline and refill against work that is already outstanding.
+        let outstanding = self.registry.total_unreceived();
 
         // Count only the download pipeline (pending WorkQueue heights + the
         // unreceived heights of in-flight requests) against the refill low-water

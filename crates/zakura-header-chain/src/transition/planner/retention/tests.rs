@@ -177,6 +177,34 @@ fn permanent_subtrees_are_evicted_first_only_under_pressure() {
 }
 
 #[test]
+fn permanent_eviction_exposes_leaf_for_node_limit_eviction() {
+    let mut store = retention_graph();
+    let anchor = store.finalized_frontier();
+    let parent = insert_header(&mut store, anchor.hash, 1, []);
+    let permanent = insert_header(
+        &mut store,
+        parent.hash,
+        2,
+        [EligibilityReason::CheckpointConflict {
+            height: block::Height(2),
+            expected: block::Hash([9; 32]),
+        }],
+    );
+    let selected = insert_header(&mut store, anchor.hash, 3, []);
+
+    let plan = enforce_retention(&mut store, selected, anchor, [], limits(10, 1))
+        .expect("permanent eviction exposes the parent as an eviction candidate");
+
+    assert!(!plan.admission_refused);
+    assert!(store.header_node(permanent.hash).is_none());
+    assert!(store.header_node(parent.hash).is_none());
+    assert!(store.header_node(selected.hash).is_some());
+    assert_eq!(store.header_node_count(), 2);
+    assert_eq!(plan.work.candidate_nodes_scanned, 7);
+    assert_eq!(plan.work.evicted_nodes, 2);
+}
+
+#[test]
 fn retention_below_both_limits_has_no_graph_work_or_effects() {
     let mut store = retention_graph();
     let anchor = store.finalized_frontier();

@@ -64,7 +64,7 @@ pub(super) fn authenticate_and_admit(
     let snapshot_before_commit = engine.snapshot();
     let metadata = engine.metadata().clone();
     validate_snapshot(&snapshot_before_commit, &metadata, context)?;
-    if context.retention_references.len() > crate::POW_PREDECESSOR_CONTEXT_SPAN {
+    if context.retention_references.len() > context.config.limits.max_retention_references.get() {
         return Err(
             InvalidTransitionEvidence::Limit(LimitViolation::RetentionReferencesExceeded).into(),
         );

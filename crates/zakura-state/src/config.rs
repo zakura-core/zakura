@@ -20,8 +20,8 @@ use zakura_chain::{common::default_cache_dir, parameters::Network};
 
 use crate::{
     constants::{
-        min_pruning_retention, DATABASE_FORMAT_VERSION_FILE_NAME, MIN_PRUNING_RETENTION,
-        STATE_DATABASE_KIND,
+        min_pruning_retention, DATABASE_FORMAT_VERSION_FILE_NAME,
+        DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MIN_PRUNING_RETENTION, STATE_DATABASE_KIND,
     },
     service::finalized_state::restorable_db_versions,
     state_database_format_version_in_code, BoxError,
@@ -145,6 +145,42 @@ pub struct Config {
     /// as an independent state setting.
     #[serde(skip)]
     pub vct_fast_sync: bool,
+
+    /// Whether to rebuild historical note commitment trees on demand for RPC queries.
+    ///
+    /// Set to `false` by default. A verified-commitment-trees fast-synced node never wrote
+    /// per-height trees below the checkpoint handoff, so `z_gettreestate` and the `trees` sizes in
+    /// `getblock`/`getblockheader` fail across that band. When this is `true`, those queries are
+    /// answered by replaying retained block bodies forward from the nearest frontier the node
+    /// already holds, and the result is served only if it reproduces the authenticated root the
+    /// node already stores. Derived frontiers are memoized, so a wallet scanning forward pays for
+    /// one batch of replay per request rather than one sweep of the band.
+    ///
+    /// The first request of a sweep can be expensive: it replays from the bottom of the band.
+    /// [`Self::max_historical_tree_replay_blocks`] bounds that cost. Replay reads block bodies, so
+    /// this has no effect in [`StorageMode::Pruned`].
+    pub derive_historical_trees: bool,
+
+    /// Path to a frontier artifact used to anchor historical tree derivation.
+    ///
+    /// Set to `None` by default. The artifact holds note commitment frontiers at a sparse height
+    /// grid, so a cold request replays from the nearest grid entry instead of from genesis. Every
+    /// entry is checked against the authenticated root this node already stores before it is used,
+    /// so a corrupt or hostile artifact is rejected rather than absorbed, and the file needs no
+    /// trust of its own. Only consulted when [`Self::derive_historical_trees`] is set.
+    ///
+    /// Completed subtree roots need no equivalent setting: they ship embedded in the binary and
+    /// are loaded without operator configuration.
+    pub historical_frontier_artifact: Option<PathBuf>,
+
+    /// The most blocks one historical tree derivation may replay.
+    ///
+    /// Set to [`DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS`] by default, which is large enough to
+    /// cover the whole absent band on Mainnet. This bounds what a single RPC request can cost when
+    /// [`Self::derive_historical_trees`] is enabled; a request needing a longer replay fails
+    /// instead of occupying a thread indefinitely. Raise it to serve heights further from any
+    /// frontier the node holds, at the cost of a slower worst-case request.
+    pub max_historical_tree_replay_blocks: u64,
 
     /// Whether to delete the old database directories when present.
     ///
@@ -431,6 +467,9 @@ impl Default for Config {
             enable_zakura_header_seed_from_committed_blocks: false,
             checkpoint_sync: true,
             vct_fast_sync: true,
+            derive_historical_trees: false,
+            historical_frontier_artifact: None,
+            max_historical_tree_replay_blocks: DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,

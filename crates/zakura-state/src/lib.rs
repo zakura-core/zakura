@@ -96,6 +96,12 @@ pub use service::finalized_state::{
     VctTreestateInventory,
 };
 pub use service::finalized_state::{
+    export_frontier_grid, produce_release_treestate_artifacts, verify_subtree_artifact,
+    FrontierArtifact, FrontierEntry, FrontierGridExport, FrontierGridExportError, GridSpacing,
+    ReleaseTreestateArtifacts, ReleaseTreestateArtifactsError, SubtreeArtifact, SubtreeRecord,
+    TreestateArtifactError, VerifiedSubtreeCounts,
+};
+pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,
     PruneFinalizedStateOptions, PruneFinalizedStateSummary,
 };
@@ -106,11 +112,6 @@ pub use service::finalized_state::{
 pub use service::finalized_state::{
     produce_final_frontiers_bytes, produce_settled_final_frontiers_bytes,
     validate_final_frontiers_bytes, FinalFrontiersGenerationError, FinalFrontiersValidationError,
-};
-pub use service::finalized_state::{
-    produce_release_treestate_artifacts, verify_subtree_artifact, ReleaseTreestateArtifacts,
-    ReleaseTreestateArtifactsError, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
-    VerifiedSubtreeCounts,
 };
 pub use service::read::{
     derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_MEMOIZED_FRONTIERS,

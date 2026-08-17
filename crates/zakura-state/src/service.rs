@@ -19,7 +19,7 @@ use std::{
     future::Future,
     ops::Bound,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -62,8 +62,9 @@ use crate::{
         read::find,
         watch_receiver::WatchReceiver,
     },
-    BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, KnownBlock,
-    ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock, StateInitError,
+    BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, HashOrHeight,
+    HistoricalTreeUnavailable, KnownBlock, ReadRequest, ReadResponse, Request, Response,
+    SemanticallyVerifiedBlock, StateInitError,
 };
 
 pub mod block_iter;
@@ -259,6 +260,13 @@ pub struct ReadStateService {
     block_write_task: Option<Arc<std::thread::JoinHandle<write::BlockWriteTaskExit>>>,
     /// Shared fail-closed attachment result, visible to every clone without joining the worker.
     block_write_failure: Arc<OnceLock<write::BlockWriteTaskFailure>>,
+
+    /// Note commitment frontiers this service has derived and root-checked for heights in a
+    /// verified-commitment-trees fast-synced database's absent band.
+    ///
+    /// Shared across clones so a wallet's sequential scan anchors each request on the previous
+    /// one. Empty, and never written, unless `derive_historical_trees` is configured.
+    historical_trees: Arc<Mutex<read::HistoricalTreeCache>>,
 
     /// Published completed subtree roots for heights below the last checkpoint.
     ///
@@ -1228,6 +1236,10 @@ impl ReadStateService {
     ) -> Self {
         let historical_subtrees =
             finalized_state::embedded_historical_subtrees(&finalized_state.network()).map(Arc::new);
+        let historical_trees = load_historical_frontier_artifact(
+            &finalized_state.network(),
+            finalized_state.db.config(),
+        );
 
         let read_service = Self {
             network: finalized_state.network(),
@@ -1235,6 +1247,7 @@ impl ReadStateService {
             non_finalized_state_receiver,
             block_write_task,
             block_write_failure,
+            historical_trees,
             historical_subtrees,
             vct_root_repair_receiver,
             header_chain_snapshot_receiver: header_chain.snapshots,
@@ -1941,6 +1954,80 @@ fn subtrees_with_published_fallback<Node, Error>(
     }
 }
 
+/// Loads the configured frontier grid into a fresh derivation memo.
+///
+/// A missing, unreadable, or invalid artifact is a warning rather than a startup failure. The grid
+/// carries no trust weight — every entry is root-checked before it anchors anything — so a node
+/// without one is not less correct, only slower on a cold request, and refusing to start over an
+/// optional optimization would be the wrong trade.
+fn load_historical_frontier_artifact(
+    network: &Network,
+    config: &Config,
+) -> Arc<Mutex<read::HistoricalTreeCache>> {
+    let frontiers = config.historical_frontier_artifact.as_ref().and_then(
+        |path| match std::fs::read(path) {
+            Ok(bytes) => match finalized_state::FrontierArtifact::decode(&bytes, network) {
+                Ok(artifact) => {
+                    tracing::info!(
+                        ?path,
+                        entries = artifact.entries.len(),
+                        spacing = artifact.spacing,
+                        "loaded historical frontier artifact"
+                    );
+                    Some(Arc::new(artifact))
+                }
+                Err(error) => {
+                    tracing::warn!(?path, %error, "ignoring invalid historical frontier artifact");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(?path, %error, "cannot read historical frontier artifact");
+                None
+            }
+        },
+    );
+
+    Arc::new(Mutex::new(match frontiers {
+        Some(artifact) => read::HistoricalTreeCache::with_artifact(artifact),
+        None => read::HistoricalTreeCache::default(),
+    }))
+}
+
+/// Derives the note commitment frontiers for `hash_or_height`, whose stored per-height trees are
+/// absent because this is a verified-commitment-trees fast-synced database.
+///
+/// Callers reach this only once a tree read has already reported the absent band, so `unavailable`
+/// is the error that stands if derivation is switched off. Inside the band the request either
+/// derives a root-checked frontier or fails: an absent tree there must never reach a client as an
+/// empty treestate (see [`crate::HistoricalTreeUnavailable`]).
+fn historical_frontiers(
+    state: &ReadStateService,
+    hash_or_height: HashOrHeight,
+    unavailable: HistoricalTreeUnavailable,
+) -> Result<Option<Arc<read::DerivedFrontiers>>, BoxError> {
+    let config = state.db.config();
+    if !config.derive_historical_trees {
+        return Err(unavailable.into());
+    }
+
+    let Some(height) = hash_or_height.height_or_else(|hash| state.db.height(hash)) else {
+        // The absent-band check resolved this block to a height, so failing to resolve it again
+        // means the database changed underneath the read. Report the original error rather than
+        // an empty tree.
+        return Err(unavailable.into());
+    };
+
+    read::derive_historical_frontiers(
+        &state.db,
+        &state.historical_trees,
+        height,
+        config.max_historical_tree_replay_blocks,
+    )
+    .map(Some)
+    .map_err(BoxError::from)
+}
+
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -2468,20 +2555,41 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::SaplingTree(hash_or_height) => {
-                let tree =
-                    read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
+                let tree = match read::sapling_tree(
+                    state.latest_best_chain(),
+                    &state.db,
+                    hash_or_height,
+                ) {
+                    Ok(tree) => tree,
+                    Err(unavailable) => historical_frontiers(&state, hash_or_height, unavailable)?
+                        .map(|frontiers| frontiers.sapling.clone()),
+                };
                 Ok(ReadResponse::SaplingTree(tree))
             }
 
             ReadRequest::OrchardTree(hash_or_height) => {
-                let tree =
-                    read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
+                let tree = match read::orchard_tree(
+                    state.latest_best_chain(),
+                    &state.db,
+                    hash_or_height,
+                ) {
+                    Ok(tree) => tree,
+                    Err(unavailable) => historical_frontiers(&state, hash_or_height, unavailable)?
+                        .map(|frontiers| frontiers.orchard.clone()),
+                };
                 Ok(ReadResponse::OrchardTree(tree))
             }
 
             ReadRequest::IronwoodTree(hash_or_height) => {
                 let tree =
-                    read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
+                    match read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height)
+                    {
+                        Ok(tree) => tree,
+                        Err(unavailable) => {
+                            historical_frontiers(&state, hash_or_height, unavailable)?
+                                .map(|frontiers| frontiers.ironwood.clone())
+                        }
+                    };
                 Ok(ReadResponse::IronwoodTree(tree))
             }
 

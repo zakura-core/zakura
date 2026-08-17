@@ -30,7 +30,7 @@ use zakura_chain::{
 
 use zakura_chain::subtree::NoteCommitmentSubtreeIndex;
 
-use crate::service::finalized_state::{TransactionLocation, ZakuraDb};
+use crate::service::finalized_state::{FrontierArtifact, TransactionLocation, ZakuraDb};
 
 /// The most derived frontiers to keep memoized per node.
 ///
@@ -189,9 +189,38 @@ pub enum HistoricalTreeDerivationError {
 pub struct HistoricalTreeCache {
     /// Verified frontiers, keyed by the height they are the state at the end of.
     frontiers: BTreeMap<Height, Arc<DerivedFrontiers>>,
+
+    /// A published frontier grid to fall back on when the memo has nothing nearby.
+    ///
+    /// Entries here are *not* trusted: one is root-checked before it anchors anything, exactly
+    /// like a locally derived frontier, which is what lets the grid be coarse and distributed
+    /// outside the binary.
+    artifact: Option<Arc<FrontierArtifact>>,
 }
 
 impl HistoricalTreeCache {
+    /// Returns a cache that can also anchor on `artifact`'s published grid.
+    pub fn with_artifact(artifact: Arc<FrontierArtifact>) -> Self {
+        Self {
+            frontiers: BTreeMap::new(),
+            artifact: Some(artifact),
+        }
+    }
+
+    /// Returns the highest published grid entry at or below `height`, if any.
+    fn artifact_anchor_at_or_below(&self, height: Height) -> Option<(Height, DerivedFrontiers)> {
+        let entry = self.artifact.as_ref()?.anchor_at_or_below(height)?;
+
+        Some((
+            entry.height,
+            DerivedFrontiers {
+                sapling: entry.sapling.clone(),
+                orchard: entry.orchard.clone(),
+                ironwood: entry.ironwood.clone(),
+            },
+        ))
+    }
+
     /// Returns the highest memoized frontier at or below `height`, if any.
     fn anchor_at_or_below(&self, height: Height) -> Option<(Height, Arc<DerivedFrontiers>)> {
         self.frontiers
@@ -339,6 +368,33 @@ fn anchor_for(
 
     if memoized.is_some() {
         return Ok(memoized);
+    }
+
+    // Fall back to the published grid. The entry is checked against this node's own authenticated
+    // root before it anchors anything, so a wrong or hostile artifact cannot steer a derivation.
+    //
+    // A failed check is deliberately *not* fatal: the artifact is an optimization with no trust
+    // weight, so a bad entry is ignored and the derivation falls back to replaying further. Making
+    // it fatal would hand anyone who can supply a corrupt artifact a denial of service over a
+    // node that is perfectly capable of answering without one.
+    let published = lock(cache).artifact_anchor_at_or_below(height);
+    if let Some((anchor_height, frontiers)) = published {
+        match verify_against_index(db, anchor_height, &frontiers) {
+            Ok(()) => {
+                let frontiers = Arc::new(frontiers);
+                lock(cache).insert(anchor_height, frontiers.clone());
+
+                return Ok(Some((anchor_height, frontiers)));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?anchor_height,
+                    %error,
+                    "ignoring a published frontier entry that does not match the authenticated root",
+                );
+                metrics::counter!("state.historical_tree.artifact_entry_rejected").increment(1);
+            }
+        }
     }
 
     // Below the upgrade height `U` this binary did not run, so per-height trees are present. The

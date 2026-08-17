@@ -11,7 +11,8 @@ use crate::config::ZakuradConfig;
 pub use self::{entry_point::EntryPoint, start::StartCmd};
 
 use self::{
-    audit_historical_treestates::AuditHistoricalTreestatesCmd, generate::GenerateCmd,
+    audit_historical_treestates::AuditHistoricalTreestatesCmd,
+    export_historical_treestates::ExportHistoricalTreestatesCmd, generate::GenerateCmd,
     prune_state::PruneStateCmd, rollback_state::RollbackStateCmd, tip_height::TipHeightCmd,
     verify_historical_treestates::VerifyHistoricalTreestatesCmd,
 };
@@ -20,6 +21,7 @@ pub mod start;
 
 mod audit_historical_treestates;
 mod entry_point;
+mod export_historical_treestates;
 mod generate;
 pub mod prune_state;
 pub mod rollback_state;
@@ -45,6 +47,9 @@ pub enum ZakuradCmd {
 
     /// Prove a historical subtree-root artifact against a note commitment frontier
     VerifyHistoricalTreestates(VerifyHistoricalTreestatesCmd),
+
+    /// Generate the historical note commitment frontier grid from a state database
+    ExportHistoricalTreestates(ExportHistoricalTreestatesCmd),
 
     /// Generate a default `zakura.toml` configuration
     Generate(GenerateCmd),
@@ -76,6 +81,7 @@ impl ZakuradCmd {
 
             // Utility commands that don't use server components
             AuditHistoricalTreestates(_)
+            | ExportHistoricalTreestates(_)
             | Generate(_)
             | PruneState(_)
             | RollbackState(_)
@@ -95,6 +101,7 @@ impl ZakuradCmd {
 
             // Utility commands
             AuditHistoricalTreestates(_)
+            | ExportHistoricalTreestates(_)
             | Generate(_)
             | PruneState(_)
             | RollbackState(_)
@@ -119,6 +126,7 @@ impl ZakuradCmd {
             // - is used by automated tools, or
             // - needs to be read easily.
             AuditHistoricalTreestates(_)
+            | ExportHistoricalTreestates(_)
             | Generate(_)
             | PruneState(_)
             | RollbackState(_)
@@ -143,6 +151,7 @@ impl Runnable for ZakuradCmd {
     fn run(&self) {
         match self {
             AuditHistoricalTreestates(cmd) => cmd.run(),
+            ExportHistoricalTreestates(cmd) => cmd.run(),
             Generate(cmd) => cmd.run(),
             PruneState(cmd) => cmd.run(),
             RollbackState(cmd) => cmd.run(),

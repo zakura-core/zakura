@@ -355,7 +355,8 @@ WANTED_METRICS = frozenset((
 # A live mainnet/testnet exposition runs to ~12 MB because several net counters
 # are labelled per peer address. This is only a runaway guard, not a budget.
 MAX_METRICS_BYTES = 64 * 1024 * 1024
-# Carries the peer version breakdown in a user_agent label.
+# Legacy peer-software breakdown. Newer zakurad omits this label; getpeerinfo
+# subver is the durable source once the node exposes it.
 PEER_AGENT_METRIC = "zcash_net_peers_connected"
 IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 
@@ -432,8 +433,7 @@ def scrape_metrics(endpoint):
             version = labels.split('version="', 1)[1].split('"', 1)[0]
             continue
         if name == PEER_AGENT_METRIC and 'user_agent="' in labels:
-            # zakurad's getpeerinfo has no subver field, so the peer version
-            # breakdown has to come from this label instead of the RPC.
+            # Fallback for older zakurad builds that omit getpeerinfo.subver.
             agent = labels.split('user_agent="', 1)[1].split('"', 1)[0]
             try:
                 agents[agent] = agents.get(agent, 0.0) + float(value)
@@ -878,7 +878,9 @@ if rpc_url:
             subversions[key] = subversions.get(key, 0) + 1
         out["peer_count"] = len(peers)
         out["peer_inbound"] = inbound
-        # zakurad omits subver, so this is only meaningful for the zcashd probe.
+        # Live peer software mix. zakurad omitted subver historically; once the
+        # node exposes it, this restores the dashboard panel without metrics
+        # labels. Until then the exporter user_agent fallback still applies.
         if set(subversions) != {"unknown"}:
             out["peer_subversions"] = sorted(
                 subversions.items(), key=lambda item: (-item[1], item[0])
@@ -3430,11 +3432,11 @@ const PEER_ROWS = [
 function renderNodePeers(data) {
   const row = data.node || {};
   const m = row.metrics || {};
-  // zakurad's getpeerinfo has no subver, so prefer the exporter's user_agent
-  // label and fall back to the RPC breakdown for the zcashd probe.
-  const subversions = (row.peer_user_agents || []).length
-    ? row.peer_user_agents
-    : (row.peer_subversions || []);
+  // Prefer getpeerinfo.subver (live peers). Fall back to the exporter
+  // user_agent label on older zakurad builds that omit subver.
+  const subversions = (row.peer_subversions || []).length
+    ? row.peer_subversions
+    : (row.peer_user_agents || []);
   let html = '<div class="kv">'
     + kvRow('Peers (RPC)', row.peer_count == null ? '—' : num(row.peer_count))
     + kvRow('Inbound', row.peer_inbound == null ? '—' : num(row.peer_inbound));

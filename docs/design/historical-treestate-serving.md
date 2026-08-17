@@ -14,7 +14,7 @@ for that band. Wallets that sync against a fast-synced archive snapshot cannot s
 The design in one paragraph: publish a **coarse artifact of per-pool frontiers** at a
 sparse height grid alongside the existing release-state bundle, and have the node derive
 any other height on demand by replaying retained block bodies forward from the nearest
-entry, memoizing what it derives. Every frontier the node accepts, whether read from the
+entry, caching what it derives. Every frontier the node accepts, whether read from the
 artifact or derived locally, is checked by comparing its root against the already
 authenticated root in `commitment_roots_by_height`. That check makes the frontier
 artifact carry **no trust weight**, which is what lets it be coarse, small, and
@@ -184,7 +184,7 @@ Three consequences:
    increment 9.
 3. Locally derived frontiers get the same check for free, so §4.3 is self-validating too.
 
-### 4.3 On-demand derivation and memoization
+### 4.3 On-demand derivation and caching
 
 To serve an arbitrary height `h` in the band: take the nearest artifact entry at or below
 `h`, replay the note commitments from the retained block bodies in `(entry, h]`, verify
@@ -194,14 +194,14 @@ Two properties make a coarse grid viable:
 
 **Wallet access is sequential.** Scan batches are contiguous: a wallet's next request is
 for the block immediately preceding the range it just finished, which is the block it just
-scanned to. A node that memoizes its most recently derived frontier replays _forward by
+scanned to. A node that caches its most recently derived frontier replays _forward by
 one batch_, not from a distant grid point.
 
 **Therefore spacing only costs the first request of a sweep.** Steady-state replay cost is
 bounded by the client's batch size, independent of grid spacing. This is why the
 recommendation is to go coarse on the artifact and spend the effort on the cache.
 
-Derived frontiers should be memoized in a bounded cache, and may optionally be persisted.
+Derived frontiers should be kept in a bounded cache, and may optionally be persisted.
 A node that persists them accumulates a demand-shaped index over time, with no upfront
 pass and no follower lane.
 
@@ -444,7 +444,7 @@ what grid is needed to fix that.
 3. Node-side load and verification: every frontier entry checked against stored roots and
    rejected on mismatch; the subtree-root artifact validated for framing and digest, and
    wired into `z_getsubtreesbyindex`.
-4. Anchor selection and memoization of derived frontiers, replacing the phase B genesis
+4. Anchor selection and caching of derived frontiers, replacing the phase B genesis
    replay, including the opportunistic subtree-root check at completion positions.
 
 Exit criteria: a cold `z_gettreestate` anywhere in the band completes within the RPC

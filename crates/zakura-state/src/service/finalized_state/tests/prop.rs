@@ -1829,12 +1829,12 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 );
             }
 
-            // The replay bound is a serving limit: with the memo primed by the loop above, the
-            // last height is already derived, so it costs nothing. A cold height below every memo
+            // The replay bound is a serving limit: with the cache primed by the loop above, the
+            // last height is already derived, so it costs nothing. A cold height below every cache
             // entry still has to replay, and refuses rather than running unbounded.
             prop_assert!(
                 derive_historical_frontiers(&fast.db, &cache, Height(last as u32 - 1), 0).is_ok(),
-                "a memoized height is served without replaying, whatever the bound"
+                "a cached height is served without replaying, whatever the bound"
             );
             let cold_cache = Mutex::new(HistoricalTreeCache::default());
             let cold_height = Height(last as u32 - 1);

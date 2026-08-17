@@ -153,7 +153,7 @@ pub struct Config {
     /// `getblock`/`getblockheader` fail across that band. When this is `true`, those queries are
     /// answered by replaying retained block bodies forward from the nearest frontier the node
     /// already holds, and the result is served only if it reproduces the authenticated root the
-    /// node already stores. Derived frontiers are memoized, so a wallet scanning forward pays for
+    /// node already stores. Derived frontiers are cached, so a wallet scanning forward pays for
     /// one batch of replay per request rather than one sweep of the band.
     ///
     /// The first request of a sweep can be expensive: it replays from the bottom of the band.

@@ -1954,7 +1954,7 @@ fn subtrees_with_published_fallback<Node, Error>(
     }
 }
 
-/// Loads the configured frontier grid into a fresh derivation memo.
+/// Loads the configured frontier grid into a fresh derivation cache.
 ///
 /// A missing, unreadable, or invalid artifact is a warning rather than a startup failure. The grid
 /// carries no trust weight — every entry is root-checked before it anchors anything — so a node

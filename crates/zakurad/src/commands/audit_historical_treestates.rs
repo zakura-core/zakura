@@ -69,11 +69,11 @@ pub struct AuditHistoricalTreestatesCmd {
     #[clap(long, help = "last height to derive")]
     to: Option<u32>,
 
-    /// Start each derivation from a fresh memo, measuring cold replay rather than sequential.
+    /// Start each derivation from a fresh cache, measuring cold replay rather than sequential.
     ///
     /// This is what sizes the published frontier grid: it reports what a client pays when no
-    /// nearby frontier is memoized.
-    #[clap(long, help = "clear the memo before each derivation")]
+    /// nearby frontier is cached.
+    #[clap(long, help = "clear the cache before each derivation")]
     cold: bool,
 
     /// Print one line per derivation with its measured cost and its replay inputs.
@@ -336,7 +336,7 @@ impl AuditHistoricalTreestatesCmd {
         let new_cache = HistoricalTreeCache::default;
 
         let result = if self.cold {
-            // A fresh memo per height forces every derivation to replay from the bottom of the
+            // A fresh cache per height forces every derivation to replay from the bottom of the
             // band, which is the cost a client pays with no nearby frontier.
             let mut result = Ok(());
             for height in heights {

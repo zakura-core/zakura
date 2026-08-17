@@ -27,16 +27,18 @@ pub use event::{
     VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 pub use outcome::{
-    ApplyResult, AuxiliaryEffect, CommittedStallReceipt, FinalityEffect, HeaderWorkEffect,
-    NoChangeReceipt, RetiredWork, StaleReceipt, TransitionEffect, VctRootRepairState,
-    VctRootRepairStatus,
+    ApplyResult, AuxiliaryEffect, BodyWorkEffect, CommittedStallReceipt, FinalityEffect,
+    HeaderWorkEffect, NoChangeReceipt, RetiredWork, StaleReceipt, TransitionEffect,
+    VctRootRepairState, VctRootRepairStatus,
 };
 pub(crate) use preparation::hash_network_policy;
 pub use preparation::{
     ContextFreePreparationReceipt, HeaderContextFact, PreparedHeader, PreparedHeaderBatch,
     ValidationLease,
 };
-pub use snapshot::{AlarmSet, EngineMetadata, EngineSnapshot, HeaderChainDiskVersion};
+pub use snapshot::{
+    AlarmSet, CommittedHeaderChainView, EngineMetadata, EngineSnapshot, HeaderChainDiskVersion,
+};
 pub use write_set::{
     AuxDelta, ChangeSet, EligibilityDelta, FinalityHistoryCheckpoint, FinalityRecord,
     FinalitySource, IndexChanges, ProjectionDelta,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future,
 };
 
@@ -16,10 +16,10 @@ use super::{
         DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
         MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
-    peer_registry::PeerRegistry,
+    peer_registry::{OutstandingMeta, PeerRegistry},
     reactor::{
-        body_progress_preserves_download_pipeline, node_id_from_block_peer_id,
-        EMPTY_STATE_HEADER_QUIET_MIN_LAG, EMPTY_STATE_HEADER_QUIET_PERIOD,
+        node_id_from_block_peer_id, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
+        EMPTY_STATE_HEADER_QUIET_PERIOD,
     },
     reorder::*,
     request::*,
@@ -237,7 +237,7 @@ fn committed_block_sync_startup(
     initial: zakura_header_chain::EngineSnapshot,
     config: ZakuraBlockSyncConfig,
 ) -> (
-    watch::Sender<Option<zakura_header_chain::EngineSnapshot>>,
+    watch::Sender<Option<zakura_header_chain::CommittedHeaderChainView>>,
     BlockSyncStartup,
 ) {
     let frontiers = BlockSyncFrontiers {
@@ -249,15 +249,25 @@ fn committed_block_sync_startup(
         initial.frontiers.header_best.height,
         initial.frontiers.header_best.hash,
     );
-    let (snapshots, committed_snapshots) = watch::channel(Some(initial));
-    let startup = BlockSyncStartup::new_with_committed_snapshots(
+    let (snapshots, committed_views) = watch::channel(Some(committed_view(initial, 0)));
+    let startup = BlockSyncStartup::new_with_committed_views(
         frontiers,
         best_header_tip,
-        committed_snapshots,
+        committed_views,
         config,
     );
 
     (snapshots, startup)
+}
+
+fn committed_view(
+    snapshot: zakura_header_chain::EngineSnapshot,
+    epoch: u64,
+) -> zakura_header_chain::CommittedHeaderChainView {
+    zakura_header_chain::CommittedHeaderChainView::new(
+        snapshot,
+        zakura_header_chain::BodyWorkEpoch::new(epoch),
+    )
 }
 
 fn test_committed_snapshot(
@@ -279,7 +289,7 @@ fn test_committed_snapshot(
 }
 
 #[test]
-fn monotone_body_progress_below_the_same_header_target_preserves_downloads() {
+fn selected_extension_preserves_body_work_epoch() {
     let target = block::Hash([0x80; 32]);
     let old = test_committed_snapshot(
         1,
@@ -298,11 +308,13 @@ fn monotone_body_progress_below_the_same_header_target_preserves_downloads() {
         (100, target),
     );
 
-    assert!(body_progress_preserves_download_pipeline(&old, &advanced));
+    let old = committed_view(old, 7);
+    let advanced = committed_view(advanced, 7);
+    assert_eq!(old.body_work_epoch, advanced.body_work_epoch);
 }
 
 #[test]
-fn target_changes_and_body_frontier_retreats_retire_downloads() {
+fn selected_replacement_advances_body_work_epoch() {
     let old = test_committed_snapshot(
         1,
         2,
@@ -319,20 +331,68 @@ fn target_changes_and_body_frontier_retreats_retire_downloads() {
         (13, block::Hash([0x13; 32])),
         (100, block::Hash([0x81; 32])),
     );
-    let retreated = test_committed_snapshot(
-        2,
-        2,
-        4,
-        (9, block::Hash([0x09; 32])),
-        (11, block::Hash([0x11; 32])),
-        (100, block::Hash([0x80; 32])),
-    );
+    let old = committed_view(old, 7);
+    let changed_target = committed_view(changed_target, 8);
+    assert_ne!(old.body_work_epoch, changed_target.body_work_epoch);
+}
 
-    assert!(!body_progress_preserves_download_pipeline(
-        &old,
-        &changed_target
-    ));
-    assert!(!body_progress_preserves_download_pipeline(&old, &retreated));
+#[tokio::test]
+async fn same_epoch_verified_growth_without_successor_work_preserves_reset_epoch() {
+    let verified_hash = block::Hash([0x12; 32]);
+    let header_hash = block::Hash([0x13; 32]);
+    let initial = test_committed_snapshot(
+        1,
+        1,
+        1,
+        (0, block::Hash([0; 32])),
+        (0, block::Hash([0; 32])),
+        (2, header_hash),
+    );
+    let (snapshots, startup) =
+        committed_block_sync_startup(initial, immediate_body_download_config());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let sequencer_view = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the test reactor exposes routine wiring")
+        .view
+        .clone();
+    let reset_epoch = sequencer_view.borrow().reset_epoch;
+
+    snapshots
+        .send(Some(committed_view(
+            test_committed_snapshot(
+                2,
+                1,
+                2,
+                (0, block::Hash([0; 32])),
+                (1, verified_hash),
+                (2, header_hash),
+            ),
+            0,
+        )))
+        .expect("the verified-growth view publishes");
+
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::QueryNeededBlocks {
+                from: block::Height(2),
+                ..
+            } => break,
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action after verified growth: {action:?}"),
+        }
+    }
+    await_until(
+        "verified frontier reaches height 1",
+        Duration::from_secs(1),
+        || sequencer_view.borrow().verified_tip == block::Height(1),
+    )
+    .await
+    .expect("same-epoch verified growth advances the frontier");
+    assert_eq!(sequencer_view.borrow().reset_epoch, reset_epoch);
+
+    reactor_task.abort();
 }
 
 fn committed_block_sync_startup_at_heights(
@@ -341,7 +401,7 @@ fn committed_block_sync_startup_at_heights(
     header: u32,
     config: ZakuraBlockSyncConfig,
 ) -> (
-    watch::Sender<Option<zakura_header_chain::EngineSnapshot>>,
+    watch::Sender<Option<zakura_header_chain::CommittedHeaderChainView>>,
     BlockSyncStartup,
 ) {
     let initial = test_committed_snapshot(
@@ -380,7 +440,7 @@ async fn next_action(actions: &mut mpsc::Receiver<BlockSyncAction>) -> BlockSync
 }
 
 #[tokio::test]
-async fn committed_snapshots_are_the_sole_production_frontier_source() {
+async fn committed_views_are_the_sole_production_frontier_source() {
     let legacy_frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(40),
         verified_block_tip: block::Height(40),
@@ -388,7 +448,7 @@ async fn committed_snapshots_are_the_sole_production_frontier_source() {
     };
     let legacy_header = (block::Height(50), block::Hash([0x50; 32]));
     let (snapshot_tx, snapshot_rx) = watch::channel(None);
-    let startup = BlockSyncStartup::new_with_committed_snapshots(
+    let startup = BlockSyncStartup::new_with_committed_views(
         legacy_frontiers,
         legacy_header,
         snapshot_rx,
@@ -409,8 +469,9 @@ async fn committed_snapshots_are_the_sole_production_frontier_source() {
     let first_header =
         zakura_header_chain::Frontier::new(block::Height(3), block::Hash([0x03; 32]));
     let first = committed_snapshot(1, 1, 1, finalized, verified, first_header);
+    let first_view = committed_view(first.clone(), 0);
     snapshot_tx
-        .send(Some(first.clone()))
+        .send(Some(first_view.clone()))
         .expect("the committed snapshot receiver is live");
 
     let first_query = next_action(&mut actions).await;
@@ -427,14 +488,15 @@ async fn committed_snapshots_are_the_sole_production_frontier_source() {
     assert_eq!(best_header_tip, first_header.height);
     assert_eq!(
         scope,
-        zakura_header_chain::BodyWorkAuthority::for_snapshot(&first)
+        zakura_header_chain::BodyWorkAuthority::for_view(&first_view)
     );
 
     let second_header =
         zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x22; 32]));
     let second = committed_snapshot(2, 2, 1, finalized, verified, second_header);
+    let second_view = committed_view(second.clone(), 1);
     snapshot_tx
-        .send(Some(second.clone()))
+        .send(Some(second_view.clone()))
         .expect("the committed snapshot receiver is live");
 
     let second_query = next_action(&mut actions).await;
@@ -451,7 +513,7 @@ async fn committed_snapshots_are_the_sole_production_frontier_source() {
     assert_eq!(best_header_tip, second_header.height);
     assert_eq!(
         scope,
-        zakura_header_chain::BodyWorkAuthority::for_snapshot(&second)
+        zakura_header_chain::BodyWorkAuthority::for_view(&second_view)
     );
 
     reactor_task.abort();
@@ -469,7 +531,7 @@ async fn empty_state_body_queries_wait_for_the_latest_header_quiet_period() {
         block::Hash([3; 32]),
     );
     let (snapshot_tx, snapshot_rx) = watch::channel(None);
-    let startup = BlockSyncStartup::new_with_committed_snapshots(
+    let startup = BlockSyncStartup::new_with_committed_views(
         BlockSyncFrontiers {
             finalized_height: finalized.height,
             verified_block_tip: finalized.height,
@@ -482,13 +544,9 @@ async fn empty_state_body_queries_wait_for_the_latest_header_quiet_period() {
     let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
 
     snapshot_tx
-        .send(Some(committed_snapshot(
-            1,
-            1,
-            1,
-            finalized,
-            finalized,
-            first_header,
+        .send(Some(committed_view(
+            committed_snapshot(1, 1, 1, finalized, finalized, first_header),
+            0,
         )))
         .expect("the committed snapshot receiver is live");
     time::advance(Duration::from_millis(1)).await;
@@ -498,13 +556,9 @@ async fn empty_state_body_queries_wait_for_the_latest_header_quiet_period() {
 
     time::advance(Duration::from_secs(10)).await;
     snapshot_tx
-        .send(Some(committed_snapshot(
-            2,
-            2,
-            1,
-            finalized,
-            finalized,
-            second_header,
+        .send(Some(committed_view(
+            committed_snapshot(2, 2, 1, finalized, finalized, second_header),
+            0,
         )))
         .expect("the newer committed snapshot receiver is live");
     time::advance(Duration::from_millis(1)).await;
@@ -535,10 +589,11 @@ async fn past_genesis_body_queries_ignore_far_ahead_header_quiet_period() {
         block::Height(EMPTY_STATE_HEADER_QUIET_MIN_LAG + 100),
         block::Hash([3; 32]),
     );
-    let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_snapshot(
-        1, 1, 1, finalized, verified, header,
+    let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_view(
+        committed_snapshot(1, 1, 1, finalized, verified, header),
+        0,
     )));
-    let startup = BlockSyncStartup::new_with_committed_snapshots(
+    let startup = BlockSyncStartup::new_with_committed_views(
         BlockSyncFrontiers {
             finalized_height: finalized.height,
             verified_block_tip: verified.height,
@@ -601,7 +656,8 @@ fn state_is_only_frontier_publisher() {
 
     assert!(
         STATE_PUBLISHER.contains("pub struct Publisher")
-            && STATE_PUBLISHER.contains("fn publish(&self, snapshot: EngineSnapshot)"),
+            && STATE_PUBLISHER
+                .contains("fn publish(&self, snapshot: EngineSnapshot, effect: TransitionEffect)"),
         "state must retain the sole committed-snapshot publisher"
     );
 }
@@ -610,8 +666,9 @@ fn state_is_only_frontier_publisher() {
 async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x52; 32]));
     let snapshot = alarmed_committed_snapshot(header);
-    let scope = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot);
-    let (snapshot_tx, snapshot_rx) = watch::channel(Some(snapshot));
+    let view = committed_view(snapshot, 0);
+    let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
+    let (snapshot_tx, snapshot_rx) = watch::channel(Some(view));
     let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
@@ -619,7 +676,7 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
         verified_block_hash: block::Hash([0x50; 32]),
     };
     startup.best_header_tip = (header.height, header.hash);
-    startup.committed_snapshots = Some(snapshot_rx);
+    startup.committed_views = Some(snapshot_rx);
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
 
     handle
@@ -705,7 +762,7 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     cleared.state_version = zakura_header_chain::StateVersion::new(8);
     cleared.alarms.header_best_body_unavailable = None;
     snapshot_tx
-        .send(Some(cleared))
+        .send(Some(committed_view(cleared, 0)))
         .expect("the durable alarm-clear snapshot publishes");
     tokio::time::timeout(Duration::from_secs(1), async {
         while wiring
@@ -739,7 +796,7 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
         .alarms
         .header_best_body_unavailable
         .expect("the fixture contains a persistent body alarm");
-    let (_snapshot_tx, snapshot_rx) = watch::channel(Some(snapshot));
+    let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_view(snapshot, 0)));
     let config = ZakuraBlockSyncConfig::default();
     let mut startup = BlockSyncStartup::inert(config.clone());
     startup.frontiers = BlockSyncFrontiers {
@@ -748,7 +805,7 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
         verified_block_hash: block::Hash([0x50; 32]),
     };
     startup.best_header_tip = (header.height, header.hash);
-    startup.committed_snapshots = Some(snapshot_rx);
+    startup.committed_views = Some(snapshot_rx);
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let (_supplier, inbound, _outbound) = connect_peer_with_status(
@@ -1974,7 +2031,7 @@ fn work_queue_extend_dedups_against_pending_in_flight_and_floor() {
 }
 
 #[test]
-fn work_queue_separates_scopes_and_retires_obsolete_reservations() {
+fn work_queue_refreshes_queued_authority_and_preserves_registered_requests() {
     let obsolete = test_work_scope();
     let current = zakura_header_chain::BodyWorkAuthority {
         verified_generation: zakura_header_chain::VerifiedGeneration::new(9),
@@ -1986,17 +2043,8 @@ fn work_queue_separates_scopes_and_retires_obsolete_reservations() {
         queue.extend(obsolete, [needed(1, BlockSizeEstimate::Advertised(100))]),
         1
     );
-    assert_eq!(
-        queue.extend(current, [needed(2, BlockSizeEstimate::Advertised(200))]),
-        1
-    );
-
-    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
-    assert_eq!(
-        taken.len(),
-        1,
-        "one request must never mix ownership scopes"
-    );
+    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
+    assert_eq!(taken.len(), 1);
     assert_eq!(taken[0].1.scope, obsolete);
     let owner = obsolete.bind(
         12,
@@ -2008,14 +2056,15 @@ fn work_queue_separates_scopes_and_retires_obsolete_reservations() {
     );
     assert_eq!(queue.owner_for_height(block::Height(1)), Some(owner));
 
-    assert_eq!(queue.retire_obsolete_scope(current), 100);
-    assert_eq!(queue.reserved_bytes(), 0);
-    assert!(!queue.in_flight_contains(block::Height(1)));
-    assert_eq!(
-        queue.extend(current, [needed(1, BlockSizeEstimate::Advertised(100))]),
-        1
-    );
-    let replacement = queue.take_in_range(block::Height(1), block::Height(2), 1);
+    queue.refresh_authority(current);
+    assert_eq!(queue.owner_for_height(block::Height(1)), Some(owner));
+    assert_eq!(queue.reserved_bytes(), 100);
+
+    let returned =
+        queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
+    assert_eq!(returned.released_bytes, 100);
+    assert_eq!(returned.returned_count, 1);
+    let replacement = queue.take_in_range(block::Height(1), block::Height(1), 1);
     assert_eq!(replacement.len(), 1);
     assert_eq!(replacement[0].0, block::Height(1));
     assert_eq!(replacement[0].1.scope, current);
@@ -2024,30 +2073,96 @@ fn work_queue_separates_scopes_and_retires_obsolete_reservations() {
         12,
         std::num::NonZeroU64::new(14).expect("fourteen is nonzero"),
     );
+    assert_eq!(replacement_owner.authority(), current);
+}
+
+/// Same-epoch refresh leaves live GetBlocks on the issuing authority. After
+/// `reset_above` drops that height from the WorkQueue, the producer still sees
+/// the request by height and hash, so it does not extend the height again.
+#[test]
+fn producer_filter_keeps_live_requests_after_same_epoch_refresh() {
+    let scope = test_work_scope();
+    let refreshed = zakura_header_chain::BodyWorkAuthority {
+        header: zakura_header_chain::HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(
+                scope.header_generation.get().saturating_add(1),
+            ),
+            branch: zakura_header_chain::BranchId::new(
+                scope.branch.anchor_hash,
+                block::Hash([7; 32]),
+            ),
+        },
+        ..scope
+    };
+    assert_ne!(refreshed, scope);
+    assert_eq!(refreshed.body_work_epoch, scope.body_work_epoch);
+
+    let owner = test_work_owner();
+    let height = block::Height(1);
+    let hash = block::Hash([1; 32]);
+    let queue = WorkQueue::new(block::Height(0));
+    queue.set_estimate_floor_for_tests(1);
     assert_eq!(
-        queue.mark_reserved_for_owner(replacement_owner, [block::Height(1)]),
-        100
+        queue.extend(scope, [needed(1, BlockSizeEstimate::Advertised(100))]),
+        1
     );
-    let stale_same_scope_owner = current.bind(
-        12,
-        std::num::NonZeroU64::new(13).expect("thirteen is nonzero"),
+    assert_eq!(queue.take_in_range(height, height, 1).len(), 1);
+    assert_eq!(queue.mark_reserved_for_owner(owner, [height]), 100);
+
+    let config = ZakuraBlockSyncConfig::default();
+    let registry = PeerRegistry::new();
+    let peer = peer(1);
+    let generation = registry
+        .admit_session(
+            &peer,
+            ServicePeerDirection::Outbound,
+            &config,
+            0,
+            Instant::now(),
+        )
+        .generation();
+    registry.set_outstanding(
+        &peer,
+        generation,
+        BTreeMap::from([(
+            height,
+            OutstandingMeta {
+                owner,
+                hash,
+                estimated_bytes: 100,
+                queued_at: Instant::now(),
+                deadline: Instant::now(),
+            },
+        )]),
     );
-    let stale_cleanup = queue.release_reserved_and_return_items_detailed_for_owner(
-        stale_same_scope_owner,
-        [block::Height(1)],
+
+    queue.refresh_authority(refreshed);
+    assert!(queue.in_flight_contains(height));
+    assert_eq!(queue.owner_for_height(height), Some(owner));
+
+    queue.reset_above(block::Height(0));
+    assert!(!queue.in_flight_contains(height));
+    assert!(!queue.pending_contains(height));
+    assert!(
+        registry.has_outstanding_request(height, hash),
+        "outstanding entries keep the issuing authority across a same-epoch refresh"
     );
-    assert_eq!(stale_cleanup.released_bytes, 0);
-    assert_eq!(stale_cleanup.returned_count, 0);
-    assert_eq!(stale_cleanup.missing_count, 1);
+    assert_eq!(registry.total_unreceived(), 1);
+
+    let request_floor = block::Height(0);
+    let producer_would_enqueue = height > request_floor
+        && !queue.in_flight_contains(height)
+        && !registry.has_outstanding_request(height, hash);
+    assert!(
+        !producer_would_enqueue,
+        "the producer filter must keep a live request from being extended again"
+    );
+
     assert_eq!(
-        queue.owner_for_height(block::Height(1)),
-        Some(replacement_owner)
+        queue.extend(refreshed, [needed(1, BlockSizeEstimate::Advertised(100))]),
+        1,
+        "the height is absent from the queue, so only the outstanding filter prevents a duplicate fetch"
     );
-    assert_eq!(queue.reserved_bytes(), 100);
-    assert_eq!(queue.retire_all(), 100);
-    assert_eq!(queue.reserved_bytes(), 0);
-    assert_eq!(queue.pending_len(), 0);
-    assert_eq!(queue.in_flight_len(), 0);
 }
 
 #[test]
@@ -4749,7 +4864,10 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
             outcome: test_block_apply_outcome(BlockApplyResult::Committed),
             eligible_sources: BTreeSet::new(),
             persisted_availability: None,
-            semantic_current: true,
+            semantic_completion: Some((
+                test_work_owner(),
+                zakura_header_chain::StateVersion::default(),
+            )),
         })
         .expect("height 1 completion queues");
 
@@ -4777,7 +4895,10 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                 outcome: test_block_apply_outcome(BlockApplyResult::Committed),
                 eligible_sources: BTreeSet::new(),
                 persisted_availability: None,
-                semantic_current: true,
+                semantic_completion: Some((
+                    test_work_owner(),
+                    zakura_header_chain::StateVersion::default(),
+                )),
             })
             .expect("stale checkpoint completion queues");
     }
@@ -4904,9 +5025,12 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
         }
     }
 
+    let mut changed_authority = test_work_scope();
+    changed_authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
     control_tx
-        .send(SequencerControlInput::WorkScopeChanged {
-            scope: Some(test_work_scope()),
+        .send(SequencerControlInput::BodyWorkEpochChanged {
+            authority: changed_authority,
+            frontiers,
         })
         .expect("scope transition queues");
     time::timeout(CHANNEL_TIMEOUT, async {
@@ -4931,7 +5055,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
         let height = block::Height(u32::try_from(index + 1).expect("402 indices fit in u32"));
         body_tx
             .send(SequencedBody::new_queued(
-                test_work_owner(),
+                changed_authority.bind(test_work_owner().session_id, test_work_owner().request_id),
                 zakura_header_chain::SourceId::from_digest([1; 32]),
                 height,
                 block.hash(),
@@ -4979,7 +5103,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
                 outcome: test_block_apply_outcome(BlockApplyResult::Duplicate),
                 eligible_sources: BTreeSet::new(),
                 persisted_availability: None,
-                semantic_current: false,
+                semantic_completion: None,
             })
             .expect("detached duplicate completion queues");
     }
@@ -12346,13 +12470,16 @@ async fn committed_reanchor_lowers_only_best_header_target() {
     wait_for_query_needed_blocks(&mut actions, block::Height(5), block::Height(10)).await;
 
     snapshots
-        .send(Some(test_committed_snapshot(
-            2,
-            2,
+        .send(Some(committed_view(
+            test_committed_snapshot(
+                2,
+                2,
+                1,
+                (0, block::Hash([0; 32])),
+                (5, block::Hash([5; 32])),
+                (7, block::Hash([7; 32])),
+            ),
             1,
-            (0, block::Hash([0; 32])),
-            (5, block::Hash([5; 32])),
-            (7, block::Hash([7; 32])),
         )))
         .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(5), block::Height(7)).await;
@@ -12410,28 +12537,372 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
     // still outstanding. The forced post-reset producer query must fire even if
     // the registry still briefly counts those outstanding heights.
     snapshots
-        .send(Some(test_committed_snapshot(
-            2,
-            2,
+        .send(Some(committed_view(
+            test_committed_snapshot(
+                2,
+                2,
+                1,
+                (0, block::Hash([0; 32])),
+                (0, block::Hash([0; 32])),
+                (1, blocks[0].hash()),
+            ),
             1,
-            (0, block::Hash([0; 32])),
-            (0, block::Hash([0; 32])),
-            (1, blocks[0].hash()),
         )))
         .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
 
     snapshots
-        .send(Some(test_committed_snapshot(
-            3,
-            3,
+        .send(Some(committed_view(
+            test_committed_snapshot(
+                3,
+                3,
+                1,
+                (0, block::Hash([0; 32])),
+                (0, block::Hash([0; 32])),
+                (3, blocks[2].hash()),
+            ),
             1,
-            (0, block::Hash([0; 32])),
-            (0, block::Hash([0; 32])),
-            (3, blocks[2].hash()),
         )))
         .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn epoch_change_supersedes_stale_floor_query() {
+    let blocks = mainnet_blocks_1_to_3();
+    let old_target_hash = block::Hash([0x44; 32]);
+    let new_target_hash = block::Hash([0x45; 32]);
+    let config = immediate_body_download_config();
+    let initial = test_committed_snapshot(
+        1,
+        1,
+        1,
+        (0, block::Hash([0; 32])),
+        (0, block::Hash([0; 32])),
+        (4, old_target_hash),
+    );
+    let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id,
+        scope,
+        from: block::Height(1),
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup must query from the verified tip");
+    };
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        69,
+        block::Height(4),
+        old_target_hash,
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            query_id,
+            scope,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+            blocks: blocks.iter().map(block_meta).collect(),
+        })
+        .await
+        .expect("initial needed metadata queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 3)
+    );
+    for block in &blocks {
+        send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
+    }
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 3,
+        },
+    )
+    .await;
+    let mut submitted = 0usize;
+    while submitted < blocks.len() {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { .. } => submitted += 1,
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action while advancing the floor: {action:?}"),
+        }
+    }
+    let sequencer_view = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the test reactor exposes routine wiring")
+        .view
+        .clone();
+    await_until(
+        "download floor reaches height 3",
+        Duration::from_secs(1),
+        || sequencer_view.borrow().download_floor == block::Height(3),
+    )
+    .await
+    .expect("unresolved submissions advance the download floor");
+    let old_reset_epoch = sequencer_view.borrow().reset_epoch;
+
+    let changed_view = committed_view(
+        test_committed_snapshot(
+            2,
+            2,
+            1,
+            (0, block::Hash([0; 32])),
+            (0, block::Hash([0; 32])),
+            (4, new_target_hash),
+        ),
+        1,
+    );
+    let changed_scope = zakura_header_chain::BodyWorkAuthority::for_view(&changed_view);
+    snapshots
+        .send(Some(changed_view))
+        .expect("the invalidating committed view publishes");
+
+    let stale_floor_query = loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::QueryNeededBlocks {
+                query_id,
+                from: block::Height(4),
+                scope,
+                ..
+            } if scope == changed_scope => break (query_id, scope),
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before the stale-floor query: {action:?}"),
+        }
+    };
+    let replacement_query = loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::QueryNeededBlocks {
+                query_id,
+                from: block::Height(1),
+                scope,
+                ..
+            } if scope == changed_scope => break (query_id, scope),
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before the replacement query: {action:?}"),
+        }
+    };
+    assert_ne!(stale_floor_query.0, replacement_query.0);
+    assert!(sequencer_view.borrow().reset_epoch > old_reset_epoch);
+
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::Status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(4),
+            tip_hash: new_target_hash,
+            max_blocks_per_response: 16,
+            max_inflight_requests: 1,
+            max_response_bytes: MAX_BS_RESPONSE_BYTES,
+        }),
+    )
+    .await;
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            query_id: stale_floor_query.0,
+            scope: stale_floor_query.1,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+            blocks: vec![block_meta(&blocks[2])],
+        })
+        .await
+        .expect("stale query completion queues");
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            query_id: replacement_query.0,
+            scope: replacement_query.1,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+            blocks: vec![block_meta(&blocks[0])],
+        })
+        .await
+        .expect("replacement query completion queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 1)
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn header_extension_preserves_checkpoint_pipeline() {
+    let blocks = mainnet_blocks_1_to_3();
+    let old_target_hash = blocks[2].hash();
+    let new_target_hash = block::Hash([0x47; 32]);
+    let config = immediate_body_download_config();
+    let initial = test_committed_snapshot(
+        1,
+        1,
+        1,
+        (0, block::Hash([0; 32])),
+        (1, blocks[0].hash()),
+        (3, old_target_hash),
+    );
+    let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id, scope, ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup must query from the verified tip");
+    };
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        70,
+        block::Height(3),
+        old_target_hash,
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            query_id,
+            scope,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(1), blocks[0].hash()),
+            blocks: blocks[1..].iter().map(block_meta).collect(),
+        })
+        .await
+        .expect("initial metadata queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(2), 2)
+    );
+    for block in &blocks[1..] {
+        send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
+    }
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(2),
+            returned: 2,
+        },
+    )
+    .await;
+    let mut submissions = Vec::new();
+    while submissions.len() < 2 {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } => submissions.push((owner, source, token, block)),
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action while filling the checkpoint pipeline: {action:?}"),
+        }
+    }
+    let sequencer_view = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the test reactor exposes routine wiring")
+        .view
+        .clone();
+    await_until(
+        "download floor reaches height 3",
+        Duration::from_secs(1),
+        || sequencer_view.borrow().download_floor == block::Height(3),
+    )
+    .await
+    .expect("unresolved submissions advance the floor");
+    let reset_epoch = sequencer_view.borrow().reset_epoch;
+
+    let extension = committed_view(
+        test_committed_snapshot(
+            2,
+            2,
+            1,
+            (0, block::Hash([0; 32])),
+            (1, blocks[0].hash()),
+            (2_010, new_target_hash),
+        ),
+        0,
+    );
+    let extension_scope = zakura_header_chain::BodyWorkAuthority::for_view(&extension);
+    snapshots
+        .send(Some(extension))
+        .expect("the 2,007-header extension publishes");
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::QueryNeededBlocks {
+                from: block::Height(4),
+                scope,
+                ..
+            } if scope == extension_scope => break,
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action after the compatible extension: {action:?}"),
+        }
+    }
+    assert_eq!(sequencer_view.borrow().reset_epoch, reset_epoch);
+    assert_eq!(sequencer_view.borrow().download_floor, block::Height(3));
+    assert_eq!(sequencer_view.borrow().applying_len, 2);
+
+    let checkpoint = committed_view(
+        test_committed_snapshot(
+            3,
+            3,
+            2,
+            (1, blocks[0].hash()),
+            (1, blocks[0].hash()),
+            (2_010, new_target_hash),
+        ),
+        0,
+    );
+    let checkpoint_scope = zakura_header_chain::BodyWorkAuthority::for_view(&checkpoint);
+    snapshots
+        .send(Some(checkpoint))
+        .expect("checkpoint finality publishes after the extension");
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::QueryNeededBlocks {
+                from: block::Height(4),
+                scope,
+                ..
+            } if scope == checkpoint_scope => break,
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action after checkpoint finality: {action:?}"),
+        }
+    }
+    assert_eq!(sequencer_view.borrow().reset_epoch, reset_epoch);
+    assert_eq!(sequencer_view.borrow().download_floor, block::Height(3));
+    assert_eq!(sequencer_view.borrow().applying_len, 2);
+    assert_eq!(sequencer_view.borrow().in_flight_submission_count, 2);
+
+    for (owner, source, token, block) in submissions {
+        handle
+            .send(BlockSyncEvent::BlockApplyFinished {
+                owner,
+                source,
+                token,
+                height: block
+                    .coinbase_height()
+                    .expect("the fixture block has a height"),
+                hash: block.hash(),
+                outcome: test_block_apply_outcome(BlockApplyResult::Committed),
+            })
+            .await
+            .expect("the compatible completion queues");
+    }
+    await_until(
+        "checkpoint submissions complete",
+        Duration::from_secs(1),
+        || sequencer_view.borrow().applying_len == 0,
+    )
+    .await
+    .expect("the preserved checkpoint pipeline completes without a gap");
+    assert_eq!(sequencer_view.borrow().reset_epoch, reset_epoch);
 
     reactor_task.abort();
 }
@@ -12482,13 +12953,16 @@ async fn committed_body_progress_preserves_same_target_native_response() {
     );
 
     snapshots
-        .send(Some(test_committed_snapshot(
-            2,
-            1,
-            2,
-            (0, block::Hash([0; 32])),
-            (1, blocks[0].hash()),
-            (3, blocks[2].hash()),
+        .send(Some(committed_view(
+            test_committed_snapshot(
+                2,
+                1,
+                2,
+                (0, block::Hash([0; 32])),
+                (1, blocks[0].hash()),
+                (3, blocks[2].hash()),
+            ),
+            0,
         )))
         .expect("the committed snapshot receiver is live");
     await_until(
@@ -12609,25 +13083,31 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
     );
 
     snapshots
-        .send(Some(test_committed_snapshot(
-            2,
-            2,
+        .send(Some(committed_view(
+            test_committed_snapshot(
+                2,
+                2,
+                1,
+                (0, block::Hash([0; 32])),
+                (0, block::Hash([0; 32])),
+                (1, blocks[0].hash()),
+            ),
             1,
-            (0, block::Hash([0; 32])),
-            (0, block::Hash([0; 32])),
-            (1, blocks[0].hash()),
         )))
         .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
 
     snapshots
-        .send(Some(test_committed_snapshot(
-            3,
-            3,
+        .send(Some(committed_view(
+            test_committed_snapshot(
+                3,
+                3,
+                1,
+                (0, block::Hash([0; 32])),
+                (0, block::Hash([0; 32])),
+                (3, blocks[2].hash()),
+            ),
             1,
-            (0, block::Hash([0; 32])),
-            (0, block::Hash([0; 32])),
-            (3, blocks[2].hash()),
         )))
         .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;

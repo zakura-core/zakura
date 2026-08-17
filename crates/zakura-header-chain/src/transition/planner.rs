@@ -180,6 +180,7 @@ fn derive_plan_candidate(
         header_rebase: bound_request.header_rebase,
         context,
         old_selected,
+        old_verified,
     })?;
     let settled = match settlement {
         FinalityRetentionOutcome::ResourceStalled => {
@@ -214,6 +215,7 @@ fn assemble_writes<'a>(
         projected,
         selected,
         finality_append,
+        finality_lineage,
         retention,
         effect,
         metadata,
@@ -228,6 +230,7 @@ fn assemble_writes<'a>(
         old_verified,
         selected,
         finality_append,
+        finality_lineage,
         retention,
         fingerprint: event.fingerprint(),
         domain: event.domain(),

@@ -3,8 +3,9 @@
 use zakura_chain::{block, parameters::NetworkKind};
 
 use crate::{
-    BodyUnavailableSummary, BodyWorkAuthority, BranchId, ChainScore, EngineMode, FinalityEpoch,
-    Frontier, FrontierSet, HeaderGeneration, HeaderWorkAuthority, StateVersion, VerifiedGeneration,
+    BodyUnavailableSummary, BodyWorkAuthority, BodyWorkEpoch, BranchId, ChainScore, EngineMode,
+    FinalityEpoch, Frontier, FrontierSet, HeaderGeneration, HeaderWorkAuthority, StateVersion,
+    VerifiedGeneration,
 };
 
 use super::event::TransitionFingerprint;
@@ -50,6 +51,33 @@ pub struct EngineSnapshot {
     pub alarms: AlarmSet,
 }
 
+/// One atomic committed snapshot and its body-work compatibility epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedHeaderChainView {
+    /// Exact durable header-chain snapshot.
+    pub snapshot: EngineSnapshot,
+    /// Process-local selected-lineage epoch.
+    pub body_work_epoch: BodyWorkEpoch,
+}
+
+impl CommittedHeaderChainView {
+    /// Construct a committed view at one body-work epoch.
+    pub const fn new(snapshot: EngineSnapshot, body_work_epoch: BodyWorkEpoch) -> Self {
+        Self {
+            snapshot,
+            body_work_epoch,
+        }
+    }
+}
+
+impl std::ops::Deref for CommittedHeaderChainView {
+    type Target = EngineSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
 impl HeaderWorkAuthority {
     /// Capture authority for one exact advertised header target.
     pub fn for_target(snapshot: &EngineSnapshot, target_tip_hash: block::Hash) -> Self {
@@ -72,7 +100,15 @@ impl BodyWorkAuthority {
                 ),
             },
             verified_generation: snapshot.verified_generation,
+            body_work_epoch: BodyWorkEpoch::default(),
         }
+    }
+
+    /// Capture body authority from one atomic committed view.
+    pub fn for_view(view: &CommittedHeaderChainView) -> Self {
+        let mut authority = Self::for_snapshot(&view.snapshot);
+        authority.body_work_epoch = view.body_work_epoch;
+        authority
     }
 }
 

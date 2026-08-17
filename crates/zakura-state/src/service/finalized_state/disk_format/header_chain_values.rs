@@ -1240,6 +1240,7 @@ fn get_owner(decoder: &mut Decoder<'_>) -> Result<HeaderSyncWorkOwner, HeaderCha
             authority: BodyWorkAuthority {
                 header,
                 verified_generation,
+                body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
             },
             session_id,
             request_id,
@@ -1713,6 +1714,7 @@ mod tests {
                     branch: BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
                 },
                 verified_generation: VerifiedGeneration::new(3),
+                body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
             },
             session_id: 4,
             request_id: NonZeroU64::new(5).expect("five is nonzero"),

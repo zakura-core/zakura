@@ -3,8 +3,8 @@
 use std::{collections::HashMap, num::NonZeroU64};
 
 use crate::{
-    BodyWorkAuthority, BodyWorkOwner, EngineSnapshot, HeaderSyncWorkOwner, HeaderWorkAuthority,
-    HeaderWorkOwner, SourceId,
+    BodyWorkAuthority, BodyWorkOwner, CommittedHeaderChainView, EngineSnapshot,
+    HeaderSyncWorkOwner, HeaderWorkAuthority, HeaderWorkOwner, SourceId,
 };
 
 /// Domain-specific owner facts required by the shared completion registry.
@@ -76,6 +76,8 @@ impl CompletionOwner for HeaderSyncWorkOwner {
 /// Exact reason an asynchronous completion has no remaining authority.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StaleReason {
+    /// The header-chain engine invalidated the selected body-work lineage.
+    BodyWorkEpoch,
     /// Selected-header work generation changed.
     HeaderGeneration,
     /// Verified-body generation changed for work that depends on it.
@@ -95,6 +97,17 @@ pub enum CompletionDecision {
     Current,
     /// The coordinator treats the completion as terminally stale.
     /// The completion must have no effects.
+    Stale(StaleReason),
+}
+
+/// Result of the body-specific completion gate.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BodyCompletionDecision {
+    /// The completion already has exact current authority.
+    Current,
+    /// The completion was registered under compatible authority and now has current authority.
+    Rebased(BodyWorkOwner),
+    /// The completion has no remaining authority and must have no effects.
     Stale(StaleReason),
 }
 
@@ -184,6 +197,32 @@ impl PendingOwners<HeaderSyncWorkOwner> {
 pub struct Gate;
 
 impl Gate {
+    /// Verify exact registration, then reauthorize compatible body work to current authority.
+    pub fn check_body(
+        current: &CommittedHeaderChainView,
+        pending: &PendingOwners<BodyWorkOwner>,
+        source: SourceId,
+        owner: &BodyWorkOwner,
+    ) -> BodyCompletionDecision {
+        match pending.get(source, owner.request_id()) {
+            None => return BodyCompletionDecision::Stale(StaleReason::MissingOwner),
+            Some(registered) if registered != *owner => {
+                return BodyCompletionDecision::Stale(StaleReason::OwnerMismatch);
+            }
+            Some(_) => {}
+        }
+
+        let current_authority = BodyWorkAuthority::for_view(current);
+        if owner.authority == current_authority {
+            return BodyCompletionDecision::Current;
+        }
+        if owner.authority.body_work_epoch != current.body_work_epoch {
+            return BodyCompletionDecision::Stale(StaleReason::BodyWorkEpoch);
+        }
+
+        BodyCompletionDecision::Rebased(current_authority.bind(owner.session_id, owner.request_id))
+    }
+
     /// Compare one structurally registered attempt with its completion.
     pub fn check_registered<O: CompletionOwner>(
         current: &EngineSnapshot,
@@ -271,6 +310,7 @@ mod tests {
                     branch: BranchId::new(snapshot.frontiers.finalized.hash, block::Hash([2; 32])),
                 },
                 verified_generation: snapshot.verified_generation,
+                body_work_epoch: crate::BodyWorkEpoch::default(),
             },
             session_id: 11,
             request_id: NonZeroU64::new(12).expect("twelve is nonzero"),
@@ -358,6 +398,43 @@ mod tests {
         assert_eq!(
             Gate::check(&current, &pending, source, &expected),
             CompletionDecision::Stale(StaleReason::MissingOwner)
+        );
+    }
+
+    #[test]
+    fn compatible_body_completion_rebases_to_current_authority() {
+        let source = SourceId::from_digest([7; 32]);
+        let before = CommittedHeaderChainView::new(snapshot(), crate::BodyWorkEpoch::new(4));
+        let owner = BodyWorkAuthority::for_view(&before)
+            .bind(11, NonZeroU64::new(12).expect("twelve is nonzero"));
+        let mut pending = PendingOwners::default();
+        pending.insert(source, owner);
+        assert_eq!(
+            Gate::check_body(&before, &pending, source, &owner),
+            BodyCompletionDecision::Current
+        );
+
+        let mut extended_snapshot = before.snapshot.clone();
+        extended_snapshot.header_generation = HeaderGeneration::new(9);
+        extended_snapshot.frontiers.header_best =
+            Frontier::new(block::Height(11), block::Hash([8; 32]));
+        let extended = CommittedHeaderChainView::new(extended_snapshot, before.body_work_epoch);
+        let rebased =
+            BodyWorkAuthority::for_view(&extended).bind(owner.session_id, owner.request_id);
+        assert_eq!(
+            Gate::check_body(&extended, &pending, source, &owner),
+            BodyCompletionDecision::Rebased(rebased)
+        );
+
+        let invalidated =
+            CommittedHeaderChainView::new(extended.snapshot.clone(), crate::BodyWorkEpoch::new(5));
+        assert_eq!(
+            Gate::check_body(&invalidated, &pending, source, &owner),
+            BodyCompletionDecision::Stale(StaleReason::BodyWorkEpoch)
+        );
+        assert_eq!(
+            Gate::check_body(&extended, &pending, SourceId::from_digest([9; 32]), &owner,),
+            BodyCompletionDecision::Stale(StaleReason::MissingOwner)
         );
     }
 

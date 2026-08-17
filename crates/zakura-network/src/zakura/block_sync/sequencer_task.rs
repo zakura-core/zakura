@@ -145,13 +145,14 @@ impl Drop for SequencerInputAccounting {
 /// they use a separate prioritized channel.
 #[derive(Debug)]
 pub(super) enum SequencerControlInput {
-    /// Retire all body work from the previous authoritative scope before accepting new work.
-    WorkScopeChanged {
-        scope: Option<zakura_header_chain::BodyWorkAuthority>,
+    /// Reauthorize compatible body work under the latest exact authority.
+    WorkAuthorityRefreshed {
+        authority: zakura_header_chain::BodyWorkAuthority,
     },
-    /// Advance authority along the same exact selected target without retiring downloads.
-    WorkScopeAdvanced {
-        scope: zakura_header_chain::BodyWorkAuthority,
+    /// Retire body work after the header-chain engine invalidates its lineage.
+    BodyWorkEpochChanged {
+        authority: zakura_header_chain::BodyWorkAuthority,
+        frontiers: BlockSyncFrontiers,
     },
     /// Refresh the global CAS coordinate used only by synchronous state writes.
     StateVersionChanged(zakura_header_chain::StateVersion),
@@ -189,7 +190,10 @@ pub(super) enum SequencerControlInput {
         outcome: BlockApplyOutcome,
         eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
         persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
-        semantic_current: bool,
+        semantic_completion: Option<(
+            zakura_header_chain::BodyWorkOwner,
+            zakura_header_chain::StateVersion,
+        )>,
     },
 }
 
@@ -272,8 +276,6 @@ pub(super) struct SequencerTask {
     reset_epoch: u64,
     reaction_epoch: u64,
     current_scope: Option<zakura_header_chain::BodyWorkAuthority>,
-    /// Exact target whose older download owners remain valid across monotone body progress.
-    preserved_download_target: Option<block::Hash>,
     /// Global CAS coordinate for synchronous alarm writes, never body-work authority.
     current_state_version: Option<zakura_header_chain::StateVersion>,
     body_retries: crate::zakura::header_sync::BodyRetryQueue,
@@ -336,7 +338,6 @@ impl SequencerTask {
             reset_epoch: 0,
             reaction_epoch: 0,
             current_scope,
-            preserved_download_target: None,
             current_state_version: current_scope
                 .map(|_| zakura_header_chain::StateVersion::default()),
             body_retries: crate::zakura::header_sync::BodyRetryQueue::default(),
@@ -423,30 +424,31 @@ impl SequencerTask {
         // the reactor from re-querying/-scheduling on a pure body buffer/submit or
         // a no-op (stale/duplicate) apply completion.
         match input {
-            SequencerControlInput::WorkScopeChanged { scope } => {
-                self.current_scope = scope;
-                self.preserved_download_target = None;
-                self.registry.retain_body_retry_scope(scope);
-                if let Some(scope) = scope {
-                    self.body_retries
-                        .retain_scope(scope.header_generation, scope.branch.anchor_hash);
-                } else {
-                    self.body_retries = crate::zakura::header_sync::BodyRetryQueue::default();
-                }
-                let verified_tip = self.sequencer.verified_tip();
-                let _ = self.sequencer.reset_to(verified_tip, false);
-                true
-            }
-            SequencerControlInput::WorkScopeAdvanced { scope } => {
-                debug_assert!(self.current_scope.is_some_and(|old| {
-                    old.branch.target_tip_hash == scope.branch.target_tip_hash
-                }));
-                self.current_scope = Some(scope);
-                self.preserved_download_target = Some(scope.branch.target_tip_hash);
-                self.registry.retain_body_retry_scope(Some(scope));
+            SequencerControlInput::WorkAuthorityRefreshed { authority } => {
+                debug_assert!(self
+                    .current_scope
+                    .is_none_or(|old| { old.body_work_epoch == authority.body_work_epoch }));
+                self.current_scope = Some(authority);
+                self.registry.refresh_body_retry_scope(authority);
                 self.body_retries
-                    .retain_scope(scope.header_generation, scope.branch.anchor_hash);
+                    .refresh_scope(authority.header_generation, authority.branch);
                 false
+            }
+            SequencerControlInput::BodyWorkEpochChanged {
+                authority,
+                frontiers,
+            } => {
+                debug_assert!(self
+                    .current_scope
+                    .is_none_or(|old| { old.body_work_epoch != authority.body_work_epoch }));
+                self.current_scope = Some(authority);
+                self.registry.retain_body_retry_scope(Some(authority));
+                self.body_retries = crate::zakura::header_sync::BodyRetryQueue::default();
+                self.finalized_height = frontiers.finalized_height;
+                self.verified_block_hash = frontiers.verified_block_hash;
+                self.destructive_reset_to(frontiers.verified_block_tip, false);
+                self.work.refresh_authority(authority);
+                true
             }
             SequencerControlInput::StateVersionChanged(state_version) => {
                 self.current_state_version = Some(state_version);
@@ -490,7 +492,7 @@ impl SequencerTask {
                 mut outcome,
                 eligible_sources,
                 persisted_availability,
-                semantic_current,
+                semantic_completion,
             } => {
                 let (needs_reaction, allow_submit) = self
                     .handle_apply_finished(
@@ -502,7 +504,7 @@ impl SequencerTask {
                         &mut outcome,
                         eligible_sources,
                         persisted_availability,
-                        semantic_current,
+                        semantic_completion,
                     )
                     .await;
                 if allow_submit {
@@ -515,16 +517,18 @@ impl SequencerTask {
 
     /// Body-acceptance tail: offer the body to the reorder buffer, then drain the
     /// ready contiguous prefix into applying.
-    fn handle_accept_body(&mut self, body: SequencedBody) {
-        let scope_is_current = self.current_scope == Some(body.owner.authority())
-            || self
-                .preserved_download_target
-                .is_some_and(|target| body.owner.authority().branch.target_tip_hash == target);
+    fn handle_accept_body(&mut self, mut body: SequencedBody) {
+        let scope_is_current = self.current_scope.is_some_and(|current| {
+            current.body_work_epoch == body.owner.authority().body_work_epoch
+        });
         #[cfg(test)]
         let scope_is_current = scope_is_current || self.current_scope.is_none();
         if !scope_is_current {
             self.trace_body_accepted(body.height, body.received_at.elapsed(), "stale_scope");
             return;
+        }
+        if let Some(current) = self.current_scope {
+            body.owner.authority = current;
         }
         let queued_elapsed = body.received_at.elapsed();
         let outcome = match self.sequencer.accept_buffered_body(
@@ -542,6 +546,14 @@ impl SequencerTask {
         };
         self.trace_body_accepted(body.height, queued_elapsed, outcome);
         let _ = self.sequencer.drain_ready_into_applying();
+    }
+
+    /// Reset the body pipeline and queued work above `tip` under one reset epoch.
+    fn destructive_reset_to(&mut self, tip: block::Height, keep_submitted_applies: bool) {
+        let _ = self.sequencer.reset_to(tip, keep_submitted_applies);
+        let released = self.work.reset_above(tip);
+        self.budget.release(released);
+        self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
     /// Apply a verified-tip frontier advance: fold finalized height forward, drop
@@ -660,16 +672,7 @@ impl SequencerTask {
         self.finalized_height = frontiers.finalized_height;
         self.verified_block_hash = frontiers.verified_block_hash;
 
-        // Retained bodies do not charge the request budget.
-        let _ = self
-            .sequencer
-            .reset_to(frontiers.verified_block_tip, remember_released_applies);
-        // Return unreceived request reservations above the reset target.
-        let released = self.work.reset_above(self.sequencer.floor());
-        self.budget.release(released);
-        // A destructive reset: bump the epoch so the reactor drops *all*
-        // outstanding requests (not just those through the tip).
-        self.reset_epoch = self.reset_epoch.saturating_add(1);
+        self.destructive_reset_to(frontiers.verified_block_tip, remember_released_applies);
     }
 
     /// Handle a verifier apply completion.
@@ -687,7 +690,10 @@ impl SequencerTask {
         outcome: &mut BlockApplyOutcome,
         mut eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
         persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
-        semantic_current: bool,
+        semantic_completion: Option<(
+            zakura_header_chain::BodyWorkOwner,
+            zakura_header_chain::StateVersion,
+        )>,
     ) -> (bool, bool) {
         let result = outcome.result();
         // A stale completion (no live applying entry, or token/hash mismatch)
@@ -703,7 +709,7 @@ impl SequencerTask {
                 outcome.verification(),
                 zakura_header_chain::BodyVerificationOutcome::Verified(_)
             );
-            return (false, released && verified && semantic_current);
+            return (false, released && verified && semantic_completion.is_some());
         };
         if applying_owner != owner
             || applying_source != source
@@ -721,12 +727,12 @@ impl SequencerTask {
             // can shrink below the range needed to resolve the next checkpoint.
             return (false, released);
         }
-        if !semantic_current {
+        let Some((semantic_owner, semantic_state_version)) = semantic_completion else {
             let _ = self.sequencer.remove_applying(height);
             self.sequencer
                 .finish_submission(owner, source, token, height, hash);
             return (false, false);
-        }
+        };
         let attribution_matches = outcome
             .attributed_source()
             .is_none_or(|attributed| attributed == source);
@@ -735,16 +741,14 @@ impl SequencerTask {
                 outcome.verification()
             {
                 self.send_action(BlockSyncAction::RecordBodyInvalid {
-                    expected_version: self.current_state_version.expect(
-                        "a semantically current body completion has a committed state version",
-                    ),
+                    expected_version: semantic_state_version,
                     invalid: invalid.clone(),
                 })
                 .await;
             }
         }
         self.record_body_retry(
-            owner,
+            semantic_owner,
             source,
             zakura_header_chain::Frontier::new(height, hash),
             outcome,
@@ -755,9 +759,7 @@ impl SequencerTask {
             outcome.verification()
         {
             self.send_action(BlockSyncAction::RecordBodyUnavailable {
-                expected_version: self
-                    .current_state_version
-                    .expect("a semantically current body completion has a committed state version"),
+                expected_version: semantic_state_version,
                 failure: *failure,
             })
             .await;
@@ -1452,17 +1454,14 @@ mod tests {
 
         assert!(
             !task
-                .handle_control_input(SequencerControlInput::WorkScopeAdvanced {
-                    scope: advanced_scope,
+                .handle_control_input(SequencerControlInput::WorkAuthorityRefreshed {
+                    authority: advanced_scope,
                 })
                 .await,
             "a same-target authority advance does not require a destructive reaction"
         );
         assert_eq!(task.current_scope, Some(advanced_scope));
-        assert_eq!(
-            task.preserved_download_target,
-            Some(old_scope.branch.target_tip_hash)
-        );
+        assert_eq!(task.reset_epoch, 0);
 
         let mut body = queued_test_body(input_bytes, input_decoded_bytes);
         body.leave_queue();
@@ -1470,6 +1469,72 @@ mod tests {
 
         assert_eq!(task.sequencer.applying_len(), 1);
         assert_eq!(task.sequencer.reorder_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn body_invalid_reselection_resets_block_pipeline() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let old_authority = super::test_work_scope();
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.extend(
+            old_authority,
+            [(
+                block::Height(2),
+                block::Hash([2; 32]),
+                BlockSizeEstimate::Advertised(123),
+            )],
+        );
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, _actions_rx) = mpsc::channel(1);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            work.clone(),
+            Arc::new(PeerRegistry::new()),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(old_authority),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+
+        let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+        body.leave_queue();
+        task.handle_accept_body(body);
+        assert_eq!(task.sequencer.applying_len(), 1);
+        assert_eq!(work.pending_len(), 1);
+
+        let mut new_authority = old_authority;
+        new_authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
+        assert!(
+            task.handle_control_input(SequencerControlInput::BodyWorkEpochChanged {
+                authority: new_authority,
+                frontiers,
+            })
+            .await
+        );
+
+        assert_eq!(task.sequencer.floor(), frontiers.verified_block_tip);
+        assert_eq!(task.sequencer.applying_len(), 0);
+        assert_eq!(task.sequencer.reorder_len(), 0);
+        assert_eq!(work.pending_len(), 0);
+        assert_eq!(work.in_flight_len(), 0);
+        assert_eq!(task.reset_epoch, 1);
     }
 
     #[tokio::test]
@@ -1531,7 +1596,7 @@ mod tests {
                 &mut outcome,
                 BTreeSet::new(),
                 None,
-                false,
+                None,
             )
             .await,
             (false, false),
@@ -1550,9 +1615,11 @@ mod tests {
 
         let mut current_scope = super::test_work_scope();
         current_scope.verified_generation = zakura_header_chain::VerifiedGeneration::new(9);
+        current_scope.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
         assert!(
-            task.handle_control_input(SequencerControlInput::WorkScopeChanged {
-                scope: Some(current_scope),
+            task.handle_control_input(SequencerControlInput::BodyWorkEpochChanged {
+                authority: current_scope,
+                frontiers,
             })
             .await
         );
@@ -1649,7 +1716,7 @@ mod tests {
                         &mut outcome,
                         BTreeSet::new(),
                         None,
-                        true,
+                        Some((owner, zakura_header_chain::StateVersion::default())),
                     )
                     .await,
                     (true, true),
@@ -1680,7 +1747,7 @@ mod tests {
     #[tokio::test]
     // IN-02: persist a consensus-invalid result.
     // Attribute it only to the authenticated supplier.
-    async fn consensus_invalidity_persists_and_scores_only_exact_supplier() {
+    async fn body_invalid_after_header_extension_reaches_header_dag() {
         for attribution_matches in [true, false] {
             let frontiers = BlockSyncFrontiers {
                 finalized_height: block::Height(0),
@@ -1739,6 +1806,18 @@ mod tests {
                 source: attributed_source,
             };
             let mut outcome = BlockApplyOutcome::consensus_invalid(invalid.clone());
+            let mut refreshed_authority = owner.authority();
+            refreshed_authority.header.header_generation =
+                zakura_header_chain::HeaderGeneration::new(8);
+            refreshed_authority.header.branch.target_tip_hash = block::Hash([8; 32]);
+            assert!(
+                !task
+                    .handle_control_input(SequencerControlInput::WorkAuthorityRefreshed {
+                        authority: refreshed_authority,
+                    })
+                    .await
+            );
+            let semantic_owner = refreshed_authority.bind(owner.session_id(), owner.request_id());
 
             assert_eq!(
                 task.handle_apply_finished(
@@ -1750,7 +1829,7 @@ mod tests {
                     &mut outcome,
                     BTreeSet::new(),
                     None,
-                    true,
+                    Some((semantic_owner, zakura_header_chain::StateVersion::default(),)),
                 )
                 .await,
                 (true, true)

@@ -10,6 +10,11 @@
 # 2.0.0 mid-incident). This job settles bump levels when the change merges,
 # not when the release is being cut.
 #
+# This check cannot see a dependency's major bump underneath unchanged
+# type names (the silent-duplicate-major failure). The `crates.io publish
+# graph` job in tests-unit.yml is the gate for that: it dry-run-publishes
+# against the live index, including skipped dependents.
+#
 # Notes:
 # - `--default-features` matches the documented release-prep invocation and
 #   keeps optional heavy features (e.g. lightwalletd-grpc-tests and its

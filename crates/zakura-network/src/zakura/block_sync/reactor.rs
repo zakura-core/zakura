@@ -76,17 +76,16 @@ struct PendingNeededQuery {
 
 fn synchronize_persisted_body_alarm(
     registry: &PeerRegistry,
-    snapshot: Option<&zakura_header_chain::EngineSnapshot>,
+    view: Option<&zakura_header_chain::CommittedHeaderChainView>,
 ) {
-    let alarm = snapshot.and_then(|snapshot| {
-        snapshot
-            .alarms
+    let alarm = view.and_then(|view| {
+        view.alarms
             .header_best_body_unavailable
             .filter(|summary| summary.alarmed)
             .map(|summary| {
                 (
-                    zakura_header_chain::BodyWorkAuthority::for_snapshot(snapshot),
-                    snapshot.frontiers.header_best.hash,
+                    zakura_header_chain::BodyWorkAuthority::for_view(view),
+                    view.frontiers.header_best.hash,
                     retry_deadline_instant(summary.next_probe_at),
                 )
             })
@@ -102,24 +101,6 @@ fn block_sync_frontiers(snapshot: &zakura_header_chain::EngineSnapshot) -> Block
     }
 }
 
-/// Return whether a committed snapshot only advances body progress under the same header target.
-///
-/// The target hash fixes the branch for already-issued body downloads. A
-/// target change or any frontier retreat still takes the destructive scope
-/// transition path.
-pub(super) fn body_progress_preserves_download_pipeline(
-    old: &zakura_header_chain::EngineSnapshot,
-    new: &zakura_header_chain::EngineSnapshot,
-) -> bool {
-    old.frontiers.header_best == new.frontiers.header_best
-        && new.frontiers.finalized.height >= old.frontiers.finalized.height
-        && new.frontiers.verified_best.height >= old.frontiers.verified_best.height
-        && (new.frontiers.finalized.height != old.frontiers.finalized.height
-            || new.frontiers.finalized.hash == old.frontiers.finalized.hash)
-        && (new.frontiers.verified_best.height != old.frontiers.verified_best.height
-            || new.frontiers.verified_best.hash == old.frontiers.verified_best.hash)
-}
-
 /// Spawn a block-sync reactor and return its handle plus action stream.
 pub fn spawn_block_sync_reactor(
     mut startup: BlockSyncStartup,
@@ -130,20 +111,20 @@ pub fn spawn_block_sync_reactor(
 ) {
     debug_assert!(
         !startup.state_queries_enabled
-            || startup.committed_snapshots.is_some()
+            || startup.committed_views.is_some()
             || startup.header_tip.is_some(),
         "state-backed block sync must have a frontier source",
     );
 
-    let committed_snapshot = startup
-        .committed_snapshots
+    let committed_view = startup
+        .committed_views
         .as_ref()
         .and_then(|snapshots| snapshots.borrow().clone());
-    if let Some(snapshot) = committed_snapshot.as_ref() {
-        startup.frontiers = block_sync_frontiers(snapshot);
+    if let Some(view) = committed_view.as_ref() {
+        startup.frontiers = block_sync_frontiers(view);
         startup.best_header_tip = (
-            snapshot.frontiers.header_best.height,
-            snapshot.frontiers.header_best.hash,
+            view.frontiers.header_best.height,
+            view.frontiers.header_best.hash,
         );
     }
 
@@ -183,16 +164,16 @@ pub fn spawn_block_sync_reactor(
     let (sequencer_input_tx, sequencer_body_input_rx) =
         mpsc::channel(startup.config.submitted_apply_limit().max(1));
     let (sequencer_control_tx, sequencer_control_rx) = mpsc::unbounded_channel();
-    let initial_body_scope = committed_snapshot
+    let initial_body_scope = committed_view
         .as_ref()
-        .map(zakura_header_chain::BodyWorkAuthority::for_snapshot);
-    let initial_state_version = committed_snapshot
+        .map(zakura_header_chain::BodyWorkAuthority::for_view);
+    let initial_state_version = committed_view
         .as_ref()
         .map(|snapshot| snapshot.state_version);
     #[cfg(test)]
     let initial_state_version = initial_state_version.or_else(|| {
         startup
-            .committed_snapshots
+            .committed_views
             .is_none()
             .then_some(zakura_header_chain::StateVersion::default())
     });
@@ -202,7 +183,7 @@ pub fn spawn_block_sync_reactor(
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
     // Shared peer facts are also the exact per-supplier body-retry admission gate.
     let registry = Arc::new(PeerRegistry::new());
-    synchronize_persisted_body_alarm(&registry, committed_snapshot.as_ref());
+    synchronize_persisted_body_alarm(&registry, committed_view.as_ref());
     let mut retry_jitter_seed = [0u8; 32];
     OsRng.fill_bytes(&mut retry_jitter_seed);
 
@@ -272,13 +253,13 @@ pub fn spawn_block_sync_reactor(
         last_reaction_epoch: 0,
         last_view: initial_view(startup.frontiers),
         published_body_alarm: None,
-        empty_state_body_sync_started: startup.committed_snapshots.is_none()
+        empty_state_body_sync_started: startup.committed_views.is_none()
             || startup.frontiers.verified_block_tip > block::Height(0),
-        empty_state_header_quiet_until: committed_snapshot.as_ref().and_then(|snapshot| {
+        empty_state_header_quiet_until: committed_view.as_ref().and_then(|snapshot| {
             empty_state_header_quiet_required(snapshot)
                 .then(|| Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD)
         }),
-        committed_snapshot,
+        committed_view,
         startup,
         state,
         registry,
@@ -306,8 +287,8 @@ pub fn spawn_block_sync_reactor(
 pub(super) struct BlockSyncReactor {
     startup: BlockSyncStartup,
     state: BlockSyncState,
-    /// Latest atomic header-engine snapshot used to stamp body-work ownership.
-    committed_snapshot: Option<zakura_header_chain::EngineSnapshot>,
+    /// Latest atomic header-engine view used to stamp body-work ownership.
+    committed_view: Option<zakura_header_chain::CommittedHeaderChainView>,
     /// Shared per-peer fact table: servable/caps/outstanding written by the
     /// per-peer pipe-routines; read by producer/candidate/trace. The reactor owns
     /// only entry insert (admission) / remove (teardown).
@@ -395,7 +376,7 @@ impl BlockSyncReactor {
     async fn run(mut self) {
         let mut header_tip = self.startup.header_tip.clone();
         let mut header_tip_open = header_tip.is_some();
-        let mut committed_snapshots = self.startup.committed_snapshots.clone();
+        let mut committed_views = self.startup.committed_views.clone();
         set_block_reactor_active_connection_gauge(self.state.peers.len());
         // Metrics/trace snapshot cadence only. Per-peer request timeouts are owned
         // by the routines (each sleeps to its own earliest deadline), so this timer
@@ -434,20 +415,20 @@ impl BlockSyncReactor {
                     self.handle_event(event).await;
                 }
                 changed = async {
-                    match committed_snapshots.as_mut() {
+                    match committed_views.as_mut() {
                         Some(snapshots) => snapshots.changed().await,
                         None => std::future::pending().await,
                     }
                 } => {
                     if changed.is_ok() {
-                        if let Some(snapshot) = committed_snapshots
+                        if let Some(snapshot) = committed_views
                             .as_ref()
                             .and_then(|snapshots| snapshots.borrow().clone())
                         {
-                            self.observe_committed_snapshot(snapshot).await;
+                            self.observe_committed_view(snapshot).await;
                         }
                     } else {
-                        committed_snapshots = None;
+                        committed_views = None;
                     }
                 }
                 changed = async {
@@ -630,10 +611,7 @@ impl BlockSyncReactor {
                 hash,
                 outcome,
             } => {
-                let semantic_current = matches!(
-                    outcome.verification(),
-                    zakura_header_chain::BodyVerificationOutcome::Verified(_)
-                ) || self.body_completion_is_current(source, &owner);
+                let semantic_completion = self.body_completion_authority(source, &owner);
                 self.handle_block_apply_finished(
                     owner,
                     source,
@@ -641,7 +619,7 @@ impl BlockSyncReactor {
                     height,
                     hash,
                     outcome,
-                    semantic_current,
+                    semantic_completion,
                 )
                 .await
             }
@@ -808,32 +786,34 @@ impl BlockSyncReactor {
         self.query_needed_blocks().await;
     }
 
-    async fn observe_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
-        let previous = self.committed_snapshot.clone();
+    async fn observe_committed_view(
+        &mut self,
+        view: zakura_header_chain::CommittedHeaderChainView,
+    ) {
+        let previous = self.committed_view.clone();
         let previous_scope = self.body_work_scope();
-        let preserves_download_pipeline = previous
+        let body_work_epoch_changed = previous
             .as_ref()
-            .is_some_and(|old| body_progress_preserves_download_pipeline(old, &snapshot));
-        let previous_body_alarm = previous.as_ref().and_then(|snapshot| {
-            snapshot
-                .alarms
+            .is_some_and(|old| old.body_work_epoch != view.body_work_epoch);
+        let previous_body_alarm = previous.as_ref().and_then(|old| {
+            old.alarms
                 .header_best_body_unavailable
                 .filter(|summary| summary.alarmed)
                 .map(|_| {
                     (
-                        zakura_header_chain::BodyWorkAuthority::for_snapshot(snapshot),
-                        snapshot.frontiers.header_best.hash,
+                        zakura_header_chain::BodyWorkAuthority::for_view(old),
+                        old.frontiers.header_best.hash,
                     )
                 })
         });
-        let frontiers = block_sync_frontiers(&snapshot);
-        let header_best = snapshot.frontiers.header_best;
-        self.committed_snapshot = Some(snapshot.clone());
+        let frontiers = block_sync_frontiers(&view);
+        let header_best = view.frontiers.header_best;
+        self.committed_view = Some(view.clone());
         self.pending_body_supplier_restart = None;
         self.pending_operator_body_retry = None;
-        synchronize_persisted_body_alarm(&self.registry, Some(&snapshot));
+        synchronize_persisted_body_alarm(&self.registry, Some(&view));
 
-        let current_alarm_hash = snapshot
+        let current_alarm_hash = view
             .alarms
             .header_best_body_unavailable
             .filter(|summary| summary.alarmed)
@@ -847,31 +827,29 @@ impl BlockSyncReactor {
         }
 
         let current_scope = self.body_work_scope();
-        if previous.as_ref().map(|old| old.state_version) != Some(snapshot.state_version) {
+        if previous.as_ref().map(|old| old.state_version) != Some(view.state_version) {
             let _ = self
                 .sequencer_control
                 .send(SequencerControlInput::StateVersionChanged(
-                    snapshot.state_version,
+                    view.state_version,
                 ));
         }
         if current_scope != previous_scope {
-            if preserves_download_pipeline {
-                if let Some(scope) = current_scope {
-                    let _ = self
-                        .sequencer_control
-                        .send(SequencerControlInput::WorkScopeAdvanced { scope });
-                }
-            } else {
-                let released = match current_scope {
-                    Some(scope) => self.state.work_queue.retire_obsolete_scope(scope),
-                    None => self.state.work_queue.retire_all(),
-                };
-                self.state.budget.release(released);
+            self.pending_needed_query = None;
+            let authority =
+                current_scope.expect("a committed view always constructs current body authority");
+            if body_work_epoch_changed {
                 let _ = self
                     .sequencer_control
-                    .send(SequencerControlInput::WorkScopeChanged {
-                        scope: current_scope,
+                    .send(SequencerControlInput::BodyWorkEpochChanged {
+                        authority,
+                        frontiers,
                     });
+            } else {
+                self.state.work_queue.refresh_authority(authority);
+                let _ = self
+                    .sequencer_control
+                    .send(SequencerControlInput::WorkAuthorityRefreshed { authority });
             }
         }
 
@@ -881,7 +859,7 @@ impl BlockSyncReactor {
         if header_changed {
             self.state.best_header_tip = header_best.height;
             self.state.best_header_hash = header_best.hash;
-            if !self.empty_state_body_sync_started && empty_state_header_quiet_required(&snapshot) {
+            if !self.empty_state_body_sync_started && empty_state_header_quiet_required(&view) {
                 self.empty_state_header_quiet_until =
                     Some(Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD);
             }
@@ -889,19 +867,26 @@ impl BlockSyncReactor {
 
         match previous.as_ref() {
             None => self.handle_chain_tip_reset(frontiers, false).await,
-            Some(old) if old.verified_generation != snapshot.verified_generation => {
-                self.handle_chain_tip_reset(frontiers, false).await;
-            }
+            Some(_) if body_work_epoch_changed => {}
             Some(old)
-                if old.frontiers.verified_best != snapshot.frontiers.verified_best
-                    || old.frontiers.finalized != snapshot.frontiers.finalized =>
+                if old.frontiers.verified_best != view.frontiers.verified_best
+                    || old.frontiers.finalized != view.frontiers.finalized =>
             {
+                debug_assert!(
+                    view.frontiers.verified_best.height >= old.frontiers.verified_best.height,
+                    "same-epoch verified authority cannot retreat"
+                );
+                debug_assert!(
+                    view.frontiers.verified_best.height != old.frontiers.verified_best.height
+                        || view.frontiers.verified_best.hash == old.frontiers.verified_best.hash,
+                    "same-epoch verified authority cannot replace a hash at the same height"
+                );
                 self.handle_state_frontiers_changed(frontiers).await;
             }
             Some(_) => {}
         }
 
-        if header_changed || (current_scope != previous_scope && !preserves_download_pipeline) {
+        if header_changed || current_scope != previous_scope {
             self.query_needed_blocks_with_options(true).await;
         }
     }
@@ -1130,16 +1115,22 @@ impl BlockSyncReactor {
         // timeout). The hash is checked so a reanchor (different hash) still
         // re-queues. The registry's outstanding is routine-owned, so this clause is
         // now backed by per-peer state independent of `work.in_flight`.
+        //
+        // The clause matches on height and hash, never on the full
+        // `BodyWorkAuthority`. Outstanding entries are routine-owned and keep the
+        // authority that issued them, so a same-epoch authority refresh would make
+        // every live request look absent and admit a duplicate fetch. Height and hash
+        // are sufficient: `BodyWorkEpochChanged` bumps `reset_epoch`, and every
+        // routine clears its outstanding in place on that bump, so no entry from an
+        // invalidated lineage survives into the current epoch.
         let blocks: Vec<_> = blocks
             .into_iter()
             .filter(|block| {
                 block.height > self.request_floor
                     && !self.state.work_queue.in_flight_contains(block.height)
-                    && !self.registry.has_outstanding_request_in_scope(
-                        scope,
-                        block.height,
-                        block.hash,
-                    )
+                    && !self
+                        .registry
+                        .has_outstanding_request(block.height, block.hash)
             })
             .collect();
 
@@ -1268,7 +1259,7 @@ impl BlockSyncReactor {
     }
 
     fn restart_body_alarm_for_new_supplier(&mut self) {
-        let Some(snapshot) = self.committed_snapshot.as_ref() else {
+        let Some(snapshot) = self.committed_view.as_ref() else {
             return;
         };
         let Some(previous) = snapshot
@@ -1332,7 +1323,7 @@ impl BlockSyncReactor {
     }
 
     fn retry_body_availability(&mut self, hash: block::Hash) {
-        let Some(snapshot) = self.committed_snapshot.as_ref() else {
+        let Some(snapshot) = self.committed_view.as_ref() else {
             return;
         };
         let header = snapshot.frontiers.header_best;
@@ -1544,7 +1535,10 @@ impl BlockSyncReactor {
         height: block::Height,
         hash: block::Hash,
         outcome: BlockApplyOutcome,
-        semantic_current: bool,
+        semantic_completion: Option<(
+            zakura_header_chain::BodyWorkOwner,
+            zakura_header_chain::StateVersion,
+        )>,
     ) {
         // The whole commit-pipeline body (token validate, applying removal,
         // throughput record, rollback + misbehavior, drain + submit) runs on the
@@ -1557,7 +1551,7 @@ impl BlockSyncReactor {
             outcome.result(),
             self.state.budget.reserved(),
         );
-        let persisted_availability = self.committed_snapshot.as_ref().and_then(|snapshot| {
+        let persisted_availability = self.committed_view.as_ref().and_then(|snapshot| {
             (snapshot.frontiers.header_best.hash == hash)
                 .then_some(snapshot.alarms.header_best_body_unavailable)
                 .flatten()
@@ -1576,7 +1570,7 @@ impl BlockSyncReactor {
                 outcome,
                 eligible_sources: self.registry.eligible_sources(height),
                 persisted_availability,
-                semantic_current,
+                semantic_completion,
             });
         self.trace_sequencer_control_send(
             "apply_finished",
@@ -1682,9 +1676,9 @@ impl BlockSyncReactor {
 
     fn body_work_scope(&self) -> Option<zakura_header_chain::BodyWorkAuthority> {
         let scope = self
-            .committed_snapshot
+            .committed_view
             .as_ref()
-            .map(zakura_header_chain::BodyWorkAuthority::for_snapshot);
+            .map(zakura_header_chain::BodyWorkAuthority::for_view);
         #[cfg(not(test))]
         {
             scope
@@ -1692,7 +1686,7 @@ impl BlockSyncReactor {
         #[cfg(test)]
         {
             scope.or_else(|| {
-                self.startup.committed_snapshots.is_none().then_some(
+                self.startup.committed_views.is_none().then_some(
                     zakura_header_chain::BodyWorkAuthority {
                         header: zakura_header_chain::HeaderWorkAuthority {
                             header_generation: zakura_header_chain::HeaderGeneration::new(0),
@@ -1702,40 +1696,48 @@ impl BlockSyncReactor {
                             ),
                         },
                         verified_generation: zakura_header_chain::VerifiedGeneration::new(0),
+                        body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
                     },
                 )
             })
         }
     }
 
-    fn body_completion_is_current(
+    fn body_completion_authority(
         &self,
         source: zakura_header_chain::SourceId,
         owner: &zakura_header_chain::BodyWorkOwner,
-    ) -> bool {
+    ) -> Option<(
+        zakura_header_chain::BodyWorkOwner,
+        zakura_header_chain::StateVersion,
+    )> {
         let current = self
             .startup
-            .committed_snapshots
+            .committed_views
             .as_ref()
             .and_then(|snapshots| snapshots.borrow().clone());
         #[cfg(test)]
         if current.is_none() {
-            return self.body_work_scope() == Some(owner.authority());
+            return (self.body_work_scope() == Some(owner.authority()))
+                .then_some((*owner, zakura_header_chain::StateVersion::default()));
         }
-        let Some(current) = current else {
-            return false;
-        };
+        let current = current?;
         let mut pending = zakura_header_chain::PendingOwners::default();
         pending.insert(source, *owner);
-        match zakura_header_chain::Gate::check(&current, &pending, source, owner) {
-            zakura_header_chain::CompletionDecision::Current => true,
-            zakura_header_chain::CompletionDecision::Stale(reason) => {
+        match zakura_header_chain::Gate::check_body(&current, &pending, source, owner) {
+            zakura_header_chain::BodyCompletionDecision::Current => {
+                Some((*owner, current.state_version))
+            }
+            zakura_header_chain::BodyCompletionDecision::Rebased(owner) => {
+                Some((owner, current.state_version))
+            }
+            zakura_header_chain::BodyCompletionDecision::Stale(reason) => {
                 metrics::counter!(
                     "sync.header_chain.stale_completion.total",
                     "kind" => format!("body_{reason:?}")
                 )
                 .increment(1);
-                false
+                None
             }
         }
     }
@@ -1770,9 +1772,11 @@ impl BlockSyncReactor {
         // The unreceived in-flight heights live in the routines, mirrored into the
         // registry's per-peer outstanding set (per-request granularity: each entry
         // is one still-unreceived requested height). `total_unreceived` sums them.
-        let outstanding = self
-            .body_work_scope()
-            .map_or(0, |scope| self.registry.total_unreceived_in_scope(scope));
+        // The sum ignores the entries' issuing authority for the same reason the
+        // producer filter does: a same-epoch refresh leaves live requests on their
+        // older authority, and counting them by authority would undercount the
+        // pipeline and refill against work that is already outstanding.
+        let outstanding = self.registry.total_unreceived();
 
         // Count only the download pipeline (pending WorkQueue heights + the
         // unreceived heights of in-flight requests) against the refill low-water
@@ -2177,7 +2181,7 @@ impl BlockSyncReactor {
     }
 
     fn publish_body_unavailable_metrics(&mut self) {
-        let current = self.committed_snapshot.as_ref().and_then(|snapshot| {
+        let current = self.committed_view.as_ref().and_then(|snapshot| {
             snapshot
                 .alarms
                 .header_best_body_unavailable

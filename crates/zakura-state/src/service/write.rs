@@ -1410,6 +1410,7 @@ struct WriteBlockWorkerTask {
 #[derive(Clone, Debug)]
 pub(in crate::service) struct HeaderChainObservers {
     snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
+    view_sender: watch::Sender<Option<zakura_header_chain::CommittedHeaderChainView>>,
     reader_sender: watch::Sender<Option<HeaderChainReader>>,
     runtime_status_sender: watch::Sender<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
 }
@@ -1417,6 +1418,7 @@ pub(in crate::service) struct HeaderChainObservers {
 impl HeaderChainObservers {
     pub(in crate::service) fn new(
         snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
+        view_sender: watch::Sender<Option<zakura_header_chain::CommittedHeaderChainView>>,
         reader_sender: watch::Sender<Option<HeaderChainReader>>,
         runtime_status_sender: watch::Sender<
             zakura_node_services::sync_lifecycle::HeaderRuntimeStatus,
@@ -1424,6 +1426,7 @@ impl HeaderChainObservers {
     ) -> Self {
         Self {
             snapshot_sender,
+            view_sender,
             reader_sender,
             runtime_status_sender,
         }
@@ -1904,6 +1907,10 @@ fn attach_header_chain_if_genesis_is_committed(
         .runtime
         .publisher()
         .mirror_to(observers.snapshot_sender.clone());
+    writer
+        .runtime
+        .publisher()
+        .mirror_views_to(observers.view_sender.clone());
     observers
         .ready(epoch)
         .map_err(BlockWriteTaskExit::HeaderChainAttachmentFailed)?;

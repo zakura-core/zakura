@@ -10,6 +10,7 @@ fn attachment_failure_exits_with_a_typed_error_before_publication() {
     let (chain_tip_sender, _latest_tip, _tip_change) = ChainTipSender::new(None, &network);
     let (non_finalized_state_sender, _non_finalized_state_receiver) = watch::channel(live.clone());
     let (snapshot_sender, snapshot_receiver) = watch::channel(None);
+    let (view_sender, view_receiver) = watch::channel(None);
     let (reader_sender, reader_receiver) = watch::channel(None);
     let (runtime_status_sender, runtime_status_receiver) = watch::channel(
         zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Detached {
@@ -34,7 +35,12 @@ fn attachment_failure_exits_with_a_typed_error_before_publication() {
         None,
         None,
         true,
-        HeaderChainObservers::new(snapshot_sender, reader_sender, runtime_status_sender),
+        HeaderChainObservers::new(
+            snapshot_sender,
+            view_sender,
+            reader_sender,
+            runtime_status_sender,
+        ),
     );
 
     drop(senders.finalized.take());
@@ -54,6 +60,7 @@ fn attachment_failure_exits_with_a_typed_error_before_publication() {
         "header-chain attachment failed: finalized state has no authenticated genesis header at semantic handoff"
     );
     assert!(snapshot_receiver.borrow().is_none());
+    assert!(view_receiver.borrow().is_none());
     assert!(reader_receiver.borrow().is_none());
     assert!(matches!(
         &*runtime_status_receiver.borrow(),
@@ -79,6 +86,7 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
                         ),
                     },
                     verified_generation: VerifiedGeneration::new(3),
+                    body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
                 },
                 session_id: 6,
                 request_id: std::num::NonZeroU64::new(7).expect("seven is nonzero"),

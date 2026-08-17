@@ -93,6 +93,7 @@ fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {
             branch: zakura_header_chain::BranchId::new(block::Hash([4; 32]), block::Hash([5; 32])),
         },
         verified_generation: zakura_header_chain::VerifiedGeneration::new(3),
+        body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
     }
 }
 

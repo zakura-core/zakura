@@ -26,6 +26,22 @@ pub(super) struct SettlementInputs<'engine, 'ctx> {
     pub(super) header_rebase: HeaderInsertionRebase,
     pub(super) context: &'ctx TransitionContext<'ctx>,
     pub(super) old_selected: &'engine [Frontier],
+    pub(super) old_verified: &'engine [Frontier],
+}
+
+/// Evidence that an appended finality record continues the prior projections.
+///
+/// Appending a finality record trims every projection entry below the new frontier.
+/// When the trim removes a complete projection, the retained frontiers no longer show
+/// whether the new lineage continues the old one, so body-work classification consults
+/// this ancestry instead. The planner captures it before the finality advance deletes
+/// the headers the ancestry walk reads.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FinalityLineage {
+    /// The new finalized frontier descends from the prior selected tip.
+    pub(super) continues_selected: bool,
+    /// The new finalized frontier descends from the prior verified tip.
+    pub(super) continues_verified: bool,
 }
 
 /// Settled projections ready for write-set assembly.
@@ -36,6 +52,8 @@ pub(super) struct SettledTransition<'a> {
     pub(super) selected: Cow<'a, [Frontier]>,
     /// Optional finality record to append.
     pub(super) finality_append: Option<FinalityRecord>,
+    /// Ancestry evidence for the projections the finality append trims away.
+    pub(super) finality_lineage: FinalityLineage,
     /// Retention outcome.
     pub(super) retention: RetentionPlan,
     /// Orthogonal transition effects.
@@ -65,6 +83,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         header_rebase,
         context,
         old_selected,
+        old_verified,
     } = inputs;
     let work_rebased = projected.work_coordinates_rebased();
     if work_rebased {
@@ -145,10 +164,23 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     }
 
     let mut finality_append = None;
+    let mut finality_lineage = FinalityLineage::default();
     if let Some((new_finalized, source)) = finality {
         if new_finalized != projected.graph().view_finalized_frontier() {
             let previous = projected.graph().view_finalized_frontier();
             let epoch = metadata.finality_epoch.checked_next()?;
+            finality_lineage = FinalityLineage {
+                continues_selected: finality_continues_projection(
+                    projected.graph(),
+                    old_selected,
+                    new_finalized,
+                )?,
+                continues_verified: finality_continues_projection(
+                    projected.graph(),
+                    old_verified,
+                    new_finalized,
+                )?,
+            };
             projected.advance_finality(new_finalized)?;
             finality_append = Some(FinalityRecord {
                 previous,
@@ -219,11 +251,39 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
             projected,
             selected,
             finality_append,
+            finality_lineage,
             retention,
             effect,
             metadata,
         },
     )))
+}
+
+/// Return whether the new finalized frontier descends from the projection's tip.
+///
+/// Call this before the finality advance deletes the headers below the new frontier,
+/// because the walk reads them. An empty projection has no lineage to continue, and a
+/// new frontier at or below the projection tip leaves retained entries that carry the
+/// evidence directly, so both cases answer true without a walk. The walk itself spans
+/// the same heights the finality advance already traverses, so it adds no new bound.
+fn finality_continues_projection<G: HeaderGraphView>(
+    graph: &G,
+    old: &[Frontier],
+    new_finalized: Frontier,
+) -> Result<bool, TransitionFailure> {
+    let Some(tip) = old.last() else {
+        return Ok(true);
+    };
+    if new_finalized.height <= tip.height {
+        return Ok(true);
+    }
+    if *tip == graph.view_finalized_frontier() {
+        // The finality advance rejects a frontier that does not descend from the current
+        // finalized frontier, so a projection ending there needs no separate walk. This
+        // is the headers-only verified projection, which collapses to finality.
+        return Ok(true);
+    }
+    Ok(graph.view_header_ancestor(new_finalized.hash, tip.height)? == Some(*tip))
 }
 
 /// Apply a migrated-pin refutation alarm before settlement when durable facts authenticate it.

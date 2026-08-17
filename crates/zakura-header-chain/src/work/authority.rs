@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU64;
 
-use crate::{BranchId, HeaderGeneration, VerifiedGeneration};
+use crate::{BodyWorkEpoch, BranchId, HeaderGeneration, VerifiedGeneration};
 
 /// Header-generation and branch authority captured before asynchronous header work.
 ///
@@ -34,6 +34,8 @@ pub struct BodyWorkAuthority {
     pub header: HeaderWorkAuthority,
     /// Verified-body generation that scheduled the work.
     pub verified_generation: VerifiedGeneration,
+    /// Compatible selected-lineage epoch that scheduled the work.
+    pub body_work_epoch: BodyWorkEpoch,
 }
 
 impl BodyWorkAuthority {
@@ -232,6 +234,7 @@ mod tests {
                 branch: BranchId::new(block::Hash([4; 32]), block::Hash([5; 32])),
             },
             verified_generation: VerifiedGeneration::new(3),
+            body_work_epoch: BodyWorkEpoch::new(4),
         };
         let request_id = NonZeroU64::new(7).expect("seven is nonzero");
         let owner = authority.bind(6, request_id);

@@ -1492,6 +1492,7 @@ async fn raw_block_range_read_stops_at_pruned_gap_before_retained_bodies() {
         tokio::sync::watch::channel(VctRootRepairStatus::default());
     let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
         tokio::sync::watch::channel(None);
+    let (_header_chain_view_sender, header_chain_view_receiver) = tokio::sync::watch::channel(None);
     let (_header_runtime_status_sender, header_runtime_status_receiver) =
         tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
             epoch: LifecycleEpoch::INITIAL,
@@ -1508,6 +1509,7 @@ async fn raw_block_range_read_stops_at_pruned_gap_before_retained_bodies() {
         vct_root_repair_receiver,
         HeaderChainSubscriptions {
             snapshots: header_chain_snapshot_receiver,
+            views: header_chain_view_receiver,
             runtime_status: header_runtime_status_receiver,
             reader: header_chain_reader_receiver,
         },

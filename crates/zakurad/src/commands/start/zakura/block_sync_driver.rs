@@ -1797,6 +1797,7 @@ mod tests {
                 ),
             },
             verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+            body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
         }
         .bind(
             1,

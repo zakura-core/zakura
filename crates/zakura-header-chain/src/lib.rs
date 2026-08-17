@@ -33,8 +33,8 @@ pub use graph::{
     WorkCoordinate, WorkCoordinateError, MAX_DIRECT_ELIGIBILITY_REASONS_V1,
 };
 pub use identity::{
-    AuxObservationId, BranchId, CounterExhausted, EvidenceId, FinalityEpoch, HeaderGeneration,
-    HeaderId, OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration,
+    AuxObservationId, BodyWorkEpoch, BranchId, CounterExhausted, EvidenceId, FinalityEpoch,
+    HeaderGeneration, HeaderId, OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration,
 };
 pub use transition::*;
 pub use validation::{
@@ -47,8 +47,8 @@ pub use validation::{
     POW_MEDIAN_BLOCK_SPAN, POW_PREDECESSOR_CONTEXT_SPAN,
 };
 pub use work::{
-    BodyWorkAuthority, BodyWorkOwner, CompletionDecision, CompletionOwner, Gate,
-    HeaderSyncWorkOwner, HeaderWorkAuthority, HeaderWorkOwner, PendingOwners, StaleReason,
+    BodyCompletionDecision, BodyWorkAuthority, BodyWorkOwner, CompletionDecision, CompletionOwner,
+    Gate, HeaderSyncWorkOwner, HeaderWorkAuthority, HeaderWorkOwner, PendingOwners, StaleReason,
 };
 
 #[cfg(test)]

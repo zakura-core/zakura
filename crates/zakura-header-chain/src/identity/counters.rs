@@ -58,6 +58,12 @@ counter_type!(
     "Monotonic epoch of irreversible finality changes."
 );
 
+counter_type!(
+    BodyWorkEpoch,
+    "body-work epoch",
+    "Process-local epoch that identifies one compatible selected-path lineage."
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +90,12 @@ mod tests {
             FinalityEpoch::new(u64::MAX).checked_next(),
             Err(CounterExhausted {
                 counter: "finality epoch"
+            })
+        );
+        assert_eq!(
+            BodyWorkEpoch::new(u64::MAX).checked_next(),
+            Err(CounterExhausted {
+                counter: "body-work epoch"
             })
         );
     }

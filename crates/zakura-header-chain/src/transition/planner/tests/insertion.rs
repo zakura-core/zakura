@@ -17,6 +17,7 @@ fn ordinary_header_insertion_rejects_body_repair_authority() {
         authority: crate::BodyWorkAuthority {
             header: header_owner.authority,
             verified_generation: store.metadata.verified_generation,
+            body_work_epoch: crate::BodyWorkEpoch::default(),
         },
         session_id: header_owner.session_id,
         request_id: header_owner.request_id,

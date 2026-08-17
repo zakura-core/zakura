@@ -4,15 +4,16 @@ use std::{borrow::Cow, sync::Arc};
 
 use crate::graph::{GraphDelta, HeaderGraphView};
 use crate::{
-    BodyValidationState, ChangeSet, EligibilityDelta, EngineLimits, EngineMetadata, EngineSnapshot,
-    Frontier, FrontierSet, GraphError, HeaderChainEngine, IndexChanges, MemHeaderStore,
-    ProjectionDelta, TransitionContext, TransitionDomain, TransitionEffect, TransitionEvent,
-    TransitionFingerprint,
+    BodyValidationState, BodyWorkEffect, ChangeSet, EligibilityDelta, EngineLimits, EngineMetadata,
+    EngineSnapshot, Frontier, FrontierSet, GraphError, HeaderChainEngine, IndexChanges,
+    MemHeaderStore, ProjectionDelta, TransitionContext, TransitionDomain, TransitionEffect,
+    TransitionEvent, TransitionFingerprint,
 };
 
 use super::admission::validate_authority;
 use super::projected_state::SettledProjectedState;
 use super::retention::RetentionPlan;
+use super::settlement::FinalityLineage;
 use super::{
     InvalidTransitionEvidence, PlanCandidate, PlannerCoherenceViolation, ProjectionKind,
     TransitionFailure,
@@ -29,6 +30,7 @@ pub(super) struct DerivePlanInputs<'a> {
     pub(super) old_verified: &'a [Frontier],
     pub(super) selected: Cow<'a, [Frontier]>,
     pub(super) finality_append: Option<crate::FinalityRecord>,
+    pub(super) finality_lineage: FinalityLineage,
     pub(super) retention: RetentionPlan,
     pub(super) fingerprint: Option<TransitionFingerprint>,
     pub(super) domain: TransitionDomain,
@@ -51,10 +53,11 @@ pub(super) fn derive_plan(
         old_verified,
         selected,
         finality_append,
+        finality_lineage,
         retention,
         fingerprint,
         domain,
-        effect,
+        mut effect,
         trust_pins,
         limits,
     } = inputs;
@@ -77,6 +80,14 @@ pub(super) fn derive_plan(
     eligibility_changes.sort_unstable_by_key(|delta| delta.hash.0);
     let selected_changed = selected.as_ref() != old_selected;
     let verified_changed = verified.as_ref() != old_verified;
+    effect.body_work = body_work_effect(
+        old_selected,
+        &selected,
+        old_verified,
+        &verified,
+        finality_append,
+        finality_lineage,
+    );
     let header_topology_changed = !delete_nodes.is_empty()
         || put_nodes
             .iter()
@@ -288,5 +299,294 @@ pub(super) fn projection_delta(old: &[Frontier], new: &[Frontier]) -> Projection
             .or_else(|| new.get(common))
             .map(|frontier| frontier.height),
         put: new[common..].to_vec(),
+    }
+}
+
+/// Classify whether final selected and verified projections retain prior body work.
+pub(super) fn body_work_effect(
+    old_selected: &[Frontier],
+    new_selected: &[Frontier],
+    old_verified: &[Frontier],
+    new_verified: &[Frontier],
+    finality_append: Option<crate::FinalityRecord>,
+    finality_lineage: FinalityLineage,
+) -> BodyWorkEffect {
+    if projection_retains_path(
+        old_selected,
+        new_selected,
+        finality_append,
+        finality_lineage.continues_selected,
+    ) && projection_retains_path(
+        old_verified,
+        new_verified,
+        finality_append,
+        finality_lineage.continues_verified,
+    ) {
+        BodyWorkEffect::Preserved
+    } else {
+        BodyWorkEffect::Invalidated
+    }
+}
+
+fn projection_retains_path(
+    old: &[Frontier],
+    new: &[Frontier],
+    finality_append: Option<crate::FinalityRecord>,
+    finality_continues_old: bool,
+) -> bool {
+    let Some(record) = finality_append else {
+        return new.starts_with(old);
+    };
+    let retained_old =
+        &old[old.partition_point(|frontier| frontier.height < record.current.height)..];
+    if retained_old.is_empty() {
+        // The finality append trims away every prior entry, so `starts_with` compares
+        // against an empty prefix and holds for any new path, including one on an
+        // unrelated branch. Only the captured ancestry distinguishes a lineage the
+        // finalized frontier continues from one it replaces.
+        return finality_continues_old;
+    }
+    new.starts_with(retained_old)
+}
+
+#[cfg(test)]
+mod body_work_epoch_tests {
+    use zakura_chain::block;
+
+    use super::*;
+
+    fn path(markers: &[u8]) -> Vec<Frontier> {
+        markers
+            .iter()
+            .enumerate()
+            .map(|(height, marker)| {
+                Frontier::new(
+                    block::Height(u32::try_from(height).expect("the fixture height fits in u32")),
+                    block::Hash([*marker; 32]),
+                )
+            })
+            .collect()
+    }
+
+    fn frontier(height: u32, marker: u8) -> Frontier {
+        Frontier::new(block::Height(height), block::Hash([marker; 32]))
+    }
+
+    fn finality(current: Frontier) -> crate::FinalityRecord {
+        crate::FinalityRecord {
+            previous: frontier(0, 1),
+            current,
+            source: crate::FinalitySource::MigratedHeadersOnly,
+            epoch: crate::FinalityEpoch::new(1),
+        }
+    }
+
+    /// The finalized frontier descends from both prior projection tips.
+    fn continues() -> FinalityLineage {
+        FinalityLineage {
+            continues_selected: true,
+            continues_verified: true,
+        }
+    }
+
+    /// The finalized frontier descends from neither prior projection tip.
+    fn replaces() -> FinalityLineage {
+        FinalityLineage::default()
+    }
+
+    #[test]
+    fn selected_extension_and_finalized_trim_preserve_body_work_epoch() {
+        let old = path(&[1, 2, 3]);
+        let extended = path(&[1, 2, 3, 4]);
+        assert_eq!(
+            body_work_effect(&old, &extended, &old, &old, None, replaces()),
+            BodyWorkEffect::Preserved
+        );
+        // The trim retains a prefix of both projections, so that prefix carries the
+        // continuation evidence and the classifier never consults the ancestry.
+        assert_eq!(
+            body_work_effect(
+                &old,
+                &extended[1..],
+                &old,
+                &old[1..],
+                Some(finality(extended[1])),
+                replaces(),
+            ),
+            BodyWorkEffect::Preserved
+        );
+    }
+
+    #[test]
+    fn side_branch_changes_preserve_body_work_epoch() {
+        let selected = path(&[1, 2, 3]);
+        assert_eq!(
+            body_work_effect(&selected, &selected, &selected, &selected, None, replaces()),
+            BodyWorkEffect::Preserved
+        );
+    }
+
+    #[test]
+    fn selected_replacement_and_retreat_advance_body_work_epoch() {
+        let old = path(&[1, 2, 3]);
+        for replacement in [
+            path(&[1, 9, 8]),
+            path(&[1, 9, 8, 7]),
+            vec![Frontier::new(block::Height(8), block::Hash([8; 32]))],
+            path(&[1, 2]),
+        ] {
+            assert_eq!(
+                body_work_effect(&old, &replacement, &old, &old, None, replaces()),
+                BodyWorkEffect::Invalidated
+            );
+        }
+    }
+
+    #[test]
+    fn verified_growth_preserves_and_verified_reset_advances_body_work_epoch() {
+        let selected = path(&[1, 2, 3, 4]);
+        let old_verified = path(&[1, 2]);
+        let grown_verified = path(&[1, 2, 3]);
+        assert_eq!(
+            body_work_effect(
+                &selected,
+                &selected,
+                &old_verified,
+                &grown_verified,
+                None,
+                replaces(),
+            ),
+            BodyWorkEffect::Preserved
+        );
+        assert_eq!(
+            body_work_effect(
+                &selected,
+                &selected,
+                &old_verified,
+                &path(&[1, 9]),
+                None,
+                replaces(),
+            ),
+            BodyWorkEffect::Invalidated
+        );
+    }
+
+    #[test]
+    fn invalid_body_advances_epoch_only_when_selection_changes() {
+        let selected = path(&[1, 2, 3]);
+        assert_eq!(
+            body_work_effect(
+                &selected,
+                &path(&[1, 8, 9]),
+                &selected,
+                &selected,
+                None,
+                replaces(),
+            ),
+            BodyWorkEffect::Invalidated
+        );
+        assert_eq!(
+            body_work_effect(&selected, &selected, &selected, &selected, None, replaces()),
+            BodyWorkEffect::Preserved
+        );
+    }
+
+    #[test]
+    fn authoritative_finality_retires_a_complete_old_projection_it_continues() {
+        let old = vec![frontier(4, 4), frontier(5, 5)];
+        let new = vec![frontier(8, 8), frontier(9, 9)];
+        let record = finality(new[0]);
+
+        assert_eq!(
+            body_work_effect(&old, &new, &old, &new, Some(record), continues()),
+            BodyWorkEffect::Preserved
+        );
+    }
+
+    #[test]
+    fn finality_above_the_old_tip_invalidates_a_replaced_lineage() {
+        let old = vec![frontier(4, 4), frontier(5, 5)];
+        let unrelated = vec![frontier(8, 0x88), frontier(9, 0x99)];
+        let record = finality(unrelated[0]);
+
+        // The trim empties both retained projections, so the paths alone cannot tell a
+        // continuation from a replacement. Without ancestry back to the old tips the
+        // classifier must retire the epoch.
+        assert_eq!(
+            body_work_effect(&old, &unrelated, &old, &unrelated, Some(record), replaces()),
+            BodyWorkEffect::Invalidated
+        );
+    }
+
+    #[test]
+    fn finality_invalidates_when_it_continues_only_one_projection() {
+        let old = vec![frontier(4, 4), frontier(5, 5)];
+        let new = vec![frontier(8, 8), frontier(9, 9)];
+        let record = finality(new[0]);
+
+        for lineage in [
+            FinalityLineage {
+                continues_selected: true,
+                continues_verified: false,
+            },
+            FinalityLineage {
+                continues_selected: false,
+                continues_verified: true,
+            },
+        ] {
+            assert_eq!(
+                body_work_effect(&old, &new, &old, &new, Some(record), lineage),
+                BodyWorkEffect::Invalidated
+            );
+        }
+    }
+
+    #[test]
+    fn authoritative_finality_preserves_the_retained_projection_prefix() {
+        let old = vec![frontier(4, 4), frontier(5, 5), frontier(6, 6)];
+        let new = vec![frontier(5, 5), frontier(6, 6), frontier(7, 7)];
+        let record = finality(new[0]);
+
+        assert_eq!(
+            body_work_effect(&old, &new, &old, &new, Some(record), replaces()),
+            BodyWorkEffect::Preserved
+        );
+    }
+
+    #[test]
+    fn finality_does_not_authorize_a_conflicting_reanchor() {
+        let old = vec![frontier(4, 4), frontier(5, 5), frontier(6, 6)];
+        let reanchored = vec![frontier(5, 0x55), frontier(6, 0x66)];
+        let record = finality(reanchored[0]);
+
+        assert_eq!(
+            body_work_effect(
+                &old,
+                &reanchored,
+                &old,
+                &reanchored,
+                Some(record),
+                continues()
+            ),
+            BodyWorkEffect::Invalidated
+        );
+    }
+
+    #[test]
+    fn projection_retirement_without_finality_invalidates_body_work() {
+        let old = vec![frontier(4, 4), frontier(5, 5), frontier(6, 6)];
+        let arbitrary_suffix = &old[1..];
+
+        assert_eq!(
+            body_work_effect(
+                &old,
+                arbitrary_suffix,
+                &old,
+                arbitrary_suffix,
+                None,
+                continues()
+            ),
+            BodyWorkEffect::Invalidated
+        );
     }
 }

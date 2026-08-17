@@ -1,11 +1,15 @@
-use std::{hint::black_box, time::Instant};
+use std::{
+    cmp::{max, min},
+    hint::black_box,
+    time::Instant,
+};
 
 use chrono::{DateTime, Duration, Utc};
 use zakura_chain::{
     block,
     parameters::{
         testnet::{Parameters, RegtestParameters},
-        Network, NetworkUpgrade,
+        Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
     },
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _, U256},
 };
@@ -428,6 +432,410 @@ fn disabled_pow_low_target_window_does_not_calculate_expected_difficulty() {
             expected_difficulty,
         }) if difficulty_threshold == invalid_target && expected_difficulty == limit
     ));
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SimulationTargetSamples {
+    Constant,
+    Alternating,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SimulationTimeMutation {
+    None,
+    OneExtreme,
+    SixRecent,
+    ParentGap(i64),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SimulationNetwork {
+    Mainnet,
+    Testnet,
+}
+
+impl SimulationNetwork {
+    fn network(self) -> Network {
+        match self {
+            Self::Mainnet => Network::Mainnet,
+            Self::Testnet => Network::new_default_testnet(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DifficultySimulationCase {
+    name: &'static str,
+    network: SimulationNetwork,
+    averaging_window: usize,
+    median_span: usize,
+    target_spacing_seconds: i64,
+    observed_spacing_seconds: i64,
+    target_samples: SimulationTargetSamples,
+    time_mutation: SimulationTimeMutation,
+    expected_actual_timespan_seconds: i64,
+    expected_minimum_difficulty: bool,
+    compare_with_production: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DifficultySimulationResult {
+    mean_target: ExpandedDifficulty,
+    actual_timespan: Duration,
+    damped_timespan: Duration,
+    bounded_timespan: Duration,
+    expanded_target: ExpandedDifficulty,
+    expected_nbits: CompactDifficulty,
+    minimum_difficulty: bool,
+}
+
+fn simulation_context(
+    case: DifficultySimulationCase,
+    network: &Network,
+    candidate_time: DateTime<Utc>,
+) -> Vec<(CompactDifficulty, DateTime<Utc>)> {
+    let context_len = case
+        .averaging_window
+        .checked_add(case.median_span)
+        .expect("simulation windows are small");
+    let easy_target = compact_half_limit(network);
+    let harder_target = (network.target_difficulty_limit() / U256::from(4_u8)).to_compact();
+    let observed_spacing = Duration::seconds(case.observed_spacing_seconds);
+    let mut context = (1..=context_len)
+        .map(|offset| {
+            let offset = i32::try_from(offset).expect("simulation context length fits in i32");
+            let target = match case.target_samples {
+                SimulationTargetSamples::Constant => easy_target,
+                SimulationTargetSamples::Alternating if offset % 2 == 0 => harder_target,
+                SimulationTargetSamples::Alternating => easy_target,
+            };
+            (target, candidate_time - observed_spacing * offset)
+        })
+        .collect::<Vec<_>>();
+
+    match case.time_mutation {
+        SimulationTimeMutation::None => {}
+        SimulationTimeMutation::OneExtreme => {
+            context[0].1 = candidate_time + Duration::hours(24);
+        }
+        SimulationTimeMutation::SixRecent => {
+            for (_, time) in context.iter_mut().take(6) {
+                *time = candidate_time - Duration::seconds(1);
+            }
+        }
+        SimulationTimeMutation::ParentGap(seconds) => {
+            context[0].1 = candidate_time - Duration::seconds(seconds);
+        }
+    }
+
+    context
+}
+
+fn simulation_median(mut times: Vec<DateTime<Utc>>) -> DateTime<Utc> {
+    times.sort_unstable();
+    times[times.len() / 2]
+}
+
+fn simulate_difficulty(
+    case: DifficultySimulationCase,
+    network: &Network,
+    candidate_height: block::Height,
+    candidate_time: DateTime<Utc>,
+    context: &[(CompactDifficulty, DateTime<Utc>)],
+) -> DifficultySimulationResult {
+    let expected_context_len = case
+        .averaging_window
+        .checked_add(case.median_span)
+        .expect("simulation windows are small");
+    assert_eq!(
+        context.len(),
+        expected_context_len,
+        "the simulation requires one complete target and median window"
+    );
+
+    let divisor: U256 = case.averaging_window.into();
+    let mut quotient_total = U256::zero();
+    let mut remainder_total = U256::zero();
+    for (compact, _) in &context[..case.averaging_window] {
+        let target: U256 = compact
+            .to_expanded()
+            .expect("simulation targets are valid")
+            .into();
+        quotient_total = quotient_total
+            .checked_add(target / divisor)
+            .expect("divided simulation targets fit in U256");
+        remainder_total = remainder_total
+            .checked_add(target % divisor)
+            .expect("simulation target remainders fit in U256");
+    }
+    let mean_target = ExpandedDifficulty::from(
+        quotient_total
+            .checked_add(remainder_total / divisor)
+            .expect("the exact simulation target mean fits in U256"),
+    );
+
+    let newer_median = simulation_median(
+        context[..case.median_span]
+            .iter()
+            .map(|(_, time)| *time)
+            .collect(),
+    );
+    let older_median = simulation_median(
+        context[case.averaging_window..expected_context_len]
+            .iter()
+            .map(|(_, time)| *time)
+            .collect(),
+    );
+    let actual_timespan = newer_median - older_median;
+
+    let averaging_window =
+        i32::try_from(case.averaging_window).expect("simulation averaging window fits in i32");
+    let expected_timespan = Duration::seconds(case.target_spacing_seconds) * averaging_window;
+    let damped_variance = (actual_timespan - expected_timespan) / POW_DAMPING_FACTOR;
+    let damped_timespan = expected_timespan + Duration::seconds(damped_variance.num_seconds());
+    let minimum_timespan = expected_timespan * (100 - POW_MAX_ADJUST_UP_PERCENT) / 100;
+    let maximum_timespan = expected_timespan * (100 + POW_MAX_ADJUST_DOWN_PERCENT) / 100;
+    let bounded_timespan = max(minimum_timespan, min(maximum_timespan, damped_timespan));
+
+    let target_limit = network.target_difficulty_limit();
+    let bounded_seconds = bounded_timespan.num_seconds();
+    let scaled_mean = mean_target / expected_timespan.num_seconds();
+    let adjusted_target = if scaled_mean > target_limit / bounded_seconds {
+        target_limit
+    } else {
+        min(target_limit, scaled_mean * bounded_seconds)
+    };
+    let minimum_difficulty = NetworkUpgrade::is_testnet_min_difficulty_block(
+        network,
+        candidate_height,
+        candidate_time,
+        context[0].1,
+    );
+    let expanded_target = if minimum_difficulty {
+        target_limit
+    } else {
+        adjusted_target
+    };
+
+    DifficultySimulationResult {
+        mean_target,
+        actual_timespan,
+        damped_timespan,
+        bounded_timespan,
+        expanded_target,
+        expected_nbits: expanded_target.to_compact(),
+        minimum_difficulty,
+    }
+}
+
+/// Run with:
+/// `cargo test -p zakura-header-chain -- --ignored --nocapture table_driven_difficulty_simulator`
+#[test]
+#[ignore = "manual table-driven exploration of difficulty adjustment scenarios"]
+#[allow(clippy::print_stdout)]
+fn table_driven_difficulty_simulator() {
+    const POST_BLOSSOM_SPACING_SECONDS: i64 = 75;
+
+    let cases = [
+        DifficultySimulationCase {
+            name: "regular 75-second blocks",
+            network: SimulationNetwork::Mainnet,
+            averaging_window: POW_AVERAGING_WINDOW,
+            median_span: POW_MEDIAN_BLOCK_SPAN,
+            target_spacing_seconds: POST_BLOSSOM_SPACING_SECONDS,
+            observed_spacing_seconds: 75,
+            target_samples: SimulationTargetSamples::Constant,
+            time_mutation: SimulationTimeMutation::None,
+            expected_actual_timespan_seconds: 1_275,
+            expected_minimum_difficulty: false,
+            compare_with_production: true,
+        },
+        DifficultySimulationCase {
+            name: "fast 50-second blocks",
+            network: SimulationNetwork::Mainnet,
+            averaging_window: POW_AVERAGING_WINDOW,
+            median_span: POW_MEDIAN_BLOCK_SPAN,
+            target_spacing_seconds: POST_BLOSSOM_SPACING_SECONDS,
+            observed_spacing_seconds: 50,
+            target_samples: SimulationTargetSamples::Constant,
+            time_mutation: SimulationTimeMutation::None,
+            expected_actual_timespan_seconds: 850,
+            expected_minimum_difficulty: false,
+            compare_with_production: true,
+        },
+        DifficultySimulationCase {
+            name: "slow 100-second blocks",
+            network: SimulationNetwork::Mainnet,
+            averaging_window: POW_AVERAGING_WINDOW,
+            median_span: POW_MEDIAN_BLOCK_SPAN,
+            target_spacing_seconds: POST_BLOSSOM_SPACING_SECONDS,
+            observed_spacing_seconds: 100,
+            target_samples: SimulationTargetSamples::Constant,
+            time_mutation: SimulationTimeMutation::None,
+            expected_actual_timespan_seconds: 1_700,
+            expected_minimum_difficulty: false,
+            compare_with_production: true,
+        },
+        DifficultySimulationCase {
+            name: "one extreme timestamp",
+            network: SimulationNetwork::Mainnet,
+            averaging_window: POW_AVERAGING_WINDOW,
+            median_span: POW_MEDIAN_BLOCK_SPAN,
+            target_spacing_seconds: POST_BLOSSOM_SPACING_SECONDS,
+            observed_spacing_seconds: 75,
+            target_samples: SimulationTargetSamples::Constant,
+            time_mutation: SimulationTimeMutation::OneExtreme,
+            expected_actual_timespan_seconds: 1_275,
+            expected_minimum_difficulty: false,
+            compare_with_production: true,
+        },
+        DifficultySimulationCase {
+            name: "six recent timestamps moved",
+            network: SimulationNetwork::Mainnet,
+            averaging_window: POW_AVERAGING_WINDOW,
+            median_span: POW_MEDIAN_BLOCK_SPAN,
+            target_spacing_seconds: POST_BLOSSOM_SPACING_SECONDS,
+            observed_spacing_seconds: 75,
+            target_samples: SimulationTargetSamples::Constant,
+            time_mutation: SimulationTimeMutation::SixRecent,
+            expected_actual_timespan_seconds: 1_724,
+            expected_minimum_difficulty: false,
+            compare_with_production: true,
+        },
+        DifficultySimulationCase {
+            name: "sudden hash-rate doubling",
+            network: SimulationNetwork::Mainnet,
+            averaging_window: POW_AVERAGING_WINDOW,
+            median_span: POW_MEDIAN_BLOCK_SPAN,
+            target_spacing_seconds: POST_BLOSSOM_SPACING_SECONDS,
+            observed_spacing_seconds: 38,
+            target_samples: SimulationTargetSamples::Constant,
+            time_mutation: SimulationTimeMutation::None,
+            expected_actual_timespan_seconds: 646,
+            expected_minimum_difficulty: false,
+            compare_with_production: true,
+        },
+        DifficultySimulationCase {
+            name: "alternating target samples",
+            network: SimulationNetwork::Mainnet,
+            averaging_window: POW_AVERAGING_WINDOW,
+            median_span: POW_MEDIAN_BLOCK_SPAN,
+            target_spacing_seconds: POST_BLOSSOM_SPACING_SECONDS,
+            observed_spacing_seconds: 75,
+            target_samples: SimulationTargetSamples::Alternating,
+            time_mutation: SimulationTimeMutation::None,
+            expected_actual_timespan_seconds: 1_275,
+            expected_minimum_difficulty: false,
+            compare_with_production: true,
+        },
+        DifficultySimulationCase {
+            name: "Testnet gap exactly six spacings",
+            network: SimulationNetwork::Testnet,
+            averaging_window: POW_AVERAGING_WINDOW,
+            median_span: POW_MEDIAN_BLOCK_SPAN,
+            target_spacing_seconds: POST_BLOSSOM_SPACING_SECONDS,
+            observed_spacing_seconds: 75,
+            target_samples: SimulationTargetSamples::Constant,
+            time_mutation: SimulationTimeMutation::ParentGap(450),
+            expected_actual_timespan_seconds: 1_275,
+            expected_minimum_difficulty: false,
+            compare_with_production: true,
+        },
+        DifficultySimulationCase {
+            name: "Testnet gap six spacings plus one",
+            network: SimulationNetwork::Testnet,
+            averaging_window: POW_AVERAGING_WINDOW,
+            median_span: POW_MEDIAN_BLOCK_SPAN,
+            target_spacing_seconds: POST_BLOSSOM_SPACING_SECONDS,
+            observed_spacing_seconds: 75,
+            target_samples: SimulationTargetSamples::Constant,
+            time_mutation: SimulationTimeMutation::ParentGap(451),
+            expected_actual_timespan_seconds: 1_274,
+            expected_minimum_difficulty: true,
+            compare_with_production: true,
+        },
+        DifficultySimulationCase {
+            name: "experimental 34-target window",
+            network: SimulationNetwork::Mainnet,
+            averaging_window: 34,
+            median_span: POW_MEDIAN_BLOCK_SPAN,
+            target_spacing_seconds: POST_BLOSSOM_SPACING_SECONDS,
+            observed_spacing_seconds: 75,
+            target_samples: SimulationTargetSamples::Constant,
+            time_mutation: SimulationTimeMutation::None,
+            expected_actual_timespan_seconds: 2_550,
+            expected_minimum_difficulty: false,
+            compare_with_production: false,
+        },
+    ];
+
+    let candidate_height = block::Height(700_000);
+    let previous_height = (candidate_height - 1).expect("simulation height is positive");
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("simulation timestamp is in range");
+
+    println!(
+        "{:<40} {:>6} {:>8} {:>8} {:>8} {:>12} {:>8}",
+        "case", "window", "actual", "damped", "bounded", "nBits", "min-diff"
+    );
+    for case in cases {
+        let network = case.network.network();
+        let context = simulation_context(case, &network, candidate_time);
+        let result =
+            simulate_difficulty(case, &network, candidate_height, candidate_time, &context);
+
+        assert_eq!(
+            result.actual_timespan.num_seconds(),
+            case.expected_actual_timespan_seconds,
+            "{} has an unexpected median timespan",
+            case.name
+        );
+        assert_eq!(
+            result.minimum_difficulty, case.expected_minimum_difficulty,
+            "{} has an unexpected Testnet minimum-difficulty classification",
+            case.name
+        );
+
+        if case.compare_with_production {
+            assert_eq!(
+                case.averaging_window, POW_AVERAGING_WINDOW,
+                "production comparisons require the active averaging window"
+            );
+            assert_eq!(
+                case.median_span, POW_MEDIAN_BLOCK_SPAN,
+                "production comparisons require the active median span"
+            );
+            let production = AdjustedDifficulty::new_from_header_time(
+                candidate_time,
+                previous_height,
+                &network,
+                context.iter().copied(),
+            )
+            .expect("the production comparison supplies complete context")
+            .expected_difficulty_threshold();
+            assert_eq!(
+                result.expected_nbits, production,
+                "{} differs from the production difficulty calculation",
+                case.name
+            );
+        }
+
+        let nbits = u32::from_le_bytes(result.expected_nbits.to_le_bytes());
+        println!(
+            "{:<40} {:>6} {:>7}s {:>7}s {:>7}s {:#012x} {:>8}",
+            case.name,
+            case.averaging_window,
+            result.actual_timespan.num_seconds(),
+            result.damped_timespan.num_seconds(),
+            result.bounded_timespan.num_seconds(),
+            nbits,
+            result.minimum_difficulty,
+        );
+        println!(
+            "    mean_target={:?}\n    expanded_target={:?}",
+            result.mean_target, result.expanded_target
+        );
+    }
 }
 
 /// Run with:

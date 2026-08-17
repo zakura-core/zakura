@@ -744,6 +744,7 @@ mod tests {
                         ),
                     },
                     verified_generation: zakura_header_chain::VerifiedGeneration::new(3),
+                    body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
                 },
                 session_id: 6,
                 request_id: NonZeroU64::new(7).expect("seven is nonzero"),

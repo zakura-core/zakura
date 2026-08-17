@@ -643,6 +643,18 @@ fn auxiliary_outcomes_derive_from_exact_owned_observations() {
             &authenticated
         )
     );
+    let mut changed_policy = authenticated.clone();
+    changed_policy.change_set.metadata.network_policy_digest = [0xbd; 32];
+    assert!(
+        !super::super::super::invariants::is_incremental_aux_authentication(
+            &test_engine(&store),
+            &changed_policy
+        )
+    );
+    assert_eq!(
+        verify_plan(&test_engine(&store), &changed_policy),
+        Err(InvariantViolation::SnapshotBeforeCommit)
+    );
     let AuxDelta::Put(authenticated_delivery) = &authenticated.change_set.aux_changes[0] else {
         unreachable!("authentication puts one delivery")
     };

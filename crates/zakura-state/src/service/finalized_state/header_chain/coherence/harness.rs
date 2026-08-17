@@ -571,6 +571,24 @@ impl Harness {
             .expect("authenticated full-state finality reaches the writer");
         assert!(matches!(result, ApplyResult::Committed));
 
+        let mut canonical = DiskWriteBatch::new();
+        for frontier in &self.verified_path[..=advance] {
+            self.runtime()
+                .store
+                .put_raw(
+                    &mut canonical,
+                    "hash_by_height",
+                    frontier.height.as_bytes(),
+                    frontier.hash.0,
+                )
+                .expect("the full-state canonical fact stages");
+        }
+        self.runtime()
+            .store
+            .db
+            .write(canonical)
+            .expect("the full-state canonical facts commit");
+
         let retained: HashSet<_> = self
             .model
             .keys()

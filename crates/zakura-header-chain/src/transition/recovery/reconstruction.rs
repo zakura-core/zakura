@@ -112,10 +112,11 @@ fn verified_path(
     )?;
     if path.iter().skip(1).any(|frontier| {
         nodes.get(&frontier.hash).is_none_or(|node| {
-            !matches!(
-                node.body_validation_state,
-                BodyValidationState::Verified { .. }
-            )
+            !node.is_eligible()
+                || !matches!(
+                    node.body_validation_state,
+                    BodyValidationState::Verified { .. }
+                )
         })
     }) {
         return Err(source_failure(AuditViolation::ProtectedPath(

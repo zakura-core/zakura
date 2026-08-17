@@ -149,24 +149,29 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
             invalid_history = true;
         }
         if source_matches {
+            let context_authenticates_current = contexts
+                .binary_search_by_key(&record.current.height, |context| context.height)
+                .is_ok_and(|index| contexts[index].header.hash() == record.current.hash);
+            let current_is_authentic = record.current == metadata.frontiers.finalized
+                || record.current == config.bootstrap_anchor().frontier
+                || context_authenticates_current
+                || store.authenticated_canonical_hash(record.current.height)?
+                    == Some(record.current.hash);
+            if !current_is_authentic {
+                invalid_history = true;
+            }
             if let Some(selected_tip) =
                 record.headers_only_depth_witness(config.limits.local_finality_depth.get())
             {
-                // The canonical index only authenticates settled heights. A depth witness sits
-                // `local_finality_depth` blocks above its own record, so every recent record
-                // points above the finalized frontier and must be proved from retained rows.
+                // The canonical index authenticates settled witnesses. Retained rows authenticate
+                // an above-finalized witness against the current finalized frontier. Recovery
+                // authenticates the record's historical current frontier independently above.
                 let witness_is_authentic =
                     if selected_tip.height <= metadata.frontiers.finalized.height {
                         store.authenticated_canonical_hash(selected_tip.height)?
                             == Some(selected_tip.hash)
-                    } else if record.current == metadata.frontiers.finalized
-                        || by_hash.contains_key(&selected_tip.hash)
-                    {
-                        witness_descends_to(&by_hash, selected_tip, record.current)
                     } else {
-                        // An older record carries transient evidence that retention may have
-                        // dropped, so an unretained witness stays unproven rather than invalid.
-                        true
+                        witness_descends_to(&by_hash, selected_tip, metadata.frontiers.finalized)
                     };
                 if !witness_is_authentic {
                     invalid_history = true;
@@ -226,14 +231,14 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
     Ok(())
 }
 
-/// Return true when the audited header rows prove `witness` descends to `current`.
+/// Return true when the audited header rows prove `witness` descends to `frontier`.
 ///
-/// The walk costs at most `local_finality_depth` lookups per record, because
-/// [`FinalityRecord::headers_only_depth_witness`] fixes that exact height gap.
+/// Retention keeps the current finalized frontier and every descendant. The walk therefore
+/// avoids a historical frontier that retention may have pruned.
 fn witness_descends_to(
     by_hash: &HashMap<block::Hash, &HeaderNode>,
     witness: crate::Frontier,
-    current: crate::Frontier,
+    frontier: crate::Frontier,
 ) -> bool {
     let Some(mut node) = by_hash.get(&witness.hash).copied() else {
         return false;
@@ -241,7 +246,7 @@ fn witness_descends_to(
     if node.height != witness.height {
         return false;
     }
-    while node.height > current.height {
+    while node.height > frontier.height {
         let Some(parent) = by_hash.get(&node.parent_hash).copied() else {
             return false;
         };
@@ -252,7 +257,7 @@ fn witness_descends_to(
         }
         node = parent;
     }
-    node.hash == current.hash && node.height == current.height
+    node.hash == frontier.hash && node.height == frontier.height
 }
 
 fn finality_history_starts_validly(

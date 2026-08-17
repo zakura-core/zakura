@@ -140,6 +140,7 @@ fn immutable_metadata_changed(
 ) -> bool {
     projected.disk_format != source.disk_format
         || projected.network_id != source.network_id
+        || projected.network_policy_digest != source.network_policy_digest
         || projected.anchor_manifest_digest != source.anchor_manifest_digest
 }
 
@@ -660,6 +661,10 @@ mod tests {
         let mut network = no_change_candidate(&fixture.engine);
         network.change_set.metadata.network_id = Network::Mainnet.kind();
         cases.push(network);
+
+        let mut network_policy = no_change_candidate(&fixture.engine);
+        network_policy.change_set.metadata.network_policy_digest = [0xfe; 32];
+        cases.push(network_policy);
 
         let mut manifest = no_change_candidate(&fixture.engine);
         manifest.change_set.metadata.anchor_manifest_digest = [0xff; 32];

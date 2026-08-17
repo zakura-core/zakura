@@ -1458,8 +1458,8 @@ impl FallibleDiskValue for EngineMetadata {
 
 /// Decode metadata that carries the released version-one marker.
 ///
-/// Version one predates the durable network policy, so the caller passes the digest that the
-/// migration binds into the upgraded row.
+/// Version one predates the durable network policy. The migration accepts this decoded metadata
+/// only when the recorded network kind identifies one fixed policy.
 pub(crate) fn decode_v1_engine_metadata(
     bytes: &[u8],
     network_policy_digest: [u8; 32],

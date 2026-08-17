@@ -177,8 +177,11 @@ the same plan without performing a time-based state transition.
 `audit_store_for_trust_anchor_update` permits only the audited manifest-digest
 rebind in addition to ordinary reconstructible repairs. The startup adapter
 runs one normal `ReevaluateDeferred` transition before it constructs the
-publisher. Recovery also authenticates each retained headers-only selected-tip
-witness through one independent canonical-index lookup.
+publisher. Recovery authenticates each settled headers-only selected-tip witness
+through the independent canonical index. Recovery authenticates each witness
+above the finalized frontier through a bounded retained-row parent walk to the
+current finalized frontier. Recovery authenticates every historical current
+frontier through the linked predecessor context or the canonical index.
 
 ## Changing the transition model
 

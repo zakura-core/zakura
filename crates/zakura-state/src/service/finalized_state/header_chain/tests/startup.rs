@@ -1,8 +1,9 @@
 use super::*;
 
-/// Commit one header whose deferral has already elapsed, and return the closed database.
-fn commit_elapsed_deferral(
+/// Commit one deferred header at `insertion_time`, then return the closed database.
+fn commit_deferral(
     header_generation: HeaderGeneration,
+    insertion_time: DateTime<Utc>,
 ) -> (DiskDb, EngineConfig, Frontier) {
     #[derive(Copy, Clone)]
     struct FixedClock(DateTime<Utc>);
@@ -25,7 +26,7 @@ fn commit_elapsed_deferral(
         .startup(&engine_config)
         .expect("the initial store audits");
     let before = runtime.publisher().snapshot();
-    let insertion_clock = FixedClock(Utc::now() - chrono::Duration::hours(3));
+    let insertion_clock = FixedClock(insertion_time);
     let mut child_header = *anchor.header;
     child_header.previous_block_hash = anchor.hash;
     child_header.time = insertion_clock.0 + chrono::Duration::hours(3);
@@ -54,7 +55,7 @@ fn commit_elapsed_deferral(
     .expect("the future header prepares as deferred");
     assert!(matches!(
         batch.headers()[0].validation,
-        HeaderValidationState::DeferredUntil(until) if until <= Utc::now()
+        HeaderValidationState::DeferredUntil(_)
     ));
     runtime
         .apply(
@@ -90,7 +91,10 @@ fn commit_elapsed_deferral(
 
 #[test]
 fn startup_commits_deferred_reevaluation_before_publication() {
-    let (db, engine_config, child) = commit_elapsed_deferral(HeaderGeneration::new(1));
+    let (db, engine_config, child) = commit_deferral(
+        HeaderGeneration::new(1),
+        Utc::now() - chrono::Duration::hours(3),
+    );
 
     let (reopened, report) = HeaderChainStore::new(db)
         .startup(&engine_config)
@@ -117,19 +121,33 @@ fn startup_commits_deferred_reevaluation_before_publication() {
 }
 
 #[test]
-fn startup_publishes_when_deferred_settlement_fails() {
-    // The insertion consumes the last header generation, so startup cannot plan the elapsed
-    // deferral. The runtime reevaluates it at the next deadline, so the database still opens.
-    let (db, engine_config, child) =
-        commit_elapsed_deferral(HeaderGeneration::new(u64::MAX.saturating_sub(1)));
+fn startup_rejects_a_due_deferral_when_settlement_cannot_plan() {
+    // The insertion consumes the last header generation. Startup must reject the database because
+    // the runtime would repeat the same exhausted transition as soon as its writer starts.
+    let (db, engine_config, _) = commit_deferral(
+        HeaderGeneration::new(u64::MAX.saturating_sub(1)),
+        Utc::now() - chrono::Duration::hours(3),
+    );
+
+    assert!(matches!(
+        HeaderChainStore::new(db).startup(&engine_config),
+        Err(HeaderChainStoreError::Transition(
+            TransitionFailure::Counter(_)
+        ))
+    ));
+}
+
+#[test]
+fn startup_preserves_a_future_deferral_without_settlement() {
+    let (db, engine_config, child) = commit_deferral(HeaderGeneration::new(1), Utc::now());
 
     let (reopened, report) = HeaderChainStore::new(db)
         .startup(&engine_config)
-        .expect("an unsettled deferral does not keep the database closed");
+        .expect("a future deferral does not require startup settlement");
     assert!(report.repairs.is_empty());
     assert_eq!(
         report.current.frontiers.header_best,
-        reopened.publisher().snapshot().frontiers.header_best
+        engine_config.bootstrap_anchor().frontier
     );
     assert!(matches!(
         reopened
@@ -138,7 +156,7 @@ fn startup_publishes_when_deferred_settlement_fails() {
             .expect("the child row is readable")
             .expect("the child remains retained")
             .validation,
-        HeaderValidationState::DeferredUntil(_)
+        HeaderValidationState::DeferredUntil(until) if until > Utc::now()
     ));
     assert_eq!(
         reopened
@@ -148,6 +166,107 @@ fn startup_publishes_when_deferred_settlement_fails() {
             .len(),
         1
     );
+}
+
+#[test]
+fn startup_rejects_an_ineligible_verified_projection_before_publication() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the header schema initializes");
+
+    let mut child_header = *anchor.header;
+    child_header.previous_block_hash = anchor.hash;
+    child_header.time += chrono::Duration::seconds(1);
+    child_header.nonce.0[0] = 0x71;
+    let child_header = Arc::new(child_header);
+    let child = VerifiedHeaderRef {
+        height: anchor
+            .height
+            .next()
+            .expect("the genesis anchor has a successor"),
+        hash: child_header.hash(),
+        header: child_header,
+    };
+    let (runtime, _) = store
+        .startup_reconciled(
+            &engine_config,
+            anchor_frontier,
+            Vec::new(),
+            vec![child.clone()],
+        )
+        .expect("the verified child reconciles before the corruption");
+
+    let evidence = EvidenceId::from_digest([0x72; 32]);
+    let id = OperatorInvalidationId::new([0x73; 16]);
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest as _;
+    hasher.update(b"zakura-operator-invalidation-v1");
+    hasher.update(child.hash.0);
+    hasher.update(id.bytes());
+    let before = runtime.publisher().snapshot();
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::OperatorInvalidate(OperatorInvalidate {
+                    target: child.hash,
+                    id,
+                    operator_reason_digest: hasher.finalize().into(),
+                    evidence,
+                }),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&Authority(evidence)),
+                retention_references: &[],
+            },
+        )
+        .expect("the operator invalidation removes the child from active projections");
+    assert_eq!(
+        runtime.publisher().snapshot().frontiers.verified_best,
+        anchor_frontier
+    );
+
+    let child_frontier = Frontier::new(child.height, child.hash);
+    let mut corrupt_metadata = runtime
+        .store
+        .metadata()
+        .expect("the post-invalidation metadata is readable");
+    corrupt_metadata.frontiers.verified_best = child_frontier;
+    let mut corrupt = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_value(
+            &mut corrupt,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            &corrupt_metadata,
+        )
+        .expect("the corrupt metadata encodes");
+    runtime
+        .store
+        .put_raw(
+            &mut corrupt,
+            HEADER_VERIFIED,
+            HeaderHeightKey(child.height).as_bytes(),
+            child.hash.0,
+        )
+        .expect("the corrupt verified projection row encodes");
+    db.write(corrupt)
+        .expect("the ineligible verified projection reaches RocksDB");
+    drop(runtime);
+
+    assert!(matches!(
+        HeaderChainStore::new(db).startup(&engine_config),
+        Err(HeaderChainStoreError::Recovery(RecoveryFailure::Source { violations }))
+            if violations == vec![zakura_header_chain::AuditViolation::ProtectedPath(child.hash)]
+    ));
 }
 
 #[test]
@@ -323,7 +442,7 @@ fn rocksdb_snapshot_stops_at_the_first_extra_row_without_decoding() {
 #[test]
 fn version_one_migration_downgrades_legacy_verdicts_atomically() {
     let db_config = Config::ephemeral();
-    let (engine_config, mut anchor, mut metadata) = fixture();
+    let (engine_config, mut anchor, mut metadata) = mainnet_fixture();
     metadata.last_transition = Some(zakura_header_chain::TransitionFingerprint::from_parts(
         zakura_header_chain::TransitionDomain::AuxEvidence,
         EvidenceId::from_digest([0x30; 32]),
@@ -419,7 +538,7 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
 #[test]
 fn version_one_migration_limit_leaves_every_row_unchanged() {
     let db_config = Config::ephemeral();
-    let (mut engine_config, mut anchor, metadata) = fixture();
+    let (mut engine_config, mut anchor, metadata) = mainnet_fixture();
     engine_config.limits.max_aux_deliveries_total = NonZeroUsize::new(1).expect("one is nonzero");
     let deliveries = [0x41, 0x42].map(|marker| {
         AuxDelivery::new(
@@ -499,6 +618,71 @@ fn version_one_migration_limit_leaves_every_row_unchanged() {
             .expect("the second row is readable"),
         Some(second_value)
     );
+    assert_eq!(
+        store
+            .db
+            .raw_get_cf(&metadata_cf, METADATA_KEY)
+            .expect("the metadata row is readable"),
+        Some(metadata_value)
+    );
+}
+
+#[test]
+fn version_one_migration_rejects_an_ambiguous_network_policy_without_writing() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let changed_network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            canopy: Some(10),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let changed_config = EngineConfig::new(
+        engine_config.mode,
+        changed_network,
+        engine_config.bootstrap_anchor().clone(),
+        CheckpointSet::default(),
+    )
+    .expect("the changed policy accepts the same bootstrap anchor");
+    assert_eq!(
+        engine_config.network().kind(),
+        changed_config.network().kind()
+    );
+    assert_eq!(
+        engine_config.trust_anchor_digest(),
+        changed_config.trust_anchor_digest()
+    );
+    assert_ne!(
+        engine_config.network_policy_digest(),
+        changed_config.network_policy_digest()
+    );
+    let metadata_value = mark_metadata_as_v1(&metadata);
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db);
+    store
+        .initialize(metadata, anchor)
+        .expect("the current fixture initializes");
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            &metadata_value,
+        )
+        .expect("the version-one metadata stages");
+    store.db.write(batch).expect("the legacy fixture commits");
+
+    assert!(matches!(
+        store.migrate_v1_to_current(&changed_config),
+        Err(HeaderChainStoreError::Incoherent(
+            "version-one network policy is ambiguous; rebuild the header-chain database"
+        ))
+    ));
+    let metadata_cf = store
+        .cf(HEADER_ENGINE_META)
+        .expect("the metadata column family exists");
     assert_eq!(
         store
             .db

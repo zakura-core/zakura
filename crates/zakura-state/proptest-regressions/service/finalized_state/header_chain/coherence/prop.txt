@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 083dba764caabf595d71004ce93a69ec39173c5d5355ca556922072196f625bd # shrinks to operations = [Verify { source: Branch(0), index: 0 }, InsertHeaders { source: Trunk, offset: 47, len: 11, anchor: Natural }, InsertHeaders { source: Trunk, offset: 47, len: 11, anchor: Natural }]
+cc 4b7421e130efdf1a34382483c5e55c6d3651412ec07396f46a91699826ae9005 # shrinks to operations = [Verify { source: Trunk, index: 1 }, Finalize { count: 1 }, Finalize { count: 1 }]
+cc 96c1e0d27a256fa22e28a09650a5ad1fdfeff0700ae93a87b9f9f173f95417bf # shrinks to operations = [Verify { source: Trunk, index: 0 }, Finalize { count: 1 }, Verify { source: Branch(0), index: 0 }, Finalize { count: 7 }, Finalize { count: 4 }, Finalize { count: 8 }, Finalize { count: 1 }, Finalize { count: 8 }]

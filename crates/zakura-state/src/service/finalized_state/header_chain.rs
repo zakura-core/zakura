@@ -464,10 +464,10 @@ fn any_deferral_is_due(plan: &zakura_header_chain::RecoveryPlan) -> bool {
 /// Reevaluate due recovered deferrals before constructing a publisher.
 ///
 /// The function uses the normal planner and durable commit path. It leaves the recovered engine
-/// unchanged when no deferral is due, when the planner derives no change, and when the planner
-/// fails: the runtime reevaluates deferrals again at the next deadline, so a planner failure must
-/// not keep the database closed. On success, the returned engine matches the durable state that
-/// the caller may publish.
+/// unchanged when no deferral is due or when the planner derives no change. It propagates planner
+/// failures because the runtime would immediately repeat the due transition. Any retryable
+/// planning failure needs an explicit classification and a bounded retry policy. On success, the
+/// returned engine matches the durable state that the caller may publish.
 fn settle_deferred_before_publication(
     store: &HeaderChainStore,
     config: &EngineConfig,
@@ -484,21 +484,12 @@ fn settle_deferred_before_publication(
         full_state_authority: None,
         retention_references: &[],
     };
-    let transition = match engine.plan_transition(
+    let transition = engine.plan_transition(
         TransitionInput::ReevaluateDeferred {
             expected_version: before.state_version,
         },
         &context,
-    ) {
-        Ok(transition) => transition,
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                "startup left due deferrals unsettled; the runtime reevaluates them at the next deadline"
-            );
-            return Ok(engine);
-        }
-    };
+    )?;
     if transition.is_no_change() {
         return Ok(engine);
     }

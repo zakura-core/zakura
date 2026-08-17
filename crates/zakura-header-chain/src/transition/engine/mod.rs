@@ -392,8 +392,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AlarmSet, BodySizeHint, BodyValidationState, BranchId, EngineMode, EvidenceId,
-        FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderGeneration,
+        AlarmSet, BodySizeHint, BodyValidationState, BranchId, EligibilityReason, EngineMode,
+        EvidenceId, FinalityEpoch, Frontier, FrontierSet, HeaderChainDiskVersion, HeaderGeneration,
         HeaderValidationState, HeaderWorkAuthority, InsertResult, SourceId, StateVersion,
         VerifiedGeneration,
     };
@@ -518,6 +518,30 @@ mod tests {
         view.metadata.frontiers.verified_best = child;
     }
 
+    fn verified_projection_has_ineligible_header(view: &mut AuditedView) {
+        let child = view.metadata.frontiers.header_best;
+        view.graph
+            .set_body_validation_state(
+                child.hash,
+                BodyValidationState::Verified {
+                    evidence: EvidenceId::from_digest([0xe1; 32]),
+                },
+            )
+            .expect("the child accepts verified body state");
+        view.graph
+            .add_eligibility_reason(
+                child.hash,
+                EligibilityReason::operator_invalid(
+                    child.hash,
+                    crate::OperatorInvalidationId::new([0xe2; 16]),
+                    EvidenceId::from_digest([0xe3; 32]),
+                ),
+            )
+            .expect("the child accepts an operator invalidation");
+        view.verified.push(child);
+        view.metadata.frontiers.verified_best = child;
+    }
+
     fn headers_only_verified_projection_extends(view: &mut AuditedView) {
         view.metadata.mode = EngineMode::HeadersOnly;
         let child = view.metadata.frontiers.header_best;
@@ -590,7 +614,16 @@ mod tests {
             (
                 "verified body",
                 verified_projection_has_unverified_body,
-                EngineHydrationError::Incoherent("verified projection contains an unverified body"),
+                EngineHydrationError::Incoherent(
+                    "verified projection contains an ineligible or unverified header",
+                ),
+            ),
+            (
+                "verified eligibility",
+                verified_projection_has_ineligible_header,
+                EngineHydrationError::Incoherent(
+                    "verified projection contains an ineligible or unverified header",
+                ),
             ),
             (
                 "headers-only verified projection",

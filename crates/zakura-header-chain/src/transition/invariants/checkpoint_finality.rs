@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn incremental_checkpoint_rejects_immutable_metadata_drift() {
         let (fixture, mut plan) = checkpoint_fixture();
-        plan.change_set.metadata.anchor_manifest_digest = [0x64; 32];
+        plan.change_set.metadata.network_policy_digest = [0x64; 32];
         assert_eq!(
             verify_incremental_checkpoint_finality(
                 &fixture.engine,

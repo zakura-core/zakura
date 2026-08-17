@@ -79,7 +79,7 @@ fn apply_with_header_rebase_facts(
 }
 
 #[test]
-fn finality_consumed_header_work_precedes_replay_conflict() {
+fn replay_conflict_precedes_finality_consumed_header_work() {
     for finalized_count in 1..=3_u32 {
         let (mut store, config) = TestStore::new(EngineMode::Integrated);
         let clock = ManualClock(Utc::now());

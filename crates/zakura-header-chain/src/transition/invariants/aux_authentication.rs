@@ -33,6 +33,7 @@ pub(crate) fn is_incremental_aux_authentication(
         && metadata.disk_format == source_metadata.disk_format
         && metadata.mode == source_metadata.mode
         && metadata.network_id == source_metadata.network_id
+        && metadata.network_policy_digest == source_metadata.network_policy_digest
         && metadata.anchor_manifest_digest == source_metadata.anchor_manifest_digest
         && metadata.work_origin == source_metadata.work_origin
         && metadata.finality_epoch == source_metadata.finality_epoch

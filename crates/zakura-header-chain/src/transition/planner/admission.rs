@@ -121,6 +121,7 @@ pub(super) fn validate_snapshot(
     if snapshot.mode != context.config.mode
         || metadata.mode != context.config.mode
         || metadata.network_id != context.config.network().kind()
+        || metadata.network_policy_digest != context.config.network_policy_digest()
         || metadata.anchor_manifest_digest != context.config.trust_anchor_digest()
         || snapshot.state_version != metadata.state_version
         || snapshot.frontiers != metadata.frontiers

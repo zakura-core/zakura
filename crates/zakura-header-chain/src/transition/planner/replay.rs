@@ -43,6 +43,16 @@ pub(super) fn bind_replay_and_freshness(
     if let Some(owner) = event.body_owner() {
         validate_body_owner(owner, snapshot_before_commit)?;
     }
+    let fingerprint = event.fingerprint();
+    // A conflicting replay key outranks every no-change short circuit: the same evidence carrying
+    // a different payload is a distinct request, whether or not its headers are already applied.
+    if metadata
+        .last_transition
+        .zip(fingerprint)
+        .is_some_and(|(previous, current)| previous.conflicts_with(current))
+    {
+        return Err(TransitionFailure::ConflictingReplay);
+    }
     if matches!(
         header_rebase.header_work_effect(),
         Some(crate::HeaderWorkEffect::AlreadyApplied)
@@ -54,8 +64,6 @@ pub(super) fn bind_replay_and_freshness(
             no_change_effect: Some(TransitionEffect::header_work_already_applied()),
         });
     }
-
-    let fingerprint = event.fingerprint();
     if fingerprint.is_some() && metadata.last_transition == fingerprint {
         return Ok(BoundRequest {
             event,
@@ -63,13 +71,6 @@ pub(super) fn bind_replay_and_freshness(
             header_rebase,
             no_change_effect: Some(TransitionEffect::event()),
         });
-    }
-    if metadata
-        .last_transition
-        .zip(fingerprint)
-        .is_some_and(|(previous, current)| previous.conflicts_with(current))
-    {
-        return Err(TransitionFailure::ConflictingReplay);
     }
     let has_async_authority = event.header_sync_owner().is_some() || event.body_owner().is_some();
     if !has_async_authority {

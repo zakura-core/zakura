@@ -194,6 +194,30 @@ fn finality_consumed_header_work_precedes_replay_conflict() {
             ));
         }
         if finalized_count == 3 {
+            // A conflicting replay key outranks fully consumed header work: the same batch
+            // evidence carrying a different payload is a distinct request. Replay identity binds
+            // the rebased batch, so the conflicting key carries the rebased evidence.
+            let mut rebased_batch = prepared.clone();
+            rebased_batch
+                .rebase_after(verified_tip)
+                .expect("the prepared batch rebases onto the finalized frontier");
+            let mut conflicted = store.clone();
+            conflicted.metadata.last_transition = Some(crate::TransitionFingerprint::from_parts(
+                crate::TransitionDomain::InsertHeaders,
+                rebased_batch.evidence(),
+                [0x87; 32],
+            ));
+            assert!(matches!(
+                apply_with_header_rebase_facts(
+                    &conflicted,
+                    held.clone(),
+                    &config,
+                    &clock,
+                    rebased_validation.clone(),
+                ),
+                Err(TransitionFailure::ConflictingReplay)
+            ));
+
             // Reproduce an adjacent replay key whose original payload finality fully consumed.
             store.metadata.last_transition = held.event.fingerprint();
         }

@@ -164,12 +164,12 @@ nearest anchor. It is a serving backstop, not a correctness bound.
 
 A completed subtree root is an interior node rather than a complete frontier, so it cannot
 be checked by comparing it directly with `commitment_roots_by_height`. It is nevertheless
-pinned by the final frontier. Ommers at levels at or above the tracked subtree height are
-pairwise hashes of the completed subtrees they span, so folding the candidate roots in
-index order must reproduce every corresponding ommer, and the frontier's own subtree-level
-root checks the boundary case where it ends exactly at a subtree completion. A wrong,
-missing, or extra root therefore fails verification without replaying any of the subtree's
-65,536 leaves.
+pinned by the final frontier. The frontier already holds the pairwise hashes of completed
+subtrees at every level at or above the tracked subtree height, so folding the candidate
+roots in index order must reproduce those stored hashes, and the frontier's own
+subtree-level root checks the boundary case where it ends exactly at a subtree
+completion. A wrong, missing, or extra root therefore fails verification without
+replaying any of the subtree's 65,536 leaves.
 
 The set is small and static: ~1,895 records at the last checkpoint (3,418,406), roughly 70 KB
 framed, growing append-only by a handful of subtrees per month at current usage. It ships
@@ -276,8 +276,8 @@ median below 400k, 3.6 ms median through 1.6M–2.0M.
 
 **Entry size.** 715 B measured. Earlier sizing used 1,489 B, the size of
 `mainnet-frontier.bin`, as a conservative upper bound; that figure includes Sprout, which
-this artifact omits. Adjacent entries share nearly all their ommers, so delta encoding
-would shrink the artifact further if it ever mattered.
+this artifact omits. Adjacent entries share nearly all of their stored sibling hashes, so
+delta encoding would shrink the artifact further if it ever mattered.
 
 **Grid sizing at 3.42M heights.**
 

@@ -836,6 +836,16 @@ mod tests {
         frontier_size: u64,
         subtrees_sha256: String,
         subtrees_size: u64,
+        // The frontier grid joined the release state after the other artifacts, so a manifest
+        // without these is a valid older one. Unlike the others the grid is not embedded in the
+        // binary, so its bytes are bound to the manifest by `scripts/check-release-state.sh`
+        // rather than here.
+        #[serde(default)]
+        frontier_grid_sha256: Option<String>,
+        #[serde(default)]
+        frontier_grid_size: Option<u64>,
+        #[serde(default)]
+        frontier_grid_entries: Option<u32>,
         #[serde(default)]
         meta_sha256: Option<String>,
     }
@@ -1004,6 +1014,21 @@ mod tests {
         );
         assert_eq!(provenance.schema_version, 1);
         assert_eq!(provenance.network, "Mainnet");
+        // All three grid fields or none: a half-written record would let the file and the
+        // manifest disagree about which artifact is committed.
+        let grid_fields = [
+            provenance.frontier_grid_sha256.is_some(),
+            provenance.frontier_grid_size.is_some(),
+            provenance.frontier_grid_entries.is_some(),
+        ];
+        assert!(
+            grid_fields.iter().all(|present| *present)
+                || grid_fields.iter().all(|present| !*present),
+            "the frontier grid provenance record must be complete or absent, found {grid_fields:?}"
+        );
+        if let Some(entries) = provenance.frontier_grid_entries {
+            assert!(entries > 0, "a recorded frontier grid must have entries");
+        }
         assert!(
             matches!(
                 provenance.source.as_str(),

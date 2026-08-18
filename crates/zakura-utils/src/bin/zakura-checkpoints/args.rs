@@ -154,6 +154,18 @@ pub struct Args {
     #[arg(long)]
     pub mainnet_frontier_grid_output: Option<PathBuf>,
 
+    /// Offline mode: generate only the frontier grid, for an already-committed checkpoint.
+    ///
+    /// The normal export selects a new checkpoint above the embedded list and pins every
+    /// artifact to it. This backfills a grid for a checkpoint the repository already ships,
+    /// so the artifact can be committed without advancing `main-checkpoints.txt`. The height
+    /// must be one of the embedded checkpoints.
+    ///
+    /// Requires `--state-cache-dir` and `--mainnet-frontier-grid-output`, and excludes the
+    /// other artifact outputs, which would be generated for a newly selected checkpoint.
+    #[arg(long)]
+    pub mainnet_frontier_grid_checkpoint: Option<Height>,
+
     /// Offline mode: per-entry replay budget for the frontier grid, in milliseconds.
     ///
     /// Defaults to 2000 ms. The grid is spaced by estimated replay cost rather than
@@ -200,6 +212,10 @@ impl Args {
                  --mainnet-frontier-grid-output: add it, or remove them"
                     .to_string(),
             );
+        }
+
+        if self.state_cache_dir.is_some() && self.mainnet_frontier_grid_checkpoint.is_some() {
+            return self.validate_grid_backfill_mode();
         }
 
         if self.state_cache_dir.is_some() {
@@ -251,6 +267,59 @@ impl Args {
             if self.full_list {
                 return Err("--full-list requires --state-cache-dir".to_string());
             }
+            if self.mainnet_frontier_grid_checkpoint.is_some() {
+                return Err(
+                    "--mainnet-frontier-grid-checkpoint requires --state-cache-dir".to_string(),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check the flags of a grid-only backfill run.
+    ///
+    /// This mode exists to produce a grid for a checkpoint the repository already ships, so it
+    /// emits no checkpoints and writes no other artifact. Pairing it with the flags that do
+    /// either would silently pin those outputs to a different, newly selected checkpoint.
+    fn validate_grid_backfill_mode(&self) -> Result<(), String> {
+        if self.mainnet_frontier_grid_output.is_none() {
+            return Err(
+                "--mainnet-frontier-grid-checkpoint needs somewhere to write: add \
+                 --mainnet-frontier-grid-output"
+                    .to_string(),
+            );
+        }
+        if self.mainnet_frontier_output.is_some() || self.mainnet_subtree_output.is_some() {
+            return Err(
+                "--mainnet-frontier-grid-checkpoint backfills the grid alone: remove \
+                 --mainnet-frontier-output and --mainnet-subtree-output, which are only \
+                 produced for a newly selected checkpoint"
+                    .to_string(),
+            );
+        }
+        if self.full_list {
+            return Err(
+                "--mainnet-frontier-grid-checkpoint emits no checkpoints: remove --full-list"
+                    .to_string(),
+            );
+        }
+        if self.last_checkpoint.is_some() {
+            return Err(
+                "--mainnet-frontier-grid-checkpoint selects no checkpoints: remove \
+                 --last-checkpoint"
+                    .to_string(),
+            );
+        }
+        if self.addr.is_some() {
+            return Err("--state-cache-dir reads the database directly: remove --addr".to_string());
+        }
+        if !self.zcli_args.is_empty() {
+            return Err(
+                "--state-cache-dir reads the database directly: remove zcash-cli passthrough \
+                 arguments"
+                    .to_string(),
+            );
         }
 
         Ok(())
@@ -349,6 +418,7 @@ mod tests {
             mainnet_frontier_output: None,
             mainnet_subtree_output: None,
             mainnet_frontier_grid_output: None,
+            mainnet_frontier_grid_checkpoint: None,
             frontier_grid_target_cost_ms: None,
             frontier_grid_spacing: None,
             full_list: false,
@@ -366,6 +436,56 @@ mod tests {
             full_list: true,
             ..rpc_args()
         }
+    }
+
+    /// A baseline grid-backfill `Args` value.
+    fn backfill_args() -> Args {
+        Args {
+            state_cache_dir: Some(PathBuf::from("state")),
+            mainnet_frontier_grid_output: Some(PathBuf::from("grid.bin")),
+            mainnet_frontier_grid_checkpoint: Some(Height(3_449_371)),
+            ..rpc_args()
+        }
+    }
+
+    #[test]
+    fn grid_backfill_flag_combinations() {
+        assert_eq!(backfill_args().validate_mode(), Ok(()));
+
+        let mut without_output = backfill_args();
+        without_output.mainnet_frontier_grid_output = None;
+        assert!(
+            without_output.validate_mode().is_err(),
+            "a backfill needs somewhere to write"
+        );
+
+        let mut with_frontier = backfill_args();
+        with_frontier.mainnet_frontier_output = Some(PathBuf::from("frontier.bin"));
+        assert!(
+            with_frontier.validate_mode().is_err(),
+            "the other artifacts belong to a newly selected checkpoint"
+        );
+
+        let mut with_full_list = backfill_args();
+        with_full_list.full_list = true;
+        assert!(
+            with_full_list.validate_mode().is_err(),
+            "a backfill emits no checkpoint list"
+        );
+
+        let mut with_last_checkpoint = backfill_args();
+        with_last_checkpoint.last_checkpoint = Some(Height(100));
+        assert!(
+            with_last_checkpoint.validate_mode().is_err(),
+            "a backfill selects no checkpoints"
+        );
+
+        let mut without_state = backfill_args();
+        without_state.state_cache_dir = None;
+        assert!(
+            without_state.validate_mode().is_err(),
+            "a backfill reads a state database"
+        );
     }
 
     #[test]

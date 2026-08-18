@@ -146,6 +146,10 @@ pub fn run_offline(args: &Args) -> Result<()> {
         zakura_state::init_read_only(state_config, &network)
             .wrap_err("opening the Mainnet state database read-only")?;
 
+    if let Some(checkpoint) = args.mainnet_frontier_grid_checkpoint {
+        return backfill_frontier_grid(args, &db, &network, checkpoint);
+    }
+
     let (tip_height, tip_hash) = db
         .tip()
         .ok_or_else(|| eyre!("Mainnet state database has no finalized tip"))?;
@@ -271,6 +275,70 @@ pub fn run_offline(args: &Args) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Generate only the frontier grid, for a checkpoint the binary already ships.
+///
+/// The normal export pins every artifact to a checkpoint it selects above the embedded list.
+/// That is right for an advancing release, and wrong for backfilling the one artifact a
+/// committed release state is missing: it would advance `main-checkpoints.txt` as a side effect
+/// of producing a file for a checkpoint already reviewed and merged.
+fn backfill_frontier_grid(
+    args: &Args,
+    db: &zakura_state::ZakuraDb,
+    network: &Network,
+    checkpoint: Height,
+) -> Result<()> {
+    let grid_path = args
+        .mainnet_frontier_grid_output
+        .as_ref()
+        .expect("backfill mode is only entered with --mainnet-frontier-grid-output");
+
+    // Only an embedded checkpoint can be backfilled. A height off the reviewed list would
+    // produce an artifact no committed release state can be coupled to.
+    let embedded_hash = network.checkpoint_list().hash(checkpoint).ok_or_else(|| {
+        eyre!(
+            "{} is not an embedded Mainnet checkpoint; backfill targets a checkpoint this \
+             binary already ships",
+            checkpoint.0,
+        )
+    })?;
+
+    let (tip_height, tip_hash) = db
+        .tip()
+        .ok_or_else(|| eyre!("Mainnet state database has no finalized tip"))?;
+    ensure!(
+        tip_height >= checkpoint,
+        "state tip {} is below checkpoint {}; sync further before backfilling",
+        tip_height.0,
+        checkpoint.0,
+    );
+
+    // Same anchor check as the checkpoint export: a database that disagrees with the embedded
+    // list at this height is a different chain, and its grid would be silently wrong.
+    let database_hash = db
+        .hash(checkpoint)
+        .ok_or_else(|| eyre!("state database has no block at checkpoint {}", checkpoint.0))?;
+    ensure!(
+        database_hash == embedded_hash,
+        "state database hash at checkpoint {} is {database_hash}, but the embedded checkpoint \
+         list has {embedded_hash}; refusing to export from a mismatched chain",
+        checkpoint.0,
+    );
+
+    eprintln!(
+        "backfilling the frontier grid for embedded checkpoint {} from finalized tip {} \
+         ({tip_hash}); no checkpoints are emitted",
+        checkpoint.0, tip_height.0,
+    );
+
+    write_frontier_grid(
+        db,
+        network,
+        checkpoint,
+        grid_path,
+        frontier_grid_spacing(args),
+    )
 }
 
 /// Chooses the frontier grid layout from the CLI flags.

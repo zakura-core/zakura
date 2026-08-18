@@ -279,6 +279,10 @@ block bodies nor the grid's pass. `zakurad verify-historical-treestates` repeats
 offline for a candidate bundle, and also checks the bundle's grid for framing and for
 covering the same checkpoint as the rest of the bundle.
 
+A grid for a checkpoint already committed is produced by
+`--mainnet-frontier-grid-checkpoint`, which emits nothing else. That is how the first grid is
+introduced for a release state that predates it, without a checkpoint advance riding along.
+
 **Distribution** — the release-state publisher uploads all four files as one immutable
 bundle, and `update-release-state.yml` imports them into one reviewable draft PR
 (verified-commitment-trees design §16). The grid is committed like the other artifacts,

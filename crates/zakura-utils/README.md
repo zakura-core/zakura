@@ -50,6 +50,21 @@ spacing reads every block body once to place its entries, so expect a long batch
 grid's per-entry cost budget (default 2000); `--frontier-grid-spacing` produces a uniform grid
 and is not recommended.
 
+To produce a grid for a checkpoint the binary already ships — backfilling the one artifact a
+committed release state is missing, without advancing the checkpoint list — run the grid
+alone:
+
+```sh
+zakura-checkpoints \
+  --state-cache-dir /path/to/archive-zakura-cache \
+  --mainnet-frontier-grid-output /out/mainnet-frontier-grid.bin \
+  --mainnet-frontier-grid-checkpoint <embedded checkpoint height>
+```
+
+That mode emits no checkpoints and refuses the other artifact outputs, which only exist for a
+newly selected checkpoint. The height must be one of the embedded checkpoints, and the database
+must agree with the embedded list at it.
+
 Do not hand-append RPC-mode output to the Mainnet list: pipeline
 updates must stay on the deterministic selection grid (see
 `docs/design/verified-commitment-trees.md`, "Mainnet release-state pipeline").

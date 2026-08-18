@@ -886,6 +886,11 @@ zakura-checkpoints \
   what lets the importer verify grid updates as pure appends.
 - All artifacts are written before any checkpoint line reaches stdout, so a failure never
   leaves a caller's redirected output holding an advanced list without its coupled state.
+- `--mainnet-frontier-grid-checkpoint <height>` backfills the grid alone, for a checkpoint the
+  binary already embeds. It emits no checkpoints and refuses the other artifact outputs, so a
+  release state that predates the grid can gain one without advancing the checkpoint list as a
+  side effect. The height must be an embedded checkpoint, and the database's hash at it must
+  match the embedded list.
 - Checkpoint lines go to stdout; all status goes to stderr. RPC mode remains for Testnet
   updates and diagnostics.
 

@@ -1076,7 +1076,9 @@ impl AddressBookPeers for AddressBook {
     }
 
     fn connected_peers(&self) -> Option<Vec<crate::ConnectedPeer>> {
-        self.peer_registry.as_ref().map(PeerRegistry::peers)
+        self.peer_registry
+            .as_ref()
+            .map(PeerRegistry::connected_peers)
     }
 
     fn add_peer(&mut self, peer: PeerSocketAddr) -> bool {

@@ -7,13 +7,16 @@ use std::{
 };
 
 use crate::{
-    peer::ConnectionInfo, protocol::external::types::Version, zakura::ZakuraPeerId, PeerSocketAddr,
+    peer::ConnectionInfo,
+    protocol::external::types::Version,
+    zakura::{ZakuraConnId, ZakuraPeerId},
+    PeerSocketAddr,
 };
 
 /// A snapshot of one active peer connection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectedPeer {
-    /// The transient address for this connection.
+    /// The remote socket address for this direct connection.
     pub addr: PeerSocketAddr,
     /// The sanitized user agent advertised during the handshake.
     pub user_agent: Arc<str>,
@@ -31,7 +34,7 @@ impl ConnectedPeer {
     /// Build a registry entry from a completed legacy handshake.
     pub(crate) fn from_connection_info(connection_info: &ConnectionInfo) -> Option<Self> {
         Some(Self {
-            addr: connection_info.connected_addr.get_transient_addr()?,
+            addr: connection_info.connected_addr.diagnostic_remote_addr()?,
             user_agent: sanitize_subversion(&connection_info.remote.user_agent).into(),
             version: connection_info.remote.version,
             is_inbound: connection_info.connected_addr.is_inbound(),
@@ -50,42 +53,42 @@ pub(crate) struct PeerRegistry {
 #[derive(Debug, Default)]
 struct RegistryState {
     next_legacy_generation: u64,
-    active: HashMap<ConnectionKey, ConnectedPeer>,
-    native_generations: HashMap<ZakuraPeerId, u64>,
-    native_metadata: HashMap<ZakuraPeerId, ConnectedPeer>,
+    active_connections: HashMap<ConnectionKey, ConnectedPeer>,
+    native_conn_ids: HashMap<ZakuraPeerId, ZakuraConnId>,
+    retained_native_metadata: HashMap<ZakuraPeerId, ConnectedPeer>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ConnectionKey {
     Legacy(u64),
-    Native(ZakuraPeerId, u64),
+    Native(ZakuraPeerId, ZakuraConnId),
 }
 
 impl PeerRegistry {
     /// Return a point-in-time snapshot of active connections.
-    pub(crate) fn peers(&self) -> Vec<ConnectedPeer> {
-        let mut peers: Vec<_> = self
+    pub(crate) fn connected_peers(&self) -> Vec<ConnectedPeer> {
+        let mut connected_peers: Vec<_> = self
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned")
-            .active
+            .active_connections
             .values()
             .cloned()
             .collect();
-        peers.sort_by(|left, right| {
+        connected_peers.sort_by(|left, right| {
             left.addr
                 .cmp(&right.addr)
                 .then(left.is_inbound.cmp(&right.is_inbound))
                 .then(left.version.0.cmp(&right.version.0))
                 .then(left.user_agent.cmp(&right.user_agent))
         });
-        peers
+        connected_peers
     }
 
     /// Register one legacy connection until the returned guard drops.
     pub(crate) fn register_legacy(
         &self,
-        peer: ConnectedPeer,
+        connected_peer: ConnectedPeer,
     ) -> (PeerRegistryGuard, PeerRegistryUpdater) {
         let mut state = self
             .inner
@@ -97,7 +100,7 @@ impl PeerRegistry {
             .checked_add(1)
             .expect("legacy connection generation cannot overflow in one process");
         let key = ConnectionKey::Legacy(generation);
-        state.active.insert(key.clone(), peer);
+        state.active_connections.insert(key.clone(), connected_peer);
         drop(state);
 
         (
@@ -112,85 +115,100 @@ impl PeerRegistry {
         )
     }
 
-    /// Attach a legacy handshake snapshot to an authenticated native peer.
+    /// Attach legacy handshake metadata to one authenticated native connection.
+    ///
+    /// Returns `false` without changing active or retained metadata when another
+    /// `conn_id` currently owns `peer_id`.
+    #[must_use]
     pub(crate) fn attach_native_metadata(
         &self,
         peer_id: ZakuraPeerId,
-        peer: ConnectedPeer,
+        conn_id: ZakuraConnId,
+        connection_metadata: ConnectedPeer,
         retain_for_redial: bool,
+    ) -> bool {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("peer registry mutex is never poisoned");
+        if state.native_conn_ids.get(&peer_id) != Some(&conn_id) {
+            return false;
+        }
+        if retain_for_redial {
+            state
+                .retained_native_metadata
+                .insert(peer_id.clone(), connection_metadata.clone());
+        }
+        state
+            .active_connections
+            .insert(ConnectionKey::Native(peer_id, conn_id), connection_metadata);
+        true
+    }
+
+    /// Register one authenticated native `conn_id`.
+    ///
+    /// Retained outbound metadata follows a reconnect to its new `conn_id`.
+    pub(crate) fn register_native_connection(&self, peer_id: ZakuraPeerId, conn_id: ZakuraConnId) {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("peer registry mutex is never poisoned");
+        if let Some(previous) = state.native_conn_ids.insert(peer_id.clone(), conn_id) {
+            state
+                .active_connections
+                .remove(&ConnectionKey::Native(peer_id.clone(), previous));
+        }
+        if let Some(connection_metadata) = state.retained_native_metadata.get(&peer_id).cloned() {
+            state
+                .active_connections
+                .insert(ConnectionKey::Native(peer_id, conn_id), connection_metadata);
+        }
+    }
+
+    /// Remove one exact authenticated native `conn_id`.
+    pub(crate) fn deregister_native_connection(
+        &self,
+        peer_id: &ZakuraPeerId,
+        conn_id: ZakuraConnId,
     ) {
         let mut state = self
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned");
-        if retain_for_redial {
-            state.native_metadata.insert(peer_id.clone(), peer.clone());
-        }
-        if let Some(generation) = state.native_generations.get(&peer_id).copied() {
+        if state.native_conn_ids.get(peer_id) == Some(&conn_id) {
+            state.native_conn_ids.remove(peer_id);
             state
-                .active
-                .insert(ConnectionKey::Native(peer_id, generation), peer);
+                .active_connections
+                .remove(&ConnectionKey::Native(peer_id.clone(), conn_id));
         }
     }
 
-    /// Record an authenticated native supervisor generation.
-    pub(crate) fn native_connected(&self, peer_id: ZakuraPeerId, generation: u64) {
-        let mut state = self
-            .inner
-            .lock()
-            .expect("peer registry mutex is never poisoned");
-        if let Some(previous) = state.native_generations.insert(peer_id.clone(), generation) {
-            state
-                .active
-                .remove(&ConnectionKey::Native(peer_id.clone(), previous));
-        }
-        if let Some(peer) = state.native_metadata.get(&peer_id).cloned() {
-            state
-                .active
-                .insert(ConnectionKey::Native(peer_id, generation), peer);
-        }
-    }
-
-    /// Remove one exact native supervisor generation.
-    pub(crate) fn native_disconnected(&self, peer_id: &ZakuraPeerId, generation: u64) {
-        let mut state = self
-            .inner
-            .lock()
-            .expect("peer registry mutex is never poisoned");
-        if state.native_generations.get(peer_id) == Some(&generation) {
-            state.native_generations.remove(peer_id);
-            state
-                .active
-                .remove(&ConnectionKey::Native(peer_id.clone(), generation));
-        }
-    }
-
-    /// Forget metadata when the maintained native upgrade dial ends.
-    pub(crate) fn forget_native_metadata(&self, peer_id: &ZakuraPeerId) {
+    /// Forget retained metadata when the maintained native upgrade dial ends.
+    pub(crate) fn forget_retained_native_metadata(&self, peer_id: &ZakuraPeerId) {
         self.inner
             .lock()
             .expect("peer registry mutex is never poisoned")
-            .native_metadata
+            .retained_native_metadata
             .remove(peer_id);
     }
 
-    fn update(&self, key: &ConnectionKey, update: impl FnOnce(&mut ConnectedPeer)) {
-        if let Some(peer) = self
+    fn update_connection(&self, key: &ConnectionKey, update: impl FnOnce(&mut ConnectedPeer)) {
+        if let Some(connected_peer) = self
             .inner
             .lock()
             .expect("peer registry mutex is never poisoned")
-            .active
+            .active_connections
             .get_mut(key)
         {
-            update(peer);
+            update(connected_peer);
         }
     }
 
-    fn remove(&self, key: &ConnectionKey) {
+    fn remove_connection(&self, key: &ConnectionKey) {
         self.inner
             .lock()
             .expect("peer registry mutex is never poisoned")
-            .active
+            .active_connections
             .remove(key);
     }
 }
@@ -204,16 +222,18 @@ pub(crate) struct PeerRegistryUpdater {
 
 impl PeerRegistryUpdater {
     pub(crate) fn record_ping_sent(&self, now: Instant) {
-        self.registry.update(&self.key, |peer| {
-            peer.ping_sent_at = Some(now);
-        });
+        self.registry
+            .update_connection(&self.key, |connected_peer| {
+                connected_peer.ping_sent_at = Some(now);
+            });
     }
 
     pub(crate) fn record_response(&self, rtt: Duration) {
-        self.registry.update(&self.key, |peer| {
-            peer.rtt = Some(rtt);
-            peer.ping_sent_at = None;
-        });
+        self.registry
+            .update_connection(&self.key, |connected_peer| {
+                connected_peer.rtt = Some(rtt);
+                connected_peer.ping_sent_at = None;
+            });
     }
 }
 
@@ -226,7 +246,7 @@ pub(crate) struct PeerRegistryGuard {
 
 impl Drop for PeerRegistryGuard {
     fn drop(&mut self) {
-        self.registry.remove(&self.key);
+        self.registry.remove_connection(&self.key);
     }
 }
 
@@ -268,46 +288,62 @@ mod tests {
 
         drop(first);
 
-        assert_eq!(registry.peers(), vec![peer(2)]);
+        assert_eq!(registry.connected_peers(), vec![peer(2)]);
     }
 
     #[test]
     fn native_replacement_ignores_stale_disconnect() {
         let registry = PeerRegistry::default();
         let peer_id = peer_id(1);
-        registry.attach_native_metadata(peer_id.clone(), peer(1), true);
-        registry.native_connected(peer_id.clone(), 1);
-        registry.native_connected(peer_id.clone(), 2);
+        registry.register_native_connection(peer_id.clone(), 1);
+        assert!(registry.attach_native_metadata(peer_id.clone(), 1, peer(1), true));
+        registry.register_native_connection(peer_id.clone(), 2);
 
-        registry.native_disconnected(&peer_id, 1);
-        assert_eq!(registry.peers(), vec![peer(1)]);
+        registry.deregister_native_connection(&peer_id, 1);
+        assert_eq!(registry.connected_peers(), vec![peer(1)]);
 
-        registry.native_disconnected(&peer_id, 2);
-        assert!(registry.peers().is_empty());
+        registry.deregister_native_connection(&peer_id, 2);
+        assert!(registry.connected_peers().is_empty());
     }
 
     #[test]
     fn native_metadata_can_arrive_after_registration() {
         let registry = PeerRegistry::default();
         let peer_id = peer_id(2);
-        registry.native_connected(peer_id.clone(), 1);
-        assert!(registry.peers().is_empty());
+        registry.register_native_connection(peer_id.clone(), 1);
+        assert!(registry.connected_peers().is_empty());
 
-        registry.attach_native_metadata(peer_id, peer(1), true);
-        assert_eq!(registry.peers(), vec![peer(1)]);
+        assert!(registry.attach_native_metadata(peer_id, 1, peer(1), true));
+        assert_eq!(registry.connected_peers(), vec![peer(1)]);
+    }
+
+    #[test]
+    fn stale_native_metadata_cannot_replace_active_or_retained_metadata() {
+        let registry = PeerRegistry::default();
+        let peer_id = peer_id(3);
+        registry.register_native_connection(peer_id.clone(), 1);
+        assert!(registry.attach_native_metadata(peer_id.clone(), 1, peer(1), true));
+        registry.register_native_connection(peer_id.clone(), 2);
+
+        assert!(!registry.attach_native_metadata(peer_id.clone(), 1, peer(2), true));
+        assert_eq!(registry.connected_peers(), vec![peer(1)]);
+
+        registry.deregister_native_connection(&peer_id, 2);
+        registry.register_native_connection(peer_id, 3);
+        assert_eq!(registry.connected_peers(), vec![peer(1)]);
     }
 
     #[test]
     fn transient_native_metadata_does_not_survive_reconnect() {
         let registry = PeerRegistry::default();
-        let peer_id = peer_id(3);
-        registry.native_connected(peer_id.clone(), 1);
-        registry.attach_native_metadata(peer_id.clone(), peer(1), false);
-        assert_eq!(registry.peers(), vec![peer(1)]);
+        let peer_id = peer_id(4);
+        registry.register_native_connection(peer_id.clone(), 1);
+        assert!(registry.attach_native_metadata(peer_id.clone(), 1, peer(1), false));
+        assert_eq!(registry.connected_peers(), vec![peer(1)]);
 
-        registry.native_disconnected(&peer_id, 1);
-        registry.native_connected(peer_id, 2);
-        assert!(registry.peers().is_empty());
+        registry.deregister_native_connection(&peer_id, 1);
+        registry.register_native_connection(peer_id, 2);
+        assert!(registry.connected_peers().is_empty());
     }
 
     #[test]
@@ -316,11 +352,14 @@ mod tests {
         let (guard, updater) = registry.register_legacy(peer(1));
         updater.record_ping_sent(Instant::now());
         updater.record_response(Duration::from_millis(5));
-        assert_eq!(registry.peers()[0].rtt, Some(Duration::from_millis(5)));
+        assert_eq!(
+            registry.connected_peers()[0].rtt,
+            Some(Duration::from_millis(5)),
+        );
 
         drop(guard);
         updater.record_response(Duration::from_millis(10));
-        assert!(registry.peers().is_empty());
+        assert!(registry.connected_peers().is_empty());
     }
 
     #[test]

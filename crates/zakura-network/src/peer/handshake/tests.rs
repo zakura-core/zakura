@@ -62,6 +62,26 @@ fn connected_addr_labels_require_explicit_opt_in() {
 }
 
 #[test]
+fn diagnostic_remote_addr_excludes_proxy_connection_identifiers() {
+    let proxy_addr: SocketAddr = "192.0.2.10:9050".parse().expect("valid proxy address");
+    let local_addr: SocketAddr = "127.0.0.1:49152".parse().expect("valid local address");
+    let outbound_proxy = ConnectedAddr::new_outbound_proxy(proxy_addr, local_addr);
+    let inbound_proxy = ConnectedAddr::new_inbound_proxy(proxy_addr);
+
+    assert_eq!(
+        outbound_proxy.get_transient_addr(),
+        Some(local_addr.into()),
+        "the transient outbound proxy identifier is the local socket",
+    );
+    assert_eq!(outbound_proxy.diagnostic_remote_addr(), None);
+    assert_eq!(inbound_proxy.diagnostic_remote_addr(), None);
+    assert_eq!(
+        ConnectedAddr::new_outbound_direct(peer_addr(8233)).diagnostic_remote_addr(),
+        Some(peer_addr(8233)),
+    );
+}
+
+#[test]
 fn noncanonical_shielded_proof_size_gets_ban_score() {
     let addr = peer_addr(8233);
     let change = inbound_error_address_change(
@@ -91,6 +111,7 @@ fn test_config(p2p_stack: P2pStack) -> Config {
 fn upgraded_outcome() -> ZakuraUpgradeOutcome {
     ZakuraUpgradeOutcome::Upgraded {
         peer_id: ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds"),
+        conn_id: 1,
     }
 }
 
@@ -348,7 +369,7 @@ async fn mutual_p2p_v2_legacy_upgrade_forms_zakura_connection() {
         "the legacy upgrade should establish a Zakura connection registered on both endpoints",
     );
 
-    let local_peers = local_peer_registry.peers();
+    let local_peers = local_peer_registry.connected_peers();
     assert_eq!(local_peers.len(), 1);
     assert_eq!(local_peers[0].addr, peer_addr(18233));
     assert_eq!(
@@ -361,7 +382,7 @@ async fn mutual_p2p_v2_legacy_upgrade_forms_zakura_connection() {
     );
     assert!(!local_peers[0].is_inbound);
 
-    let remote_peers = remote_peer_registry.peers();
+    let remote_peers = remote_peer_registry.connected_peers();
     assert_eq!(remote_peers.len(), 1);
     assert_eq!(remote_peers[0].addr, peer_addr(28233));
     assert_eq!(
@@ -377,8 +398,8 @@ async fn mutual_p2p_v2_legacy_upgrade_forms_zakura_connection() {
     local_endpoint.shutdown().await;
     remote_endpoint.shutdown().await;
 
-    assert!(local_peer_registry.peers().is_empty());
-    assert!(remote_peer_registry.peers().is_empty());
+    assert!(local_peer_registry.connected_peers().is_empty());
+    assert!(remote_peer_registry.connected_peers().is_empty());
 }
 
 /// An inbound legacy peer that sends a valid upgrade `Init`, receives our

@@ -214,6 +214,8 @@ pub enum ZakuraUpgradeOutcome {
     Upgraded {
         /// The authenticated Zakura/Iroh peer identity.
         peer_id: ZakuraPeerId,
+        /// The exact supervisor connection generation created by this handoff.
+        conn_id: ZakuraConnId,
     },
 
     /// The peer was authenticated, but a better duplicate connection already exists.
@@ -227,6 +229,28 @@ pub enum ZakuraUpgradeOutcome {
         /// The neutral rejection reason.
         reason: ZakuraRejectReason,
     },
+}
+
+/// Result of handing one legacy connection to the native supervisor.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ZakuraNativeHandoff {
+    /// The handoff observed one exact newly registered native generation.
+    Registered(ZakuraConnId),
+    /// The peer identity already had a connection or a pending handoff.
+    Duplicate,
+    /// The native dial or registration wait failed.
+    Failed,
+}
+
+/// Ownership result for a maintained dial requested by a legacy handoff.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ZakuraUpgradeDialStart {
+    /// This handoff started and owns the maintained dial.
+    Started,
+    /// An earlier handoff owns the maintained dial.
+    AlreadyRunning,
+    /// The dial address contains an invalid peer identity.
+    InvalidPeerId,
 }
 
 /// An error from the Zakura handshake upgrade hook.
@@ -293,33 +317,56 @@ impl ZakuraHandshakeConnector {
         peer_id: &ZakuraPeerId,
         node_id: &[u8],
         direct_addresses: &[Vec<u8>],
-    ) -> bool {
+    ) -> ZakuraNativeHandoff {
         let Some(endpoint) = self.endpoint.as_ref() else {
-            return false;
+            return ZakuraNativeHandoff::Failed;
         };
         let Some(node_addr) = node_addr_from_hints(node_id, direct_addresses) else {
-            return false;
+            return ZakuraNativeHandoff::Failed;
         };
-        let mut registered = endpoint.supervisor().subscribe();
-        if !endpoint.ensure_upgrade_native_dial(node_addr) {
-            return false;
+        let registration_wait = match endpoint
+            .supervisor()
+            .begin_connection_registration_wait(peer_id)
+            .await
+        {
+            ZakuraConnectionRegistrationWaitStart::Waiting(registration_wait) => registration_wait,
+            ZakuraConnectionRegistrationWaitStart::Duplicate => {
+                return ZakuraNativeHandoff::Duplicate;
+            }
+            ZakuraConnectionRegistrationWaitStart::Unavailable => {
+                return ZakuraNativeHandoff::Failed;
+            }
+        };
+        let dial_start = endpoint.start_upgrade_native_dial(node_addr);
+        if dial_start == ZakuraUpgradeDialStart::InvalidPeerId {
+            return ZakuraNativeHandoff::Failed;
         }
-        if wait_for_zakura_peer(&mut registered, peer_id, ZAKURA_LIVENESS_APPEAR_TIMEOUT).await {
-            return true;
+        let conn_id = registration_wait.wait(ZAKURA_LIVENESS_APPEAR_TIMEOUT).await;
+        match (dial_start, conn_id) {
+            (ZakuraUpgradeDialStart::Started, Some(conn_id)) => {
+                return ZakuraNativeHandoff::Registered(conn_id);
+            }
+            (ZakuraUpgradeDialStart::AlreadyRunning, Some(_)) => {
+                return ZakuraNativeHandoff::Duplicate;
+            }
+            (ZakuraUpgradeDialStart::InvalidPeerId, _) => {
+                unreachable!("invalid peer identities return before waiting for registration")
+            }
+            (ZakuraUpgradeDialStart::AlreadyRunning, None) => {
+                return ZakuraNativeHandoff::Failed;
+            }
+            (ZakuraUpgradeDialStart::Started, None) => {}
         }
 
         // The hand-off did not complete within the wait window. The dial spawned
-        // by `ensure_upgrade_native_dial` uses `RedialPolicy::maintain`, so it
+        // by `start_upgrade_native_dial` uses `RedialPolicy::maintain`, so it
         // would keep redialing this peer-supplied address forever and retain its
-        // `upgrade_dials` entry. Unless the peer registered in the meantime
-        // (keep its maintained dial as the recovery path), cancel the dial and
-        // drop the entry so a malicious legacy responder cannot leak unbounded
-        // maintained dials and outbound QUIC traffic by repeating failed
-        // upgrades with distinct node ids.
-        if !registered.borrow().iter().any(|id| id == peer_id) {
-            endpoint.cancel_upgrade_native_dial(peer_id);
-        }
-        false
+        // `upgrade_dials` entry. Cancel the dial and drop the entry so a
+        // malicious legacy responder cannot leak unbounded maintained dials and
+        // outbound QUIC traffic by repeating failed upgrades with distinct node
+        // ids.
+        endpoint.cancel_upgrade_native_dial(peer_id);
+        ZakuraNativeHandoff::Failed
     }
 
     /// Wait until the upgraded peer's inbound native QUIC connection registers
@@ -330,16 +377,34 @@ impl ZakuraHandshakeConnector {
     /// endpoint, and our iroh router registers that connection separately. The
     /// outer handshake drops the legacy TCP connection once the upgrade is
     /// reported, so the responder must confirm a usable Zakura replacement
-    /// exists first. Returns `false` (keep legacy) if the peer never registers
-    /// within [`ZAKURA_LIVENESS_APPEAR_TIMEOUT`] or this node has no live
-    /// endpoint, so a peer that sends a valid `Init` and then never completes
-    /// the native dial cannot make us silently drop a working legacy peer.
-    pub(crate) async fn wait_for_zakura_registration(&self, peer_id: &ZakuraPeerId) -> bool {
+    /// exists first. Returns [`ZakuraNativeHandoff::Failed`] if the peer never
+    /// registers within [`ZAKURA_LIVENESS_APPEAR_TIMEOUT`] or this node has no
+    /// live endpoint. The caller retains the legacy connection after a failed
+    /// handoff.
+    pub(crate) async fn wait_for_zakura_registration(
+        &self,
+        peer_id: &ZakuraPeerId,
+    ) -> ZakuraNativeHandoff {
         let Some(endpoint) = self.endpoint.as_ref() else {
-            return false;
+            return ZakuraNativeHandoff::Failed;
         };
-        let mut registered = endpoint.supervisor().subscribe();
-        wait_for_zakura_peer(&mut registered, peer_id, ZAKURA_LIVENESS_APPEAR_TIMEOUT).await
+        let registration_wait = match endpoint
+            .supervisor()
+            .begin_connection_registration_wait(peer_id)
+            .await
+        {
+            ZakuraConnectionRegistrationWaitStart::Waiting(registration_wait) => registration_wait,
+            ZakuraConnectionRegistrationWaitStart::Duplicate => {
+                return ZakuraNativeHandoff::Duplicate;
+            }
+            ZakuraConnectionRegistrationWaitStart::Unavailable => {
+                return ZakuraNativeHandoff::Failed;
+            }
+        };
+        registration_wait
+            .wait(ZAKURA_LIVENESS_APPEAR_TIMEOUT)
+            .await
+            .map_or(ZakuraNativeHandoff::Failed, ZakuraNativeHandoff::Registered)
     }
 
     /// Keep an upgraded peer's legacy address-book entry live for the lifetime

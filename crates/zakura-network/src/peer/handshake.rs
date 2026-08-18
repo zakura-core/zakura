@@ -348,6 +348,19 @@ impl ConnectedAddr {
         }
     }
 
+    /// Returns the remote socket address when the transport identifies the peer.
+    ///
+    /// Proxy connections do not expose the peer's remote socket. In particular,
+    /// an outbound proxy connection stores this node's local ephemeral socket as
+    /// its transient identifier. Callers must not report that identifier as the
+    /// remote peer address.
+    pub(crate) fn diagnostic_remote_addr(&self) -> Option<PeerSocketAddr> {
+        match self {
+            OutboundDirect { addr } | InboundDirect { addr } => Some(*addr),
+            OutboundProxy { .. } | InboundProxy { .. } | Isolated => None,
+        }
+    }
+
     /// Returns the redacted label for this connection's address.
     pub fn get_transient_addr_label(&self) -> String {
         self.get_transient_addr()
@@ -1087,13 +1100,14 @@ where
     };
 
     match &outcome {
-        ZakuraUpgradeOutcome::Upgraded { peer_id } => {
+        ZakuraUpgradeOutcome::Upgraded { peer_id, conn_id } => {
             // The success metric `zakura.p2p.handshake.upgraded` is incremented by
             // the supervisor when the dialed/accepted QUIC connection registers.
             info!(
                 peer = %addr_label,
                 connection_kind = connected_addr.get_short_kind_label(),
                 ?peer_id,
+                conn_id,
                 remote_services = ?connection_info.remote.services,
                 "upgraded mutually P2P-v2-capable peer to Zakura",
             );
@@ -1144,7 +1158,7 @@ fn record_zakura_upgrade(
     peer_registry: Option<&PeerRegistry>,
     address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
 ) {
-    let ZakuraUpgradeOutcome::Upgraded { peer_id } = outcome else {
+    let ZakuraUpgradeOutcome::Upgraded { peer_id, conn_id } = outcome else {
         return;
     };
 
@@ -1155,7 +1169,13 @@ fn record_zakura_upgrade(
         // The maintained outbound dial reuses this metadata across transport reconnects.
         // An inbound upgrade binds its metadata only to the current connection.
         let retain_for_redial = !connected_addr.is_inbound();
-        peer_registry.attach_native_metadata(peer_id.clone(), peer, retain_for_redial);
+        if !peer_registry.attach_native_metadata(peer_id.clone(), *conn_id, peer, retain_for_redial)
+        {
+            debug!(
+                ?peer_id,
+                conn_id, "native connection changed before metadata attachment",
+            );
+        }
     }
 
     if connected_addr.is_inbound() {
@@ -1243,18 +1263,22 @@ where
     // Dial the responder's Zakura endpoint over QUIC and wait for the local
     // supervisor to register a usable outbound handle before dropping the
     // legacy connection.
-    if !connector
+    let handoff = connector
         .spawn_zakura_dial_to_hints_and_wait(
             &peer_id,
             &accept.iroh_node_id,
             &accept.iroh_direct_addresses,
         )
-        .await
-    {
-        return Ok(neutral_upgrade_fallback());
+        .await;
+    match handoff {
+        crate::zakura::ZakuraNativeHandoff::Registered(conn_id) => {
+            Ok(ZakuraUpgradeOutcome::Upgraded { peer_id, conn_id })
+        }
+        crate::zakura::ZakuraNativeHandoff::Duplicate => {
+            Ok(ZakuraUpgradeOutcome::Duplicate { peer_id })
+        }
+        crate::zakura::ZakuraNativeHandoff::Failed => Ok(neutral_upgrade_fallback()),
     }
-
-    Ok(ZakuraUpgradeOutcome::Upgraded { peer_id })
 }
 
 /// Selects the registration wait used by the responder upgrade path.
@@ -1265,14 +1289,18 @@ enum ResponderRegistrationWait {
 }
 
 impl ResponderRegistrationWait {
-    async fn wait(self, connector: &ZakuraHandshakeConnector, peer_id: &ZakuraPeerId) -> bool {
+    async fn wait(
+        self,
+        connector: &ZakuraHandshakeConnector,
+        peer_id: &ZakuraPeerId,
+    ) -> crate::zakura::ZakuraNativeHandoff {
         match self {
             Self::Production => connector.wait_for_zakura_registration(peer_id).await,
             #[cfg(test)]
             Self::TestTimeout(timeout) => {
                 tokio::time::timeout(timeout, connector.wait_for_zakura_registration(peer_id))
                     .await
-                    .unwrap_or(false)
+                    .unwrap_or(crate::zakura::ZakuraNativeHandoff::Failed)
             }
         }
     }
@@ -1350,11 +1378,15 @@ where
     // and then never completes the native dial would make us discard a working
     // legacy connection with no Zakura replacement. This mirrors the initiator's
     // `spawn_zakura_dial_to_hints_and_wait` hand-off wait.
-    if !registration_wait.wait(connector, &peer_id).await {
-        return Ok(neutral_upgrade_fallback());
+    match registration_wait.wait(connector, &peer_id).await {
+        crate::zakura::ZakuraNativeHandoff::Registered(conn_id) => {
+            Ok(ZakuraUpgradeOutcome::Upgraded { peer_id, conn_id })
+        }
+        crate::zakura::ZakuraNativeHandoff::Duplicate => {
+            Ok(ZakuraUpgradeOutcome::Duplicate { peer_id })
+        }
+        crate::zakura::ZakuraNativeHandoff::Failed => Ok(neutral_upgrade_fallback()),
     }
-
-    Ok(ZakuraUpgradeOutcome::Upgraded { peer_id })
 }
 
 /// Sends a neutral [`P2pV2UpgradeReject`] so the peer stops waiting for an accept

@@ -409,40 +409,6 @@ fn config_legacy_zebra_env_is_supported() {
 }
 
 #[test]
-fn config_zakura_target_env_is_supported() {
-    let env = EnvGuard::new();
-
-    env.set_var("ZAKURA_TARGET_STATE__CACHE_DIR", "/target/cache");
-
-    let config = ZakuradConfig::load_with_env(None, "ZAKURA_TARGET")
-        .expect("load config with ZAKURA_TARGET_STATE__CACHE_DIR");
-    assert_eq!(config.state.cache_dir, PathBuf::from("/target/cache"));
-}
-
-#[test]
-fn config_legacy_zebra_target_env_is_supported() {
-    let env = EnvGuard::new();
-
-    env.set_var("ZEBRA_TARGET_STATE__CACHE_DIR", "/target/cache");
-
-    let config = ZakuradConfig::load_with_env(None, "ZAKURA_TARGET")
-        .expect("load config with legacy ZEBRA_TARGET_ env var");
-    assert_eq!(config.state.cache_dir, PathBuf::from("/target/cache"));
-}
-
-#[test]
-fn config_zakura_target_env_overrides_legacy_zebra_target_env() {
-    let env = EnvGuard::new();
-
-    env.set_var("ZEBRA_TARGET_STATE__CACHE_DIR", "/legacy/cache");
-    env.set_var("ZAKURA_TARGET_STATE__CACHE_DIR", "/target/cache");
-
-    let config = ZakuradConfig::load_with_env(None, "ZAKURA_TARGET")
-        .expect("load target config with both env prefixes");
-    assert_eq!(config.state.cache_dir, PathBuf::from("/target/cache"));
-}
-
-#[test]
 fn config_zakura_mining_miner_address_from_toml() {
     let _env = EnvGuard::new();
 

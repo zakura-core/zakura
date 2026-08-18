@@ -53,11 +53,8 @@ async fn shutdown() {
     imp::shutdown().await;
 }
 
-/// Extension trait to centralize entry point for runnable subcommands that
-/// depend on tokio
+/// Extension trait for running the server command on the Tokio runtime.
 pub(crate) trait RuntimeRun {
-    fn run(self, fut: impl Future<Output = Result<(), Report>>);
-
     fn run_with_graceful_shutdown<F>(
         self,
         run: impl FnOnce(CancellationToken, CancellationToken) -> F,
@@ -66,22 +63,6 @@ pub(crate) trait RuntimeRun {
 }
 
 impl RuntimeRun for Runtime {
-    fn run(self, fut: impl Future<Output = Result<(), Report>>) {
-        let result = self.block_on(async move {
-            // Always poll the shutdown future first.
-            //
-            // Otherwise, a busy Zebra instance could starve the shutdown future,
-            // and delay shutting down.
-            tokio::select! {
-                biased;
-                _ = shutdown() => Ok(()),
-                result = fut => result,
-            }
-        });
-
-        finish_runtime(self, result);
-    }
-
     fn run_with_graceful_shutdown<F>(
         self,
         run: impl FnOnce(CancellationToken, CancellationToken) -> F,

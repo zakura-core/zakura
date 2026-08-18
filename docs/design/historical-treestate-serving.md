@@ -21,7 +21,7 @@ separately, pinned by the same final frontier the commit path already verifies.
 | Subtree-root artifact and `z_getsubtreesbyindex` serving | On `main` |
 | Typed `HistoricalTreeUnavailable` in place of `null` / empty list | On `main` |
 | Frontier grid artifact and config gating | PR [#703](https://github.com/zakura-core/zakura/pull/703) |
-| Grid generation and distribution through the release-state pipeline | This PR |
+| Grid generation and distribution through the release-state pipeline | PR [#735](https://github.com/zakura-core/zakura/pull/735) |
 | Client-side removal of the per-block `trees` dependency (§6) | Not started |
 
 ## 1. Problem: the absent band
@@ -331,3 +331,25 @@ would shrink the artifact further if it ever mattered.
 The residual tail above the budget is variance rather than a missing model term. It does
 not correlate with block bytes (r = -0.10) or with replay length, so tightening it costs
 entries, not modelling.
+
+## Appendix B: the first full generation run (2026-08-18)
+
+Appendix A's grid sizing is a projection. The first complete run, on the Mainnet legacy
+archive node at checkpoint 3,449,371, measured:
+
+| | Projected (Appendix A) | Measured |
+| --- | --- | --- |
+| Entries | 3,380 | 5,472 |
+| Artifact | 3.25 MB | 4,763,633 B |
+| Entry size | 715 B | 870 B |
+| Blocks replayed | — | 0 |
+| Wall clock | — | 4,873 s |
+
+Both figures run about 60% above the projection, so an implementation planning against
+Appendix A should use these instead. The 2 s per-entry budget is unchanged; what moved is
+how many entries that budget buys.
+
+`0 blocks replayed` is the legacy-archive path in §5 confirmed end to end: every entry came
+from a stored per-height tree, and the 81 minutes is the cost-model scan reading each block
+body once, not replay. That is the floor for any archive node, and it is why the run is
+long even where no commitment is ever re-appended.

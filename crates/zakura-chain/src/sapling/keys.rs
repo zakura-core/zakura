@@ -20,9 +20,6 @@ use crate::{
     serialization::{ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize},
 };
 
-#[cfg(test)]
-mod test_vectors;
-
 /// The [Randomness Beacon][1] ("URS").
 ///
 /// First 64 bytes of the BLAKE2s input during JubJub group hash.  URS

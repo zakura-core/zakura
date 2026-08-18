@@ -7,5 +7,5 @@
 
 pub use crate::orchard::{
     tree, Action, Address, AuthorizedAction, CommitmentRandomness, Diversifier, EncryptedNote,
-    Flags, Note, NoteCommitment, Nullifier, ShieldedData, ValueCommitment, WrappedNoteKey,
+    Flags, NoteCommitment, Nullifier, ShieldedData, ValueCommitment, WrappedNoteKey,
 };

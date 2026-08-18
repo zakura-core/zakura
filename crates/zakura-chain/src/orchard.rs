@@ -21,5 +21,5 @@ pub use action::Action;
 pub use address::Address;
 pub use commitment::{CommitmentRandomness, NoteCommitment, ValueCommitment};
 pub use keys::Diversifier;
-pub use note::{EncryptedNote, Note, Nullifier, WrappedNoteKey};
+pub use note::{EncryptedNote, Nullifier, WrappedNoteKey};
 pub use shielded_data::{AuthorizedAction, Flags, ShieldedData};

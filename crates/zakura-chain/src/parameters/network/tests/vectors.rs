@@ -771,6 +771,150 @@ fn check_configured_funding_stream_constraints() {
         .expect_err("should panic when recipient addresses are for Mainnet");
 }
 
+/// Checks that funding stream numerators which sum to a multiple of `2^64` are rejected,
+/// instead of wrapping to a value inside the valid range.
+#[test]
+fn check_configured_funding_stream_numerator_sum_does_not_wrap() {
+    std::panic::set_hook(Box::new(|_| {}));
+
+    // These numerators sum to exactly `2^64`, which wraps to zero.
+    let wrapping_sum = std::panic::catch_unwind(|| {
+        testnet::Parameters::build()
+            .with_funding_streams(vec![ConfiguredFundingStreams {
+                recipients: Some(vec![
+                    ConfiguredFundingStreamRecipient {
+                        receiver: FundingStreamReceiver::Ecc,
+                        numerator: u64::MAX,
+                        addresses: Some(
+                            subsidy::constants::testnet::FUNDING_STREAM_ECC_ADDRESSES
+                                .map(Into::into)
+                                .to_vec(),
+                        ),
+                    },
+                    ConfiguredFundingStreamRecipient {
+                        receiver: FundingStreamReceiver::ZcashFoundation,
+                        numerator: 1,
+                        addresses: Some(
+                            subsidy::constants::testnet::FUNDING_STREAM_ZF_ADDRESSES
+                                .map(Into::into)
+                                .to_vec(),
+                        ),
+                    },
+                ]),
+                ..Default::default()
+            }])
+            .to_network()
+    });
+
+    let _ = std::panic::take_hook();
+
+    let panic = wrapping_sum.expect_err("wrapping numerator sum must be rejected");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+
+    // Without the checked sum, release builds accept the wrapped total, and debug builds
+    // abort with the generic overflow panic instead of this invariant.
+    assert!(
+        message.contains("sum of funding stream numerators must not overflow"),
+        "numerator sum must be checked explicitly, got panic: {message}"
+    );
+}
+
+/// Checks that funding stream recipient addresses which are not P2SH are rejected when the
+/// network is configured, rather than panicking in block validation at the activation height.
+#[test]
+fn check_configured_funding_stream_addresses_are_p2sh() {
+    // A valid Testnet address that is P2PKH instead of P2SH.
+    const TESTNET_P2PKH_ADDRESS: &str = "tmWbBGi7TjExNmLZyMcFpxVh3ZPbGrpbX3H";
+
+    let num_addresses = subsidy::constants::testnet::FUNDING_STREAM_ECC_ADDRESSES.len();
+
+    let error = testnet::Parameters::build()
+        .with_funding_streams(vec![ConfiguredFundingStreams {
+            recipients: Some(vec![ConfiguredFundingStreamRecipient {
+                receiver: FundingStreamReceiver::Ecc,
+                numerator: 10,
+                addresses: Some(vec![TESTNET_P2PKH_ADDRESS.to_string(); num_addresses]),
+            }]),
+            ..Default::default()
+        }])
+        .to_network()
+        .expect_err("P2PKH funding stream addresses must be rejected");
+
+    assert_eq!(
+        error,
+        ParametersBuilderError::FundingStreamAddressNotP2SH {
+            receiver: FundingStreamReceiver::Ecc,
+            address: TESTNET_P2PKH_ADDRESS.to_string(),
+        },
+        "configuring a non-P2SH funding stream address must report which address is invalid"
+    );
+}
+
+/// Checks that a receiver configured twice in the same funding stream is rejected, instead of
+/// the last entry silently replacing the earlier one.
+#[test]
+fn check_configured_funding_stream_receivers_are_unique() {
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let duplicate_receiver = std::panic::catch_unwind(|| {
+        let addresses = subsidy::constants::testnet::FUNDING_STREAM_ECC_ADDRESSES
+            .map(Into::into)
+            .to_vec();
+
+        testnet::Parameters::build().with_funding_streams(vec![ConfiguredFundingStreams {
+            recipients: Some(vec![
+                ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::Ecc,
+                    numerator: 10,
+                    addresses: Some(addresses.clone()),
+                },
+                ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::Ecc,
+                    numerator: 90,
+                    addresses: Some(addresses),
+                },
+            ]),
+            ..Default::default()
+        }])
+    });
+
+    let _ = std::panic::take_hook();
+
+    duplicate_receiver.expect_err("a receiver configured twice must be rejected");
+}
+
+/// Checks that a slow start interval which makes the founders reward inexact is rejected when
+/// the network is configured, rather than panicking in block validation at the first block.
+#[test]
+fn check_configured_slow_start_interval_keeps_founders_reward_exact() {
+    // The block subsidy limit divided by three leaves a remainder modulo five, so the founders
+    // reward for the first block cannot be calculated with exact division.
+    // The funding streams are cleared because the slow start interval also moves the first
+    // halving, which changes how many funding stream addresses the height range needs.
+    let error = testnet::Parameters::build()
+        .with_slow_start_interval(Height(3))
+        .clear_funding_streams()
+        .to_network()
+        .expect_err("an indivisible slow start interval must be rejected");
+
+    assert_eq!(
+        error,
+        ParametersBuilderError::IndivisibleFoundersReward {
+            slow_start_interval: Height(3)
+        },
+        "configuring an indivisible slow start interval must report the interval"
+    );
+
+    // The default interval divides the block subsidy limit into a multiple of five.
+    testnet::Parameters::build()
+        .to_network()
+        .expect("the default slow start interval must keep the founders reward exact");
+}
+
 /// Check that `new_regtest()` constructs a network with the provided funding streams.
 #[test]
 fn check_configured_funding_stream_regtest() {

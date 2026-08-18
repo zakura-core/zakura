@@ -1,6 +1,10 @@
 //! Types and implementation for Testnet consensus parameters
 
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 use crate::{
     amount::{Amount, NonNegative},
@@ -15,10 +19,10 @@ use crate::{
             constants::testnet,
             constants::{
                 BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
-                POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
+                MAX_BLOCK_SUBSIDY, POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
             },
             funding_stream_address_period, FundingStreamReceiver, FundingStreamRecipient,
-            FundingStreams,
+            FundingStreams, ParameterSubsidy,
         },
         Network, NetworkKind, NetworkUpgrade,
     },
@@ -229,6 +233,19 @@ impl ConfiguredFundingStreams {
         let recipients = self
             .recipients
             .map(|recipients| {
+                // Recipients are keyed by receiver, so a repeated receiver would silently
+                // replace the earlier entry, and the numerator check below would only see
+                // the last one. Reject the ambiguous configuration instead.
+                let mut seen_receivers = HashSet::new();
+                for recipient in &recipients {
+                    assert!(
+                        seen_receivers.insert(recipient.receiver),
+                        "funding stream receiver {:?} must not be configured more than once \
+                         in the same funding stream",
+                        recipient.receiver
+                    );
+                }
+
                 recipients
                     .into_iter()
                     .map(ConfiguredFundingStreamRecipient::into_recipient)
@@ -250,12 +267,17 @@ impl ConfiguredFundingStreams {
         let funding_streams = FundingStreams::new(height_range.clone(), recipients);
 
         // check that sum of receiver numerators is valid.
-
+        //
+        // The numerators are operator-supplied, so sum them with checked arithmetic: a
+        // wrapping sum can land back inside the valid range, and the check below would
+        // then accept numerators that make every block subsidy calculation fail.
         let sum_numerators: u64 = funding_streams
             .recipients()
             .values()
-            .map(|r| r.numerator())
-            .sum();
+            .try_fold(0u64, |sum, recipient| {
+                sum.checked_add(recipient.numerator())
+            })
+            .expect("sum of funding stream numerators must not overflow");
 
         assert!(
             sum_numerators <= FUNDING_STREAM_RECEIVER_DENOMINATOR,
@@ -334,6 +356,79 @@ fn check_funding_stream_address_period(funding_streams: &FundingStreams, network
             );
         }
     }
+}
+
+/// Checks that every funding stream recipient address in the provided [`FundingStreams`]
+/// is a P2SH address.
+///
+/// The funding stream consensus rule only accepts P2SH outputs, so block validation
+/// panics when an expected funding stream address is any other type. Rejecting those
+/// addresses here surfaces the problem when the network is configured, rather than at
+/// the activation height of the stream.
+fn check_funding_stream_address_types(
+    funding_streams: &FundingStreams,
+) -> Result<(), ParametersBuilderError> {
+    for (&receiver, recipient) in funding_streams.recipients() {
+        if receiver == FundingStreamReceiver::Deferred {
+            // The `Deferred` receiver has no addresses, and pays no outputs.
+            continue;
+        }
+
+        for address in recipient.addresses() {
+            if !address.is_script_hash() {
+                return Err(ParametersBuilderError::FundingStreamAddressNotP2SH {
+                    receiver,
+                    address: address.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The divisor used to calculate the founders reward from the block subsidy.
+///
+/// The founders reward is 20% of the block subsidy, calculated with exact division.
+const FOUNDERS_REWARD_DIVISOR: u64 = 5;
+
+/// Checks that the founders reward is an exact fifth of the block subsidy at every height
+/// that pays it.
+///
+/// `founders_reward()` divides the block subsidy by five and panics on a remainder, and the
+/// slow start rate is the block subsidy limit divided by the configured slow start interval,
+/// truncated. An interval that leaves a remainder modulo five therefore crashes block
+/// validation at the first block that pays a founders reward.
+fn check_founders_reward_is_exact(network: &Network) -> Result<(), ParametersBuilderError> {
+    let slow_start_interval = network.slow_start_interval();
+
+    // The founders reward is paid below both the first halving and Canopy, and the genesis
+    // block does not pay one. If either boundary is at or below the first block, or the slow
+    // start ends there, no block uses a slow start subsidy to pay a founders reward.
+    let canopy_height = NetworkUpgrade::Canopy
+        .activation_height(network)
+        .unwrap_or(Height::MAX);
+    if slow_start_interval <= Height(1)
+        || canopy_height <= Height(1)
+        || network.height_for_first_halving() <= Height(1)
+    {
+        return Ok(());
+    }
+
+    // Every slow start subsidy is a multiple of this rate, and the first block pays exactly
+    // one or two of them, so the rate itself must divide evenly by five.
+    //
+    // Subsidies above the slow start interval are the block subsidy limit, optionally divided
+    // by the Blossom spacing ratio, and both of those constants divide evenly by five.
+    let slow_start_rate = MAX_BLOCK_SUBSIDY / u64::from(slow_start_interval);
+
+    if !slow_start_rate.is_multiple_of(FOUNDERS_REWARD_DIVISOR) {
+        return Err(ParametersBuilderError::IndivisibleFoundersReward {
+            slow_start_interval,
+        });
+    }
+
+    Ok(())
 }
 
 /// Configurable activation heights for Regtest and configured Testnets.
@@ -909,7 +1004,10 @@ impl ParametersBuilder {
         for fs in &self.funding_streams {
             // Check that the funding streams are valid for the configured Testnet parameters.
             check_funding_stream_address_period(fs, &network);
+            check_funding_stream_address_types(fs)?;
         }
+
+        check_founders_reward_is_exact(&network)?;
 
         // Final check that the configured checkpoints are valid for this network.
         if network.checkpoint_list().hash(Height(0)) != Some(network.genesis_hash()) {
@@ -1081,6 +1179,12 @@ impl Parameters {
 
         if Some(true) == extend_funding_stream_addresses_as_required {
             parameters = parameters.extend_funding_streams();
+        }
+
+        // Regtest does not run the `to_network()` checks, so check the address types here:
+        // block validation panics on a funding stream address that is not P2SH.
+        for funding_stream in &parameters.funding_streams {
+            check_funding_stream_address_types(funding_stream)?;
         }
 
         Ok(Self {

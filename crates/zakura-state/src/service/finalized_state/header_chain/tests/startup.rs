@@ -401,9 +401,17 @@ fn legacy_rejected_aux_bytes(delivery: AuxDelivery, evidence: [u8; 32]) -> Vec<u
 }
 
 fn mark_metadata_as_v1(metadata: &EngineMetadata) -> Vec<u8> {
+    mark_metadata_as_legacy_without_policy(metadata, 1)
+}
+
+fn mark_metadata_as_v2(metadata: &EngineMetadata) -> Vec<u8> {
+    mark_metadata_as_legacy_without_policy(metadata, 2)
+}
+
+fn mark_metadata_as_legacy_without_policy(metadata: &EngineMetadata, version: u32) -> Vec<u8> {
     let mut bytes = metadata.encode().expect("the metadata fixture encodes");
-    bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
-    // Version one wrote the network kind but no network policy digest.
+    bytes[..4].copy_from_slice(&version.to_be_bytes());
+    // Version one and two wrote the network kind but no network policy digest.
     bytes.drain(6..38);
     bytes
 }
@@ -888,6 +896,146 @@ fn version_one_migration_rejects_an_ambiguous_network_policy_without_writing() {
         store.migrate_v1_to_current(&changed_config),
         Err(HeaderChainStoreError::Incoherent(
             "version-one network policy is ambiguous; rebuild the header-chain database"
+        ))
+    ));
+    let metadata_cf = store
+        .cf(HEADER_ENGINE_META)
+        .expect("the metadata column family exists");
+    assert_eq!(
+        store
+            .db
+            .raw_get_cf(&metadata_cf, METADATA_KEY)
+            .expect("the metadata row is readable"),
+        Some(metadata_value)
+    );
+}
+
+#[test]
+fn version_two_migration_injects_network_policy_and_leaves_current_aux_unchanged() {
+    let db_config = Config::ephemeral();
+    let (engine_config, mut anchor, metadata) = mainnet_fixture();
+    let previous_state_version = metadata.state_version;
+    let delivery = AuxDelivery::new(
+        EvidenceId::from_digest([0x21; 32]),
+        anchor.hash,
+        SourceId::from_digest([0x22; 32]),
+        header_owner(&metadata.snapshot(), anchor.hash, 3, 1),
+        zakura_header_chain::BodySizeHint::Unknown,
+        None,
+    );
+    anchor.aux_delivery_ids.push(delivery.delivery_id);
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata.clone(), anchor.clone())
+        .expect("the current fixture initializes");
+
+    let delivery_key = HeaderAuxDeliveryKey {
+        header: delivery.header_hash,
+        delivery: delivery.delivery_id,
+    }
+    .as_bytes();
+    let current_aux = delivery
+        .encode()
+        .expect("the current auxiliary fixture encodes");
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(&mut batch, HEADER_AUX_DELIVERY, delivery_key, &current_aux)
+        .expect("the current auxiliary row stages");
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            mark_metadata_as_v2(&metadata),
+        )
+        .expect("the version-two metadata stages");
+    store
+        .db
+        .write(batch)
+        .expect("the version-two fixture commits");
+    let aux_cf = store
+        .cf(HEADER_AUX_DELIVERY)
+        .expect("the auxiliary column family exists");
+
+    assert!(store
+        .is_initialized()
+        .expect("released version-two metadata identifies an initialized store"));
+    assert!(store
+        .migrate_v1_to_current(&engine_config)
+        .expect("the version-two store migrates"));
+    let migrated_metadata = store.metadata().expect("the metadata remains readable");
+    assert_eq!(
+        migrated_metadata.disk_format,
+        HeaderChainDiskVersion::CURRENT
+    );
+    assert_eq!(
+        migrated_metadata.network_policy_digest,
+        engine_config.network_policy_digest()
+    );
+    assert_eq!(
+        migrated_metadata.state_version,
+        previous_state_version
+            .checked_next()
+            .expect("the fixture state version can advance")
+    );
+    assert_eq!(migrated_metadata.last_transition, None);
+    assert_eq!(
+        store
+            .db
+            .raw_get_cf(&aux_cf, &delivery_key)
+            .expect("the auxiliary row stays readable"),
+        Some(current_aux)
+    );
+    let (_, report) = store
+        .clone()
+        .startup(&engine_config)
+        .expect("startup audits the migrated version-two store");
+    assert!(report.publication_allowed);
+    assert!(!HeaderChainStore::new(db)
+        .migrate_v1_to_current(&engine_config)
+        .expect("reopening the migrated store is a no-op"));
+}
+
+#[test]
+fn version_two_migration_rejects_an_ambiguous_network_policy_without_writing() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let changed_network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            canopy: Some(10),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let changed_config = EngineConfig::new(
+        engine_config.mode,
+        changed_network,
+        engine_config.bootstrap_anchor().clone(),
+        CheckpointSet::default(),
+    )
+    .expect("the changed policy accepts the same bootstrap anchor");
+    let metadata_value = mark_metadata_as_v2(&metadata);
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db);
+    store
+        .initialize(metadata, anchor)
+        .expect("the current fixture initializes");
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            &metadata_value,
+        )
+        .expect("the version-two metadata stages");
+    store.db.write(batch).expect("the legacy fixture commits");
+
+    assert!(matches!(
+        store.migrate_v1_to_current(&changed_config),
+        Err(HeaderChainStoreError::Incoherent(
+            "version-two network policy is ambiguous; rebuild the header-chain database"
         ))
     ));
     let metadata_cf = store

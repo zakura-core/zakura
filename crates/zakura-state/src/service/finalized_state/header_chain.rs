@@ -2699,10 +2699,10 @@ impl HeaderChainStore {
         match self.metadata_row() {
             Ok(metadata) => Ok(metadata.is_some()),
             // Service construction classifies the durable runtime before the block writer
-            // migrates released version-one rows to the current format.
-            Err(HeaderChainStoreError::Codec(HeaderChainValueError::UnsupportedDiskFormat(1))) => {
-                Ok(true)
-            }
+            // migrates released version-one and version-two rows to the current format.
+            Err(HeaderChainStoreError::Codec(HeaderChainValueError::UnsupportedDiskFormat(
+                1 | 2,
+            ))) => Ok(true),
             Err(error) => Err(error),
         }
     }

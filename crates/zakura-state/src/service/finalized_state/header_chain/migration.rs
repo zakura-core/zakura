@@ -20,8 +20,8 @@ use crate::service::finalized_state::{
         header_chain_values::{
             decode_v1_aux_delivery, decode_v1_consensus_invalid_body_tombstone,
             decode_v1_engine_metadata, decode_v1_full_state_body_validation_evidence_authority,
-            FullStateBodyValidationEvidenceAuthorityDisk, HeaderChainValueError,
-            HeaderRowCountDisk, HeaderValidationContextDisk,
+            decode_v2_engine_metadata, FullStateBodyValidationEvidenceAuthorityDisk,
+            HeaderChainValueError, HeaderRowCountDisk, HeaderValidationContextDisk,
         },
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
@@ -37,7 +37,7 @@ use crate::service::finalized_state::{
 };
 
 impl HeaderChainStore {
-    /// Atomically migrate released version-one rows to the current format.
+    /// Atomically migrate released version-one and version-two rows to the current format.
     pub(in crate::service) fn migrate_v1_to_current(
         &self,
         config: &EngineConfig,
@@ -92,6 +92,10 @@ impl HeaderChainStore {
                 "completed an interrupted durable header-chain migration"
             );
             return Ok(true);
+        }
+
+        if version == 2 {
+            return self.migrate_v2_metadata_to_current(config, &metadata_bytes);
         }
 
         let mut metadata =
@@ -161,6 +165,46 @@ impl HeaderChainStore {
             tombstone_rows,
             finality_rows,
             from_version = 1,
+            to_version = HeaderChainDiskVersion::CURRENT.0,
+            "migrated the durable header-chain format"
+        );
+        Ok(true)
+    }
+
+    /// Rewrite version-two metadata to the current format.
+    ///
+    /// Version two used the version-one metadata layout (network kind, no policy digest) with
+    /// format marker 2. Auxiliary and authority rows are already in the current encoding.
+    fn migrate_v2_metadata_to_current(
+        &self,
+        config: &EngineConfig,
+        metadata_bytes: &[u8],
+    ) -> Result<bool, HeaderChainStoreError> {
+        let mut metadata =
+            decode_v2_engine_metadata(metadata_bytes, config.network_policy_digest())?;
+        if metadata.network_id != config.network().kind() {
+            return Err(HeaderChainStoreError::Incoherent(
+                "version-two network kind does not match the configured network",
+            ));
+        }
+        if metadata.network_id != NetworkKind::Mainnet {
+            return Err(HeaderChainStoreError::Incoherent(
+                "version-two network policy is ambiguous; rebuild the header-chain database",
+            ));
+        }
+        metadata.disk_format = HeaderChainDiskVersion::CURRENT;
+        metadata.state_version = metadata.state_version.checked_next()?;
+        metadata.last_transition = None;
+        let mut batch = DiskWriteBatch::new();
+        self.put_value(
+            &mut batch,
+            HEADER_ENGINE_META,
+            super::METADATA_KEY,
+            &metadata,
+        )?;
+        self.db.write(batch)?;
+        tracing::info!(
+            from_version = 2,
             to_version = HeaderChainDiskVersion::CURRENT.0,
             "migrated the durable header-chain format"
         );

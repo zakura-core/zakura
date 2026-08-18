@@ -1519,7 +1519,7 @@ impl FallibleDiskValue for EngineMetadata {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
-        decode_engine_metadata(bytes, None)
+        decode_engine_metadata(bytes, HeaderChainDiskVersion::CURRENT, None)
     }
 }
 
@@ -1531,18 +1531,34 @@ pub(crate) fn decode_v1_engine_metadata(
     bytes: &[u8],
     network_policy_digest: [u8; 32],
 ) -> Result<EngineMetadata, HeaderChainValueError> {
-    decode_engine_metadata(bytes, Some(network_policy_digest))
+    decode_engine_metadata(
+        bytes,
+        HeaderChainDiskVersion(1),
+        Some(network_policy_digest),
+    )
 }
 
-/// Decode metadata, reading the network policy digest unless the caller supplies a version-one one.
+/// Decode metadata that carries the released version-two marker.
+///
+/// Version two also omitted the durable network policy digest. The layout matches version one
+/// except for the format marker; the migration injects the running node's policy the same way.
+pub(crate) fn decode_v2_engine_metadata(
+    bytes: &[u8],
+    network_policy_digest: [u8; 32],
+) -> Result<EngineMetadata, HeaderChainValueError> {
+    decode_engine_metadata(
+        bytes,
+        HeaderChainDiskVersion(2),
+        Some(network_policy_digest),
+    )
+}
+
+/// Decode metadata, reading the network policy digest unless the caller supplies a legacy one.
 fn decode_engine_metadata(
     bytes: &[u8],
-    v1_network_policy_digest: Option<[u8; 32]>,
+    expected_disk_format: HeaderChainDiskVersion,
+    injected_network_policy_digest: Option<[u8; 32]>,
 ) -> Result<EngineMetadata, HeaderChainValueError> {
-    let expected_disk_format = match v1_network_policy_digest {
-        Some(_) => HeaderChainDiskVersion(1),
-        None => HeaderChainDiskVersion::CURRENT,
-    };
     let mut decoder = Decoder::new(bytes);
     let disk_format = decoder.u32()?;
     if disk_format != expected_disk_format.0 {
@@ -1570,7 +1586,7 @@ fn decode_engine_metadata(
             })
         }
     };
-    let network_policy_digest = match v1_network_policy_digest {
+    let network_policy_digest = match injected_network_policy_digest {
         Some(digest) => digest,
         None => decoder.array()?,
     };
@@ -1958,6 +1974,21 @@ mod tests {
             decode_v1_engine_metadata(&version_one_bytes, metadata.network_policy_digest),
             Ok(EngineMetadata {
                 disk_format: HeaderChainDiskVersion(1),
+                ..metadata.clone()
+            })
+        );
+        // Version two used the same layout as version one with a different format marker.
+        let mut version_two_bytes = bytes.clone();
+        version_two_bytes[..4].copy_from_slice(&2_u32.to_be_bytes());
+        version_two_bytes.drain(6..38);
+        assert_eq!(
+            EngineMetadata::decode(&version_two_bytes),
+            Err(HeaderChainValueError::UnsupportedDiskFormat(2))
+        );
+        assert_eq!(
+            decode_v2_engine_metadata(&version_two_bytes, metadata.network_policy_digest),
+            Ok(EngineMetadata {
+                disk_format: HeaderChainDiskVersion(2),
                 ..metadata.clone()
             })
         );

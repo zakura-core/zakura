@@ -26,19 +26,6 @@ mod arbitrary;
 #[allow(dead_code)]
 pub struct SeedRandomness(pub(crate) [u8; 32]);
 
-impl SeedRandomness {
-    pub fn new<T>(csprng: &mut T) -> Result<Self, RandError>
-    where
-        T: RngCore + CryptoRng,
-    {
-        let mut bytes = [0u8; 32];
-        csprng
-            .try_fill_bytes(&mut bytes)
-            .map_err(|_| RandError::FillBytes)?;
-        Ok(Self(bytes))
-    }
-}
-
 /// Used as input to PRF^nf as part of deriving the _nullifier_ of the _note_.
 ///
 /// When creating a new note from spending an old note, the new note's _rho_ is

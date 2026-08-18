@@ -9,7 +9,7 @@ use crate::{
     constants::CURRENT_NETWORK_PROTOCOL_VERSION,
     protocol::external::{AddrInVersion, Codec, Message},
     types::PeerServices,
-    VersionMessage,
+    PeerSocketAddr, VersionMessage,
 };
 
 use super::super::*;

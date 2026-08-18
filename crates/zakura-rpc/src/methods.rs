@@ -2921,6 +2921,10 @@ where
 
     async fn get_peer_info(&self) -> Result<Vec<PeerInfo>> {
         let address_book = self.address_book.clone();
+        if let Some(connected_peers) = address_book.connected_peers() {
+            return Ok(connected_peers.into_iter().map(PeerInfo::from).collect());
+        }
+
         Ok(address_book
             .recently_live_peers(chrono::Utc::now())
             .into_iter()

@@ -45,6 +45,7 @@ use crate::{
         OutboundConnectorRequest, PeerPreference,
     },
     peer_cache_updater::peer_cache_updater,
+    peer_registry::PeerRegistry,
     peer_set::{set::MorePeers, ActiveConnectionCounter, CandidateSet, ConnectionTracker, PeerSet},
     protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
     AddressBook, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
@@ -202,7 +203,8 @@ where
     // handshake builder consumes the original below. The factory only runs when
     // `v2_p2p` is enabled; otherwise the endpoint is `None` and the clone drops.
     let inbound_for_zakura_sink = inbound_service.clone();
-    let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_header_sync_driver(
+    let peer_registry = PeerRegistry::default();
+    let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_peer_registry(
         &config,
         move |supervisor, trace| {
             Arc::new(crate::zakura::LegacyGossipSink::spawn_with_trace(
@@ -212,12 +214,18 @@ where
             )) as Arc<dyn crate::zakura::Service>
         },
         header_sync_driver_startup,
+        peer_registry.clone(),
     )
     .await
     .expect("Zakura endpoint should start when P2P v2 is enabled");
 
     let (address_book, bans, address_book_updater, address_metrics, address_book_updater_guard) =
-        AddressBookUpdater::spawn(&config, listen_addr, advertised_services);
+        AddressBookUpdater::spawn_with_peer_registry(
+            &config,
+            listen_addr,
+            advertised_services,
+            peer_registry.clone(),
+        );
 
     let (misbehavior_tx, misbehavior_rx) = mpsc::channel(
         // Leave enough room for a misbehaviour update on every peer connection
@@ -271,6 +279,7 @@ where
             .with_advertised_services(advertised_services)
             .with_user_agent(user_agent)
             .with_latest_chain_tip(latest_chain_tip.clone())
+            .with_peer_registry(peer_registry)
             .with_protected_peer_ips(protected_peer_ips)
             .want_transactions(true);
 

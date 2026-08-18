@@ -43,6 +43,7 @@ use crate::{
         CancelHeartbeatTask, Client, ClientRequest, Connection, ErrorSlot, HandshakeError,
         MinimumPeerVersion, PeerError,
     },
+    peer_registry::PeerRegistry,
     peer_set::{ConnectionTracker, InventoryChange},
     protocol::{
         external::{canonical_ip, types::*, AddrInVersion, Codec, InventoryHash, Message},
@@ -86,6 +87,7 @@ where
     minimum_peer_version: MinimumPeerVersion<C>,
     nonces: Arc<futures::lock::Mutex<IndexSet<Nonce>>>,
     zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
+    peer_registry: Option<PeerRegistry>,
 
     /// Inbound peer IPs that are exempt from the inbound-overload connection
     /// drop (operator-configured block-gossip / zcashd-compat sidecars),
@@ -136,6 +138,7 @@ where
             minimum_peer_version: self.minimum_peer_version.clone(),
             nonces: self.nonces.clone(),
             zakura_handshake_connector: self.zakura_handshake_connector.clone(),
+            peer_registry: self.peer_registry.clone(),
             protected_peer_ips: self.protected_peer_ips.clone(),
             parent_span: self.parent_span.clone(),
         }
@@ -478,6 +481,7 @@ where
     address_book_updater: Option<tokio::sync::mpsc::Sender<MetaAddrChange>>,
     inv_collector: Option<broadcast::Sender<InventoryChange>>,
     zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
+    peer_registry: Option<PeerRegistry>,
     protected_peer_ips: Option<Arc<HashSet<IpAddr>>>,
     latest_chain_tip: C,
 }
@@ -562,6 +566,7 @@ where
             relay: self.relay,
             inv_collector: self.inv_collector,
             zakura_handshake_connector: self.zakura_handshake_connector,
+            peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips,
         }
     }
@@ -572,6 +577,12 @@ where
         zakura_handshake_connector: ZakuraHandshakeConnector,
     ) -> Self {
         self.zakura_handshake_connector = Some(zakura_handshake_connector);
+        self
+    }
+
+    /// Provide the active peer registry used by local diagnostics.
+    pub(crate) fn with_peer_registry(mut self, peer_registry: PeerRegistry) -> Self {
+        self.peer_registry = Some(peer_registry);
         self
     }
 
@@ -633,6 +644,7 @@ where
             minimum_peer_version,
             nonces,
             zakura_handshake_connector: self.zakura_handshake_connector,
+            peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
             parent_span: Span::current(),
         })
@@ -658,6 +670,7 @@ where
             address_book_updater: None,
             inv_collector: None,
             zakura_handshake_connector: None,
+            peer_registry: None,
             protected_peer_ips: None,
             latest_chain_tip: NoChainTip,
         }
@@ -1004,6 +1017,7 @@ async fn upgrade_to_zakura_handshake<PeerTransport>(
     connected_addr: ConnectedAddr,
     node_config: &Config,
     zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
+    peer_registry: Option<&PeerRegistry>,
     address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
 ) -> Result<ZakuraUpgradeOutcome, HandshakeError>
 where
@@ -1020,6 +1034,14 @@ where
     // the real prelude exchange over a live Zakura endpoint.
     #[cfg(test)]
     if let Some(outcome) = connector.consume_test_outcome() {
+        record_zakura_upgrade(
+            &outcome,
+            connection_info,
+            connected_addr,
+            &connector,
+            peer_registry,
+            address_book_updater,
+        );
         return Ok(outcome);
     }
 
@@ -1101,26 +1123,57 @@ where
         }
     }
 
-    // Keep the upgraded peer's legacy address-book entry live for as long as the
-    // Zakura connection is registered, so the outbound crawler treats it as
-    // connected and does not re-dial it (which would re-run this upgrade and
-    // churn the QUIC connection). Only the outbound side reconnects, and only
-    // when we have a dialable address book entry for the peer.
-    if let ZakuraUpgradeOutcome::Upgraded { peer_id }
-    | ZakuraUpgradeOutcome::Duplicate { peer_id } = &outcome
-    {
-        if !connected_addr.is_inbound() {
-            if let Some(book_addr) = connected_addr.get_address_book_addr() {
-                connector.spawn_legacy_liveness_keeper(
-                    peer_id.clone(),
-                    book_addr,
-                    address_book_updater.clone(),
-                );
-            }
-        }
-    }
+    record_zakura_upgrade(
+        &outcome,
+        connection_info,
+        connected_addr,
+        &connector,
+        peer_registry,
+        address_book_updater,
+    );
 
     Ok(outcome)
+}
+
+/// Record active native metadata and suppress redundant outbound legacy dials.
+fn record_zakura_upgrade(
+    outcome: &ZakuraUpgradeOutcome,
+    connection_info: &ConnectionInfo,
+    connected_addr: ConnectedAddr,
+    connector: &ZakuraHandshakeConnector,
+    peer_registry: Option<&PeerRegistry>,
+    address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
+) {
+    let ZakuraUpgradeOutcome::Upgraded { peer_id } = outcome else {
+        return;
+    };
+
+    if let (Some(peer_registry), Some(peer)) = (
+        peer_registry,
+        crate::ConnectedPeer::from_connection_info(connection_info),
+    ) {
+        // The maintained outbound dial reuses this metadata across transport reconnects.
+        // An inbound upgrade binds its metadata only to the current connection.
+        let retain_for_redial = !connected_addr.is_inbound();
+        peer_registry.attach_native_metadata(peer_id.clone(), peer, retain_for_redial);
+    }
+
+    if connected_addr.is_inbound() {
+        return;
+    }
+
+    let Some(book_addr) = connected_addr.get_address_book_addr() else {
+        return;
+    };
+
+    // Keep the upgraded peer's legacy address-book entry live for as long as
+    // its Zakura connection is registered. This prevents the outbound crawler
+    // from re-running the upgrade.
+    connector.spawn_legacy_liveness_keeper(
+        peer_id.clone(),
+        book_addr,
+        address_book_updater.clone(),
+    );
 }
 
 /// The neutral upgrade fallback outcome: keep the legacy connection.
@@ -1467,6 +1520,7 @@ where
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
+        let peer_registry = self.peer_registry.clone();
 
         // Whether this peer is exempt from the inbound-overload connection drop.
         // Computed here (not in the future) so only the resulting `bool` is moved
@@ -1557,6 +1611,7 @@ where
                     connected_addr,
                     &config,
                     zakura_handshake_connector,
+                    peer_registry.as_ref(),
                     &address_book_updater,
                 )
                 .await
@@ -1601,6 +1656,14 @@ where
                     ))
                     .await;
             }
+
+            let (peer_registry_guard, peer_registry_updater) = peer_registry
+                .as_ref()
+                .and_then(|registry| {
+                    crate::ConnectedPeer::from_connection_info(&connection_info)
+                        .map(|peer| registry.register_legacy(peer))
+                })
+                .unzip();
 
             // Reconfigure the codec to use the negotiated version.
             //
@@ -1749,10 +1812,12 @@ where
             );
 
             let connection_task = tokio::spawn(
-                server
-                    .run(peer_rx)
-                    .instrument(connection_span.clone())
-                    .boxed(),
+                async move {
+                    let _peer_registry_guard = peer_registry_guard;
+                    server.run(peer_rx).await;
+                }
+                .instrument(connection_span.clone())
+                .boxed(),
             );
 
             let heartbeat_task = tokio::spawn(
@@ -1761,6 +1826,7 @@ where
                     shutdown_rx,
                     server_tx.clone(),
                     address_book_updater.clone(),
+                    peer_registry_updater,
                 )
                 .instrument(tracing::debug_span!(parent: connection_span, "heartbeat"))
                 .boxed(),
@@ -1898,6 +1964,7 @@ async fn send_periodic_heartbeats_with_shutdown_handle(
     shutdown_rx: oneshot::Receiver<CancelHeartbeatTask>,
     server_tx: futures::channel::mpsc::Sender<ClientRequest>,
     heartbeat_ts_collector: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    peer_registry_updater: Option<crate::peer_registry::PeerRegistryUpdater>,
 ) -> Result<(), BoxError> {
     use futures::future::Either;
 
@@ -1905,6 +1972,7 @@ async fn send_periodic_heartbeats_with_shutdown_handle(
         connected_addr,
         server_tx,
         heartbeat_ts_collector.clone(),
+        peer_registry_updater,
     );
 
     pin_mut!(shutdown_rx);
@@ -1955,6 +2023,7 @@ async fn send_periodic_heartbeats_run_loop(
     connected_addr: ConnectedAddr,
     mut server_tx: futures::channel::mpsc::Sender<ClientRequest>,
     heartbeat_ts_collector: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    peer_registry_updater: Option<crate::peer_registry::PeerRegistryUpdater>,
 ) -> Result<(), BoxError> {
     // Don't send the first heartbeat immediately - we've just completed the handshake!
     let mut interval = tokio::time::interval_at(
@@ -1971,6 +2040,9 @@ async fn send_periodic_heartbeats_run_loop(
         // We've reached another heartbeat interval without
         // shutting down, so do a heartbeat request.
         let ping_sent_at = Instant::now();
+        if let Some(peer_registry_updater) = &peer_registry_updater {
+            peer_registry_updater.record_ping_sent(ping_sent_at.into_std());
+        }
         if let Some(book_addr) = connected_addr.get_address_book_addr() {
             let _ = heartbeat_ts_collector
                 .send(MetaAddr::new_ping_sent(book_addr, ping_sent_at.into()))
@@ -1979,6 +2051,10 @@ async fn send_periodic_heartbeats_run_loop(
 
         let heartbeat = send_one_heartbeat(&mut server_tx);
         let rtt = heartbeat_timeout(heartbeat, &heartbeat_ts_collector, &connected_addr).await?;
+
+        if let (Some(peer_registry_updater), Some(rtt)) = (&peer_registry_updater, rtt) {
+            peer_registry_updater.record_response(rtt);
+        }
 
         // # Security
         //

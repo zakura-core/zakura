@@ -28,7 +28,8 @@ use zakura_chain::{
 };
 use zakura_consensus::MAX_BLOCK_SIGOPS;
 use zakura_network::{
-    address_book_peers::MockAddressBookPeers, types::PeerServices, PeerSocketAddr,
+    address_book_peers::MockAddressBookPeers, types::PeerServices, ConnectedPeer, PeerSocketAddr,
+    Version,
 };
 use zakura_node_services::BoxError;
 use zakura_state::{
@@ -2781,11 +2782,35 @@ async fn rpc_getpeerinfo() {
         zakura_chain::serialization::DateTime32::now(),
     );
 
+    let connected_peers = vec![
+        ConnectedPeer {
+            addr: outbound_mock_peer_address.addr(),
+            user_agent: Arc::from("/Zakura:1.0.3/"),
+            version: Version(170_160),
+            is_inbound: false,
+            rtt: None,
+            ping_sent_at: None,
+        },
+        ConnectedPeer {
+            addr: inbound_mock_peer_address.addr(),
+            user_agent: Arc::from("/MagicBean:2.1.1/"),
+            version: Version(170_120),
+            is_inbound: true,
+            rtt: None,
+            ping_sent_at: None,
+        },
+    ];
+    let expected_peer_info: Vec<_> = connected_peers
+        .iter()
+        .cloned()
+        .map(PeerInfo::from)
+        .collect();
     let mock_address_book = MockAddressBookPeers::new(vec![
         outbound_mock_peer_address,
         inbound_mock_peer_address,
         not_connected_mock_peer_adderess,
-    ]);
+    ])
+    .with_connected_peers(connected_peers);
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
@@ -2812,25 +2837,11 @@ async fn rpc_getpeerinfo() {
         .await
         .expect("We should have an array of addresses");
 
-    // Response of length should be 2. We have 2 connected peers and 1 unconnected peer in the address book.
+    // The registry contains two active peers.
+    // The RPC ignores the unconnected address-book peer.
     assert_eq!(get_peer_info.len(), 2);
 
-    let mut res_iter = get_peer_info.into_iter();
-    // Check for the outbound peer
-    assert_eq!(
-        res_iter
-            .next()
-            .expect("there should be a mock peer address"),
-        outbound_mock_peer_address.into()
-    );
-
-    // Check for the inbound peer
-    assert_eq!(
-        res_iter
-            .next()
-            .expect("there should be a mock peer address"),
-        inbound_mock_peer_address.into()
-    );
+    assert_eq!(get_peer_info, expected_peer_info);
 
     mempool.expect_no_requests().await;
 }
@@ -4099,6 +4110,8 @@ async fn rpc_addnode() {
             // TODO: Fix this when mock address book provides other values
             pingtime: Some(0.1f64),
             pingwait: None,
+            subver: None,
+            version: None,
         }]
     );
 

@@ -48,6 +48,7 @@ use super::trace::{reject_reason_label, ZakuraTrace};
 use crate::zakura::drive_header_sync_actions;
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::HeaderSyncAction;
+use crate::{peer_registry::PeerRegistry, BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
@@ -67,7 +68,6 @@ use crate::{
         ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
-use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
 
 /// Default total Zakura connections when P2P v2 is enabled.
 pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 256;
@@ -740,6 +740,7 @@ impl ZakuraEndpoint {
         let task_peer_id = peer_id.clone();
         let dial = tokio::spawn(async move {
             native_dial_supervised(endpoint.clone(), node_addr, limits, policy).await;
+            endpoint.supervisor.forget_native_metadata(&task_peer_id);
             endpoint
                 .upgrade_dials
                 .lock()
@@ -769,6 +770,7 @@ impl ZakuraEndpoint {
             .remove(peer_id);
         if let Some(handle) = handle {
             handle.abort();
+            self.supervisor.forget_native_metadata(peer_id);
         }
     }
 
@@ -881,6 +883,7 @@ pub struct ZakuraSupervisorHandle {
     inner: Arc<Mutex<ZakuraSupervisorState>>,
     shutdown: CancellationToken,
     peer_set_tx: watch::Sender<Vec<ZakuraPeerId>>,
+    peer_registry: Option<PeerRegistry>,
 }
 
 static NEXT_SUPERVISOR_ID: AtomicU64 = AtomicU64::new(1);
@@ -1016,6 +1019,17 @@ pub enum ZakuraOutboundFrame {
 impl ZakuraSupervisorHandle {
     /// Create an empty supervisor.
     pub fn new(max_connections_per_ip: usize) -> Self {
+        Self::new_inner(max_connections_per_ip, None)
+    }
+
+    pub(crate) fn new_with_peer_registry(
+        max_connections_per_ip: usize,
+        peer_registry: PeerRegistry,
+    ) -> Self {
+        Self::new_inner(max_connections_per_ip, Some(peer_registry))
+    }
+
+    fn new_inner(max_connections_per_ip: usize, peer_registry: Option<PeerRegistry>) -> Self {
         Self {
             id: NEXT_SUPERVISOR_ID.fetch_add(1, Ordering::Relaxed),
             inner: Arc::new(Mutex::new(ZakuraSupervisorState {
@@ -1027,6 +1041,7 @@ impl ZakuraSupervisorHandle {
             })),
             shutdown: CancellationToken::new(),
             peer_set_tx: watch::channel(Vec::new()).0,
+            peer_registry,
         }
     }
 
@@ -1142,6 +1157,9 @@ impl ZakuraSupervisorHandle {
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
                 set_active_connection_gauge(registered_ids.len());
                 self.peer_set_tx.send_replace(registered_ids);
+                if let Some(peer_registry) = &self.peer_registry {
+                    peer_registry.native_connected(peer_id.clone(), conn_id);
+                }
                 let disconnect_token = state
                     .active_by_peer
                     .get(&peer_id)
@@ -1211,6 +1229,15 @@ impl ZakuraSupervisorHandle {
         let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
         set_active_connection_gauge(registered_ids.len());
         self.peer_set_tx.send_replace(registered_ids);
+        if let Some(peer_registry) = &self.peer_registry {
+            peer_registry.native_disconnected(peer_id, conn_id);
+        }
+    }
+
+    fn forget_native_metadata(&self, peer_id: &ZakuraPeerId) {
+        if let Some(peer_registry) = &self.peer_registry {
+            peer_registry.forget_native_metadata(peer_id);
+        }
     }
 
     fn shutdown(&self) {
@@ -3260,6 +3287,30 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
+    spawn_zakura_endpoint_inner(config, sink_factory, header_sync_driver_startup, None).await
+}
+
+pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
+    config: &Config,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
+    peer_registry: PeerRegistry,
+) -> Result<Option<ZakuraEndpoint>, BoxError> {
+    spawn_zakura_endpoint_inner(
+        config,
+        sink_factory,
+        header_sync_driver_startup,
+        Some(peer_registry),
+    )
+    .await
+}
+
+async fn spawn_zakura_endpoint_inner(
+    config: &Config,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
+    peer_registry: Option<PeerRegistry>,
+) -> Result<Option<ZakuraEndpoint>, BoxError> {
     if !config.v2_p2p() {
         return Ok(None);
     }
@@ -3275,7 +3326,13 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     // case does not expose the native P2P_V2_ALPN surface on all interfaces.
     let builder = bind_native_endpoint(builder, config.zakura.listen_addr);
     let endpoint = builder.bind().await?;
-    let supervisor = ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip());
+    let supervisor = match peer_registry {
+        Some(peer_registry) => ZakuraSupervisorHandle::new_with_peer_registry(
+            config.zakura.max_connections_per_ip(),
+            peer_registry,
+        ),
+        None => ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip()),
+    };
     let tracer = config
         .zakura
         .trace_dir

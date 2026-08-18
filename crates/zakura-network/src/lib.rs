@@ -162,6 +162,7 @@ mod isolated;
 mod meta_addr;
 mod peer;
 mod peer_cache_updater;
+mod peer_registry;
 mod peer_set;
 mod policies;
 mod protocol;
@@ -194,6 +195,7 @@ pub use crate::{
         Client, ConnectedAddr, ConnectionInfo, HandshakeError, NotFoundClass, PeerError,
         SharedPeerError,
     },
+    peer_registry::ConnectedPeer,
     peer_set::{init, init_with_zakura_header_sync},
     policies::RetryLimit,
     protocol::{

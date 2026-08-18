@@ -5,13 +5,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{meta_addr::MetaAddr, AddressBookPeers, PeerSocketAddr};
+use crate::{meta_addr::MetaAddr, AddressBookPeers, ConnectedPeer, PeerSocketAddr};
 
 /// A mock [`AddressBookPeers`] implementation that's always empty.
 #[derive(Debug, Default, Clone)]
 pub struct MockAddressBookPeers {
     /// Return value for mock `recently_live_peers` method.
     recently_live_peers: Vec<MetaAddr>,
+    /// Return value for the optional live peer registry.
+    connected_peers: Option<Vec<ConnectedPeer>>,
 }
 
 impl MockAddressBookPeers {
@@ -19,7 +21,14 @@ impl MockAddressBookPeers {
     pub fn new(recently_live_peers: Vec<MetaAddr>) -> Self {
         Self {
             recently_live_peers,
+            connected_peers: None,
         }
+    }
+
+    /// Provide active connections from a live peer registry.
+    pub fn with_connected_peers(mut self, connected_peers: Vec<ConnectedPeer>) -> Self {
+        self.connected_peers = Some(connected_peers);
+        self
     }
 
     /// Adds a peer to the mock address book.
@@ -45,6 +54,10 @@ impl AddressBookPeers for MockAddressBookPeers {
             .filter(|peer| peer.was_recently_live(now))
             .cloned()
             .collect()
+    }
+
+    fn connected_peers(&self) -> Option<Vec<ConnectedPeer>> {
+        self.connected_peers.clone()
     }
 
     fn add_peer(&mut self, peer: PeerSocketAddr) -> bool {

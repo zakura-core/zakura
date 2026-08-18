@@ -122,8 +122,8 @@ impl ZakuradConfig {
 
     /// Loads configuration using a caller-provided environment variable prefix.
     ///
-    /// This allows callers that need multiple configs in the same process (e.g.,
-    /// the `copy-state` command) to keep overrides separate. For example:
+    /// This allows callers that need multiple configs in the same process to
+    /// keep overrides separate. For example:
     /// - Source/base config uses `ZAKURA_...` env vars (default prefix)
     /// - Target config uses `ZAKURA_TARGET_...` env vars
     ///

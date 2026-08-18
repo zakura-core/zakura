@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Export a Mainnet release-state bundle from a stopped-node state copy and publish
+# Export a Mainnet release-state bundle from an archive node's state and publish
 # it to R2: an immutable release-state/v1/<height>/ bundle plus the mutable
 # latest.json pointer consumed by the update-release-state workflow.
-# Run after the snapshot job stops the node, against the same state directory.
-# See README.md in this directory for host wiring, and
+#
+# The exporter opens the database as a read-only RocksDB secondary, so the node
+# does not have to be stopped. It must be an *archive* node: the frontier grid
+# covers the heights below the checkpoint, which a pruned database no longer
+# holds. See README.md in this directory for host wiring, and
 # docs/design/verified-commitment-trees.md, section 16, for the design.
 #
-# Usage: publish-release-state.sh <stopped-node-zakura-cache-dir>
+# Usage: publish-release-state.sh <archive-node-zakura-cache-dir>
 #
 # Required environment:
 #   RELEASE_STATE_R2_REMOTE   rclone destination, e.g. "r2:zakura-artifacts"
@@ -16,13 +19,16 @@
 # Optional environment:
 #   ZAKURA_CHECKPOINTS_BIN    zakura-checkpoints binary (default: on PATH),
 #                             built with --features zakura-checkpoints-offline
+#   RELEASE_STATE_GRID_COST_MS
+#                             per-entry frontier grid cost budget in ms
+#                             (default: whatever the exporter defaults to)
 #   RELEASE_STATE_KEEP        immutable bundles to retain (default 4)
 #   RELEASE_STATE_LOCK_FILE   host-local publisher lock
 #                             (default: /tmp/zakura-release-state-publish.lock)
 
 set -euo pipefail
 
-STATE_DIR=${1:?usage: publish-release-state.sh <stopped-node-zakura-cache-dir>}
+STATE_DIR=${1:?usage: publish-release-state.sh <archive-node-zakura-cache-dir>}
 : "${RELEASE_STATE_R2_REMOTE:?set RELEASE_STATE_R2_REMOTE to an rclone destination}"
 : "${RELEASE_STATE_PUBLIC_BASE:?set RELEASE_STATE_PUBLIC_BASE to the public HTTPS base URL}"
 BIN=${ZAKURA_CHECKPOINTS_BIN:-zakura-checkpoints}
@@ -35,6 +41,16 @@ if ! [[ "$KEEP" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 REMOTE_PREFIX="${RELEASE_STATE_R2_REMOTE%/}/release-state"
+# Left empty by default so the exporter's own budget applies, rather than pinning
+# a second copy of it here that would drift when the exporter's default changes.
+GRID_ARGS=()
+if [ -n "${RELEASE_STATE_GRID_COST_MS:-}" ]; then
+    if ! [[ "$RELEASE_STATE_GRID_COST_MS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "RELEASE_STATE_GRID_COST_MS must be a positive integer, got: ${RELEASE_STATE_GRID_COST_MS@Q}" >&2
+        exit 1
+    fi
+    GRID_ARGS+=(--frontier-grid-target-cost-ms "$RELEASE_STATE_GRID_COST_MS")
+fi
 
 # The publisher is intentionally single-host. Serializing the complete
 # export/upload/pointer/retention transaction prevents overlapping snapshot or
@@ -77,11 +93,15 @@ list_remote_object() {
     fi
 }
 
+# One run, one coupled release state: the frontier, subtree roots, and frontier
+# grid are all generated for the checkpoint this run selects.
 "$BIN" \
     --state-cache-dir "$STATE_DIR" \
     --full-list \
     --mainnet-frontier-output "$STAGE/mainnet-frontier.bin" \
     --mainnet-subtree-output "$STAGE/mainnet-treestate-subtrees.bin" \
+    --mainnet-frontier-grid-output "$STAGE/mainnet-frontier-grid.bin" \
+    ${GRID_ARGS[@]+"${GRID_ARGS[@]}"} \
     > "$STAGE/main-checkpoints.txt"
 
 HEIGHT=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f1)
@@ -112,6 +132,7 @@ for name in (
     "main-checkpoints.txt",
     "mainnet-frontier.bin",
     "mainnet-treestate-subtrees.bin",
+    "mainnet-frontier-grid.bin",
 ):
     data = open(os.path.join(stage, name), "rb").read()
     files[name] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
@@ -158,6 +179,7 @@ else
     rclone copyto "$STAGE/main-checkpoints.txt" "$BUNDLE_REMOTE/main-checkpoints.txt"
     rclone copyto "$STAGE/mainnet-frontier.bin" "$BUNDLE_REMOTE/mainnet-frontier.bin"
     rclone copyto "$STAGE/mainnet-treestate-subtrees.bin" "$BUNDLE_REMOTE/mainnet-treestate-subtrees.bin"
+    rclone copyto "$STAGE/mainnet-frontier-grid.bin" "$BUNDLE_REMOTE/mainnet-frontier-grid.bin"
     rclone copyto "$STAGE/meta.json" "$BUNDLE_REMOTE/meta.json"
     echo "published bundle v1/$HEIGHT ($BLOCK_HASH)" >&2
 fi

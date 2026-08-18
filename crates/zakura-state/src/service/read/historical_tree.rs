@@ -30,7 +30,9 @@ use zakura_chain::{
 
 use zakura_chain::subtree::NoteCommitmentSubtreeIndex;
 
-use crate::service::finalized_state::{FrontierArtifact, TransactionLocation, ZakuraDb};
+use crate::service::finalized_state::{
+    serve_block_roots, FrontierArtifact, TransactionLocation, ZakuraDb,
+};
 
 /// The most derived frontiers to keep in the per-node cache.
 ///
@@ -475,24 +477,41 @@ pub(crate) fn stored_frontier_before_absent_band(
         return Err(HistoricalTreeDerivationError::MissingAnchor { height, anchor });
     }
 
-    // These reads intentionally search backwards because unchanged trees are deduplicated. The tip
-    // check above establishes that the chain still reaches `anchor`, so such a row is its state.
+    // The tip check above establishes that the chain still reaches `anchor`, so the newest stored
+    // row at or below it is its state rather than a pre-rollback leftover.
+    let frontiers = stored_frontiers_at(db, anchor)
+        .map_err(|_| HistoricalTreeDerivationError::MissingAnchor { height, anchor })?;
+
+    Ok(Some((anchor, frontiers)))
+}
+
+/// Returns the per-height trees the database stores at `height`.
+///
+/// Unchanged trees are deduplicated, so the newest stored row at or below `height` is the state
+/// at `height`. That holds only where the database actually stores trees: callers must not use
+/// this inside a fast-synced database's absent band, where the newest row below the requested
+/// height belongs to a different stretch of the chain entirely. Genesis writes a row for every
+/// pool, so a pool with no activity yet still resolves to its empty tree.
+pub(crate) fn stored_frontiers_at(
+    db: &ZakuraDb,
+    height: Height,
+) -> Result<DerivedFrontiers, HistoricalTreeDerivationError> {
     let (Some(sapling), Some(orchard), Some(ironwood)) = (
-        db.latest_stored_sapling_tree(&anchor),
-        db.latest_stored_orchard_tree(&anchor),
-        db.latest_stored_ironwood_tree(&anchor),
+        db.latest_stored_sapling_tree(&height),
+        db.latest_stored_orchard_tree(&height),
+        db.latest_stored_ironwood_tree(&height),
     ) else {
-        return Err(HistoricalTreeDerivationError::MissingAnchor { height, anchor });
+        return Err(HistoricalTreeDerivationError::MissingAnchor {
+            height,
+            anchor: height,
+        });
     };
 
-    Ok(Some((
-        anchor,
-        DerivedFrontiers {
-            sapling,
-            orchard,
-            ironwood,
-        },
-    )))
+    Ok(DerivedFrontiers {
+        sapling,
+        orchard,
+        ironwood,
+    })
 }
 
 /// Appends the note commitments of blocks `replay_from..=height` to `frontiers`, reporting every
@@ -652,6 +671,33 @@ pub fn verify_against_index(
     frontiers: &DerivedFrontiers,
 ) -> Result<(), HistoricalTreeDerivationError> {
     let roots = authenticated_roots(db, height)?;
+
+    if frontiers.matches(&roots) {
+        Ok(())
+    } else {
+        Err(HistoricalTreeDerivationError::RootMismatch { height })
+    }
+}
+
+/// Checks `frontiers` against the best roots the database can produce for `height`.
+///
+/// Generation-only. It differs from [`verify_against_index`] in one place: below the upgrade
+/// marker, where the serving index has no rows because an older binary committed those blocks,
+/// it falls back to roots derived from the per-height trees. There the check is a consistency
+/// check rather than an independent one, since the roots come from the same trees the entry does.
+/// That is acceptable precisely because the artifact carries no trust of its own — the consumer
+/// re-checks every entry against roots authenticated by its own header chain before anchoring on
+/// it, and a consumer's absent band never overlaps a range where it has trees of its own.
+pub(crate) fn verify_against_available_roots(
+    db: &ZakuraDb,
+    height: Height,
+    frontiers: &DerivedFrontiers,
+) -> Result<(), HistoricalTreeDerivationError> {
+    let roots = serve_block_roots(db, height..=height)
+        .into_iter()
+        .next()
+        .filter(|roots| roots.height == height)
+        .ok_or(HistoricalTreeDerivationError::MissingAuthenticatedRoot { height })?;
 
     if frontiers.matches(&roots) {
         Ok(())

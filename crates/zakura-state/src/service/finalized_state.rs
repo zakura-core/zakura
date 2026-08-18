@@ -123,7 +123,7 @@ pub use treestate_artifact::{
     TreestateArtifactError, VerifiedSubtreeCounts,
 };
 pub use treestate_export::{
-    export_frontier_grid, produce_release_treestate_artifacts, FrontierGridExport,
+    export_frontier_grid_to, produce_release_treestate_artifacts, FrontierGridExport,
     FrontierGridExportError, GridSpacing, ReleaseTreestateArtifacts,
     ReleaseTreestateArtifactsError,
 };

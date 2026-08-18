@@ -20,7 +20,8 @@ separately, pinned by the same final frontier the commit path already verifies.
 | Frontier derivation, root check, bounded cache | On `main` |
 | Subtree-root artifact and `z_getsubtreesbyindex` serving | On `main` |
 | Typed `HistoricalTreeUnavailable` in place of `null` / empty list | On `main` |
-| Frontier grid artifact, config gating, `export-historical-treestates` | PR [#703](https://github.com/zakura-core/zakura/pull/703) |
+| Frontier grid artifact and config gating | PR [#703](https://github.com/zakura-core/zakura/pull/703) |
+| Grid generation and distribution through the release-state pipeline | This PR |
 | Client-side removal of the per-block `trees` dependency (§6) | Not started |
 
 ## 1. Problem: the absent band
@@ -61,7 +62,9 @@ Goals:
 - Add no **new** trust surface: every served frontier and subtree root is cryptographically
   pinned by something the node already authenticated.
 - Keep the artifact small enough to distribute through the existing release-state pipeline,
-  without embedding it in the binary.
+  without embedding it in the binary. Committed as a file, not `include_bytes!`: an operator
+  points `state.historical_frontier_artifact` at it, and a node that never enables derivation
+  pays nothing for it.
 - Keep the consensus commit path untouched.
 
 Non-goals:
@@ -229,25 +232,58 @@ Configuration (`zakura-state/src/config.rs`):
 
 ## 5. Generation
 
-The two artifacts have independent generators. Neither needs the other, and neither
-touches the consensus commit path.
+Both artifacts come out of one `zakura-checkpoints` run, alongside the checkpoint list and
+the final frontier, and none of it touches the consensus commit path. The coupling is not
+cosmetic. A node refuses to start when the grid's checkpoint is below its own fast-sync
+handoff, and a node's handoff comes from the embedded checkpoint list, so a grid that
+advanced independently of that list would eventually fail closed on upgrade. Generating
+every artifact for the checkpoint the same run selects makes that impossible by
+construction.
 
-**Frontier grid** — `zakurad export-historical-treestates`, run read-only against a
-quiesced archive database on the publisher host. It replays block bodies and checks each
-grid entry against the authenticated roots in `commitment_roots_by_height`, rather than
-reading stored per-height trees, so any **archive** node can generate it, fast-synced
-included. That is how the current Mainnet artifacts were produced. A pruned node still
-cannot, because replay needs retained bodies. Where a database upgraded to VCT above
-genesis, generation anchors on the stored per-pool trees at `U - 1` and replays only the
-absent band `[U, H)`. The command defaults to a cost-weighted grid at a 2 s per-entry
-budget (`--target-cost-ms 2000`); `--spacing` produces a uniform grid, which cannot bound
-the worst-case cold request at a sane size and is not recommended.
+**Frontier grid** — `zakura-checkpoints --mainnet-frontier-grid-output`, run against an
+archive database. The database is opened as a read-only RocksDB secondary, so the node
+does not have to be stopped. Each entry's frontiers come from whichever source the
+database holds at that height: stored per-height trees where they exist, and a replay of
+retained block bodies only across a fast-synced database's absent band `[U, H)`. Every
+entry is then checked against the authenticated roots the database already holds, and a
+failed check stops generation rather than publishing the entry.
 
-**Subtree roots** — the release-state pipeline, where `zakura-checkpoints` extends the
-embedded artifact with the rows the database retained after the previous checkpoint and
-proves the result against the newly produced final frontier before returning it. It needs
-neither historical block bodies nor a shared pass with the grid.
-`zakurad verify-historical-treestates` repeats that proof offline for a candidate bundle.
+A **legacy archive** node is therefore the natural generator: it has trees at every
+height, so it reads the whole grid with no replay at all, and its coverage tracks its tip
+rather than freezing at a handoff it no longer has. A fast-synced archive node can also
+generate, at the cost of one whole-band replay (Appendix A: ~1.9 h on Mainnet). A pruned
+node cannot, because it holds neither the trees nor the bodies below the checkpoint.
+
+Spacing defaults to cost-weighted at a 2 s per-entry budget
+(`--frontier-grid-target-cost-ms`); `--frontier-grid-spacing` produces a uniform grid,
+which cannot bound the worst-case cold request at a sane size and is not recommended.
+
+Cost-weighted spacing has a generation cost of its own: entry placement is decided by
+each block's commitment count, so the generator reads every block body from genesis
+once, whatever source its entries come from. That is why a legacy archive node is faster
+than a fast-synced one but not fast in absolute terms — it skips the appends, not the
+scan. The alternative would be a cheaper proxy for commitment counts, but the placement
+function is part of the artifact's prefix contract, so changing it invalidates every
+published grid.
+
+The grid walk starts at genesis regardless of where the generating database's own
+boundaries fall. That is what makes entry heights a function of the chain alone, so
+exports from different databases, and from the same database at different tips, are
+byte-prefix extensions of one another. The release pipeline checks exactly that property
+before committing a new grid.
+
+**Subtree roots** — the same run, where `zakura-checkpoints` extends the embedded artifact
+with the rows the database retained after the previous checkpoint and proves the result
+against the newly produced final frontier before returning it. It needs neither historical
+block bodies nor the grid's pass. `zakurad verify-historical-treestates` repeats that proof
+offline for a candidate bundle, and also checks the bundle's grid for framing and for
+covering the same checkpoint as the rest of the bundle.
+
+**Distribution** — the release-state publisher uploads all four files as one immutable
+bundle, and `update-release-state.yml` imports them into one reviewable draft PR
+(verified-commitment-trees design §16). The grid is committed like the other artifacts,
+with its digest, size, and entry count recorded in `mainnet-vct-manifest.json`. It carries
+no trust weight either way: a consuming node re-checks every entry it anchors on.
 
 This remains the design's central trade: the ordered pass happens once, on one host, and is
 verified independently by every consumer.

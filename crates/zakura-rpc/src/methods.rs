@@ -178,7 +178,8 @@ mod tests;
 #[rpc(server)]
 /// RPC method signatures.
 pub trait Rpc {
-    /// Returns software information from the RPC server, as a [`GetInfo`] JSON struct.
+    /// Returns software information from the RPC server, as a
+    /// [`GetInfoResponse`] JSON struct.
     ///
     /// zcashd reference: [`getinfo`](https://zcash.github.io/rpc/getinfo.html)
     /// method: post
@@ -187,10 +188,12 @@ pub trait Rpc {
     /// # Notes
     ///
     /// [The zcashd reference](https://zcash.github.io/rpc/getinfo.html) might not show some fields
-    /// in Zebra's [`GetInfo`]. Zebra uses the field names and formats from the
-    /// [zcashd code](https://github.com/zcash/zcash/blob/v4.6.0-1/src/rpc/misc.cpp#L86-L87).
+    /// in Zebra's [`GetInfoResponse`]. Zebra uses the field names and formats
+    /// from the [zcashd
+    /// code](https://github.com/zcash/zcash/blob/v4.6.0-1/src/rpc/misc.cpp#L86-L87).
     ///
-    /// Some fields from the zcashd reference are missing from Zebra's [`GetInfo`]. It only contains the fields
+    /// Some fields from the zcashd reference are missing from Zebra's
+    /// [`GetInfoResponse`]. It only contains the fields
     /// [required for lightwalletd support.](https://github.com/zcash/lightwalletd/blob/v0.4.9/common/common.go#L91-L95)
     #[method(name = "getinfo")]
     async fn get_info(&self) -> Result<GetInfoResponse>;
@@ -236,7 +239,8 @@ pub trait Rpc {
     #[method(name = "getblockchaininfo")]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse>;
 
-    /// Returns the total balance of a provided `addresses` in an [`AddressBalance`] instance.
+    /// Returns the total balance of provided `addresses` in a
+    /// [`GetAddressBalanceResponse`] instance.
     ///
     /// zcashd reference: [`getaddressbalance`](https://zcash.github.io/rpc/getaddressbalance.html)
     /// method: post
@@ -265,7 +269,8 @@ pub trait Rpc {
     ) -> Result<GetAddressBalanceResponse>;
 
     /// Sends the raw bytes of a signed transaction to the local node's mempool, if the transaction is valid.
-    /// Returns the [`SentTransactionHash`] for the transaction, as a JSON string.
+    /// Returns the [`SendRawTransactionResponse`] for the transaction, as a
+    /// JSON string.
     ///
     /// zcashd reference: [`sendrawtransaction`](https://zcash.github.io/rpc/sendrawtransaction.html)
     /// method: post
@@ -287,7 +292,8 @@ pub trait Rpc {
         _allow_high_fees: Option<bool>,
     ) -> Result<SendRawTransactionResponse>;
 
-    /// Returns the requested block by hash or height, as a [`GetBlock`] JSON string.
+    /// Returns the requested block by hash or height, as a
+    /// [`GetBlockResponse`] JSON string.
     /// If the block is not in Zebra's state, returns
     /// [error code `-8`.](https://github.com/zcash/zcash/issues/5758) if a height was
     /// passed or -5 if a hash was passed.
@@ -317,7 +323,8 @@ pub trait Rpc {
         verbosity: Option<u8>,
     ) -> Result<GetBlockResponse>;
 
-    /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
+    /// Returns the requested block header by hash or height, as a
+    /// [`GetBlockHeaderResponse`] JSON string.
     /// If the block is not in Zebra's state,
     /// returns [error code `-8`.](https://github.com/zcash/zcash/issues/5758)
     /// if a height was passed or -5 if a hash was passed.
@@ -341,7 +348,8 @@ pub trait Rpc {
         verbose: Option<bool>,
     ) -> Result<GetBlockHeaderResponse>;
 
-    /// Returns the hash of the current best blockchain tip block, as a [`GetBlockHash`] JSON string.
+    /// Returns the hash of the current best blockchain tip block, as a
+    /// [`GetBlockHashResponse`] JSON string.
     ///
     /// zcashd reference: [`getbestblockhash`](https://zcash.github.io/rpc/getbestblockhash.html)
     /// method: post
@@ -425,7 +433,8 @@ pub trait Rpc {
         limit: Option<NoteCommitmentSubtreeIndex>,
     ) -> Result<GetSubtreesByIndexResponse>;
 
-    /// Returns the raw transaction data, as a [`GetRawTransaction`] JSON string or structure.
+    /// Returns the raw transaction data, as a [`GetRawTransactionResponse`]
+    /// JSON string or structure.
     ///
     /// zcashd reference: [`getrawtransaction`](https://zcash.github.io/rpc/getrawtransaction.html)
     /// method: post
@@ -1282,7 +1291,7 @@ where
         }
     }
 
-    // TODO: use HexData or GetRawTransaction::Bytes to handle the transaction data argument
+    // TODO: use HexData to handle the transaction data argument.
     async fn send_raw_transaction(
         &self,
         raw_transaction_hex: String,
@@ -3449,9 +3458,6 @@ pub struct GetInfoResponse {
     errors_timestamp: i64,
 }
 
-#[deprecated(note = "Use `GetInfoResponse` instead")]
-pub use self::GetInfoResponse as GetInfo;
-
 impl Default for GetInfoResponse {
     fn default() -> Self {
         GetInfoResponse {
@@ -3473,7 +3479,7 @@ impl Default for GetInfoResponse {
 }
 
 impl GetInfoResponse {
-    /// Constructs [`GetInfo`] from its constituent parts.
+    /// Constructs [`GetInfoResponse`] from its constituent parts.
     #[allow(clippy::too_many_arguments)]
     #[deprecated(note = "Use `GetInfoResponse::new` instead")]
     pub fn from_parts(
@@ -3508,7 +3514,7 @@ impl GetInfoResponse {
         }
     }
 
-    /// Returns the contents of ['GetInfo'].
+    /// Returns the contents of [`GetInfoResponse`].
     pub fn into_parts(
         self,
     ) -> (
@@ -3953,7 +3959,7 @@ impl From<DGetAddressBalanceRequest> for GetAddressBalanceRequest {
     }
 }
 
-/// An intermediate type used to deserialize [`AddressStrings`].
+/// An intermediate type used to deserialize [`GetAddressBalanceRequest`].
 #[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum DGetAddressBalanceRequest {
@@ -3962,10 +3968,6 @@ enum DGetAddressBalanceRequest {
     /// A single address string.
     Address(String),
 }
-
-/// A request to get the transparent balance of a set of addresses.
-#[deprecated(note = "Use `GetAddressBalanceRequest` instead.")]
-pub type AddressStrings = GetAddressBalanceRequest;
 
 /// A collection of validatable addresses
 pub trait ValidateAddresses {
@@ -3999,14 +4001,16 @@ impl ValidateAddresses for GetAddressBalanceRequest {
 }
 
 impl GetAddressBalanceRequest {
-    /// Creates a new `AddressStrings` given a vector.
+    /// Creates a new [`GetAddressBalanceRequest`] from a vector.
     pub fn new(addresses: Vec<String>) -> GetAddressBalanceRequest {
         GetAddressBalanceRequest { addresses }
     }
 
-    /// Creates a new [`AddressStrings`] from a given vector, returns an error if any addresses are incorrect.
+    /// Creates a new [`GetAddressBalanceRequest`] from a vector, returning an
+    /// error if any addresses are incorrect.
     #[deprecated(
-        note = "Use `AddressStrings::new` instead. Validity will be checked by the server."
+        note = "Use `GetAddressBalanceRequest::new` instead. Validity will be \
+                checked by the server."
     )]
     pub fn new_valid(addresses: Vec<String>) -> Result<GetAddressBalanceRequest> {
         let req = Self { addresses };
@@ -4035,9 +4039,6 @@ pub struct GetAddressBalanceResponse {
     /// The total received balance, including change.
     pub received: u64,
 }
-
-#[deprecated(note = "Use `GetAddressBalanceResponse` instead.")]
-pub use self::GetAddressBalanceResponse as AddressBalance;
 
 /// Parameters of [`RpcServer::get_address_utxos`] RPC method.
 #[derive(
@@ -4202,9 +4203,6 @@ impl TipConsensusBranch {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SendRawTransactionResponse(#[serde(with = "hex")] transaction::Hash);
 
-#[deprecated(note = "Use `SendRawTransactionResponse` instead")]
-pub use self::SendRawTransactionResponse as SentTransactionHash;
-
 impl Default for SendRawTransactionResponse {
     fn default() -> Self {
         Self(transaction::Hash::from([0; 32]))
@@ -4212,18 +4210,18 @@ impl Default for SendRawTransactionResponse {
 }
 
 impl SendRawTransactionResponse {
-    /// Constructs a new [`SentTransactionHash`].
+    /// Constructs a new [`SendRawTransactionResponse`].
     pub fn new(hash: transaction::Hash) -> Self {
         SendRawTransactionResponse(hash)
     }
 
-    /// Returns the contents of ['SentTransactionHash'].
-    #[deprecated(note = "Use `SentTransactionHash::hash` instead")]
+    /// Returns the contents of [`SendRawTransactionResponse`].
+    #[deprecated(note = "Use `SendRawTransactionResponse::hash` instead")]
     pub fn inner(&self) -> transaction::Hash {
         self.hash()
     }
 
-    /// Returns the contents of ['SentTransactionHash'].
+    /// Returns the contents of [`SendRawTransactionResponse`].
     pub fn hash(&self) -> transaction::Hash {
         self.0
     }
@@ -4240,9 +4238,6 @@ pub enum GetBlockResponse {
     /// The block object.
     Object(Box<BlockObject>),
 }
-
-#[deprecated(note = "Use `GetBlockResponse` instead")]
-pub use self::GetBlockResponse as GetBlock;
 
 impl Default for GetBlockResponse {
     fn default() -> Self {
@@ -4425,9 +4420,6 @@ pub enum GetBlockHeaderResponse {
     Object(Box<BlockHeaderObject>),
 }
 
-#[deprecated(note = "Use `GetBlockHeaderResponse` instead")]
-pub use self::GetBlockHeaderResponse as GetBlockHeader;
-
 #[allow(clippy::too_many_arguments)]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 /// Verbose response to a `getblockheader` RPC request.
@@ -4506,9 +4498,6 @@ pub struct BlockHeaderObject {
     next_block_hash: Option<block::Hash>,
 }
 
-#[deprecated(note = "Use `BlockHeaderObject` instead")]
-pub use BlockHeaderObject as GetBlockHeaderObject;
-
 impl Default for GetBlockHeaderResponse {
     fn default() -> Self {
         GetBlockHeaderResponse::Object(Box::default())
@@ -4560,9 +4549,6 @@ impl GetBlockHashResponse {
     }
 }
 
-#[deprecated(note = "Use `GetBlockHashResponse` instead")]
-pub use self::GetBlockHashResponse as GetBlockHash;
-
 /// A block hash used by this crate that encodes as hex by default.
 pub type Hash = GetBlockHashResponse;
 
@@ -4576,9 +4562,6 @@ pub struct GetBlockHeightAndHashResponse {
     #[getter(copy)]
     hash: block::Hash,
 }
-
-#[deprecated(note = "Use `GetBlockHeightAndHashResponse` instead.")]
-pub use GetBlockHeightAndHashResponse as GetBestBlockHeightAndHash;
 
 impl Default for GetBlockHeightAndHashResponse {
     fn default() -> Self {
@@ -4606,9 +4589,6 @@ pub enum GetRawTransactionResponse {
     /// The transaction object.
     Object(Box<TransactionObject>),
 }
-
-#[deprecated(note = "Use `GetRawTransactionResponse` instead")]
-pub use self::GetRawTransactionResponse as GetRawTransaction;
 
 impl Default for GetRawTransactionResponse {
     fn default() -> Self {
@@ -4669,9 +4649,6 @@ pub struct Utxo {
     height: Height,
 }
 
-#[deprecated(note = "Use `Utxo` instead")]
-pub use self::Utxo as GetAddressUtxos;
-
 impl Default for Utxo {
     fn default() -> Self {
         Self {
@@ -4689,7 +4666,7 @@ impl Default for Utxo {
 }
 
 impl Utxo {
-    /// Constructs a new instance of [`GetAddressUtxos`].
+    /// Constructs a new [`Utxo`].
     #[deprecated(note = "Use `Utxo::new` instead")]
     pub fn from_parts(
         address: transparent::Address,
@@ -4709,7 +4686,7 @@ impl Utxo {
         }
     }
 
-    /// Returns the contents of [`GetAddressUtxos`].
+    /// Returns the contents of [`Utxo`].
     pub fn into_parts(
         &self,
     ) -> (

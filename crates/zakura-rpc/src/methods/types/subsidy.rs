@@ -56,9 +56,6 @@ pub struct GetBlockSubsidyResponse {
     pub(crate) total_block_subsidy: Zec<NonNegative>,
 }
 
-#[deprecated(note = "Use `GetBlockSubsidyResponse` instead")]
-pub use self::GetBlockSubsidyResponse as BlockSubsidy;
-
 /// A single funding stream's information in a  `getblocksubsidy` RPC request
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct FundingStream {

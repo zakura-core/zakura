@@ -885,7 +885,8 @@ impl Default for TransactionObject {
 }
 
 impl TransactionObject {
-    /// Converts `tx` and `height` into a new `GetRawTransaction` in the `verbose` format.
+    /// Converts `tx` and `height` into a verbose
+    /// [`GetRawTransactionResponse`](crate::methods::GetRawTransactionResponse).
     #[allow(clippy::unwrap_in_result)]
     #[allow(clippy::too_many_arguments)]
     pub fn from_transaction(

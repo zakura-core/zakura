@@ -20,7 +20,7 @@ use zakura_rpc::{
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockchainInfoResponse, HexData,
         SubmitBlockResponse,
     },
-    methods::GetBlockHash,
+    methods::GetBlockHashResponse,
     proposal_block_from_template,
     server::{self, OPENED_RPC_ENDPOINT_MSG},
 };
@@ -147,7 +147,9 @@ impl MiningRpcMethods for RpcRequestClient {
     async fn generate(&self, num_blocks: u32) -> Result<Vec<block::Hash>> {
         self.json_result_from_call("generate", format!("[{num_blocks}]"))
             .await
-            .map(|response: Vec<GetBlockHash>| response.into_iter().map(|rsp| rsp.hash()).collect())
+            .map(|response: Vec<GetBlockHashResponse>| {
+                response.into_iter().map(|rsp| rsp.hash()).collect()
+            })
             .map_err(|err| eyre!(err))
     }
 

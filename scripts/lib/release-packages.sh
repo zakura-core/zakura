@@ -36,3 +36,14 @@ list_release_packages_at() {
     printf '%s\t%s\n' "$package" "$manifest_rel"
   done < <(git ls-tree -r --name-only "$revision")
 }
+
+# Rewrite every requirement for a workspace dependency to an explicit
+# prerelease target. Stable requirements never select prerelease versions, even
+# when they select the corresponding stable package version.
+rewrite_prerelease_dependency_requirements() {
+  local manifest="$1" crate="$2" target="$3"
+
+  CRATE="$crate" TARGET="$target" perl -0777 -pi -e \
+    's/(\Q$ENV{CRATE}\E\s*=\s*\{[^}]*?version\s*=\s*")[^"]+(")/$1$ENV{TARGET}$2/gs' \
+    "$manifest"
+}

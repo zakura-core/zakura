@@ -198,9 +198,7 @@ set_crate_version() {
       "$manifest_rel"
     local dep_manifest
     while IFS= read -r dep_manifest; do
-      CRATE="$crate" OLD="$current" NEW="$target" perl -0777 -pi -e \
-        's/(\Q$ENV{CRATE}\E\s*=\s*\{[^}]*?version\s*=\s*")\Q$ENV{OLD}\E(")/$1$ENV{NEW}$2/gs' \
-        "$dep_manifest"
+      rewrite_prerelease_dependency_requirements "$dep_manifest" "$crate" "$target"
     done < <(jq -r '.packages[].manifest_path' <<<"$metadata")
   else
     cargo release version "$target" \

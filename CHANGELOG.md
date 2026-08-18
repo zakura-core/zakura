@@ -11,6 +11,148 @@ independently.
 
 ## [Unreleased]
 
+## [1.3.0-rc0] - 2026-08-18
+
+### Added
+
+- Added fork-aware, bounded header and block synchronization with crash-atomic
+  header-chain persistence, contextual validation, resumable startup
+  reconstruction, and header-time authentication of peer-supplied
+  verified-commitment-tree metadata
+  ([#586](https://github.com/zakura-core/zakura/pull/586)).
+- Embedded published completed subtree roots alongside the Mainnet last checkpoint, letting a
+  verified-commitment-trees fast-synced node serve `z_getsubtreesbyindex` through that last
+  checkpoint. Published roots never displace the node's own rows. A node that fast-synced at an
+  older checkpoint still uses a newer artifact, but only for history below its original handoff
+  ([#593](https://github.com/zakura-core/zakura/pull/593)).
+- Published subtree roots are proven against the note commitment frontier that pins them, so an
+  artifact with wrong or missing roots is rejected rather than served. The check runs at
+  generation, on the embedded artifact in CI, and on a candidate bundle before the release-state
+  update workflow imports it ([#593](https://github.com/zakura-core/zakura/pull/593)).
+- Mainnet checkpoint export now extends the completed subtree roots embedded in the binary using
+  retained database rows, allowing a pruned VCT node to publish the next coupled checkpoint,
+  frontier, and subtree artifacts. Added `verify-historical-treestates` to prove an artifact
+  against a frontier without a state database
+  ([#593](https://github.com/zakura-core/zakura/pull/593)).
+- The release-state update workflow now imports the subtree-root artifact alongside the checkpoint
+  list and frontier, enforcing that published roots are only ever appended to
+  ([#593](https://github.com/zakura-core/zakura/pull/593)).
+- `zakura_consensus::clear_shielded_verification_caches` forgets every cached
+  shielded bundle verification. It is hidden from the documentation and exists
+  for benchmarks, which must start each iteration with cold caches to measure
+  verification rather than cache hits. Clearing a cache only costs a
+  re-verification ([#600](https://github.com/zakura-core/zakura/pull/600)).
+
+### Changed
+
+- Changed native/legacy sync handoff, header capability readiness, and ordered
+  service demand to use one explicit lifecycle coordinator, preventing legacy
+  fallback from applying blocks while an accepted native apply is still live
+  ([#586](https://github.com/zakura-core/zakura/pull/586)).
+- Sapling bundle verification is now cached, so a transaction's Sapling proofs
+  and signatures are not verified a second time when the block that mines it
+  arrives. This extends the Orchard and Ironwood cache added in #597 to the
+  remaining shielded pool, under the same transaction-ID key
+  ([#600](https://github.com/zakura-core/zakura/pull/600)).
+- The shielded verification cache metrics moved from
+  `zakura.consensus.halo2.cache.{hit,miss,insert,evict,size}` to
+  `zakura.consensus.cache.{hit,miss,insert,evict,size}`, each carrying a
+  `verifier` label whose values are `halo2_pre_nu6_2`, `halo2_nu6_2`,
+  `halo2_nu6_3_onward` and `groth16_sapling`. Each Orchard circuit era now
+  reports its own hit rate instead of the three sharing one series. The
+  explicit-flush log for the Sapling batch also reports `groth16_sapling`
+  instead of `sapling`, matching that verifier's other metrics
+  ([#600](https://github.com/zakura-core/zakura/pull/600)).
+- Zakura derives auxiliary outcomes from exact state observations. It removes the caller-selected
+  verdict API. It validates untrusted durable outcomes before recovery promotes them. It requests
+  replacement auxiliary data when a retained successor lacks a usable witness. Version 2 changes
+  the auxiliary outcome encoding. Zakura atomically migrates version-1 header-chain databases at
+  startup without requiring a resync
+  ([#667](https://github.com/zakura-core/zakura/pull/667)).
+- Zakura bounds every header-chain startup collection before RocksDB decodes durable rows
+  ([#667](https://github.com/zakura-core/zakura/pull/667)).
+- Block and checkpoint verification now reject a block whose header carries an
+  invalid version or an unrepresentable timestamp before computing its hash.
+  Canonical deserialization already enforced the version rule, so this closes
+  the gap for in-memory headers that never went through the parser, such as
+  block proposals and locally constructed blocks
+  ([#674](https://github.com/zakura-core/zakura/pull/674)).
+- The provisional header-chain durable format moves from version 2 to version 3 to store the
+  complete network policy. Startup still migrates a released Mainnet version-1 database. Startup
+  rejects version-1 Testnet and Regtest databases because that format cannot authenticate their
+  configurable policy. Version 2 is unreleased and has no migration path, so a header-chain
+  database on that version must be deleted and resynchronized. The startup error names the
+  required version ([#692](https://github.com/zakura-core/zakura/pull/692)).
+
+### Removed
+
+- Removed the height-keyed header-root authentication lane and its durable
+  frontier; the committer now verifies supplied roots before persistence
+  ([#586](https://github.com/zakura-core/zakura/pull/586)).
+
+### Fixed
+
+- Fixed header-sync work and memory retention across body commits, finality
+  advances, peer terminal paths, process restarts, and committed resource-limit
+  refusals
+  ([#586](https://github.com/zakura-core/zakura/pull/586)).
+- Improved native scratch-sync commit throughput by caching immutable trust
+  data, using bounded exact-key lookups, parallelizing independent header
+  checks, and refilling the bounded header window before it is exhausted
+  ([#586](https://github.com/zakura-core/zakura/pull/586)).
+- Fixed `zakurad` silently accepting an expired or not-yet-valid RPC TLS
+  certificate at startup. It now logs a warning naming the certificate file and
+  the date the certificate fails on before opening the listener, so operators
+  can diagnose rejected client handshakes
+  ([#627](https://github.com/zakura-core/zakura/pull/627)).
+- Refused header-chain transitions before commit when protected retained paths
+  exceed configured bounds. Retention uses bounded candidate passes only under
+  pressure, recovers stalled headers-only state, and reports exact structural
+  work budgets
+  ([#665](https://github.com/zakura-core/zakura/pull/665)).
+- Improved checkpoint-sync performance by applying header graph updates incrementally
+  ([#679](https://github.com/zakura-core/zakura/pull/679)).
+- Fixed fork-aware header-chain upgrades so nodes atomically discard obsolete
+  header-overlay indexes instead of requiring a state resync
+  ([#688](https://github.com/zakura-core/zakura/pull/688)).
+- Fixed initial header DAG migration startup so it does not rescan every
+  historical finalized header
+  ([#689](https://github.com/zakura-core/zakura/pull/689)).
+- Stopped labeling network Prometheus counters by peer address, so `/metrics`
+  stays bounded on long-lived public listeners
+  ([#697](https://github.com/zakura-core/zakura/pull/697)).
+- Fixed block sync so selected-header extensions preserve in-flight body work
+  instead of downloading the bounded checkpoint window again
+  ([#700](https://github.com/zakura-core/zakura/pull/700)).
+- Accepted header batches that finalize past headers the same transition
+  inserted. A batch longer than the local finality depth advanced the finalized
+  frontier above a header it had just inserted, and the graph transition rejected
+  it, so header sync stalled on every retry of that batch
+  ([#706](https://github.com/zakura-core/zakura/pull/706)).
+- Stopped leaking one header child-index entry on every finality advance. The
+  advance deletes the new finalized frontier's parent, and the transition then
+  restored a child edge under that deleted parent
+  ([#706](https://github.com/zakura-core/zakura/pull/706)).
+- Fixed startup of version-one header-chain databases so the supported migration runs without
+  requiring a resync
+  ([#710](https://github.com/zakura-core/zakura/pull/710)).
+
+### Security
+
+- Updated dependencies to address published security advisories and expanded
+  supply-chain review coverage
+  ([#619](https://github.com/zakura-core/zakura/pull/619)).
+- Disabling proof of work now requires an authenticated custom network
+  configuration. A configuration claiming `disable_pow` for Mainnet or the
+  default public Testnet is refused with an error instead of silently waiving
+  Equihash verification. The waiver path still validates solution shape, so a
+  short Regtest-shaped solution cannot be accepted on a larger network
+  ([#674](https://github.com/zakura-core/zakura/pull/674)).
+- Fixed nine header-chain authority, recovery, finality, and replay flaws found by the V12
+  security review. Recovery now binds durable state to the complete network policy and validates
+  independent authority before it accepts full-state paths and finality witnesses
+  ([#692](https://github.com/zakura-core/zakura/pull/692)).
+
 ## [1.2.0] - 2026-08-14
 
 ### Added

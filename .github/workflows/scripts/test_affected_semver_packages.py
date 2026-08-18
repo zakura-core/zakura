@@ -135,6 +135,22 @@ class AffectedSemverPackagesTest(unittest.TestCase):
 
         self.assertEqual(affected, ["dependent"])
 
+    def test_excludes_zakura_node_package_from_semver_enforcement(self):
+        packages = [
+            self.package("library"),
+            self.package(
+                "zakura",
+                dependencies=[self.dependency("library")],
+            ),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=["library/src/lib.rs", "zakura/src/main.rs"],
+        )
+
+        self.assertEqual(affected, ["library"])
+
 
 if __name__ == "__main__":
     unittest.main()

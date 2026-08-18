@@ -20,6 +20,8 @@
 #   keeps optional heavy features (e.g. lightwalletd-grpc-tests and its
 #   protoc dependency) out of the rustdoc builds. Feature-gated public APIs
 #   are not semver-checked, mirroring existing release practice.
+# - The `zakura` node binary package is excluded because its Rust types are not
+#   a supported library API. Its release version is managed separately.
 # - publish = false members (xtask, zakura-watchdog) are skipped automatically.
 # - A NEW publishable crate that has never been published to crates.io fails
 #   with "no baseline": add `--exclude <crate>` to the check command in the

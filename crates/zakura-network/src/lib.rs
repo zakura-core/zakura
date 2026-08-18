@@ -58,9 +58,6 @@
 //! Zebra uses direct TCP connections to share blocks and mempool transactions
 //! with other peers.
 //!
-//! The [`isolated`] API provides isolated connections to individual peers for
-//! testing and custom applications.
-//!
 //! ### Individual Peer Connections
 //!
 //! Each new peer connection spawns the following tasks:
@@ -156,6 +153,7 @@ pub mod constants;
 
 mod address_book;
 mod address_book_updater;
+#[cfg(any(test, feature = "proptest-impl"))]
 mod isolated;
 mod meta_addr;
 mod peer;

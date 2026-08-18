@@ -654,7 +654,7 @@ wait_for_native_suffix_coverage() {
   local block_file="${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.jsonl"
   local header_file="${ZAKURA_E2E_TRACE_DIR}/node2/header_sync.jsonl"
   local deadline=$((SECONDS + timeout)) request_summary covered=0
-  local first_request_ts lifecycle_count apply_summary
+  local first_request_ts lifecycle_count apply_summary apply_ready=0
 
   while (( SECONDS < deadline )); do
     request_summary=$(trace_rows_after "${block_file}" "${block_lines_before}" \
@@ -719,12 +719,15 @@ wait_for_native_suffix_coverage() {
         ' >/dev/null \
     || fail "node2 native requests were not confined to suffix ${suffix_start}..${suffix_end}"
 
-  apply_summary=$(trace_rows_after "${block_file}" "${block_lines_before}" \
-    | jq -sc \
-        --arg process "${CHECKPOINT_HANDOFF_PROCESS_TRACE_ID}" \
-        --argjson handoff_ts "${CHECKPOINT_HANDOFF_TS}" \
-        --argjson suffix_start "${suffix_start}" \
-        --argjson suffix_end "${suffix_end}" '
+  # RPC height can advance before the asynchronous trace writer flushes the
+  # matching block_apply_finished row. Poll the trace within the request deadline.
+  while true; do
+    apply_summary=$(trace_rows_after "${block_file}" "${block_lines_before}" \
+      | jq -sc \
+          --arg process "${CHECKPOINT_HANDOFF_PROCESS_TRACE_ID}" \
+          --argjson handoff_ts "${CHECKPOINT_HANDOFF_TS}" \
+          --argjson suffix_start "${suffix_start}" \
+          --argjson suffix_end "${suffix_end}" '
           [ .[] | select(
               .process_trace_id == $process
               and .event == "block_apply_finished"
@@ -751,9 +754,9 @@ wait_for_native_suffix_coverage() {
               committed_count: ($committed | length),
               expected_count: ($suffix_end - $suffix_start + 1)
             }
-        ')
-  printf '%s' "${apply_summary}" \
-    | jq -e \
+          ')
+    apply_ready=$(printf '%s' "${apply_summary}" \
+      | jq -r \
         --argjson suffix_start "${suffix_start}" \
         --argjson suffix_end "${suffix_end}" '
           .applies_before_or_at_handoff == 0
@@ -761,7 +764,17 @@ wait_for_native_suffix_coverage() {
           and .committed_first == $suffix_start
           and .committed_last == $suffix_end
           and .committed_count == .expected_count
-        ' >/dev/null \
+        ')
+    printf '  node2 native suffix commit coverage=%s/%s (target %s..%s)\n' \
+      "$(printf '%s' "${apply_summary}" | jq -r '.committed_count')" \
+      "$(printf '%s' "${apply_summary}" | jq -r '.expected_count')" \
+      "${suffix_start}" "${suffix_end}"
+    [[ "${apply_ready}" == "true" ]] && break
+    (( SECONDS < deadline )) || break
+    sleep 3
+  done
+
+  [[ "${apply_ready}" == "true" ]] \
     || fail "node2 did not commit exactly the native suffix ${suffix_start}..${suffix_end} after checkpoint handoff"
 
   first_request_ts=$(printf '%s' "${request_summary}" | jq -r '.first_request_ts')

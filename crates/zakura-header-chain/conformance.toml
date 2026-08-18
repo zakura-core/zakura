@@ -196,6 +196,7 @@ status = "implemented"
 owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
 tests = [
     "IN-02::public_transition_api_plans_then_installs_one_verified_dag_change",
+    "IN-02::transition_installs_only_on_its_exact_source_engine",
     "DF-02::transition_event_contract_matrix_is_exhaustive",
 ]
 networks = ["mainnet", "testnet", "custom"]
@@ -473,6 +474,14 @@ tests = ["DG-07::migrated_pin_refutation_requires_full_state_authority_and_exact
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
+id = "LC-FINAL-05"
+name = "Authenticated disk migration"
+status = "implemented"
+owner = "zakura_state::HeaderChainStore::migrate_to_current"
+tests = ["DG-07::version_three_integrated_migration_authenticates_the_full_state_frontier", "DG-07::version_three_migration_rejects_a_network_policy_mismatch_atomically", "DG-07::every_legacy_headers_only_version_migrates_with_a_complete_depth_proof"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
 id = "LC-RETAIN-01"
 name = "Fork and node limits"
 status = "implemented"
@@ -710,6 +719,14 @@ name = "Cryptographic metadata authentication"
 status = "implemented"
 owner = "zakura_state::service::write::HeaderChainWriter::vct_authentication_request"
 tests = ["IN-06::auxiliary_outcomes_derive_from_exact_owned_observations", "IN-06::vct_untrusted_source_defers_unverifiable_tip_root_until_successor", "IN-06::vct_untrusted_source_bad_root_replacement_commits_same_height", "IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence", "IN-06::authenticates_every_supplied_delivery_ahead_of_its_body", "IN-06::never_authenticates_or_over_rejects_a_corrupted_delivery", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-AUX-05"
+name = "Recovered outcome lifecycle"
+status = "implemented"
+owner = "zakura_state::service::finalized_state::VctAuxiliaryWindow"
+tests = ["IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_evidence"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

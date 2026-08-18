@@ -182,6 +182,12 @@ through the independent canonical index. Recovery authenticates each witness
 above the finalized frontier through a bounded retained-row parent walk to the
 current finalized frontier. Recovery authenticates every historical current
 frontier through the linked predecessor context or the canonical index.
+Recovery verifies the deterministic receipt identity of every retained
+full-state finality record. Disk-format migration authenticates the active
+frontier before it replaces unverifiable version 1–3 history with one migration
+record at the existing finality epoch. Headers-only history uses a bounded
+content-addressed witness DAG. Recovery checks retained or canonical witnesses
+before it reads that DAG.
 
 ## Changing the transition model
 

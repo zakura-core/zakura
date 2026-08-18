@@ -15,11 +15,11 @@ use super::super::{
 use super::{fixture, injected_store_error, violations, AuditRead, AuditStore};
 use crate::{
     AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId, ChainScore,
-    CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState,
-    EngineConfig, EngineMode, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
-    FullStateFinalityProvenance, HeaderGeneration, HeaderNode, HeaderValidationState,
-    HeaderWorkAuthority, HeaderWorkOwner, SourceId, StateVersion, StoreAuditSnapshot, StoreError,
-    SuffixWork, WorkCoordinate,
+    CheckpointSet, ConsensusInvalidBodyTombstone, DiskMigrationAuthentication, EligibilityReason,
+    EligibilityState, EngineConfig, EngineMode, EvidenceId, FinalityEpoch, FinalityRecord,
+    FinalitySource, Frontier, FullStateFinalityProvenance, HeaderChainDiskVersion,
+    HeaderGeneration, HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner,
+    SourceId, StateVersion, StoreAuditSnapshot, StoreError, SuffixWork, WorkCoordinate,
 };
 
 #[test]
@@ -429,6 +429,80 @@ fn rebased_work_origin_requires_finality_history_and_canonical_authentication() 
     store
         .canonical
         .insert(child.height, block::Hash([0x92; 32]));
+    assert!(violations(&store, &config).contains(&AuditViolation::Configuration));
+}
+
+#[test]
+fn disk_migration_preserves_a_rebased_work_origin_below_the_migrated_frontier() {
+    let (mut store, config) = fixture();
+    let genesis_node = store.nodes[0].clone();
+    let child = store.metadata.frontiers.header_best;
+    let child_node = store.nodes[1].clone();
+    let mut grandchild_header = *child_node.header;
+    grandchild_header.previous_block_hash = child.hash;
+    grandchild_header.time += Duration::seconds(1);
+    grandchild_header.nonce = [2; 32].into();
+    let grandchild_header = Arc::new(grandchild_header);
+    let grandchild_hash = grandchild_header.hash();
+    let grandchild_work = grandchild_header
+        .difficulty_threshold
+        .to_work()
+        .expect("the fixture grandchild target has work");
+    let grandchild = Frontier::new(block::Height(2), grandchild_hash);
+    let grandchild_node = HeaderNode::from_durable_parts(
+        grandchild_header,
+        grandchild_hash,
+        child.hash,
+        grandchild.height,
+        grandchild_work,
+        WorkCoordinate::new(child.hash, grandchild_work.as_u256()),
+        HeaderValidationState::Valid,
+        EligibilityState::default(),
+        BodyValidationState::Verified {
+            evidence: EvidenceId::from_digest([0x61; 32]),
+        },
+        Vec::new(),
+    )
+    .expect("the canonical grandchild fields agree");
+
+    store.nodes = vec![grandchild_node];
+    store.children.clear();
+    store.selected = vec![grandchild];
+    store.verified = vec![grandchild];
+    store.contexts = vec![
+        ValidationContextRecord {
+            header: genesis_node.header,
+            height: genesis_node.height,
+        },
+        ValidationContextRecord {
+            header: child_node.header,
+            height: child.height,
+        },
+    ];
+    store.metadata.work_origin = child;
+    store.metadata.frontiers.finalized = grandchild;
+    store.metadata.frontiers.header_best = grandchild;
+    store.metadata.frontiers.verified_best = grandchild;
+    store.metadata.header_best_score = ChainScore::new(SuffixWork::zero(), grandchild.hash);
+    store.metadata.oldest_retained_height = grandchild.height;
+    store.finality = vec![FinalityRecord {
+        previous: grandchild,
+        current: grandchild,
+        source: FinalitySource::DiskMigration {
+            from_version: HeaderChainDiskVersion(3),
+            network_policy_digest: config.network_policy_digest(),
+            authentication: DiskMigrationAuthentication::FullState,
+        },
+        epoch: store.metadata.finality_epoch,
+    }];
+    store.canonical.insert(grandchild.height, grandchild.hash);
+    store.snapshot = store.metadata.snapshot();
+
+    audit_store(&store, &config).expect("a v3 disk migration keeps an earlier rebased work origin");
+
+    store
+        .canonical
+        .insert(child.height, block::Hash([0x93; 32]));
     assert!(violations(&store, &config).contains(&AuditViolation::Configuration));
 }
 

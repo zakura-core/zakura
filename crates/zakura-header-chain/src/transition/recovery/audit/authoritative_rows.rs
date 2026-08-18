@@ -196,7 +196,11 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
         }
         previous = Some(record);
         last = Some(record);
-        work_origin_seen |= record.current == metadata.work_origin;
+        // v3→v4 migration replaces history with one DiskMigration row at finalized.
+        // Production nodes rebase work_origin to the init tip, which can sit below that frontier.
+        work_origin_seen |= record.current == metadata.work_origin
+            || matches!(record.source, FinalitySource::DiskMigration { .. })
+                && metadata.work_origin.height <= record.current.height;
         Ok(())
     })?;
     let history_has_expected_count = history_count == expected_history_count;

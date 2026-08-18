@@ -133,6 +133,7 @@ pub(super) fn candidate_with_delta(
             eligibility_changes: Vec::new(),
             aux_changes: Vec::new(),
             finality_append: None,
+            finality_ancestry: crate::FinalityWitnessProof::default(),
             metadata: engine.metadata().clone(),
         },
         graph_delta,
@@ -211,7 +212,11 @@ pub(super) fn checkpoint_fixture() -> (Fixture, PlanCandidate) {
         previous: fixture.anchor,
         current: fixture.child,
         source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x42; 32]),
+            provenance: crate::FullStateFinalityProvenance {
+                evidence: EvidenceId::from_digest([0x42; 32]),
+                state_version: plan.snapshot_before_commit.state_version,
+                kind: crate::FullStateFinalityKind::CheckpointGrow,
+            },
         },
         epoch: metadata.finality_epoch,
     });

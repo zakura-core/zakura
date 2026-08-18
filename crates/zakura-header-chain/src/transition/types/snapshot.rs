@@ -16,7 +16,7 @@ pub struct HeaderChainDiskVersion(pub u32);
 
 impl HeaderChainDiskVersion {
     /// Current durable header-chain schema version.
-    pub const CURRENT: Self = Self(3);
+    pub const CURRENT: Self = Self(4);
 }
 
 /// Persistent externally visible engine alarms.

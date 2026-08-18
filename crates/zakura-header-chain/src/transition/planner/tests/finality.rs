@@ -483,14 +483,42 @@ fn finalization_and_replacement_match_serial_histories() {
             store.snapshot(),
             store.selected.clone(),
             store.verified.clone(),
-            store.finality.clone(),
             nodes,
         )
     };
     assert_eq!(
         logical_state(&replacement_then_finality),
         logical_state(&finality_then_replacement),
-        "both barrier orders converge to one complete serial history"
+        "both barrier orders converge to one graph and projection state"
+    );
+    let left = replacement_then_finality
+        .finality
+        .last()
+        .expect("replacement-first history records finality");
+    let right = finality_then_replacement
+        .finality
+        .last()
+        .expect("finality-first history records finality");
+    assert_eq!(
+        (left.previous, left.current, left.epoch),
+        (right.previous, right.current, right.epoch)
+    );
+    let (
+        FinalitySource::FullState {
+            provenance: left_provenance,
+        },
+        FinalitySource::FullState {
+            provenance: right_provenance,
+        },
+    ) = (left.source, right.source)
+    else {
+        panic!("both serial histories use full-state finality");
+    };
+    assert_eq!(left_provenance.evidence, right_provenance.evidence);
+    assert_eq!(left_provenance.kind, right_provenance.kind);
+    assert_ne!(
+        left_provenance.state_version,
+        right_provenance.state_version
     );
     assert_eq!(
         replacement_then_finality
@@ -667,14 +695,16 @@ fn finality_atomic_prune_rebase_projection_generation() {
     );
     assert_eq!(
         changes.finality_append,
-        Some(FinalityRecord {
-            previous: old_finalized,
-            current: new_finalized,
-            source: FinalitySource::FullState {
+        Some(FinalityRecord::full_state_with_provenance(
+            old_finalized,
+            new_finalized,
+            FinalityEpoch::new(1),
+            crate::FullStateFinalityProvenance {
                 evidence: EvidenceId::from_digest([0x73; 32]),
+                state_version: before.state_version,
+                kind: crate::FullStateFinalityKind::Finalized,
             },
-            epoch: FinalityEpoch::new(1),
-        })
+        ))
     );
     verify_plan(&test_engine(&store), &plan)
         .expect("the complete atomic finality plan is coherent");
@@ -899,6 +929,7 @@ fn integrated_finality_requires_authority_and_exact_verified_path() {
     let old_finalized = store.metadata.frontiers.finalized;
     let new_finalized = store.verified[1];
     let finality_id = EvidenceId::from_digest([5; 32]);
+    let finality_version = store.metadata.state_version;
     let finalize = TransitionRequest {
         expected_version: store.metadata.state_version,
         event: TransitionEvent::FullStateFinalized(crate::FullStateFinalized {
@@ -914,10 +945,21 @@ fn integrated_finality_requires_authority_and_exact_verified_path() {
     )
     .expect("exact verified full-state evidence advances finality");
     assert_eq!(plan.change_set.metadata.frontiers.finalized, new_finalized);
-    assert!(matches!(
-        plan.change_set.finality_append.expect("full-state finality is recorded").source,
-        FinalitySource::FullState { evidence } if evidence == finality_id
-    ));
+    assert_eq!(
+        plan.change_set
+            .finality_append
+            .expect("full-state finality is recorded"),
+        FinalityRecord::full_state_with_provenance(
+            old_finalized,
+            new_finalized,
+            FinalityEpoch::new(1),
+            crate::FullStateFinalityProvenance {
+                evidence: finality_id,
+                state_version: finality_version,
+                kind: crate::FullStateFinalityKind::Finalized,
+            },
+        )
+    );
     store.commit(&plan);
 
     assert!(matches!(
@@ -982,6 +1024,7 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
         .header
         .clone();
     let evidence = EvidenceId::from_digest([0x92; 32]);
+    let checkpoint_version = store.metadata.state_version;
     let request = TransitionRequest {
         expected_version: store.metadata.state_version,
         event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
@@ -1012,13 +1055,21 @@ fn checkpoint_verified_growth_advances_verified_and_finalized_atomically() {
             &plan
         )
     );
-    assert!(matches!(
+    assert_eq!(
         plan.change_set
             .finality_append
-            .expect("checkpoint finality is recorded")
-            .source,
-        FinalitySource::FullState { evidence: actual } if actual == evidence
-    ));
+            .expect("checkpoint finality is recorded"),
+        FinalityRecord::full_state_with_provenance(
+            old_tip,
+            checkpoint,
+            FinalityEpoch::new(1),
+            crate::FullStateFinalityProvenance {
+                evidence,
+                state_version: checkpoint_version,
+                kind: crate::FullStateFinalityKind::CheckpointGrow,
+            },
+        )
+    );
 
     let mut unverified = plan.clone();
     unverified.change_set.put_nodes[0].body_validation_state = BodyValidationState::Unknown;
@@ -1209,7 +1260,13 @@ fn validate_finality_rebase_path_table() {
     let a3 = Frontier::new(block::Height(3), block::Hash([0x13; 32]));
     let competing = Frontier::new(block::Height(1), block::Hash([0x91; 32]));
     let evidence = EvidenceId::from_digest([0x44; 32]);
-    let source = FinalitySource::FullState { evidence };
+    let source = FinalitySource::FullState {
+        provenance: crate::FullStateFinalityProvenance {
+            evidence,
+            state_version: StateVersion::new(1),
+            kind: crate::FullStateFinalityKind::Finalized,
+        },
+    };
 
     struct Case {
         label: &'static str,

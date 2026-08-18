@@ -596,6 +596,12 @@ impl DiskWriteBatch {
             batch: rocksdb::WriteBatch::default(),
         }
     }
+
+    /// Return the exact serialized RocksDB write-batch size for internal benchmarks.
+    #[cfg(feature = "internal-bench")]
+    pub fn size_in_bytes(&self) -> usize {
+        self.batch.size_in_bytes()
+    }
 }
 
 impl DiskDb {
@@ -1228,6 +1234,37 @@ impl DiskDb {
             .next()
             .transpose()
             .map(|entry| entry.map(|(key, value)| (key.to_vec(), value.to_vec())))
+    }
+
+    /// Read the last raw key/value pair from one column family.
+    pub(crate) fn raw_last_cf<C>(
+        &self,
+        cf: &C,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        self.db
+            .iterator_cf(cf, rocksdb::IteratorMode::End)
+            .next()
+            .transpose()
+            .map(|entry| entry.map(|(key, value)| (key.to_vec(), value.to_vec())))
+    }
+
+    /// Read at most `limit` raw rows from the start of one column family.
+    pub(crate) fn raw_prefix_cf<C>(
+        &self,
+        cf: &C,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        self.db
+            .iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .take(limit)
+            .map(|entry| entry.map(|(key, value)| (key.to_vec(), value.to_vec())))
+            .collect()
     }
 
     /// Visit raw key/value pairs one at a time without collecting the column family.

@@ -21,10 +21,10 @@ use super::*;
 use crate::{
     AlarmSet, AuxDelivery, BodyValidationState, ChainScore, CheckpointSet,
     ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState, EngineMetadata, EngineMode,
-    EngineSnapshot, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
-    FrontierSet, HeaderChainDiskVersion, HeaderGeneration, HeaderNode, HeaderValidationState,
-    RowLimit, StateVersion, StoreCollection, StoreError, SuffixWork, TrustedAnchor,
-    UntrustedAuxDeliveryRow, VerifiedGeneration, WorkCoordinate,
+    EngineSnapshot, FinalityEpoch, FinalityRecord, Frontier, FrontierSet, HeaderChainDiskVersion,
+    HeaderGeneration, HeaderNode, HeaderValidationState, RowLimit, StateVersion, StoreCollection,
+    StoreError, SuffixWork, TrustedAnchor, UntrustedAuxDeliveryRow, VerifiedGeneration,
+    WorkCoordinate,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -439,14 +439,11 @@ pub(super) fn fixture() -> (AuditStore, EngineConfig) {
             canonical: HashMap::from([(anchor.height, anchor.hash), (child.height, child.hash)]),
             canonical_reads: Arc::new(AtomicUsize::new(0)),
             finality_checkpoint: None,
-            finality: vec![FinalityRecord {
-                previous: anchor,
-                current: anchor,
-                source: FinalitySource::FullState {
-                    evidence: EvidenceId::from_digest([0x44; 32]),
-                },
-                epoch: FinalityEpoch::new(0),
-            }],
+            finality: vec![FinalityRecord::full_state(
+                anchor,
+                anchor,
+                FinalityEpoch::new(0),
+            )],
             failed_read: None,
         },
         config,

@@ -127,3 +127,8 @@ feature_missing = "warn"
 name = "transparent_spend_worst_case"
 harness = false
 required-features = ["internal-bench"]
+
+[[bench]]
+name = "finality_witness"
+harness = false
+required-features = ["internal-bench"]

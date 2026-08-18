@@ -539,7 +539,7 @@ impl MemHeaderStore {
             }
             Err(error) => return Err(error.into()),
         };
-        if let Some(tombstone) = self.consensus_invalid_body_tombstones.get(&hash) {
+        if let Some(tombstone) = self.consensus_invalid_body_tombstones.get(&hash).cloned() {
             body_validation_state = BodyValidationState::ConsensusInvalid {
                 evidence: tombstone.evidence,
                 rule: tombstone.rule.clone(),

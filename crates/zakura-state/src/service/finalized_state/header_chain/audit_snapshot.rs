@@ -342,37 +342,85 @@ impl StoreAuditSnapshot for HeaderChainAuditSnapshot<'_> {
         &self,
         height: block::Height,
     ) -> Result<Option<block::Hash>, StoreError> {
-        let read_hash = |family| -> Result<Option<block::Hash>, StoreError> {
+        let read_hash = |family, key: &[u8]| -> Result<Option<block::Hash>, StoreError> {
             let cf = self.store.cf(family).map_err(store_error)?;
             self.snapshot
-                .get_cf(&cf, height.as_bytes())
+                .get_cf(&cf, key)
                 .map_err(|_| StoreError::Unavailable("canonical snapshot read failed"))
                 .map(|value| value.map(block::Hash::from_bytes))
         };
-        let hash = read_hash("hash_by_height")?;
+        let hash = read_hash("hash_by_height", &height.as_bytes())?;
         if hash.is_some() {
             return Ok(hash);
         }
-        let hash = read_hash("zakura_header_hash_by_height")?;
-        // Tests build header rows without a canonical index. Answer from those rows only at
-        // settled heights, where the production index answers too. Above the finalized frontier
-        // the index holds nothing, so answering there would let a test authenticate a height that
-        // a release build leaves unauthenticated.
-        #[cfg(test)]
-        if hash.is_none() && height <= self.metadata()?.frontiers.finalized.height {
-            let mut found = None;
-            self.visit_header_nodes(
-                RowLimit::new(zakura_header_chain::MAX_NON_FINALIZED_NODES_V1 + 1),
-                &mut |node| {
-                    if node.height == height {
-                        found = Some(node.hash);
-                    }
-                    Ok(())
-                },
-            )?;
-            return Ok(found);
-        }
-        Ok(hash)
+        read_hash("zakura_header_hash_by_height", &height.as_bytes())
+    }
+
+    fn finality_witness_header(
+        &self,
+        frontier: Frontier,
+    ) -> Result<Option<zakura_header_chain::FinalityAncestryHeader>, StoreError> {
+        let row = self.get_value::<HeaderFinalityWitnessDisk>(
+            HEADER_FINALITY_WITNESS,
+            HeaderFinalityWitnessKey {
+                height: frontier.height,
+                hash: frontier.hash,
+            }
+            .as_bytes(),
+        )?;
+        row.map(|row| {
+            if row.context.height != frontier.height || row.context.header.hash() != frontier.hash {
+                return Err(StoreError::Incoherent("finality witness key/hash mismatch"));
+            }
+            Ok(zakura_header_chain::FinalityAncestryHeader {
+                header: row.context.header,
+                frontier,
+            })
+        })
+        .transpose()
+    }
+
+    fn finality_witness_count(&self) -> Result<usize, StoreError> {
+        let count = self
+            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, FINALITY_WITNESS_COUNT_KEY)?
+            .ok_or(StoreError::Incoherent("finality witness count is absent"))?;
+        usize::try_from(count.0)
+            .map_err(|_| StoreError::Incoherent("finality witness count does not fit usize"))
+    }
+
+    fn visit_finality_witnesses(
+        &self,
+        limit: RowLimit,
+        visitor: &mut dyn FnMut(
+            zakura_header_chain::FinalityAncestryHeader,
+            u32,
+            u32,
+        ) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.visit_raw(
+            StoreCollection::FinalityHistory,
+            HEADER_FINALITY_WITNESS,
+            limit,
+            &mut |key, value| {
+                let key = HeaderFinalityWitnessKey::try_from_bytes(key)
+                    .map_err(|_| StoreError::Incoherent("invalid finality witness key"))?;
+                let row = HeaderFinalityWitnessDisk::decode(value)
+                    .map_err(|_| StoreError::Incoherent("invalid finality witness value"))?;
+                if row.context.height != key.height || row.context.header.hash() != key.hash {
+                    return Err(StoreError::Incoherent(
+                        "finality witness key/value mismatch",
+                    ));
+                }
+                visitor(
+                    zakura_header_chain::FinalityAncestryHeader {
+                        header: row.context.header,
+                        frontier: Frontier::new(row.context.height, key.hash),
+                    },
+                    row.root_references,
+                    row.child_references,
+                )
+            },
+        )
     }
 
     fn visit_finality_history(

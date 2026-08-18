@@ -94,6 +94,45 @@ impl FromDisk for HeaderHeightKey {
     }
 }
 
+/// Height and hash key for one immutable finality-witness DAG node.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub struct HeaderFinalityWitnessKey {
+    /// Exact witness height.
+    pub height: block::Height,
+    /// Exact canonical header hash.
+    pub hash: block::Hash,
+}
+
+impl HeaderFinalityWitnessKey {
+    /// Decode a witness key and reject every non-v4 width.
+    pub fn try_from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self, HeaderChainKeyError> {
+        let bytes = fixed::<36>(bytes)?;
+        let height = fixed::<4>(&bytes[..4])?;
+        let hash = fixed::<32>(&bytes[4..])?;
+        Ok(Self {
+            height: block::Height(u32::from_be_bytes(height)),
+            hash: block::Hash(hash),
+        })
+    }
+}
+
+impl IntoDisk for HeaderFinalityWitnessKey {
+    type Bytes = [u8; 36];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        let mut bytes = [0; 36];
+        bytes[..4].copy_from_slice(&self.height.0.to_be_bytes());
+        bytes[4..].copy_from_slice(&self.hash.0);
+        bytes
+    }
+}
+
+impl FromDisk for HeaderFinalityWitnessKey {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        Self::try_from_bytes(bytes).expect("finality-witness keys have a fixed v4 width")
+    }
+}
+
 /// Stable reason-kind ordering used by the eligibility-root index.
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -312,6 +351,23 @@ mod tests {
             HeaderHeightKey::from_bytes(HeaderHeightKey(height).as_bytes()),
             HeaderHeightKey(height)
         );
+        let witness = HeaderFinalityWitnessKey {
+            height,
+            hash: block::Hash([0x42; 32]),
+        };
+        assert_eq!(&witness.as_bytes()[..4], &[1, 2, 3, 4]);
+        assert_eq!(&witness.as_bytes()[4..], &[0x42; 32]);
+        assert_eq!(
+            HeaderFinalityWitnessKey::try_from_bytes(witness.as_bytes()),
+            Ok(witness)
+        );
+        assert!(matches!(
+            HeaderFinalityWitnessKey::try_from_bytes([0; 35]),
+            Err(HeaderChainKeyError::Length {
+                expected: 36,
+                actual: 35
+            })
+        ));
 
         let child = HeaderChildKey {
             parent: block::Hash([1; 32]),
@@ -343,8 +399,9 @@ mod tests {
         use crate::service::finalized_state::{
             HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD,
             HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT,
-            HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_NODE_BY_HASH, HEADER_SELECTED,
-            HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED, STATE_COLUMN_FAMILIES_IN_CODE,
+            HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_FINALITY_WITNESS,
+            HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
+            STATE_COLUMN_FAMILIES_IN_CODE,
         };
 
         let required = [
@@ -358,6 +415,7 @@ mod tests {
             HEADER_AUX_DELIVERY,
             HEADER_DEFERRED,
             HEADER_FINALITY_HISTORY,
+            HEADER_FINALITY_WITNESS,
             HEADER_VALIDATION_CONTEXT,
             HEADER_ENGINE_META,
         ];
@@ -461,6 +519,7 @@ mod tests {
             crate::service::finalized_state::HEADER_AUX_DELIVERY,
             crate::service::finalized_state::HEADER_DEFERRED,
             crate::service::finalized_state::HEADER_FINALITY_HISTORY,
+            crate::service::finalized_state::HEADER_FINALITY_WITNESS,
             crate::service::finalized_state::HEADER_VALIDATION_CONTEXT,
             crate::service::finalized_state::HEADER_ENGINE_META,
         ] {

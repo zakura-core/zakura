@@ -8,8 +8,8 @@ use zakura_chain::block;
 
 use crate::{
     BodyValidationState, ConsensusInvalidBodyTombstone, CounterExhausted, EligibilityReason,
-    EngineMetadata, EngineSnapshot, FinalityHistoryCheckpoint, FinalityRecord, Frontier,
-    HeaderNode, RowLimit, StoreError, UntrustedAuxDeliveryRow,
+    EngineMetadata, EngineSnapshot, FinalityAncestryHeader, FinalityHistoryCheckpoint,
+    FinalityRecord, Frontier, HeaderNode, RowLimit, StoreError, UntrustedAuxDeliveryRow,
 };
 
 /// One immutable predecessor record stored below the selectable finalized anchor.
@@ -121,6 +121,76 @@ pub trait StoreAuditSnapshot {
         &self,
         height: block::Height,
     ) -> Result<Option<block::Hash>, StoreError>;
+    /// Return whether full state authenticates this exact finality provenance.
+    fn authenticates_full_state_finality(
+        &self,
+        record: FinalityRecord,
+        bootstrap_frontier: Frontier,
+    ) -> Result<bool, StoreError> {
+        let crate::FinalitySource::FullState { provenance } = record.source else {
+            return Ok(false);
+        };
+        if (provenance.kind == crate::FullStateFinalityKind::Initialization)
+            != (record.epoch == crate::FinalityEpoch::new(0))
+        {
+            return Ok(false);
+        }
+        if record.current != bootstrap_frontier
+            && self.authenticated_canonical_hash(record.current.height)?
+                != Some(record.current.hash)
+        {
+            return Ok(false);
+        }
+        let expected = match provenance.kind {
+            crate::FullStateFinalityKind::CheckpointGrow => {
+                crate::checkpoint_finality_evidence(provenance.state_version, record.current)
+            }
+            crate::FullStateFinalityKind::Finalized => {
+                let mut proof = Vec::new();
+                let mut height = record.previous.height;
+                loop {
+                    let Some(hash) = self.authenticated_canonical_hash(height)? else {
+                        return Ok(false);
+                    };
+                    proof.push(hash);
+                    if height == record.current.height {
+                        break;
+                    }
+                    height = height.next().map_err(|_| {
+                        StoreError::Incoherent("full-state finality proof height overflow")
+                    })?;
+                }
+                crate::full_state_finality_evidence(
+                    provenance.state_version,
+                    record.current,
+                    &proof,
+                )
+            }
+            crate::FullStateFinalityKind::Initialization => {
+                crate::full_state_initialization_evidence(record.current)
+            }
+        };
+        Ok(expected == provenance.evidence)
+    }
+    /// Return one canonical header retained for a historical finality witness.
+    fn finality_witness_header(
+        &self,
+        _frontier: Frontier,
+    ) -> Result<Option<FinalityAncestryHeader>, StoreError> {
+        Ok(None)
+    }
+    /// Return the witness-DAG row count stored with the logical root.
+    fn finality_witness_count(&self) -> Result<usize, StoreError> {
+        Ok(0)
+    }
+    /// Visit each immutable witness-DAG node and its exact reference counts.
+    fn visit_finality_witnesses(
+        &self,
+        _limit: RowLimit,
+        _visitor: &mut dyn FnMut(FinalityAncestryHeader, u32, u32) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
     /// Return the authenticated frontier before the retained finality-history window.
     fn finality_history_checkpoint(&self) -> Result<Option<FinalityHistoryCheckpoint>, StoreError>;
     /// Return the retained finality-history row count stored with the logical root.

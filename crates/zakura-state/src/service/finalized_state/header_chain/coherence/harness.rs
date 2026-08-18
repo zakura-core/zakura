@@ -11,13 +11,14 @@ use zakura_chain::{
     work::difficulty::{Work, U256},
 };
 use zakura_header_chain::{
-    audit_store, AlarmSet, ApplyResult, BodyValidationState, ChainScore, CheckpointSet,
-    EngineConfig, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch, Frontier, FrontierSet,
-    FullStateEvidenceAuthority, FullStateFinalized, HeaderBatchInput, HeaderChainDiskVersion,
-    HeaderGeneration, HeaderNode, HeaderRules, HeaderValidationState, InsertHeaders, SourceId,
-    StateVersion, SuffixWork, SystemClock, TargetCompletion, TransitionContext, TransitionEvent,
-    TransitionFailure, TransitionRequest, TrustedAnchor, VerifiedChainChanged, VerifiedChangeCause,
-    VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate,
+    audit_store, full_state_finality_evidence, AlarmSet, ApplyResult, BodyValidationState,
+    ChainScore, CheckpointSet, EngineConfig, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch,
+    Frontier, FrontierSet, FullStateEvidenceAuthority, FullStateFinalized, HeaderBatchInput,
+    HeaderChainDiskVersion, HeaderGeneration, HeaderNode, HeaderRules, HeaderValidationState,
+    InsertHeaders, SourceId, StateVersion, SuffixWork, SystemClock, TargetCompletion,
+    TransitionContext, TransitionEvent, TransitionFailure, TransitionRequest, TrustedAnchor,
+    VerifiedChainChanged, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef,
+    WorkCoordinate,
 };
 
 use super::{
@@ -33,12 +34,13 @@ use super::{
         HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError, HEADER_AUX_DELIVERY,
         HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
         HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
-        HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
+        HEADER_FINALITY_WITNESS, HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT,
+        HEADER_VERIFIED,
     },
     fabricate::{FabHeader, Universe},
 };
 
-const HEADER_FAMILIES: [&str; 12] = [
+const HEADER_FAMILIES: [&str; 13] = [
     HEADER_NODE_BY_HASH,
     HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
     HEADER_BODY_EVIDENCE_AUTHORITY,
@@ -49,6 +51,7 @@ const HEADER_FAMILIES: [&str; 12] = [
     HEADER_AUX_DELIVERY,
     HEADER_DEFERRED,
     HEADER_FINALITY_HISTORY,
+    HEADER_FINALITY_WITNESS,
     HEADER_VALIDATION_CONTEXT,
     HEADER_ENGINE_META,
 ];
@@ -546,9 +549,10 @@ impl Harness {
         let proof = self.verified_path[..=advance]
             .iter()
             .map(|frontier| frontier.hash)
-            .collect();
+            .collect::<Vec<_>>();
         let snapshot = self.runtime().publisher().snapshot();
-        let evidence = self.next_evidence(0x70);
+        let _request_id = self.next_evidence(0x70);
+        let evidence = full_state_finality_evidence(snapshot.state_version, new_finalized, &proof);
         let authority = Authority(evidence);
         let result = self
             .runtime()

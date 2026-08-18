@@ -358,6 +358,119 @@ fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
     audit_store(&runtime.store, &engine_config)
         .expect("the exact headers-only selected-tip witness recovers");
 
+    let witness_key = HeaderFinalityWitnessKey {
+        height: selected_tip.height,
+        hash: selected_tip.hash,
+    }
+    .as_bytes();
+    let witness_cf = runtime
+        .store
+        .cf(HEADER_FINALITY_WITNESS)
+        .expect("the witness column family exists");
+    let witness_value = db
+        .raw_get_cf(&witness_cf, &witness_key)
+        .expect("the witness row is readable")
+        .expect("the selected tip has a witness row");
+
+    let mut bad_count = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_value(
+            &mut bad_count,
+            HEADER_ENGINE_META,
+            FINALITY_WITNESS_COUNT_KEY,
+            &HeaderRowCountDisk(2),
+        )
+        .expect("the forged witness count encodes");
+    db.write(bad_count)
+        .expect("the forged witness count reaches RocksDB");
+    assert!(HeaderChainStore::new(db.clone())
+        .startup(&engine_config)
+        .is_err());
+    let mut restore_count = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_value(
+            &mut restore_count,
+            HEADER_ENGINE_META,
+            FINALITY_WITNESS_COUNT_KEY,
+            &HeaderRowCountDisk(1),
+        )
+        .expect("the exact witness count encodes");
+    db.write(restore_count)
+        .expect("the exact witness count is restored");
+
+    let mut zero_references = witness_value.clone();
+    zero_references[1..9].fill(0);
+    let mut bad_references = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_raw(
+            &mut bad_references,
+            HEADER_FINALITY_WITNESS,
+            witness_key,
+            zero_references,
+        )
+        .expect("the forged witness references stage");
+    db.write(bad_references)
+        .expect("the forged witness references reach RocksDB");
+    assert!(HeaderChainStore::new(db.clone())
+        .startup(&engine_config)
+        .is_err());
+    let mut restore_witness = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_raw(
+            &mut restore_witness,
+            HEADER_FINALITY_WITNESS,
+            witness_key,
+            &witness_value,
+        )
+        .expect("the exact witness row stages");
+    db.write(restore_witness)
+        .expect("the exact witness row is restored");
+
+    let forged_key = HeaderFinalityWitnessKey {
+        height: selected_tip.height,
+        hash: block::Hash([0x64; 32]),
+    }
+    .as_bytes();
+    let mut bad_key = DiskWriteBatch::new();
+    runtime
+        .store
+        .delete_raw(&mut bad_key, HEADER_FINALITY_WITNESS, witness_key)
+        .expect("the exact witness deletion stages");
+    runtime
+        .store
+        .put_raw(
+            &mut bad_key,
+            HEADER_FINALITY_WITNESS,
+            forged_key,
+            &witness_value,
+        )
+        .expect("the forged witness key stages");
+    db.write(bad_key)
+        .expect("the forged witness key reaches RocksDB");
+    assert!(HeaderChainStore::new(db.clone())
+        .startup(&engine_config)
+        .is_err());
+    let mut restore_key = DiskWriteBatch::new();
+    runtime
+        .store
+        .delete_raw(&mut restore_key, HEADER_FINALITY_WITNESS, forged_key)
+        .expect("the forged witness deletion stages");
+    runtime
+        .store
+        .put_raw(
+            &mut restore_key,
+            HEADER_FINALITY_WITNESS,
+            witness_key,
+            &witness_value,
+        )
+        .expect("the exact witness key stages");
+    db.write(restore_key)
+        .expect("the exact witness key is restored");
+
     let mut forged = runtime
         .store
         .finality_history()
@@ -406,6 +519,12 @@ fn mark_metadata_as_v1(metadata: &EngineMetadata) -> Vec<u8> {
 
 fn mark_metadata_as_v2(metadata: &EngineMetadata) -> Vec<u8> {
     mark_metadata_as_legacy_without_policy(metadata, 2)
+}
+
+fn mark_metadata_as_v3(metadata: &EngineMetadata) -> Vec<u8> {
+    let mut bytes = metadata.encode().expect("the metadata fixture encodes");
+    bytes[..4].copy_from_slice(&3_u32.to_be_bytes());
+    bytes
 }
 
 fn mark_metadata_as_legacy_without_policy(metadata: &EngineMetadata, version: u32) -> Vec<u8> {
@@ -560,13 +679,14 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
     store
         .delete_raw(&mut batch, HEADER_ENGINE_META, FINALITY_HISTORY_COUNT_KEY)
         .expect("the version-one fixture omits the current finality count");
+    stage_full_state_canonical_hash(&store, &mut batch, metadata.frontiers.finalized);
     store.db.write(batch).expect("the legacy fixture commits");
 
     assert!(store
         .is_initialized()
         .expect("released version-one metadata identifies an initialized store"));
     assert!(store
-        .migrate_v1_to_current(&engine_config)
+        .migrate_to_current(&engine_config)
         .expect("the version-one store migrates"));
     let migrated_metadata = store.metadata().expect("the metadata remains readable");
     assert_eq!(
@@ -592,50 +712,9 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
             .expect("the migrated finality count is readable"),
         Some(HeaderRowCountDisk(1))
     );
-    let mut interrupted = DiskWriteBatch::new();
-    store
-        .delete_raw(&mut interrupted, HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
-        .expect("the interrupted migration omits the tombstone count");
-    store
-        .delete_raw(
-            &mut interrupted,
-            HEADER_ENGINE_META,
-            FINALITY_HISTORY_COUNT_KEY,
-        )
-        .expect("the interrupted migration omits the finality count");
-    let mut interrupted_authority = store
-        .db
-        .raw_get_cf(&authority_cf, &anchor.hash.0)
-        .expect("the migrated body-evidence authority is readable")
-        .expect("the migrated body-evidence authority exists");
-    interrupted_authority[0] = 1;
-    store
-        .put_raw(
-            &mut interrupted,
-            HEADER_BODY_EVIDENCE_AUTHORITY,
-            anchor.hash.0,
-            interrupted_authority,
-        )
-        .expect("the interrupted migration retains version-one body authority");
-    store
-        .db
-        .write(interrupted)
-        .expect("the interrupted migration fixture commits");
-    assert!(store
-        .migrate_v1_to_current(&engine_config)
-        .expect("the interrupted current-format migration completes"));
-    assert_eq!(
-        store
-            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, TOMBSTONE_COUNT_KEY)
-            .expect("the recovered tombstone count is readable"),
-        Some(HeaderRowCountDisk(0))
-    );
-    assert_eq!(
-        store
-            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, FINALITY_HISTORY_COUNT_KEY)
-            .expect("the recovered finality count is readable"),
-        Some(HeaderRowCountDisk(1))
-    );
+    assert!(!store
+        .migrate_to_current(&engine_config)
+        .expect("a repeated migration is a no-op"));
     assert_eq!(
         store
             .load_aux_deliveries()
@@ -663,7 +742,7 @@ fn version_one_migration_downgrades_legacy_verdicts_atomically() {
     assert_eq!(AuxDelivery::decode(&migrated_value), Ok(delivery));
     assert_ne!(migrated_value, delivery_value);
     assert!(!HeaderChainStore::new(db)
-        .migrate_v1_to_current(&engine_config)
+        .migrate_to_current(&engine_config)
         .expect("reopening the migrated store is a no-op"));
 }
 
@@ -711,6 +790,7 @@ fn version_one_migration_drops_pruned_consensus_invalid_rows() {
     store
         .delete_raw(&mut batch, HEADER_ENGINE_META, FINALITY_HISTORY_COUNT_KEY)
         .expect("the version-one fixture omits the current finality count");
+    stage_full_state_canonical_hash(&store, &mut batch, metadata.frontiers.finalized);
     store
         .db
         .write(batch)
@@ -721,7 +801,7 @@ fn version_one_migration_drops_pruned_consensus_invalid_rows() {
         .expect("a missing pruned header is readable")
         .is_none());
     assert!(store
-        .migrate_v1_to_current(&engine_config)
+        .migrate_to_current(&engine_config)
         .expect("the version-one store migrates without the pruned header node"));
 
     let tombstone_cf = store
@@ -807,10 +887,11 @@ fn version_one_migration_limit_leaves_every_row_unchanged() {
             &metadata_value,
         )
         .expect("the legacy metadata row stages");
+    stage_full_state_canonical_hash(&store, &mut batch, metadata.frontiers.finalized);
     store.db.write(batch).expect("the legacy fixture commits");
 
     assert!(matches!(
-        store.migrate_v1_to_current(&engine_config),
+        store.migrate_to_current(&engine_config),
         Err(HeaderChainStoreError::Store(StoreError::LimitExceeded {
             collection: StoreCollection::AuxiliaryDeliveries,
             limit,
@@ -893,7 +974,7 @@ fn version_one_migration_rejects_an_ambiguous_network_policy_without_writing() {
     store.db.write(batch).expect("the legacy fixture commits");
 
     assert!(matches!(
-        store.migrate_v1_to_current(&changed_config),
+        store.migrate_to_current(&changed_config),
         Err(HeaderChainStoreError::Incoherent(
             "version-one network policy is ambiguous; rebuild the header-chain database"
         ))
@@ -950,6 +1031,7 @@ fn version_two_migration_injects_network_policy_and_leaves_current_aux_unchanged
             mark_metadata_as_v2(&metadata),
         )
         .expect("the version-two metadata stages");
+    stage_full_state_canonical_hash(&store, &mut batch, metadata.frontiers.finalized);
     store
         .db
         .write(batch)
@@ -962,7 +1044,7 @@ fn version_two_migration_injects_network_policy_and_leaves_current_aux_unchanged
         .is_initialized()
         .expect("released version-two metadata identifies an initialized store"));
     assert!(store
-        .migrate_v1_to_current(&engine_config)
+        .migrate_to_current(&engine_config)
         .expect("the version-two store migrates"));
     let migrated_metadata = store.metadata().expect("the metadata remains readable");
     assert_eq!(
@@ -993,7 +1075,7 @@ fn version_two_migration_injects_network_policy_and_leaves_current_aux_unchanged
         .expect("startup audits the migrated version-two store");
     assert!(report.publication_allowed);
     assert!(!HeaderChainStore::new(db)
-        .migrate_v1_to_current(&engine_config)
+        .migrate_to_current(&engine_config)
         .expect("reopening the migrated store is a no-op"));
 }
 
@@ -1033,7 +1115,7 @@ fn version_two_migration_rejects_an_ambiguous_network_policy_without_writing() {
     store.db.write(batch).expect("the legacy fixture commits");
 
     assert!(matches!(
-        store.migrate_v1_to_current(&changed_config),
+        store.migrate_to_current(&changed_config),
         Err(HeaderChainStoreError::Incoherent(
             "version-two network policy is ambiguous; rebuild the header-chain database"
         ))
@@ -1048,6 +1130,281 @@ fn version_two_migration_rejects_an_ambiguous_network_policy_without_writing() {
             .expect("the metadata row is readable"),
         Some(metadata_value)
     );
+}
+
+#[test]
+fn version_three_integrated_migration_authenticates_the_full_state_frontier() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = mainnet_fixture();
+    let frontier = metadata.frontiers.finalized;
+    let previous_state_version = metadata.state_version;
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata.clone(), anchor)
+        .expect("the current fixture initializes");
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            mark_metadata_as_v3(&metadata),
+        )
+        .expect("the version-three metadata stages");
+    stage_full_state_canonical_hash(&store, &mut batch, frontier);
+    store.db.write(batch).expect("the legacy fixture commits");
+
+    assert!(store
+        .migrate_to_current(&engine_config)
+        .expect("the version-three store migrates"));
+    let migrated = store.metadata().expect("the migrated metadata is readable");
+    assert_eq!(migrated.disk_format, HeaderChainDiskVersion::CURRENT);
+    assert_eq!(
+        migrated.state_version,
+        previous_state_version
+            .checked_next()
+            .expect("the fixture state version advances")
+    );
+    assert_eq!(
+        store.finality_history().expect("history is readable"),
+        vec![FinalityRecord {
+            previous: frontier,
+            current: frontier,
+            source: FinalitySource::DiskMigration {
+                from_version: HeaderChainDiskVersion(3),
+                network_policy_digest: engine_config.network_policy_digest(),
+                authentication: zakura_header_chain::DiskMigrationAuthentication::FullState,
+            },
+            epoch: metadata.finality_epoch,
+        }]
+    );
+    let (_, report) = HeaderChainStore::new(db)
+        .startup(&engine_config)
+        .expect("startup audits the migrated store");
+    assert!(report.publication_allowed);
+}
+
+#[test]
+fn version_three_migration_rejects_a_network_policy_mismatch_atomically() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, mut metadata) = mainnet_fixture();
+    metadata.network_policy_digest = [0x73; 32];
+    let metadata_value = mark_metadata_as_v3(&metadata);
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db);
+    store
+        .initialize(
+            EngineMetadata {
+                disk_format: HeaderChainDiskVersion::CURRENT,
+                network_policy_digest: engine_config.network_policy_digest(),
+                ..metadata.clone()
+            },
+            anchor,
+        )
+        .expect("the current fixture initializes");
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            &metadata_value,
+        )
+        .expect("the mismatched version-three metadata stages");
+    store.db.write(batch).expect("the legacy fixture commits");
+
+    assert!(matches!(
+        store.migrate_to_current(&engine_config),
+        Err(HeaderChainStoreError::Incoherent(
+            "legacy network policy does not match the configured policy"
+        ))
+    ));
+    let metadata_cf = store
+        .cf(HEADER_ENGINE_META)
+        .expect("the metadata column family exists");
+    assert_eq!(
+        store
+            .db
+            .raw_get_cf(&metadata_cf, METADATA_KEY)
+            .expect("the metadata remains readable"),
+        Some(metadata_value)
+    );
+}
+
+#[test]
+fn every_legacy_headers_only_version_migrates_with_a_complete_depth_proof() {
+    for version in 1_u32..=3 {
+        let db_config = Config::ephemeral();
+        let (mut engine_config, anchor, mut metadata) = mainnet_fixture();
+        engine_config.mode = EngineMode::HeadersOnly;
+        engine_config.limits.local_finality_depth =
+            std::num::NonZeroU32::new(1).expect("one is nonzero");
+        metadata.mode = EngineMode::HeadersOnly;
+        let db = open(&db_config, engine_config.network());
+        let store = HeaderChainStore::new(db.clone());
+        store
+            .initialize(metadata, anchor.clone())
+            .expect("the headers-only fixture initializes");
+        let (runtime, _) = store
+            .startup(&engine_config)
+            .expect("the headers-only fixture audits");
+        let before = runtime.publisher().snapshot();
+        let lease = runtime
+            .reader()
+            .validation_context(anchor.hash)
+            .expect("the anchor context is coherent")
+            .expect("the anchor is retained");
+        let rules =
+            HeaderRules::for_validation_lease(&lease).expect("the Mainnet rules are coherent");
+        let blocks = [
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
+            zakura_test::vectors::BLOCK_MAINNET_2_BYTES.as_slice(),
+        ]
+        .map(|bytes| {
+            bytes
+                .zcash_deserialize_into::<Arc<block::Block>>()
+                .expect("the Mainnet block fixture deserializes")
+        });
+        let headers = blocks.map(|block| block.header.clone());
+        let selected_tip = Frontier::new(block::Height(2), headers[1].hash());
+        let prepared = zakura_header_chain::prepare_headers(
+            HeaderBatchInput::new(&headers),
+            lease.parent(),
+            &rules,
+            &SystemClock,
+        )
+        .expect("the Mainnet depth proof prepares");
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: before.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: header_owner(&before, selected_tip.hash, 0x81, 0x82),
+                        source: SourceId::from_digest([0x83; 32]),
+                        parent_hash: anchor.hash,
+                        target_tip_hash: selected_tip.hash,
+                        completion: TargetCompletion::TargetComplete {
+                            common_ancestor: Frontier::new(anchor.height, anchor.hash),
+                        },
+                        batch: prepared,
+                        aux: Vec::new(),
+                    })),
+                },
+                &TransitionContext {
+                    config: &engine_config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    retention_references: &[],
+                },
+            )
+            .expect("the headers-only depth transition commits");
+        let legacy_metadata = runtime.store.metadata().expect("metadata is readable");
+        let finalized = legacy_metadata.frontiers.finalized;
+        assert_eq!(finalized.height, block::Height(1));
+        let metadata_value = match version {
+            1 => mark_metadata_as_v1(&legacy_metadata),
+            2 => mark_metadata_as_v2(&legacy_metadata),
+            3 => mark_metadata_as_v3(&legacy_metadata),
+            _ => unreachable!("the loop covers released legacy versions"),
+        };
+        let mut downgrade = DiskWriteBatch::new();
+        runtime
+            .store
+            .put_raw(
+                &mut downgrade,
+                HEADER_ENGINE_META,
+                METADATA_KEY,
+                metadata_value,
+            )
+            .expect("the legacy metadata stages");
+        stage_full_state_canonical_hash(&runtime.store, &mut downgrade, finalized);
+        runtime
+            .store
+            .db
+            .write(downgrade)
+            .expect("the legacy fixture commits");
+        let migrated_store = runtime.store.clone();
+        drop(runtime);
+
+        assert!(migrated_store
+            .migrate_to_current(&engine_config)
+            .expect("the headers-only store migrates"));
+        let history = migrated_store
+            .finality_history()
+            .expect("the migration history is readable");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].previous, finalized);
+        assert_eq!(history[0].current, finalized);
+        assert!(matches!(
+            history[0].source,
+            FinalitySource::DiskMigration {
+                from_version,
+                authentication:
+                    zakura_header_chain::DiskMigrationAuthentication::HeadersOnlyDepth {
+                        selected_tip: tip,
+                    },
+                ..
+            } if from_version == HeaderChainDiskVersion(version) && tip == selected_tip
+        ));
+        let (reopened, report) = HeaderChainStore::new(db)
+            .startup(&engine_config)
+            .expect("startup audits the migrated headers-only store");
+        assert!(report.publication_allowed);
+
+        let before = reopened.publisher().snapshot();
+        let lease = reopened
+            .reader()
+            .validation_context(selected_tip.hash)
+            .expect("the selected-tip context is coherent")
+            .expect("the selected tip is retained");
+        let rules =
+            HeaderRules::for_validation_lease(&lease).expect("the Mainnet rules remain coherent");
+        let block_three = zakura_test::vectors::BLOCK_MAINNET_3_BYTES
+            .as_slice()
+            .zcash_deserialize_into::<Arc<block::Block>>()
+            .expect("Mainnet block three deserializes");
+        let next_tip = Frontier::new(block::Height(3), block_three.hash());
+        let prepared = zakura_header_chain::prepare_headers(
+            HeaderBatchInput::new(std::slice::from_ref(&block_three.header)),
+            lease.parent(),
+            &rules,
+            &SystemClock,
+        )
+        .expect("the ordinary extension prepares");
+        reopened
+            .apply(
+                TransitionRequest {
+                    expected_version: before.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: header_owner(&before, next_tip.hash, 0x84, 0x85),
+                        source: SourceId::from_digest([0x86; 32]),
+                        parent_hash: selected_tip.hash,
+                        target_tip_hash: next_tip.hash,
+                        completion: TargetCompletion::TargetComplete {
+                            common_ancestor: selected_tip,
+                        },
+                        batch: prepared,
+                        aux: Vec::new(),
+                    })),
+                },
+                &TransitionContext {
+                    config: &engine_config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    retention_references: &[],
+                },
+            )
+            .expect("the ordinary extension commits");
+        assert_eq!(
+            reopened
+                .store
+                .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, FINALITY_WITNESS_COUNT_KEY,)
+                .expect("the witness count is readable"),
+            Some(HeaderRowCountDisk(2)),
+            "one ordinary extension adds one witness node"
+        );
+    }
 }
 
 #[test]
@@ -1165,7 +1522,15 @@ fn startup_reconciles_restored_full_state_before_first_publication() {
 
     drop(reopened);
     let finalized_child = Frontier::new(child.height, child.hash);
-    let advanced = HeaderChainStore::new(db)
+    let advanced_store = HeaderChainStore::new(db);
+    let mut full_state_batch = DiskWriteBatch::new();
+    stage_full_state_canonical_hash(&advanced_store, &mut full_state_batch, anchor_frontier);
+    stage_full_state_canonical_hash(&advanced_store, &mut full_state_batch, finalized_child);
+    advanced_store
+        .db
+        .write(full_state_batch)
+        .expect("the full-state canonical child commits");
+    let advanced = advanced_store
         .startup_reconciled(&engine_config, finalized_child, vec![child], Vec::new())
         .expect("a dark checkpoint gap is reconciled and finalized before publication")
         .0;
@@ -1211,6 +1576,24 @@ fn startup_reconciliation_chunks_finalized_gaps_at_the_node_limit() {
         parent = Frontier::new(height, hash);
         parent_header = header;
     }
+
+    let mut full_state_batch = DiskWriteBatch::new();
+    stage_full_state_canonical_hash(
+        &store,
+        &mut full_state_batch,
+        Frontier::new(anchor.height, anchor.hash),
+    );
+    for header in &path {
+        stage_full_state_canonical_hash(
+            &store,
+            &mut full_state_batch,
+            Frontier::new(header.height, header.hash),
+        );
+    }
+    store
+        .db
+        .write(full_state_batch)
+        .expect("the canonical full-state path commits");
 
     let (runtime, report) = store
         .startup_reconciled(&engine_config, parent, path, Vec::new())
@@ -1274,6 +1657,24 @@ fn streaming_reconstruction_resumes_from_the_last_atomic_chunk() {
         parent = Frontier::new(height, hash);
         parent_header = header;
     }
+
+    let mut full_state_batch = DiskWriteBatch::new();
+    stage_full_state_canonical_hash(
+        &store,
+        &mut full_state_batch,
+        Frontier::new(anchor.height, anchor.hash),
+    );
+    for header in &path {
+        stage_full_state_canonical_hash(
+            &store,
+            &mut full_state_batch,
+            Frontier::new(header.height, header.hash),
+        );
+    }
+    store
+        .db
+        .write(full_state_batch)
+        .expect("the canonical full-state path commits");
 
     let first_attempt = store.clone().startup_reconciled_streaming(
         &engine_config,

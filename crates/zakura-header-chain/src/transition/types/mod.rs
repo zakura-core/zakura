@@ -40,6 +40,8 @@ pub use snapshot::{
     AlarmSet, CommittedHeaderChainView, EngineMetadata, EngineSnapshot, HeaderChainDiskVersion,
 };
 pub use write_set::{
-    AuxDelta, ChangeSet, EligibilityDelta, FinalityHistoryCheckpoint, FinalityRecord,
-    FinalitySource, IndexChanges, ProjectionDelta,
+    checkpoint_finality_evidence, full_state_finality_evidence, full_state_initialization_evidence,
+    AuxDelta, ChangeSet, DiskMigrationAuthentication, EligibilityDelta, FinalityAncestryHeader,
+    FinalityHistoryCheckpoint, FinalityRecord, FinalitySource, FinalityWitnessProof,
+    FullStateFinalityKind, FullStateFinalityProvenance, IndexChanges, ProjectionDelta,
 };

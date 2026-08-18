@@ -54,6 +54,7 @@ pub(crate) fn is_incremental_checkpoint_finality(
         && plan.change_set.put_nodes.len() == 1
         && plan.change_set.put_nodes[0].hash == finalized.hash
         && plan.change_set.eligibility_changes.is_empty()
+        && plan.change_set.finality_ancestry.is_empty()
         && plan
             .change_set
             .aux_changes
@@ -125,6 +126,7 @@ pub(crate) fn verify_incremental_checkpoint_against_graph<G: HeaderGraphView>(
         || record.current != metadata.frontiers.finalized
         || record.epoch != metadata.finality_epoch
         || !matches!(record.source, FinalitySource::FullState { .. })
+        || !plan.change_set.finality_ancestry.is_empty()
     {
         return Err(InvariantViolation::Protected(finalized.hash));
     }

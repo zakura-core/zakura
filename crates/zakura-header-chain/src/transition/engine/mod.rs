@@ -126,8 +126,8 @@ impl HeaderChainEngine {
     /// Validate untrusted durable auxiliary rows and hydrate one recovered engine.
     ///
     /// The decoder cannot construct an authoritative auxiliary outcome. This recovery entry point
-    /// checks row structure, global delivery identity, retained-header ownership, replay identity,
-    /// and derived-boundary topology before it promotes any outcome.
+    /// checks row structure, global delivery identity, and retained-header ownership. It discards
+    /// outcome claims because the durable format does not retain their full-state observations.
     pub fn from_untrusted_durable_state(
         graph: MemHeaderStore,
         metadata: EngineMetadata,
@@ -136,6 +136,17 @@ impl HeaderChainEngine {
         deliveries: impl IntoIterator<Item = UntrustedAuxDeliveryRow>,
     ) -> Result<Self, EngineHydrationError> {
         let deliveries = validate_recovered_auxiliary_rows(&graph, deliveries)?;
+        Self::from_validated_state(graph, metadata, selected, verified, deliveries)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_state(
+        graph: MemHeaderStore,
+        metadata: EngineMetadata,
+        selected: Vec<crate::Frontier>,
+        verified: Vec<crate::Frontier>,
+        deliveries: Vec<AuxDelivery>,
+    ) -> Result<Self, EngineHydrationError> {
         Self::from_validated_state(graph, metadata, selected, verified, deliveries)
     }
 
@@ -708,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_auxiliary_outcomes_require_checked_recovery_promotion() {
+    fn durable_auxiliary_outcome_claims_are_discarded_during_recovery() {
         let mut view = audited_view();
         let child = view.metadata.frontiers.header_best;
         let row = delivery(3, child.hash);
@@ -735,22 +746,21 @@ mod tests {
                 "authoritative auxiliary outcomes require recovery validation"
             ))
         ));
-        assert!(matches!(
-            HeaderChainEngine::from_untrusted_durable_state(
-                view.graph,
-                view.metadata,
-                view.selected,
-                view.verified,
+        for status_code in [1, 2, 3] {
+            let recovered = HeaderChainEngine::from_untrusted_durable_state(
+                view.graph.clone(),
+                view.metadata.clone(),
+                view.selected.clone(),
+                view.verified.clone(),
                 [UntrustedAuxDeliveryRow::new(
                     row,
-                    1,
+                    status_code,
                     [Some([4; 32]), None],
                     Some(block::Hash([0xf4; 32])),
                 )],
-            ),
-            Err(EngineHydrationError::Incoherent(
-                "derived auxiliary boundary is not retained"
-            ))
-        ));
+            )
+            .expect("recovery discards a structurally valid outcome claim");
+            assert_eq!(recovered.aux_deliveries(child.hash), &[row]);
+        }
     }
 }

@@ -6,22 +6,25 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zakura_chain::{block, parameters::NetworkKind, work::difficulty::U256};
 use zakura_header_chain::{
-    AlarmSet, BodyValidationState, ChainScore, ChangeSet, EngineConfig, EngineMetadata, EngineMode,
-    EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier, FrontierSet,
-    HeaderChainDiskVersion, HeaderGeneration, HeaderNode, HeaderValidationState, IndexChanges,
-    ProjectionDelta, StateVersion, VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate,
+    AlarmSet, BodyValidationState, ChainScore, ChangeSet, DiskMigrationAuthentication,
+    EngineConfig, EngineMetadata, EngineMode, EvidenceId, FinalityAncestryHeader, FinalityEpoch,
+    FinalityRecord, FinalitySource, FinalityWitnessProof, Frontier, FrontierSet,
+    HeaderChainDiskVersion, HeaderGeneration, HeaderGraphReconstruction, HeaderNode,
+    HeaderValidationState, IndexChanges, MemHeaderStore, ProjectionDelta, StateVersion,
+    StoreAuditRead, StoreAuditSnapshot, VerifiedGeneration, VerifiedHeaderRef, WorkCoordinate,
 };
 
 use super::{HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError, StartupReport};
 use crate::service::finalized_state::{
     disk_db::{RawVisitError, ReadDisk, WriteDisk},
     disk_format::{
-        header_chain::HeaderAuxDeliveryKey,
+        header_chain::{HeaderAuxDeliveryKey, HeaderFinalityKey, HeaderFinalityWitnessKey},
         header_chain_values::{
             decode_v1_aux_delivery, decode_v1_consensus_invalid_body_tombstone,
             decode_v1_engine_metadata, decode_v1_full_state_body_validation_evidence_authority,
-            decode_v2_engine_metadata, FullStateBodyValidationEvidenceAuthorityDisk,
-            HeaderChainValueError, HeaderRowCountDisk, HeaderValidationContextDisk,
+            decode_v2_engine_metadata, decode_v3_engine_metadata,
+            FullStateBodyValidationEvidenceAuthorityDisk, HeaderChainValueError,
+            HeaderFinalityWitnessDisk, HeaderRowCountDisk, HeaderValidationContextDisk,
         },
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
@@ -33,12 +36,12 @@ use crate::service::finalized_state::{
     },
     DiskWriteBatch, HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY,
     HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
-    HEADER_VALIDATION_CONTEXT,
+    HEADER_FINALITY_WITNESS, HEADER_VALIDATION_CONTEXT,
 };
 
 impl HeaderChainStore {
-    /// Atomically migrate released version-one and version-two rows to the current format.
-    pub(in crate::service) fn migrate_v1_to_current(
+    /// Atomically migrate every released legacy header-chain format to v4.
+    pub(in crate::service) fn migrate_to_current(
         &self,
         config: &EngineConfig,
     ) -> Result<bool, HeaderChainStoreError> {
@@ -50,70 +53,213 @@ impl HeaderChainStore {
         let Some(metadata_bytes) = self.db.raw_get_cf(&metadata_cf, super::METADATA_KEY)? else {
             return Ok(false);
         };
-        let mut version_bytes = [0; 4];
-        version_bytes.copy_from_slice(
-            metadata_bytes
-                .get(..4)
-                .ok_or(HeaderChainValueError::Truncated)?,
-        );
+        let version_bytes = metadata_bytes
+            .get(..4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(HeaderChainValueError::Truncated)?;
         let version = u32::from_be_bytes(version_bytes);
         if version == HeaderChainDiskVersion::CURRENT.0 {
             EngineMetadata::decode(&metadata_bytes)?;
-            let tombstone_count_exists = self
-                .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, super::TOMBSTONE_COUNT_KEY)?
-                .is_some();
-            let finality_count_exists = self
-                .get_value::<HeaderRowCountDisk>(
-                    HEADER_ENGINE_META,
-                    super::FINALITY_HISTORY_COUNT_KEY,
-                )?
-                .is_some();
-            let v1_authorities = self.first_row_has_version(HEADER_BODY_EVIDENCE_AUTHORITY, 1)?;
-            let v1_tombstones =
-                self.first_row_has_version(HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, 1)?;
-            if tombstone_count_exists && finality_count_exists && !v1_authorities && !v1_tombstones
-            {
-                return Ok(false);
-            }
-            let mut batch = DiskWriteBatch::new();
-            let authority_rows = if v1_authorities {
-                self.stage_v1_body_evidence_authorities(config, &mut batch)?
-            } else {
-                0
-            };
-            let tombstone_rows = self.stage_tombstone_count(&mut batch)?;
-            let finality_rows = self.stage_finality_history_count(&mut batch)?;
-            self.db.write(batch)?;
-            tracing::info!(
-                authority_rows,
-                tombstone_rows,
-                finality_rows,
-                disk_format = HeaderChainDiskVersion::CURRENT.0,
-                "completed an interrupted durable header-chain migration"
-            );
-            return Ok(true);
+            return Ok(false);
         }
-
-        if version == 2 {
-            return self.migrate_v2_metadata_to_current(config, &metadata_bytes);
-        }
-
-        let mut metadata =
-            decode_v1_engine_metadata(&metadata_bytes, config.network_policy_digest())?;
+        let from_version = HeaderChainDiskVersion(version);
+        let mut metadata = match version {
+            1 => decode_v1_engine_metadata(&metadata_bytes, config.network_policy_digest())?,
+            2 => decode_v2_engine_metadata(&metadata_bytes, config.network_policy_digest())?,
+            3 => decode_v3_engine_metadata(&metadata_bytes)?,
+            _ => return Err(HeaderChainValueError::UnsupportedDiskFormat(version).into()),
+        };
         if metadata.network_id != config.network().kind() {
             return Err(HeaderChainStoreError::Incoherent(
-                "version-one network kind does not match the configured network",
+                "legacy network kind does not match the configured network",
             ));
         }
-        if metadata.network_id != NetworkKind::Mainnet {
+        if version <= 2 && metadata.network_id != NetworkKind::Mainnet {
+            let message = if version == 1 {
+                "version-one network policy is ambiguous; rebuild the header-chain database"
+            } else {
+                "version-two network policy is ambiguous; rebuild the header-chain database"
+            };
+            return Err(HeaderChainStoreError::Incoherent(message));
+        }
+        if metadata.network_policy_digest != config.network_policy_digest() {
             return Err(HeaderChainStoreError::Incoherent(
-                "version-one network policy is ambiguous; rebuild the header-chain database",
+                "legacy network policy does not match the configured policy",
             ));
         }
+        if metadata.mode != config.mode
+            || metadata.anchor_manifest_digest != config.trust_anchor_digest()
+        {
+            return Err(HeaderChainStoreError::Incoherent(
+                "legacy metadata does not match the configured engine policy",
+            ));
+        }
+
+        let frontier = metadata.frontiers.finalized;
+        let (authentication, proof) = match metadata.mode {
+            EngineMode::Integrated => {
+                if self.authenticated_canonical_hash(frontier.height)? != Some(frontier.hash) {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "full state cannot authenticate the legacy finalized frontier",
+                    ));
+                }
+                (
+                    DiskMigrationAuthentication::FullState,
+                    FinalityWitnessProof::default(),
+                )
+            }
+            EngineMode::HeadersOnly => {
+                let selected_tip = metadata.frontiers.header_best;
+                if selected_tip.height.0.checked_sub(frontier.height.0)
+                    != Some(config.limits.local_finality_depth.get())
+                {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "headers-only migration lacks the complete active depth proof",
+                    ));
+                }
+                let mut entries = Vec::new();
+                let mut cursor = selected_tip;
+                while cursor.height > frontier.height {
+                    let node = self.header_node(cursor.hash)?.filter(|node| {
+                        node.height == cursor.height && node.header.hash() == cursor.hash
+                    });
+                    let node = node.ok_or(HeaderChainStoreError::Incoherent(
+                        "headers-only migration proof is missing a retained header",
+                    ))?;
+                    entries.push(FinalityAncestryHeader {
+                        header: node.header.clone(),
+                        frontier: cursor,
+                    });
+                    cursor = Frontier::new(
+                        block::Height(cursor.height.0.checked_sub(1).ok_or(
+                            HeaderChainStoreError::Incoherent(
+                                "headers-only migration proof height underflow",
+                            ),
+                        )?),
+                        node.parent_hash,
+                    );
+                }
+                if cursor != frontier {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "headers-only migration proof does not reach finality",
+                    ));
+                }
+                entries.reverse();
+                (
+                    DiskMigrationAuthentication::HeadersOnlyDepth { selected_tip },
+                    FinalityWitnessProof::new(entries),
+                )
+            }
+        };
+
+        let mut batch = DiskWriteBatch::new();
+        let auxiliary_rows = if version == 1 {
+            self.stage_v1_aux_deliveries(config, &mut batch)?
+        } else {
+            0
+        };
+        let authority_rows = if version == 1 {
+            self.stage_v1_body_evidence_authorities(config, &mut batch)?
+        } else {
+            0
+        };
+        let tombstones = self.stage_tombstones(&mut batch)?;
+        let tombstone_rows = tombstones.len();
+        self.validate_legacy_graph(&metadata, config, tombstones)?;
+        self.clear_bounded_family(
+            HEADER_FINALITY_HISTORY,
+            super::FINALITY_HISTORY_LIMIT,
+            &mut batch,
+        )?;
+        self.clear_bounded_family(
+            HEADER_FINALITY_WITNESS,
+            super::FINALITY_WITNESS_LIMIT,
+            &mut batch,
+        )?;
+        self.delete_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            super::FINALITY_HISTORY_CHECKPOINT_KEY,
+        )?;
+
+        let record = FinalityRecord {
+            previous: frontier,
+            current: frontier,
+            source: FinalitySource::DiskMigration {
+                from_version,
+                network_policy_digest: config.network_policy_digest(),
+                authentication,
+            },
+            epoch: metadata.finality_epoch,
+        };
+        self.put_value(
+            &mut batch,
+            HEADER_FINALITY_HISTORY,
+            HeaderFinalityKey(record.epoch).as_bytes(),
+            &record,
+        )?;
+        self.put_value(
+            &mut batch,
+            HEADER_ENGINE_META,
+            super::FINALITY_HISTORY_COUNT_KEY,
+            &HeaderRowCountDisk(1),
+        )?;
+        for (index, entry) in proof.iter().enumerate() {
+            self.put_value(
+                &mut batch,
+                HEADER_FINALITY_WITNESS,
+                HeaderFinalityWitnessKey {
+                    height: entry.frontier.height,
+                    hash: entry.frontier.hash,
+                }
+                .as_bytes(),
+                &HeaderFinalityWitnessDisk {
+                    context: HeaderValidationContextDisk {
+                        header: entry.header.clone(),
+                        height: entry.frontier.height,
+                    },
+                    root_references: u32::from(index + 1 == proof.len()),
+                    child_references: u32::from(index + 1 < proof.len()),
+                },
+            )?;
+        }
+        self.put_value(
+            &mut batch,
+            HEADER_ENGINE_META,
+            super::FINALITY_WITNESS_COUNT_KEY,
+            &HeaderRowCountDisk(u64::try_from(proof.len()).map_err(|_| {
+                HeaderChainStoreError::Incoherent("migration witness count does not fit u64")
+            })?),
+        )?;
+        metadata.disk_format = HeaderChainDiskVersion::CURRENT;
+        metadata.state_version = metadata.state_version.checked_next()?;
+        metadata.last_transition = None;
+        self.put_value(
+            &mut batch,
+            HEADER_ENGINE_META,
+            super::METADATA_KEY,
+            &metadata,
+        )?;
+        self.db.write(batch)?;
+        tracing::info!(
+            auxiliary_rows,
+            authority_rows,
+            tombstone_rows,
+            from_version = version,
+            to_version = HeaderChainDiskVersion::CURRENT.0,
+            "migrated the authenticated durable header-chain format"
+        );
+        Ok(true)
+    }
+
+    fn stage_v1_aux_deliveries(
+        &self,
+        config: &EngineConfig,
+        batch: &mut DiskWriteBatch,
+    ) -> Result<usize, HeaderChainStoreError> {
         let limit =
             zakura_header_chain::RowLimit::new(config.limits.max_aux_deliveries_total.get());
         let aux_cf = self.cf(HEADER_AUX_DELIVERY)?;
-        let mut batch = DiskWriteBatch::new();
         let mut rows = 0;
         self.db
             .raw_visit_cf(&aux_cf, &mut |key, value| {
@@ -138,89 +284,48 @@ impl HeaderChainStore {
                         "version-one auxiliary key/value mismatch",
                     ));
                 }
-                self.put_value(&mut batch, HEADER_AUX_DELIVERY, key.as_bytes(), &delivery)?;
+                self.put_value(batch, HEADER_AUX_DELIVERY, key.as_bytes(), &delivery)?;
                 Ok(())
             })
             .map_err(|error| match error {
                 RawVisitError::RocksDb(error) => HeaderChainStoreError::RocksDb(error),
                 RawVisitError::Visitor(error) => error,
             })?;
-
-        metadata.disk_format = HeaderChainDiskVersion::CURRENT;
-        metadata.state_version = metadata.state_version.checked_next()?;
-        metadata.last_transition = None;
-        let authority_rows = self.stage_v1_body_evidence_authorities(config, &mut batch)?;
-        let tombstone_rows = self.stage_tombstone_count(&mut batch)?;
-        let finality_rows = self.stage_finality_history_count(&mut batch)?;
-        self.put_value(
-            &mut batch,
-            HEADER_ENGINE_META,
-            super::METADATA_KEY,
-            &metadata,
-        )?;
-        self.db.write(batch)?;
-        tracing::info!(
-            auxiliary_rows = rows,
-            authority_rows,
-            tombstone_rows,
-            finality_rows,
-            from_version = 1,
-            to_version = HeaderChainDiskVersion::CURRENT.0,
-            "migrated the durable header-chain format"
-        );
-        Ok(true)
+        Ok(rows)
     }
 
-    /// Rewrite version-two metadata to the current format.
-    ///
-    /// Version two used the version-one metadata layout (network kind, no policy digest) with
-    /// format marker 2. Auxiliary and authority rows are already in the current encoding.
-    fn migrate_v2_metadata_to_current(
-        &self,
-        config: &EngineConfig,
-        metadata_bytes: &[u8],
-    ) -> Result<bool, HeaderChainStoreError> {
-        let mut metadata =
-            decode_v2_engine_metadata(metadata_bytes, config.network_policy_digest())?;
-        if metadata.network_id != config.network().kind() {
-            return Err(HeaderChainStoreError::Incoherent(
-                "version-two network kind does not match the configured network",
-            ));
-        }
-        if metadata.network_id != NetworkKind::Mainnet {
-            return Err(HeaderChainStoreError::Incoherent(
-                "version-two network policy is ambiguous; rebuild the header-chain database",
-            ));
-        }
-        metadata.disk_format = HeaderChainDiskVersion::CURRENT;
-        metadata.state_version = metadata.state_version.checked_next()?;
-        metadata.last_transition = None;
-        let mut batch = DiskWriteBatch::new();
-        self.put_value(
-            &mut batch,
-            HEADER_ENGINE_META,
-            super::METADATA_KEY,
-            &metadata,
-        )?;
-        self.db.write(batch)?;
-        tracing::info!(
-            from_version = 2,
-            to_version = HeaderChainDiskVersion::CURRENT.0,
-            "migrated the durable header-chain format"
-        );
-        Ok(true)
-    }
-
-    fn first_row_has_version(
+    fn clear_bounded_family(
         &self,
         family: &'static str,
-        version: u8,
-    ) -> Result<bool, HeaderChainStoreError> {
+        limit: usize,
+        batch: &mut DiskWriteBatch,
+    ) -> Result<usize, HeaderChainStoreError> {
         let cf = self.cf(family)?;
-        Ok(self
-            .db
-            .raw_first_cf(&cf)?
-            .is_some_and(|(_, value)| value.first() == Some(&version)))
+        let mut rows = 0;
+        self.db
+            .raw_visit_cf(&cf, &mut |key, value| {
+                if rows == limit {
+                    return Err(HeaderChainStoreError::Store(
+                        zakura_header_chain::StoreError::LimitExceeded {
+                            collection: zakura_header_chain::StoreCollection::FinalityHistory,
+                            limit: zakura_header_chain::RowLimit::new(limit),
+                        },
+                    ));
+                }
+                rows += 1;
+                if key.is_empty() || value.is_empty() {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "legacy finality family contains a malformed row",
+                    ));
+                }
+                self.delete_raw(batch, family, key)?;
+                Ok(())
+            })
+            .map_err(|error| match error {
+                RawVisitError::RocksDb(error) => HeaderChainStoreError::RocksDb(error),
+                RawVisitError::Visitor(error) => error,
+            })?;
+        Ok(rows)
     }
 
     fn stage_v1_body_evidence_authorities(
@@ -302,50 +407,16 @@ impl HeaderChainStore {
         Ok(rows)
     }
 
-    fn stage_finality_history_count(
+    fn stage_tombstones(
         &self,
         batch: &mut DiskWriteBatch,
-    ) -> Result<usize, HeaderChainStoreError> {
-        let finality_cf = self.cf(HEADER_FINALITY_HISTORY)?;
-        let limit = zakura_header_chain::RowLimit::new(super::FINALITY_HISTORY_LIMIT);
-        let mut rows = 0;
-        self.db
-            .raw_visit_cf(&finality_cf, &mut |_, _| {
-                if rows == limit.get() {
-                    return Err(HeaderChainStoreError::Store(
-                        zakura_header_chain::StoreError::LimitExceeded {
-                            collection: zakura_header_chain::StoreCollection::FinalityHistory,
-                            limit,
-                        },
-                    ));
-                }
-                rows += 1;
-                Ok(())
-            })
-            .map_err(|error| match error {
-                RawVisitError::RocksDb(error) => HeaderChainStoreError::RocksDb(error),
-                RawVisitError::Visitor(error) => error,
-            })?;
-        self.put_value(
-            batch,
-            HEADER_ENGINE_META,
-            super::FINALITY_HISTORY_COUNT_KEY,
-            &HeaderRowCountDisk(u64::try_from(rows).map_err(|_| {
-                HeaderChainStoreError::Incoherent("finality history count does not fit u64")
-            })?),
-        )?;
-        Ok(rows)
-    }
-
-    fn stage_tombstone_count(
-        &self,
-        batch: &mut DiskWriteBatch,
-    ) -> Result<usize, HeaderChainStoreError> {
+    ) -> Result<Vec<zakura_header_chain::ConsensusInvalidBodyTombstone>, HeaderChainStoreError>
+    {
         let tombstone_cf = self.cf(HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE)?;
-        let mut tombstone_rows = 0;
+        let mut tombstones = Vec::new();
         self.db
             .raw_visit_cf(&tombstone_cf, &mut |key, value| {
-                if tombstone_rows == super::TOMBSTONE_LIMIT {
+                if tombstones.len() == super::TOMBSTONE_LIMIT {
                     return Err(HeaderChainStoreError::Store(
                         zakura_header_chain::StoreError::LimitExceeded {
                             collection:
@@ -354,7 +425,6 @@ impl HeaderChainStore {
                         },
                     ));
                 }
-                tombstone_rows += 1;
                 let hash = block::Hash(key.try_into().map_err(|_| {
                     HeaderChainStoreError::Incoherent(
                         "invalid version-one consensus-invalid tombstone key width",
@@ -370,7 +440,6 @@ impl HeaderChainStore {
                                 HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
                                 hash.0,
                             )?;
-                            tombstone_rows -= 1;
                             return Ok(());
                         };
                         decode_v1_consensus_invalid_body_tombstone(value, node.height)?
@@ -390,6 +459,7 @@ impl HeaderChainStore {
                         &tombstone,
                     )?;
                 }
+                tombstones.push(tombstone);
                 Ok(())
             })
             .map_err(|error| match error {
@@ -400,11 +470,114 @@ impl HeaderChainStore {
             batch,
             HEADER_ENGINE_META,
             super::TOMBSTONE_COUNT_KEY,
-            &HeaderRowCountDisk(u64::try_from(tombstone_rows).map_err(|_| {
+            &HeaderRowCountDisk(u64::try_from(tombstones.len()).map_err(|_| {
                 HeaderChainStoreError::Incoherent("tombstone count does not fit u64")
             })?),
         )?;
-        Ok(tombstone_rows)
+        Ok(tombstones)
+    }
+
+    fn validate_legacy_graph(
+        &self,
+        metadata: &EngineMetadata,
+        config: &EngineConfig,
+        tombstones: Vec<zakura_header_chain::ConsensusInvalidBodyTombstone>,
+    ) -> Result<(), HeaderChainStoreError> {
+        let snapshot = self.audit_snapshot()?;
+        let node_limit = config
+            .limits
+            .max_non_finalized_nodes
+            .get()
+            .checked_add(1)
+            .ok_or(HeaderChainStoreError::Incoherent(
+                "legacy header node limit overflow",
+            ))?;
+        let mut nodes = Vec::new();
+        snapshot.visit_header_nodes(
+            zakura_header_chain::RowLimit::new(node_limit),
+            &mut |node| {
+                nodes.push(node);
+                Ok(())
+            },
+        )?;
+        let graph = MemHeaderStore::reconstruct(HeaderGraphReconstruction::new(
+            metadata.frontiers.finalized,
+            nodes.clone(),
+            tombstones,
+        ))
+        .map_err(|_| HeaderChainStoreError::Incoherent("legacy header graph is malformed"))?;
+
+        let (selected_tip, selected_score) = graph
+            .select_best_header_chain()
+            .map_err(|_| HeaderChainStoreError::Incoherent("legacy selected path is malformed"))?;
+        if selected_tip != metadata.frontiers.header_best
+            || selected_score != metadata.header_best_score
+        {
+            return Err(HeaderChainStoreError::Incoherent(
+                "legacy selected frontier or score is malformed",
+            ));
+        }
+
+        let by_hash: std::collections::HashMap<_, _> =
+            nodes.iter().map(|node| (node.hash, node)).collect();
+        self.validate_legacy_projection(
+            self.selected_projection()?,
+            metadata.frontiers.finalized,
+            metadata.frontiers.header_best,
+            &by_hash,
+        )?;
+        self.validate_legacy_projection(
+            self.verified_projection()?,
+            metadata.frontiers.finalized,
+            metadata.frontiers.verified_best,
+            &by_hash,
+        )?;
+
+        let mut actual_edges = self.header_child_edges()?;
+        actual_edges.sort_unstable_by_key(|(parent, child)| (parent.0, child.0));
+        let mut expected_edges: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.hash != metadata.frontiers.finalized.hash)
+            .map(|node| (node.parent_hash, node.hash))
+            .collect();
+        expected_edges.sort_unstable_by_key(|(parent, child)| (parent.0, child.0));
+        if actual_edges != expected_edges {
+            return Err(HeaderChainStoreError::Incoherent(
+                "legacy child index is malformed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_legacy_projection(
+        &self,
+        projection: Vec<Frontier>,
+        expected_start: Frontier,
+        expected_end: Frontier,
+        nodes: &std::collections::HashMap<block::Hash, &HeaderNode>,
+    ) -> Result<(), HeaderChainStoreError> {
+        if projection.first() != Some(&expected_start) || projection.last() != Some(&expected_end) {
+            return Err(HeaderChainStoreError::Incoherent(
+                "legacy projection endpoints are malformed",
+            ));
+        }
+        for (index, frontier) in projection.iter().enumerate() {
+            let node = nodes
+                .get(&frontier.hash)
+                .ok_or(HeaderChainStoreError::Incoherent(
+                    "legacy projection references a missing node",
+                ))?;
+            if node.height != frontier.height
+                || index > 0
+                    && (node.parent_hash != projection[index - 1].hash
+                        || projection[index - 1].height.next().ok() != Some(frontier.height))
+            {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "legacy projection is discontinuous",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -492,7 +665,12 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
         previous: config.bootstrap_anchor().frontier,
         current: anchor,
         source: match config.mode {
-            EngineMode::Integrated => FinalitySource::FullState { evidence },
+            EngineMode::Integrated => FinalitySource::FullState {
+                provenance: zakura_header_chain::FullStateFinalityProvenance::initialization(
+                    StateVersion::new(0),
+                    anchor,
+                ),
+            },
             EngineMode::HeadersOnly => FinalitySource::MigratedHeadersOnly,
         },
         epoch: FinalityEpoch::new(0),
@@ -540,6 +718,7 @@ pub(in crate::service) fn initialize_header_chain_reconciled(
         eligibility_changes: Vec::new(),
         aux_changes: Vec::new(),
         finality_append: Some(finality),
+        finality_ancestry: zakura_header_chain::FinalityWitnessProof::default(),
         metadata,
     };
     let contexts = validation_context(source, anchor, anchor_header.previous_block_hash)?;

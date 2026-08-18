@@ -111,6 +111,10 @@ pub use disk_format::{
     FallibleDiskValue, FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex,
     TransactionLocation, MAX_ON_DISK_HEIGHT,
 };
+#[cfg(feature = "internal-bench")]
+pub use header_chain::{
+    benchmark_finality_witness, FinalityWitnessBenchmarkReport, FinalityWitnessBenchmarkSample,
+};
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use header_chain::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub(crate) use treestate_artifact::embedded_historical_subtrees;
@@ -171,6 +175,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     HEADER_AUX_DELIVERY,
     HEADER_DEFERRED,
     HEADER_FINALITY_HISTORY,
+    HEADER_FINALITY_WITNESS,
     HEADER_VALIDATION_CONTEXT,
     HEADER_ENGINE_META,
     // Transactions
@@ -234,6 +239,8 @@ pub const HEADER_AUX_DELIVERY: &str = "header_aux_delivery_v1";
 pub const HEADER_DEFERRED: &str = "header_deferred_v1";
 /// Authoritative append-only finality history.
 pub const HEADER_FINALITY_HISTORY: &str = "header_finality_history_v1";
+/// Canonical hash-keyed headers that prove retained headers-only finality records.
+pub const HEADER_FINALITY_WITNESS: &str = "header_finality_witness_v1";
 /// Immutable validation-context rows.
 pub const HEADER_VALIDATION_CONTEXT: &str = "header_validation_context_v1";
 /// Singleton header-engine metadata root.

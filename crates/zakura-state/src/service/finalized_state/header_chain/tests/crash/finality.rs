@@ -56,7 +56,11 @@ pub(super) fn crash_fixture_finality_advance_reopens_complete_before_or_after() 
             .map(|frontier| frontier.hash)
             .collect::<Vec<_>>();
         let marker = u8::try_from(index + 0x60).expect("the fault-point list fits in u8");
-        let evidence = EvidenceId::from_digest([marker; 32]);
+        let evidence = zakura_header_chain::full_state_finality_evidence(
+            before.state_version,
+            new_finalized,
+            &proof,
+        );
         let authority = Authority(evidence);
         let context = TransitionContext {
             config: &engine_config,
@@ -74,6 +78,8 @@ pub(super) fn crash_fixture_finality_advance_reopens_complete_before_or_after() 
         };
         let marker_key = [marker; 4];
         let mut full_state_batch = DiskWriteBatch::new();
+        stage_full_state_canonical_hash(&runtime.store, &mut full_state_batch, anchor_frontier);
+        stage_full_state_canonical_hash(&runtime.store, &mut full_state_batch, new_finalized);
         runtime
             .store
             .put_raw(

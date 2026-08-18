@@ -974,6 +974,34 @@ fn check_configured_lockbox_disbursement_addresses_parse() {
     );
 }
 
+/// Checks that configured lockbox disbursement amounts which sum above the money supply are
+/// rejected when the network is configured, rather than panicking when the deferred pool
+/// balance is calculated during sync.
+#[test]
+fn check_configured_lockbox_disbursement_total_is_valid() {
+    // A valid Testnet P2SH address, so the amounts are what fails the check.
+    const TESTNET_P2SH_ADDRESS: &str = "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8";
+
+    // Two disbursements of the whole money supply cannot be summed into an `Amount`.
+    let max_money = Amount::<NonNegative>::try_from(crate::amount::MAX_MONEY)
+        .expect("the money supply is a valid amount");
+    let disbursement = ConfiguredLockboxDisbursement {
+        address: TESTNET_P2SH_ADDRESS.to_string(),
+        amount: max_money,
+    };
+
+    let error = testnet::Parameters::build()
+        .with_lockbox_disbursements(vec![disbursement.clone(), disbursement])
+        .to_network()
+        .expect_err("an overflowing lockbox disbursement total must be rejected");
+
+    assert_eq!(
+        error,
+        ParametersBuilderError::InvalidLockboxDisbursementTotal,
+        "configuring an overflowing lockbox disbursement total must report it"
+    );
+}
+
 /// Check that `new_regtest()` constructs a network with the provided funding streams.
 #[test]
 fn check_configured_funding_stream_regtest() {

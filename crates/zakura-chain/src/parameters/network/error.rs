@@ -119,4 +119,11 @@ pub enum ParametersBuilderError {
     )]
     #[non_exhaustive]
     LockboxDisbursementAddressNotP2SH { address: String },
+
+    #[error(
+        "the configured lockbox disbursement amounts must sum to a valid amount, because the \
+         deferred pool balance is calculated from their total"
+    )]
+    #[non_exhaustive]
+    InvalidLockboxDisbursementTotal,
 }

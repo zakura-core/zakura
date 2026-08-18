@@ -388,18 +388,24 @@ fn check_funding_stream_address_types(
     Ok(())
 }
 
-/// Checks that every configured NU6.1 one-time lockbox disbursement address parses and is a
-/// P2SH address.
+/// Checks that every configured NU6.1 one-time lockbox disbursement can be paid: each address
+/// parses and is a P2SH address, and the amounts sum to a valid amount.
 ///
 /// [`Parameters::lockbox_disbursements()`] parses these addresses with an `expect`, and the
 /// disbursement consensus rule only accepts P2SH outputs, so an address that does not parse
-/// or is not P2SH crashes block validation at the NU6.1 activation height. Rejecting those
-/// addresses here surfaces the problem when the network is configured, rather than at that
-/// activation height.
-fn check_lockbox_disbursement_addresses(
+/// or is not P2SH crashes block validation at the NU6.1 activation height.
+/// [`Parameters::lockbox_disbursement_total_amount()`] sums the amounts with an `expect`, so
+/// a total above the money supply crashes the deferred pool balance calculation. Checking
+/// both here surfaces the problem when the network is configured.
+///
+/// The address network kind is deliberately not checked: a P2SH script is the address hash
+/// alone, so a Mainnet P2SH address and a Testnet one with the same hash pay the same script.
+fn check_lockbox_disbursements(
     lockbox_disbursements: &[(String, Amount<NonNegative>)],
 ) -> Result<(), ParametersBuilderError> {
-    for (address, _amount) in lockbox_disbursements {
+    let mut total = Amount::<NonNegative>::zero();
+
+    for (address, amount) in lockbox_disbursements {
         let parsed: transparent::Address = address.parse().map_err(|err: SerializationError| {
             ParametersBuilderError::InvalidLockboxDisbursementAddress {
                 address: address.clone(),
@@ -412,6 +418,9 @@ fn check_lockbox_disbursement_addresses(
                 address: address.clone(),
             });
         }
+
+        total = (total + *amount)
+            .map_err(|_| ParametersBuilderError::InvalidLockboxDisbursementTotal)?;
     }
 
     Ok(())
@@ -1048,7 +1057,7 @@ impl ParametersBuilder {
         }
 
         check_founders_reward_is_exact(&network)?;
-        check_lockbox_disbursement_addresses(&self.lockbox_disbursements)?;
+        check_lockbox_disbursements(&self.lockbox_disbursements)?;
 
         // Final check that the configured checkpoints are valid for this network.
         if network.checkpoint_list().hash(Height(0)) != Some(network.genesis_hash()) {
@@ -1222,13 +1231,12 @@ impl Parameters {
             parameters = parameters.extend_funding_streams();
         }
 
-        // Regtest does not run the `to_network()` checks, so check the address types here:
-        // block validation panics on a funding stream or lockbox disbursement address that is
-        // not P2SH.
+        // Regtest does not run the `to_network()` checks, so run them here: block validation
+        // panics on a funding stream or lockbox disbursement address that is not P2SH.
         for funding_stream in &parameters.funding_streams {
             check_funding_stream_address_types(funding_stream)?;
         }
-        check_lockbox_disbursement_addresses(&parameters.lockbox_disbursements)?;
+        check_lockbox_disbursements(&parameters.lockbox_disbursements)?;
 
         Ok(Self {
             network_name: "Regtest".to_string(),

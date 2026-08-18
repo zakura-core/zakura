@@ -962,7 +962,7 @@ fn check_configured_lockbox_disbursement_addresses_parse() {
             amount: Amount::new_from_zec(78_750),
         }])
         .to_network()
-        .expect_err("an unparseable lockbox disbursement address must be rejected");
+        .expect_err("an unparsable lockbox disbursement address must be rejected");
 
     assert!(
         matches!(
@@ -970,7 +970,7 @@ fn check_configured_lockbox_disbursement_addresses_parse() {
             ParametersBuilderError::InvalidLockboxDisbursementAddress { ref address, .. }
                 if address == INVALID_ADDRESS
         ),
-        "configuring an unparseable lockbox disbursement address must report it, got: {error:?}"
+        "configuring an unparsable lockbox disbursement address must report it, got: {error:?}"
     );
 }
 

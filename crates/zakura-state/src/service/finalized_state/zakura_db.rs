@@ -14,7 +14,7 @@ use std::{path::Path, sync::Arc};
 use crossbeam_channel::bounded;
 use semver::Version;
 
-use zakura_chain::{block::Height, diagnostic::task::WaitForPanics, parameters::Network};
+use zakura_chain::{diagnostic::task::WaitForPanics, parameters::Network};
 
 use crate::{
     config::database_format_version_on_disk,
@@ -502,6 +502,7 @@ impl Drop for ZakuraDb {
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+    use zakura_chain::block::Height;
 
     use crate::{
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},

@@ -3402,41 +3402,6 @@ impl Default for GetInfoResponse {
 }
 
 impl GetInfoResponse {
-    /// Constructs [`GetInfoResponse`] from its constituent parts.
-    #[allow(clippy::too_many_arguments)]
-    #[deprecated(note = "Use `GetInfoResponse::new` instead")]
-    pub fn from_parts(
-        version: u64,
-        build: String,
-        subversion: String,
-        protocol_version: u32,
-        blocks: u32,
-        connections: usize,
-        proxy: Option<String>,
-        difficulty: f64,
-        testnet: bool,
-        pay_tx_fee: f64,
-        relay_fee: f64,
-        errors: String,
-        errors_timestamp: i64,
-    ) -> Self {
-        Self {
-            version,
-            build,
-            subversion,
-            protocol_version,
-            blocks,
-            connections,
-            proxy,
-            difficulty,
-            testnet,
-            pay_tx_fee,
-            relay_fee,
-            errors,
-            errors_timestamp,
-        }
-    }
-
     /// Returns the contents of [`GetInfoResponse`].
     pub fn into_parts(
         self,
@@ -3928,18 +3893,6 @@ impl GetAddressBalanceRequest {
     pub fn new(addresses: Vec<String>) -> GetAddressBalanceRequest {
         GetAddressBalanceRequest { addresses }
     }
-
-    /// Creates a new [`GetAddressBalanceRequest`] from a vector, returning an
-    /// error if any addresses are incorrect.
-    #[deprecated(
-        note = "Use `GetAddressBalanceRequest::new` instead. Validity will be \
-                checked by the server."
-    )]
-    pub fn new_valid(addresses: Vec<String>) -> Result<GetAddressBalanceRequest> {
-        let req = Self { addresses };
-        req.valid_addresses()?;
-        Ok(req)
-    }
 }
 
 /// The transparent balance of a set of addresses.
@@ -4136,12 +4089,6 @@ impl SendRawTransactionResponse {
     /// Constructs a new [`SendRawTransactionResponse`].
     pub fn new(hash: transaction::Hash) -> Self {
         SendRawTransactionResponse(hash)
-    }
-
-    /// Returns the contents of [`SendRawTransactionResponse`].
-    #[deprecated(note = "Use `SendRawTransactionResponse::hash` instead")]
-    pub fn inner(&self) -> transaction::Hash {
-        self.hash()
     }
 
     /// Returns the contents of [`SendRawTransactionResponse`].
@@ -4589,26 +4536,6 @@ impl Default for Utxo {
 }
 
 impl Utxo {
-    /// Constructs a new [`Utxo`].
-    #[deprecated(note = "Use `Utxo::new` instead")]
-    pub fn from_parts(
-        address: transparent::Address,
-        txid: transaction::Hash,
-        output_index: OutputIndex,
-        script: transparent::Script,
-        satoshis: u64,
-        height: Height,
-    ) -> Self {
-        Utxo {
-            address,
-            txid,
-            output_index,
-            script,
-            satoshis,
-            height,
-        }
-    }
-
     /// Returns the contents of [`Utxo`].
     pub fn into_parts(
         &self,
@@ -4649,16 +4576,6 @@ pub struct GetAddressTxIdsRequest {
 }
 
 impl GetAddressTxIdsRequest {
-    /// Constructs [`GetAddressTxIdsRequest`] from its constituent parts.
-    #[deprecated(note = "Use `GetAddressTxIdsRequest::new` instead.")]
-    pub fn from_parts(addresses: Vec<String>, start: u32, end: u32) -> Self {
-        GetAddressTxIdsRequest {
-            addresses,
-            start: Some(start),
-            end: Some(end),
-        }
-    }
-
     /// Returns the contents of [`GetAddressTxIdsRequest`].
     pub fn into_parts(&self) -> (Vec<String>, u32, u32) {
         (

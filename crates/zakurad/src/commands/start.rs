@@ -2107,6 +2107,215 @@ mod zakura_header_sync_driver_tests {
         }))
     }
 
+    /// Like [`counting_verifier`], but also reports each committed height on the
+    /// returned channel.
+    fn height_reporting_verifier(
+        commit_count: Arc<AtomicUsize>,
+        release_first: Option<Arc<tokio::sync::Notify>>,
+    ) -> (
+        BoxCloneService<zakura_consensus::Request, block::Hash, zakura_consensus::BoxError>,
+        mpsc::Receiver<block::Height>,
+    ) {
+        let (commit_tx, commit_rx) = mpsc::channel(8);
+        let verifier = service_fn(move |request: zakura_consensus::Request| {
+            let commit_tx = commit_tx.clone();
+            let commit_count = commit_count.clone();
+            let release_first = release_first.clone();
+            async move {
+                match request {
+                    zakura_consensus::Request::Commit(block) => {
+                        let height = block.coinbase_height().expect("test block has height");
+                        commit_count.fetch_add(1, Ordering::SeqCst);
+                        commit_tx
+                            .send(height)
+                            .await
+                            .expect("test commit receiver stays open");
+
+                        if height == block::Height(1) {
+                            if let Some(release_first) = release_first {
+                                release_first.notified().await;
+                            }
+                        }
+
+                        Ok::<_, zakura_consensus::BoxError>(block.hash())
+                    }
+                    request => panic!("unexpected consensus request: {request:?}"),
+                }
+            }
+        });
+        (BoxCloneService::new(verifier), commit_rx)
+    }
+
+    /// A block verifier that accepts every `Commit` and forwards the committed
+    /// hash to the returned channel; any other request fails the test.
+    fn commit_channel_verifier() -> (
+        BoxCloneService<zakura_consensus::Request, block::Hash, zakura_consensus::BoxError>,
+        mpsc::Receiver<block::Hash>,
+    ) {
+        let (commit_tx, commit_rx) = mpsc::channel(8);
+        let verifier = service_fn(move |request: zakura_consensus::Request| {
+            let commit_tx = commit_tx.clone();
+            async move {
+                match request {
+                    zakura_consensus::Request::Commit(block) => {
+                        let hash = block.hash();
+                        commit_tx
+                            .send(hash)
+                            .await
+                            .expect("test commit receiver stays open");
+                        Ok::<_, zakura_consensus::BoxError>(hash)
+                    }
+                    request => panic!("unexpected consensus request: {request:?}"),
+                }
+            }
+        });
+        (BoxCloneService::new(verifier), commit_rx)
+    }
+
+    /// A read state that answers `Tip` and `FinalizedTip` with the given tip
+    /// and fails the test on any other request.
+    fn fixed_tip_read_state(
+        height: block::Height,
+        hash: block::Hash,
+    ) -> BoxCloneService<
+        zakura_state::ReadRequest,
+        zakura_state::ReadResponse,
+        zakura_state::BoxError,
+    > {
+        BoxCloneService::new(service_fn(
+            move |request: zakura_state::ReadRequest| async move {
+                match request {
+                    zakura_state::ReadRequest::FinalizedTip => Ok::<_, zakura_state::BoxError>(
+                        zakura_state::ReadResponse::FinalizedTip(Some((height, hash))),
+                    ),
+                    zakura_state::ReadRequest::Tip => {
+                        Ok(zakura_state::ReadResponse::Tip(Some((height, hash))))
+                    }
+                    request => panic!("unexpected read request: {request:?}"),
+                }
+            },
+        ))
+    }
+
+    /// A read state that fails the test on any request; `context` names the
+    /// test scenario in the panic message.
+    fn panicking_read_state(
+        context: &'static str,
+    ) -> BoxCloneService<
+        zakura_state::ReadRequest,
+        zakura_state::ReadResponse,
+        zakura_state::BoxError,
+    > {
+        BoxCloneService::new(service_fn(
+            move |request: zakura_state::ReadRequest| async move {
+                panic!("unexpected read request while {context}: {request:?}");
+                #[allow(unreachable_code)]
+                Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Tip(None))
+            },
+        ))
+    }
+
+    /// A block verifier that fails the test on any request; `context` names the
+    /// test scenario in the panic message.
+    fn panicking_verifier(
+        context: &'static str,
+    ) -> BoxCloneService<zakura_consensus::Request, block::Hash, zakura_consensus::BoxError> {
+        BoxCloneService::new(service_fn(
+            move |request: zakura_consensus::Request| async move {
+                panic!("unexpected verifier request while {context}: {request:?}");
+                #[allow(unreachable_code)]
+                Ok::<_, zakura_consensus::BoxError>(block::Hash([0; 32]))
+            },
+        ))
+    }
+
+    /// The `drive_block_sync_actions` arguments the driver tests rarely
+    /// override, preloaded with the values shared by every test. Override
+    /// individual fields with struct update syntax, then call
+    /// [`DriverParams::spawn`].
+    struct DriverParams {
+        header_chain_write: Option<
+            BoxCloneService<zakura_state::Request, zakura_state::Response, zakura_state::BoxError>,
+        >,
+        body_evidence_authority: Option<zakura_state::HeaderChainBodyEvidenceAuthority>,
+        max_checkpoint_height: block::Height,
+        checkpoint_apply_limit: usize,
+        full_apply_limit: usize,
+        combined_apply_limit: usize,
+        trace: zakura_network::zakura::ZakuraTrace,
+        throughput_probe: Option<BlocksyncThroughputProbe>,
+        handoff: Arc<super::zakura::SyncCoordinator>,
+    }
+
+    impl Default for DriverParams {
+        fn default() -> Self {
+            Self {
+                header_chain_write: None,
+                body_evidence_authority: None,
+                max_checkpoint_height: block::Height::MAX,
+                checkpoint_apply_limit: sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+                full_apply_limit: sync::MIN_CONCURRENCY_LIMIT,
+                combined_apply_limit: sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+                trace: zakura_network::zakura::ZakuraTrace::noop(),
+                throughput_probe: None,
+                handoff: super::zakura::SyncCoordinator::new(),
+            }
+        }
+    }
+
+    impl DriverParams {
+        /// Spawns `drive_block_sync_actions` with these parameters and the
+        /// per-test channels and services, wiring a fresh shutdown channel.
+        /// Returns the driver task and the sender that resolves the driver's
+        /// shutdown future.
+        fn spawn<ReadState, BlockVerifier>(
+            self,
+            action_rx: mpsc::Receiver<BlockSyncAction>,
+            block_sync: zakura_network::zakura::BlockSyncHandle,
+            latest_chain_tip: impl zakura_chain::chain_tip::ChainTip + Clone + Send + Sync + 'static,
+            read_state: ReadState,
+            block_verifier: BlockVerifier,
+        ) -> (tokio::task::JoinHandle<()>, oneshot::Sender<()>)
+        where
+            ReadState: Service<
+                    zakura_state::ReadRequest,
+                    Response = zakura_state::ReadResponse,
+                    Error = zakura_state::BoxError,
+                > + Clone
+                + Send
+                + 'static,
+            ReadState::Future: Send + 'static,
+            BlockVerifier:
+                Service<zakura_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
+            BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
+            BlockVerifier::Future: Send + 'static,
+        {
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let driver = tokio::spawn(drive_block_sync_actions(
+                action_rx,
+                zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+                None,
+                block_sync,
+                latest_chain_tip,
+                read_state,
+                self.header_chain_write,
+                self.body_evidence_authority,
+                block_verifier,
+                self.max_checkpoint_height,
+                self.checkpoint_apply_limit,
+                self.full_apply_limit,
+                self.combined_apply_limit,
+                self.trace,
+                self.throughput_probe,
+                self.handoff,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            ));
+            (driver, shutdown_tx)
+        }
+    }
+
     async fn wait_for_query_seen(query_seen_rx: oneshot::Receiver<()>) {
         tokio::time::timeout(Duration::from_secs(1), query_seen_rx)
             .await
@@ -2654,16 +2863,8 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
-            panic!("unexpected read request while persisting body retry evidence: {request:?}");
-            #[allow(unreachable_code)]
-            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Tip(None))
-        });
-        let verifier = service_fn(|request: zakura_consensus::Request| async move {
-            panic!("unexpected verifier request while persisting body retry evidence: {request:?}");
-            #[allow(unreachable_code)]
-            Ok::<_, zakura_consensus::BoxError>(block::Hash([0; 32]))
-        });
+        let read_state = panicking_read_state("persisting body retry evidence");
+        let verifier = panicking_verifier("persisting body retry evidence");
         let (request_tx, mut request_rx) = mpsc::channel(1);
         let header_chain_write =
             BoxCloneService::new(service_fn(move |request: zakura_state::Request| {
@@ -2684,28 +2885,18 @@ mod zakura_header_sync_driver_tests {
                 }
             }));
         let body_evidence_authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, shutdown_tx) = DriverParams {
+            header_chain_write: Some(header_chain_write),
+            body_evidence_authority: Some(body_evidence_authority.clone()),
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            Some(header_chain_write),
-            Some(body_evidence_authority.clone()),
             verifier,
-            block::Height::MAX,
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            sync::MIN_CONCURRENCY_LIMIT,
-            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         let expected_version = zakura_header_chain::StateVersion::new(7);
         let failure = zakura_header_chain::TransientBodyFailure {
@@ -2744,18 +2935,8 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
-            panic!("unexpected read request while persisting invalid-body evidence: {request:?}");
-            #[allow(unreachable_code)]
-            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Tip(None))
-        });
-        let verifier = service_fn(|request: zakura_consensus::Request| async move {
-            panic!(
-                "unexpected verifier request while persisting invalid-body evidence: {request:?}"
-            );
-            #[allow(unreachable_code)]
-            Ok::<_, zakura_consensus::BoxError>(block::Hash([0; 32]))
-        });
+        let read_state = panicking_read_state("persisting invalid-body evidence");
+        let verifier = panicking_verifier("persisting invalid-body evidence");
         let (request_tx, mut request_rx) = mpsc::channel(1);
         let header_chain_write =
             BoxCloneService::new(service_fn(move |request: zakura_state::Request| {
@@ -2777,28 +2958,18 @@ mod zakura_header_sync_driver_tests {
                 }
             }));
         let body_evidence_authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, shutdown_tx) = DriverParams {
+            header_chain_write: Some(header_chain_write),
+            body_evidence_authority: Some(body_evidence_authority.clone()),
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            Some(header_chain_write),
-            Some(body_evidence_authority.clone()),
             verifier,
-            block::Height::MAX,
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            sync::MIN_CONCURRENCY_LIMIT,
-            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         let expected_version = zakura_header_chain::StateVersion::new(7);
         let invalid = zakura_header_chain::ConsensusBodyInvalid {
@@ -2832,18 +3003,8 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
-            panic!("unexpected read request while refreshing invalid-body evidence: {request:?}");
-            #[allow(unreachable_code)]
-            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Tip(None))
-        });
-        let verifier = service_fn(|request: zakura_consensus::Request| async move {
-            panic!(
-                "unexpected verifier request while refreshing invalid-body evidence: {request:?}"
-            );
-            #[allow(unreachable_code)]
-            Ok::<_, zakura_consensus::BoxError>(block::Hash([0; 32]))
-        });
+        let read_state = panicking_read_state("refreshing invalid-body evidence");
+        let verifier = panicking_verifier("refreshing invalid-body evidence");
         let (request_tx, mut request_rx) = mpsc::channel(2);
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts_for_service = attempts.clone();
@@ -2878,28 +3039,18 @@ mod zakura_header_sync_driver_tests {
                 }
             }));
         let body_evidence_authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, shutdown_tx) = DriverParams {
+            header_chain_write: Some(header_chain_write),
+            body_evidence_authority: Some(body_evidence_authority.clone()),
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            Some(header_chain_write),
-            Some(body_evidence_authority.clone()),
             verifier,
-            block::Height::MAX,
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            sync::MIN_CONCURRENCY_LIMIT,
-            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         let stale_version = zakura_header_chain::StateVersion::new(7);
         let invalid = zakura_header_chain::ConsensusBodyInvalid {
@@ -2945,18 +3096,8 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
-            panic!("unexpected read request while fail-closing invalid-body evidence: {request:?}");
-            #[allow(unreachable_code)]
-            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Tip(None))
-        });
-        let verifier = service_fn(|request: zakura_consensus::Request| async move {
-            panic!(
-                "unexpected verifier request while fail-closing invalid-body evidence: {request:?}"
-            );
-            #[allow(unreachable_code)]
-            Ok::<_, zakura_consensus::BoxError>(block::Hash([0; 32]))
-        });
+        let read_state = panicking_read_state("fail-closing invalid-body evidence");
+        let verifier = panicking_verifier("fail-closing invalid-body evidence");
         let header_chain_write =
             BoxCloneService::new(service_fn(|request: zakura_state::Request| async move {
                 let zakura_state::Request::RecordHeaderChainBodyInvalid { .. } = request else {
@@ -2967,28 +3108,18 @@ mod zakura_header_sync_driver_tests {
                 )
             }));
         let body_evidence_authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
-        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, _shutdown_tx) = DriverParams {
+            header_chain_write: Some(header_chain_write),
+            body_evidence_authority: Some(body_evidence_authority),
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            Some(header_chain_write),
-            Some(body_evidence_authority),
             verifier,
-            block::Height::MAX,
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            sync::MIN_CONCURRENCY_LIMIT,
-            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         action_tx
             .send(BlockSyncAction::RecordBodyInvalid {
@@ -3061,45 +3192,14 @@ mod zakura_header_sync_driver_tests {
             }
         });
 
-        let (commit_tx, mut commit_rx) = mpsc::channel(1);
-        let verifier = service_fn(move |request: zakura_consensus::Request| {
-            let commit_tx = commit_tx.clone();
-            async move {
-                match request {
-                    zakura_consensus::Request::Commit(block) => {
-                        let hash = block.hash();
-                        commit_tx
-                            .send(hash)
-                            .await
-                            .expect("test commit receiver stays open");
-                        Ok::<_, zakura_consensus::BoxError>(hash)
-                    }
-                    request => panic!("unexpected consensus request: {request:?}"),
-                }
-            }
-        });
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (verifier, mut commit_rx) = commit_channel_verifier();
+        let (driver, shutdown_tx) = DriverParams::default().spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height::MAX,
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            sync::MIN_CONCURRENCY_LIMIT,
-            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         action_tx
             .send(needed_blocks_query(
@@ -3221,41 +3321,19 @@ mod zakura_header_sync_driver_tests {
         });
 
         let commit_count = Arc::new(AtomicUsize::new(0));
-        let verifier_count = commit_count.clone();
-        let verifier = service_fn(move |request: zakura_consensus::Request| {
-            let verifier_count = verifier_count.clone();
-            async move {
-                match request {
-                    zakura_consensus::Request::Commit(block) => {
-                        verifier_count.fetch_add(1, Ordering::SeqCst);
-                        Ok::<_, zakura_consensus::BoxError>(block.hash())
-                    }
-                    request => panic!("unexpected consensus request: {request:?}"),
-                }
-            }
-        });
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let verifier = counting_verifier(commit_count.clone(), None);
+        let (driver, shutdown_tx) = DriverParams {
+            trace: trace.clone(),
+            throughput_probe: Some(probe),
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height::MAX,
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            sync::MIN_CONCURRENCY_LIMIT,
-            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
-            trace.clone(),
-            Some(probe),
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         let startup_action = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
             .await
@@ -3360,58 +3438,15 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let (commit_tx, mut commit_rx) = mpsc::channel(8);
-        let verifier = service_fn(move |request: zakura_consensus::Request| {
-            let commit_tx = commit_tx.clone();
-            async move {
-                match request {
-                    zakura_consensus::Request::Commit(block) => {
-                        let hash = block.hash();
-                        commit_tx
-                            .send(hash)
-                            .await
-                            .expect("test commit receiver stays open");
-                        Ok::<_, zakura_consensus::BoxError>(hash)
-                    }
-                    request => panic!("unexpected consensus request: {request:?}"),
-                }
-            }
-        });
-        let block2_hash = block2.hash();
-        let read_state = service_fn(move |request: zakura_state::ReadRequest| async move {
-            match request {
-                zakura_state::ReadRequest::FinalizedTip => Ok::<_, zakura_state::BoxError>(
-                    zakura_state::ReadResponse::FinalizedTip(Some((block::Height(2), block2_hash))),
-                ),
-                zakura_state::ReadRequest::Tip => Ok(zakura_state::ReadResponse::Tip(Some((
-                    block::Height(2),
-                    block2_hash,
-                )))),
-                request => panic!("unexpected read request: {request:?}"),
-            }
-        });
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (verifier, mut commit_rx) = commit_channel_verifier();
+        let read_state = fixed_tip_read_state(block::Height(2), block2.hash());
+        let (driver, shutdown_tx) = DriverParams::default().spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height::MAX,
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            sync::MIN_CONCURRENCY_LIMIT,
-            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         let peer =
             zakura_network::zakura::ZakuraPeerId::new(vec![8; 32]).expect("test peer id is valid");
@@ -3471,67 +3506,22 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let (commit_tx, mut commit_rx) = mpsc::channel(8);
         let release_first = Arc::new(tokio::sync::Notify::new());
-        let verifier = {
-            let release_first = release_first.clone();
-            service_fn(move |request: zakura_consensus::Request| {
-                let commit_tx = commit_tx.clone();
-                let release_first = release_first.clone();
-                async move {
-                    match request {
-                        zakura_consensus::Request::Commit(block) => {
-                            let height = block.coinbase_height().expect("test block has height");
-                            let hash = block.hash();
-                            commit_tx
-                                .send(height)
-                                .await
-                                .expect("test commit receiver stays open");
-                            if height == block::Height(1) {
-                                release_first.notified().await;
-                            }
-                            Ok::<_, zakura_consensus::BoxError>(hash)
-                        }
-                        request => panic!("unexpected consensus request: {request:?}"),
-                    }
-                }
-            })
-        };
-        let block2_hash = block2.hash();
-        let read_state = service_fn(move |request: zakura_state::ReadRequest| async move {
-            match request {
-                zakura_state::ReadRequest::FinalizedTip => Ok::<_, zakura_state::BoxError>(
-                    zakura_state::ReadResponse::FinalizedTip(Some((block::Height(2), block2_hash))),
-                ),
-                zakura_state::ReadRequest::Tip => Ok(zakura_state::ReadResponse::Tip(Some((
-                    block::Height(2),
-                    block2_hash,
-                )))),
-                request => panic!("unexpected read request: {request:?}"),
-            }
-        });
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (verifier, mut commit_rx) =
+            height_reporting_verifier(Arc::new(AtomicUsize::new(0)), Some(release_first.clone()));
+        let read_state = fixed_tip_read_state(block::Height(2), block2.hash());
+        let (driver, shutdown_tx) = DriverParams {
+            max_checkpoint_height: block::Height(2),
+            checkpoint_apply_limit: 2,
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height(2),
-            2,
-            sync::MIN_CONCURRENCY_LIMIT,
-            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
@@ -3579,67 +3569,22 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let (commit_tx, mut commit_rx) = mpsc::channel(8);
         let release_first = Arc::new(tokio::sync::Notify::new());
-        let verifier = {
-            let release_first = release_first.clone();
-            service_fn(move |request: zakura_consensus::Request| {
-                let commit_tx = commit_tx.clone();
-                let release_first = release_first.clone();
-                async move {
-                    match request {
-                        zakura_consensus::Request::Commit(block) => {
-                            let height = block.coinbase_height().expect("test block has height");
-                            let hash = block.hash();
-                            commit_tx
-                                .send(height)
-                                .await
-                                .expect("test commit receiver stays open");
-                            if height == block::Height(1) {
-                                release_first.notified().await;
-                            }
-                            Ok::<_, zakura_consensus::BoxError>(hash)
-                        }
-                        request => panic!("unexpected consensus request: {request:?}"),
-                    }
-                }
-            })
-        };
-        let block2_hash = block2.hash();
-        let read_state = service_fn(move |request: zakura_state::ReadRequest| async move {
-            match request {
-                zakura_state::ReadRequest::FinalizedTip => Ok::<_, zakura_state::BoxError>(
-                    zakura_state::ReadResponse::FinalizedTip(Some((block::Height(2), block2_hash))),
-                ),
-                zakura_state::ReadRequest::Tip => Ok(zakura_state::ReadResponse::Tip(Some((
-                    block::Height(2),
-                    block2_hash,
-                )))),
-                request => panic!("unexpected read request: {request:?}"),
-            }
-        });
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (verifier, mut commit_rx) =
+            height_reporting_verifier(Arc::new(AtomicUsize::new(0)), Some(release_first.clone()));
+        let read_state = fixed_tip_read_state(block::Height(2), block2.hash());
+        let (driver, shutdown_tx) = DriverParams {
+            max_checkpoint_height: block::Height(2),
+            combined_apply_limit: 1,
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height(2),
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            sync::MIN_CONCURRENCY_LIMIT,
-            1,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
@@ -3688,67 +3633,24 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let (commit_tx, mut commit_rx) = mpsc::channel(8);
         let release_first = Arc::new(tokio::sync::Notify::new());
-        let verifier = {
-            let release_first = release_first.clone();
-            service_fn(move |request: zakura_consensus::Request| {
-                let commit_tx = commit_tx.clone();
-                let release_first = release_first.clone();
-                async move {
-                    match request {
-                        zakura_consensus::Request::Commit(block) => {
-                            let height = block.coinbase_height().expect("test block has height");
-                            let hash = block.hash();
-                            commit_tx
-                                .send(height)
-                                .await
-                                .expect("test commit receiver stays open");
-                            if height == block::Height(1) {
-                                release_first.notified().await;
-                            }
-                            Ok::<_, zakura_consensus::BoxError>(hash)
-                        }
-                        request => panic!("unexpected consensus request: {request:?}"),
-                    }
-                }
-            })
-        };
-        let block2_hash = block2.hash();
-        let read_state = service_fn(move |request: zakura_state::ReadRequest| async move {
-            match request {
-                zakura_state::ReadRequest::FinalizedTip => Ok::<_, zakura_state::BoxError>(
-                    zakura_state::ReadResponse::FinalizedTip(Some((block::Height(2), block2_hash))),
-                ),
-                zakura_state::ReadRequest::Tip => Ok(zakura_state::ReadResponse::Tip(Some((
-                    block::Height(2),
-                    block2_hash,
-                )))),
-                request => panic!("unexpected read request: {request:?}"),
-            }
-        });
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (verifier, mut commit_rx) =
+            height_reporting_verifier(Arc::new(AtomicUsize::new(0)), Some(release_first.clone()));
+        let read_state = fixed_tip_read_state(block::Height(2), block2.hash());
+        let (driver, shutdown_tx) = DriverParams {
+            max_checkpoint_height: block::Height(0),
+            checkpoint_apply_limit: 2,
+            full_apply_limit: 2,
+            combined_apply_limit: 1,
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height(0),
-            2,
-            2,
-            1,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
@@ -3817,28 +3719,21 @@ mod zakura_header_sync_driver_tests {
         let (query_seen_tx, query_seen_rx) = oneshot::channel();
         let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
         let read_state = read_state_serving_blocks(vec![block.clone()], Some(query_seen));
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, shutdown_tx) = DriverParams {
+            max_checkpoint_height: block::Height(0),
+            full_apply_limit: 1,
+            combined_apply_limit: 1,
+            trace: trace.clone(),
+            handoff,
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height(0),
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            1,
-            1,
-            trace.clone(),
-            None,
-            handoff,
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         // Send 2 actions to the driver
         // Submit block should be acked as abandoned.
@@ -3916,28 +3811,21 @@ mod zakura_header_sync_driver_tests {
             read_state_serving_blocks(vec![block1.clone(), block2.clone()], Some(query_seen));
         let handoff = super::zakura::SyncCoordinator::new();
         let drain_handoff = handoff.clone();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, shutdown_tx) = DriverParams {
+            max_checkpoint_height: block::Height(0),
+            full_apply_limit: 1,
+            combined_apply_limit: 1,
+            trace: trace.clone(),
+            handoff,
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height(0),
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            1,
-            1,
-            trace.clone(),
-            None,
-            handoff,
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
@@ -4039,28 +3927,21 @@ mod zakura_header_sync_driver_tests {
             .acquire_legacy_fallback(Duration::from_secs(1))
             .await
             .expect("idle native applies yield to fallback");
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, shutdown_tx) = DriverParams {
+            max_checkpoint_height: block::Height(0),
+            full_apply_limit: 1,
+            combined_apply_limit: 1,
+            trace: trace.clone(),
+            handoff,
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height(0),
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            1,
-            1,
-            trace.clone(),
-            None,
-            handoff,
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         // Send a serving query to Zakura.
         action_tx
@@ -4120,28 +4001,21 @@ mod zakura_header_sync_driver_tests {
             .acquire_legacy_fallback(Duration::from_secs(1))
             .await
             .expect("idle native applies yield to fallback");
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, shutdown_tx) = DriverParams {
+            max_checkpoint_height: block::Height(0),
+            full_apply_limit: 1,
+            combined_apply_limit: 1,
+            trace: trace.clone(),
+            handoff,
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height(0),
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            1,
-            1,
-            trace.clone(),
-            None,
-            handoff,
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         for token in 1..=SUBMIT_COUNT {
             let block = if token % 2 == 0 {
@@ -4208,70 +4082,24 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let (commit_tx, mut commit_rx) = mpsc::channel(8);
         let release_first = Arc::new(tokio::sync::Notify::new());
         let commit_count = Arc::new(AtomicUsize::new(0));
-        let verifier = {
-            let release_first = release_first.clone();
-            let commit_count = commit_count.clone();
-            service_fn(move |request: zakura_consensus::Request| {
-                let commit_tx = commit_tx.clone();
-                let release_first = release_first.clone();
-                let commit_count = commit_count.clone();
-                async move {
-                    match request {
-                        zakura_consensus::Request::Commit(block) => {
-                            let height = block.coinbase_height().expect("test block has height");
-                            commit_count.fetch_add(1, Ordering::SeqCst);
-                            commit_tx
-                                .send(height)
-                                .await
-                                .expect("test commit receiver stays open");
-                            if height == block::Height(1) {
-                                release_first.notified().await;
-                            }
-                            Ok::<_, zakura_consensus::BoxError>(block.hash())
-                        }
-                        request => panic!("unexpected consensus request: {request:?}"),
-                    }
-                }
-            })
-        };
-        let block1_hash = block1.hash();
-        let read_state = service_fn(move |request: zakura_state::ReadRequest| async move {
-            match request {
-                zakura_state::ReadRequest::FinalizedTip => Ok::<_, zakura_state::BoxError>(
-                    zakura_state::ReadResponse::FinalizedTip(Some((block::Height(1), block1_hash))),
-                ),
-                zakura_state::ReadRequest::Tip => Ok(zakura_state::ReadResponse::Tip(Some((
-                    block::Height(1),
-                    block1_hash,
-                )))),
-                request => panic!("unexpected read request: {request:?}"),
-            }
-        });
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let mut driver = tokio::spawn(drive_block_sync_actions(
+        let (verifier, mut commit_rx) =
+            height_reporting_verifier(commit_count.clone(), Some(release_first.clone()));
+        let read_state = fixed_tip_read_state(block::Height(1), block1.hash());
+        let (mut driver, shutdown_tx) = DriverParams {
+            max_checkpoint_height: block::Height(0),
+            full_apply_limit: 1,
+            combined_apply_limit: 1,
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height(0),
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            1,
-            1,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
@@ -4810,28 +4638,13 @@ mod zakura_header_sync_driver_tests {
                 }
             }
         });
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, shutdown_tx) = DriverParams::default().spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height::MAX,
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            sync::MIN_CONCURRENCY_LIMIT,
-            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
@@ -4912,28 +4725,18 @@ mod zakura_header_sync_driver_tests {
                 }
             }
         });
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, shutdown_tx) = DriverParams {
+            checkpoint_apply_limit: two_checkpoint_gaps,
+            combined_apply_limit: zakura_consensus::MAX_CHECKPOINT_HEIGHT_GAP,
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height::MAX,
-            two_checkpoint_gaps,
-            sync::MIN_CONCURRENCY_LIMIT,
-            zakura_consensus::MAX_CHECKPOINT_HEIGHT_GAP,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         for token in 0..=two_checkpoint_gaps {
             action_tx
@@ -5028,28 +4831,13 @@ mod zakura_header_sync_driver_tests {
                 }
             }
         });
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, shutdown_tx) = DriverParams::default().spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
             verifier,
-            block::Height::MAX,
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            sync::MIN_CONCURRENCY_LIMIT,
-            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
@@ -5161,30 +4949,19 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, shutdown_tx) = DriverParams {
+            // Every block 0..=10 is at or below the checkpoint, so all are Checkpoint-class
+            // (indefinite-wait) commits — the path that wedges in production.
+            max_checkpoint_height: block::Height(CHECKPOINT_HEIGHT),
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             _latest_tip,
             read_state.clone(),
-            None,
-            None,
             verifier,
-            // Every block 0..=10 is at or below the checkpoint, so all are Checkpoint-class
-            // (indefinite-wait) commits — the path that wedges in production.
-            block::Height(CHECKPOINT_HEIGHT),
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            sync::MIN_CONCURRENCY_LIMIT,
-            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         let finalized_tip = || {
             let read_state = read_state.clone();
@@ -5324,28 +5101,17 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let driver = tokio::spawn(drive_block_sync_actions(
+        let (driver, shutdown_tx) = DriverParams {
+            max_checkpoint_height: second_checkpoint_height,
+            ..DriverParams::default()
+        }
+        .spawn(
             action_rx,
-            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
-            None,
             block_sync,
             latest_tip,
             read_state.clone(),
-            None,
-            None,
             verifier,
-            second_checkpoint_height,
-            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
-            sync::MIN_CONCURRENCY_LIMIT,
-            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
-            zakura_network::zakura::ZakuraTrace::noop(),
-            None,
-            super::zakura::SyncCoordinator::new(),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        );
 
         for (height, block) in &chain {
             action_tx

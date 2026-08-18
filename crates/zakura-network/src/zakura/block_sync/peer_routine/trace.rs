@@ -5,6 +5,16 @@ use super::super::trace::{
 use super::*;
 use crate::zakura::trace::block_sync_trace as bs_trace;
 
+pub(super) struct ReceivedBodyTrace {
+    pub height: block::Height,
+    pub hash: block::Hash,
+    pub serialized_bytes: u64,
+    pub decoded_attributed_memory_size_bytes: u64,
+    pub request_start_height: Option<block::Height>,
+    pub request_range_count: Option<u32>,
+    pub request_elapsed_ms: Option<u64>,
+}
+
 impl PeerRoutine {
     pub(super) fn emit(&self, event: &'static str, build: impl FnOnce(&mut BlockTraceFields)) {
         self.trace
@@ -146,31 +156,30 @@ impl PeerRoutine {
         });
     }
 
-    pub(super) fn trace_body_received(
-        &self,
-        height: block::Height,
-        serialized_bytes: u64,
-        decoded_attributed_memory_size_bytes: u64,
-        request_start_height: Option<block::Height>,
-        request_range_count: Option<u32>,
-        request_elapsed_ms: Option<u64>,
-    ) {
+    pub(super) fn trace_body_received(&self, received: ReceivedBodyTrace) {
+        self.trace.block_propagation().native_block_body_received(
+            &self.peer,
+            received.hash,
+            received.height,
+        );
         self.emit(bs_trace::BLOCK_BODY_RECEIVED, |row| {
             row.peer = Some(trace_peer(&self.peer));
-            row.height = Some(trace_height(height));
-            row.serialized_bytes = Some(serialized_bytes);
-            row.decoded_attributed_memory_size_bytes = Some(decoded_attributed_memory_size_bytes);
+            row.height = Some(trace_height(received.height));
+            row.hash = Some(received.hash.to_string());
+            row.serialized_bytes = Some(received.serialized_bytes);
+            row.decoded_attributed_memory_size_bytes =
+                Some(received.decoded_attributed_memory_size_bytes);
             row.budget_reserved_after = Some(self.budget.reserved());
             row.sequencer_input_capacity = Some(saturating_usize(self.sequencer_input.capacity()));
             row.sequencer_input_max_capacity =
                 Some(saturating_usize(self.sequencer_input.max_capacity()));
-            if let Some(request_start_height) = request_start_height {
+            if let Some(request_start_height) = received.request_start_height {
                 row.request_start = Some(trace_height(request_start_height));
             }
-            if let Some(request_range_count) = request_range_count {
+            if let Some(request_range_count) = received.request_range_count {
                 row.request_range_count = Some(u64::from(request_range_count));
             }
-            if let Some(request_elapsed_ms) = request_elapsed_ms {
+            if let Some(request_elapsed_ms) = received.request_elapsed_ms {
                 row.request_elapsed_ms = Some(request_elapsed_ms);
             }
             self.insert_bbr_fields(row);

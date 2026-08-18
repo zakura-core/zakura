@@ -791,6 +791,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn received_body_schema_carries_block_hash() {
+        let mut event = BlockTraceEvent::new("block_body_received");
+        event.fields.height = Some(42);
+        event.fields.hash = Some("abcd".to_string());
+        event.fields.peer = Some("peer:1234".to_string());
+
+        assert_eq!(
+            serde_json::to_value(event).expect("body event serializes"),
+            json!({
+                "event": "block_body_received",
+                "peer": "peer:1234",
+                "height": 42,
+                "hash": "abcd",
+            })
+        );
+    }
+
+    #[test]
     fn block_sync_core_avoids_legacy_trace_builders() {
         for (name, source) in [
             ("reactor", include_str!("reactor.rs")),

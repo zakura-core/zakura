@@ -101,10 +101,16 @@ The workflow is manual (`workflow_dispatch`). Inputs:
   `legacy`. The default `auto` preserves the fleet's dual-stack role.
 - `header_sync_trace` — write structured canary traces under
   `/mnt/data/traces/header-chain-canary`; defaults to `false`.
+- `block_propagation_trace` — write hash-correlated block propagation traces
+  under `/mnt/data/traces/block-propagation` on every selected node; defaults
+  to `false`. This enables only `block_propagation.jsonl`; see
+  [`docs/block-propagation-tracing.md`](../../docs/block-propagation-tracing.md).
 - `node` — optional deployer node name; blank deploys the whole fleet.
 
 Explicit `p2p_stack` overrides and `header_sync_trace = true` require an
 explicit `node`, preventing canary settings from being applied fleet-wide.
+`block_propagation_trace` may be enabled for the whole selected fleet.
+The two trace inputs are mutually exclusive.
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
@@ -215,8 +221,9 @@ cd deploy/deployer
 ./mainnet/bootstrap-zakura-mainnet-runner.sh
 ```
 
-The workflow is manual (`workflow_dispatch`) with the same inputs as testnet
-(`ref` defaults to `main`, plus `force_rebuild`, `no_restart`, `node`).
+The workflow is manual (`workflow_dispatch`). In addition to `ref`,
+`force_rebuild`, `no_restart`, and `node`, `block_propagation_trace` enables
+the narrow trace across every selected node.
 
 **Binary-only deploy (`manage_config = false`).** The mainnet nodes were
 provisioned by hand with rich, per-node configs — `external_addr`, custom peers,
@@ -233,6 +240,13 @@ dashboard's SSH probe, not deployed to nodes. On-node configs should use
 `network.p2p_stack` (not the deprecated `v2_p2p` /
 `legacy_p2p` bools). Reproducing these configs in the deployer's managed model
 is separate future work.
+
+When `block_propagation_trace` is enabled, the deployer manages only
+`50-zakura-block-propagation-trace.conf` under the service's systemd drop-in
+directory. It sets the dedicated trace environment variable and stable node
+label without rewriting the base unit or TOML. A deployment with the input
+disabled removes that owned drop-in. Failed restarts restore both the previous
+binary and previous drop-in.
 
 The workflow refreshes a fleet status dashboard on `us-east-0`:
 

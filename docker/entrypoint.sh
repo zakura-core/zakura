@@ -86,6 +86,9 @@ create_owned_directory() {
 [[ -n ${ZAKURA_RPC__COOKIE_DIR} ]] && create_owned_directory "${ZAKURA_RPC__COOKIE_DIR}"
 [[ -n ${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR:-} ]] && create_owned_directory "${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR}"
 [[ -n ${ZAKURA_TRACING__LOG_FILE:-} ]] && create_owned_directory "$(dirname "${ZAKURA_TRACING__LOG_FILE}")"
+[[ -n ${ZAKURA_NETWORK__ZAKURA__TRACE_DIR:-} ]] && create_owned_directory "${ZAKURA_NETWORK__ZAKURA__TRACE_DIR}"
+[[ -n ${ZAKURA_NETWORK__ZAKURA__BLOCK_PROPAGATION_TRACE_DIR:-} ]] && \
+  create_owned_directory "${ZAKURA_NETWORK__ZAKURA__BLOCK_PROPAGATION_TRACE_DIR}"
 
 # --- Optional config file support ---
 # If provided, pass a config file path through to zakurad via CONFIG_FILE_PATH.

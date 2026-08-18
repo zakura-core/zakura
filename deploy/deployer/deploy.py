@@ -72,8 +72,11 @@ DEFAULTS = {
     "checkpoint_sync": True,
     # Setting this false keeps checkpoint sync on while selecting the legacy non-VCT path.
     "vct_fast_sync": True,
+    # Binary-only systemd deploys manage this through an owned drop-in.
+    # Empty removes the owned override without touching the hand-managed unit.
+    "block_propagation_trace_dir": "",
     # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
-    # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
+    # Common keys: dev_network, listen_addr, bootstrap_peers, and trace dirs.
     "zakura": None,
     # Process deploys are for manually supervised nodes, like the testnet
     # zcashd-compat Zakura sidecar, where systemd would fight the local runbook.
@@ -115,6 +118,7 @@ class Node:
     tracing_filter: str
     checkpoint_sync: bool
     vct_fast_sync: bool
+    block_propagation_trace_dir: str
     zakura: object  # dict | None: fleet-wide [network.zakura] settings
     working_dir: str
     start_command: str
@@ -216,6 +220,32 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
         seen.add(name)
         merged = dict(defaults)
         merged.update(raw)
+        block_propagation_trace_dir = merged["block_propagation_trace_dir"]
+        if not isinstance(block_propagation_trace_dir, str):
+            raise DeployError(
+                f"[[nodes]] {name}: block_propagation_trace_dir must be a string"
+            )
+        if block_propagation_trace_dir:
+            trace_path = Path(block_propagation_trace_dir)
+            if (
+                not trace_path.is_absolute()
+                or trace_path != DATA_MOUNT
+                and DATA_MOUNT not in trace_path.parents
+            ):
+                raise DeployError(
+                    f"[[nodes]] {name}: block_propagation_trace_dir must be under "
+                    f"{DATA_MOUNT}"
+                )
+            if any(char in block_propagation_trace_dir for char in '"\\\n\r'):
+                raise DeployError(
+                    f"[[nodes]] {name}: block_propagation_trace_dir contains "
+                    "unsupported characters"
+                )
+            if merged["manage_config"] or merged["deploy_kind"] != "systemd":
+                raise DeployError(
+                    f"[[nodes]] {name}: block_propagation_trace_dir requires "
+                    "manage_config=false and deploy_kind=systemd"
+                )
         nodes.append(Node(
             name=name,
             ssh_string=merged["ssh_string"],
@@ -242,6 +272,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             tracing_filter=merged["tracing_filter"],
             checkpoint_sync=merged["checkpoint_sync"],
             vct_fast_sync=merged["vct_fast_sync"],
+            block_propagation_trace_dir=block_propagation_trace_dir,
             zakura=merged.get("zakura"),
             working_dir=merged["working_dir"],
             start_command=merged["start_command"],
@@ -506,6 +537,7 @@ def render_service(node: Node) -> str:
             f"AssertPathIsMountPoint={DATA_MOUNT}\n"
         )
     return render_template("zakurad.service", {
+        "NODE_NAME": node.name,
         "SERVICE_NAME": node.service_name,
         "BIN_PATH": node.bin_path,
         "CONFIG_PATH": node.config_path,
@@ -700,25 +732,52 @@ fi
 
 
 # Binary-only deploy (manage_config = false): swap the binary in place and
-# restart the existing service, leaving the node's config, unit, and state cache
-# untouched. Used for fleets provisioned outside the deployer.
+# restart the existing service, leaving the node's config, base unit, and state
+# cache untouched. It may manage one owned propagation-trace drop-in.
 BINARY_ONLY_INSTALL_SCRIPT = r"""
 set -euo pipefail
 
 BIN_PATH={bin_path}
 SERVICE={service}
 NO_RESTART={no_restart}
+TRACE_DIR={block_propagation_trace_dir}
+NODE_ID={node_id}
+DROP_IN_DIR="/etc/systemd/system/${{SERVICE}}.service.d"
+DROP_IN="${{DROP_IN_DIR}}/50-zakura-block-propagation-trace.conf"
+DROP_IN_BACKUP="/tmp/zakurad-block-propagation-trace.conf.bak"
+HAD_DROP_IN=0
 
 mkdir -p "$(dirname "$BIN_PATH")"
 
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
 fi
+if [ -f "$DROP_IN" ]; then
+    cp -a "$DROP_IN" "$DROP_IN_BACKUP"
+    HAD_DROP_IN=1
+else
+    rm -f "$DROP_IN_BACKUP"
+fi
 install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
 rm -f /tmp/zakurad-deploy.new
 
+if [ -n "$TRACE_DIR" ]; then
+    install -d -m 755 "$TRACE_DIR" "$DROP_IN_DIR"
+    {{
+        printf '%s\n' '[Service]'
+        printf 'Environment="ZAKURA_NETWORK__ZAKURA__BLOCK_PROPAGATION_TRACE_DIR=%s"\n' "$TRACE_DIR"
+        printf 'Environment="ZAKURA_NODE_ID=%s"\n' "$NODE_ID"
+    }} > "${{DROP_IN}}.new"
+    install -m 644 "${{DROP_IN}}.new" "$DROP_IN"
+    rm -f "${{DROP_IN}}.new"
+else
+    rm -f "$DROP_IN"
+fi
+systemctl daemon-reload
+
 if [ "$NO_RESTART" = "1" ]; then
-    echo "installed binary (restart skipped)"
+    rm -f "$DROP_IN_BACKUP"
+    echo "installed binary and propagation trace override (restart skipped)"
     exit 0
 fi
 
@@ -735,14 +794,22 @@ restart_service() {{
 }}
 
 if ! restart_service; then
-    echo "service unhealthy after deploy; rolling back to ${{BIN_PATH}}.bak" >&2
+    echo "service unhealthy after deploy; rolling back binary and trace override" >&2
     if [ -x "${{BIN_PATH}}.bak" ]; then
         install -m 755 "${{BIN_PATH}}.bak" "$BIN_PATH"
-        restart_service || true
     fi
+    if [ "$HAD_DROP_IN" = "1" ]; then
+        install -m 644 "$DROP_IN_BACKUP" "$DROP_IN"
+    else
+        rm -f "$DROP_IN"
+    fi
+    rm -f "$DROP_IN_BACKUP"
+    systemctl daemon-reload
+    restart_service || true
     exit 1
 fi
 
+rm -f "$DROP_IN_BACKUP"
 systemctl is-active "$SERVICE"
 "$BIN_PATH" --version || true
 """
@@ -856,6 +923,10 @@ def cmd_deploy(args) -> int:
                         bin_path=shlex.quote(node.bin_path),
                         service=shlex.quote(node.service_name),
                         no_restart="1" if args.no_restart else "0",
+                        block_propagation_trace_dir=shlex.quote(
+                            node.block_propagation_trace_dir
+                        ),
+                        node_id=shlex.quote(node.name),
                     )
                 proc = ssh_with_stdin(node, script)
                 if proc.returncode != 0:

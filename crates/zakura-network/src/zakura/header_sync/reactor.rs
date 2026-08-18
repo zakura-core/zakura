@@ -790,6 +790,14 @@ impl HeaderSyncReactor {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         }
+        self.startup
+            .trace
+            .block_propagation()
+            .native_header_status_received(
+                &peer,
+                status.selected_tip_hash,
+                status.selected_tip_height,
+            );
         if let Some(state) = self.peer_state.get_mut(&peer) {
             state.last_status = Some(status.clone());
         }

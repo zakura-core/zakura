@@ -9,6 +9,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=ZAKURA_NODE_ID={{NODE_NAME}}
 ExecStart={{BIN_PATH}} -c {{CONFIG_PATH}} start
 Restart=always
 RestartSec=5

@@ -1247,6 +1247,12 @@ impl<'de> Deserialize<'de> for Config {
 
         // Clamp too-small budgets rather than rejecting existing configurations.
         let mut zakura = zakura;
+        if zakura.trace_dir.is_some() && zakura.block_propagation_trace_dir.is_some() {
+            return Err(de::Error::custom(
+                "network.zakura.trace_dir and \
+                 network.zakura.block_propagation_trace_dir are mutually exclusive",
+            ));
+        }
         zakura.apply_network_defaults(&network);
         let default_zakura_bootstrap_peers =
             ZakuraConfig::default_bootstrap_peers_for_network(&network);

@@ -22,7 +22,7 @@ use futures::{
 use tokio::sync::oneshot::{self, error::TryRecvError};
 use tower::{buffer::Buffer, timeout::Timeout, util::BoxService, Service, ServiceExt};
 
-use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_network::{self as zn, zakura::BlockPropagationTrace, PeerSocketAddr};
 use zakura_state::{self as zs};
 
 use zakura_chain::{
@@ -336,6 +336,9 @@ pub struct Inbound {
     /// Whether legacy peer address labels in logs are unredacted.
     expose_peer_addresses: bool,
 
+    /// Hash-correlated diagnostics for block gossip handled by this service.
+    block_propagation_trace: BlockPropagationTrace,
+
     /// Diagnostics for zcashd-compat requests that need pruned block bodies.
     pruned_block_not_found_logger: Arc<PrunedBlockNotFoundLogger>,
 }
@@ -357,11 +360,21 @@ impl Inbound {
                 setup,
             },
             expose_peer_addresses,
+            block_propagation_trace: BlockPropagationTrace::noop(),
             pruned_block_not_found_logger: Arc::new(PrunedBlockNotFoundLogger::new(
                 zcashd_compat_pruning_retention,
                 zcashd_compat_peer_ips,
             )),
         }
+    }
+
+    /// Attach an opt-in block propagation trace to this inbound service.
+    pub(crate) fn with_block_propagation_trace(
+        mut self,
+        block_propagation_trace: BlockPropagationTrace,
+    ) -> Self {
+        self.block_propagation_trace = block_propagation_trace;
+        self
     }
 
     /// Remove `self.setup`, temporarily replacing it with an invalid state.
@@ -406,14 +419,17 @@ impl Service<zn::Request> for Inbound {
 
                     let cached_peer_addr_response = CachedPeerAddrResponse::new(address_book);
 
-                    let block_downloads = Box::pin(BlockDownloads::new(
-                        full_verify_concurrency_limit,
-                        self.expose_peer_addresses,
-                        Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
-                        Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
-                        state.clone(),
-                        latest_chain_tip,
-                    ));
+                    let block_downloads = Box::pin(
+                        BlockDownloads::new(
+                            full_verify_concurrency_limit,
+                            self.expose_peer_addresses,
+                            Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
+                            Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
+                            state.clone(),
+                            latest_chain_tip,
+                        )
+                        .with_block_propagation_trace(self.block_propagation_trace.clone()),
+                    );
 
                     result = Ok(());
                     Setup::Initialized {
@@ -536,6 +552,7 @@ impl Service<zn::Request> for Inbound {
     #[instrument(name = "inbound", skip(self, req))]
     fn call(&mut self, req: zn::Request) -> Self::Future {
         let pruned_block_not_found_logger = self.pruned_block_not_found_logger.clone();
+        let block_propagation_trace = self.block_propagation_trace.clone();
         let (cached_peer_addr_response, block_downloads, mempool, state) = match &mut self.setup {
             Setup::Initialized {
                 cached_peer_addr_response,
@@ -754,6 +771,13 @@ impl Service<zn::Request> for Inbound {
                     .boxed()
             }
             zn::Request::AdvertiseBlock(hash, Some(zn::PeerSource::Zakura(peer_id))) => {
+                let source = zn::PeerSource::Zakura(peer_id.clone());
+                block_propagation_trace.block_announced(
+                    hash,
+                    Some(&source),
+                    "native_compat",
+                    "ignored_native_sync",
+                );
                 debug!(
                     ?hash,
                     ?peer_id,

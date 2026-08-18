@@ -87,6 +87,30 @@ recreate S-NOMP:
 docker compose up -d --force-recreate s-nomp
 ```
 
+## Block Propagation Tracing
+
+The optional Compose override enables the narrow, hash-correlated
+`block_propagation.jsonl` trace on the mining node without enabling the general
+Zakura trace tables or exposing another host port:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.trace.yml up -d
+```
+
+The trace rows use `ZAKURA_NODE_ID` (default `zakura-testnet-miner`) and are
+stored in the `block-propagation-traces` Docker volume. Export them after a
+canary block:
+
+```bash
+mkdir -p propagation-artifacts/miner
+docker compose -f docker-compose.yml -f docker-compose.trace.yml \
+  cp zakura:/var/lib/zakura-traces/. propagation-artifacts/miner/
+```
+
+Use the base Compose file by itself to run without propagation tracing. See
+[`../../docs/block-propagation-tracing.md`](../../docs/block-propagation-tracing.md)
+for the fleet rollout, collection, and report workflow.
+
 ## Checking Sync Status
 
 Zebra must fully sync before mining can begin.

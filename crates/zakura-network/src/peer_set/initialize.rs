@@ -191,6 +191,44 @@ where
     S::Future: Send + 'static,
     C: ChainTip + Clone + Send + Sync + 'static,
 {
+    let block_propagation = crate::zakura::BlockPropagationTrace::from_config(&config);
+    init_with_zakura_header_sync_and_block_propagation(
+        config,
+        inbound_service,
+        latest_chain_tip,
+        user_agent,
+        advertised_services,
+        block_gossip_peer_ips,
+        (header_sync_driver_startup, block_propagation),
+    )
+    .await
+}
+
+/// Initialize a peer set with real-driver Zakura sync and propagation tracing.
+#[doc(hidden)]
+pub async fn init_with_zakura_header_sync_and_block_propagation<S, C>(
+    config: Config,
+    inbound_service: S,
+    latest_chain_tip: C,
+    user_agent: String,
+    advertised_services: PeerServices,
+    block_gossip_peer_ips: Vec<IpAddr>,
+    driver_tracing: (
+        Option<crate::zakura::ZakuraHeaderSyncDriverStartup>,
+        crate::zakura::BlockPropagationTrace,
+    ),
+) -> (
+    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    Arc<std::sync::Mutex<AddressBook>>,
+    mpsc::Sender<(PeerSocketAddr, u32)>,
+    Option<crate::zakura::ZakuraEndpoint>,
+)
+where
+    S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + Sync + 'static,
+    S::Future: Send + 'static,
+    C: ChainTip + Clone + Send + Sync + 'static,
+{
+    let (header_sync_driver_startup, block_propagation) = driver_tracing;
     let (tcp_listener, listen_addr) = if config.legacy_p2p() {
         let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
         (Some(tcp_listener), listen_addr)
@@ -202,7 +240,7 @@ where
     // handshake builder consumes the original below. The factory only runs when
     // `v2_p2p` is enabled; otherwise the endpoint is `None` and the clone drops.
     let inbound_for_zakura_sink = inbound_service.clone();
-    let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_header_sync_driver(
+    let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_traces(
         &config,
         move |supervisor, trace| {
             Arc::new(crate::zakura::LegacyGossipSink::spawn_with_trace(
@@ -212,6 +250,7 @@ where
             )) as Arc<dyn crate::zakura::Service>
         },
         header_sync_driver_startup,
+        block_propagation,
     )
     .await
     .expect("Zakura endpoint should start when P2P v2 is enabled");

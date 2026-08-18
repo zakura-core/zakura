@@ -14,6 +14,7 @@ use blake2b_simd::Params as Blake2bParams;
 use serde_json::{Map, Number, Value};
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceEvent, JsonlTracer};
 
+use super::block_propagation_trace::BlockPropagationTrace;
 use super::{ZakuraPeerId, ZakuraRejectReason};
 
 /// A Zakura JSONL trace table.
@@ -470,6 +471,7 @@ pub mod commit_state_trace {
 #[derive(Clone, Debug)]
 pub struct ZakuraTrace {
     emitter: JsonlEventEmitter,
+    block_propagation: BlockPropagationTrace,
 }
 
 impl ZakuraTrace {
@@ -482,7 +484,19 @@ impl ZakuraTrace {
     pub fn new(tracer: JsonlTracer, node: impl Into<Arc<str>>) -> Self {
         Self {
             emitter: JsonlEventEmitter::new(tracer, node),
+            block_propagation: BlockPropagationTrace::noop(),
         }
+    }
+
+    /// Attach the narrow block propagation trace sink.
+    pub fn with_block_propagation(mut self, block_propagation: BlockPropagationTrace) -> Self {
+        self.block_propagation = block_propagation;
+        self
+    }
+
+    /// Return the narrow block propagation trace sink.
+    pub fn block_propagation(&self) -> &BlockPropagationTrace {
+        &self.block_propagation
     }
 
     /// Return the underlying JSONL tracer.

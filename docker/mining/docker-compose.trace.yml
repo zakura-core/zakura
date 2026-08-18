@@ -1,0 +1,10 @@
+services:
+  zakura:
+    environment:
+      - ZAKURA_NODE_ID=${ZAKURA_NODE_ID:-zakura-testnet-miner}
+      - ZAKURA_NETWORK__ZAKURA__BLOCK_PROPAGATION_TRACE_DIR=${BLOCK_PROPAGATION_TRACE_DIR:-/var/lib/zakura-traces}
+    volumes:
+      - block-propagation-traces:${BLOCK_PROPAGATION_TRACE_DIR:-/var/lib/zakura-traces}
+
+volumes:
+  block-propagation-traces:

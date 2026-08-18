@@ -6,6 +6,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use futures::{
@@ -25,7 +26,7 @@ use zakura_chain::{
     block::{self, HeightDiff},
     chain_tip::ChainTip,
 };
-use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_network::{self as zn, zakura::BlockPropagationTrace, PeerSocketAddr};
 use zakura_state as zs;
 
 use crate::components::{auth_download_height::tip_child_mismatch, sync::MIN_CONCURRENCY_LIMIT};
@@ -269,6 +270,9 @@ where
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: zs::LatestChainTip,
 
+    /// Hash-correlated diagnostics for gossip-path block propagation.
+    block_propagation_trace: BlockPropagationTrace,
+
     // Internal downloads state
     //
     /// Active block download and verify tasks.
@@ -392,12 +396,22 @@ where
             verifier,
             state,
             latest_chain_tip,
+            block_propagation_trace: BlockPropagationTrace::noop(),
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             source_locks: HashMap::new(),
             source_counts: HashMap::new(),
             poisoned_retries: PoisonedRetryBudgets::default(),
         }
+    }
+
+    /// Attach an opt-in block propagation trace to this download stream.
+    pub(crate) fn with_block_propagation_trace(
+        mut self,
+        block_propagation_trace: BlockPropagationTrace,
+    ) -> Self {
+        self.block_propagation_trace = block_propagation_trace;
+        self
     }
 
     /// Re-request a gossiped block whose body was rejected as poisoned, from any peer.
@@ -454,7 +468,7 @@ where
 
         // Report what actually happened, not what was attempted: the replacement can be refused
         // by the queue bounds, which spends the budget without dispatching anything.
-        let action = self.download_and_verify(hash, None);
+        let action = self.download_and_verify_inner(hash, None, false);
 
         match action {
             DownloadAction::AddedToQueue => {
@@ -497,6 +511,15 @@ where
         hash: block::Hash,
         download_source: Option<zn::PeerSource>,
     ) -> DownloadAction {
+        self.download_and_verify_inner(hash, download_source, true)
+    }
+
+    fn download_and_verify_inner(
+        &mut self,
+        hash: block::Hash,
+        download_source: Option<zn::PeerSource>,
+        trace_announcement: bool,
+    ) -> DownloadAction {
         let source_label = download_source
             .as_ref()
             .map(|source| peer_source_log_label(source, self.expose_peer_addresses))
@@ -513,6 +536,14 @@ where
 
             metrics::gauge!("gossip.queued.block.count").set(self.queue_len() as f64);
             metrics::counter!("gossip.already.queued.dropped.block.hash.count").increment(1);
+            if trace_announcement {
+                self.block_propagation_trace.block_announced(
+                    hash,
+                    download_source.as_ref(),
+                    "legacy",
+                    "already_queued",
+                );
+            }
 
             return DownloadAction::AlreadyQueued;
         }
@@ -527,6 +558,14 @@ where
 
             metrics::gauge!("gossip.queued.block.count").set(self.queue_len() as f64);
             metrics::counter!("gossip.full.queue.dropped.block.hash.count").increment(1);
+            if trace_announcement {
+                self.block_propagation_trace.block_announced(
+                    hash,
+                    download_source.as_ref(),
+                    "legacy",
+                    "queue_full",
+                );
+            }
 
             return DownloadAction::FullQueue;
         }
@@ -547,6 +586,14 @@ where
 
                 metrics::gauge!("gossip.queued.block.count").set(self.queue_len() as f64);
                 metrics::counter!("gossip.source.queue.dropped.block.hash.count").increment(1);
+                if trace_announcement {
+                    self.block_propagation_trace.block_announced(
+                        hash,
+                        download_source.as_ref(),
+                        "legacy",
+                        "source_queue_full",
+                    );
+                }
 
                 return DownloadAction::FullQueue;
             }
@@ -558,6 +605,14 @@ where
             download_source,
         };
 
+        if trace_announcement {
+            self.block_propagation_trace.block_announced(
+                hash,
+                download.download_source.as_ref(),
+                "legacy",
+                "queued",
+            );
+        }
         self.spawn_download_task(download);
 
         debug!(
@@ -598,6 +653,8 @@ where
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
+        let block_propagation_trace = self.block_propagation_trace.clone();
+        let download_started = Instant::now();
 
         let fut = async move {
             // Check if the full block body is already in the state. `KnownBlock`
@@ -721,6 +778,12 @@ where
                     BoxError::from("gossiped block with no height")
                 })
                 .map_err(|e| (e, None))?;
+            block_propagation_trace.legacy_block_downloaded(
+                hash,
+                block_height,
+                advertiser_addr,
+                download_started.elapsed(),
+            );
 
             // Security: authenticate the claimed coinbase height against our own tip before the
             // height policies below run. See `crate::components::auth_download_height`.
@@ -791,14 +854,36 @@ where
                 .map(|hash| (hash, block_height))
                 .map_err(|e| (e, advertiser_addr))
         }
-        .map_ok(|(hash, height)| {
-            info!(?height, "downloaded and verified gossiped block");
-            metrics::counter!("gossip.verified.block.count").increment(1);
-            hash
+        .map_ok({
+            let block_propagation_trace = self.block_propagation_trace.clone();
+            move |(hash, height)| {
+                block_propagation_trace.legacy_block_finished(
+                    hash,
+                    Some(height),
+                    "committed",
+                    None,
+                    download_started.elapsed(),
+                );
+                info!(?height, "downloaded and verified gossiped block");
+                metrics::counter!("gossip.verified.block.count").increment(1);
+                hash
+            }
         })
         // Tack the hash onto the error so poll_next can look up the cancel
         // handle and advertising IP on failure as well as success.
-        .map_err(move |(e, advertiser_addr)| (e, hash, advertiser_addr))
+        .map_err({
+            let block_propagation_trace = self.block_propagation_trace.clone();
+            move |(e, advertiser_addr)| {
+                block_propagation_trace.legacy_block_finished(
+                    hash,
+                    None,
+                    "error",
+                    Some(&e.to_string()),
+                    download_started.elapsed(),
+                );
+                (e, hash, advertiser_addr)
+            }
+        })
         .in_current_span();
 
         let task = tokio::spawn(async move {

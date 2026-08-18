@@ -2,7 +2,10 @@
 //!
 //! [`block::Hash`]: zakura_chain::block::Hash
 
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use futures::TryFutureExt;
 use thiserror::Error;
@@ -11,7 +14,7 @@ use tower::{timeout::Timeout, Service, ServiceExt};
 use tracing::Instrument;
 
 use zakura_chain::block;
-use zakura_network as zn;
+use zakura_network::{self as zn, zakura::BlockPropagationTrace};
 use zakura_state::ChainTipChange;
 
 use crate::{
@@ -100,9 +103,31 @@ pub enum BlockGossipError {
 /// [`block::Hash`]: zakura_chain::block::Hash
 pub async fn gossip_best_tip_block_hashes<ZN>(
     sync_status: SyncStatus,
+    chain_state: ChainTipChange,
+    broadcast_network: ZN,
+    mined_block_receiver: Option<mpsc::Receiver<(block::Hash, block::Height)>>,
+) -> Result<(), BlockGossipError>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
+{
+    gossip_best_tip_block_hashes_with_trace(
+        sync_status,
+        chain_state,
+        broadcast_network,
+        mined_block_receiver,
+        BlockPropagationTrace::noop(),
+    )
+    .await
+}
+
+/// Run block gossip with hash-correlated propagation diagnostics.
+pub(crate) async fn gossip_best_tip_block_hashes_with_trace<ZN>(
+    sync_status: SyncStatus,
     mut chain_state: ChainTipChange,
     broadcast_network: ZN,
     mut mined_block_receiver: Option<mpsc::Receiver<(block::Hash, block::Height)>>,
+    block_propagation_trace: BlockPropagationTrace,
 ) -> Result<(), BlockGossipError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
@@ -211,11 +236,12 @@ where
         };
 
         info!(?height, ?request, log_msg);
-        let broadcast_fut = broadcast_network
-            .ready()
-            .await
-            .map_err(PeerSetReadiness)?
-            .call(request);
+        let ready_network = broadcast_network.ready().await.map_err(PeerSetReadiness)?;
+        let broadcast_started = Instant::now();
+        if is_block_submission {
+            block_propagation_trace.mined_block_broadcast_started(hash, height);
+        }
+        let broadcast_fut = ready_network.call(request);
 
         // Await the broadcast future in a spawned task to avoid waiting on
         // `AdvertiseBlockToAll` requests when there are unready peers.
@@ -223,8 +249,16 @@ where
         if is_block_submission {
             let mark_tx = mined_block_mark_sender.clone();
             let submission_hash = hash;
+            let block_propagation_trace = block_propagation_trace.clone();
             tokio::spawn(async move {
-                if broadcast_fut.await.is_ok() {
+                let result = broadcast_fut.await;
+                block_propagation_trace.mined_block_broadcast_finished(
+                    submission_hash,
+                    height,
+                    if result.is_ok() { "ok" } else { "error" },
+                    broadcast_started.elapsed(),
+                );
+                if result.is_ok() {
                     let _ = mark_tx.send(submission_hash).await;
                 }
             });

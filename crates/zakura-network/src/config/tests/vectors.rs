@@ -625,6 +625,35 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 }
 
 #[test]
+fn block_propagation_trace_dir_is_narrow_and_mutually_exclusive() {
+    let narrow: Config = toml::from_str(
+        r#"
+        [zakura]
+        block_propagation_trace_dir = "target/block-propagation"
+        "#,
+    )
+    .expect("dedicated propagation tracing is valid");
+    assert_eq!(
+        narrow.zakura.block_propagation_trace_dir,
+        Some("target/block-propagation".into())
+    );
+    assert!(narrow.zakura.trace_dir.is_none());
+
+    let error = toml::from_str::<Config>(
+        r#"
+        [zakura]
+        trace_dir = "target/general"
+        block_propagation_trace_dir = "target/block-propagation"
+        "#,
+    )
+    .expect_err("general and dedicated tracing must fail closed");
+    assert!(
+        error.to_string().contains("mutually exclusive"),
+        "unexpected trace directory conflict error: {error}"
+    );
+}
+
+#[test]
 fn configured_regtest_checkpoints_preserve_regtest_identity() {
     let _init_guard = zakura_test::init();
 

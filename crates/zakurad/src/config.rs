@@ -177,6 +177,12 @@ fn filtered_env_vars(env_prefix: &str) -> Result<HashMap<String, String>, config
 
     for (key, value) in std::env::vars() {
         if let Some(without_prefix) = key.strip_prefix(&required_prefix) {
+            // This process metadata is consumed by `zakura-jsonl-trace`, not by
+            // the serde configuration tree.
+            if is_process_metadata_env_key(without_prefix) {
+                continue;
+            }
+
             // Check for sensitive keys on the stripped key.
             let parts: Vec<&str> = without_prefix.split("__").collect();
             if let Some(leaf) = parts.last() {
@@ -197,6 +203,10 @@ fn filtered_env_vars(env_prefix: &str) -> Result<HashMap<String, String>, config
     Ok(filtered_env)
 }
 
+fn is_process_metadata_env_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("NODE_ID")
+}
+
 impl With<MinerAddressType> for ZakuradConfig {
     fn with(mut self, miner_address_type: MinerAddressType) -> Self {
         self.mining.miner_address = Some(
@@ -206,5 +216,17 @@ impl With<MinerAddressType> for ZakuradConfig {
         );
 
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_process_metadata_env_key;
+
+    #[test]
+    fn trace_node_id_is_not_deserialized_as_application_config() {
+        assert!(is_process_metadata_env_key("NODE_ID"));
+        assert!(is_process_metadata_env_key("node_id"));
+        assert!(!is_process_metadata_env_key("NETWORK__NETWORK"));
     }
 }

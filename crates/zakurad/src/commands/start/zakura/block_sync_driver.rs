@@ -1349,6 +1349,9 @@ where
         }
     };
     let result = outcome.result();
+    trace
+        .block_propagation()
+        .native_commit_finished(expected_hash, height, result);
     trace.trace_block_commit_finished(token, class, height, expected_hash, result, started);
     let _ = block_sync.send_control(BlockSyncEvent::BlockApplyFinished {
         owner,

@@ -46,7 +46,10 @@ pub const DEFAULT_BUFFER_FLUSH_BYTES: usize = 256 * 1024;
 pub const DEFAULT_FILE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Env var used to label every JSONL trace record with a stable node identifier.
-pub const NODE_ID_ENV: &str = "ZEBRA_NODE_ID";
+pub const NODE_ID_ENV: &str = "ZAKURA_NODE_ID";
+
+/// Legacy env var retained for deployments that still use Zebra naming.
+pub const LEGACY_NODE_ID_ENV: &str = "ZEBRA_NODE_ID";
 
 /// A logical JSONL trace table and its output file.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -171,6 +174,7 @@ impl JsonlEventEmitter {
         let event = build();
         let row = JsonlEventEnvelope {
             ts: elapsed_micros(self.started.elapsed()),
+            wall_ts_unix_us: unix_time_micros(),
             node: &self.node,
             process_trace_id: process_trace_id(),
             event: &event,
@@ -195,6 +199,10 @@ impl JsonlEventEmitter {
         row.insert(
             "ts".to_string(),
             Value::from(elapsed_micros(self.started.elapsed())),
+        );
+        row.insert(
+            "wall_ts_unix_us".to_string(),
+            Value::from(unix_time_micros()),
         );
         row.insert("node".to_string(), Value::String(self.node.to_string()));
         row.insert(
@@ -222,6 +230,7 @@ impl Default for JsonlEventEmitter {
 #[derive(Serialize)]
 struct JsonlEventEnvelope<'a, E> {
     ts: u64,
+    wall_ts_unix_us: u64,
     node: &'a str,
     process_trace_id: &'static str,
     #[serde(flatten)]
@@ -232,19 +241,36 @@ fn elapsed_micros(elapsed: Duration) -> u64 {
     saturating_micros(elapsed)
 }
 
+fn unix_time_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(saturating_micros)
+        .unwrap_or_default()
+}
+
 /// Returns the process-wide node identifier used to tag JSONL trace records.
 ///
-/// Resolution order: `ZEBRA_NODE_ID`, `HOSTNAME`, `/etc/hostname`, then
-/// `"unknown"`. The value is resolved once on first call and cached for the
-/// lifetime of the process so every trace record from this node reports the
-/// same id.
+/// Resolution order: `ZAKURA_NODE_ID`, `ZEBRA_NODE_ID`, `HOSTNAME`,
+/// `/etc/hostname`, then `"unknown"`. The value is resolved once on first call
+/// and cached for the lifetime of the process so every trace record from this
+/// node reports the same id.
 pub fn node_id() -> &'static str {
     static NODE_ID: OnceLock<String> = OnceLock::new();
     NODE_ID
         .get_or_init(|| {
             std::env::var(NODE_ID_ENV)
                 .ok()
-                .or_else(|| std::env::var("HOSTNAME").ok())
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    std::env::var(LEGACY_NODE_ID_ENV)
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                })
+                .or_else(|| {
+                    std::env::var("HOSTNAME")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                })
                 .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -863,6 +889,7 @@ mod tests {
         assert_eq!(row["value"], 7);
         assert_eq!(row["optional"], Value::Null);
         assert!(row["ts"].is_u64());
+        assert!(row["wall_ts_unix_us"].is_u64());
     }
 
     #[test]
@@ -880,6 +907,23 @@ mod tests {
         assert_eq!(row["process_trace_id"], process_trace_id());
         assert_eq!(row["event"], "raw_event");
         assert!(row["ts"].is_u64());
+        assert!(row["wall_ts_unix_us"].is_u64());
+    }
+
+    #[test]
+    fn unix_wall_timestamp_is_bounded_by_observation_times() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(saturating_micros)
+            .expect("current time is after the Unix epoch");
+        let observed = unix_time_micros();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(saturating_micros)
+            .expect("current time is after the Unix epoch");
+
+        assert!(before <= observed);
+        assert!(observed <= after);
     }
 
     #[test]

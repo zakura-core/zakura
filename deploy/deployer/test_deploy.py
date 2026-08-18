@@ -146,6 +146,7 @@ class NodeBuilder:
             "tracing_filter": "",
             "checkpoint_sync": True,
             "vct_fast_sync": True,
+            "block_propagation_trace_dir": "",
             "zakura": None,
             "working_dir": "",
             "start_command": "",
@@ -171,6 +172,11 @@ class MountRenderingTests(NodeBuilder, unittest.TestCase):
 
         self.assertNotIn("RequiresMountsFor=/mnt/data", service)
         self.assertNotIn("AssertPathIsMountPoint=/mnt/data", service)
+
+    def test_render_service_sets_stable_trace_node_id(self):
+        service = deploy.render_service(self.node(name="testnet-observer-eu"))
+
+        self.assertIn("Environment=ZAKURA_NODE_ID=testnet-observer-eu", service)
 
 
 class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
@@ -198,6 +204,18 @@ class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
 
         self.assertNotIn("metrics", config)
         self.assertEqual(config["health"], {"listen_addr": "127.0.0.1:8080"})
+
+    def test_dedicated_propagation_directory_renders_in_zakura_section(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            zakura={
+                "block_propagation_trace_dir": "/mnt/data/traces/block-propagation",
+            },
+        )))
+
+        self.assertEqual(
+            config["network"]["zakura"]["block_propagation_trace_dir"],
+            "/mnt/data/traces/block-propagation",
+        )
 
 
 class ConfigKeyTests(unittest.TestCase):
@@ -236,6 +254,95 @@ class ConfigKeyTests(unittest.TestCase):
 
             with self.assertRaises(deploy.DeployError):
                 deploy.load_nodes(path, None)
+
+    def test_binary_only_block_propagation_trace_dir_is_loaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, """
+                [defaults]
+                manage_config = false
+                block_propagation_trace_dir = "/mnt/data/traces/block-propagation"
+
+                [[nodes]]
+                name = "node-a"
+                ssh_string = "root@example"
+                commit = "main"
+            """.replace("                ", ""))
+
+            nodes = deploy.load_nodes(path, None)
+
+            self.assertEqual(
+                nodes[0].block_propagation_trace_dir,
+                "/mnt/data/traces/block-propagation",
+            )
+
+    def test_block_propagation_trace_dir_rejects_managed_or_external_paths(self):
+        for defaults in (
+            'block_propagation_trace_dir = "/mnt/data/traces/block-propagation"',
+            'manage_config = false\nblock_propagation_trace_dir = "/tmp/traces"',
+        ):
+            with self.subTest(defaults=defaults), tempfile.TemporaryDirectory() as tmp:
+                path = self.write_config(tmp, f"""
+                    [defaults]
+                    {defaults}
+
+                    [[nodes]]
+                    name = "node-a"
+                    ssh_string = "root@example"
+                    commit = "main"
+                """.replace("                    ", ""))
+
+                with self.assertRaises(deploy.DeployError):
+                    deploy.load_nodes(path, None)
+
+
+class BinaryOnlyTraceOverrideTests(unittest.TestCase):
+    def render_script(self, trace_dir, no_restart="0"):
+        return deploy.BINARY_ONLY_INSTALL_SCRIPT.format(
+            bin_path="'/usr/local/bin/zakurad'",
+            service="'zakurad'",
+            no_restart=no_restart,
+            block_propagation_trace_dir=f"'{trace_dir}'",
+            node_id="'us-east-0'",
+        )
+
+    def test_enable_stages_narrow_environment_override(self):
+        script = self.render_script("/mnt/data/traces/block-propagation")
+
+        self.assertIn(
+            "ZAKURA_NETWORK__ZAKURA__BLOCK_PROPAGATION_TRACE_DIR=%s",
+            script,
+        )
+        self.assertIn('Environment="ZAKURA_NODE_ID=%s"', script)
+        self.assertIn('install -d -m 755 "$TRACE_DIR" "$DROP_IN_DIR"', script)
+        self.assertIn("systemctl daemon-reload", script)
+
+    def test_disable_removes_only_owned_drop_in(self):
+        script = self.render_script("")
+
+        self.assertIn('DROP_IN="${DROP_IN_DIR}/50-zakura-block-propagation-trace.conf"', script)
+        self.assertIn('rm -f "$DROP_IN"', script)
+
+    def test_failure_restores_binary_and_previous_drop_in(self):
+        script = self.render_script("/mnt/data/traces/block-propagation")
+
+        self.assertIn('install -m 755 "${BIN_PATH}.bak" "$BIN_PATH"', script)
+        self.assertIn('install -m 644 "$DROP_IN_BACKUP" "$DROP_IN"', script)
+        self.assertIn("rolling back binary and trace override", script)
+
+    def test_no_restart_stages_drop_in_before_exiting(self):
+        script = self.render_script(
+            "/mnt/data/traces/block-propagation",
+            no_restart="1",
+        )
+
+        self.assertLess(
+            script.index('install -m 644 "${DROP_IN}.new" "$DROP_IN"'),
+            script.index('if [ "$NO_RESTART" = "1" ]'),
+        )
+        self.assertIn(
+            "installed binary and propagation trace override (restart skipped)",
+            script,
+        )
 
 
 if __name__ == "__main__":

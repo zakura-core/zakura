@@ -15,6 +15,7 @@ use crate::{
     PeerSocketAddr,
 };
 
+mod block_propagation_trace;
 mod block_sync;
 mod discovery;
 mod handler;
@@ -27,6 +28,7 @@ pub mod testkit;
 mod trace;
 pub mod transport;
 
+pub use block_propagation_trace::BlockPropagationTrace;
 pub use block_sync::*;
 pub use discovery::*;
 pub use handler::*;

@@ -51,6 +51,7 @@ use tokio::time;
 use zakura_chain::{block, serialization::ZcashSerialize};
 
 mod trace;
+use trace::ReceivedBodyTrace;
 
 /// How long a routine avoids a height after returning it because of a failure.
 /// The delay lets another routine take the height first on the single-threaded
@@ -1524,14 +1525,15 @@ impl PeerRoutine {
         };
         let decoded_attributed_memory_size_bytes =
             record_decoded_memory_size(&block, body_wire_bytes);
-        self.trace_body_received(
+        self.trace_body_received(ReceivedBodyTrace {
             height,
+            hash: block.hash(),
             serialized_bytes,
             decoded_attributed_memory_size_bytes,
-            Some(request_start_height),
-            Some(request_range_count),
-            Some(request_elapsed_ms),
-        );
+            request_start_height: Some(request_start_height),
+            request_range_count: Some(request_range_count),
+            request_elapsed_ms: Some(request_elapsed_ms),
+        });
 
         self.window
             .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
@@ -1734,14 +1736,15 @@ impl PeerRoutine {
         let decoded_attributed_memory_size_bytes =
             record_decoded_memory_size(&block, body_wire_bytes);
         self.record_received(serialized_bytes);
-        self.trace_body_received(
+        self.trace_body_received(ReceivedBodyTrace {
             height,
+            hash: block.hash(),
             serialized_bytes,
             decoded_attributed_memory_size_bytes,
-            None,
-            None,
-            None,
-        );
+            request_start_height: None,
+            request_range_count: None,
+            request_elapsed_ms: None,
+        });
 
         // A real, wanted body that no longer matches an outstanding request (typically
         // arrived just after its request timed out). Count it as block progress: resets

@@ -246,62 +246,6 @@ pub enum Message {
     ///
     /// [BIP35]: https://github.com/bitcoin/bips/blob/master/bip-0035.mediawiki
     Mempool,
-
-    /// A `filterload` message.
-    ///
-    /// This was defined in [BIP37], which is included in Zcash.
-    ///
-    /// Zebra currently ignores this message.
-    ///
-    /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#filterload.2C_filteradd.2C_filterclear.2C_merkleblock)
-    ///
-    /// [BIP37]: https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki
-    FilterLoad {
-        /// The filter itself is simply a bit field of arbitrary
-        /// byte-aligned size. The maximum size is 36,000 bytes.
-        filter: Filter,
-
-        /// The number of hash functions to use in this filter. The
-        /// maximum value allowed in this field is 50.
-        hash_functions_count: u32,
-
-        /// A random value to add to the seed value in the hash
-        /// function used by the bloom filter.
-        tweak: Tweak,
-
-        /// A set of flags that control how matched items are added to the filter.
-        flags: u8,
-    },
-
-    /// A `filteradd` message.
-    ///
-    /// This was defined in [BIP37], which is included in Zcash.
-    ///
-    /// Zebra currently ignores this message.
-    ///
-    /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#filterload.2C_filteradd.2C_filterclear.2C_merkleblock)
-    ///
-    /// [BIP37]: https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki
-    FilterAdd {
-        /// The data element to add to the current filter.
-        // The data field must be smaller than or equal to 520 bytes
-        // in size (the maximum size of any potentially matched
-        // object).
-        //
-        // A Vec instead of [u8; 520] because of needed traits.
-        data: Vec<u8>,
-    },
-
-    /// A `filterclear` message.
-    ///
-    /// This was defined in [BIP37], which is included in Zcash.
-    ///
-    /// Zebra currently ignores this message.
-    ///
-    /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#filterload.2C_filteradd.2C_filterclear.2C_merkleblock)
-    ///
-    /// [BIP37]: https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki
-    FilterClear,
 }
 
 /// The maximum size of the user agent string.
@@ -530,10 +474,6 @@ impl fmt::Display for Message {
             Message::NotFound(invs) => format!("notfound {{ invs: {} }}", invs.len()),
 
             Message::Mempool => "mempool".to_string(),
-
-            Message::FilterLoad { .. } => "filterload".to_string(),
-            Message::FilterAdd { .. } => "filteradd".to_string(),
-            Message::FilterClear => "filterclear".to_string(),
         })
     }
 }
@@ -559,9 +499,6 @@ impl Message {
             Message::Tx(_) => "tx",
             Message::NotFound(_) => "notfound",
             Message::Mempool => "mempool",
-            Message::FilterLoad { .. } => "filterload",
-            Message::FilterAdd { .. } => "filteradd",
-            Message::FilterClear => "filterclear",
         }
     }
 }

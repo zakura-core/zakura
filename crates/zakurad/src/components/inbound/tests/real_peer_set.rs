@@ -27,7 +27,7 @@ use zakura_chain::{
 };
 use zakura_consensus::{error::TransactionError, router::RouterError, transaction};
 use zakura_network::{
-    canonical_peer_addr, connect_isolated_tcp_direct_with_inbound,
+    canonical_peer_addr, connect_isolated_with_inbound,
     types::{InventoryHash, PeerServices},
     CacheDir, Config as NetworkConfig, InventoryResponse, P2pStack, PeerError, PeerSource, Request,
     Response, SharedPeerError,
@@ -1083,9 +1083,12 @@ async fn setup(
     let user_agent = "test".to_string();
 
     // Open a fake peer connection to the inbound listener, using the isolated connection API
-    let connected_peer_service = connect_isolated_tcp_direct_with_inbound(
+    let isolated_stream = tokio::net::TcpStream::connect(listen_addr)
+        .await
+        .expect("local listener connection succeeds");
+    let connected_peer_service = connect_isolated_with_inbound(
         &network,
-        listen_addr,
+        isolated_stream,
         user_agent,
         response_inbound_service,
     )

@@ -133,47 +133,36 @@ fn deserialize_version_with_time(time: i64) -> Result<Message, Error> {
 }
 
 #[test]
-fn filterload_message_round_trip() {
-    let (rt, _init_guard) = zakura_test::init_async();
+fn bloom_filter_messages_are_discarded_without_dropping_following_messages() {
+    let mut codec = Codec::builder().finish();
+    let mut bytes = BytesMut::new();
 
-    let v = Message::FilterLoad {
-        filter: Filter(vec![0; 35999]),
-        hash_functions_count: 0,
-        tweak: Tweak(0),
-        flags: 0,
-    };
+    for (command, body) in [
+        (BLOOM_FILTER_COMMANDS[0], &[1, 2, 3][..]),
+        (BLOOM_FILTER_COMMANDS[1], &[4, 5][..]),
+        (BLOOM_FILTER_COMMANDS[2], &[][..]),
+    ] {
+        bytes.extend_from_slice(&wire_message(command, body));
+    }
+    bytes.extend_from_slice(&wire_message(*b"verack\0\0\0\0\0\0", &[]));
 
-    use tokio_util::codec::{FramedRead, FramedWrite};
-    let v_bytes = rt.block_on(async {
-        let mut bytes = Vec::new();
-        {
-            let mut fw = FramedWrite::new(
-                &mut bytes,
-                Codec::builder()
-                    .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
-                    .finish(),
-            );
-            fw.send(v.clone())
-                .await
-                .expect("message should be serialized");
-        }
-        bytes
-    });
+    assert_eq!(
+        codec.decode(&mut bytes).expect("message should be decoded"),
+        Some(Message::Verack),
+        "message following discarded bloom filter messages should be decoded",
+    );
+    assert!(bytes.is_empty(), "all complete messages should be consumed");
+}
 
-    let v_parsed = rt.block_on(async {
-        let mut fr = FramedRead::new(
-            Cursor::new(&v_bytes),
-            Codec::builder()
-                .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
-                .finish(),
-        );
-        fr.next()
-            .await
-            .expect("a next message should be available")
-            .expect("that message should deserialize")
-    });
-
-    assert_eq!(v, v_parsed);
+fn wire_message(command: [u8; 12], body: &[u8]) -> Vec<u8> {
+    let body_len = u32::try_from(body.len()).expect("test message body fits in a u32");
+    let mut bytes = Vec::with_capacity(HEADER_LEN + body.len());
+    bytes.extend_from_slice(&Network::Mainnet.magic().0);
+    bytes.extend_from_slice(&command);
+    bytes.extend_from_slice(&body_len.to_le_bytes());
+    bytes.extend_from_slice(&sha256d::Checksum::from(body).0);
+    bytes.extend_from_slice(body);
+    bytes
 }
 
 #[test]
@@ -242,48 +231,6 @@ fn reject_message_extra_data_round_trip() {
     });
 
     assert_eq!(v, v_parsed);
-}
-
-#[test]
-fn filterload_message_too_large_round_trip() {
-    let (rt, _init_guard) = zakura_test::init_async();
-
-    let v = Message::FilterLoad {
-        filter: Filter(vec![0; 40000]),
-        hash_functions_count: 0,
-        tweak: Tweak(0),
-        flags: 0,
-    };
-
-    use tokio_util::codec::{FramedRead, FramedWrite};
-    let v_bytes = rt.block_on(async {
-        let mut bytes = Vec::new();
-        {
-            let mut fw = FramedWrite::new(
-                &mut bytes,
-                Codec::builder()
-                    .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
-                    .finish(),
-            );
-            fw.send(v.clone())
-                .await
-                .expect("message should be serialized");
-        }
-        bytes
-    });
-
-    rt.block_on(async {
-        let mut fr = FramedRead::new(
-            Cursor::new(&v_bytes),
-            Codec::builder()
-                .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
-                .finish(),
-        );
-        fr.next()
-            .await
-            .expect("a next message should be available")
-            .expect_err("that message should not deserialize")
-    });
 }
 
 #[test]

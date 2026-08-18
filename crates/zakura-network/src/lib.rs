@@ -55,13 +55,11 @@
 //!  * initiates Zcash [`peer::Handshake`]s, which creates [`peer::Connection`]
 //!    tasks for each outbound connection
 //!
-//! Zebra uses direct TCP connections to share blocks and mempool transactions with other peers.
+//! Zebra uses direct TCP connections to share blocks and mempool transactions
+//! with other peers.
 //!
-//! The [`isolated`] APIs provide anonymised TCP and [Tor](https://crates.io/crates/arti)
-//! connections to individual peers.
-//! These isolated connections can be used to send user-generated transactions anonymously.
-//! Tor connections are currently disabled until `arti-client`'s dependency `x25519-dalek v1.2.0`
-//! is updated to a higher version. See #5492.
+//! The [`isolated`] API provides isolated connections to individual peers for
+//! testing and custom applications.
 //!
 //! ### Individual Peer Connections
 //!
@@ -170,25 +168,13 @@ pub mod zakura;
 #[allow(unused)]
 pub(crate) use peer_set::PeerSet;
 
-// Wait until `arti-client`'s dependency `x25519-dalek v1.2.0` is updated to a higher version. (#5492)
-// #[cfg(feature = "tor")]
-// pub use crate::isolated::tor::connect_isolated_tor;
-
-// Wait until `arti-client`'s dependency `x25519-dalek v1.2.0` is updated to a higher version. (#5492)
-// #[cfg(all(feature = "tor", any(test, feature = "proptest-impl")))]
-// pub use crate::isolated::tor::connect_isolated_tor_with_inbound;
-
 #[cfg(any(test, feature = "proptest-impl"))]
-pub use crate::{
-    isolated::{connect_isolated_tcp_direct_with_inbound, connect_isolated_with_inbound},
-    protocol::external::canonical_peer_addr,
-};
+pub use crate::{isolated::connect_isolated_with_inbound, protocol::external::canonical_peer_addr};
 
 pub use crate::{
     address_book::{AddressBook, BannedIps},
     address_book_peers::AddressBookPeers,
     config::{CacheDir, Config, P2pStack},
-    isolated::{connect_isolated, connect_isolated_tcp_direct},
     meta_addr::{PeerAddrState, PeerSocketAddr},
     peer::{
         Client, ConnectedAddr, ConnectionInfo, HandshakeError, NotFoundClass, PeerError,

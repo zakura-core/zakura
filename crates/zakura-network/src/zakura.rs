@@ -9,6 +9,7 @@ use iroh::{endpoint, Endpoint, NodeAddr, NodeId, RelayMode, SecretKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     meta_addr::{MetaAddr, MetaAddrChange},
@@ -407,17 +408,16 @@ impl ZakuraHandshakeConnector {
             .map_or(ZakuraNativeHandoff::Failed, ZakuraNativeHandoff::Registered)
     }
 
-    /// Keep an upgraded peer's legacy address-book entry live for the lifetime
-    /// of its Zakura connection, so the outbound crawler does not re-dial it.
+    /// Keep an upgraded peer's legacy address-book entry live while the
+    /// maintained native dial owns the peer.
     ///
     /// After a legacy->Zakura upgrade the legacy TCP connection is dropped, so
     /// nothing else refreshes the peer's `Responded` liveness. Without this, the
     /// crawler re-dials the peer once its entry ages past
     /// [`constants::MIN_PEER_RECONNECTION_DELAY`](crate::constants::MIN_PEER_RECONNECTION_DELAY),
-    /// re-running the upgrade and churning the QUIC connection. While the peer
-    /// is registered with the supervisor the keeper marks it `Responded`; once
-    /// it deregisters the keeper stops, so a genuinely gone peer becomes a
-    /// reconnection candidate again.
+    /// re-running the upgrade and churning the QUIC connection. The keeper
+    /// continues refreshing across native reconnects. It stops when the
+    /// maintained native dial ends.
     ///
     /// Only meaningful for outbound connections, where `book_addr` is the
     /// dialable remote address the crawler would otherwise reconnect to. Does
@@ -431,12 +431,16 @@ impl ZakuraHandshakeConnector {
         let Some(endpoint) = self.endpoint.as_ref() else {
             return;
         };
+        let Some(dial_lifetime) = endpoint.upgrade_dial_lifetime(&peer_id) else {
+            return;
+        };
         let registered = endpoint.supervisor().subscribe();
         tokio::spawn(run_legacy_liveness_keeper(
             registered,
             peer_id,
             book_addr,
             address_book_updater,
+            dial_lifetime,
             ZAKURA_LIVENESS_APPEAR_TIMEOUT,
             ZAKURA_LIVENESS_REFRESH_INTERVAL,
         ));
@@ -484,51 +488,48 @@ fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<
     Some(NodeAddr::new(node_id).with_direct_addresses(direct))
 }
 
-/// Refresh an upgraded peer's legacy `Responded` liveness while it stays
-/// registered with the Zakura supervisor.
+/// Refresh an upgraded peer's legacy `Responded` liveness while its maintained
+/// native dial owns the peer.
 ///
-/// See [`ZakuraHandshakeConnector::spawn_legacy_liveness_keeper`]. Exits when
-/// the peer never registers within `appear_timeout`, when it deregisters, or
-/// when the address book updater closes (node shutdown).
+/// See [`ZakuraHandshakeConnector::spawn_legacy_liveness_keeper`]. The keeper
+/// starts after the peer registers once and continues across native reconnects.
+/// It exits when dial ownership ends, when the peer never registers within
+/// `appear_timeout`, or when the address book updater closes.
 async fn run_legacy_liveness_keeper(
     mut registered: watch::Receiver<Vec<ZakuraPeerId>>,
     peer_id: ZakuraPeerId,
     book_addr: PeerSocketAddr,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    dial_lifetime: CancellationToken,
     appear_timeout: Duration,
     refresh_interval: Duration,
 ) {
-    if !wait_for_zakura_peer(&mut registered, &peer_id, appear_timeout).await {
+    let appeared = tokio::select! {
+        biased;
+        _ = dial_lifetime.cancelled() => false,
+        appeared = wait_for_zakura_peer(&mut registered, &peer_id, appear_timeout) => appeared,
+    };
+    if !appeared {
         return;
     }
 
     loop {
         // Refresh the peer's `Responded` liveness so the crawler treats it as a
         // live (Zakura) peer instead of re-dialing it over legacy TCP.
-        if address_book_updater
-            .send(MetaAddr::new_responded(book_addr, None))
-            .await
-            .is_err()
-        {
+        let sent = tokio::select! {
+            biased;
+            _ = dial_lifetime.cancelled() => return,
+            sent = address_book_updater.send(MetaAddr::new_responded(book_addr, None)) => sent,
+        };
+        if sent.is_err() {
             // The address book updater is gone: the node is shutting down.
             break;
         }
 
-        // Wait for the next refresh, but wake early if the peer set changes so
-        // we react to deregistration promptly.
         tokio::select! {
-            changed = registered.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-            }
+            biased;
+            _ = dial_lifetime.cancelled() => break,
             _ = tokio::time::sleep(refresh_interval) => {}
-        }
-
-        if !registered.borrow().iter().any(|id| id == &peer_id) {
-            // The Zakura connection deregistered: stop refreshing so the entry
-            // ages out and the peer can be reconnected over legacy.
-            break;
         }
     }
 }
@@ -643,40 +644,49 @@ mod tests {
             .into()
     }
 
-    /// While the peer stays registered, the keeper repeatedly refreshes its
-    /// `Responded` liveness; once it deregisters, the keeper stops.
+    /// The keeper refreshes `Responded` liveness across native reconnects and
+    /// stops when maintained dial ownership ends.
     #[tokio::test]
-    async fn legacy_liveness_keeper_refreshes_until_deregistered() {
+    async fn legacy_liveness_keeper_refreshes_until_dial_ownership_ends() {
         let peer_id = test_peer_id();
         let (registered_tx, registered_rx) = watch::channel(vec![peer_id.clone()]);
         let (updater_tx, mut updater_rx) = tokio::sync::mpsc::channel(16);
+        let dial_lifetime = CancellationToken::new();
 
         let keeper = tokio::spawn(run_legacy_liveness_keeper(
             registered_rx,
             peer_id.clone(),
             test_book_addr(),
             updater_tx,
+            dial_lifetime.clone(),
             Duration::from_secs(5),
-            Duration::from_millis(20),
+            Duration::from_millis(250),
         ));
 
-        // The keeper should keep marking the peer `Responded` while it is registered.
-        for _ in 0..2 {
-            let change = tokio::time::timeout(Duration::from_secs(1), updater_rx.recv())
-                .await
-                .expect("keeper refreshes liveness on a registered peer")
-                .expect("the keeper holds the sender open");
-            assert!(
-                matches!(change, MetaAddrChange::UpdateResponded { addr, .. } if addr == test_book_addr()),
-                "keeper should refresh the upgraded peer's responded liveness, got {change:?}",
-            );
-        }
+        let first_change = tokio::time::timeout(Duration::from_secs(1), updater_rx.recv())
+            .await
+            .expect("keeper refreshes liveness after the peer registers")
+            .expect("the keeper holds the sender open");
+        assert!(
+            matches!(first_change, MetaAddrChange::UpdateResponded { addr, .. } if addr == test_book_addr()),
+            "keeper should refresh the upgraded peer's responded liveness, got {first_change:?}",
+        );
 
-        // Deregister the peer: the keeper must observe the change and exit.
+        // A native disconnect does not release maintained dial ownership.
         registered_tx.send(Vec::new()).expect("receiver is alive");
+        let reconnect_change = tokio::time::timeout(Duration::from_secs(1), updater_rx.recv())
+            .await
+            .expect("keeper refreshes liveness during a native reconnect")
+            .expect("the keeper holds the sender open");
+        assert!(
+            matches!(reconnect_change, MetaAddrChange::UpdateResponded { addr, .. } if addr == test_book_addr()),
+            "keeper should suppress legacy dials during a native reconnect, got {reconnect_change:?}",
+        );
+
+        dial_lifetime.cancel();
         tokio::time::timeout(Duration::from_secs(2), keeper)
             .await
-            .expect("keeper exits after the peer deregisters")
+            .expect("keeper exits after maintained dial ownership ends")
             .expect("keeper task does not panic");
     }
 
@@ -687,12 +697,14 @@ mod tests {
         let peer_id = test_peer_id();
         let (_registered_tx, registered_rx) = watch::channel(Vec::new());
         let (updater_tx, mut updater_rx) = tokio::sync::mpsc::channel(16);
+        let dial_lifetime = CancellationToken::new();
 
         let keeper = tokio::spawn(run_legacy_liveness_keeper(
             registered_rx,
             peer_id,
             test_book_addr(),
             updater_tx,
+            dial_lifetime,
             Duration::from_millis(50),
             Duration::from_millis(20),
         ));

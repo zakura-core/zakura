@@ -529,10 +529,15 @@ pub struct ZakuraEndpoint {
     header_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
     block_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
     /// Maintained native dials started by the legacy->Zakura upgrade hand-off,
-    /// keyed by the advertised peer id. The [`AbortHandle`] lets a failed
-    /// hand-off cancel its maintain-forever dial instead of leaking it; see
-    /// [`Self::start_upgrade_native_dial`] and [`Self::cancel_upgrade_native_dial`].
-    upgrade_dials: Arc<StdMutex<HashMap<ZakuraPeerId, AbortHandle>>>,
+    /// keyed by the advertised peer id. See [`Self::start_upgrade_native_dial`]
+    /// and [`Self::cancel_upgrade_native_dial`].
+    upgrade_dials: Arc<StdMutex<HashMap<ZakuraPeerId, UpgradeDialOwnership>>>,
+}
+
+#[derive(Debug)]
+struct UpgradeDialOwnership {
+    dial_abort: AbortHandle,
+    lifetime: CancellationToken,
 }
 
 #[derive(Debug)]
@@ -696,8 +701,8 @@ impl ZakuraEndpoint {
     /// waiting for the legacy crawler to re-dial and re-run the whole upgrade.
     /// Once the legacy TCP connection is dropped, this task is the prompt
     /// recovery path for short Zakura disconnects; the address-book liveness
-    /// keeper prevents the slower legacy crawler from churning while this peer
-    /// remains registered.
+    /// keeper prevents the slower legacy crawler from churning while this dial
+    /// owns the peer.
     pub fn spawn_native_dial(&self, node_addr: NodeAddr) -> tokio::task::JoinHandle<()> {
         let endpoint = self.clone();
         let limits = self.handler.limits.clone();
@@ -738,8 +743,11 @@ impl ZakuraEndpoint {
             DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
             DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
         );
+        let lifetime = CancellationToken::new();
+        let task_lifetime = lifetime.clone();
         let task_peer_id = peer_id.clone();
         let dial = tokio::spawn(async move {
+            let _lifetime_guard = task_lifetime.drop_guard();
             native_dial_supervised(endpoint.clone(), node_addr, limits, policy).await;
             endpoint
                 .supervisor
@@ -750,8 +758,27 @@ impl ZakuraEndpoint {
                 .expect("Zakura upgrade dial registry mutex is never poisoned")
                 .remove(&task_peer_id);
         });
-        upgrade_dials.insert(peer_id, dial.abort_handle());
+        upgrade_dials.insert(
+            peer_id,
+            UpgradeDialOwnership {
+                dial_abort: dial.abort_handle(),
+                lifetime,
+            },
+        );
         ZakuraUpgradeDialStart::Started
+    }
+
+    /// Return a token that is canceled when this endpoint stops owning the
+    /// maintained native dial for `peer_id`.
+    pub(crate) fn upgrade_dial_lifetime(
+        &self,
+        peer_id: &ZakuraPeerId,
+    ) -> Option<CancellationToken> {
+        self.upgrade_dials
+            .lock()
+            .expect("Zakura upgrade dial registry mutex is never poisoned")
+            .get(peer_id)
+            .map(|ownership| ownership.lifetime.clone())
     }
 
     /// Cancel and forget the maintained native dial started by the legacy
@@ -766,13 +793,14 @@ impl ZakuraEndpoint {
     /// registered (its entry is reclaimed only when the maintained dial ends on
     /// shutdown) or if another upgrade owns the dedup slot.
     pub(crate) fn cancel_upgrade_native_dial(&self, peer_id: &ZakuraPeerId) {
-        let handle = self
+        let ownership = self
             .upgrade_dials
             .lock()
             .expect("Zakura upgrade dial registry mutex is never poisoned")
             .remove(peer_id);
-        if let Some(handle) = handle {
-            handle.abort();
+        if let Some(ownership) = ownership {
+            ownership.lifetime.cancel();
+            ownership.dial_abort.abort();
             self.supervisor.forget_retained_native_metadata(peer_id);
         }
     }

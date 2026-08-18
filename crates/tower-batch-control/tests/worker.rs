@@ -1,11 +1,49 @@
 //! Fixed test cases for batch worker tasks.
 
-use std::time::Duration;
+use std::{
+    future::Ready,
+    panic::AssertUnwindSafe,
+    task::{Context, Poll},
+    time::Duration,
+};
 
+use tokio::sync::oneshot;
 use tokio_test::{assert_pending, assert_ready, assert_ready_err, task};
 use tower::{Service, ServiceExt};
 use tower_batch_control::{error, Batch, BatchControl, RequestWeight};
 use tower_test::mock;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Sends on `tx` when it is dropped, including while a panic unwinds the worker task.
+struct SendOnDrop(Option<oneshot::Sender<()>>);
+
+impl Drop for SendOnDrop {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .take()
+            .expect("the sender is only taken by this drop impl")
+            .send(());
+    }
+}
+
+/// An inner service that panics when the batch worker checks its readiness.
+struct PanicService;
+
+impl Service<BatchControl<()>> for PanicService {
+    type Response = ();
+    type Error = BoxError;
+    type Future = Ready<Result<(), BoxError>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        panic!("inner service panicked");
+    }
+
+    fn call(&mut self, _req: BatchControl<()>) -> Self::Future {
+        unreachable!("the worker panics before it calls the inner service");
+    }
+}
 
 #[tokio::test]
 async fn wakes_pending_waiters_on_close() {
@@ -190,4 +228,112 @@ async fn try_flush_completes_zero_weight_items() {
         .await
         .expect("item response should complete")
         .expect("zero-weight item should verify");
+}
+
+/// The batch worker exits when its inner service returns a recoverable error. Every later
+/// readiness check must report that failure, rather than polling the completed
+/// [`JoinHandle`](tokio::task::JoinHandle) again and panicking.
+#[tokio::test]
+async fn poll_ready_reports_worker_exit_every_time() {
+    let _init_guard = zakura_test::init();
+
+    let (inner_service, mut inner_handle) = mock::pair::<BatchControl<()>, ()>();
+    let (mut service, worker) = Batch::pair(inner_service, 1, 1, Duration::from_secs(1));
+
+    let (worker_exited_tx, worker_exited_rx) = oneshot::channel();
+    let worker_handle = tokio::spawn(async move {
+        let _signal_exit = SendOnDrop(Some(worker_exited_tx));
+        worker.run().await;
+    });
+    service.register_worker(worker_handle);
+
+    // Hold the item in the worker, so the worker is waiting on the inner service.
+    inner_handle.allow(0);
+    service.ready().await.expect("batch starts ready");
+    let _response = service.call(());
+
+    // A recoverable inner error permanently fails the worker, which then drains its queue
+    // and returns. This is the `Poll::Ready(Ok(()))` case in `Batch::poll_ready()`.
+    inner_handle.send_error("inner service error");
+    worker_exited_rx.await.expect("worker task should exit");
+
+    let Err(first_error) = service.ready().await else {
+        panic!("readiness should fail once the worker has exited");
+    };
+    assert!(
+        first_error.is::<error::ServiceError>(),
+        "the first check should return the worker error, got: {first_error:?}",
+    );
+
+    // Before the fix, this check polled the completed `JoinHandle` again, and panicked.
+    let Err(second_error) = service.ready().await else {
+        panic!("readiness should keep failing once the worker has exited");
+    };
+    assert_eq!(
+        first_error.to_string(),
+        second_error.to_string(),
+        "every check should return the same worker error",
+    );
+
+    // Clones share the worker handle, so they must not poll it again either.
+    let mut cloned_service = service.clone();
+    let Err(cloned_error) = cloned_service.ready().await else {
+        panic!("clones should fail once the worker has exited");
+    };
+    assert_eq!(
+        first_error.to_string(),
+        cloned_error.to_string(),
+        "clones should return the same worker error",
+    );
+}
+
+/// A panicking worker propagates its panic to one readiness check. Every later check must
+/// report the worker failure, rather than panicking on a poisoned worker handle mutex.
+#[tokio::test]
+async fn poll_ready_after_worker_panic_does_not_poison_the_handle_mutex() {
+    let _init_guard = zakura_test::init();
+
+    let (mut service, worker) = Batch::pair(PanicService, 1, 1, Duration::from_secs(1));
+
+    let (worker_exited_tx, worker_exited_rx) = oneshot::channel();
+    let worker_handle = tokio::spawn(async move {
+        let _signal_exit = SendOnDrop(Some(worker_exited_tx));
+        worker.run().await;
+    });
+    service.register_worker(worker_handle);
+
+    service.ready().await.expect("batch starts ready");
+    let _response = service.call(());
+    worker_exited_rx.await.expect("worker task should panic");
+
+    // The first check resumes the worker panic.
+    let mut context_task = task::spawn(());
+    let panic_payload = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        context_task.enter(|cx, _| service.poll_ready(cx))
+    }))
+    .expect_err("the first check should resume the worker panic");
+    assert_eq!(
+        panic_payload.downcast_ref::<&str>().copied(),
+        Some("inner service panicked"),
+        "the first check should resume the inner service panic",
+    );
+
+    // Before the fix, the panic unwound through the locked worker handle mutex, so this
+    // check panicked on the poisoned mutex instead of returning the worker error.
+    let Err(error) = service.ready().await else {
+        panic!("readiness should fail once the worker has panicked");
+    };
+    assert!(
+        error.is::<error::ServiceError>(),
+        "later checks should return the worker error, got: {error:?}",
+    );
+
+    let mut cloned_service = service.clone();
+    let Err(cloned_error) = cloned_service.ready().await else {
+        panic!("clones should fail once the worker has panicked");
+    };
+    assert!(
+        cloned_error.is::<error::ServiceError>(),
+        "clones should return the worker error, got: {cloned_error:?}",
+    );
 }

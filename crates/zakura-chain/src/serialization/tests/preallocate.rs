@@ -5,7 +5,8 @@ use proptest::{collection::size_range, prelude::*};
 use std::matches;
 
 use crate::serialization::{
-    arbitrary::max_allocation_is_big_enough, zcash_deserialize::MAX_U8_ALLOCATION,
+    arbitrary::max_allocation_is_big_enough,
+    zcash_deserialize::{MAX_INITIAL_ALLOCATION, MAX_U8_ALLOCATION},
     CompactSizeMessage, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashSerialize,
     MAX_PROTOCOL_MESSAGE_LEN,
 };
@@ -121,19 +122,26 @@ impl std::io::Read for TruncatedReader {
 /// Confirm that a short message declaring a near-maximal byte vector length does not
 /// make the deserializer allocate that length before the bytes arrive.
 ///
-/// `read_exact()` is handed the uninitialised tail of the output buffer, so the largest
-/// buffer the reader sees is the largest amount the deserializer has allocated. A peer
-/// that declares `MAX_U8_ALLOCATION` bytes and then ends the message used to force a
-/// two megabyte allocation from a few hundred bytes of input, which is the byte vector
-/// case of GHSA-xr93-pcq3-pxf8.
+/// `read_exact()` is handed the tail of the output buffer that the deserializer has
+/// grown so far, so the largest buffer the reader sees tracks how much the deserializer
+/// allocates as it goes. A peer that declares `MAX_U8_ALLOCATION` bytes and then ends
+/// the message used to force a two megabyte allocation from a few hundred bytes of
+/// input, which is the byte vector case of GHSA-xr93-pcq3-pxf8.
+///
+/// This proxy has one blind spot: it can not see a `Vec::with_capacity(external_count)`
+/// that is followed by chunked reads, because that reserves the full length while still
+/// handing the reader small buffers. Safe Rust can not observe the capacity from the
+/// reader side, and a counting global allocator needs `unsafe`, which this workspace
+/// denies. So the deserializer carries a matching comment telling the reader never to
+/// pre-reserve the declared length.
 fn u8_deser_does_not_preallocate_declared_length() {
     /// The number of body bytes the peer actually sends.
     const SUPPLIED_LEN: usize = 512;
 
     /// The largest buffer the deserializer may hand to the reader. The chunked read grows
-    /// the buffer in `MAX_INITIAL_ALLOCATION` steps, so this bound is far below
-    /// `MAX_U8_ALLOCATION` but leaves room to retune the chunk size.
-    const MAX_ALLOWED_READ_LEN: usize = 64 * 1024;
+    /// the buffer in `MAX_INITIAL_ALLOCATION` steps, so one chunk is the exact maximum;
+    /// the factor of two leaves room to retune the chunk size without editing this test.
+    const MAX_ALLOWED_READ_LEN: usize = 2 * MAX_INITIAL_ALLOCATION;
 
     // A CompactSize length prefix for `MAX_U8_ALLOCATION`, followed by a truncated body.
     let mut serialized = Vec::new();

@@ -8,7 +8,7 @@ use super::{AtLeastOne, CompactSizeMessage, SerializationError, MAX_PROTOCOL_MES
 ///
 /// 1024 is large enough that honest messages amortize their growth to a few
 /// reallocations.
-const MAX_INITIAL_ALLOCATION: usize = 1024;
+pub(crate) const MAX_INITIAL_ALLOCATION: usize = 1024;
 
 /// Consensus-critical deserialization for Zcash.
 ///
@@ -50,7 +50,8 @@ impl<T: ZcashDeserialize + TrustedPreallocate> ZcashDeserialize for AtLeastOne<T
 
 /// Implement ZcashDeserialize for `Vec<u8>` directly instead of using the blanket Vec implementation
 ///
-/// This allows us to optimize the inner loop into a single call to `read_exact()`
+/// This allows us to optimize the inner loop into a small number of `read_exact()`
+/// calls, rather than one call per byte.
 /// Note that we don't implement TrustedPreallocate for u8.
 /// This allows the optimization without relying on specialization.
 impl ZcashDeserialize for Vec<u8> {
@@ -131,9 +132,15 @@ pub fn zcash_deserialize_bytes_external_count<R: io::Read>(
     // Grow the buffer as the bytes arrive, rather than reserving `external_count`
     // up front. A peer can declare a length near `MAX_U8_ALLOCATION` in a message
     // that ends after a few hundred bytes, so an upfront reservation lets a small
-    // message force a multi-megabyte allocation. This bounds the allocation to the
-    // bytes the peer actually sends, plus one chunk. Fixes the byte-vector case of
+    // message force a multi-megabyte allocation. `resize()` below grows the capacity
+    // by doubling, so this bounds the allocation to about twice the bytes the peer
+    // actually sends, matching the `Vec<T>` path. Fixes the byte-vector case of
     // GHSA-xr93-pcq3-pxf8.
+    //
+    // Never reserve `external_count` here, even as an optimisation to avoid the
+    // reallocations: that reintroduces the vulnerability, and
+    // `u8_deser_does_not_preallocate_declared_length` can not catch it, because it
+    // observes the read buffer size rather than the capacity.
     let mut vec = Vec::with_capacity(external_count.min(MAX_INITIAL_ALLOCATION));
 
     while vec.len() < external_count {
@@ -152,7 +159,8 @@ pub fn zcash_deserialize_bytes_external_count<R: io::Read>(
 /// `zcash_deserialize_external_count`, specialised for [`String`].
 /// The external count is in bytes. (Not UTF-8 characters.)
 ///
-/// This allows us to optimize the inner loop into a single call to `read_exact()`.
+/// This allows us to optimize the inner loop into a small number of `read_exact()`
+/// calls, rather than one call per byte.
 ///
 /// This function has a `zcash_` prefix to alert the reader that the
 /// serialization in use is consensus-critical serialization, rather than

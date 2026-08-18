@@ -915,6 +915,65 @@ fn check_configured_slow_start_interval_keeps_founders_reward_exact() {
         .expect("the default slow start interval must keep the founders reward exact");
 }
 
+/// Checks that a configured lockbox disbursement address which is not P2SH is rejected when the
+/// network is configured, rather than panicking in block validation at the NU6.1 activation
+/// height.
+#[test]
+fn check_configured_lockbox_disbursement_addresses_are_p2sh() {
+    // A valid Testnet address that is P2PKH instead of P2SH.
+    const TESTNET_P2PKH_ADDRESS: &str = "tmWbBGi7TjExNmLZyMcFpxVh3ZPbGrpbX3H";
+
+    let error = testnet::Parameters::build()
+        .with_lockbox_disbursements(vec![ConfiguredLockboxDisbursement {
+            address: TESTNET_P2PKH_ADDRESS.to_string(),
+            amount: Amount::new_from_zec(78_750),
+        }])
+        .to_network()
+        .expect_err("a P2PKH lockbox disbursement address must be rejected");
+
+    assert_eq!(
+        error,
+        ParametersBuilderError::LockboxDisbursementAddressNotP2SH {
+            address: TESTNET_P2PKH_ADDRESS.to_string(),
+        },
+        "configuring a non-P2SH lockbox disbursement address must report which address is invalid"
+    );
+
+    // Regtest skips the `to_network()` checks, so it must reject the address on its own path.
+    testnet::Parameters::new_regtest(RegtestParameters {
+        lockbox_disbursements: Some(vec![ConfiguredLockboxDisbursement {
+            address: TESTNET_P2PKH_ADDRESS.to_string(),
+            amount: Amount::new_from_zec(78_750),
+        }]),
+        ..Default::default()
+    })
+    .expect_err("a P2PKH lockbox disbursement address must be rejected on Regtest");
+}
+
+/// Checks that a configured lockbox disbursement address which does not parse is rejected when
+/// the network is configured, rather than panicking in the `lockbox_disbursements()` accessor.
+#[test]
+fn check_configured_lockbox_disbursement_addresses_parse() {
+    const INVALID_ADDRESS: &str = "not a transparent address";
+
+    let error = testnet::Parameters::build()
+        .with_lockbox_disbursements(vec![ConfiguredLockboxDisbursement {
+            address: INVALID_ADDRESS.to_string(),
+            amount: Amount::new_from_zec(78_750),
+        }])
+        .to_network()
+        .expect_err("an unparseable lockbox disbursement address must be rejected");
+
+    assert!(
+        matches!(
+            error,
+            ParametersBuilderError::InvalidLockboxDisbursementAddress { ref address, .. }
+                if address == INVALID_ADDRESS
+        ),
+        "configuring an unparseable lockbox disbursement address must report it, got: {error:?}"
+    );
+}
+
 /// Check that `new_regtest()` constructs a network with the provided funding streams.
 #[test]
 fn check_configured_funding_stream_regtest() {

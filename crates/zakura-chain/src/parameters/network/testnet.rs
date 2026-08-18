@@ -26,6 +26,7 @@ use crate::{
         },
         Network, NetworkKind, NetworkUpgrade,
     },
+    serialization::SerializationError,
     transparent,
     work::difficulty::{ExpandedDifficulty, U256},
 };
@@ -387,6 +388,35 @@ fn check_funding_stream_address_types(
     Ok(())
 }
 
+/// Checks that every configured NU6.1 one-time lockbox disbursement address parses and is a
+/// P2SH address.
+///
+/// [`Parameters::lockbox_disbursements()`] parses these addresses with an `expect`, and the
+/// disbursement consensus rule only accepts P2SH outputs, so an address that does not parse
+/// or is not P2SH crashes block validation at the NU6.1 activation height. Rejecting those
+/// addresses here surfaces the problem when the network is configured, rather than at that
+/// activation height.
+fn check_lockbox_disbursement_addresses(
+    lockbox_disbursements: &[(String, Amount<NonNegative>)],
+) -> Result<(), ParametersBuilderError> {
+    for (address, _amount) in lockbox_disbursements {
+        let parsed: transparent::Address = address.parse().map_err(|err: SerializationError| {
+            ParametersBuilderError::InvalidLockboxDisbursementAddress {
+                address: address.clone(),
+                err: err.to_string(),
+            }
+        })?;
+
+        if !parsed.is_script_hash() {
+            return Err(ParametersBuilderError::LockboxDisbursementAddressNotP2SH {
+                address: address.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// The divisor used to calculate the founders reward from the block subsidy.
 ///
 /// The founders reward is 20% of the block subsidy, calculated with exact division.
@@ -408,8 +438,18 @@ fn check_founders_reward_is_exact(network: &Network) -> Result<(), ParametersBui
     let canopy_height = NetworkUpgrade::Canopy
         .activation_height(network)
         .unwrap_or(Height::MAX);
-    if slow_start_interval <= Height(1)
-        || canopy_height <= Height(1)
+    if slow_start_interval <= Height(1) || canopy_height <= Height(1) {
+        return Ok(());
+    }
+
+    // For a configured Testnet, `height_for_first_halving()` derives the height from the
+    // Blossom activation height and panics when the network has none, so check for Blossom
+    // first. `activation_height()` falls back to the next configured upgrade, so Blossom is
+    // only absent when every configured upgrade precedes it, which also leaves Canopy absent.
+    // `mandatory_checkpoint_height()` already panics on such a network later in
+    // `to_network()`, so this guard is unreachable today; it keeps this check from being the
+    // one that panics if that height ever becomes fallible.
+    if NetworkUpgrade::Blossom.activation_height(network).is_none()
         || network.height_for_first_halving() <= Height(1)
     {
         return Ok(());
@@ -1008,6 +1048,7 @@ impl ParametersBuilder {
         }
 
         check_founders_reward_is_exact(&network)?;
+        check_lockbox_disbursement_addresses(&self.lockbox_disbursements)?;
 
         // Final check that the configured checkpoints are valid for this network.
         if network.checkpoint_list().hash(Height(0)) != Some(network.genesis_hash()) {
@@ -1182,10 +1223,12 @@ impl Parameters {
         }
 
         // Regtest does not run the `to_network()` checks, so check the address types here:
-        // block validation panics on a funding stream address that is not P2SH.
+        // block validation panics on a funding stream or lockbox disbursement address that is
+        // not P2SH.
         for funding_stream in &parameters.funding_streams {
             check_funding_stream_address_types(funding_stream)?;
         }
+        check_lockbox_disbursement_addresses(&parameters.lockbox_disbursements)?;
 
         Ok(Self {
             network_name: "Regtest".to_string(),

@@ -174,8 +174,8 @@ where
         // Clamp config to sensible values.
         let max_items_weight_in_batch = max(max_items_weight_in_batch, 1);
         // The worker can only run a batch if it is allowed at least one concurrent batch:
-        // with a limit of zero it never reads from `rx`, so every request queued against the
-        // semaphore below waits forever.
+        // with a limit of zero, every branch of the worker's `select!` is disabled, so the
+        // worker panics on its first poll and fails every request with `Closed`.
         let max_batches = max(
             max_batches
                 .into()

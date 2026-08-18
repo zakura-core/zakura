@@ -108,4 +108,15 @@ pub enum ParametersBuilderError {
     )]
     #[non_exhaustive]
     IndivisibleFoundersReward { slow_start_interval: Height },
+
+    #[error("lockbox disbursement address {address} must parse as a transparent address: {err}")]
+    #[non_exhaustive]
+    InvalidLockboxDisbursementAddress { address: String, err: String },
+
+    #[error(
+        "lockbox disbursement address {address} must be a P2SH address, because the lockbox \
+         disbursement consensus rule only accepts P2SH outputs"
+    )]
+    #[non_exhaustive]
+    LockboxDisbursementAddressNotP2SH { address: String },
 }

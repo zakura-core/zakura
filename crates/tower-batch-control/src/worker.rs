@@ -149,7 +149,16 @@ where
                 // Floor each item at weight 1 so `pending_items_weight == 0` always
                 // means "no queued items": a zero-weight item must still start the
                 // batch timer and be flushed. See `RequestWeight::request_weight`.
-                self.pending_items_weight += req.request_weight().max(1);
+                //
+                // Saturate rather than wrap on overflow: `RequestWeight` is a public
+                // trait, so a weight large enough to wrap the counter back to zero
+                // would make `flush_service()` skip the flush for items the inner
+                // service has already been given, stranding their response futures.
+                // Saturating keeps the counter above `max_items_weight_in_batch`, so
+                // the run loop flushes the batch instead.
+                self.pending_items_weight = self
+                    .pending_items_weight
+                    .saturating_add(req.request_weight().max(1));
                 let rsp = svc.call(req.into());
                 let _ = tx.send(Ok(rsp));
             }

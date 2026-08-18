@@ -173,10 +173,16 @@ where
 
         // Clamp config to sensible values.
         let max_items_weight_in_batch = max(max_items_weight_in_batch, 1);
-        let max_batches = max_batches
-            .into()
-            .unwrap_or_else(rayon::current_num_threads);
-        let max_batches_in_queue = max_batches.clamp(1, QUEUE_BATCH_LIMIT);
+        // The worker can only run a batch if it is allowed at least one concurrent batch:
+        // with a limit of zero it never reads from `rx`, so every request queued against the
+        // semaphore below waits forever.
+        let max_batches = max(
+            max_batches
+                .into()
+                .unwrap_or_else(rayon::current_num_threads),
+            1,
+        );
+        let max_batches_in_queue = max_batches.min(QUEUE_BATCH_LIMIT);
 
         // The semaphore bound limits the maximum number of concurrent requests
         // (specifically, requests which got a `Ready` from `poll_ready`, but haven't

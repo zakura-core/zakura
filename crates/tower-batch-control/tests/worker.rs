@@ -337,3 +337,94 @@ async fn poll_ready_after_worker_panic_does_not_poison_the_handle_mutex() {
         "clones should return the worker error, got: {cloned_error:?}",
     );
 }
+
+#[tokio::test]
+async fn zero_max_batches_still_runs_batches() {
+    use tokio::time::timeout;
+    let _init_guard = zakura_test::init();
+
+    let (service, mut handle) = mock::pair::<BatchControl<()>, ()>();
+    // A limit of zero concurrent batches must be clamped to one: otherwise every branch of
+    // the worker's `select!` is disabled, so the worker panics on its first poll and fails
+    // every request with `Closed`.
+    let (mut service, worker) = Batch::pair(service, 1, 0, Duration::from_secs(1000));
+    tokio::spawn(worker.run());
+
+    handle.allow(2);
+    service.ready().await.unwrap();
+    let response = service.call(());
+
+    let (request, send_item) = timeout(Duration::from_secs(5), handle.next_request())
+        .await
+        .expect("item should reach the inner service")
+        .expect("inner service should stay open");
+    assert!(matches!(request, BatchControl::Item(())));
+    send_item.send_response(());
+
+    let (request, send_flush) = timeout(Duration::from_secs(5), handle.next_request())
+        .await
+        .expect("flush should reach the inner service")
+        .expect("inner service should stay open");
+    assert!(matches!(request, BatchControl::Flush));
+    send_flush.send_response(());
+
+    timeout(Duration::from_secs(5), response)
+        .await
+        .expect("item response should complete")
+        .expect("item should verify");
+}
+
+#[tokio::test]
+async fn overflowing_request_weight_still_flushes() {
+    use tokio::time::timeout;
+    let _init_guard = zakura_test::init();
+
+    #[derive(Debug)]
+    struct WeightedItem(usize);
+
+    impl RequestWeight for WeightedItem {
+        fn request_weight(&self) -> usize {
+            self.0
+        }
+    }
+
+    let (service, mut handle) = mock::pair::<BatchControl<WeightedItem>, ()>();
+    // A long latency, so only the item weights can flush this batch.
+    let (mut service, worker) = Batch::pair(service, 100, 1, Duration::from_secs(1000));
+    tokio::spawn(worker.run());
+
+    handle.allow(3);
+    service.ready().await.unwrap();
+    let light_response = service.call(WeightedItem(1));
+
+    // The weight of these two items sums to zero if the counter wraps. A wrapped counter
+    // means "no queued items", so the worker would skip the flush for items the inner
+    // service has already been given, and neither response would ever complete.
+    service.ready().await.unwrap();
+    let heavy_response = service.call(WeightedItem(usize::MAX));
+
+    for _ in 0..2 {
+        let (request, send_item) = timeout(Duration::from_secs(5), handle.next_request())
+            .await
+            .expect("item should reach the inner service")
+            .expect("inner service should stay open");
+        assert!(matches!(request, BatchControl::Item(_)));
+        send_item.send_response(());
+    }
+
+    let (request, send_flush) = timeout(Duration::from_secs(5), handle.next_request())
+        .await
+        .expect("flush should reach the inner service")
+        .expect("inner service should stay open");
+    assert!(matches!(request, BatchControl::Flush));
+    send_flush.send_response(());
+
+    timeout(Duration::from_secs(5), light_response)
+        .await
+        .expect("light item response should complete")
+        .expect("light item should verify");
+    timeout(Duration::from_secs(5), heavy_response)
+        .await
+        .expect("heavy item response should complete")
+        .expect("heavy item should verify");
+}

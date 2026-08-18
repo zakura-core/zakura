@@ -23,7 +23,7 @@ Production host wiring, operations, and rollback:
 ## Why an archive node, and why it need not be stopped
 
 The exporter opens the state database as a read-only RocksDB secondary, so it
-reads a consistent view of a *running* node and does not need the stopped-node
+reads a consistent view of a _running_ node and does not need the stopped-node
 window the pruned snapshot job used to provide.
 
 It must be an archive node. Checkpoints, the frontier, and the subtree roots

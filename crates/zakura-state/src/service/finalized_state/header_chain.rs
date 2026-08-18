@@ -4291,9 +4291,25 @@ impl HeaderChainStore {
                     ));
                 }
                 let history_cf = self.cf(HEADER_FINALITY_HISTORY)?;
-                let prefix = self
-                    .db
-                    .raw_prefix_cf(&history_cf, eviction_count.saturating_add(1))?;
+                // The published checkpoint names the last epoch a previous eviction removed, so
+                // every epoch at or below it is already deleted and the oldest surviving record
+                // sits above it. Seeking from there keeps eviction independent of how many
+                // evictions preceded it. Starting at the beginning of the column family instead
+                // would step over the tombstone left by every previous eviction: the retained
+                // window is a few MB, far too small to trigger the compaction that collects
+                // them, so that cost grows without bound and eventually dominates every block
+                // commit.
+                let retained_low = self
+                    .get_value::<FinalityHistoryCheckpoint>(
+                        HEADER_ENGINE_META,
+                        FINALITY_HISTORY_CHECKPOINT_KEY,
+                    )?
+                    .map_or(0, |checkpoint| checkpoint.epoch.get().saturating_add(1));
+                let prefix = self.db.raw_prefix_cf_from(
+                    &history_cf,
+                    &retained_low.to_be_bytes(),
+                    eviction_count.saturating_add(1),
+                )?;
                 let mut decoded_prefix = Vec::with_capacity(prefix.len());
                 for (key, value) in prefix {
                     let row = FinalityRecord::decode(&value).map_err(|_| {

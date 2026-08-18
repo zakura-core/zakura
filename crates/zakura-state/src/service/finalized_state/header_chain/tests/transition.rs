@@ -574,6 +574,134 @@ fn finality_history_creates_an_authenticated_checkpoint_at_the_retained_bound() 
 }
 
 #[test]
+fn finality_history_eviction_does_not_walk_earlier_tombstones() {
+    // Every eviction deletes the lowest key in the retained window, so it leaves a tombstone
+    // exactly where a from-the-start seek begins. The window is a few MB, far too small to
+    // trigger the compaction that would collect those tombstones, so locating the oldest
+    // record by walking from the start costs one skipped delete per eviction ever performed
+    // and eventually dominates every block commit. Eviction must seek past the published
+    // checkpoint instead, which keeps its cost flat.
+    const ROUNDS: u64 = 64;
+    const ALLOWED_GROWTH: u64 = 8;
+
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor_node, metadata) = fixture();
+    let anchor = metadata.frontiers.finalized;
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
+    store
+        .initialize(metadata.clone(), anchor_node)
+        .expect("the bounded history fixture initializes");
+
+    let limit = u64::try_from(FINALITY_HISTORY_LIMIT).expect("the limit fits u64");
+    let mut seed = DiskWriteBatch::new();
+    stage_full_state_canonical_hash(&store, &mut seed, anchor);
+    for epoch in 1..limit {
+        let record = FinalityRecord {
+            previous: anchor,
+            current: anchor,
+            source: full_state_source(EvidenceId::from_digest([0x90; 32])),
+            epoch: FinalityEpoch::new(epoch),
+        };
+        store
+            .put_value(
+                &mut seed,
+                HEADER_FINALITY_HISTORY,
+                HeaderFinalityKey(record.epoch).as_bytes(),
+                &record,
+            )
+            .expect("the retained history row encodes");
+    }
+    store
+        .put_value(
+            &mut seed,
+            HEADER_ENGINE_META,
+            FINALITY_HISTORY_COUNT_KEY,
+            &HeaderRowCountDisk(limit),
+        )
+        .expect("the retained history count encodes");
+    store.db.write(seed).expect("the bounded history seeds");
+
+    let mut next_metadata = metadata;
+    rocksdb::perf::set_perf_stats(rocksdb::PerfStatsLevel::EnableCount);
+    let mut context = rocksdb::PerfContext::default();
+    let mut skipped_deletes =
+        Vec::with_capacity(usize::try_from(ROUNDS).expect("the round count fits usize"));
+
+    for round in 0..ROUNDS {
+        let appended = FinalityRecord {
+            previous: anchor,
+            current: anchor,
+            source: full_state_source(EvidenceId::from_digest([0x91; 32])),
+            epoch: FinalityEpoch::new(limit + round),
+        };
+        next_metadata.finality_epoch = appended.epoch;
+        let changes = ChangeSet {
+            put_nodes: Vec::new(),
+            delete_nodes: Vec::new(),
+            put_consensus_invalid_body_tombstones: Vec::new(),
+            index_changes: zakura_header_chain::IndexChanges::default(),
+            selected_projection: zakura_header_chain::ProjectionDelta::default(),
+            verified_projection: zakura_header_chain::ProjectionDelta::default(),
+            eligibility_changes: Vec::new(),
+            aux_changes: Vec::new(),
+            finality_append: Some(appended),
+            finality_ancestry: zakura_header_chain::FinalityWitnessProof::default(),
+            metadata: next_metadata.clone(),
+        };
+
+        context.reset();
+        let batch = store
+            .batch_for(&changes)
+            .expect("the bounded append evicts the oldest record");
+        skipped_deletes.push(context.metric(rocksdb::PerfMetric::InternalDeleteSkippedCount));
+
+        store
+            .db
+            .write(batch)
+            .expect("the eviction commits atomically");
+    }
+    rocksdb::perf::set_perf_stats(rocksdb::PerfStatsLevel::Disable);
+
+    let first = skipped_deletes.first().copied().expect("a round ran");
+    let last = skipped_deletes.last().copied().expect("a round ran");
+    assert!(
+        last <= first + ALLOWED_GROWTH,
+        "eviction cost grows with the number of prior evictions: the first eviction skipped \
+         {first} deleted keys and eviction {ROUNDS} skipped {last}. Eviction is seeking from \
+         the start of the retained window instead of from the published checkpoint. \
+         Per-round counts: {skipped_deletes:?}"
+    );
+
+    // The window still holds exactly `limit` records, ending at the last epoch appended.
+    let audit = store
+        .audit_snapshot()
+        .expect("the checkpoint snapshot opens");
+    assert_eq!(
+        audit
+            .finality_history_count()
+            .expect("the retained count decodes"),
+        FINALITY_HISTORY_LIMIT
+    );
+    assert_eq!(
+        audit
+            .finality_history_checkpoint()
+            .expect("the checkpoint decodes")
+            .map(|checkpoint| checkpoint.epoch),
+        Some(FinalityEpoch::new(ROUNDS - 1)),
+        "each round must evict exactly one record, advancing the checkpoint by one"
+    );
+    let mut epochs = Vec::with_capacity(FINALITY_HISTORY_LIMIT);
+    audit
+        .visit_finality_history(RowLimit::new(FINALITY_HISTORY_LIMIT), &mut |record| {
+            epochs.push(record.epoch);
+            Ok(())
+        })
+        .expect("the retained history remains bounded");
+    assert_eq!(epochs.first(), Some(&FinalityEpoch::new(ROUNDS)));
+    assert_eq!(epochs.last(), Some(&FinalityEpoch::new(limit + ROUNDS - 1)));
+}
+
+#[test]
 fn prepared_full_state_swaps_only_after_combined_commit() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();

@@ -17,15 +17,6 @@ pub use nullifiers::Nullifier;
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
 
-/// A random seed (rseed) used in the Orchard note creation.
-#[derive(Clone, Copy, Debug)]
-// At the moment this field is never read.
-//
-// TODO: consider replacing this code with the equivalent `orchard` crate code,
-//       which is better tested.
-#[allow(dead_code)]
-pub struct SeedRandomness(pub(crate) [u8; 32]);
-
 /// Used as input to PRF^nf as part of deriving the _nullifier_ of the _note_.
 ///
 /// When creating a new note from spending an old note, the new note's _rho_ is

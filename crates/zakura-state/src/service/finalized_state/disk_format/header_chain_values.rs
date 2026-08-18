@@ -1326,18 +1326,43 @@ impl FallibleDiskValue for FinalityRecord {
 
     fn encode(&self) -> Result<Vec<u8>, HeaderChainValueError> {
         let mut encoder = Encoder::default();
+        encoder.u8(2);
         put_frontier(&mut encoder, self.previous);
         put_frontier(&mut encoder, self.current);
         match self.source {
-            FinalitySource::FullState { evidence } => {
+            FinalitySource::FullState { provenance } => {
                 encoder.u8(0);
-                encoder.fixed(&evidence.digest());
+                encoder.fixed(&provenance.evidence.digest());
+                encoder.u64(provenance.state_version.get());
+                encoder.u8(match provenance.kind {
+                    zakura_header_chain::FullStateFinalityKind::CheckpointGrow => 0,
+                    zakura_header_chain::FullStateFinalityKind::Finalized => 1,
+                    zakura_header_chain::FullStateFinalityKind::Initialization => 2,
+                });
             }
             FinalitySource::HeadersOnlyDepth { selected_tip } => {
                 encoder.u8(1);
                 put_frontier(&mut encoder, selected_tip);
             }
             FinalitySource::MigratedHeadersOnly => encoder.u8(2),
+            FinalitySource::DiskMigration {
+                from_version,
+                network_policy_digest,
+                authentication,
+            } => {
+                encoder.u8(3);
+                encoder.u32(from_version.0);
+                encoder.fixed(&network_policy_digest);
+                match authentication {
+                    zakura_header_chain::DiskMigrationAuthentication::FullState => encoder.u8(0),
+                    zakura_header_chain::DiskMigrationAuthentication::HeadersOnlyDepth {
+                        selected_tip,
+                    } => {
+                        encoder.u8(1);
+                        put_frontier(&mut encoder, selected_tip);
+                    }
+                }
+            }
         }
         encoder.u64(self.epoch.get());
         Ok(encoder.0)
@@ -1345,16 +1370,52 @@ impl FallibleDiskValue for FinalityRecord {
 
     fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
         let mut decoder = Decoder::new(bytes);
+        if decoder.u8()? != 2 {
+            return Err(HeaderChainValueError::UnknownDiscriminant {
+                field: "finality_record_version",
+                value: bytes.first().copied().unwrap_or_default(),
+            });
+        }
         let previous = get_frontier(&mut decoder)?;
         let current = get_frontier(&mut decoder)?;
         let source = match decoder.u8()? {
             0 => FinalitySource::FullState {
-                evidence: EvidenceId::from_digest(decoder.array()?),
+                provenance: zakura_header_chain::FullStateFinalityProvenance {
+                    evidence: EvidenceId::from_digest(decoder.array()?),
+                    state_version: StateVersion::new(decoder.u64()?),
+                    kind: match decoder.u8()? {
+                        0 => zakura_header_chain::FullStateFinalityKind::CheckpointGrow,
+                        1 => zakura_header_chain::FullStateFinalityKind::Finalized,
+                        2 => zakura_header_chain::FullStateFinalityKind::Initialization,
+                        value => {
+                            return Err(HeaderChainValueError::UnknownDiscriminant {
+                                field: "full_state_finality_kind",
+                                value,
+                            })
+                        }
+                    },
+                },
             },
             1 => FinalitySource::HeadersOnlyDepth {
                 selected_tip: get_frontier(&mut decoder)?,
             },
             2 => FinalitySource::MigratedHeadersOnly,
+            3 => FinalitySource::DiskMigration {
+                from_version: HeaderChainDiskVersion(decoder.u32()?),
+                network_policy_digest: decoder.array()?,
+                authentication: match decoder.u8()? {
+                    0 => zakura_header_chain::DiskMigrationAuthentication::FullState,
+                    1 => zakura_header_chain::DiskMigrationAuthentication::HeadersOnlyDepth {
+                        selected_tip: get_frontier(&mut decoder)?,
+                    },
+                    value => {
+                        return Err(HeaderChainValueError::UnknownDiscriminant {
+                            field: "disk_migration_authentication",
+                            value,
+                        })
+                    }
+                },
+            },
             value => {
                 return Err(HeaderChainValueError::UnknownDiscriminant {
                     field: "finality_source",
@@ -1369,6 +1430,61 @@ impl FallibleDiskValue for FinalityRecord {
             current,
             source,
             epoch,
+        })
+    }
+}
+
+/// One immutable headers-only finality witness DAG node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderFinalityWitnessDisk {
+    /// Canonical witness header and height.
+    pub context: HeaderValidationContextDisk,
+    /// Retained finality records that select this node as their proof root.
+    pub root_references: u32,
+    /// Stored child nodes whose immutable parent edge reaches this node.
+    pub child_references: u32,
+}
+
+impl FallibleDiskValue for HeaderFinalityWitnessDisk {
+    type Error = HeaderChainValueError;
+
+    fn encode(&self) -> Result<Vec<u8>, HeaderChainValueError> {
+        if self.root_references == 0 && self.child_references == 0 {
+            return Err(HeaderChainValueError::Zero("finality_witness_references"));
+        }
+        let mut encoder = Encoder::default();
+        encoder.u8(2);
+        encoder.u32(self.root_references);
+        encoder.u32(self.child_references);
+        encoder.bounded(
+            "finality_witness_header",
+            &self.context.encode()?,
+            MAX_HEADER_BYTES + 8,
+        )?;
+        Ok(encoder.0)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
+        let mut decoder = Decoder::new(bytes);
+        if decoder.u8()? != 2 {
+            return Err(HeaderChainValueError::UnknownDiscriminant {
+                field: "finality_witness_version",
+                value: bytes.first().copied().unwrap_or_default(),
+            });
+        }
+        let root_references = decoder.u32()?;
+        let child_references = decoder.u32()?;
+        if root_references == 0 && child_references == 0 {
+            return Err(HeaderChainValueError::Zero("finality_witness_references"));
+        }
+        let context = HeaderValidationContextDisk::decode(
+            decoder.bounded("finality_witness_header", MAX_HEADER_BYTES + 8)?,
+        )?;
+        decoder.finish()?;
+        Ok(Self {
+            context,
+            root_references,
+            child_references,
         })
     }
 }
@@ -1551,6 +1667,13 @@ pub(crate) fn decode_v2_engine_metadata(
         HeaderChainDiskVersion(2),
         Some(network_policy_digest),
     )
+}
+
+/// Decode released version-three metadata, including its durable network-policy digest.
+pub(crate) fn decode_v3_engine_metadata(
+    bytes: &[u8],
+) -> Result<EngineMetadata, HeaderChainValueError> {
+    decode_engine_metadata(bytes, HeaderChainDiskVersion(3), None)
 }
 
 /// Decode metadata, reading the network policy digest unless the caller supplies a legacy one.
@@ -1773,6 +1896,24 @@ mod tests {
             HeaderValidationContextDisk::decode(&context.encode().expect("context encodes")),
             Ok(context.clone())
         );
+        let witness = HeaderFinalityWitnessDisk {
+            context: context.clone(),
+            root_references: 2,
+            child_references: 1,
+        };
+        assert_eq!(
+            HeaderFinalityWitnessDisk::decode(&witness.encode().expect("witness encodes")),
+            Ok(witness)
+        );
+        assert_eq!(
+            HeaderFinalityWitnessDisk {
+                context: context.clone(),
+                root_references: 0,
+                child_references: 0,
+            }
+            .encode(),
+            Err(HeaderChainValueError::Zero("finality_witness_references"))
+        );
         assert_eq!(
             [
                 digest(&bytes),
@@ -1911,6 +2052,36 @@ mod tests {
             FinalityRecord::decode(&finality.encode().expect("finality encodes")),
             Ok(finality)
         );
+        for migration in [
+            FinalityRecord {
+                previous: frontier(11, 2),
+                current: frontier(11, 2),
+                source: FinalitySource::DiskMigration {
+                    from_version: HeaderChainDiskVersion(1),
+                    network_policy_digest: [0x31; 32],
+                    authentication: zakura_header_chain::DiskMigrationAuthentication::FullState,
+                },
+                epoch: FinalityEpoch::new(5),
+            },
+            FinalityRecord {
+                previous: frontier(11, 2),
+                current: frontier(11, 2),
+                source: FinalitySource::DiskMigration {
+                    from_version: HeaderChainDiskVersion(3),
+                    network_policy_digest: [0x32; 32],
+                    authentication:
+                        zakura_header_chain::DiskMigrationAuthentication::HeadersOnlyDepth {
+                            selected_tip: frontier(1_011, 3),
+                        },
+                },
+                epoch: FinalityEpoch::new(6),
+            },
+        ] {
+            assert_eq!(
+                FinalityRecord::decode(&migration.encode().expect("migration record encodes")),
+                Ok(migration)
+            );
+        }
 
         let metadata = EngineMetadata {
             disk_format: HeaderChainDiskVersion::CURRENT,
@@ -1959,7 +2130,7 @@ mod tests {
             )),
         };
         let bytes = metadata.encode().expect("metadata encodes");
-        assert_eq!(&bytes[..6], &[0, 0, 0, 3, 1, 2]);
+        assert_eq!(&bytes[..6], &[0, 0, 0, 4, 1, 2]);
         assert_eq!(EngineMetadata::decode(&bytes), Ok(metadata.clone()));
         // Version one wrote no network policy digest, so its row is the current row with the
         // marker rolled back and that field removed.
@@ -2005,7 +2176,7 @@ mod tests {
         );
         // These digests pin the on-disk encodings. Regenerate a digest only together with a
         // deliberate encoding change; an unexplained change means a value's layout drifted.
-        // The metadata digest last moved when the header-chain disk version advanced to 3.
+        // The finality and metadata digests moved with the version-four migration provenance.
         assert_eq!(
             [
                 digest(&aux.encode().expect("aux encodes")),
@@ -2014,8 +2185,8 @@ mod tests {
             ],
             [
                 "c041fc819cc43fcd28dd3ba7fe296271ae0c7225c9bbcdf1dd38152dc313346a",
-                "b887bf384510dfb1a255221a8c97066617cb145eaf3e272ad70dc94cd17a3802",
-                "a57d37f3cadf2a983019c448ab61b130b1a2230af1e8206b6020c759d37984dc",
+                "37c583dc11b5fb0d06484330fe75a5b022249099fd00b3e4d06c267babcbff33",
+                "df7bc9d2128e1f9435005b3830b4871528449f1f2fd04e3aeb6ce68417e94146",
             ]
         );
     }
@@ -2092,13 +2263,13 @@ mod tests {
                 ..
             })
         ));
-        let mut metadata = vec![0, 0, 0, 4];
+        let mut metadata = vec![0, 0, 0, 5];
         metadata.resize(512, 0);
         assert_eq!(
             EngineMetadata::decode(&metadata),
-            Err(HeaderChainValueError::UnsupportedDiskFormat(4))
+            Err(HeaderChainValueError::UnsupportedDiskFormat(5))
         );
-        metadata[3] = 3;
+        metadata[3] = 4;
         metadata[4] = 9;
         assert!(matches!(
             EngineMetadata::decode(&metadata),

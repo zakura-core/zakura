@@ -85,6 +85,10 @@ pub use service::{
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
 
+#[cfg(feature = "internal-bench")]
+pub use service::finalized_state::{
+    benchmark_finality_witness, FinalityWitnessBenchmarkReport, FinalityWitnessBenchmarkSample,
+};
 pub use service::finalized_state::{
     derived_roots_in_display_order, inventory as vct_treestate_inventory,
     inventory_with_scans as vct_treestate_inventory_with_scans, measure_derivations, replay_inputs,

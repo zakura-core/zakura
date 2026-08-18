@@ -7,8 +7,9 @@ use super::{
 };
 use crate::graph::HeaderGraphView;
 use crate::{
-    AuxiliaryEffect, EngineMetadata, EngineMode, EngineSnapshot, FinalityEffect, FinalityRecord,
-    FinalitySource, Frontier, HeaderChainEngine, HeaderWorkEffect, TransitionContext,
+    AuxiliaryEffect, EngineMetadata, EngineMode, EngineSnapshot, FinalityAncestryHeader,
+    FinalityEffect, FinalityRecord, FinalitySource, Frontier, FullStateFinalityKind,
+    FullStateFinalityProvenance, HeaderChainEngine, HeaderWorkEffect, TransitionContext,
     TransitionEffect, TransitionEvent,
 };
 
@@ -54,6 +55,8 @@ pub(super) struct SettledTransition<'a> {
     pub(super) finality_append: Option<FinalityRecord>,
     /// Ancestry evidence for the projections the finality append trims away.
     pub(super) finality_lineage: FinalityLineage,
+    /// Canonical ancestry carried by a headers-only depth record.
+    pub(super) finality_ancestry: crate::FinalityWitnessProof,
     /// Retention outcome.
     pub(super) retention: RetentionPlan,
     /// Orthogonal transition effects.
@@ -120,7 +123,21 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
             )
             .into());
         }
-        finality = Some((new_finalized, FinalitySource::FullState { evidence }));
+        let kind = if checkpoint_finality_event(event) {
+            FullStateFinalityKind::CheckpointGrow
+        } else {
+            FullStateFinalityKind::Finalized
+        };
+        finality = Some((
+            new_finalized,
+            FinalitySource::FullState {
+                provenance: FullStateFinalityProvenance {
+                    evidence,
+                    state_version: snapshot_before_commit.state_version,
+                    kind,
+                },
+            },
+        ));
     } else if context.config.mode == EngineMode::HeadersOnly {
         let depth = context.config.limits.local_finality_depth.get();
         if selected_tip
@@ -165,6 +182,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
 
     let mut finality_append = None;
     let mut finality_lineage = FinalityLineage::default();
+    let mut finality_ancestry = crate::FinalityWitnessProof::default();
     if let Some((new_finalized, source)) = finality {
         if new_finalized != projected.graph().view_finalized_frontier() {
             let previous = projected.graph().view_finalized_frontier();
@@ -181,6 +199,10 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                     new_finalized,
                 )?,
             };
+            if let FinalitySource::HeadersOnlyDepth { selected_tip } = source {
+                finality_ancestry =
+                    headers_only_finality_ancestry(projected.graph(), previous, selected_tip)?;
+            }
             projected.advance_finality(new_finalized)?;
             finality_append = Some(FinalityRecord {
                 previous,
@@ -200,7 +222,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                         FinalityEffect::FullState
                     });
                 }
-                FinalitySource::MigratedHeadersOnly => {}
+                FinalitySource::MigratedHeadersOnly | FinalitySource::DiskMigration { .. } => {}
             }
         }
     }
@@ -252,11 +274,54 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
             selected,
             finality_append,
             finality_lineage,
+            finality_ancestry,
             retention,
             effect,
             metadata,
         },
     )))
+}
+
+fn headers_only_finality_ancestry(
+    graph: &impl HeaderGraphView,
+    previous: Frontier,
+    selected_tip: Frontier,
+) -> Result<crate::FinalityWitnessProof, TransitionFailure> {
+    let mut ancestry = Vec::new();
+    let mut cursor = selected_tip;
+    while cursor.height > previous.height {
+        let node = graph
+            .view_header_node(cursor.hash)
+            .ok_or(crate::GraphError::UnknownHeaderNode(cursor.hash))?;
+        if node.height != cursor.height || node.header.hash() != cursor.hash {
+            return Err(crate::GraphError::UnknownHeaderNode(cursor.hash).into());
+        }
+        ancestry.push(FinalityAncestryHeader {
+            header: node.header.clone(),
+            frontier: cursor,
+        });
+        cursor = Frontier::new(
+            zakura_chain::block::Height(cursor.height.0 - 1),
+            node.parent_hash,
+        );
+    }
+    if cursor != previous {
+        return Err(crate::GraphError::FinalizedFrontierNotDescendant {
+            current: previous.hash,
+            candidate: selected_tip.hash,
+        }
+        .into());
+    }
+    ancestry.reverse();
+    Ok(crate::FinalityWitnessProof::new(ancestry))
+}
+
+fn checkpoint_finality_event(event: &TransitionEvent) -> bool {
+    matches!(
+        event,
+        TransitionEvent::VerifiedChainChanged(event)
+            if event.cause == crate::VerifiedChangeCause::CheckpointFinalizedGrow
+    )
 }
 
 /// Return whether the new finalized frontier descends from the projection's tip.

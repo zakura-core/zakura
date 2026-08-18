@@ -482,11 +482,7 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
             .aux_deliveries(current.hash)
             .expect("the auxiliary row read succeeds");
         assert_eq!(stored_delivery.len(), 1, "{target:?}");
-        assert_eq!(
-            stored_delivery[0].is_authenticated(),
-            committed,
-            "{target:?}"
-        );
+        assert!(stored_delivery[0].is_unauthenticated(), "{target:?}");
         let current_node = observation
             .reopened
             .store
@@ -517,11 +513,7 @@ pub(super) fn crash_fixture_aux_authentication_reopens_complete_before_or_after(
             .aux_deliveries(current.hash)
             .expect("the reopened auxiliary row is readable");
         assert_eq!(reopened_delivery.len(), 1, "{target:?}");
-        assert_eq!(
-            reopened_delivery[0].is_authenticated(),
-            committed,
-            "{target:?}"
-        );
+        assert!(reopened_delivery[0].is_unauthenticated(), "{target:?}");
     }
 }
 
@@ -680,7 +672,7 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
             .aux_deliveries(anchor.hash)
             .expect("the rejected delivery rows are readable");
         assert_eq!(stored.len(), 2);
-        assert_eq!(stored[0].is_rejected(), committed);
+        assert!(stored[0].is_unauthenticated());
         assert!(stored[1].is_unauthenticated());
         assert_eq!(
             observation
@@ -707,7 +699,7 @@ pub(super) fn crash_fixture_two_delivery_aux_rejection_never_partially_commits()
             .aux_deliveries(anchor.hash)
             .expect("the reopened rejected delivery rows are readable");
         assert_eq!(reopened_deliveries.len(), 2);
-        assert_eq!(reopened_deliveries[0].is_rejected(), committed);
+        assert!(reopened_deliveries[0].is_unauthenticated());
         assert!(reopened_deliveries[1].is_unauthenticated());
     }
 }

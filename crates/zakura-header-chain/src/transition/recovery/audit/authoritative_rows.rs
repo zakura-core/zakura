@@ -122,13 +122,16 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
     let mut first = None;
     let mut last = None;
     let mut invalid_history = false;
+    let mut durable_parent_cache = HashMap::new();
+    let mut expected_witness_roots: HashMap<crate::Frontier, u32> = HashMap::new();
     let expected_history_count = store.finality_history_count()?;
     let mut history_count = 0_usize;
     let checkpoint = store.finality_history_checkpoint()?;
     if let Some(checkpoint) = checkpoint {
         if checkpoint.frontier.height > metadata.frontiers.finalized.height
-            || store.authenticated_canonical_hash(checkpoint.frontier.height)?
-                != Some(checkpoint.frontier.hash)
+            || checkpoint.frontier != config.bootstrap_anchor().frontier
+                && store.authenticated_canonical_hash(checkpoint.frontier.height)?
+                    != Some(checkpoint.frontier.hash)
         {
             violations.push(AuditViolation::Finality);
         }
@@ -139,7 +142,12 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
     store.visit_finality_history(RowLimit::new(65_536), &mut |record| {
         history_count = history_count.saturating_add(1);
         first.get_or_insert(record);
-        let source_matches = source_matches_mode(&record, metadata, config);
+        let source_matches = source_matches_mode(&record, metadata, config)
+            && (!matches!(record.source, FinalitySource::FullState { .. })
+                || store.authenticates_full_state_finality(
+                    record,
+                    config.bootstrap_anchor().frontier,
+                )?);
         if previous.is_some_and(|previous: FinalityRecord| {
             previous.current != record.previous
                 || previous.epoch.get().checked_add(1) != Some(record.epoch.get())
@@ -163,16 +171,24 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
             if let Some(selected_tip) =
                 record.headers_only_depth_witness(config.limits.local_finality_depth.get())
             {
-                // The canonical index authenticates settled witnesses. Retained rows authenticate
-                // an above-finalized witness against the current finalized frontier. Recovery
-                // authenticates the record's historical current frontier independently above.
-                let witness_is_authentic =
-                    if selected_tip.height <= metadata.frontiers.finalized.height {
-                        store.authenticated_canonical_hash(selected_tip.height)?
-                            == Some(selected_tip.hash)
-                    } else {
-                        witness_descends_to(&by_hash, selected_tip, metadata.frontiers.finalized)
-                    };
+                let root_references = expected_witness_roots.entry(selected_tip).or_default();
+                *root_references = root_references.saturating_add(1);
+                let canonical_witness = selected_tip.height <= metadata.frontiers.finalized.height
+                    && store.authenticated_canonical_hash(selected_tip.height)?
+                        == Some(selected_tip.hash);
+                let retained_witness = selected_tip.height > metadata.frontiers.finalized.height
+                    && witness_descends_to(&by_hash, selected_tip, metadata.frontiers.finalized);
+                let durable_witness = if canonical_witness || retained_witness {
+                    false
+                } else {
+                    historical_witness_descends_to(
+                        store,
+                        selected_tip,
+                        record.current,
+                        &mut durable_parent_cache,
+                    )?
+                };
+                let witness_is_authentic = canonical_witness || retained_witness || durable_witness;
                 if !witness_is_authentic {
                     invalid_history = true;
                 }
@@ -205,6 +221,49 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
     if !history_is_valid {
         violations.push(AuditViolation::Finality);
     }
+
+    let expected_witness_count = store.finality_witness_count()?;
+    let mut witness_rows = HashMap::with_capacity(expected_witness_count);
+    store.visit_finality_witnesses(RowLimit::new(132_072), &mut |entry, roots, children| {
+        let frontier = entry.frontier;
+        let parent = crate::Frontier::new(
+            block::Height(entry.frontier.height.0.saturating_sub(1)),
+            entry.header.previous_block_hash,
+        );
+        if witness_rows
+            .insert(frontier, (parent, roots, children))
+            .is_some()
+        {
+            invalid_history = true;
+        }
+        Ok(())
+    })?;
+    if witness_rows.len() != expected_witness_count || witness_rows.len() > 132_072 {
+        invalid_history = true;
+    }
+    let mut actual_children: HashMap<crate::Frontier, u32> = HashMap::new();
+    for (frontier, (parent, roots, _)) in &witness_rows {
+        if *roots != expected_witness_roots.get(frontier).copied().unwrap_or(0) {
+            invalid_history = true;
+        }
+        if witness_rows.contains_key(parent) {
+            let children = actual_children.entry(*parent).or_default();
+            *children = children.saturating_add(1);
+        }
+    }
+    if (expected_witness_count != 0
+        && expected_witness_roots
+            .keys()
+            .any(|root| !witness_rows.contains_key(root)))
+        || witness_rows.iter().any(|(frontier, (_, _, children))| {
+            *children != actual_children.get(frontier).copied().unwrap_or(0)
+        })
+    {
+        invalid_history = true;
+    }
+    if invalid_history && !violations.contains(&AuditViolation::Finality) {
+        violations.push(AuditViolation::Finality);
+    }
     let work_origin_is_authenticated = metadata.work_origin == config.bootstrap_anchor().frontier
         || store.authenticated_canonical_hash(metadata.work_origin.height)?
             == Some(metadata.work_origin.hash);
@@ -229,6 +288,34 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
         }
     }
     Ok(())
+}
+
+fn historical_witness_descends_to<S: StoreAuditSnapshot>(
+    store: &S,
+    witness: crate::Frontier,
+    frontier: crate::Frontier,
+    parent_cache: &mut HashMap<crate::Frontier, Option<crate::Frontier>>,
+) -> Result<bool, StoreError> {
+    let mut cursor = witness;
+    while cursor.height > frontier.height {
+        let parent = if let Some(parent) = parent_cache.get(&cursor) {
+            *parent
+        } else {
+            let parent = store.finality_witness_header(cursor)?.map(|row| {
+                crate::Frontier::new(
+                    block::Height(cursor.height.0 - 1),
+                    row.header.previous_block_hash,
+                )
+            });
+            parent_cache.insert(cursor, parent);
+            parent
+        };
+        let Some(parent) = parent else {
+            return Ok(false);
+        };
+        cursor = parent;
+    }
+    Ok(cursor == frontier)
 }
 
 /// Return true when the audited header rows prove `witness` descends to `frontier`.
@@ -265,18 +352,29 @@ fn finality_history_starts_validly(
     checkpoint: Option<crate::FinalityHistoryCheckpoint>,
     bootstrap_frontier: crate::Frontier,
 ) -> bool {
-    let follows_starting_frontier = match checkpoint {
+    match checkpoint {
         Some(checkpoint) => {
             checkpoint.epoch.get().checked_add(1) == Some(record.epoch.get())
                 && record.previous == checkpoint.frontier
         }
         None => {
-            record.epoch == crate::FinalityEpoch::new(0) && record.previous == bootstrap_frontier
+            (record.epoch == crate::FinalityEpoch::new(0)
+                && record.previous == bootstrap_frontier
+                && (record.current.height > record.previous.height
+                    || record.previous == record.current
+                        && matches!(
+                            record.source,
+                            FinalitySource::FullState {
+                                provenance: crate::FullStateFinalityProvenance {
+                                    kind: crate::FullStateFinalityKind::Initialization,
+                                    ..
+                                }
+                            } | FinalitySource::MigratedHeadersOnly
+                        )))
+                || (record.previous == record.current
+                    && matches!(record.source, FinalitySource::DiskMigration { .. }))
         }
-    };
-    let preserves_frontier_order =
-        record.current.height > record.previous.height || record.current == record.previous;
-    follows_starting_frontier && preserves_frontier_order
+    }
 }
 
 fn source_matches_mode(
@@ -302,6 +400,35 @@ fn source_matches_mode(
         (EngineMode::HeadersOnly, None, FinalitySource::HeadersOnlyDepth { .. }) => record
             .headers_only_depth_witness(config.limits.local_finality_depth.get())
             .is_some(),
+        (
+            EngineMode::Integrated,
+            _,
+            FinalitySource::DiskMigration {
+                from_version,
+                network_policy_digest,
+                authentication: crate::DiskMigrationAuthentication::FullState,
+            },
+        ) => {
+            (1..=3).contains(&from_version.0)
+                && network_policy_digest == metadata.network_policy_digest
+                && record.previous == record.current
+        }
+        (
+            EngineMode::HeadersOnly,
+            None,
+            FinalitySource::DiskMigration {
+                from_version,
+                network_policy_digest,
+                authentication: crate::DiskMigrationAuthentication::HeadersOnlyDepth { .. },
+            },
+        ) => {
+            (1..=3).contains(&from_version.0)
+                && network_policy_digest == metadata.network_policy_digest
+                && record.previous == record.current
+                && record
+                    .headers_only_depth_witness(config.limits.local_finality_depth.get())
+                    .is_some()
+        }
         _ => false,
     }
 }

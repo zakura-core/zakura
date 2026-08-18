@@ -1,6 +1,55 @@
 use super::*;
 
 #[test]
+fn state_adapter_rejects_tampered_full_state_finality_provenance() {
+    let (_, anchor, metadata) = fixture();
+    let snapshot = metadata.snapshot();
+    let current = Frontier::new(
+        anchor
+            .height
+            .next()
+            .expect("the anchor has a successor height"),
+        block::Hash([0x91; 32]),
+    );
+    let proof = vec![anchor.hash, current.hash];
+    let mut event = FullStateFinalized {
+        full_state_transition_id: zakura_header_chain::full_state_finality_evidence(
+            snapshot.state_version,
+            current,
+            &proof,
+        ),
+        new_finalized: current,
+        verified_path_proof: proof,
+    };
+    assert!(validate_full_state_finality_provenance(
+        &TransitionEvent::FullStateFinalized(event.clone()),
+        &snapshot,
+    )
+    .is_ok());
+
+    event.full_state_transition_id = EvidenceId::from_digest([0x92; 32]);
+    assert!(matches!(
+        validate_full_state_finality_provenance(
+            &TransitionEvent::FullStateFinalized(event),
+            &snapshot,
+        ),
+        Err(HeaderChainStoreError::Incoherent(
+            "full-state finality provenance does not match the authorized transition"
+        ))
+    ));
+}
+
+fn full_state_source(evidence: EvidenceId) -> FinalitySource {
+    FinalitySource::FullState {
+        provenance: zakura_header_chain::FullStateFinalityProvenance {
+            evidence,
+            state_version: StateVersion::new(1),
+            kind: zakura_header_chain::FullStateFinalityKind::Finalized,
+        },
+    }
+}
+
+#[test]
 fn authenticated_full_state_retention_uses_only_the_staged_fork_set() {
     let staged = [block::Hash([0x21; 32]), block::Hash([0x22; 32])];
     let stale_lease = [block::Hash([0x20; 32])];
@@ -40,25 +89,19 @@ fn finality_rebase_reads_only_the_generation_bounded_recent_suffix() {
     let record_two = FinalityRecord {
         previous: anchor_frontier,
         current: second,
-        source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x22; 32]),
-        },
+        source: full_state_source(EvidenceId::from_digest([0x22; 32])),
         epoch: FinalityEpoch::new(2),
     };
     let record_three = FinalityRecord {
         previous: second,
         current: third,
-        source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x32; 32]),
-        },
+        source: full_state_source(EvidenceId::from_digest([0x32; 32])),
         epoch: FinalityEpoch::new(3),
     };
     let record_four = FinalityRecord {
         previous: third,
         current: fourth,
-        source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x42; 32]),
-        },
+        source: full_state_source(EvidenceId::from_digest([0x42; 32])),
         epoch: FinalityEpoch::new(4),
     };
     metadata.finality_epoch = FinalityEpoch::new(4);
@@ -410,6 +453,7 @@ fn failed_batch_encoding_has_zero_durable_effects() {
         eligibility_changes: Vec::new(),
         aux_changes: Vec::new(),
         finality_append: None,
+        finality_ancestry: zakura_header_chain::FinalityWitnessProof::default(),
         metadata: next_metadata,
     };
 
@@ -442,13 +486,12 @@ fn finality_history_creates_an_authenticated_checkpoint_at_the_retained_bound() 
         .expect("the bounded history fixture initializes");
 
     let mut seed = DiskWriteBatch::new();
+    stage_full_state_canonical_hash(&store, &mut seed, anchor);
     for epoch in 1..u64::try_from(FINALITY_HISTORY_LIMIT).expect("the limit fits u64") {
         let record = FinalityRecord {
             previous: anchor,
             current: anchor,
-            source: FinalitySource::FullState {
-                evidence: EvidenceId::from_digest([0x90; 32]),
-            },
+            source: full_state_source(EvidenceId::from_digest([0x90; 32])),
             epoch: FinalityEpoch::new(epoch),
         };
         store
@@ -473,9 +516,7 @@ fn finality_history_creates_an_authenticated_checkpoint_at_the_retained_bound() 
     let appended = FinalityRecord {
         previous: anchor,
         current: anchor,
-        source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x91; 32]),
-        },
+        source: full_state_source(EvidenceId::from_digest([0x91; 32])),
         epoch: FinalityEpoch::new(
             u64::try_from(FINALITY_HISTORY_LIMIT).expect("the limit fits u64"),
         ),
@@ -492,6 +533,7 @@ fn finality_history_creates_an_authenticated_checkpoint_at_the_retained_bound() 
         eligibility_changes: Vec::new(),
         aux_changes: Vec::new(),
         finality_append: Some(appended),
+        finality_ancestry: zakura_header_chain::FinalityWitnessProof::default(),
         metadata: next_metadata,
     };
     let batch = store

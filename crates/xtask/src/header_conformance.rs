@@ -10,7 +10,7 @@ use std::{
 use serde::Deserialize;
 
 const SUPPORTED_SPEC_VERSION: &str = "1.4";
-const EXPECTED_RULE_COUNT: usize = 114;
+const EXPECTED_RULE_COUNT: usize = 116;
 const SPEC_PATH: &str = "docs/specs/fork-aware-header-chain-engine.md";
 const MANIFEST_PATH: &str = "crates/zakura-header-chain/conformance.toml";
 const MAX_DOCUMENT_BYTES: u64 = 2 * 1024 * 1024;

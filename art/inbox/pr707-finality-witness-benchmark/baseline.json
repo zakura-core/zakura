@@ -1,0 +1,1 @@
+{"commit":"59d90ed7d50751d58948480c0a2f5292dd89a422","advances":100,"depth":1000,"median_ns":3228021,"p95_ns":5147295,"p99_ns":5459351,"startup_ns":144518883,"ordinary_reads":1000,"ordinary_writes":1000,"ordinary_batch_bytes":232669,"final_history_rows":101}

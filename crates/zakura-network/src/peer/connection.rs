@@ -1235,21 +1235,6 @@ where
                 debug!(%msg, "got headers message unsolicited or from canceled request");
                 Unused
             }
-            // These messages should never be sent by peers.
-            Message::FilterLoad { .. } | Message::FilterAdd { .. } | Message::FilterClear => {
-                // # Security
-                //
-                // Zcash connections are not authenticated, so malicious nodes can send fake messages,
-                // with connected peers' IP addresses in the IP header.
-                //
-                // Since we can't verify their source, Zebra needs to ignore unexpected messages,
-                // because closing the connection could cause a denial of service or eclipse attack.
-                debug!(%msg, "got BIP111 message without advertising NODE_BLOOM");
-
-                // Ignored, but consumed because it is technically a protocol error.
-                Consumed
-            }
-
             // # Security
             //
             // Zebra crawls the network proactively, and that's the only way peers get into our

@@ -71,6 +71,9 @@ where
     /// A worker task handle shared between all service clones for the same worker.
     ///
     /// Only used when the worker is spawned on the tokio runtime.
+    ///
+    /// [`poll_ready`](Service::poll_ready) clears this handle when the worker finishes,
+    /// because a [`JoinHandle`] panics when it is polled after it completes.
     worker_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -270,41 +273,63 @@ where
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // Check to see if the worker has returned or panicked.
         //
-        // Correctness: Registers this task for wakeup when the worker finishes.
-        if let Some(worker_handle) = self
-            .worker_handle
-            .lock()
-            .expect("previous task panicked while holding the worker handle mutex")
-            .as_mut()
-        {
-            // # Correctness
-            //
-            // The inner service used with `Batch` MUST NOT return recoverable errors from its:
-            // - `poll_ready` method, or
-            // - `call` method when called with a `BatchControl::Flush` request.
-            //
-            // If the inner service returns an error in those cases, this `poll_ready` method will
-            // return an error the first time its called, and will panic the second time its called
-            // as it attempts to call `poll` on a `JoinHandle` that has already completed.
-            match Pin::new(worker_handle).poll(cx) {
-                Poll::Ready(Ok(())) => {
-                    let worker_error = self.get_worker_error();
-                    tracing::warn!(?worker_error, "batch worker finished unexpectedly");
-                    return Poll::Ready(Err(worker_error));
-                }
-                Poll::Ready(Err(task_cancelled)) if task_cancelled.is_cancelled() => {
-                    tracing::warn!(
-                        "batch task cancelled: {task_cancelled}\n\
-                         Is Zakura shutting down?"
-                    );
+        // # Correctness
+        //
+        // Polling the handle registers this task for wakeup when the worker finishes.
+        //
+        // A `JoinHandle` panics when it is polled after it completes, and every `Batch`
+        // clone polls this same shared handle. So take the finished handle out of the
+        // shared slot here. Later calls skip this check, and report the worker failure
+        // from the closed channel or the closed semaphore below.
+        let worker_result = {
+            let mut worker_handle = self
+                .worker_handle
+                .lock()
+                .expect("previous task panicked while holding the worker handle mutex");
 
-                    return Poll::Ready(Err(task_cancelled.into()));
+            let poll_result = worker_handle
+                .as_mut()
+                .map(|handle| Pin::new(handle).poll(cx));
+
+            match poll_result {
+                Some(Poll::Ready(worker_result)) => {
+                    *worker_handle = None;
+                    Some(worker_result)
                 }
-                Poll::Ready(Err(task_panic)) => {
-                    std::panic::resume_unwind(task_panic.into_panic());
-                }
-                Poll::Pending => {}
+                Some(Poll::Pending) | None => None,
             }
+        };
+
+        // # Correctness
+        //
+        // The worker handle mutex is unlocked here, so the `resume_unwind()` below does not
+        // poison it. A poisoned mutex would make every later `poll_ready()` call panic when
+        // it locks the mutex, instead of returning the worker error.
+        //
+        // The inner service used with `Batch` SHOULD NOT return recoverable errors from its:
+        // - `poll_ready` method, or
+        // - `call` method when called with a `BatchControl::Flush` request.
+        //
+        // If the inner service returns an error in those cases, the worker fails permanently
+        // and exits, and every later request on every `Batch` clone fails with that error.
+        match worker_result {
+            Some(Ok(())) => {
+                let worker_error = self.get_worker_error();
+                tracing::warn!(?worker_error, "batch worker finished unexpectedly");
+                return Poll::Ready(Err(worker_error));
+            }
+            Some(Err(task_cancelled)) if task_cancelled.is_cancelled() => {
+                tracing::warn!(
+                    "batch task cancelled: {task_cancelled}\n\
+                     Is Zakura shutting down?"
+                );
+
+                return Poll::Ready(Err(task_cancelled.into()));
+            }
+            Some(Err(task_panic)) => {
+                std::panic::resume_unwind(task_panic.into_panic());
+            }
+            None => {}
         }
 
         // Check if the worker has set an error and closed its channels.

@@ -832,6 +832,7 @@ impl<'a> GraphOverlay<'a> {
             .new_consensus_invalid_body_tombstones_by_hash
             .get(&hash)
             .or_else(|| self.base_graph.consensus_invalid_body_tombstones.get(&hash))
+            .cloned()
         {
             body_validation_state = BodyValidationState::ConsensusInvalid {
                 evidence: tombstone.evidence,

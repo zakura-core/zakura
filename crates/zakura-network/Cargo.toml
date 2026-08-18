@@ -34,9 +34,6 @@ progress-bar = [
     "howudoin",
 ]
 
-# Wait until `arti-client`'s dependency `x25519-dalek v1.2.0` is updated to a higher version. (#5492)
-# tor = ["arti-client", "tor-rtcompat"]
-
 # Testing features that activate extra dependencies
 header-fuzz = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl"]
@@ -83,11 +80,6 @@ tracing = { workspace = true }
 
 # prod feature progress-bar
 howudoin = { workspace = true, optional = true }
-
-# tor dependencies
-# Wait until `arti-client`'s dependency `x25519-dalek v1.2.0` is updated to a higher version. (#5492)
-# arti-client = { version = "0.0", optional = true }
-# tor-rtcompat  = { version = "0.0", optional = true }
 
 # proptest dependencies
 proptest = { workspace = true, optional = true }

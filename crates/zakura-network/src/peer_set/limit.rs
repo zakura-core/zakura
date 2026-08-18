@@ -60,6 +60,7 @@ impl fmt::Debug for ActiveConnectionCounter {
 
 impl ActiveConnectionCounter {
     /// Create and return a new active connection counter.
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub fn new_counter() -> Self {
         Self::new_counter_with(usize::MAX, "Active Connections")
     }

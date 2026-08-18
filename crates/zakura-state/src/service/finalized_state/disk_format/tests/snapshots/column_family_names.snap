@@ -18,6 +18,7 @@ expression: cf_names
   "header_eligibility_root_v1",
   "header_engine_meta_v1",
   "header_finality_history_v1",
+  "header_finality_witness_v1",
   "header_node_by_hash_v1",
   "header_selected_v1",
   "header_validation_context_v1",

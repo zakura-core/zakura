@@ -287,7 +287,9 @@ Eligibility reasons are a set, not a single overwritable flag. Permanent reasons
 
 **LC-FINAL-03 [LS] — Headers-only depth finality.** In headers-only mode, after each atomic insertion or reselection, if `header_best.height - finalized.height > 1000`, the same serialized transition MUST advance `finalized` to the unique ancestor of `header_best` at `header_best.height - 1000`, apply LC-FINAL-01, and only then publish. Thus no published headers-only state retains more than 1,000 selected descendants above its local finality pin. This rule is a bounded-resource local trust policy, not proof of body validity or a Zcash consensus rule, and the deployment MUST expose the disclosure in LC-SCOPE-08.
 
-**LC-FINAL-04 [LS] — Mode and finality provenance.** The durable store MUST record whether it is integrated or headers-only and the finality source for every advancement. Startup MUST fail closed on a mode mismatch or a finality record without the required full-state evidence or headers-only 1,000-deep ancestor proof. Switching modes requires an explicit migration that preserves existing pins; it MUST NOT roll finality back. A headers-only finality record is local trust, never body-verification evidence: a migration to integrated mode MUST import headers-only pins as header trust anchors only, MUST NOT count them as full-state finalization, and integrated mode MUST still body-verify the imported history from its own last full-state-verified anchor. If deterministic body validation refutes an imported headers-only pin, the node MUST fail closed with an explicit incident naming that pin; the only supported recovery is deleting the migrated header store and its finality records and resynchronizing, which discards a local trust artifact rather than rolling back integrated finality, because integrated finality was never granted to the imported pin.
+**LC-FINAL-04 [LS] — Mode and finality provenance.** The durable store MUST record whether it is integrated or headers-only and the finality source for every advancement. Startup MUST fail closed on a mode mismatch, a full-state record without its exact deterministic receipt identity, or a headers-only record without its 1,000-deep ancestor proof. Recovery MUST also authenticate each historical finalized frontier through canonical full state, retained nodes, or the bounded content-addressed witness DAG. The witness DAG MUST key every immutable header by exact height and hash. It MUST retain no more than 132,072 rows. It MUST preserve at least one finality record when enforcing that limit. Switching modes requires an explicit migration that preserves existing pins; it MUST NOT roll finality back. A headers-only finality record is local trust, never body-verification evidence: a migration to integrated mode MUST import headers-only pins as header trust anchors only, MUST NOT count them as full-state finalization, and integrated mode MUST still body-verify the imported history from its own last full-state-verified anchor. If deterministic body validation refutes an imported headers-only pin, the node MUST fail closed with an explicit incident naming that pin; the only supported recovery is deleting the migrated header store and its finality records and resynchronizing, which discards a local trust artifact rather than rolling back integrated finality, because integrated finality was never granted to the imported pin.
+
+**LC-FINAL-05 [LS] — Authenticated disk migration.** A released legacy store MUST publish current metadata only in the same atomic batch as its authenticated migration record, witness proof, and required row counts. Formats that lack a network-policy digest MUST migrate only under the fixed Mainnet policy. A format that stores the digest MUST match the configured digest exactly. Migration MUST authenticate integrated finality through canonical full state or authenticate headers-only finality through the complete active depth proof. Migration failure MUST leave every legacy row unchanged.
 
 <a id="lc-retain-01"></a>
 **LC-RETAIN-01 [LS] — Fork and node limits.** The engine MUST retain no more than `MAX_NON_FINALIZED_CHAIN_FORKS` eligible candidate tips—the same shared constant that caps full-state non-finalized chains, currently 10—and 65,536 non-finalized DAG nodes. The tip cap MUST be consumed from the same shared `zakura-chain`-level definition as full state, so the header engine can never retain an eligible fork that integrated full state cannot represent. It MUST protect every node on `header_best` and `verified_best` from resource eviction. If integrated-mode verification/finalization stalls and admitting another node would exceed the node cap after all permitted eviction, the engine MUST refuse or stage that admission, retain the current frontiers, and raise an explicit resource-stalled alarm; it MUST NOT evict either protected path or synthesize finality to make room.
@@ -393,6 +395,8 @@ VCT/tree-aux records are execution assistance. They can help reconstruct and aut
 **LC-AUX-01 [ZW] — Hash-scoped metadata provenance.** Body-size and tree-aux data MUST be keyed by header hash, not height alone, and MUST record supplying peer, request, branch, generation, and authentication status.
 
 **LC-AUX-02 [ZW] — Unauthenticated metadata isolation.** Unauthenticated auxiliary data MUST NOT affect header validity, cumulative work, or fork choice. Missing or invalid auxiliary data invalidates only that metadata delivery unless a separately verified header commitment or body supplies intrinsic consensus evidence.
+
+**LC-AUX-05 [LS] — Recovered outcome lifecycle.** A durable auxiliary row MUST recover as unauthenticated provenance because the row does not contain its observation proof. The current process MUST run the bounded authentication sweep before a committer uses that delivery. Peer-failure attribution MUST wait until the current process derives an authenticated, rejected, or disputed outcome.
 
 **LC-AUX-03 [ZW] — Branch-scoped VCT repair.** VCT repair MUST be scoped to a header generation and exact branch. Any branch/generation change MUST retire scheduled, outstanding, buffered, commit-waiting, and state-dispatched repair ownership before forward work for the new branch is scheduled; late results are discarded under LC-GEN-04.
 
@@ -688,7 +692,7 @@ Every normative rule is mapped here. A range such as `LC-SCOPE-01..03` includes 
 | LC-ANCHOR-01..03 | HV-06, DG-05 |
 | LC-ANCHOR-04..05 | HV-09, DG-04 |
 | LC-SELECT-01..04 | DG-01, HV-07, DF-01, AUD-01..03 |
-| LC-REORG-01, LC-FINAL-01..04 | DG-05, DG-07, AUD-13 |
+| LC-REORG-01, LC-FINAL-01..05 | DG-05, DG-07, AUD-13 |
 | LC-RETAIN-01..04 | DG-06, PW-05 |
 | LC-INT-01..08 | IN-01, IN-04, IN-06, AUD-04, AUD-10..15 |
 | LC-BODY-01..04 | IN-02, DF-02 |
@@ -696,7 +700,7 @@ Every normative rule is mapped here. A range such as `LC-SCOPE-01..03` includes 
 | LC-AVAIL-01..03 | IN-03 |
 | LC-WORK-01..03 | IN-05, IN-07, AUD-04..09, AUD-INCIDENT |
 | LC-ERR-01..02 | IN-02, IN-05, IN-07, PW-04 |
-| LC-AUX-01..04 | IN-06 |
+| LC-AUX-01..05 | IN-06 |
 | LC-WIRE-01 | PW-01 |
 | LC-WIRE-02 | PW-01, PW-05, HV-07 |
 | LC-WIRE-03..04 | PW-02, PW-05 |
@@ -760,15 +764,15 @@ Non-normative provenance: the production failure evidence that motivated the aud
 
 | Official source | Applicable behavior | Rules and tests |
 | --- | --- | --- |
-| Protocol section 3.3, The Block Chain | visible candidate tree, greatest total work, protocol first-seen equal-work guidance, settled-upgrade scope, optional rollback limit | LC-SCOPE-01..03, LC-SELECT-01..04, LC-ANCHOR-04, LC-FINAL-01..04; DG-01, DG-05, HV-07, DF-01..02 |
+| Protocol section 3.3, The Block Chain | visible candidate tree, greatest total work, protocol first-seen equal-work guidance, settled-upgrade scope, optional rollback limit | LC-SCOPE-01..03, LC-SELECT-01..04, LC-ANCHOR-04, LC-FINAL-01..05; DG-01, DG-05, HV-07, DF-01..02 |
 | Protocol section 3.12, Mainnet and Testnet | genesis and settled activation hashes in RPC display order | LC-ANCHOR-01, LC-ANCHOR-04..05; HV-06, HV-09 |
 | Protocol section 7.6, Block Header Encoding and Consensus | signed version, canonical solution encoding, MTP, exact Mainnet/Testnet maximum-time activation heights, and upgrade-specific commitment semantics | LC-VAL-02..08, LC-COMMIT-01; HV-02..05, HV-08, DF-01 |
 | Protocol sections 7.7.1–7.7.2, Equihash and difficulty filter | Equihash parameters/solution and little-endian header-hash target filter | LC-VAL-04..05; HV-03, DF-01 |
 | Protocol sections 7.7.3–7.7.4; ZIP 205; ZIP 208 | 17-block averaging, 11-block medians, compact-target conversion, Testnet minimum difficulty, and Blossom spacing | LC-VAL-06; HV-04, DF-01 |
 | Protocol section 7.7.5; ZIP 221 work metadata | exact per-block work and ecosystem 256-bit cumulative-work bound | LC-VAL-10, LC-WORKCALC-01, LC-SELECT-02, LC-WIRE-02; HV-07, PW-01, DF-01 |
 | ZIP 204 | bounded framing and contiguous-response discipline, adopted as design ancestry only; no `getheaders`/`headers` message path is implemented or served | LC-VAL-01, LC-SCOPE-09; HV-01, PW-08 |
-| ZIP 221 | Heartwood activation zero, history-tree commitment semantics, and one-header-later authentication boundary | LC-COMMIT-01, LC-AUX-01..04; HV-08, IN-06 |
-| ZIP 244 | NU5 `hashBlockCommitments` and `hashAuthDataRoot` semantics | LC-COMMIT-01, LC-AUX-01..04; HV-08, IN-02, IN-06 |
+| ZIP 221 | Heartwood activation zero, history-tree commitment semantics, and one-header-later authentication boundary | LC-COMMIT-01, LC-AUX-01..05; HV-08, IN-06 |
+| ZIP 244 | NU5 `hashBlockCommitments` and `hashAuthDataRoot` semantics | LC-COMMIT-01, LC-AUX-01..05; HV-08, IN-02, IN-06 |
 | ZIP 307 | wallet scanning and payment detection, explicitly outside this engine | LC-SCOPE-04; architecture dependency check |
 
 This table covers every part of the cited Zcash sources that this engine implements, strengthens, or explicitly excludes. Transaction, proof, script, note, nullifier, and state-transition rules remain full-state responsibilities under LC-SCOPE-03 and are not re-specified here.

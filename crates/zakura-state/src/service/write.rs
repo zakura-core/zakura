@@ -22,12 +22,13 @@ use zakura_chain::{
     parallel::tree::NoteCommitmentTrees,
 };
 use zakura_header_chain::{
-    ApplyResult, AuxEvidence, AuxObservationV1, AuxVerificationFactV1, BodyWorkAuthority,
-    CheckpointSet, Clock, EngineConfig, EngineConfigError, EngineMode, EngineSnapshot, EvidenceId,
-    Frontier, FullStateEvidenceAuthority, FullStateFinalized, OperatorInvalidate,
-    OperatorInvalidationId, OperatorReconsider, StateVersion, StoreError, SystemClock,
-    TransitionContext, TransitionEvent, TransitionRequest, TrustedAnchor, VerifiedBlockAccepted,
-    VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
+    checkpoint_finality_evidence, full_state_finality_evidence, ApplyResult, AuxEvidence,
+    AuxObservationV1, AuxVerificationFactV1, BodyWorkAuthority, CheckpointSet, Clock, EngineConfig,
+    EngineConfigError, EngineMode, EngineSnapshot, EvidenceId, Frontier,
+    FullStateEvidenceAuthority, FullStateFinalized, OperatorInvalidate, OperatorInvalidationId,
+    OperatorReconsider, StateVersion, StoreError, SystemClock, TransitionContext, TransitionEvent,
+    TransitionRequest, TrustedAnchor, VerifiedBlockAccepted, VerifiedChainChanged,
+    VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -509,7 +510,7 @@ impl HeaderChainWriter {
         let restored_path = verified_path(non_finalized_state);
         let restored_side_paths = verified_side_paths(non_finalized_state, &restored_path);
         let store = HeaderChainStore::new(finalized_state.db.header_chain_disk_db());
-        store.migrate_v1_to_current(&config)?;
+        store.migrate_to_current(&config)?;
         let runtime = if store.is_initialized()? {
             let persisted_finalized = store.snapshot()?.frontiers.finalized;
             let (full_state_height, full_state_hash) = finalized_state
@@ -599,12 +600,7 @@ impl HeaderChainWriter {
             hash: block.hash,
             header: block.block.header.clone(),
         }];
-        let evidence = full_state_evidence(
-            b"checkpoint-grow",
-            snapshot.state_version,
-            block.hash,
-            &path,
-        );
+        let evidence = checkpoint_finality_evidence(snapshot.state_version, accepted);
         let checkpoint_event = TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
             full_state_transition_id: evidence,
             old_tip: snapshot.frontiers.verified_best,
@@ -1134,15 +1130,8 @@ fn finalization_request(
         .take_while(|frontier| frontier.height <= new_finalized.height)
         .map(|frontier| frontier.hash)
         .collect::<Vec<_>>();
-    let mut hasher = Sha256::new();
-    hasher.update(b"zakura-full-state-finalized-v1");
-    hasher.update(snapshot.state_version.get().to_be_bytes());
-    hasher.update(new_finalized.height.0.to_be_bytes());
-    hasher.update(new_finalized.hash.0);
-    for hash in &verified_path_proof {
-        hasher.update(hash.0);
-    }
-    let evidence = EvidenceId::from_digest(hasher.finalize().into());
+    let evidence =
+        full_state_finality_evidence(snapshot.state_version, new_finalized, &verified_path_proof);
     Ok((
         evidence,
         TransitionRequest {

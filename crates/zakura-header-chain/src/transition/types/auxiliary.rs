@@ -292,11 +292,11 @@ pub struct TreeAuxRecordV1 {
 /// Prepared auxiliary input admitted alongside a header batch.
 pub type PreparedAuxDelivery = AuxDelivery;
 
-/// One auxiliary delivery row decoded from durable state before outcome validation.
+/// One auxiliary delivery row decoded from durable state before recovery validation.
 ///
 /// The row keeps raw outcome fields separate from [`AuxDelivery`] so decoding
-/// cannot construct an authoritative outcome. Recovery validates the complete
-/// row against the retained graph before it promotes the outcome.
+/// cannot construct an authoritative outcome. Recovery validates the encoding
+/// and discards the outcome because the row lacks its full-state observation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct UntrustedAuxDeliveryRow {
     delivery: AuxDelivery,

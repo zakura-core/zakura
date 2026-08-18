@@ -401,7 +401,11 @@ mod tests {
             previous: parent,
             current: frontier(37, 1),
             source: FinalitySource::FullState {
-                evidence: EvidenceId::from_digest([38; 32]),
+                provenance: crate::FullStateFinalityProvenance {
+                    evidence: EvidenceId::from_digest([38; 32]),
+                    state_version: StateVersion::new(1),
+                    kind: crate::FullStateFinalityKind::Finalized,
+                },
             },
             epoch: FinalityEpoch::new(1),
         };

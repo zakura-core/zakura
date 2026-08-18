@@ -171,24 +171,6 @@ impl Default for Nonce {
     }
 }
 
-/// A random value to add to the seed value in a hash function.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-pub struct Tweak(pub u32);
-
-impl Default for Tweak {
-    fn default() -> Self {
-        use rand::{thread_rng, Rng};
-        Self(thread_rng().gen())
-    }
-}
-
-/// A Bloom filter consisting of a bit field of arbitrary byte-aligned
-/// size, maximum size is 36,000 bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
-pub struct Filter(pub Vec<u8>);
-
 #[cfg(test)]
 mod test {
     use super::*;

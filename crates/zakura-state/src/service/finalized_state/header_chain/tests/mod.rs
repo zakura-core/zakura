@@ -92,6 +92,21 @@ fn open(config: &Config, network: &Network) -> DiskDb {
     .expect("the header-chain fixture database opens")
 }
 
+fn stage_full_state_canonical_hash(
+    store: &HeaderChainStore,
+    batch: &mut DiskWriteBatch,
+    frontier: Frontier,
+) {
+    store
+        .put_raw(
+            batch,
+            "hash_by_height",
+            frontier.height.as_bytes(),
+            frontier.hash.0,
+        )
+        .expect("the full-state canonical hash stages");
+}
+
 fn fixture() -> (EngineConfig, HeaderNode, EngineMetadata) {
     let network = Network::new_regtest(RegtestParameters::default());
     let block = regtest_genesis_block();

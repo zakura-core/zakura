@@ -1689,11 +1689,9 @@ impl Service<Request> for StateService {
             | Request::BestChainBlockHash(_)
             | Request::BlockLocator
             | Request::Transaction(_)
-            | Request::AnyChainTransaction(_)
             | Request::UnspentBestChainUtxo(_)
             | Request::Block(_)
             | Request::AnyChainBlock(_)
-            | Request::BlockAndSize(_)
             | Request::BlockHeader(_)
             | Request::FindBlockHashes { .. }
             | Request::FindBlockHeaders { .. }
@@ -2417,21 +2415,6 @@ impl Service<ReadRequest> for ReadStateService {
                 state.header_chain_snapshot_receiver.borrow().clone(),
             )),
 
-            ReadRequest::MissingBlockBodies { from, limit } => {
-                let verified_block_tip = read::tip_height(state.latest_best_chain(), &state.db);
-                let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
-                let best_header_tip = match header_chain_reader {
-                    Some(reader) => Some(reader.selected_tip()?.height),
-                    None => verified_block_tip,
-                };
-
-                Ok(ReadResponse::MissingBlockBodies(
-                    state
-                        .db
-                        .missing_block_bodies(verified_block_tip, best_header_tip, from, limit),
-                ))
-            }
-
             ReadRequest::MissingBlockBodyMetadata { from, limit } => {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
                 Ok(ReadResponse::MissingBlockBodyMetadata(
@@ -2444,10 +2427,6 @@ impl Service<ReadRequest> for ReadStateService {
                     )?,
                 ))
             }
-
-            ReadRequest::BlockSizeHints { from, count } => Ok(ReadResponse::BlockSizeHints(
-                read::block_size_hints(state.latest_best_chain(), &state.db, from, count),
-            )),
 
             ReadRequest::BlocksByHeightRange { start, count } => {
                 let best_chain = state.latest_best_chain();

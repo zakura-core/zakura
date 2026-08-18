@@ -1190,16 +1190,6 @@ pub enum Request {
     /// * [`Response::Transaction(None)`](Response::Transaction) otherwise.
     Transaction(transaction::Hash),
 
-    /// Looks up a transaction by hash in any chain.
-    ///
-    /// Returns
-    ///
-    /// * [`Response::AnyChainTransaction(Some(AnyTx))`](Response::AnyChainTransaction)
-    ///   if the transaction is in any chain;
-    /// * [`Response::AnyChainTransaction(None)`](Response::AnyChainTransaction)
-    ///   otherwise.
-    AnyChainTransaction(transaction::Hash),
-
     /// Looks up a UTXO identified by the given [`OutPoint`](transparent::OutPoint),
     /// returning `None` immediately if it is unknown.
     ///
@@ -1228,14 +1218,6 @@ pub enum Request {
     /// Note: the [`HashOrHeight`] can be constructed from a [`block::Hash`] or
     /// [`block::Height`] using `.into()`.
     AnyChainBlock(HashOrHeight),
-
-    //// Same as Block, but also returns serialized block size.
-    ////
-    /// Returns
-    ///
-    /// * [`ReadResponse::BlockAndSize(Some((Arc<Block>, usize)))`](ReadResponse::BlockAndSize) if the block is in the best chain;
-    /// * [`ReadResponse::BlockAndSize(None)`](ReadResponse::BlockAndSize) otherwise.
-    BlockAndSize(HashOrHeight),
 
     /// Looks up a block header by hash or height in the current best chain.
     ///
@@ -1387,11 +1369,9 @@ impl Request {
             Request::Tip => "tip",
             Request::BlockLocator => "block_locator",
             Request::Transaction(_) => "transaction",
-            Request::AnyChainTransaction(_) => "any_chain_transaction",
             Request::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
             Request::Block(_) => "block",
             Request::AnyChainBlock(_) => "any_chain_block",
-            Request::BlockAndSize(_) => "block_and_size",
             Request::BlockHeader(_) => "block_header",
             Request::FindBlockHashes { .. } => "find_block_hashes",
             Request::FindBlockHeaders { .. } => "find_block_headers",
@@ -1691,31 +1671,12 @@ pub enum ReadRequest {
     /// Returns the highest header held on disk.
     BestHeaderTip,
 
-    /// Returns header-known, body-missing heights in `(verified_block_tip, best_header_tip]`.
-    MissingBlockBodies {
-        /// First height to consider.
-        from: block::Height,
-        /// Maximum number of heights to return.
-        limit: u32,
-    },
-
     /// Returns header-known, body-missing block metadata for block-sync scheduling.
     MissingBlockBodyMetadata {
         /// First height to consider.
         from: block::Height,
         /// Maximum number of heights to scan.
         limit: u32,
-    },
-
-    /// Returns scheduling-only body-size hints for a contiguous height range.
-    ///
-    /// Confirmed committed block sizes win over untrusted advertised header
-    /// hints. Unknown advertised sizes are returned as `None`.
-    BlockSizeHints {
-        /// First height to read.
-        from: block::Height,
-        /// Maximum number of heights to return.
-        count: u32,
     },
 
     /// Returns contiguous committed blocks by height, in ascending order.
@@ -1950,9 +1911,7 @@ impl ReadRequest {
             ReadRequest::ReleaseRetainedHeaderPath { .. } => "release_retained_header_path",
             ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::BestHeaderTip => "best_header_tip",
-            ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
             ReadRequest::MissingBlockBodyMetadata { .. } => "missing_block_body_metadata",
-            ReadRequest::BlockSizeHints { .. } => "block_size_hints",
             ReadRequest::BlocksByHeightRange { .. } => "blocks_by_height_range",
             #[cfg(feature = "indexer")]
             ReadRequest::RawBlocksByHeightRange { .. } => "raw_blocks_by_height_range",
@@ -2009,10 +1968,8 @@ impl TryFrom<Request> for ReadRequest {
             Request::AnyChainBlock(hash_or_height) => {
                 Ok(ReadRequest::AnyChainBlock(hash_or_height))
             }
-            Request::BlockAndSize(hash_or_height) => Ok(ReadRequest::BlockAndSize(hash_or_height)),
             Request::BlockHeader(hash_or_height) => Ok(ReadRequest::BlockHeader(hash_or_height)),
             Request::Transaction(tx_hash) => Ok(ReadRequest::Transaction(tx_hash)),
-            Request::AnyChainTransaction(tx_hash) => Ok(ReadRequest::AnyChainTransaction(tx_hash)),
             Request::UnspentBestChainUtxo(outpoint) => {
                 Ok(ReadRequest::UnspentBestChainUtxo(outpoint))
             }

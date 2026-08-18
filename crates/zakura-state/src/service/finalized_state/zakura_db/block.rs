@@ -521,35 +521,6 @@ impl ZakuraDb {
         self.block(height.into())
     }
 
-    /// Returns header-known, body-missing heights.
-    pub fn missing_block_bodies(
-        &self,
-        verified_block_tip: Option<block::Height>,
-        best_header_tip: Option<block::Height>,
-        from: block::Height,
-        limit: u32,
-    ) -> Vec<block::Height> {
-        let Some(best_header_tip) = best_header_tip else {
-            return Vec::new();
-        };
-
-        let start = verified_block_tip
-            .and_then(|tip| tip.next().ok())
-            .map_or(from, |first_missing| first_missing.max(from));
-
-        if start > best_header_tip {
-            return Vec::new();
-        }
-
-        let count = limit.min(best_header_tip.0.saturating_sub(start.0).saturating_add(1));
-
-        (0..count)
-            .filter_map(|offset| start.0.checked_add(offset).map(block::Height))
-            .filter(|height| !self.contains_body_at_height(*height))
-            .take(limit as usize)
-            .collect()
-    }
-
     #[allow(clippy::unwrap_in_result)]
     pub(in crate::service) fn header_by_height(
         &self,

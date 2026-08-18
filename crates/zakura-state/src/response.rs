@@ -80,17 +80,11 @@ pub enum Response {
     /// Response to [`Request::Transaction`] with the specified transaction.
     Transaction(Option<Arc<Transaction>>),
 
-    /// Response to [`Request::AnyChainTransaction`] with the specified transaction.
-    AnyChainTransaction(Option<AnyTx>),
-
     /// Response to [`Request::UnspentBestChainUtxo`] with the UTXO
     UnspentBestChainUtxo(Option<transparent::Utxo>),
 
     /// Response to [`Request::Block`] with the specified block.
     Block(Option<Arc<Block>>),
-
-    /// Response to [`Request::BlockAndSize`] with the specified block and size.
-    BlockAndSize(Option<(Arc<Block>, usize)>),
 
     /// The response to a `BlockHeader` request.
     BlockHeader {
@@ -515,14 +509,8 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::BestHeaderTip`].
     BestHeaderTip(Option<(block::Height, block::Hash)>),
 
-    /// Response to [`ReadRequest::MissingBlockBodies`].
-    MissingBlockBodies(Vec<block::Height>),
-
     /// Response to [`ReadRequest::MissingBlockBodyMetadata`].
     MissingBlockBodyMetadata(BlockSyncBodyMetadata),
-
-    /// Response to [`ReadRequest::BlockSizeHints`].
-    BlockSizeHints(Vec<(block::Height, Option<u32>)>),
 
     /// Response to [`ReadRequest::BlocksByHeightRange`].
     Blocks(Vec<(block::Height, Arc<Block>, usize)>),
@@ -672,7 +660,9 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::BlockHash(hash) => Ok(Response::BlockHash(hash)),
 
             ReadResponse::Block(block) => Ok(Response::Block(block)),
-            ReadResponse::BlockAndSize(block) => Ok(Response::BlockAndSize(block)),
+            ReadResponse::BlockAndSize(_) => {
+                Err("there is no corresponding Response for this ReadResponse")
+            }
             ReadResponse::BlockHeader {
                 header,
                 hash,
@@ -687,7 +677,9 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::Transaction(tx_info) => {
                 Ok(Response::Transaction(tx_info.map(|tx_info| tx_info.tx)))
             }
-            ReadResponse::AnyChainTransaction(tx) => Ok(Response::AnyChainTransaction(tx)),
+            ReadResponse::AnyChainTransaction(_) => {
+                Err("there is no corresponding Response for this ReadResponse")
+            }
             ReadResponse::UnspentBestChainUtxo(utxo) => Ok(Response::UnspentBestChainUtxo(utxo)),
 
 
@@ -725,9 +717,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::RetainedHeaderPathPage(_)
             | ReadResponse::RetainedHeaderPathReleased(_)
             | ReadResponse::BestHeaderTip(_)
-            | ReadResponse::MissingBlockBodies(_)
             | ReadResponse::MissingBlockBodyMetadata(_)
-            | ReadResponse::BlockSizeHints(_)
             | ReadResponse::Blocks(_)
             | ReadResponse::NonFinalizedBlocksListener(_)
             | ReadResponse::IsTransparentOutputSpent(_) => {

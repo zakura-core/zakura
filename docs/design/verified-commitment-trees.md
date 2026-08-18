@@ -353,8 +353,8 @@ places (`crates/zakura-network/src/zakura/header_sync/wire.rs`):
 Body-size hints are scheduling data, not consensus data. `CommitHeaderRange` persists non-zero
 advertised hints for header-ahead heights, preserving the maximum non-zero hint for the same
 header and clearing hints when a competing higher-work header chain replaces the range.
-`ReadRequest::BlockSizeHints` returns the durable committed block size when available, otherwise
-the advertised hint, otherwise `None`. Block sync uses those hints to pack contiguous
+`ReadRequest::MissingBlockBodyMetadata` returns the durable committed block size when available,
+otherwise the advertised hint, otherwise `None`. Block sync uses those hints to pack contiguous
 `GetBlocks` ranges by estimated bytes and to set receive-path size-mismatch tolerance; the
 downloaded body still has to hash to the committed header, and the actual serialized size is
 settled when the body is received.

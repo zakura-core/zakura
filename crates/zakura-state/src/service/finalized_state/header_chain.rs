@@ -19,14 +19,14 @@ use zakura_header_chain::{
     BodyWorkAuthority, BodyWorkOwner, ChangeSet, CommittedHeaderChainView, CommittedStallReceipt,
     CounterExhausted, EligibilityReason, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
     EvidenceId, FinalityHistoryCheckpoint, FinalityRecord, FinalitySource, Frontier,
-    FullStateEvidenceAuthority, FullStateFinalityProvenance, FullStateFinalized, HeaderChainEngine,
-    HeaderInsertionFacts, HeaderLocator, HeaderNode, HeaderSyncWorkOwner, HeaderValidationFacts,
-    HeaderWorkAuthority, MemHeaderStore, NoChangeReceipt, RecoveryFailure, RecoveryPlan,
-    RecoveryRepair, RowLimit, SourceId, StaleReceipt, StateVersion, StoreAuditRead,
-    StoreAuditSnapshot, StoreCollection, StoreError, SystemClock, TransitionContext,
-    TransitionEffect, TransitionEvent, TransitionFailure, TransitionInput, TransitionRequest,
-    UntrustedAuxDeliveryRow, ValidationContextRecord, ValidationLease, VerifiedChainChanged,
-    VerifiedChangeCause, VerifiedHeaderRef,
+    FullStateEvidenceAuthority, FullStateFinalityProvenance, FullStateFinalized,
+    HeaderChainDiskVersion, HeaderChainEngine, HeaderInsertionFacts, HeaderLocator, HeaderNode,
+    HeaderSyncWorkOwner, HeaderValidationFacts, HeaderWorkAuthority, MemHeaderStore,
+    NoChangeReceipt, RecoveryFailure, RecoveryPlan, RecoveryRepair, RowLimit, SourceId,
+    StaleReceipt, StateVersion, StoreAuditRead, StoreAuditSnapshot, StoreCollection, StoreError,
+    SystemClock, TransitionContext, TransitionEffect, TransitionEvent, TransitionFailure,
+    TransitionInput, TransitionRequest, UntrustedAuxDeliveryRow, ValidationContextRecord,
+    ValidationLease, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -3267,10 +3267,11 @@ impl HeaderChainStore {
         match self.metadata_row() {
             Ok(metadata) => Ok(metadata.is_some()),
             // Service construction classifies the durable runtime before the block writer
-            // migrates released version-one and version-two rows to the current format.
+            // migrates released legacy rows to the current format. Any older marker is a
+            // supported store; a newer marker stays fail-closed until a migrator exists.
             Err(HeaderChainStoreError::Codec(HeaderChainValueError::UnsupportedDiskFormat(
-                1 | 2,
-            ))) => Ok(true),
+                version,
+            ))) if version < HeaderChainDiskVersion::CURRENT.0 => Ok(true),
             Err(error) => Err(error),
         }
     }

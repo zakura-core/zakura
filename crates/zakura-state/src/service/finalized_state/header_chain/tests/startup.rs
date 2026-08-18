@@ -1156,6 +1156,9 @@ fn version_three_integrated_migration_authenticates_the_full_state_frontier() {
     store.db.write(batch).expect("the legacy fixture commits");
 
     assert!(store
+        .is_initialized()
+        .expect("released version-three metadata identifies an initialized store"));
+    assert!(store
         .migrate_to_current(&engine_config)
         .expect("the version-three store migrates"));
     let migrated = store.metadata().expect("the migrated metadata is readable");
@@ -1183,6 +1186,31 @@ fn version_three_integrated_migration_authenticates_the_full_state_frontier() {
         .startup(&engine_config)
         .expect("startup audits the migrated store");
     assert!(report.publication_allowed);
+}
+
+#[test]
+fn a_newer_header_chain_disk_format_does_not_classify_as_initialized() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = mainnet_fixture();
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db);
+    store
+        .initialize(metadata.clone(), anchor)
+        .expect("the current fixture initializes");
+    let mut newer = metadata.encode().expect("the metadata fixture encodes");
+    newer[..4].copy_from_slice(&(HeaderChainDiskVersion::CURRENT.0 + 1).to_be_bytes());
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(&mut batch, HEADER_ENGINE_META, METADATA_KEY, &newer)
+        .expect("the newer metadata stages");
+    store.db.write(batch).expect("the newer fixture commits");
+
+    assert!(matches!(
+        store.is_initialized(),
+        Err(HeaderChainStoreError::Codec(
+            HeaderChainValueError::UnsupportedDiskFormat(version)
+        )) if version == HeaderChainDiskVersion::CURRENT.0 + 1
+    ));
 }
 
 #[test]
@@ -1327,6 +1355,9 @@ fn every_legacy_headers_only_version_migrates_with_a_complete_depth_proof() {
         let migrated_store = runtime.store.clone();
         drop(runtime);
 
+        assert!(migrated_store
+            .is_initialized()
+            .expect("released legacy metadata identifies an initialized store"));
         assert!(migrated_store
             .migrate_to_current(&engine_config)
             .expect("the headers-only store migrates"));

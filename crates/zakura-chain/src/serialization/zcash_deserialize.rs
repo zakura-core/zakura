@@ -112,7 +112,8 @@ pub fn zcash_deserialize_external_count<R: io::Read, T: ZcashDeserialize + Trust
 
 /// `zcash_deserialize_external_count`, specialised for raw bytes.
 ///
-/// This allows us to optimize the inner loop into a single call to `read_exact()`.
+/// This reads in chunks, so the inner loop is a small number of `read_exact()`
+/// calls rather than one call per byte.
 ///
 /// This function has a `zcash_` prefix to alert the reader that the
 /// serialization in use is consensus-critical serialization, rather than
@@ -126,8 +127,25 @@ pub fn zcash_deserialize_bytes_external_count<R: io::Read>(
             "Byte vector longer than MAX_U8_ALLOCATION",
         ));
     }
-    let mut vec = vec![0u8; external_count];
-    reader.read_exact(&mut vec)?;
+
+    // Grow the buffer as the bytes arrive, rather than reserving `external_count`
+    // up front. A peer can declare a length near `MAX_U8_ALLOCATION` in a message
+    // that ends after a few hundred bytes, so an upfront reservation lets a small
+    // message force a multi-megabyte allocation. This bounds the allocation to the
+    // bytes the peer actually sends, plus one chunk. Fixes the byte-vector case of
+    // GHSA-xr93-pcq3-pxf8.
+    let mut vec = Vec::with_capacity(external_count.min(MAX_INITIAL_ALLOCATION));
+
+    while vec.len() < external_count {
+        let chunk_end = (vec.len() + MAX_INITIAL_ALLOCATION).min(external_count);
+        let chunk_start = vec.len();
+
+        vec.resize(chunk_end, 0);
+        // Returns `UnexpectedEof` if the reader runs out before `external_count`,
+        // which is the same error the single `read_exact()` call used to return.
+        reader.read_exact(&mut vec[chunk_start..])?;
+    }
+
     Ok(vec)
 }
 

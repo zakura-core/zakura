@@ -1,152 +1,60 @@
-//! Prunes duplicate Sapling and Orchard note commitment trees from database
+//! Validates that duplicate Sapling and Orchard note commitment trees are
+//! absent from the database.
 
 use crossbeam_channel::{Receiver, TryRecvError};
 
-use semver::Version;
-use zakura_chain::block::Height;
+use crate::service::finalized_state::ZakuraDb;
 
-use crate::service::finalized_state::{DiskWriteBatch, ZakuraDb};
+use super::{CancelFormatChange, FormatChangeError};
 
-use super::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError};
+/// Checks that note commitment trees use the deduplicated current format.
+pub(super) fn detailed_check(
+    db: &ZakuraDb,
+    cancel_receiver: &Receiver<CancelFormatChange>,
+) -> Result<Result<(), String>, FormatChangeError> {
+    let mut result = Ok(());
 
-/// Implements [`DiskFormatUpgrade`] for pruning duplicate Sapling and Orchard note commitment trees from database
-pub struct PruneTrees;
-
-impl DiskFormatUpgrade for PruneTrees {
-    fn version(&self) -> Version {
-        Version::new(25, 1, 1)
-    }
-
-    fn description(&self) -> &'static str {
-        "deduplicate trees upgrade"
-    }
-
-    #[allow(clippy::unwrap_in_result)]
-    fn run(
-        &self,
-        initial_finalized_tip_height: Option<Height>,
-        db: &ZakuraDb,
-        cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<(), FormatChangeError> {
-        let Some(initial_finalized_tip_height) = initial_finalized_tip_height else {
-            return Ok(());
-        };
-        // Prune duplicate Sapling note commitment trees.
-
-        // The last tree we checked.
-        let mut last_tree = db
-            .sapling_tree_by_height(&Height(0))
-            .expect("Checked above that the genesis block is in the database.");
-
-        // Run through all the possible duplicate trees in the finalized chain.
-        // The block after genesis is the first possible duplicate.
-        for (height, tree) in
-            db.sapling_tree_by_height_range(Height(1)..=initial_finalized_tip_height)
-        {
-            // Return early if there is a cancel signal.
-            if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-                return Err(CancelFormatChange.into());
-            }
-
-            // Delete any duplicate trees.
-            if tree == last_tree {
-                let mut batch = DiskWriteBatch::new();
-                batch.delete_sapling_tree(db, &height);
-                db.write_batch(batch)
-                    .expect("Deleting Sapling note commitment trees should always succeed.");
-            }
-
-            // Compare against the last tree to find unique trees.
-            last_tree = tree;
+    let mut previous_height = None;
+    let mut previous_tree = None;
+    for (height, tree) in db.sapling_tree_by_height_range(..) {
+        if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
+            return Err(CancelFormatChange.into());
         }
 
-        // Prune duplicate Orchard note commitment trees.
-
-        // The last tree we checked.
-        let mut last_tree = db
-            .orchard_tree_by_height(&Height(0))
-            .expect("Checked above that the genesis block is in the database.");
-
-        // Run through all the possible duplicate trees in the finalized chain.
-        // The block after genesis is the first possible duplicate.
-        for (height, tree) in
-            db.orchard_tree_by_height_range(Height(1)..=initial_finalized_tip_height)
-        {
-            // Return early if there is a cancel signal.
-            if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-                return Err(CancelFormatChange.into());
-            }
-
-            // Delete any duplicate trees.
-            if tree == last_tree {
-                let mut batch = DiskWriteBatch::new();
-                batch.delete_orchard_tree(db, &height);
-                db.write_batch(batch)
-                    .expect("Deleting Orchard note commitment trees should always succeed.");
-            }
-
-            // Compare against the last tree to find unique trees.
-            last_tree = tree;
+        if previous_tree == Some(tree.clone()) {
+            result = Err(format!(
+                "found duplicate sapling trees: height: {height:?}, previous height: {:?}, \
+                 tree root: {:?}",
+                previous_height.expect("a duplicate tree has a previous height"),
+                tree.root()
+            ));
+            error!(?result);
         }
 
-        Ok(())
+        previous_height = Some(height);
+        previous_tree = Some(tree);
     }
 
-    /// Check that note commitment trees were correctly de-duplicated.
-    #[allow(clippy::unwrap_in_result)]
-    fn validate(
-        &self,
-        db: &ZakuraDb,
-        cancel_receiver: &Receiver<CancelFormatChange>,
-    ) -> Result<Result<(), String>, FormatChangeError> {
-        // Runtime test: make sure we removed all duplicates.
-        // We always run this test, even if the state has supposedly been upgraded.
-        let mut result = Ok(());
-
-        let mut prev_height = None;
-        let mut prev_tree = None;
-        for (height, tree) in db.sapling_tree_by_height_range(..) {
-            // Return early if the format check is cancelled.
-            if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-                return Err(CancelFormatChange.into());
-            }
-
-            if prev_tree == Some(tree.clone()) {
-                result = Err(format!(
-                    "found duplicate sapling trees after running de-duplicate tree upgrade:\
-                     height: {height:?}, previous height: {:?}, tree root: {:?}",
-                    prev_height.unwrap(),
-                    tree.root()
-                ));
-                error!(?result);
-            }
-
-            prev_height = Some(height);
-            prev_tree = Some(tree);
+    let mut previous_height = None;
+    let mut previous_tree = None;
+    for (height, tree) in db.orchard_tree_by_height_range(..) {
+        if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
+            return Err(CancelFormatChange.into());
         }
 
-        let mut prev_height = None;
-        let mut prev_tree = None;
-        for (height, tree) in db.orchard_tree_by_height_range(..) {
-            // Return early if the format check is cancelled.
-            if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-                return Err(CancelFormatChange.into());
-            }
-
-            if prev_tree == Some(tree.clone()) {
-                result = Err(format!(
-                    "found duplicate orchard trees after running de-duplicate tree upgrade:\
-                     height: {height:?}, previous height: {:?}, tree root: {:?}",
-                    prev_height.unwrap(),
-                    tree.root()
-                ));
-                error!(?result);
-            }
-
-            prev_height = Some(height);
-            prev_tree = Some(tree);
+        if previous_tree == Some(tree.clone()) {
+            result = Err(format!(
+                "found duplicate orchard trees: height: {height:?}, previous height: {:?}, \
+                 tree root: {:?}",
+                previous_height.expect("a duplicate tree has a previous height"),
+                tree.root()
+            ));
+            error!(?result);
         }
 
-        Ok(result)
+        previous_height = Some(height);
+        previous_tree = Some(tree);
     }
+
+    Ok(result)
 }

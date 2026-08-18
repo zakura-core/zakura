@@ -1,66 +1,11 @@
-//! Updating the genesis note commitment trees to cache their roots.
-//!
-//! This reduces CPU usage when the genesis tree roots are used for transaction validation.
-//! Since mempool transactions are cheap to create, this is a potential remote denial of service.
+//! Validates cached roots in genesis and historical note commitment trees.
 
 use crossbeam_channel::{Receiver, TryRecvError};
 use zakura_chain::{block::Height, sprout};
 
-use crate::service::finalized_state::{disk_db::DiskWriteBatch, ZakuraDb};
+use crate::service::finalized_state::ZakuraDb;
 
 use super::CancelFormatChange;
-
-/// Runs disk format upgrade for changing the sprout and history tree key types.
-///
-/// Returns `Ok` if the upgrade completed, and `Err` if it was cancelled.
-///
-/// # Panics
-///
-/// If the state is empty.
-#[allow(clippy::unwrap_in_result)]
-#[instrument(skip(upgrade_db, cancel_receiver))]
-pub fn run(
-    _initial_finalized_tip_height: Height,
-    upgrade_db: &ZakuraDb,
-    cancel_receiver: &Receiver<CancelFormatChange>,
-) -> Result<(), CancelFormatChange> {
-    let sprout_genesis_tree = sprout::tree::NoteCommitmentTree::default();
-    let sprout_tip_tree = upgrade_db
-        .sprout_tree_for_tip()
-        .expect("Sprout tip tree exists because this upgrade requires a non-empty valid database");
-
-    let sapling_genesis_tree = upgrade_db
-        .sapling_tree_by_height(&Height(0))
-        .expect("caller has checked for genesis block");
-    let orchard_genesis_tree = upgrade_db
-        .orchard_tree_by_height(&Height(0))
-        .expect("caller has checked for genesis block");
-
-    // Writing the trees back to the database automatically caches their roots.
-    let mut batch = DiskWriteBatch::new();
-
-    // Fix the cached root of the Sprout genesis tree in its anchors column family.
-
-    // It's ok to write the genesis tree to the tip tree index, because it's overwritten by
-    // the actual tip before the batch is written to the database.
-    batch.update_sprout_tree(upgrade_db, &sprout_genesis_tree);
-    // This method makes sure the sprout tip tree has a cached root, even if it's the genesis tree.
-    batch.update_sprout_tree(upgrade_db, &sprout_tip_tree);
-
-    batch.create_sapling_tree(upgrade_db, &Height(0), &sapling_genesis_tree);
-    batch.create_orchard_tree(upgrade_db, &Height(0), &orchard_genesis_tree);
-
-    // Return before we write if the upgrade is cancelled.
-    if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-        return Err(CancelFormatChange);
-    }
-
-    upgrade_db
-        .write_batch(batch)
-        .expect("updating tree cached roots should always succeed");
-
-    Ok(())
-}
 
 /// Quickly check that the genesis trees and sprout tip tree have cached roots.
 ///
@@ -70,7 +15,7 @@ pub fn run(
 /// # Panics
 ///
 /// If the state is empty.
-pub fn quick_check(db: &ZakuraDb) -> Result<(), String> {
+pub(super) fn quick_check(db: &ZakuraDb) -> Result<(), String> {
     // An empty database doesn't have any trees, so its format is trivially correct.
     if db.is_empty() {
         return Ok(());
@@ -139,7 +84,7 @@ pub fn quick_check(db: &ZakuraDb) -> Result<(), String> {
 /// # Panics
 ///
 /// If the state is empty.
-pub fn detailed_check(
+pub(super) fn detailed_check(
     db: &ZakuraDb,
     cancel_receiver: &Receiver<CancelFormatChange>,
 ) -> Result<Result<(), String>, CancelFormatChange> {

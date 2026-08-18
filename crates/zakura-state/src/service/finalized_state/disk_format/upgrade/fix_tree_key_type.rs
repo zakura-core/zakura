@@ -1,76 +1,20 @@
-//! Updating the sprout and history tree key type from `Height` to the empty key `()`.
-//!
-//! This avoids a potential concurrency bug, and a known database performance issue.
+//! Validates the current Sprout and history tree key formats.
 
 use std::sync::Arc;
 
-use crossbeam_channel::{Receiver, TryRecvError};
-use zakura_chain::{block::Height, history_tree::HistoryTree, sprout};
+use crossbeam_channel::Receiver;
+use zakura_chain::{history_tree::HistoryTree, sprout};
 
-use crate::service::finalized_state::{
-    disk_db::DiskWriteBatch, disk_format::MAX_ON_DISK_HEIGHT, ZakuraDb,
-};
+use crate::service::finalized_state::ZakuraDb;
 
 use super::CancelFormatChange;
-
-/// Runs disk format upgrade for changing the sprout and history tree key types.
-///
-/// Returns `Ok` if the upgrade completed, and `Err` if it was cancelled.
-#[allow(clippy::unwrap_in_result)]
-#[instrument(skip(upgrade_db, cancel_receiver))]
-pub fn run(
-    _initial_finalized_tip_height: Height,
-    upgrade_db: &ZakuraDb,
-    cancel_receiver: &Receiver<CancelFormatChange>,
-) -> Result<(), CancelFormatChange> {
-    let sprout_tip_tree = upgrade_db
-        .sprout_tree_for_tip()
-        .expect("Sprout tip tree exists because this upgrade requires a non-empty valid database");
-    let history_tip_tree = upgrade_db.history_tree();
-
-    // Writing the trees back to the database automatically updates their format.
-    let mut batch = DiskWriteBatch::new();
-
-    // Update the sprout tip key format in the database.
-    batch.update_sprout_tree(upgrade_db, &sprout_tip_tree);
-    batch.update_history_tree(upgrade_db, &history_tip_tree);
-
-    // Return before we write if the upgrade is cancelled.
-    if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-        return Err(CancelFormatChange);
-    }
-
-    upgrade_db
-        .write_batch(batch)
-        .expect("updating tree key formats should always succeed");
-
-    // The deletes below can be slow due to tombstones for previously deleted keys,
-    // so we do it in a separate batch to avoid data races with syncing (#7961).
-    let mut batch = DiskWriteBatch::new();
-
-    // Delete the previous `Height` tip key format, which is now a duplicate.
-    // This doesn't delete the new `()` key format, because it serializes to an empty array.
-    batch.delete_range_sprout_tree(upgrade_db, &Height(0), &MAX_ON_DISK_HEIGHT);
-    batch.delete_range_history_tree(upgrade_db, &Height(0), &MAX_ON_DISK_HEIGHT);
-
-    // Return before we write if the upgrade is cancelled.
-    if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
-        return Err(CancelFormatChange);
-    }
-
-    upgrade_db
-        .write_batch(batch)
-        .expect("cleaning up old tree key formats should always succeed");
-
-    Ok(())
-}
 
 /// Quickly check that the sprout and history tip trees have updated key formats.
 ///
 /// # Panics
 ///
 /// If the state is empty.
-pub fn quick_check(db: &ZakuraDb) -> Result<(), String> {
+pub(super) fn quick_check(db: &ZakuraDb) -> Result<(), String> {
     // Check the entire format before returning any errors.
     let mut result = Ok(());
 
@@ -145,7 +89,7 @@ pub fn quick_check(db: &ZakuraDb) -> Result<(), String> {
 /// # Panics
 ///
 /// If the state is empty.
-pub fn detailed_check(
+pub(super) fn detailed_check(
     db: &ZakuraDb,
     _cancel_receiver: &Receiver<CancelFormatChange>,
 ) -> Result<Result<(), String>, CancelFormatChange> {

@@ -47,12 +47,18 @@ async fn state_init_does_not_require_a_frontier_grid() {
     );
 
     assert!(
-        super::init_read_only(config.clone(), &network).is_ok(),
-        "a deriving node without a grid starts and reports the absent band as unavailable"
+        super::init(config.clone(), &network, Height::MAX, 0)
+            .await
+            .is_ok(),
+        "a deriving node must start without a frontier grid configured"
     );
-    assert!(
-        super::init(config, &network, Height::MAX, 0).await.is_ok(),
-        "a deriving node without a grid starts and reports the absent band as unavailable"
+
+    let loaded = super::load_historical_frontier_artifact(&network, &config)
+        .expect("no configured grid is not an error");
+    assert_eq!(
+        loaded.last_checkpoint, None,
+        "with no grid loaded, serving reports the absent band as unavailable rather than \
+         replaying it"
     );
 }
 
@@ -91,7 +97,7 @@ async fn historical_frontier_load_errors_are_returned_from_state_init() {
         ..corrupt_config
     };
     assert!(
-        super::init_read_only(legacy_recompute, &network).is_ok(),
+        super::load_historical_frontier_artifact(&network, &legacy_recompute).is_ok(),
         "an unusable grid must not stop a node that would never have read it"
     );
 }

@@ -96,7 +96,7 @@ pub use service::finalized_state::{
     VctTreestateInventory,
 };
 pub use service::finalized_state::{
-    export_frontier_grid, produce_release_treestate_artifacts, verify_subtree_artifact,
+    export_frontier_grid_to, produce_release_treestate_artifacts, verify_subtree_artifact,
     FrontierArtifact, FrontierEntry, FrontierGridExport, FrontierGridExportError, GridSpacing,
     ReleaseTreestateArtifacts, ReleaseTreestateArtifactsError, SubtreeArtifact, SubtreeRecord,
     TreestateArtifactError, VerifiedSubtreeCounts,

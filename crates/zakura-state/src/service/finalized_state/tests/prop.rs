@@ -45,9 +45,10 @@ use crate::{
 };
 
 use super::super::{
-    commitment_aux, export_frontier_grid, serve_block_roots, vct::validate_final_frontiers_bytes,
-    verify_subtrees_against_stored, CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState,
-    FrontierArtifact, FrontierEntry, GridSpacing, VctAuxiliaryWindow, VctSuccessorWitness,
+    commitment_aux, export_frontier_grid_to, serve_block_roots,
+    vct::validate_final_frontiers_bytes, verify_subtrees_against_stored, CheckpointVerifiedBlock,
+    DiskWriteBatch, FinalizedState, FrontierArtifact, FrontierEntry, GridSpacing,
+    VctAuxiliaryWindow, VctSuccessorWitness,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -1653,8 +1654,9 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                     .is_none(),
                 "U = 0 starts frontier replay from empty genesis trees"
             );
-            let genesis_export = export_frontier_grid(
+            let genesis_export = export_frontier_grid_to(
                 &fast.db,
+                handoff,
                 GridSpacing::Uniform { blocks: 1 },
                 |_, _| {},
             )
@@ -2818,8 +2820,9 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                     .expect("the pre-upgrade Sapling tree is stored")
                     .root()
             );
-            let anchored_export = export_frontier_grid(
+            let anchored_export = export_frontier_grid_to(
                 &legacy.db,
+                last_height,
                 GridSpacing::Uniform { blocks: 1 },
                 |_, _| {},
             )
@@ -2828,16 +2831,125 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 .frontiers
                 .entries
                 .last()
-                .expect("the absent band [U, H) publishes at least one on-grid entry");
+                .expect("a grid over this chain publishes at least one on-grid entry");
             prop_assert!(
-                last_published.height >= upgrade && last_published.height < last_height,
-                "published heights stay inside the absent band [U, H)"
+                last_published.height < last_height,
+                "published heights stay below the target checkpoint"
+            );
+            prop_assert!(
+                anchored_export
+                    .frontiers
+                    .entries
+                    .first()
+                    .is_some_and(|first| first.height < upgrade),
+                "coverage starts at genesis, not at this database's own upgrade height"
             );
             prop_assert_eq!(
                 anchored_export.replayed_blocks,
                 u64::from(last_published.height.0 - upgrade.0) + 1,
-                "the exporter replays only [U, last on-grid entry], not [0, H)"
+                "only the absent band [U, last on-grid entry] is replayed; below U is read"
             );
+            prop_assert_eq!(
+                anchored_export.frontiers.last_checkpoint,
+                last_height,
+                "the artifact records the checkpoint it was generated for, not this database's handoff"
+            );
+            for entry in &anchored_export.frontiers.entries {
+                // Unchanged trees are deduplicated, so the newest row at or below the height is
+                // the state there.
+                let stored = legacy
+                    .db
+                    .latest_stored_sapling_tree(&entry.height)
+                    .expect("the legacy pass stored a tree at or below every height");
+                prop_assert_eq!(
+                    entry.sapling.root(),
+                    stored.root(),
+                    "every published entry reproduces the tree the legacy pass stored"
+                );
+            }
+
+            // A shorter export is a prefix of a longer one. That is what lets the release
+            // pipeline check an incoming grid against the committed one entry by entry.
+            let shorter_export = export_frontier_grid_to(
+                &legacy.db,
+                Height(last_height.0 - 2),
+                GridSpacing::Uniform { blocks: 1 },
+                |_, _| {},
+            )
+            .expect("a lower target exports the same grid, minus its tail");
+            prop_assert!(
+                shorter_export.frontiers.entries.len() < anchored_export.frontiers.entries.len(),
+                "a lower target publishes fewer entries"
+            );
+            for (earlier, later) in shorter_export
+                .frontiers
+                .entries
+                .iter()
+                .zip(&anchored_export.frontiers.entries)
+            {
+                prop_assert_eq!(earlier.height, later.height, "grid heights do not move");
+                prop_assert_eq!(
+                    earlier.sapling.root(),
+                    later.sapling.root(),
+                    "an entry's contents do not change as the target advances"
+                );
+            }
+
+            // One export can draw on every source at once. Narrowing the handoff leaves this
+            // database with stored trees on both sides of its absent band: entries below `U` and
+            // at or above the handoff are read, and only the band between them is replayed.
+            let narrow_handoff = Height(upgrade.0 + 2);
+            let mut batch = DiskWriteBatch::new();
+            batch.update_vct_sync_marker(&legacy.db, narrow_handoff);
+            legacy
+                .db
+                .write_batch(batch)
+                .expect("narrowing the absent band succeeds");
+            let mixed_export = export_frontier_grid_to(
+                &legacy.db,
+                last_height,
+                GridSpacing::Uniform { blocks: 1 },
+                |_, _| {},
+            )
+            .expect("a database with trees on both sides of its band exports every height");
+            prop_assert!(
+                mixed_export.replayed_blocks
+                    <= u64::from(narrow_handoff.0 - upgrade.0),
+                "replay is confined to the absent band"
+            );
+            prop_assert!(
+                mixed_export.replayed_blocks < anchored_export.replayed_blocks,
+                "a narrower band means less replay for the same coverage"
+            );
+            prop_assert!(
+                mixed_export
+                    .frontiers
+                    .entries
+                    .last()
+                    .is_some_and(|entry| entry.height >= narrow_handoff),
+                "coverage continues above the handoff, where the trees are stored again"
+            );
+            for (band_generated, read_generated) in anchored_export
+                .frontiers
+                .entries
+                .iter()
+                .zip(&mixed_export.frontiers.entries)
+            {
+                prop_assert_eq!(band_generated.height, read_generated.height);
+                prop_assert_eq!(
+                    band_generated.sapling.root(),
+                    read_generated.sapling.root(),
+                    "a replayed entry and a read entry at the same height are the same frontier"
+                );
+            }
+
+            // Restore the fixture's handoff for the assertions that follow.
+            let mut batch = DiskWriteBatch::new();
+            batch.update_vct_sync_marker(&legacy.db, last_height);
+            legacy
+                .db
+                .write_batch(batch)
+                .expect("restoring the fixture handoff succeeds");
             let stitched = serve_block_roots(&legacy.db, serve_range);
             prop_assert_eq!(
                 stitched,

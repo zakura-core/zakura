@@ -1,0 +1,22 @@
+# Publishes one Mainnet release-state bundle from the archive node's live cache.
+#
+# Independent of the snapshot services: the exporter reads a RocksDB secondary,
+# so it needs no stopped-node window and takes no snapshot lock. Its own
+# /run/zakura-release-state-publish.lock rejects overlapping runs.
+[Unit]
+Description=Publish Mainnet release-state bundle
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Supplies RELEASE_STATE_ARCHIVE_CACHE, and optionally RELEASE_STATE_KEEP or
+# RELEASE_STATE_GRID_COST_MS. The publisher refuses to run without the cache path.
+EnvironmentFile=/etc/zakura-release-state.env
+ExecStart=/usr/local/bin/with-secrets.sh /opt/zakura-release-state/bin/publish-from-archive-host.sh
+# A whole-band frontier grid replay takes hours on a fast-synced archive
+# database. A legacy archive database reads the grid instead and finishes in
+# minutes, but the ceiling has to cover both.
+TimeoutStartSec=6h
+Nice=10
+IOSchedulingClass=idle

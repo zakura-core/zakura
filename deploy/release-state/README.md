@@ -36,10 +36,22 @@ whole-band replay — hours on Mainnet.
 
 ## Cutover order
 
-The importer requires every bundle to carry all four files, and fails closed on one that does
-not. Deploy the publisher **before** merging the repository change that expects the frontier
-grid, or `update-release-state.yml` will reject the last bundle the old publisher produced until
-a new one appears.
+The importer requires every bundle to carry all four files and fails closed on one that does not,
+so the publisher has to be updated around the same time as the repository. It cannot be updated
+*first*: `deploy-snapshot-host.sh` refuses to install an exporter whose revision is not already an
+ancestor of `origin/main`, which is a supply-chain control worth keeping.
+
+So the order is:
+
+1. Merge the repository change.
+2. Run `deploy-snapshot-host.sh`, now buildable from `main`.
+3. Set `RELEASE_STATE_ARCHIVE_CACHE` and enable the timer.
+4. Dispatch `update-release-state.yml` once the first new bundle exists.
+
+Between 1 and 3 a scheduled import will fail with `meta.files is missing keys:
+mainnet-frontier-grid.bin`. Nothing is committed and nothing in production changes — it is a red
+scheduled job that clears as soon as the new publisher publishes — but prefer merging and
+deploying the same day over leaving it red for a week.
 
 ## One-time host setup
 
@@ -80,6 +92,11 @@ a new one appears.
 - A host-local lock serializes export, upload, pointer replacement, and
   retention. Run exactly one publisher host; multiple hosts require
   object-store conditional writes rather than the local lock.
+- Each run resumes the frontier grid from the previous bundle's copy, so it scans only the
+  blocks above that grid's last entry. Carried entries are re-checked against the database
+  before they are accepted, and are written out byte-for-byte, so a bundle is a prefix-extension
+  of its predecessor by construction. If the previous bundle has no grid, the run falls back to
+  a full walk from genesis and says so.
 - Exports continue the deterministic checkpoint selection grid from the
   binary's embedded list. Never hand-edit the Mainnet checkpoint file or
   publish RPC-mode Mainnet output: off-grid lines make every later bundle fail

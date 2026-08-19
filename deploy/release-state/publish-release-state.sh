@@ -21,7 +21,9 @@
 #                             built with --features zakura-checkpoints-offline
 #   RELEASE_STATE_GRID_COST_MS
 #                             per-entry frontier grid cost budget in ms
-#                             (default: whatever the exporter defaults to)
+#                             (default: whatever the exporter defaults to). Only
+#                             affects entries added after the resumed prefix;
+#                             published entries are carried forward verbatim.
 #   RELEASE_STATE_KEEP        immutable bundles to retain (default 4)
 #   RELEASE_STATE_LOCK_FILE   host-local publisher lock
 #                             (default: /tmp/zakura-release-state-publish.lock)
@@ -93,6 +95,30 @@ list_remote_object() {
     fi
 }
 
+# Read the pointer before exporting. Its bundle carries the previously published
+# frontier grid, and resuming from that grid means this run scans only the blocks
+# above its last entry instead of the whole chain from genesis. The pointer height
+# is reused further down for the regression guard.
+POINTER_LISTING=$(list_remote_object "$REMOTE_PREFIX/latest.json")
+POINTER_HEIGHT=
+if [ -n "$POINTER_LISTING" ]; then
+    rclone copyto "$REMOTE_PREFIX/latest.json" "$STAGE/existing-latest.json"
+    POINTER_HEIGHT=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["height"])' \
+        "$STAGE/existing-latest.json")
+
+    # A bundle published before the grid joined the release state has no grid to
+    # resume from. That is not an error: the run falls back to a full walk, which
+    # is what the first grid-bearing export has to do anyway.
+    PREVIOUS_GRID="$REMOTE_PREFIX/v1/$POINTER_HEIGHT/mainnet-frontier-grid.bin"
+    if [ -n "$(list_remote_object "$PREVIOUS_GRID")" ]; then
+        rclone copyto "$PREVIOUS_GRID" "$STAGE/previous-frontier-grid.bin"
+        GRID_ARGS+=(--mainnet-frontier-grid-input "$STAGE/previous-frontier-grid.bin")
+        echo "resuming the frontier grid from bundle v1/$POINTER_HEIGHT" >&2
+    else
+        echo "bundle v1/$POINTER_HEIGHT has no frontier grid; building one from genesis" >&2
+    fi
+fi
+
 # One run, one coupled release state: the frontier, subtree roots, and frontier
 # grid are all generated for the checkpoint this run selects.
 "$BIN" \
@@ -108,18 +134,11 @@ HEIGHT=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f1)
 BLOCK_HASH=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f2)
 GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-# Never move the pointer backwards: an export from stale stopped-node state
-# would regress latest.json, and retention could then purge the very bundle
-# it points at.
-POINTER_LISTING=$(list_remote_object "$REMOTE_PREFIX/latest.json")
-if [ -n "$POINTER_LISTING" ]; then
-    rclone copyto "$REMOTE_PREFIX/latest.json" "$STAGE/existing-latest.json"
-    POINTER_HEIGHT=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["height"])' \
-        "$STAGE/existing-latest.json")
-    if [ "$POINTER_HEIGHT" -gt "$HEIGHT" ]; then
-        echo "refusing to publish height $HEIGHT below the current pointer height $POINTER_HEIGHT; stale stopped-node state?" >&2
-        exit 1
-    fi
+# Never move the pointer backwards: an export from stale state would regress
+# latest.json, and retention could then purge the very bundle it points at.
+if [ -n "$POINTER_HEIGHT" ] && [ "$POINTER_HEIGHT" -gt "$HEIGHT" ]; then
+    echo "refusing to publish height $HEIGHT below the current pointer height $POINTER_HEIGHT; stale state?" >&2
+    exit 1
 fi
 
 HEIGHT="$HEIGHT" BLOCK_HASH="$BLOCK_HASH" GENERATED_AT="$GENERATED_AT" \

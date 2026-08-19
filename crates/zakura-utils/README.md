@@ -52,6 +52,12 @@ in 4.8 MB, without replaying a single block. `--frontier-grid-target-cost-ms` tu
 grid's per-entry cost budget (default 2000); `--frontier-grid-spacing` produces a uniform grid
 and is not recommended.
 
+`--mainnet-frontier-grid-input <path>` resumes from a previously published grid instead of
+rebuilding it. Its entries are re-checked against the database and then carried forward verbatim,
+so the run scans only the blocks above the last carried entry and the output is a prefix-extension
+of the input by construction. Use it for every run after the first: a full walk stays O(chain)
+forever, while a resumed run costs only the new tail.
+
 To produce a grid for a checkpoint the binary already ships — backfilling the one artifact a
 committed release state is missing, without advancing the checkpoint list — run the grid
 alone:

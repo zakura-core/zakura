@@ -635,6 +635,18 @@ pub enum FrontierGridExportError {
     #[error("grid spacing and cost budget must be at least 1")]
     ZeroSpacing,
 
+    /// The grid being resumed from reaches at or above the requested checkpoint.
+    #[error(
+        "cannot resume from a grid whose last entry {seed:?} is not below the requested \
+         checkpoint {target:?}"
+    )]
+    ResumeAboveTarget {
+        /// The highest entry in the grid being resumed from.
+        seed: Height,
+        /// The requested checkpoint.
+        target: Height,
+    },
+
     /// A block body needed to place entries is not retained.
     #[error(
         "cannot place frontier grid entries: block body {missing:?} is not retained; generate \
@@ -733,12 +745,20 @@ fn next_grid_target(
 /// ([`produce_release_treestate_artifacts`]) owns that artifact, and it does not need historical
 /// block bodies to build it.
 ///
+/// `resume_from` carries an earlier grid's entries forward instead of recomputing them. Each
+/// carried entry is re-checked against this database's authenticated roots before it is accepted, so
+/// resuming inherits no trust from the file it came from. Placement is unaffected: the cost
+/// accumulator resets at every emitted entry, so continuing at `last carried entry + 1` puts the
+/// remaining entries exactly where a walk from genesis would. Resuming also makes the output a
+/// prefix-extension of the input by construction rather than by both runs agreeing on a budget.
+///
 /// `on_progress` is called with each emitted entry's height and the running replay count, for
 /// long runs.
 pub fn export_frontier_grid_to(
     db: &ZakuraDb,
     target_checkpoint: Height,
     spacing: GridSpacing,
+    resume_from: Option<&FrontierArtifact>,
     mut on_progress: impl FnMut(Height, u64),
 ) -> Result<FrontierGridExport, FrontierGridExportError> {
     match spacing {
@@ -780,6 +800,47 @@ pub fn export_frontier_grid_to(
 
     let mut next = Height(0);
     let mut accrued_cost: u64 = 0;
+
+    if let Some(seed) = resume_from {
+        if let Some(top) = seed.entries.last() {
+            if top.height > last {
+                return Err(FrontierGridExportError::ResumeAboveTarget {
+                    seed: top.height,
+                    target: target_checkpoint,
+                });
+            }
+        }
+
+        // Carried entries are re-checked here, so a stale, truncated, or hostile input costs a
+        // failed export rather than an unverified entry in the published artifact.
+        for entry in &seed.entries {
+            let frontiers = DerivedFrontiers {
+                sapling: entry.sapling.clone(),
+                orchard: entry.orchard.clone(),
+                ironwood: entry.ironwood.clone(),
+            };
+            verify_against_available_roots(db, entry.height, &frontiers).map_err(|source| {
+                FrontierGridExportError::Derivation {
+                    height: entry.height,
+                    source,
+                }
+            })?;
+
+            // A carried entry inside the absent band is a verified frontier at its height, which
+            // is a nearer replay anchor than the trees below `U`.
+            if absent_band
+                .is_some_and(|(upgrade, handoff)| entry.height >= upgrade && entry.height < handoff)
+            {
+                replay = Some((frontiers, entry.height.0 + 1));
+            }
+
+            entries.push(entry.clone());
+        }
+
+        if let Some(top) = entries.last() {
+            next = Height(top.height.0 + 1);
+        }
+    }
 
     // A pruned database answers the cost scan with a missing body, which would read as a free
     // block and space entries far too widely. The artifact would still be valid — every entry is

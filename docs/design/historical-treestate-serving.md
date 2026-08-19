@@ -284,6 +284,15 @@ block bodies nor the grid's pass. `zakurad verify-historical-treestates` repeats
 offline for a candidate bundle, and also checks the bundle's grid for framing and for
 covering the same checkpoint as the rest of the bundle.
 
+**Resuming.** `--mainnet-frontier-grid-input` carries a published grid's entries forward instead
+of recomputing them. The cost accumulator resets at every emitted entry, so continuing at
+`last carried entry + 1` places the remainder exactly where a walk from genesis would — the same
+reset property that makes the checkpoint list resumable. Carried entries are re-checked against
+the generating database's authenticated roots before they are accepted, so resuming inherits no
+trust from the file. Two consequences: a routine run costs only the new tail rather than a scan
+of the whole chain, and the output is a prefix-extension of the input by construction rather than
+because two runs happened to agree on a cost budget.
+
 A grid for a checkpoint already committed is produced by
 `--mainnet-frontier-grid-checkpoint`, which emits nothing else. That is how the first grid is
 introduced for a release state that predates it, without a checkpoint advance riding along.
@@ -356,5 +365,9 @@ how many entries that budget buys.
 
 `0 blocks replayed` is the legacy-archive path in §5 confirmed end to end: every entry came
 from a stored per-height tree, and the 81 minutes is the cost-model scan reading each block
-body once, not replay. That is the floor for any archive node, and it is why the run is
-long even where no commitment is ever re-appended.
+body once, not replay. That is the floor for a run that walks from genesis, and it is why such
+a run is long even where no commitment is ever re-appended.
+
+That figure is therefore a one-off. A resumed run scans only the blocks above the previous
+grid's last entry, so the routine cost tracks how far the chain advanced since the last export
+rather than the length of the chain.

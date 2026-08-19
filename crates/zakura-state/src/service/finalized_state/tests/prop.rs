@@ -47,8 +47,8 @@ use crate::{
 use super::super::{
     commitment_aux, export_frontier_grid_to, serve_block_roots,
     vct::validate_final_frontiers_bytes, verify_subtrees_against_stored, CheckpointVerifiedBlock,
-    DiskWriteBatch, FinalizedState, FrontierArtifact, FrontierEntry, GridSpacing,
-    VctAuxiliaryWindow, VctSuccessorWitness,
+    DiskWriteBatch, FinalizedState, FrontierArtifact, FrontierEntry, FrontierGridExportError,
+    GridSpacing, VctAuxiliaryWindow, VctSuccessorWitness,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -1658,6 +1658,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 &fast.db,
                 handoff,
                 GridSpacing::Uniform { blocks: 1 },
+                None,
                 |_, _| {},
             )
             .expect("a genesis-start VCT database exports its absent band");
@@ -2824,6 +2825,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 &legacy.db,
                 last_height,
                 GridSpacing::Uniform { blocks: 1 },
+                None,
                 |_, _| {},
             )
             .expect("a mid-chain VCT database exports from its stored predecessor");
@@ -2874,6 +2876,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 &legacy.db,
                 Height(last_height.0 - 2),
                 GridSpacing::Uniform { blocks: 1 },
+                None,
                 |_, _| {},
             )
             .expect("a lower target exports the same grid, minus its tail");
@@ -2895,6 +2898,58 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 );
             }
 
+            // Resuming reproduces the from-genesis walk exactly. That is the property the whole
+            // incremental path rests on: the cost accumulator resets at every emitted entry, so
+            // continuing at `last carried entry + 1` places the remainder identically.
+            let resumed_export = export_frontier_grid_to(
+                &legacy.db,
+                last_height,
+                GridSpacing::Uniform { blocks: 1 },
+                Some(&shorter_export.frontiers),
+                |_, _| {},
+            )
+            .expect("a published grid can be carried forward");
+            prop_assert_eq!(
+                resumed_export.frontiers.entries.len(),
+                anchored_export.frontiers.entries.len(),
+                "resuming publishes the same entries as a walk from genesis"
+            );
+            for (from_genesis, resumed) in anchored_export
+                .frontiers
+                .entries
+                .iter()
+                .zip(&resumed_export.frontiers.entries)
+            {
+                prop_assert_eq!(from_genesis.height, resumed.height);
+                prop_assert_eq!(from_genesis.sapling.root(), resumed.sapling.root());
+                prop_assert_eq!(from_genesis.orchard.root(), resumed.orchard.root());
+            }
+            prop_assert_eq!(
+                resumed_export.frontiers.encode(&network),
+                anchored_export.frontiers.encode(&network),
+                "a resumed artifact is byte-identical to the one a full walk produces"
+            );
+            prop_assert!(
+                resumed_export.replayed_blocks < anchored_export.replayed_blocks,
+                "resuming replays less than a walk from genesis"
+            );
+
+            // A grid that already reaches the requested checkpoint has nothing to extend, and
+            // carrying entries at or above it would describe heights the export does not cover.
+            prop_assert!(
+                matches!(
+                    export_frontier_grid_to(
+                        &legacy.db,
+                        Height(2),
+                        GridSpacing::Uniform { blocks: 1 },
+                        Some(&anchored_export.frontiers),
+                        |_, _| {},
+                    ),
+                    Err(FrontierGridExportError::ResumeAboveTarget { .. })
+                ),
+                "a grid reaching past the target is refused rather than truncated"
+            );
+
             // One export can draw on every source at once. Narrowing the handoff leaves this
             // database with stored trees on both sides of its absent band: entries below `U` and
             // at or above the handoff are read, and only the band between them is replayed.
@@ -2909,6 +2964,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 &legacy.db,
                 last_height,
                 GridSpacing::Uniform { blocks: 1 },
+                None,
                 |_, _| {},
             )
             .expect("a database with trees on both sides of its band exports every height");

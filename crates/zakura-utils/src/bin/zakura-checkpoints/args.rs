@@ -154,6 +154,17 @@ pub struct Args {
     #[arg(long)]
     pub mainnet_frontier_grid_output: Option<PathBuf>,
 
+    /// Offline mode: resume the frontier grid from a previously published one.
+    ///
+    /// Carries that grid's entries forward instead of recomputing them, so a run scans only the
+    /// blocks above its last entry rather than the whole chain. Every carried entry is re-checked
+    /// against this database's authenticated roots first, so the input is never trusted. Omit it
+    /// to build the grid from genesis, which is what the first run has to do.
+    ///
+    /// Requires `--mainnet-frontier-grid-output`.
+    #[arg(long)]
+    pub mainnet_frontier_grid_input: Option<PathBuf>,
+
     /// Offline mode: generate only the frontier grid, for an already-committed checkpoint.
     ///
     /// The normal export selects a new checkpoint above the embedded list and pins every
@@ -210,6 +221,14 @@ impl Args {
             return Err(
                 "--frontier-grid-spacing and --frontier-grid-target-cost-ms tune \
                  --mainnet-frontier-grid-output: add it, or remove them"
+                    .to_string(),
+            );
+        }
+        if self.mainnet_frontier_grid_output.is_none() && self.mainnet_frontier_grid_input.is_some()
+        {
+            return Err(
+                "--mainnet-frontier-grid-input resumes a grid that has nowhere to go: add \
+                 --mainnet-frontier-grid-output"
                     .to_string(),
             );
         }
@@ -418,6 +437,7 @@ mod tests {
             mainnet_frontier_output: None,
             mainnet_subtree_output: None,
             mainnet_frontier_grid_output: None,
+            mainnet_frontier_grid_input: None,
             mainnet_frontier_grid_checkpoint: None,
             frontier_grid_target_cost_ms: None,
             frontier_grid_spacing: None,
@@ -567,6 +587,17 @@ mod tests {
         assert!(
             full_list_without_grid.validate_mode().is_err(),
             "a replacement checkpoint list must ship with its frontier grid too"
+        );
+
+        let mut resume_without_grid_output = offline.clone();
+        resume_without_grid_output.mainnet_frontier_grid_output = None;
+        resume_without_grid_output.mainnet_frontier_output = None;
+        resume_without_grid_output.mainnet_subtree_output = None;
+        resume_without_grid_output.full_list = false;
+        resume_without_grid_output.mainnet_frontier_grid_input = Some(PathBuf::from("old.bin"));
+        assert!(
+            resume_without_grid_output.validate_mode().is_err(),
+            "resuming a grid needs somewhere to write the result"
         );
 
         let mut grid_tuning_without_grid_output = offline.clone();

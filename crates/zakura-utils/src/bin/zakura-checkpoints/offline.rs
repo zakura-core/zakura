@@ -18,7 +18,7 @@
 // and argument invariants established by `Args::validate_mode` use `expect`.
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::unwrap_in_result)]
 
-use std::{io::Write, path::Path, time::Instant};
+use std::{fs, io::Write, path::Path, time::Instant};
 
 use color_eyre::eyre::{ensure, eyre, Context, Result};
 
@@ -251,6 +251,7 @@ pub fn run_offline(args: &Args) -> Result<()> {
             frontier_path,
             subtree_path,
             grid_path,
+            args.mainnet_frontier_grid_input.as_deref(),
             frontier_grid_spacing(args),
         )?;
     }
@@ -337,6 +338,7 @@ fn backfill_frontier_grid(
         network,
         checkpoint,
         grid_path,
+        args.mainnet_frontier_grid_input.as_deref(),
         frontier_grid_spacing(args),
     )
 }
@@ -366,6 +368,7 @@ fn write_release_treestate_artifacts(
     frontier_path: &Path,
     subtree_path: &Path,
     grid_path: &Path,
+    grid_resume_path: Option<&Path>,
     grid_spacing: zakura_state::GridSpacing,
 ) -> Result<()> {
     let artifacts = zakura_state::produce_release_treestate_artifacts(db, height)
@@ -394,7 +397,14 @@ fn write_release_treestate_artifacts(
         artifacts.verified_subtree_roots,
     );
 
-    write_frontier_grid(db, network, height, grid_path, grid_spacing)?;
+    write_frontier_grid(
+        db,
+        network,
+        height,
+        grid_path,
+        grid_resume_path,
+        grid_spacing,
+    )?;
 
     Ok(())
 }
@@ -409,6 +419,7 @@ fn write_frontier_grid(
     network: &Network,
     height: Height,
     grid_path: &Path,
+    resume_path: Option<&Path>,
     spacing: zakura_state::GridSpacing,
 ) -> Result<()> {
     match spacing {
@@ -423,24 +434,49 @@ fn write_frontier_grid(
         ),
     }
 
+    // Resuming carries a published grid's entries forward, so a run scans only the blocks above
+    // its last entry. Every carried entry is re-checked against this database before it is
+    // accepted, so the file supplies work already done, never trust.
+    let resume_from = match resume_path {
+        Some(path) => {
+            let bytes = fs::read(path).wrap_err_with(|| format!("reading {}", path.display()))?;
+            let grid = zakura_state::FrontierArtifact::decode(&bytes, network)
+                .map_err(|error| eyre!("reading {}: {error}", path.display()))?;
+            eprintln!(
+                "resuming from {}: {} entries through height {}",
+                path.display(),
+                grid.entries.len(),
+                grid.entries.last().map_or(0, |entry| entry.height.0),
+            );
+            Some(grid)
+        }
+        None => None,
+    };
+
     // Time each grid step. One step is exactly the replay a serving node performs for a cold
     // request at this spacing, so the run doubles as the measurement that sizes the grid.
     let mut entries = 0u64;
     let mut previous = Instant::now();
-    let export = zakura_state::export_frontier_grid_to(db, height, spacing, |entry, blocks| {
-        let step = previous.elapsed();
-        previous = Instant::now();
-        entries += 1;
+    let export = zakura_state::export_frontier_grid_to(
+        db,
+        height,
+        spacing,
+        resume_from.as_ref(),
+        |entry, blocks| {
+            let step = previous.elapsed();
+            previous = Instant::now();
+            entries += 1;
 
-        if entries.is_multiple_of(FRONTIER_GRID_PROGRESS_INTERVAL) {
-            eprintln!(
-                "  entry {entries:>7}  height {:>9}  {blocks:>9} blocks replayed  \
-                 last step {:>8.1}ms",
-                entry.0,
-                step.as_secs_f64() * 1e3,
-            );
-        }
-    })
+            if entries.is_multiple_of(FRONTIER_GRID_PROGRESS_INTERVAL) {
+                eprintln!(
+                    "  entry {entries:>7}  height {:>9}  {blocks:>9} blocks replayed  \
+                     last step {:>8.1}ms",
+                    entry.0,
+                    step.as_secs_f64() * 1e3,
+                );
+            }
+        },
+    )
     .map_err(|error| eyre!("producing the Mainnet historical frontier grid: {error}"))?;
 
     let grid_bytes = export.frontiers.encode(network);

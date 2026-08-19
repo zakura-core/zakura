@@ -884,6 +884,10 @@ zakura-checkpoints \
   own boundaries, so exports from different databases and different tips are byte-prefix
   extensions of one another — the same grid contract the checkpoint list follows, which is
   what lets the importer verify grid updates as pure appends.
+- `--mainnet-frontier-grid-input` resumes the grid from the previously published one, so a
+  routine export scans only the blocks above its last entry instead of the whole chain. Carried
+  entries are re-checked against the database and then written verbatim, which makes each bundle
+  a prefix-extension of its predecessor by construction — the property the importer checks.
 - All artifacts are written before any checkpoint line reaches stdout, so a failure never
   leaves a caller's redirected output holding an advanced list without its coupled state.
 - `--mainnet-frontier-grid-checkpoint <height>` backfills the grid alone, for a checkpoint the

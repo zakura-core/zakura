@@ -150,11 +150,12 @@ async fn run_dial_supervisor<F>(
 
     loop {
         // Already connected (possibly an inbound dial from the same peer).
-        if registered
+        let already_registered = registered
             .borrow_and_update()
             .iter()
-            .any(|id| id == &peer_id)
-        {
+            .any(|id| id == &peer_id);
+
+        let attempt = if already_registered {
             if !policy.redial_after_drop {
                 // Wait for it to deregister, then re-dial promptly.
                 tokio::select! {
@@ -171,15 +172,40 @@ async fn run_dial_supervisor<F>(
                     }
                 }
             }
-            if registered.changed().await.is_err() {
-                return;
-            }
-            backoff = policy.initial_backoff;
-            failures = 0;
-            continue;
-        }
 
-        match dial().await {
+            // A maintained dial owns this peer, so score the registration the
+            // same way a dial this loop drove is scored. Two things matter.
+            //
+            // Wait for *this* peer to deregister rather than for any peer-set
+            // change: on a busy node an unrelated peer connecting is not this
+            // connection ending.
+            //
+            // Then require the registration to have lasted before crediting it
+            // as healthy. A peer that shares no service beyond discovery is
+            // closed as soon as its discovery exchange completes
+            // (`discovery_exchange_complete`), and the deregistration for the
+            // connection this loop just dialed often lands after the dial
+            // future returns. Resetting the backoff on that registration made
+            // every such peer re-dial at once, forever.
+            let registered_at = Instant::now();
+            loop {
+                if registered.changed().await.is_err() {
+                    return;
+                }
+                if !registered.borrow().iter().any(|id| id == &peer_id) {
+                    break;
+                }
+            }
+            if registered_at.elapsed() >= ZAKURA_REDIAL_HEALTHY_CONNECTION {
+                DialResult::Healthy
+            } else {
+                DialResult::Failed
+            }
+        } else {
+            dial().await
+        };
+
+        match attempt {
             DialResult::Healthy => {
                 if !policy.redial_after_drop {
                     return;
@@ -383,5 +409,54 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         supervisor.abort();
+    }
+
+    /// A bootstrap peer that shares no service beyond discovery closes every
+    /// connection as soon as the discovery exchange completes. The maintained
+    /// dial must back off on that, not re-dial at once forever.
+    #[tokio::test(start_paused = true)]
+    async fn dial_supervisor_maintain_backs_off_a_peer_that_closes_every_connection() {
+        let peer_id = redial_test_peer_id();
+        let (registered_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let dial_calls = calls.clone();
+        let dial_peer_id = peer_id.clone();
+        let dial = move || {
+            dial_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let registered_tx = registered_tx.clone();
+            let dial_peer_id = dial_peer_id.clone();
+            Box::pin(async move {
+                // The connection establishes and registers, serves the
+                // discovery exchange, and is then closed as discovery-only.
+                let _ = registered_tx.send(vec![dial_peer_id]);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                // The supervisor observes the deregistration only after this
+                // dial returns, so it sees the peer as still registered.
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    let _ = registered_tx.send(Vec::new());
+                });
+                DialResult::Failed
+            }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
+        };
+
+        let supervisor = tokio::spawn(run_dial_supervisor(
+            peer_id,
+            registered,
+            RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(30)),
+            dial,
+        ));
+
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        supervisor.abort();
+
+        // Backing off 1s, 2s, 4s, ... to the 30s ceiling allows a handful of
+        // dials per minute. Without backoff the loop re-dials every 51ms.
+        let dials = dial_count(&calls);
+        assert!(
+            dials <= 8,
+            "a peer that closes every connection must be backed off, but it was dialed {dials} times in 60s",
+        );
     }
 }

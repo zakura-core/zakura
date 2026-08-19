@@ -14,7 +14,7 @@ on:
         required: false
         default: "48"
   schedule:
-    # Weekly refresh; the publisher exports daily alongside the snapshot job.
+    # Weekly refresh; the publisher exports daily on its own timer.
     - cron: "0 6 * * 1"
 
 permissions: {}

@@ -63,8 +63,8 @@ Goals:
   pinned by something the node already authenticated.
 - Keep the artifact small enough to distribute through the existing release-state pipeline,
   without embedding it in the binary. Committed as a file, not `include_bytes!`: an operator
-  points `state.historical_frontier_artifact` at it, and a node that never enables derivation
-  pays nothing for it.
+  points `state.historical_frontier_artifact` at it, and a node with no grid configured pays
+  nothing for it.
 - Keep the consensus commit path untouched.
 
 Non-goals:
@@ -160,8 +160,9 @@ sized to bound the cold request and the cache carries the rest.
 Cache entries double as anchors, which is what makes the two properties compose, and by
 §3.1 only root-checked frontiers ever enter the cache.
 
-`state.max_historical_tree_replay_blocks` bounds what a single request may cost from its
-nearest anchor. It is a serving backstop, not a correctness bound.
+`MAX_HISTORICAL_TREE_REPLAY_BLOCKS` (`zakura-state/src/constants.rs`) bounds what a single
+request may cost from its nearest anchor. It is a serving backstop, not a correctness bound,
+and not a setting: the grid an operator configures is what decides replay cost.
 
 ### 3.4 The subtree-root artifact
 
@@ -197,13 +198,14 @@ read service, and RPC requests do not repeat the proof.
 ### 3.6 Failure policy
 
 Every way this can fail returns the typed `HistoricalTreeUnavailable` error, never a
-`null` treestate or an empty subtree list: derivation disabled, artifact absent or
-unreadable, no entry covering the requested height, replay exceeding its bound, or a
-derived root failing its check. A pruned node returns it immediately rather than walking
-the range until the first missing body.
+`null` treestate or an empty subtree list: no grid configured, no entry covering the
+requested height, replay exceeding its bound, or a derived root failing its check. A pruned
+node returns it immediately rather than walking the range until the first missing body.
 
-Startup fails closed if `state.derive_historical_trees` is on without a configured grid,
-so a cold request can never replay the entire absent band.
+Serving is idle rather than fail-closed when no grid is configured, so a cold request can
+never replay the entire absent band. A grid that *is* configured and cannot be read, or that
+ends below this database's own fast-sync handoff, still fails at startup: that is the
+operator's own path being wrong, not the file's contents being untrusted.
 
 ## 4. Component map
 
@@ -226,9 +228,12 @@ Configuration (`zakura-state/src/config.rs`):
 
 | Key | Role |
 | --- | --- |
-| `state.derive_historical_trees` | Enables derivation. Off by default. |
-| `state.historical_frontier_artifact` | Path to the grid. Required when derivation is on. |
-| `state.max_historical_tree_replay_blocks` | Per-request replay backstop. |
+| `state.historical_frontier_artifact` | Path to the grid. Derivation is idle without it. |
+
+Derivation itself is not configured. `Config::derive_historical_trees()` is true exactly when
+an archive node runs the VCT fast path, which is the pairing that both leaves the band absent
+and retains the block bodies a replay reads. Pruned mode and legacy per-block recompute are
+false. The per-request replay backstop is the `MAX_HISTORICAL_TREE_REPLAY_BLOCKS` constant.
 
 ## 5. Generation
 

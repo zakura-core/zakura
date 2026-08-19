@@ -3139,8 +3139,8 @@ fn read_service_over(finalized_state: &FinalizedState) -> crate::ReadStateServic
     )
 }
 
-/// Writes a genesis-empty frontier grid that satisfies the fail-closed pairing of
-/// `derive_historical_trees` with `historical_frontier_artifact`.
+/// Writes a genesis-empty frontier grid, the anchor a deriving node needs before it will serve
+/// the absent band at all.
 ///
 /// Height 0 is empty on this synthetic chain, so the entry root-checks and a below-handoff
 /// request still has to replay. The file must outlive the [`FinalizedState`] that points at it.
@@ -3259,12 +3259,11 @@ fn vct_read_service_serves_or_refuses_absent_band_treestates() -> Result<()> {
         let probe = Height(last as u32 - 1);
         let runtime = tokio::runtime::Runtime::new().expect("a test runtime starts");
 
-        // Derivation enabled: the handler serves trees matching the legacy node's.
-        // The artifact is required to turn the flag on; a genesis-empty grid still leaves the
-        // probe as a replay rather than a zero-cost hit.
+        // An archive node on the VCT fast path derives: the handler serves trees matching the
+        // legacy node's. A genesis-empty grid is enough to anchor on, and still leaves the probe
+        // as a replay rather than a zero-cost hit.
         let artifact_file = write_genesis_frontier_artifact(&network, handoff);
         let deriving = Config {
-            derive_historical_trees: true,
             historical_frontier_artifact: Some(artifact_file.path().to_path_buf()),
             ..Config::ephemeral()
         };
@@ -3296,11 +3295,10 @@ fn vct_read_service_serves_or_refuses_absent_band_treestates() -> Result<()> {
             "the served Orchard treestate matches the legacy node"
         );
 
-        // Pruned mode with derivation on: bodies in the retention window may still be present on
-        // this short chain, but a pruned node cannot serve historical treestates. Fail with the
-        // typed archive-mode error rather than walking the replay until a missing body.
+        // Pruned mode, grid and all: bodies in the retention window may still be present on this
+        // short chain, but a pruned node cannot serve historical treestates. Fail with the typed
+        // archive-mode error rather than walking the replay until a missing body.
         let pruned = Config {
-            derive_historical_trees: true,
             historical_frontier_artifact: Some(artifact_file.path().to_path_buf()),
             storage_mode: StorageMode::Pruned(PruningConfig::default()),
             ..Config::ephemeral()
@@ -3326,20 +3324,21 @@ fn vct_read_service_serves_or_refuses_absent_band_treestates() -> Result<()> {
             "pruned mode reports the typed archive-mode error, got: {orchard_error}"
         );
 
-        // Derivation disabled: the handler reports the typed archive-mode error rather than a
-        // `None` tree, which a lightwalletd-style client would read as the empty tree.
+        // No frontier grid: derivation has nothing to anchor on, so it stays idle rather than
+        // replaying the band end to end. The handler reports the typed archive-mode error rather
+        // than a `None` tree, which a lightwalletd-style client would read as the empty tree.
         let plain = commit_fast(Config::ephemeral());
         let read_state = read_service_over(&plain);
         let sapling_error = runtime
             .block_on(read_state.clone().oneshot(ReadRequest::SaplingTree(probe.into())))
-            .expect_err("without derivation the absent band must be an error");
+            .expect_err("without a grid the absent band must be an error");
         prop_assert!(
             sapling_error.to_string().contains("fast-synced"),
             "the Sapling error names the cause, got: {sapling_error}"
         );
         let orchard_error = runtime
             .block_on(read_state.oneshot(ReadRequest::OrchardTree(probe.into())))
-            .expect_err("without derivation the absent band must be an error");
+            .expect_err("without a grid the absent band must be an error");
         prop_assert!(
             orchard_error.to_string().contains("fast-synced"),
             "the Orchard error names the cause, got: {orchard_error}"

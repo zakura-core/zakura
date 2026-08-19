@@ -17,7 +17,7 @@ use color_eyre::eyre::{eyre, Result};
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_state::{
     DerivationSample, HistoricalTreeCache, PruningConfig, StorageMode, SubtreeVerification,
-    VctTreestateInventory, DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    VctTreestateInventory, MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 
 use crate::prelude::APPLICATION;
@@ -284,7 +284,7 @@ impl AuditHistoricalTreestatesCmd {
                     db,
                     &cache,
                     [height],
-                    DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+                    MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
                 )
                 .map_err(|(height, error)| {
                     eyre!("derivation failed at height {}: {error}", height.0)
@@ -345,7 +345,7 @@ impl AuditHistoricalTreestatesCmd {
                     db,
                     &cache,
                     [height],
-                    DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+                    MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
                     &mut report,
                 ) {
                     Ok(_) => {}
@@ -362,7 +362,7 @@ impl AuditHistoricalTreestatesCmd {
                 db,
                 &cache,
                 heights,
-                DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+                MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
                 &mut report,
             )
         };

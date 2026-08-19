@@ -44,7 +44,7 @@ use zakura_chain::{
 use crate::{
     constants::{
         MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS,
-        MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_LEGACY_CHAIN_BLOCKS,
+        MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MAX_LEGACY_CHAIN_BLOCKS,
     },
     error::{CommitBlockError, CommitCheckpointVerifiedError, InvalidateError, ReconsiderError},
     request::TimedSpan,
@@ -265,8 +265,8 @@ pub struct ReadStateService {
     /// verified-commitment-trees fast-synced database's absent band.
     ///
     /// Shared across clones so a wallet's sequential scan anchors each request on the previous
-    /// one. Empty, and never written, unless `derive_historical_trees` is configured with a
-    /// frontier artifact.
+    /// one. Empty, and never written, on a node that does not derive
+    /// ([`Config::derive_historical_trees`]) or has no frontier grid configured.
     historical_trees: Arc<Mutex<read::HistoricalTreeCache>>,
 
     /// Published completed subtree roots for heights below the last checkpoint.
@@ -1297,6 +1297,15 @@ impl ReadStateService {
         (artifact.last_checkpoint >= vct_applied_below).then_some((artifact, vct_applied_below))
     }
 
+    /// Whether a published frontier grid is loaded to anchor derivation on.
+    fn has_historical_frontier_grid(&self) -> bool {
+        self.historical_trees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_checkpoint()
+            .is_some()
+    }
+
     /// Refuses a frontier grid that ends below this database's durable VCT handoff.
     ///
     /// Construction already makes this comparison, but the durable marker can be written after the
@@ -2008,7 +2017,7 @@ impl LoadedHistoricalFrontierArtifact {
         config: &Config,
         db: &ZakuraDb,
     ) -> Result<Arc<Mutex<read::HistoricalTreeCache>>, StateInitError> {
-        if config.derive_historical_trees {
+        if config.derive_historical_trees() {
             if let Some((artifact_checkpoint, vct_handoff)) =
                 frontier_grid_ends_before_vct_handoff(self.last_checkpoint, db.vct_synced_below())
             {
@@ -2043,18 +2052,22 @@ fn frontier_grid_ends_before_vct_handoff(
 
 /// Loads the configured frontier grid into a fresh derivation cache.
 ///
-/// When [`Config::derive_historical_trees`] is off, a missing, unreadable, or invalid artifact is
-/// a warning: the grid is unused. When derivation is on, the same failure is fatal. The grid
-/// carries no trust weight — every entry is root-checked before it anchors anything — but without
-/// one a cold request on a from-scratch snapshot replays the entire absent band, so serving
-/// refuses to start rather than take that path.
+/// Configuring no artifact is always fine: a node that derives ([`Config::derive_historical_trees`])
+/// simply keeps reporting the absent band as unavailable, because without a grid a cold request
+/// would replay the whole band. Configuring one that cannot be read or decoded is fatal for a node
+/// that derives, and a warning for one that does not, which would never have read it. The grid
+/// carries no trust weight — every entry is root-checked before it anchors anything — so refusing
+/// to start is about the operator's own broken path, not about the file's contents.
 fn load_historical_frontier_artifact(
     network: &Network,
     config: &Config,
 ) -> Result<LoadedHistoricalFrontierArtifact, StateInitError> {
     let Some(path) = config.historical_frontier_artifact.as_ref() else {
-        if config.derive_historical_trees {
-            return Err(StateInitError::HistoricalFrontierArtifactRequired);
+        if config.derive_historical_trees() {
+            tracing::info!(
+                "historical tree derivation is idle: set state.historical_frontier_artifact to \
+                 serve treestates below the checkpoint handoff"
+            );
         }
 
         return Ok(LoadedHistoricalFrontierArtifact {
@@ -2085,7 +2098,7 @@ fn load_historical_frontier_artifact(
                 ))),
             })
         }
-        Err(source) if config.derive_historical_trees => {
+        Err(source) if config.derive_historical_trees() => {
             Err(StateInitError::HistoricalFrontierArtifact {
                 path: path.clone(),
                 source,
@@ -2113,15 +2126,16 @@ fn historical_frontiers(
     hash_or_height: HashOrHeight,
     unavailable: HistoricalTreeUnavailable,
 ) -> Result<Arc<read::DerivedFrontiers>, BoxError> {
-    let config = state.db.config();
-    if !config.derive_historical_trees {
+    // Archive mode is part of this: replay needs every block body from the selected anchor through
+    // the requested height, and pruned mode does not guarantee that range.
+    if !state.db.config().derive_historical_trees() {
         return Err(unavailable.into());
     }
 
-    // Replay needs every block body from the selected anchor through the requested height.
-    // Pruned mode does not guarantee that range, so fail with the typed archive-mode error rather
-    // than walking it until the first missing body.
-    if config.pruning_config().is_some() {
+    // Derivation anchors on the published grid. Without one the nearest anchor is the stored
+    // frontier below the absent band, so a cold request would replay the band end to end — the
+    // cost this design exists to avoid. Report the band as unavailable instead.
+    if !state.has_historical_frontier_grid() {
         return Err(unavailable.into());
     }
 
@@ -2140,7 +2154,7 @@ fn historical_frontiers(
         &state.db,
         &state.historical_trees,
         height,
-        config.max_historical_tree_replay_blocks,
+        MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
     )
     .map_err(BoxError::from)
 }

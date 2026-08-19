@@ -2308,6 +2308,14 @@ impl HeaderChainRuntime {
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
             .active_references(Instant::now());
 
+        // The state writer binds checkpoint finality evidence to the durable version it read,
+        // and the auxiliary transition below advances that version. Provenance therefore has
+        // to be checked against the pre-auxiliary snapshot the writer actually authorized.
+        let before = transition_engine.snapshot();
+        if checkpoint_request.expected_version == before.state_version {
+            validate_full_state_finality_provenance(&checkpoint_request.event, &before)?;
+        }
+
         let first_authority = StateIssuedAuthority {
             inner: first_context.full_state_authority,
             validation_leases: &[],
@@ -2390,10 +2398,6 @@ impl HeaderChainRuntime {
         }
 
         let expected_version = transition_engine.snapshot().state_version;
-        validate_full_state_finality_provenance(
-            &checkpoint_request.event,
-            &transition_engine.snapshot(),
-        )?;
         let TransitionEvent::VerifiedChainChanged(checkpoint_event) = checkpoint_request.event
         else {
             return Err(HeaderChainStoreError::Incoherent(

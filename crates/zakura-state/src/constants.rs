@@ -39,16 +39,19 @@ pub const STATE_DATABASE_KIND: &str = "state";
 /// get the network-specific floor.
 pub const MIN_PRUNING_RETENTION: u32 = 10_000;
 
-/// The default backstop on how many blocks one historical note commitment tree derivation may
-/// replay.
+/// The backstop on how many blocks one historical note commitment tree derivation may replay.
 ///
-/// Grid spacing is the operative bound on request cost: serving requires a frontier artifact, so
-/// a cold request replays from the nearest grid entry rather than across the absent band. This
-/// default is intentionally larger than any reasonable grid gap, so it does not become the bound
-/// in normal serving. It is a safety backstop: a gappy artifact or a missed grid load cannot
-/// occupy a thread indefinitely. The `audit-historical-treestates` walk uses the same constant so
-/// a grid-free measurement can still cover the band.
-pub const DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS: u64 = 4_000_000;
+/// Grid spacing is the operative bound on request cost: serving anchors on a frontier grid, so a
+/// cold request replays from the nearest grid entry rather than across the absent band. This value
+/// is intentionally larger than any reasonable grid gap, so it does not become the bound in normal
+/// serving. It is a safety backstop: a gappy artifact or a missed grid load cannot occupy a thread
+/// indefinitely. The `audit-historical-treestates` walk uses the same constant so a grid-free
+/// measurement can still cover the band.
+///
+/// Deliberately a constant rather than a setting. It bounds nothing an operator picks: the grid an
+/// operator does pick is what decides replay cost, and no value of this backstop makes a node with
+/// a gappy grid serve faster or a node with a dense one serve more.
+pub const MAX_HISTORICAL_TREE_REPLAY_BLOCKS: u64 = 4_000_000;
 
 /// The minimum retention window allowed in pruned storage mode on `network`.
 ///

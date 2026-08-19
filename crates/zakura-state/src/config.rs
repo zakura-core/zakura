@@ -20,8 +20,8 @@ use zakura_chain::{common::default_cache_dir, parameters::Network};
 
 use crate::{
     constants::{
-        min_pruning_retention, DATABASE_FORMAT_VERSION_FILE_NAME,
-        DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MIN_PRUNING_RETENTION, STATE_DATABASE_KIND,
+        min_pruning_retention, DATABASE_FORMAT_VERSION_FILE_NAME, MIN_PRUNING_RETENTION,
+        STATE_DATABASE_KIND,
     },
     service::finalized_state::restorable_db_versions,
     state_database_format_version_in_code, BoxError,
@@ -146,45 +146,19 @@ pub struct Config {
     #[serde(skip)]
     pub vct_fast_sync: bool,
 
-    /// Whether to rebuild historical note commitment trees on demand for RPC queries.
-    ///
-    /// Set to `false` by default. A verified-commitment-trees fast-synced node never wrote
-    /// per-height trees below the checkpoint handoff, so `z_gettreestate` and the `trees` sizes in
-    /// `getblock`/`getblockheader` fail across that band. When this is `true`, those queries are
-    /// answered by replaying retained block bodies forward from the nearest frontier the node
-    /// already holds, and the result is served only if it reproduces the authenticated root the
-    /// node already stores. Derived frontiers are cached, so a wallet scanning forward pays for
-    /// one batch of replay per request rather than one sweep of the band.
-    ///
-    /// Enabling this requires [`Self::historical_frontier_artifact`]: without a grid, a cold
-    /// request on a from-scratch snapshot replays the entire absent band. Startup fails closed
-    /// rather than serving that path. [`Self::max_historical_tree_replay_blocks`] is then a
-    /// backstop on replay from the nearest grid entry. Replay reads block bodies, so this has no
-    /// effect in [`StorageMode::Pruned`]: those queries still return the typed archive-mode error.
-    pub derive_historical_trees: bool,
-
     /// Path to a frontier artifact used to anchor historical tree derivation.
     ///
-    /// Set to `None` by default. Required when [`Self::derive_historical_trees`] is `true`:
-    /// startup refuses that pairing so a cold request cannot fall through to a full-band replay.
+    /// Set to `None` by default, which leaves derivation idle. A node that derives
+    /// ([`Self::derive_historical_trees`]) but holds no grid would have to replay the whole absent
+    /// band to answer a cold request, so it keeps returning the typed archive-mode error instead.
     /// The artifact holds note commitment frontiers at a sparse height grid, so a cold request
-    /// replays from the nearest grid entry instead of from genesis. Every entry is checked against
+    /// replays from the nearest grid entry rather than from genesis. Every entry is checked against
     /// the authenticated root this node already stores before it is used, so a corrupt or hostile
     /// artifact is rejected rather than absorbed, and the file needs no trust of its own.
     ///
     /// Completed subtree roots need no equivalent setting: they ship embedded in the binary and
     /// are loaded without operator configuration.
     pub historical_frontier_artifact: Option<PathBuf>,
-
-    /// The most blocks one historical tree derivation may replay.
-    ///
-    /// Set to [`DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS`] by default. Grid spacing is the
-    /// operative bound: derivation requires [`Self::historical_frontier_artifact`], so a cold
-    /// request replays from the nearest grid entry. This limit is a backstop above that spacing,
-    /// so a gappy artifact or a bug cannot occupy a thread indefinitely. A request needing a
-    /// longer replay fails instead. Lower it to cap cost more tightly than the grid; raising it
-    /// is only useful if the artifact has gaps larger than the default.
-    pub max_historical_tree_replay_blocks: u64,
 
     /// Whether to delete the old database directories when present.
     ///
@@ -337,24 +311,23 @@ impl Config {
         Ok(())
     }
 
-    /// Validates historical tree derivation settings.
+    /// Whether this node rebuilds historical note commitment trees on demand for RPC queries.
     ///
-    /// Derivation without a frontier grid can replay the entire absent band on a from-scratch
-    /// snapshot, so [`Self::derive_historical_trees`] is refused unless
-    /// [`Self::historical_frontier_artifact`] is set.
+    /// True exactly when a verified-commitment-trees fast-synced node keeps every block body:
+    /// that pairing is what makes derivation both necessary and possible. Fast sync stored no
+    /// per-height tree below the checkpoint handoff, so `z_gettreestate` and the `trees` sizes in
+    /// `getblock`/`getblockheader` have nothing to read across that band, and archive mode is what
+    /// retains the bodies a replay reads. [`StorageMode::Pruned`] keeps returning the typed
+    /// archive-mode error there, because the bodies below its retention window are gone.
     ///
-    /// # Errors
-    ///
-    /// Returns an error when derivation is enabled and no artifact path is configured.
-    pub fn validate_historical_tree_derivation(&self) -> Result<(), BoxError> {
-        if self.derive_historical_trees && self.historical_frontier_artifact.is_none() {
-            return Err(
-                "state.derive_historical_trees = true requires state.historical_frontier_artifact"
-                    .into(),
-            );
-        }
-
-        Ok(())
+    /// This is derived rather than configured because it grants no capability an operator needs to
+    /// weigh: a derived frontier is served only when it reproduces the authenticated root this node
+    /// already stores, so the answer is verified rather than trusted, and a node that can answer a
+    /// treestate query correctly has no reason to refuse it. What an operator does choose is the
+    /// cost bound: derivation anchors on [`Self::historical_frontier_artifact`] and stays idle
+    /// without one, and [`crate::MAX_HISTORICAL_TREE_REPLAY_BLOCKS`] backstops a gappy grid.
+    pub fn derive_historical_trees(&self) -> bool {
+        self.checkpoint_sync && self.vct_fast_sync && self.pruning_config().is_none()
     }
 }
 
@@ -491,9 +464,7 @@ impl Default for Config {
             enable_zakura_header_seed_from_committed_blocks: false,
             checkpoint_sync: true,
             vct_fast_sync: true,
-            derive_historical_trees: false,
             historical_frontier_artifact: None,
-            max_historical_tree_replay_blocks: DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,
@@ -576,39 +547,54 @@ mod tests {
     }
 
     #[test]
-    fn derive_historical_trees_requires_frontier_artifact() {
+    fn historical_tree_derivation_follows_storage_mode_and_vct() {
         assert!(
-            Config::default()
-                .validate_historical_tree_derivation()
-                .is_ok(),
-            "the default (derivation off, no artifact) must stay valid"
+            Config::default().derive_historical_trees(),
+            "an archive node on the VCT fast path can rebuild the trees it skipped storing"
         );
 
-        let derive_without_artifact = Config {
-            derive_historical_trees: true,
-            ..Config::default()
-        };
-        let error = derive_without_artifact
-            .validate_historical_tree_derivation()
-            .expect_err("derivation without an artifact must fail closed");
-        assert!(
-            error.to_string().contains(
-                "state.derive_historical_trees = true requires state.historical_frontier_artifact"
-            ),
-            "unexpected error: {error}"
-        );
-
-        let derive_with_artifact = Config {
-            derive_historical_trees: true,
-            historical_frontier_artifact: Some(PathBuf::from("/tmp/frontiers.bin")),
+        let legacy_recompute = Config {
+            vct_fast_sync: false,
             ..Config::default()
         };
         assert!(
-            derive_with_artifact
-                .validate_historical_tree_derivation()
-                .is_ok(),
-            "derivation with an artifact path configured must be accepted"
+            !legacy_recompute.derive_historical_trees(),
+            "a node that recomputes every per-height tree has no absent band to derive"
         );
+
+        let full_verification = Config {
+            checkpoint_sync: false,
+            ..Config::default()
+        };
+        assert!(
+            !full_verification.derive_historical_trees(),
+            "without checkpoint sync the VCT mirror is inert, so no band is skipped"
+        );
+
+        let pruned = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            ..Config::default()
+        };
+        assert!(
+            !pruned.derive_historical_trees(),
+            "replay reads block bodies that pruned mode deletes"
+        );
+    }
+
+    #[test]
+    fn retired_historical_tree_settings_are_rejected() {
+        // Both keys were only ever available in pre-release builds, so a config carrying one is a
+        // preview config that must be updated. Silently ignoring it would leave an operator
+        // believing they had turned derivation off, or capped its replay.
+        for retired in [
+            "derive_historical_trees = true",
+            "max_historical_tree_replay_blocks = 100",
+        ] {
+            assert!(
+                toml::from_str::<Config>(retired).is_err(),
+                "{retired} is no longer a state setting and must not parse"
+            );
+        }
     }
 }
 

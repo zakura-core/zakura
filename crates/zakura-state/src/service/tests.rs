@@ -38,21 +38,22 @@ use crate::{
 const LAST_BLOCK_HEIGHT: u32 = 10;
 
 #[tokio::test]
-async fn historical_frontier_configuration_errors_are_returned_from_state_init() {
+async fn state_init_does_not_require_a_frontier_grid() {
     let network = Network::Mainnet;
-    let config = Config {
-        derive_historical_trees: true,
-        ..Config::ephemeral()
-    };
+    let config = Config::ephemeral();
+    assert!(
+        config.derive_historical_trees(),
+        "an ephemeral archive config derives, so this covers the deriving case"
+    );
 
-    assert!(matches!(
-        super::init_read_only(config.clone(), &network),
-        Err(StateInitError::HistoricalFrontierArtifactRequired)
-    ));
-    assert!(matches!(
-        super::init(config, &network, Height::MAX, 0).await,
-        Err(StateInitError::HistoricalFrontierArtifactRequired)
-    ));
+    assert!(
+        super::init_read_only(config.clone(), &network).is_ok(),
+        "a deriving node without a grid starts and reports the absent band as unavailable"
+    );
+    assert!(
+        super::init(config, &network, Height::MAX, 0).await.is_ok(),
+        "a deriving node without a grid starts and reports the absent band as unavailable"
+    );
 }
 
 #[tokio::test]
@@ -61,7 +62,6 @@ async fn historical_frontier_load_errors_are_returned_from_state_init() {
     let temp_dir = tempfile::tempdir().expect("temporary directory is created");
     let missing_path = temp_dir.path().join("missing.bin");
     let missing_config = Config {
-        derive_historical_trees: true,
         historical_frontier_artifact: Some(missing_path.clone()),
         ..Config::ephemeral()
     };
@@ -75,15 +75,25 @@ async fn historical_frontier_load_errors_are_returned_from_state_init() {
     std::fs::write(&corrupt_path, b"not a frontier artifact")
         .expect("corrupt test artifact is written");
     let corrupt_config = Config {
-        derive_historical_trees: true,
         historical_frontier_artifact: Some(corrupt_path.clone()),
         ..Config::ephemeral()
     };
 
     assert!(matches!(
-        super::init(corrupt_config, &network, Height::MAX, 0).await,
+        super::init(corrupt_config.clone(), &network, Height::MAX, 0).await,
         Err(StateInitError::HistoricalFrontierArtifact { path, .. }) if path == corrupt_path
     ));
+
+    // A node that does not derive never reads the file, so the same broken path is a warning
+    // rather than a refusal to start.
+    let legacy_recompute = Config {
+        vct_fast_sync: false,
+        ..corrupt_config
+    };
+    assert!(
+        super::init_read_only(legacy_recompute, &network).is_ok(),
+        "an unusable grid must not stop a node that would never have read it"
+    );
 }
 
 #[test]
@@ -122,7 +132,6 @@ fn historical_frontier_artifact_must_cover_the_database_vct_handoff() {
 
     let stale_path = artifact_path(Height(9));
     let stale_config = Config {
-        derive_historical_trees: true,
         historical_frontier_artifact: Some(stale_path.clone()),
         ..state_config.clone()
     };
@@ -139,7 +148,6 @@ fn historical_frontier_artifact_must_cover_the_database_vct_handoff() {
 
     for checkpoint in [vct_handoff, Height(11)] {
         let config = Config {
-            derive_historical_trees: true,
             historical_frontier_artifact: Some(artifact_path(checkpoint)),
             ..state_config.clone()
         };
@@ -218,7 +226,6 @@ fn historical_frontier_coverage_is_rechecked_once_the_vct_marker_exists() {
         .expect("historical frontier artifact is written");
 
     let config = Config {
-        derive_historical_trees: true,
         historical_frontier_artifact: Some(artifact_path),
         ..Config::ephemeral()
     };

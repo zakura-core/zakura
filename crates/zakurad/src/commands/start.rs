@@ -355,10 +355,6 @@ impl StartCmd {
             .state
             .validate_storage_mode(&config.network.network)
             .map_err(|error| eyre!("invalid state storage configuration: {error}"))?;
-        config
-            .state
-            .validate_historical_tree_derivation()
-            .map_err(|error| eyre!("invalid state configuration: {error}"))?;
 
         let (_, max_checkpoint_height) = zakura_consensus::router::init_checkpoint_list(
             config.consensus.clone(),
@@ -1187,10 +1183,6 @@ impl config::Override<ZakuradConfig> for StartCmd {
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         Self::validate_debug_blocksync_throughput_config(&config)
             .map_err(|err| std::io::Error::other(err.to_string()))?;
-        config
-            .state
-            .validate_historical_tree_derivation()
-            .map_err(|err| std::io::Error::other(format!("invalid state configuration: {err}")))?;
 
         Ok(config)
     }
@@ -1319,41 +1311,6 @@ mod tests {
 
         cmd.override_config(config)
             .expect("checkpoint_sync = false with vct_fast_sync unset is a valid config");
-    }
-
-    #[test]
-    fn derive_historical_trees_requires_frontier_artifact_at_startup() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZakuradConfig::default();
-        config.state.derive_historical_trees = true;
-
-        let error = cmd.override_config(config).expect_err(
-            "startup should reject historical tree derivation without a frontier artifact",
-        );
-
-        assert!(
-            error.to_string().contains(
-                "invalid state configuration: state.derive_historical_trees = true requires state.historical_frontier_artifact"
-            ),
-            "unexpected error: {error}"
-        );
-
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZakuradConfig::default();
-        config.state.derive_historical_trees = true;
-        config.state.historical_frontier_artifact =
-            Some(std::path::PathBuf::from("/tmp/frontiers.bin"));
-
-        cmd.override_config(config)
-            .expect("derive_historical_trees with a configured artifact path is a valid config");
     }
 
     #[test]

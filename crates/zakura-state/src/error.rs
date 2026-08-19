@@ -132,14 +132,13 @@ pub enum HistoricalSubtreeUnavailableReason {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
-    /// Historical tree derivation was enabled without configuring its required frontier artifact.
-    #[error("state.derive_historical_trees = true requires state.historical_frontier_artifact")]
-    HistoricalFrontierArtifactRequired,
-
     /// The configured historical frontier artifact could not be read or decoded.
+    ///
+    /// Only nodes that derive historical trees reach this. A node that does not derive ignores an
+    /// unusable artifact, because nothing would have read it.
     #[error(
-        "state.derive_historical_trees = true but the historical frontier artifact at {path:?} \
-         could not be loaded: {source}"
+        "the historical frontier artifact configured at {path:?} could not be loaded: {source}. \
+         Hint: remove state.historical_frontier_artifact to serve without it"
     )]
     HistoricalFrontierArtifact {
         /// Artifact path that failed to load.

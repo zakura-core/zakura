@@ -203,7 +203,7 @@ requested height, replay exceeding its bound, or a derived root failing its chec
 node returns it immediately rather than walking the range until the first missing body.
 
 Serving is idle rather than fail-closed when no grid is configured, so a cold request can
-never replay the entire absent band. A grid that *is* configured and cannot be read, or that
+never replay the entire absent band. A grid that _is_ configured and cannot be read, or that
 ends below this database's own fast-sync handoff, still fails at startup: that is the
 operator's own path being wrong, not the file's contents being untrusted.
 

@@ -38,7 +38,7 @@ whole-band replay — hours on Mainnet.
 
 The importer requires every bundle to carry all four files and fails closed on one that does not,
 so the publisher has to be updated around the same time as the repository. It cannot be updated
-*first*: `deploy-snapshot-host.sh` refuses to install an exporter whose revision is not already an
+_first_: `deploy-snapshot-host.sh` refuses to install an exporter whose revision is not already an
 ancestor of `origin/main`, which is a supply-chain control worth keeping.
 
 So the order is:

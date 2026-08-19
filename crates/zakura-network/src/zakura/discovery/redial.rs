@@ -155,7 +155,7 @@ async fn run_dial_supervisor<F>(
             .iter()
             .any(|id| id == &peer_id);
 
-        let attempt = if already_registered {
+        let mut attempt = if already_registered {
             if !policy.redial_after_drop {
                 // Wait for it to deregister, then re-dial promptly.
                 tokio::select! {
@@ -187,16 +187,12 @@ async fn run_dial_supervisor<F>(
             // connection this loop just dialed often lands after the dial
             // future returns. Resetting the backoff on that registration made
             // every such peer re-dial at once, forever.
-            let registered_at = Instant::now();
-            loop {
-                if registered.changed().await.is_err() {
-                    return;
-                }
-                if !registered.borrow().iter().any(|id| id == &peer_id) {
-                    break;
-                }
-            }
-            if registered_at.elapsed() >= ZAKURA_REDIAL_HEALTHY_CONNECTION {
+            let Some(registered_for) =
+                wait_for_peer_deregistration(&mut registered, &peer_id).await
+            else {
+                return;
+            };
+            if registered_for >= ZAKURA_REDIAL_HEALTHY_CONNECTION {
                 DialResult::Healthy
             } else {
                 DialResult::Failed
@@ -204,6 +200,27 @@ async fn run_dial_supervisor<F>(
         } else {
             dial().await
         };
+
+        // The connection deregistration can land after the dial future returns.
+        // Wait for the watch to catch up before applying this attempt's result,
+        // so the residual registration does not become a second attempt on the
+        // next loop iteration. A concurrent registration that remains healthy
+        // can still upgrade a failed dial to a healthy connection.
+        if policy.redial_after_drop
+            && registered
+                .borrow_and_update()
+                .iter()
+                .any(|id| id == &peer_id)
+        {
+            let Some(registered_for) =
+                wait_for_peer_deregistration(&mut registered, &peer_id).await
+            else {
+                return;
+            };
+            if registered_for >= ZAKURA_REDIAL_HEALTHY_CONNECTION {
+                attempt = DialResult::Healthy;
+            }
+        }
 
         match attempt {
             DialResult::Healthy => {
@@ -242,6 +259,27 @@ async fn run_dial_supervisor<F>(
             }
         }
         backoff = backoff.saturating_mul(2).min(policy.max_backoff);
+    }
+}
+
+/// Wait until `peer_id` leaves the registration watch.
+///
+/// Returns how long the peer remained registered after this observer first saw
+/// it, or `None` when the sender closes while the peer remains registered.
+async fn wait_for_peer_deregistration(
+    registered: &mut tokio::sync::watch::Receiver<Vec<ZakuraPeerId>>,
+    peer_id: &ZakuraPeerId,
+) -> Option<Duration> {
+    let registered_at = Instant::now();
+    loop {
+        registered.changed().await.ok()?;
+        if !registered
+            .borrow_and_update()
+            .iter()
+            .any(|id| id == peer_id)
+        {
+            return Some(registered_at.elapsed());
+        }
     }
 }
 
@@ -411,6 +449,51 @@ mod tests {
         supervisor.abort();
     }
 
+    /// A lagging deregistration must not turn one healthy connection into a
+    /// second failed attempt.
+    #[tokio::test(start_paused = true)]
+    async fn dial_supervisor_maintain_preserves_healthy_result_while_deregistration_lags() {
+        let peer_id = redial_test_peer_id();
+        let (registered_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let dial_calls = calls.clone();
+        let dial_peer_id = peer_id.clone();
+        let dial = move || {
+            let call = dial_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let registered_tx = registered_tx.clone();
+            let dial_peer_id = dial_peer_id.clone();
+            Box::pin(async move {
+                if call > 0 {
+                    return std::future::pending().await;
+                }
+
+                let _ = registered_tx.send(vec![dial_peer_id]);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    let _ = registered_tx.send(Vec::new());
+                });
+                DialResult::Healthy
+            }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
+        };
+
+        let supervisor = tokio::spawn(run_dial_supervisor(
+            peer_id,
+            registered,
+            RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(30)),
+            dial,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        supervisor.abort();
+
+        assert_eq!(
+            dial_count(&calls),
+            2,
+            "a healthy connection must reset backoff after its registration disappears",
+        );
+    }
+
     /// A bootstrap peer that shares no service beyond discovery closes every
     /// connection as soon as the discovery exchange completes. The maintained
     /// dial must back off on that, not re-dial at once forever.
@@ -451,12 +534,12 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(60)).await;
         supervisor.abort();
 
-        // Backing off 1s, 2s, 4s, ... to the 30s ceiling allows a handful of
-        // dials per minute. Without backoff the loop re-dials every 51ms.
-        let dials = dial_count(&calls);
-        assert!(
-            dials <= 8,
-            "a peer that closes every connection must be backed off, but it was dialed {dials} times in 60s",
+        // Backing off 1s, 2s, 4s, ... to the 30s ceiling allows six dials in
+        // one minute. Without backoff the loop re-dials every 51ms.
+        assert_eq!(
+            dial_count(&calls),
+            6,
+            "a peer that closes every connection must use one backoff step per dial",
         );
     }
 }

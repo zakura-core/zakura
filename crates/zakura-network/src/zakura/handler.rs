@@ -1866,6 +1866,7 @@ pub(crate) struct NativeHandshakeNegotiated {
     pub(crate) accepted_capabilities: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn service_registry(
     _supervisor: &ZakuraSupervisorHandle,
     header_sync: Option<super::HeaderSyncHandle>,

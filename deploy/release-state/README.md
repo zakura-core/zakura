@@ -37,7 +37,7 @@ whole-band replay — hours on Mainnet.
 ## Cutover order
 
 This change makes the publisher emit `mainnet-frontier-grid.bin`. Import and provenance checks that
-*require* the fourth file land in a follow-up, so today's importer still accepts a three-file
+_require_ the fourth file land in a follow-up, so today's importer still accepts a three-file
 bundle and a four-file one alike. Deploy when convenient after merge:
 
 1. Merge this repository change.

@@ -108,7 +108,8 @@ pub use service::finalized_state::{
     validate_final_frontiers_bytes, FinalFrontiersGenerationError, FinalFrontiersValidationError,
 };
 pub use service::finalized_state::{
-    produce_release_treestate_artifacts, verify_subtree_artifact, FrontierArtifact, FrontierEntry,
+    export_frontier_grid_to, produce_release_treestate_artifacts, verify_subtree_artifact,
+    FrontierArtifact, FrontierEntry, FrontierGridExport, FrontierGridExportError, GridSpacing,
     ReleaseTreestateArtifacts, ReleaseTreestateArtifactsError, SubtreeArtifact, SubtreeRecord,
     TreestateArtifactError, VerifiedSubtreeCounts,
 };

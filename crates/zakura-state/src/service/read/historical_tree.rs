@@ -30,7 +30,7 @@ use zakura_chain::{
 
 use zakura_chain::subtree::NoteCommitmentSubtreeIndex;
 
-use crate::service::finalized_state::{TransactionLocation, ZakuraDb};
+use crate::service::finalized_state::{serve_block_roots, TransactionLocation, ZakuraDb};
 
 /// The most derived frontiers to keep memoized per node.
 ///
@@ -377,6 +377,69 @@ fn anchor_for(
     )))
 }
 
+
+/// Returns the stored frontier immediately before the absent band, if the band starts above
+/// genesis.
+///
+/// `height` identifies the derivation or export that needs the anchor in any returned error.
+/// `None` means the absent band starts at genesis, so replay must start from empty frontiers.
+pub(crate) fn stored_frontier_before_absent_band(
+    db: &ZakuraDb,
+    height: Height,
+) -> Result<Option<(Height, DerivedFrontiers)>, HistoricalTreeDerivationError> {
+    // Below the upgrade height `U` this binary did not run, so per-height trees are present. The
+    // tree at `U - 1` is therefore the last stored frontier before the absent band starts.
+    let Some(upgrade) = db.vct_upgrade_height().filter(|upgrade| upgrade.0 > 0) else {
+        return Ok(None);
+    };
+
+    let anchor = Height(upgrade.0 - 1);
+    // Rollback can move the tip below the write-once upgrade marker. In that case a backwards tree
+    // lookup would return a retained row below the rollback target and mislabel it as `anchor`.
+    if db
+        .finalized_tip_height()
+        .is_none_or(|tip_height| anchor > tip_height)
+    {
+        return Err(HistoricalTreeDerivationError::MissingAnchor { height, anchor });
+    }
+
+    // The tip check above establishes that the chain still reaches `anchor`, so the newest stored
+    // row at or below it is its state rather than a pre-rollback leftover.
+    let frontiers = stored_frontiers_at(db, anchor)
+        .map_err(|_| HistoricalTreeDerivationError::MissingAnchor { height, anchor })?;
+
+    Ok(Some((anchor, frontiers)))
+}
+
+/// Returns the per-height trees the database stores at `height`.
+///
+/// Unchanged trees are deduplicated, so the newest stored row at or below `height` is the state
+/// at `height`. That holds only where the database actually stores trees: callers must not use
+/// this inside a fast-synced database's absent band, where the newest row below the requested
+/// height belongs to a different stretch of the chain entirely. Genesis writes a row for every
+/// pool, so a pool with no activity yet still resolves to its empty tree.
+pub(crate) fn stored_frontiers_at(
+    db: &ZakuraDb,
+    height: Height,
+) -> Result<DerivedFrontiers, HistoricalTreeDerivationError> {
+    let (Some(sapling), Some(orchard), Some(ironwood)) = (
+        db.latest_stored_sapling_tree(&height),
+        db.latest_stored_orchard_tree(&height),
+        db.latest_stored_ironwood_tree(&height),
+    ) else {
+        return Err(HistoricalTreeDerivationError::MissingAnchor {
+            height,
+            anchor: height,
+        });
+    };
+
+    Ok(DerivedFrontiers {
+        sapling,
+        orchard,
+        ironwood,
+    })
+}
+
 /// Appends the note commitments of blocks `replay_from..=height` to `frontiers`, reporting every
 /// subtree that completes along the way.
 ///
@@ -542,6 +605,34 @@ pub fn verify_against_index(
     }
 }
 
+
+/// Checks `frontiers` against the best roots the database can produce for `height`.
+///
+/// Generation-only. It differs from [`verify_against_index`] in one place: below the upgrade
+/// marker, where the serving index has no rows because an older binary committed those blocks,
+/// it falls back to roots derived from the per-height trees. There the check is a consistency
+/// check rather than an independent one, since the roots come from the same trees the entry does.
+/// That is acceptable precisely because the artifact carries no trust of its own — the consumer
+/// re-checks every entry against roots authenticated by its own header chain before anchoring on
+/// it, and a consumer's absent band never overlaps a range where it has trees of its own.
+pub(crate) fn verify_against_available_roots(
+    db: &ZakuraDb,
+    height: Height,
+    frontiers: &DerivedFrontiers,
+) -> Result<(), HistoricalTreeDerivationError> {
+    let roots = serve_block_roots(db, height..=height)
+        .into_iter()
+        .next()
+        .filter(|roots| roots.height == height)
+        .ok_or(HistoricalTreeDerivationError::MissingAuthenticatedRoot { height })?;
+
+    if frontiers.matches(&roots) {
+        Ok(())
+    } else {
+        Err(HistoricalTreeDerivationError::RootMismatch { height })
+    }
+}
+
 /// Returns the authenticated per-pool roots stored for `height`.
 fn authenticated_roots(
     db: &ZakuraDb,
@@ -552,4 +643,52 @@ fn authenticated_roots(
         .next()
         .filter(|roots| roots.height == height)
         .ok_or(HistoricalTreeDerivationError::MissingAuthenticatedRoot { height })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::{block::Height, parameters::Network};
+
+    use crate::{
+        config::Config,
+        constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+        service::finalized_state::{DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE},
+    };
+
+    use super::*;
+
+    fn ephemeral_db() -> ZakuraDb {
+        ZakuraDb::new(
+            &Config::ephemeral(),
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &Network::Mainnet,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .expect("opening an ephemeral database should succeed")
+    }
+
+    #[test]
+    fn genesis_absent_band_has_no_stored_predecessor() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_db();
+
+        assert!(stored_frontier_before_absent_band(&db, Height(0))
+            .expect("an unset upgrade marker starts replay at genesis")
+            .is_none());
+
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_upgrade_marker(&db, Height(0));
+        db.write_batch(batch)
+            .expect("seeding a genesis upgrade marker succeeds");
+
+        assert!(stored_frontier_before_absent_band(&db, Height(0))
+            .expect("a genesis upgrade starts replay at genesis")
+            .is_none());
+    }
 }

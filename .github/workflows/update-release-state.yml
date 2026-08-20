@@ -14,7 +14,7 @@ on:
         required: false
         default: "48"
   schedule:
-    # Weekly refresh; the publisher exports daily alongside the snapshot job.
+    # Weekly refresh; the publisher exports daily on its own timer.
     - cron: "0 6 * * 1"
 
 permissions: {}
@@ -67,7 +67,9 @@ jobs:
 
       # Subtree roots are interior tree nodes, so framing and append-only checks cannot prove their
       # values. Prove every required subtree artifact against its matching bundle frontier before
-      # importing either file.
+      # importing either file. The frontier grid needs no such proof — a node root-checks every
+      # entry before using one — but it is checked here for framing and for covering the same
+      # checkpoint as the rest of the bundle.
       - name: Prove the bundle's subtree roots against its own frontier
         env:
           BUNDLE: ${{ runner.temp }}/release-state-bundle
@@ -77,7 +79,8 @@ jobs:
             verify-historical-treestates \
             --network Mainnet \
             --subtree-input "$BUNDLE/mainnet-treestate-subtrees.bin" \
-            --frontier-input "$BUNDLE/mainnet-frontier.bin"
+            --frontier-input "$BUNDLE/mainnet-frontier.bin" \
+            --frontier-grid-input "$BUNDLE/mainnet-frontier-grid.bin"
 
       - name: Import checkpoints, frontier, subtrees, and provenance
         id: import
@@ -125,6 +128,7 @@ jobs:
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
           crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier-grid.bin
           crates/zakurad/src/components/sync/end_of_support.rs
           EOF
           UNEXPECTED=$(comm -23 "$RUNNER_TEMP/actual-files" "$RUNNER_TEMP/allowed-files")
@@ -141,6 +145,20 @@ jobs:
             echo "Checkpoint update removed ${REMOVED} committed lines; refusing." >&2
             exit 1
           fi
+
+          # The frontier grid is append-only too. The importer already refuses a payload that is
+          # not a byte prefix of the committed one; this is the cheap size-side backstop, which
+          # also catches a grid replaced wholesale by a shorter one.
+          GRID=crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier-grid.bin
+          if [ -s "$GRID" ]; then
+            NEW_GRID_BYTES=$(wc -c < "$GRID")
+            OLD_GRID_BYTES=$(git cat-file -s "HEAD:$GRID" 2>/dev/null || echo 0)
+            if [ "$NEW_GRID_BYTES" -lt "$OLD_GRID_BYTES" ]; then
+              echo "Frontier grid shrank from ${OLD_GRID_BYTES} to ${NEW_GRID_BYTES} bytes; refusing." >&2
+              exit 1
+            fi
+          fi
+
           git diff --stat HEAD
 
       - name: Create release GitHub App token
@@ -167,7 +185,7 @@ jobs:
           base: main
           title: "chore(chain): update Mainnet release state"
           body: |
-            Updates the embedded Mainnet checkpoint list, matching VCT frontier, subtree roots, and provenance record from one immutable release-state bundle. It also floors the end-of-support estimate.
+            Updates the embedded Mainnet checkpoint list, matching VCT frontier, subtree roots, historical frontier grid, and provenance record from one immutable release-state bundle. It also floors the end-of-support estimate.
 
             - Finalized height: `${{ steps.import.outputs.height }}`
             - Finalized hash: `${{ steps.import.outputs.block_hash }}`

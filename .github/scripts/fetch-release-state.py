@@ -37,6 +37,9 @@ FILE_LIMITS = {
     "main-checkpoints.txt": 4 * 1024 * 1024,
     "mainnet-frontier.bin": 1 * 1024 * 1024,
     "mainnet-treestate-subtrees.bin": 8 * 1024 * 1024,
+    # The cost-weighted grid measures ~3.3 MB on Mainnet. The cap leaves room for a
+    # uniform-spacing run, which is larger, without accepting an unbounded download.
+    "mainnet-frontier-grid.bin": 32 * 1024 * 1024,
 }
 LATEST_REQUIRED_KEYS = {
     "schema_version",
@@ -289,6 +292,7 @@ def _self_test() -> int:
     checkpoints = b"0 00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08\n"
     frontier = b"\x36\x3d\x33\x00frontier"
     subtrees = b"subtree roots"
+    frontier_grid = b"frontier grid"
     now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
 
     def build(
@@ -301,6 +305,7 @@ def _self_test() -> int:
             "main-checkpoints.txt": checkpoints,
             "mainnet-frontier.bin": frontier,
             "mainnet-treestate-subtrees.bin": subtrees,
+            "mainnet-frontier-grid.bin": frontier_grid,
         }
         meta = {
             "schema_version": 1,
@@ -335,6 +340,7 @@ def _self_test() -> int:
             f"{base}main-checkpoints.txt": checkpoints,
             f"{base}mainnet-frontier.bin": frontier,
             f"{base}mainnet-treestate-subtrees.bin": subtrees,
+            f"{base}mainnet-frontier-grid.bin": frontier_grid,
         }
         responses.update(file_overrides or {})
         return responses
@@ -374,6 +380,23 @@ def _self_test() -> int:
 
             with self.assertRaisesRegex(BundleError, "missing keys"):
                 self.resolve(build(meta_mutate=remove_subtrees))
+
+        def test_missing_frontier_grid_is_rejected(self):
+            def remove_grid(meta: dict[str, Any]) -> None:
+                del meta["files"]["mainnet-frontier-grid.bin"]
+
+            with self.assertRaisesRegex(BundleError, "missing keys"):
+                self.resolve(build(meta_mutate=remove_grid))
+
+        def test_frontier_grid_digest_is_checked(self):
+            base = f"https://{host}/release-state/v1/3415600/"
+            # Same length as the fixture, so the digest check is what rejects it
+            # rather than the declared-size check running first.
+            tampered = bytes(frontier_grid[:-1]) + b"D"
+            with self.assertRaisesRegex(BundleError, "digest does not match"):
+                self.resolve(
+                    build(file_overrides={f"{base}mainnet-frontier-grid.bin": tampered})
+                )
 
         def test_wrong_host_rejected(self):
             with self.assertRaisesRegex(BundleError, "host"):

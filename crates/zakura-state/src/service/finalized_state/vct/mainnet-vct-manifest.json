@@ -10,5 +10,8 @@
   "frontier_size": 1976,
   "subtrees_sha256": "7c423573f15383176ab4948db2b0679dc535d8b2d76e12754f1d9c68b1c3b431",
   "subtrees_size": 72145,
-  "meta_sha256": "665f530590bd40d32ab89436c611606d9e56735a670ee3c271dc9cc060314375"
+  "meta_sha256": "665f530590bd40d32ab89436c611606d9e56735a670ee3c271dc9cc060314375",
+  "frontier_grid_sha256": "f048013b7e89ea6bb7a45e42db7e0b452c63a57be3ba1ae9f0acdd7364740bfd",
+  "frontier_grid_size": 2167503,
+  "frontier_grid_entries": 2281
 }

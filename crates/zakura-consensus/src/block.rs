@@ -305,8 +305,18 @@ where
                 if let Some(mut prepared_block) =
                     prepared_candidates.lookup(&block, request.work_id(), &network)
                 {
-                    check::difficulty_is_valid(&block.header, &network, &height, &hash)?;
-                    check::equihash_solution_is_valid(&block.header, &network)?;
+                    let pow_policy = zakura_header_chain::PowPolicy::for_network(&network)?;
+                    if pow_policy.is_authenticated_custom_waiver() {
+                        check::difficulty_threshold_is_valid(
+                            &block.header,
+                            &network,
+                            &height,
+                            &hash,
+                        )?;
+                    } else {
+                        check::difficulty_is_valid(&block.header, &network, &height, &hash)?;
+                        check::equihash_solution_is_valid(&block.header, &network)?;
+                    }
                     check::time_is_valid_at(&block.header, Utc::now(), &height, &hash)
                         .map_err(VerifyBlockError::Time)?;
                     for transaction in &block.transactions {
@@ -520,6 +530,7 @@ where
     S::Future: Send + 'static,
 {
     let hash = prepared_block.hash;
+    let is_mined_commit = admission.is_some();
     let request = match admission {
         Some(admission) => zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
             block: prepared_block,
@@ -534,8 +545,10 @@ where
         .map_err(|source| VerifyBlockError::StateService { source, hash })?
         .call(request)
         .await;
-    metrics::histogram!("mining.contextual_commit.duration_seconds")
-        .record(commit_start.elapsed().as_secs_f64());
+    if is_mined_commit {
+        metrics::histogram!("mining.contextual_commit.duration_seconds")
+            .record(commit_start.elapsed().as_secs_f64());
+    }
 
     match response {
         Ok(zs::Response::Committed(committed_hash)) => {

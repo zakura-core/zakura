@@ -2839,7 +2839,6 @@ where
                         if mined_block_sender.try_send(event).is_ok() {
                             early_result = Some(receiver);
                         } else {
-                            metrics::counter!("mining.optimistic_inventory.fallbacks").increment(1);
                             pending_blocks.resolve(block_hash, Err(()));
                         }
                     }
@@ -2867,6 +2866,9 @@ where
                     None => false,
                 };
                 let event = if committed {
+                    if optimistic_block_inventory && !early_advertised {
+                        metrics::counter!("mining.optimistic_inventory.fallbacks").increment(1);
+                    }
                     MinedBlockEvent::Committed {
                         hash: block_hash,
                         height,

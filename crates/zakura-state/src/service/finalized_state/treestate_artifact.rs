@@ -12,11 +12,8 @@
 //!   before a read service can use it.
 //!
 //! Both follow the framing the Sprout history artifact established: magic, version, network byte,
-//! explicit record counts, and a SHA-256 digest, with the parser validating the whole frame before
-//! any record is used. The frontier digest covers only its payload; its header fields are
-//! structural metadata, while every decoded entry is independently checked against authenticated
-//! per-height roots before use. The subtree-root digest covers its semantic header fields and
-//! payload because individual subtree records cannot be independently root-checked.
+//! explicit record counts, and a SHA-256 over the non-digest header fields and payload, with the
+//! parser validating the whole frame before any record is used.
 
 use std::sync::{Arc, OnceLock};
 
@@ -68,6 +65,9 @@ const MAX_FRONTIER_ENTRIES: usize = 16_000_000;
 /// Empty tree blobs are legal in the framing, so this is the floor. Decode rejects a count that
 /// cannot fit in the payload at this size before allocating the entry vector.
 const MIN_FRONTIER_ENTRY_LEN: usize = 4 + 4 + 4 + 4;
+
+/// Offset of the digest after magic, version, network, spacing, checkpoint, and record count.
+const FRONTIER_DIGEST_OFFSET: usize = 8 + 2 + 1 + 4 + 4 + 4;
 
 /// Reviewed completed-subtree roots shipped with the Mainnet last checkpoint.
 pub(super) const MAINNET_SUBTREES: &[u8] = include_bytes!("vct/mainnet-subtrees.bin");
@@ -410,9 +410,6 @@ impl FrontierArtifact {
     const KIND: &'static str = "frontier";
 
     /// Serializes to the artifact byte format.
-    ///
-    /// The digest covers the payload only. Header fields are structural metadata, and consumers
-    /// independently authenticate every entry's roots before use.
     pub fn encode(&self, network: &Network) -> Vec<u8> {
         let mut payload = Vec::new();
         for entry in &self.entries {
@@ -433,7 +430,15 @@ impl FrontierArtifact {
                 .expect("entry count is bounded by MAX_FRONTIER_ENTRIES")
                 .to_le_bytes(),
         );
-        out.extend_from_slice(&Sha256::digest(&payload));
+        debug_assert_eq!(out.len(), FRONTIER_DIGEST_OFFSET);
+
+        let digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(&out);
+            hasher.update(&payload);
+            hasher.finalize()
+        };
+        out.extend_from_slice(&digest);
         out.extend_from_slice(&payload);
 
         out
@@ -477,7 +482,7 @@ impl FrontierArtifact {
             });
         }
 
-        let digest = read_array::<32>(bytes, 23, kind)?;
+        let digest = read_array::<32>(bytes, FRONTIER_DIGEST_OFFSET, kind)?;
         let payload =
             bytes
                 .get(FRONTIER_HEADER_LEN..)
@@ -488,13 +493,19 @@ impl FrontierArtifact {
                 })?;
 
         // Check the digest before decoding anything: a record is only worth parsing once the
-        // payload is known to be the one the encoder wrote.
-        if Sha256::digest(payload).as_slice() != digest {
+        // frame is known to be the one the encoder wrote.
+        let actual_digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes[..FRONTIER_DIGEST_OFFSET]);
+            hasher.update(payload);
+            hasher.finalize()
+        };
+        if actual_digest.as_slice() != digest {
             return Err(TreestateArtifactError::DigestMismatch { kind });
         }
 
-        // The payload-only digest does not cover the declared count, so a hostile header can pair
-        // a huge count with a matching digest over a tiny payload. Reject that before allocating.
+        // Keep this structural check even though the digest covers the count: an artifact producer
+        // can create a valid digest over an invalid frame, and parsing must remain allocation-safe.
         let min_payload_len = count.saturating_mul(MIN_FRONTIER_ENTRY_LEN);
         if min_payload_len > payload.len() {
             return Err(TreestateArtifactError::Truncated {
@@ -1175,7 +1186,13 @@ mod tests {
     fn replace_frontier_payload(bytes: &mut Vec<u8>, payload: &[u8]) {
         bytes.truncate(FRONTIER_HEADER_LEN);
         bytes.extend_from_slice(payload);
-        bytes[23..FRONTIER_HEADER_LEN].copy_from_slice(&Sha256::digest(payload));
+        let digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes[..FRONTIER_DIGEST_OFFSET]);
+            hasher.update(payload);
+            hasher.finalize()
+        };
+        bytes[FRONTIER_DIGEST_OFFSET..FRONTIER_HEADER_LEN].copy_from_slice(&digest);
     }
 
     #[test]
@@ -1272,22 +1289,8 @@ mod tests {
     }
 
     #[test]
-    fn frontier_header_mutations_are_not_covered_by_the_payload_digest() {
+    fn frontier_artifact_rejects_header_tampering() {
         let good = sample_frontiers().encode(&Network::Mainnet);
-        let digest = good[23..FRONTIER_HEADER_LEN].to_vec();
-
-        let mut metadata_changed = good.clone();
-        metadata_changed[11..15].copy_from_slice(&99u32.to_le_bytes());
-        metadata_changed[15..19].copy_from_slice(&123u32.to_le_bytes());
-        assert_eq!(
-            metadata_changed[23..FRONTIER_HEADER_LEN],
-            digest,
-            "changing header metadata must not require recomputing the payload-only digest"
-        );
-        let decoded = FrontierArtifact::decode(&metadata_changed, &Network::Mainnet)
-            .expect("spacing and checkpoint are structural metadata");
-        assert_eq!(decoded.spacing, 99);
-        assert_eq!(decoded.last_checkpoint, Height(123));
 
         let mut network_changed = good.clone();
         network_changed[10] = network_byte(&Network::new_default_testnet());
@@ -1296,12 +1299,17 @@ mod tests {
             Err(TreestateArtifactError::WrongNetwork { .. })
         ));
 
-        let mut count_changed = good;
-        count_changed[19..23].copy_from_slice(&2u32.to_le_bytes());
-        assert!(matches!(
-            FrontierArtifact::decode(&count_changed, &Network::Mainnet),
-            Err(TreestateArtifactError::TrailingBytes { .. })
-        ));
+        // These fields have no independent identity check, so the frame digest must bind them to
+        // the payload. Keep each mutation structurally plausible to isolate digest validation.
+        for offset in [11, 15, 19] {
+            let mut changed_header = good.clone();
+            changed_header[offset] ^= 0x01;
+            assert_eq!(
+                FrontierArtifact::decode(&changed_header, &Network::Mainnet).err(),
+                Some(TreestateArtifactError::DigestMismatch { kind: "frontier" }),
+                "tampering with frontier header byte {offset} must invalidate the frame digest"
+            );
+        }
     }
 
     #[test]
@@ -1357,6 +1365,8 @@ mod tests {
                 .expect("the frontier entry limit fits in its count field")
                 .to_le_bytes(),
         );
+        let payload = empty[FRONTIER_HEADER_LEN..].to_vec();
+        replace_frontier_payload(&mut empty, &payload);
         assert!(matches!(
             FrontierArtifact::decode(&empty, &Network::Mainnet),
             Err(TreestateArtifactError::Truncated { .. })

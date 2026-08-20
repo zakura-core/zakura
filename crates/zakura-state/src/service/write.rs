@@ -2502,7 +2502,7 @@ impl WriteBlockWorkerTask {
                 }
             };
 
-            let Some((queued_child, rsp_tx)) = queued_child_and_rsp_tx else {
+            let Some((queued_child, rsp_tx, _admission)) = queued_child_and_rsp_tx else {
                 continue;
             };
 

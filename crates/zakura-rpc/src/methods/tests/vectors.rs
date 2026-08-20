@@ -3093,6 +3093,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
         extra_coinbase_data: None,
         miner_memo: None,
         internal_miner: true,
+        optimistic_block_inventory: true,
     };
 
     // nu5 block height
@@ -3783,6 +3784,7 @@ async fn rpc_getdifficulty() {
         extra_coinbase_data: None,
         miner_memo: None,
         internal_miner: true,
+        optimistic_block_inventory: true,
     };
 
     // nu5 block height

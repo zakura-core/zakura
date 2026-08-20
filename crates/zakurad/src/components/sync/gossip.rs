@@ -12,6 +12,7 @@ use tracing::Instrument;
 
 use zakura_chain::block;
 use zakura_network as zn;
+use zakura_rpc::MinedBlockEvent;
 use zakura_state::ChainTipChange;
 
 use crate::{
@@ -29,15 +30,15 @@ use BlockGossipError::*;
 /// is chosen arbitrarily high to be safe.
 const MINED_BLOCK_MARK_CHANNEL_CAPACITY: usize = 16;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 enum GossipEvent<T> {
     MinedBlockBroadcastCompleted(block::Hash),
-    MinedBlockSubmitted((block::Hash, block::Height)),
+    MinedBlock(MinedBlockEvent),
     CommittedTip(T),
 }
 
 async fn next_gossip_event<T>(
-    mined_block_receiver: Option<&mut mpsc::Receiver<(block::Hash, block::Height)>>,
+    mined_block_receiver: Option<&mut mpsc::Receiver<MinedBlockEvent>>,
     mined_block_mark_receiver: &mut mpsc::Receiver<block::Hash>,
     committed_tip_fut: impl Future<Output = T>,
 ) -> GossipEvent<T> {
@@ -50,7 +51,7 @@ async fn next_gossip_event<T>(
             },
 
             Some(tip_change) = mined_block_receiver.recv() => {
-                GossipEvent::MinedBlockSubmitted(tip_change)
+                GossipEvent::MinedBlock(tip_change)
             },
 
             committed_tip = committed_tip_fut => {
@@ -102,7 +103,7 @@ pub async fn gossip_best_tip_block_hashes<ZN>(
     sync_status: SyncStatus,
     mut chain_state: ChainTipChange,
     broadcast_network: ZN,
-    mut mined_block_receiver: Option<mpsc::Receiver<(block::Hash, block::Height)>>,
+    mut mined_block_receiver: Option<mpsc::Receiver<MinedBlockEvent>>,
 ) -> Result<(), BlockGossipError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
@@ -177,7 +178,7 @@ where
         // Prefer mined-block completions and submissions when multiple
         // branches are ready. The committed-tip path is a fallback, so
         // selecting it first can duplicate a mined-block broadcast.
-        let (((hash, height), log_msg, updated_chain_state), is_block_submission) =
+        let (((hash, height), log_msg, updated_chain_state), is_block_submission, early_ack) =
             match next_gossip_event(
                 mined_block_receiver.as_mut(),
                 &mut mined_block_mark_receiver,
@@ -189,12 +190,59 @@ where
                     chain_state.mark_last_change_hash(mark_hash);
                     continue;
                 }
-                GossipEvent::MinedBlockSubmitted(tip_change) => (
-                    (tip_change, "sending mined block broadcast", chain_state),
+                GossipEvent::MinedBlock(MinedBlockEvent::Early {
+                    hash,
+                    height,
+                    submitted_at,
+                    advertised,
+                }) => (
+                    (
+                        (hash, height),
+                        "sending early mined block broadcast",
+                        chain_state,
+                    ),
                     true,
+                    Some((advertised, submitted_at)),
                 ),
+                GossipEvent::MinedBlock(MinedBlockEvent::Committed {
+                    hash,
+                    height: _,
+                    early_advertised: true,
+                }) => {
+                    chain_state.mark_last_change_hash(hash);
+                    continue;
+                }
+                GossipEvent::MinedBlock(MinedBlockEvent::Committed {
+                    hash,
+                    height,
+                    early_advertised: false,
+                }) => {
+                    metrics::counter!("mining.optimistic_inventory.fallbacks").increment(1);
+                    (
+                        (
+                            (hash, height),
+                            "sending committed mined block broadcast",
+                            chain_state,
+                        ),
+                        true,
+                        None,
+                    )
+                }
+                GossipEvent::MinedBlock(MinedBlockEvent::Failed {
+                    hash,
+                    height,
+                    early_advertised,
+                }) => {
+                    tracing::debug!(
+                        ?hash,
+                        ?height,
+                        early_advertised,
+                        "mined block lifecycle failed"
+                    );
+                    continue;
+                }
                 GossipEvent::CommittedTip(tip_change_close_to_network_tip) => {
-                    (tip_change_close_to_network_tip?, false)
+                    (tip_change_close_to_network_tip?, false, None)
                 }
             };
 
@@ -224,8 +272,18 @@ where
             let mark_tx = mined_block_mark_sender.clone();
             let submission_hash = hash;
             tokio::spawn(async move {
-                if broadcast_fut.await.is_ok() {
+                let succeeded = broadcast_fut.await.is_ok();
+                if succeeded {
                     let _ = mark_tx.send(submission_hash).await;
+                }
+                if let Some((advertised, submitted_at)) = early_ack {
+                    if succeeded {
+                        metrics::counter!("mining.optimistic_inventory.early_inventories")
+                            .increment(1);
+                        metrics::histogram!("mining.submit_to_inventory.duration_seconds")
+                            .record(submitted_at.elapsed().as_secs_f64());
+                    }
+                    let _ = advertised.send(succeeded);
                 }
             });
         } else {
@@ -242,6 +300,7 @@ mod tests {
 
     use tokio::sync::mpsc;
     use zakura_chain::block;
+    use zakura_rpc::MinedBlockEvent;
 
     // Repeat the vector so removing `biased;` reliably exposes randomized
     // selection among the ready events.
@@ -249,14 +308,21 @@ mod tests {
 
     #[tokio::test]
     async fn ready_gossip_events_are_selected_in_priority_order() {
-        let submitted_block = (block::Hash([1; 32]), block::Height(1));
+        let submitted_hash = block::Hash([1; 32]);
 
         for _ in 0..READY_EVENT_ATTEMPTS {
             let (mined_block_sender, mut mined_block_receiver) = mpsc::channel(1);
             let (mark_sender, mut mark_receiver) = mpsc::channel(1);
 
-            mined_block_sender.send(submitted_block).await.unwrap();
-            mark_sender.send(submitted_block.0).await.unwrap();
+            mined_block_sender
+                .send(MinedBlockEvent::Committed {
+                    hash: submitted_hash,
+                    height: block::Height(1),
+                    early_advertised: false,
+                })
+                .await
+                .unwrap();
+            mark_sender.send(submitted_hash).await.unwrap();
 
             let event = next_gossip_event(
                 Some(&mut mined_block_receiver),
@@ -265,10 +331,10 @@ mod tests {
             )
             .await;
 
-            assert_eq!(
+            assert!(matches!(
                 event,
-                GossipEvent::MinedBlockBroadcastCompleted(submitted_block.0)
-            );
+                GossipEvent::MinedBlockBroadcastCompleted(hash) if hash == submitted_hash
+            ));
 
             let event = next_gossip_event(
                 Some(&mut mined_block_receiver),
@@ -277,7 +343,14 @@ mod tests {
             )
             .await;
 
-            assert_eq!(event, GossipEvent::MinedBlockSubmitted(submitted_block));
+            assert!(matches!(
+                event,
+                GossipEvent::MinedBlock(MinedBlockEvent::Committed {
+                    hash,
+                    height: block::Height(1),
+                    early_advertised: false,
+                }) if hash == submitted_hash
+            ));
 
             let event = next_gossip_event(
                 Some(&mut mined_block_receiver),
@@ -286,7 +359,7 @@ mod tests {
             )
             .await;
 
-            assert_eq!(event, GossipEvent::CommittedTip("committed tip"));
+            assert!(matches!(event, GossipEvent::CommittedTip("committed tip")));
         }
     }
 }

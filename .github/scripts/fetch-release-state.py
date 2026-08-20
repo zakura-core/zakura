@@ -37,10 +37,6 @@ FILE_LIMITS = {
     "main-checkpoints.txt": 4 * 1024 * 1024,
     "mainnet-frontier.bin": 1 * 1024 * 1024,
     "mainnet-treestate-subtrees.bin": 8 * 1024 * 1024,
-}
-# Produced by the archive publisher once generation lands; still optional here so existing
-# three-file bundles keep fetching until the import follow-up requires the grid.
-OPTIONAL_FILE_LIMITS = {
     # The cost-weighted grid measures ~3.3 MB on Mainnet. The cap leaves room for a
     # uniform-spacing run, which is larger, without accepting an unbounded download.
     "mainnet-frontier-grid.bin": 32 * 1024 * 1024,
@@ -241,11 +237,9 @@ def resolve_bundle(
         raise BundleError(f"release-state bundle is older than {max_age_hours} hours")
 
     files = _object(meta["files"], "meta.files")
-    _check_keys(files, set(FILE_LIMITS), set(OPTIONAL_FILE_LIMITS), "meta.files")
+    _check_keys(files, set(FILE_LIMITS), set(), "meta.files")
     validated: dict[str, dict[str, Any]] = {}
-    for name, max_size in {**FILE_LIMITS, **OPTIONAL_FILE_LIMITS}.items():
-        if name not in files:
-            continue
+    for name, max_size in FILE_LIMITS.items():
         entry = _object(files[name], f"meta.files.{name}")
         _check_keys(entry, {"size", "sha256"}, set(), f"meta.files.{name}")
         size = _integer(entry["size"], f"meta.files.{name}.size", maximum=max_size)
@@ -298,6 +292,7 @@ def _self_test() -> int:
     checkpoints = b"0 00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08\n"
     frontier = b"\x36\x3d\x33\x00frontier"
     subtrees = b"subtree roots"
+    frontier_grid = b"frontier grid"
     now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
 
     def build(
@@ -305,16 +300,13 @@ def _self_test() -> int:
         meta_mutate: Callable[[dict[str, Any]], None] = lambda meta: None,
         latest_mutate: Callable[[dict[str, Any]], None] = lambda latest: None,
         file_overrides: dict[str, bytes] | None = None,
-        include_frontier_grid: bool = False,
     ) -> dict[str, bytes]:
-        frontier_grid = b"frontier grid"
         data_files = {
             "main-checkpoints.txt": checkpoints,
             "mainnet-frontier.bin": frontier,
             "mainnet-treestate-subtrees.bin": subtrees,
+            "mainnet-frontier-grid.bin": frontier_grid,
         }
-        if include_frontier_grid:
-            data_files["mainnet-frontier-grid.bin"] = frontier_grid
         meta = {
             "schema_version": 1,
             "network": "Mainnet",
@@ -348,9 +340,8 @@ def _self_test() -> int:
             f"{base}main-checkpoints.txt": checkpoints,
             f"{base}mainnet-frontier.bin": frontier,
             f"{base}mainnet-treestate-subtrees.bin": subtrees,
+            f"{base}mainnet-frontier-grid.bin": frontier_grid,
         }
-        if include_frontier_grid:
-            responses[f"{base}mainnet-frontier-grid.bin"] = frontier_grid
         responses.update(file_overrides or {})
         return responses
 
@@ -390,44 +381,22 @@ def _self_test() -> int:
             with self.assertRaisesRegex(BundleError, "missing keys"):
                 self.resolve(build(meta_mutate=remove_subtrees))
 
-        def test_frontier_grid_is_optional(self):
-            resolution = self.resolve(build())
-            self.assertEqual(resolution["height"], 3415600)
+        def test_missing_frontier_grid_is_rejected(self):
+            def remove_grid(meta: dict[str, Any]) -> None:
+                del meta["files"]["mainnet-frontier-grid.bin"]
 
-        def test_frontier_grid_is_accepted_when_present(self):
-            with tempfile.TemporaryDirectory() as scratch:
-                responses = build(include_frontier_grid=True)
-
-                def fake_fetch(fetch_url: str, max_bytes: int) -> bytes:
-                    data = responses.get(fetch_url)
-                    if data is None:
-                        raise BundleError(f"unexpected fetch of {fetch_url}")
-                    if len(data) > max_bytes:
-                        raise BundleError(f"{fetch_url} exceeds its maximum allowed size")
-                    return data
-
-                resolution = resolve_bundle(
-                    latest_url,
-                    Path(scratch) / "bundle",
-                    Path(scratch) / "resolution.json",
-                    48,
-                    fetch=fake_fetch,
-                    now=now,
-                )
-                self.assertEqual(resolution["height"], 3415600)
-                self.assertEqual(
-                    (Path(scratch) / "bundle" / "mainnet-frontier-grid.bin").read_bytes(),
-                    b"frontier grid",
-                )
+            with self.assertRaisesRegex(BundleError, "missing keys"):
+                self.resolve(build(meta_mutate=remove_grid))
 
         def test_frontier_grid_digest_is_checked(self):
-            responses = build(include_frontier_grid=True)
-            tampered = b"frontier griD"
-            responses[
-                f"https://{host}/release-state/v1/3415600/mainnet-frontier-grid.bin"
-            ] = tampered
+            base = f"https://{host}/release-state/v1/3415600/"
+            # Same length as the fixture, so the digest check is what rejects it
+            # rather than the declared-size check running first.
+            tampered = bytes(frontier_grid[:-1]) + b"D"
             with self.assertRaisesRegex(BundleError, "digest does not match"):
-                self.resolve(responses)
+                self.resolve(
+                    build(file_overrides={f"{base}mainnet-frontier-grid.bin": tampered})
+                )
 
         def test_wrong_host_rejected(self):
             with self.assertRaisesRegex(BundleError, "host"):

@@ -138,9 +138,10 @@ In `zakura-core/zakura`:
   gate, frontier and Sprout tests, a strict diff allowlist, then mints a
   short-lived GitHub App token and opens a signed draft
   `adam/update-release-state` PR.
-- `.github/workflows/tests-unit.yml` includes the checkpoint, frontier, and
-  provenance paths, so generated update PRs run Unit Tests. A follow-up adds the
-  frontier-grid path once the binary is committed.
+- `.github/workflows/tests-unit.yml` includes the checkpoint, frontier, grid, and
+  provenance paths, so generated update PRs run Unit Tests.
+- `.github/workflows/history-growth.yml` raises its packed-growth allowance for a change
+  confined to the release-state files, because the committed frontier grid is a few megabytes.
 - `.github/workflows/create-release.yml` and `scripts/make/release.mk` validate only
   committed release state before creating a tag.
 - `scripts/check-release-state.sh` is the non-Cargo release gate and rejects

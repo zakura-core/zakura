@@ -70,6 +70,11 @@ audit-as-crates-io = false
 [policy.zakura-utils]
 audit-as-crates-io = false
 
+[[exemptions.addchain]]
+version = "0.3.0"
+criteria = "safe-to-deploy"
+notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+
 [[exemptions.addr2line]]
 version = "0.21.0"
 criteria = "safe-to-deploy"
@@ -122,6 +127,16 @@ version = "0.2.3"
 criteria = "safe-to-deploy"
 notes = "Audit deferred: the safe single-sink wrappers preserve the documented exclusivity contract and ordinary tests pass, but the crate's core is a custom unsafe lock-free two-slot Waker state machine. Its published higher-bound Loom slot-reuse exploration did not complete within the batch review window; retain the exemption pending a dedicated concurrency review or completed model run."
 
+[[exemptions.ff]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+
+[[exemptions.ff_derive]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+
 [[exemptions.fixedbitset]]
 version = "0.5.7"
 criteria = "safe-to-deploy"
@@ -132,6 +147,16 @@ version = "1.3.0"
 criteria = "safe-to-deploy"
 suggest = false
 notes = "Audit hold: recursive directory enumeration follows directory symlinks, and move_dir then moves and deletes files reached through them. A local reproduction with source/link pointing outside the source tree returned success, removed the external sentinel, and copied it under the destination. Retain the exemption until traversal uses symlink_metadata or otherwise confines moves to the requested tree."
+
+[[exemptions.group]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+
+[[exemptions.h2]]
+version = "0.4.16"
+criteria = "safe-to-deploy"
+notes = "Patched release for RUSTSEC-2026-0258; retain this exact-version exemption pending delta audit from 0.4.15."
 
 [[exemptions.hash32]]
 version = "0.2.1"
@@ -240,6 +265,11 @@ notes = "Audit hold: validator.rs explicitly notes that empty-stack PEEK_ALL is 
 version = "5.2.0"
 criteria = "safe-to-deploy"
 notes = "Audit hold: the UEFI protocol tables expose firmware operations that accept and dereference raw pointers as safe extern function pointers. Safe Rust can therefore invoke them with invalid pointers; version 6.0.0 corrected this by making every firmware callback unsafe. Retain the 5.2.0 exemption until its dependents upgrade."
+
+[[exemptions.rand_chacha]]
+version = "0.10.0"
+criteria = "safe-to-deploy"
+notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
 
 [[exemptions.redox_users]]
 version = "0.4.5"
@@ -360,6 +390,91 @@ criteria = "safe-to-deploy"
 [[exemptions.windows_x86_64_msvc]]
 version = "0.52.5"
 criteria = "safe-to-deploy"
+
+[[exemptions.zakura-bellman]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-bls12-381]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-halo2-gadgets]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-halo2-legacy-pdqsort]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-halo2-poseidon]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-halo2-proofs]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-jubjub]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-keys]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-orchard]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-pairing]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-pasta-curves]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-primitives]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-proofs]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-reddsa]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-redjubjub]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-sapling-crypto]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-sinsemilla]]
+version = "1.0.0-rc.2"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zerovec]]
 version = "0.11.6"

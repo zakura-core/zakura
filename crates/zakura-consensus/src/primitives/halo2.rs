@@ -15,7 +15,7 @@ use orchard::{
     bundle::{BatchError, BatchValidator},
     circuit::{OrchardCircuitVersion, VerifyingKey},
 };
-use rand::thread_rng;
+use rand_10::rng as thread_rng;
 use zakura_chain::{
     parameters::NetworkUpgrade,
     transaction::{SigHash, UnminedTxId, WtxId},

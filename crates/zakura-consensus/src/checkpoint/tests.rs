@@ -1098,6 +1098,129 @@ async fn stale_commit_reset_must_not_rewind_recovered_checkpoint_progress() -> R
     Ok(())
 }
 
+/// Blocks queued before a reset must use the generation that verifies their range.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_commit_failure_after_reset_must_reset_recovered_progress() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let blockchain: Vec<_> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .iter()
+        .map(|(height, bytes)| {
+            let block = Arc::<Block>::zcash_deserialize(*bytes).expect("block deserializes");
+            let hash = block.hash();
+            let coinbase_height = block.coinbase_height().expect("block has a height");
+            assert_eq!(*height, coinbase_height.0);
+            (block, coinbase_height, hash)
+        })
+        .collect();
+    assert!(blockchain.len() > 10);
+
+    let checkpoint_list: BTreeMap<_, _> = [0usize, 3, 6, 10]
+        .into_iter()
+        .map(|index| {
+            let (_block, height, hash) = &blockchain[index];
+            (*height, *hash)
+        })
+        .collect();
+    let initial_tip = (blockchain[3].1, blockchain[3].2);
+    let (tip_sender, _tip_receiver) = tokio::sync::watch::channel(Some(initial_tip));
+    let state_service = tower::service_fn(move |request: zs::Request| {
+        let tip_sender = tip_sender.clone();
+
+        async move {
+            match request {
+                zs::Request::CommitCheckpointVerifiedBlock(block) => {
+                    if block.height == block::Height(4) {
+                        tip_sender.send_replace(Some((block.height, block.hash)));
+                        Ok(zs::Response::Committed(block.hash))
+                    } else {
+                        let mut tip_receiver = tip_sender.subscribe();
+                        loop {
+                            let height_four_is_committed = tip_receiver
+                                .borrow()
+                                .is_some_and(|(height, _hash)| height >= block::Height(4));
+                            if height_four_is_committed {
+                                break;
+                            }
+                            tip_receiver
+                                .changed()
+                                .await
+                                .expect("the test retains the tip sender");
+                        }
+
+                        Err::<zs::Response, BoxError>(
+                            std::io::Error::other("injected checkpoint commit failure").into(),
+                        )
+                    }
+                }
+                zs::Request::Tip => Ok(zs::Response::Tip(*tip_sender.borrow())),
+                _ => unreachable!("checkpoint verifier test uses only commit and tip requests"),
+            }
+        }
+    });
+    let mut checkpoint_verifier =
+        CheckpointVerifier::from_list(checkpoint_list, &Mainnet, Some(initial_tip), state_service)
+            .map_err(|error| eyre!(error))?;
+
+    let ready = checkpoint_verifier
+        .ready()
+        .map_err(|error| eyre!(error))
+        .await?;
+    let height_5 = ready.call(blockchain[5].0.clone());
+    let ready = checkpoint_verifier
+        .ready()
+        .map_err(|error| eyre!(error))
+        .await?;
+    let height_6 = ready.call(blockchain[6].0.clone());
+
+    checkpoint_verifier
+        .reset_sender
+        .send(CheckpointReset {
+            generation: 0,
+            tip: Some(initial_tip),
+        })
+        .expect("the verifier owns the reset receiver");
+
+    let ready = checkpoint_verifier
+        .ready()
+        .map_err(|error| eyre!(error))
+        .await?;
+    let height_4 = ready.call(blockchain[4].0.clone());
+    assert_eq!(checkpoint_verifier.reset_generation, 1);
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        PreviousCheckpoint(block::Height(6)),
+        "the recovered range must verify before its commits finish"
+    );
+
+    height_4.await.expect("height 4 must commit");
+    height_5
+        .await
+        .expect_err("the test state must reject height 5");
+    height_6
+        .await
+        .expect_err("the test state must reject height 6");
+
+    let ready = checkpoint_verifier
+        .ready()
+        .map_err(|error| eyre!(error))
+        .await?;
+    let retry_height_5 = ready.call(blockchain[5].0.clone());
+
+    assert_eq!(checkpoint_verifier.reset_generation, 2);
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        InitialTip(block::Height(4)),
+        "a failed recovered commit must reset optimistic verifier progress"
+    );
+    assert!(
+        retry_height_5.now_or_never().is_none(),
+        "the verifier must queue the retry instead of returning AlreadyVerified"
+    );
+
+    Ok(())
+}
+
 /// Duplicate block errors must stay classified as duplicate requests after the
 /// state wraps them, so they don't restart the syncer during checkpoint sync.
 #[test]

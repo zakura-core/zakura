@@ -62,7 +62,16 @@ struct QueuedBlock {
     /// The block, with additional precalculated data.
     block: CheckpointVerifiedBlock,
     /// The transmitting end of the oneshot channel for this block's result.
-    tx: oneshot::Sender<Result<block::Hash, VerifyCheckpointError>>,
+    tx: oneshot::Sender<QueuedBlockResult>,
+}
+
+/// The verification result and generation assigned when a queued block resolves.
+#[derive(Debug)]
+struct QueuedBlockResult {
+    /// The queued block's verification result.
+    result: Result<block::Hash, VerifyCheckpointError>,
+    /// The verifier generation that resolved the queued block.
+    reset_generation: u64,
 }
 
 /// The unverified block, with a receiver for the [`QueuedBlock`]'s result.
@@ -71,7 +80,7 @@ struct RequestBlock {
     /// The block, with additional precalculated data.
     block: CheckpointVerifiedBlock,
     /// The receiving end of the oneshot channel for this block's result.
-    rx: oneshot::Receiver<Result<block::Hash, VerifyCheckpointError>>,
+    rx: oneshot::Receiver<QueuedBlockResult>,
 }
 
 /// A list of unverified blocks at a particular height.
@@ -705,6 +714,7 @@ where
         let block = self.check_block(block)?;
         let height = block.height;
         let hash = block.hash;
+        let reset_generation = self.reset_generation;
 
         let new_qblock = QueuedBlock {
             block: block.clone(),
@@ -740,7 +750,10 @@ where
                 // even if the block hash is the same.
 
                 let old = std::mem::replace(qb, new_qblock);
-                let _ = old.tx.send(Err(e));
+                let _ = old.tx.send(QueuedBlockResult {
+                    result: Err(e),
+                    reset_generation,
+                });
                 return Ok(req_block);
             }
         }
@@ -810,12 +823,13 @@ where
             } else {
                 tracing::info!(?height, ?qblock.block.hash, ?expected_hash,
                                "Side chain hash at height in CheckpointVerifier");
-                let _ = qblock
-                    .tx
-                    .send(Err(VerifyCheckpointError::UnexpectedSideChain {
+                let _ = qblock.tx.send(QueuedBlockResult {
+                    result: Err(VerifyCheckpointError::UnexpectedSideChain {
                         found: qblock.block.hash,
                         expected: expected_hash,
-                    }));
+                    }),
+                    reset_generation: self.reset_generation,
+                });
             }
         }
 
@@ -947,9 +961,13 @@ where
 
         // All the blocks we've kept are valid, so let's verify them
         // in height order.
+        let reset_generation = self.reset_generation;
         for qblock in rev_valid_blocks.drain(..).rev() {
             // Sending can fail, but there's nothing we can do about it.
-            let _ = qblock.tx.send(Ok(qblock.block.hash));
+            let _ = qblock.tx.send(QueuedBlockResult {
+                result: Ok(qblock.block.hash),
+                reset_generation,
+            });
         }
 
         // Finally, update the checkpoint bounds
@@ -1007,7 +1025,10 @@ where
                 .expect("each entry is only removed once");
             for qblock in qblocks.drain(..) {
                 // Sending can fail, but there's nothing we can do about it.
-                let _ = qblock.tx.send(Err(VerifyCheckpointError::Dropped));
+                let _ = qblock.tx.send(QueuedBlockResult {
+                    result: Err(VerifyCheckpointError::Dropped),
+                    reset_generation: self.reset_generation,
+                });
             }
         }
     }
@@ -1200,7 +1221,6 @@ where
         // Reset the verifier back to the state tip if requested
         // (e.g. due to an error when committing a block to the state)
         self.apply_pending_reset();
-        let reset_generation = self.reset_generation;
 
         // Immediately reject all incoming blocks that arrive after we've finished.
         if let FinalCheckpoint = self.previous_checkpoint_height() {
@@ -1243,44 +1263,53 @@ where
         let state_service = self.state_service.clone();
         let network = self.network.clone();
         let commit_checkpoint_verified = tokio::spawn(async move {
-            let hash = req_block
+            let queued_result = req_block
                 .rx
                 .await
                 .map_err(Into::into)
                 .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                .expect("CheckpointVerifier does not leave dangling receivers")?;
+                .expect("CheckpointVerifier does not leave dangling receivers");
+            let reset_generation = queued_result.reset_generation;
 
-            if req_block.block.auth_data_root.is_none()
-                && NetworkUpgrade::current(&network, req_block.block.height) >= NetworkUpgrade::Nu5
-            {
-                let block = req_block.block.clone();
-                if let Ok(block) =
-                    tokio::task::spawn_blocking(move || block.with_precomputed_auth_data_root())
-                        .await
+            let result: Result<block::Hash, VerifyCheckpointError> = async move {
+                let hash = queued_result.result?;
+
+                if req_block.block.auth_data_root.is_none()
+                    && NetworkUpgrade::current(&network, req_block.block.height)
+                        >= NetworkUpgrade::Nu5
                 {
-                    req_block.block = block;
+                    let block = req_block.block.clone();
+                    if let Ok(block) =
+                        tokio::task::spawn_blocking(move || block.with_precomputed_auth_data_root())
+                            .await
+                    {
+                        req_block.block = block;
+                    }
                 }
-            }
 
-            // We use a `ServiceExt::oneshot`, so that every state service
-            // `poll_ready` has a corresponding `call`. See #1593.
-            match state_service
-                .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
-                .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                .await?
-            {
-                zs::Response::Committed(committed_hash) => {
-                    assert_eq!(committed_hash, hash, "state must commit correct hash");
-                    Ok(hash)
+                // We use a `ServiceExt::oneshot`, so that every state service
+                // `poll_ready` has a corresponding `call`. See #1593.
+                match state_service
+                    .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
+                    .map_err(VerifyCheckpointError::CommitCheckpointVerified)
+                    .await?
+                {
+                    zs::Response::Committed(committed_hash) => {
+                        assert_eq!(committed_hash, hash, "state must commit correct hash");
+                        Ok(hash)
+                    }
+                    _ => unreachable!("wrong response for CommitCheckpointVerifiedBlock"),
                 }
-                _ => unreachable!("wrong response for CommitCheckpointVerifiedBlock"),
             }
+            .await;
+
+            (result, reset_generation)
         });
 
         let state_service = self.state_service.clone();
         let reset_sender = self.reset_sender.clone();
         async move {
-            let result = commit_checkpoint_verified.await;
+            let commit_result = commit_checkpoint_verified.await;
             // Avoid a panic on shutdown
             //
             // When `zakurad` is terminated using Ctrl-C, the `commit_checkpoint_verified` task
@@ -1288,11 +1317,11 @@ where
             // so we don't need to panic here. The persistent state is correct even when the
             // task is cancelled, because block data is committed inside transactions, in
             // height order.
-            let result = if zakura_chain::shutdown::is_shutting_down() {
-                Err(VerifyCheckpointError::ShuttingDown)
-            } else {
-                result.expect("commit_checkpoint_verified should not panic")
-            };
+            if zakura_chain::shutdown::is_shutting_down() {
+                return Err(VerifyCheckpointError::ShuttingDown);
+            }
+            let (result, reset_generation) =
+                commit_result.expect("commit_checkpoint_verified should not panic");
             // Only reset on real commit/state desyncs. Duplicate / NewerRequest
             // failures are expected when sync resubmits in-queue bodies; resetting
             // for them rewinds progress behind the already-verified checkpoint and

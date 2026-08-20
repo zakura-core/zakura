@@ -1047,7 +1047,6 @@ where
         #[cfg(test)]
         {
             let _ = template;
-            return;
         }
 
         #[cfg(not(test))]

@@ -3909,6 +3909,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         block_template.bits(),
         block_template.height(),
         block_template.max_time(),
+        block_template.work_id().clone(),
         block_template.submit_old(),
     );
 
@@ -3974,6 +3975,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         block_template.bits(),
         block_template.height(),
         block_template.max_time(),
+        block_template.work_id().clone(),
         block_template.submit_old(),
     );
 

@@ -119,8 +119,8 @@ pub use header_chain::{
 pub use header_chain::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub(crate) use treestate_artifact::embedded_historical_subtrees;
 pub use treestate_artifact::{
-    verify_subtree_artifact, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
-    VerifiedSubtreeCounts,
+    verify_subtree_artifact, FrontierArtifact, FrontierEntry, SubtreeArtifact, SubtreeRecord,
+    TreestateArtifactError, VerifiedSubtreeCounts,
 };
 pub use treestate_export::{
     produce_release_treestate_artifacts, ReleaseTreestateArtifacts, ReleaseTreestateArtifactsError,

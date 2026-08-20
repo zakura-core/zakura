@@ -108,9 +108,9 @@ pub use service::finalized_state::{
     validate_final_frontiers_bytes, FinalFrontiersGenerationError, FinalFrontiersValidationError,
 };
 pub use service::finalized_state::{
-    produce_release_treestate_artifacts, verify_subtree_artifact, ReleaseTreestateArtifacts,
-    ReleaseTreestateArtifactsError, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
-    VerifiedSubtreeCounts,
+    produce_release_treestate_artifacts, verify_subtree_artifact, FrontierArtifact, FrontierEntry,
+    ReleaseTreestateArtifacts, ReleaseTreestateArtifactsError, SubtreeArtifact, SubtreeRecord,
+    TreestateArtifactError, VerifiedSubtreeCounts,
 };
 pub use service::read::{
     derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_MEMOIZED_FRONTIERS,

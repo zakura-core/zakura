@@ -24,7 +24,20 @@ use zakura_chain::{
 use crate::client::TransactionTemplate;
 use crate::config::mining::{default_miner_address, MinerAddressType};
 
-use super::MinerParams;
+use super::{MinerParams, TemplatePreparationLimiter};
+
+#[test]
+fn template_preparation_is_single_flight() {
+    let limiter = TemplatePreparationLimiter::default();
+    let permit = limiter
+        .try_acquire()
+        .expect("the first preparation reserves the slot");
+
+    assert!(limiter.try_acquire().is_none());
+
+    drop(permit);
+    assert!(limiter.try_acquire().is_some());
+}
 
 /// Tests transparent coinbase generation at every configured Sapling-and-later
 /// network upgrade activation.

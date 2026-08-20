@@ -6,9 +6,39 @@ use std::{
 };
 
 use super::{
-    block_misbehavior, canonical_ip, PrunedBlockNotFoundLogger,
+    block_by_hash_or_pending, block_misbehavior, canonical_ip, PrunedBlockNotFoundLogger,
     ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL,
 };
+
+#[tokio::test]
+async fn peer_block_lookup_queries_all_active_chains() {
+    use std::sync::Arc;
+
+    use tower::{buffer::Buffer, util::BoxService};
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+    use zakura_rpc::PendingBlockRegistry;
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis block is valid");
+    let hash = block.hash();
+    let expected_block = block.clone();
+    let state = tower::service_fn(move |request| {
+        let expected_block = expected_block.clone();
+        async move {
+            assert_eq!(request, zakura_state::Request::AnyChainBlock(hash.into()));
+            Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(Some(expected_block)))
+        }
+    });
+    let state = Buffer::new(BoxService::new(state), 1);
+
+    assert_eq!(
+        block_by_hash_or_pending(state, PendingBlockRegistry::default(), hash)
+            .await
+            .expect("the state lookup succeeds"),
+        Some(block),
+    );
+}
 
 mod fake_peer_set;
 mod real_peer_set;

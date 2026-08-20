@@ -18,7 +18,7 @@ use derive_new::new;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
@@ -64,6 +64,25 @@ pub use parameters::{
     GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
+
+const MAX_BACKGROUND_TEMPLATE_PREPARATIONS: usize = 1;
+
+#[derive(Clone, Debug)]
+struct TemplatePreparationLimiter(Arc<Semaphore>);
+
+impl Default for TemplatePreparationLimiter {
+    fn default() -> Self {
+        Self(Arc::new(Semaphore::new(
+            MAX_BACKGROUND_TEMPLATE_PREPARATIONS,
+        )))
+    }
+}
+
+impl TemplatePreparationLimiter {
+    fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.0.clone().try_acquire_owned().ok()
+    }
+}
 
 /// An alias to indicate that a usize value represents the depth of in-block dependencies of a
 /// transaction.
@@ -577,6 +596,9 @@ where
 
     /// Whether state admission can trigger an early inventory.
     optimistic_block_inventory: bool,
+
+    /// Limits detached template preparation work.
+    template_preparation_limiter: TemplatePreparationLimiter,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -602,6 +624,7 @@ where
                 .unwrap_or(SubmitBlockChannel::default().sender()),
             pending_blocks,
             optimistic_block_inventory,
+            template_preparation_limiter: TemplatePreparationLimiter::default(),
         }
     }
 
@@ -633,6 +656,11 @@ where
     /// Returns whether early mined-block inventory is enabled.
     pub fn optimistic_block_inventory(&self) -> bool {
         self.optimistic_block_inventory
+    }
+
+    /// Reserves the background template preparation slot.
+    pub(crate) fn try_acquire_template_preparation(&self) -> Option<OwnedSemaphorePermit> {
+        self.template_preparation_limiter.try_acquire()
     }
 
     /// Randomizes the coinbase data, if miner parameters are set.

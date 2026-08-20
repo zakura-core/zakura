@@ -1046,11 +1046,15 @@ where
     fn prepare_template_in_background(&self, template: &BlockTemplateResponse) {
         #[cfg(test)]
         {
-            let _ = template;
+            let _ = (template, self.gbt.try_acquire_template_preparation());
         }
 
         #[cfg(not(test))]
         {
+            let Some(preparation_permit) = self.gbt.try_acquire_template_preparation() else {
+                metrics::counter!("mining.template_preparation.saturated").increment(1);
+                return;
+            };
             let Ok(block) = proposal_block_from_template(template, None, &self.network) else {
                 return;
             };
@@ -1061,6 +1065,7 @@ where
             let verifier = self.gbt.block_verifier_router();
             tokio::spawn(
                 async move {
+                    let _preparation_permit = preparation_permit;
                     if let Err(error) = verifier.oneshot(request).await {
                         tracing::debug!(?error, "background mining candidate preparation failed");
                     }

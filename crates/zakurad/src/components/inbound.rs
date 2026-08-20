@@ -197,6 +197,28 @@ async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<bl
     }
 }
 
+/// Returns a committed block from any active chain or waits for its pending commit.
+async fn block_by_hash_or_pending(
+    mut state: State,
+    pending_blocks: PendingBlockRegistry,
+    hash: block::Hash,
+) -> Result<Option<Arc<Block>>, zn::BoxError> {
+    // Subscribe before the state lookup. A commit can remove the registry entry while state
+    // answers this request.
+    let pending_wait = pending_blocks.wait(hash);
+    let response = state
+        .ready()
+        .await?
+        .call(zs::Request::AnyChainBlock(hash.into()))
+        .await?;
+
+    match response {
+        zs::Response::Block(Some(block)) => Ok(Some(block)),
+        zs::Response::Block(None) => Ok(pending_wait.await),
+        _ => unreachable!("wrong response from state"),
+    }
+}
+
 fn mempool_queue_source(source: zn::PeerSource) -> mempool::QueueSource {
     match source {
         zn::PeerSource::LegacySocket(addr) => mempool::QueueSource::LegacySocket(*addr),
@@ -623,24 +645,9 @@ impl Service<zn::Request> for Inbound {
                         let state = state.clone();
                         let pending_blocks = pending_blocks.clone();
                         lookups.push(async move {
-                            // Subscribe before the state lookup. A commit can complete and
-                            // remove the registry entry while state answers this request.
-                            let pending_wait = pending_blocks.wait(hash);
-                            let response = state
-                                .clone()
-                                .ready()
-                                .await?
-                                .call(zs::Request::Block(hash.into()))
-                                .await?;
-                            match response {
-                                zs::Response::Block(Some(block)) => {
-                                    Ok::<_, zn::BoxError>((index, hash, Some(block)))
-                                }
-                                zs::Response::Block(None) => {
-                                    Ok((index, hash, pending_wait.await))
-                                }
-                                _ => unreachable!("wrong response from state"),
-                            }
+                            let block =
+                                block_by_hash_or_pending(state, pending_blocks, hash).await?;
+                            Ok::<_, zn::BoxError>((index, hash, block))
                         });
                     }
 

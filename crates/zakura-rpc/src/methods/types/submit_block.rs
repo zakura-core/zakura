@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 
 use zakura_chain::block;
 
@@ -39,6 +39,7 @@ pub struct SubmitBlockParameters {
 pub const PENDING_BLOCK_WAIT: Duration = Duration::from_secs(15);
 
 const MAX_PENDING_BLOCKS: usize = 16;
+const MAX_PENDING_BLOCK_WAITS: usize = 32;
 
 /// A mined-block lifecycle event consumed by the block gossip task.
 #[derive(Debug)]
@@ -86,9 +87,25 @@ struct PendingBlock {
     status: watch::Sender<PendingStatus>,
 }
 
+/// Stores pending blocks and bounds peer waits.
+#[derive(Debug)]
+struct PendingBlockRegistryInner {
+    entries: Mutex<HashMap<block::Hash, PendingBlock>>,
+    wait_permits: Arc<Semaphore>,
+}
+
 /// Holds early-advertised block bodies until their contextual commits finish.
-#[derive(Clone, Debug, Default)]
-pub struct PendingBlockRegistry(Arc<Mutex<HashMap<block::Hash, PendingBlock>>>);
+#[derive(Clone, Debug)]
+pub struct PendingBlockRegistry(Arc<PendingBlockRegistryInner>);
+
+impl Default for PendingBlockRegistry {
+    fn default() -> Self {
+        Self(Arc::new(PendingBlockRegistryInner {
+            entries: Mutex::new(HashMap::new()),
+            wait_permits: Arc::new(Semaphore::new(MAX_PENDING_BLOCK_WAITS)),
+        }))
+    }
+}
 
 impl PendingBlockRegistry {
     /// Inserts a block before its early inventory is sent.
@@ -98,6 +115,7 @@ impl PendingBlockRegistry {
         let hash = block.hash();
         let mut entries = self
             .0
+            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if entries.contains_key(&hash) {
@@ -117,6 +135,7 @@ impl PendingBlockRegistry {
     pub fn resolve(&self, hash: block::Hash, result: Result<Arc<block::Block>, ()>) {
         let entry = self
             .0
+            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&hash);
@@ -137,14 +156,26 @@ impl PendingBlockRegistry {
     ) -> impl std::future::Future<Output = Option<Arc<block::Block>>> + Send + 'static {
         let status = self
             .0
+            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&hash)
             .map(|entry| entry.status.subscribe());
+        let wait_permit = status.as_ref().and_then(|_| {
+            self.0
+                .wait_permits
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    metrics::counter!("mining.pending_peer_wait.saturated").increment(1);
+                })
+                .ok()
+        });
         let deadline = tokio::time::Instant::now() + PENDING_BLOCK_WAIT;
 
         async move {
             let mut status = status?;
+            let _wait_permit: OwnedSemaphorePermit = wait_permit?;
             let start = std::time::Instant::now();
             let result = tokio::time::timeout_at(deadline, async {
                 loop {
@@ -306,6 +337,24 @@ mod tests {
         registry.resolve(hash, Err(()));
 
         assert_eq!(wait.await.expect("wait task succeeds"), None);
+    }
+
+    #[tokio::test]
+    async fn pending_block_waits_are_bounded() {
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let hash = block.hash();
+        assert!(registry.insert(block.clone()));
+
+        let waits: Vec<_> = (0..MAX_PENDING_BLOCK_WAITS)
+            .map(|_| registry.wait(hash))
+            .collect();
+        assert_eq!(registry.wait(hash).await, None);
+
+        drop(waits);
+        let wait = registry.wait(hash);
+        registry.resolve(hash, Ok(block.clone()));
+        assert_eq!(wait.await, Some(block));
     }
 
     #[test]

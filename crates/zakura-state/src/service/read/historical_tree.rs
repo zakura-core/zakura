@@ -377,7 +377,6 @@ fn anchor_for(
     )))
 }
 
-
 /// Returns the stored frontier immediately before the absent band, if the band starts above
 /// genesis.
 ///
@@ -605,7 +604,6 @@ pub fn verify_against_index(
     }
 }
 
-
 /// Checks `frontiers` against the best roots the database can produce for `height`.
 ///
 /// Generation-only. It differs from [`verify_against_index`] in one place: below the upgrade
@@ -644,7 +642,6 @@ fn authenticated_roots(
         .filter(|roots| roots.height == height)
         .ok_or(HistoricalTreeDerivationError::MissingAuthenticatedRoot { height })
 }
-
 
 #[cfg(test)]
 mod tests {

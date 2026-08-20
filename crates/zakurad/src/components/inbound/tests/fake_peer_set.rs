@@ -46,13 +46,14 @@ use crate::{
 
 use InventoryResponse::*;
 
-/// Maximum time to wait for a network service request.
+/// How long the mock peer set waits for an expected request before panicking.
 ///
-/// The default [`MockService`] value can be too short for some of these tests that take a little
-/// longer than expected to actually send the network request.
-///
-/// Increasing this value causes the tests to take longer to complete, so it can't be too large.
-const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_millis(500);
+/// Must comfortably exceed [`PEER_GOSSIP_DELAY`]: after that sleep the gossip task still needs a tip
+/// change notification and a short submission delay before it advertises. A tight 500ms bound
+/// races under CI scheduling and fails with `timeout while waiting for a request` even though the
+/// advertise would arrive a moment later. The dedicated gossip tests use the same 30s budget;
+/// with a paused runtime the extra headroom does not slow the happy path.
+const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
 async fn wait_for_gossip() {
     // Let background gossip tasks arm their timers before this paused runtime

@@ -26,7 +26,8 @@ use crate::{
     response::MinedTx,
     service::{
         finalized_state::{
-            DiskWriteBatch, SubtreeArtifact, SubtreeRecord, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE,
+            embedded_last_checkpoint_leaf_counts, DiskWriteBatch, SubtreeArtifact, SubtreeRecord,
+            ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE,
         },
         non_finalized_state::Chain,
         read::{
@@ -773,6 +774,9 @@ async fn missing_subtree_before_last_checkpoint_reports_indeterminate_reason() {
 
 /// A subtree that the authenticated last-checkpoint frontier proves was not completed is an
 /// ordinary empty result, even while the finalized tip is below the last checkpoint.
+///
+/// Ask for the first incomplete Ironwood index from the embedded frontier leaf count so the
+/// regression stays valid after release-state imports complete earlier Ironwood subtrees.
 #[tokio::test]
 async fn incomplete_ironwood_subtree_before_mainnet_last_checkpoint_is_empty() {
     let _init_guard = zakura_test::init();
@@ -784,10 +788,20 @@ async fn incomplete_ironwood_subtree_before_mainnet_last_checkpoint_is_empty() {
     let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
         populated_state(blocks, &Mainnet).await;
     let last_checkpoint = Mainnet.checkpoint_list().max_height();
+    let (_, _, ironwood_leaves) = embedded_last_checkpoint_leaf_counts(&Mainnet, last_checkpoint)
+        .expect("Mainnet embeds a last-checkpoint frontier matching the checkpoint list");
+    let first_incomplete = NoteCommitmentSubtreeIndex(
+        u16::try_from(ironwood_leaves >> TRACKED_SUBTREE_HEIGHT)
+            .expect("completed Ironwood subtree count at the last checkpoint fits in u16"),
+    );
 
     assert!(
         read_state.db.finalized_tip_height() < Some(last_checkpoint),
         "the regression requires a finalized tip below the Mainnet last checkpoint"
+    );
+    assert!(
+        !subtree_completed_by_last_checkpoint(first_incomplete, ironwood_leaves),
+        "the chosen Ironwood index must still be incomplete at the Mainnet last checkpoint"
     );
 
     let mut batch = DiskWriteBatch::new();
@@ -797,12 +811,17 @@ async fn incomplete_ironwood_subtree_before_mainnet_last_checkpoint_is_empty() {
         .write_batch(batch)
         .expect("seeding the Mainnet VCT last checkpoint succeeds");
 
-    let subtrees = ironwood_subtrees(
-        None::<Arc<Chain>>,
-        &read_state.db,
-        NoteCommitmentSubtreeIndex(0)..1.into(),
-    )
-    .expect("the authenticated last checkpoint proves Ironwood subtree zero was not completed");
+    let end = NoteCommitmentSubtreeIndex(
+        first_incomplete
+            .0
+            .checked_add(1)
+            .expect("first incomplete Ironwood index is below u16::MAX"),
+    );
+    let subtrees = ironwood_subtrees(None::<Arc<Chain>>, &read_state.db, first_incomplete..end)
+        .expect(
+            "the authenticated last checkpoint proves the first incomplete Ironwood subtree was \
+             not completed",
+        );
 
     assert!(subtrees.is_empty());
 }

@@ -5,7 +5,7 @@ use std::{
     env,
     error::Error,
     fs,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use tempfile::TempDir;
@@ -28,25 +28,27 @@ use zakura_chain::{
 use zakura_test::prelude::*;
 
 use crate::{
-    config::Config,
+    config::{Config, PruningConfig, StorageMode},
     error::HistoricalTreeUnavailable,
     service::{
         arbitrary::PreparedChain,
         check::anchors::tx_anchors_refer_to_final_treestates,
         non_finalized_state::Chain,
         read::{
-            derive_historical_frontiers, historical_tree::HistoricalTreeDerivationError,
-            sapling_subtrees, sapling_tree, HistoricalTreeCache,
+            derive_historical_frontiers, historical_tree::stored_frontier_before_absent_band,
+            historical_tree::HistoricalTreeDerivationError, sapling_subtrees, sapling_tree,
+            HistoricalTreeCache,
         },
     },
     tests::FakeChainHelper,
-    HashOrHeight,
+    HashOrHeight, ReadRequest, ReadResponse,
 };
 
 use super::super::{
-    commitment_aux, serve_block_roots, vct::validate_final_frontiers_bytes,
-    verify_subtrees_against_stored, CheckpointVerifiedBlock, DiskWriteBatch, FinalizedState,
-    VctAuxiliaryWindow, VctSuccessorWitness,
+    commitment_aux, export_frontier_grid_to, serve_block_roots,
+    vct::validate_final_frontiers_bytes, verify_subtrees_against_stored, CheckpointVerifiedBlock,
+    DiskWriteBatch, FinalizedState, FrontierArtifact, FrontierEntry, FrontierGridExportError,
+    GridSpacing, VctAuxiliaryWindow, VctSuccessorWitness,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -1646,6 +1648,34 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             // range is the absent band and every request is served from the index.
             prop_assert_eq!(fast.vct_fast_synced_below(), Some(handoff), "fast-sync marker is set to the handoff height");
             prop_assert_eq!(fast.db.vct_upgrade_height(), Some(Height(0)), "genesis fast sync records the upgrade height at genesis");
+            prop_assert!(
+                stored_frontier_before_absent_band(&fast.db, Height(0))
+                    .expect("a genesis-start database does not need a stored predecessor")
+                    .is_none(),
+                "U = 0 starts frontier replay from empty genesis trees"
+            );
+            let genesis_export = export_frontier_grid_to(
+                &fast.db,
+                handoff,
+                GridSpacing::Uniform { blocks: 1 },
+                None,
+                |_, _| {},
+            )
+            .expect("a genesis-start VCT database exports its absent band");
+            let last_published = genesis_export
+                .frontiers
+                .entries
+                .last()
+                .expect("a genesis-start band of this length publishes at least one on-grid entry");
+            prop_assert!(
+                last_published.height < handoff,
+                "published heights stay inside the absent band [0, H)"
+            );
+            prop_assert_eq!(
+                genesis_export.replayed_blocks,
+                u64::from(last_published.height.0) + 1,
+                "a genesis-start export replays from empty frontiers through the last on-grid entry"
+            );
 
             // Consensus state (anchor sets + history root) matches the legacy recompute.
             prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors must match legacy");
@@ -1829,12 +1859,12 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 );
             }
 
-            // The replay bound is a serving limit: with the memo primed by the loop above, the
-            // last height is already derived, so it costs nothing. A cold height below every memo
+            // The replay bound is a serving limit: with the cache primed by the loop above, the
+            // last height is already derived, so it costs nothing. A cold height below every cache
             // entry still has to replay, and refuses rather than running unbounded.
             prop_assert!(
                 derive_historical_frontiers(&fast.db, &cache, Height(last as u32 - 1), 0).is_ok(),
-                "a memoized height is served without replaying, whatever the bound"
+                "a cached height is served without replaying, whatever the bound"
             );
             let cold_cache = Mutex::new(HistoricalTreeCache::default());
             let cold_height = Height(last as u32 - 1);
@@ -2011,6 +2041,25 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 verify_subtrees_against_stored(&legacy.db, Height(seed as u32), handoff),
                 Err(HistoricalTreeDerivationError::RootMismatch { height: handoff }),
                 "the subtree audit rejects a replay whose final frontiers are unauthenticated"
+            );
+
+            // Re-label the genesis-start fast database as a mid-chain upgrade only after all its
+            // other assertions. It has no per-height trees below the handoff, so the shared
+            // fallback must reject the missing U - 1 frontier rather than silently replay genesis.
+            let missing_anchor_upgrade = Height(1);
+            let mut batch = DiskWriteBatch::new();
+            batch.delete_sapling_tree(&fast.db, &Height(0));
+            batch.update_vct_upgrade_marker(&fast.db, missing_anchor_upgrade);
+            fast.db
+                .write_batch(batch)
+                .expect("simulating a missing pre-band frontier succeeds");
+            prop_assert_eq!(
+                stored_frontier_before_absent_band(&fast.db, missing_anchor_upgrade).err(),
+                Some(HistoricalTreeDerivationError::MissingAnchor {
+                    height: missing_anchor_upgrade,
+                    anchor: Height(0),
+                }),
+                "a missing stored U - 1 frontier is rejected"
             );
     });
 
@@ -2718,6 +2767,7 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             let mut batch = DiskWriteBatch::new();
             batch.delete_range_commitment_roots_by_height(&legacy.db, &Height(0), &upgrade);
             batch.update_vct_upgrade_marker(&legacy.db, upgrade);
+            batch.update_vct_sync_marker(&legacy.db, last_height);
             legacy
                 .db
                 .write_batch(batch)
@@ -2758,6 +2808,204 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 }),
                 "a zero-replay database fallback is not served without an authenticated root"
             );
+            let (stored_anchor_height, stored_anchor) =
+                stored_frontier_before_absent_band(&legacy.db, upgrade)
+                    .expect("the pre-upgrade trees provide an export anchor")
+                    .expect("a mid-chain upgrade has a stored predecessor");
+            prop_assert_eq!(stored_anchor_height, fallback_anchor);
+            prop_assert_eq!(
+                stored_anchor.sapling.root(),
+                legacy
+                    .db
+                    .latest_stored_sapling_tree(&fallback_anchor)
+                    .expect("the pre-upgrade Sapling tree is stored")
+                    .root()
+            );
+            let anchored_export = export_frontier_grid_to(
+                &legacy.db,
+                last_height,
+                GridSpacing::Uniform { blocks: 1 },
+                None,
+                |_, _| {},
+            )
+            .expect("a mid-chain VCT database exports from its stored predecessor");
+            let last_published = anchored_export
+                .frontiers
+                .entries
+                .last()
+                .expect("a grid over this chain publishes at least one on-grid entry");
+            prop_assert!(
+                last_published.height < last_height,
+                "published heights stay below the target checkpoint"
+            );
+            prop_assert!(
+                anchored_export
+                    .frontiers
+                    .entries
+                    .first()
+                    .is_some_and(|first| first.height < upgrade),
+                "coverage starts at genesis, not at this database's own upgrade height"
+            );
+            prop_assert_eq!(
+                anchored_export.replayed_blocks,
+                u64::from(last_published.height.0 - upgrade.0) + 1,
+                "only the absent band [U, last on-grid entry] is replayed; below U is read"
+            );
+            prop_assert_eq!(
+                anchored_export.frontiers.last_checkpoint,
+                last_height,
+                "the artifact records the checkpoint it was generated for, not this database's handoff"
+            );
+            for entry in &anchored_export.frontiers.entries {
+                // Unchanged trees are deduplicated, so the newest row at or below the height is
+                // the state there.
+                let stored = legacy
+                    .db
+                    .latest_stored_sapling_tree(&entry.height)
+                    .expect("the legacy pass stored a tree at or below every height");
+                prop_assert_eq!(
+                    entry.sapling.root(),
+                    stored.root(),
+                    "every published entry reproduces the tree the legacy pass stored"
+                );
+            }
+
+            // A shorter export is a prefix of a longer one. That is what lets the release
+            // pipeline check an incoming grid against the committed one entry by entry.
+            let shorter_export = export_frontier_grid_to(
+                &legacy.db,
+                Height(last_height.0 - 2),
+                GridSpacing::Uniform { blocks: 1 },
+                None,
+                |_, _| {},
+            )
+            .expect("a lower target exports the same grid, minus its tail");
+            prop_assert!(
+                shorter_export.frontiers.entries.len() < anchored_export.frontiers.entries.len(),
+                "a lower target publishes fewer entries"
+            );
+            for (earlier, later) in shorter_export
+                .frontiers
+                .entries
+                .iter()
+                .zip(&anchored_export.frontiers.entries)
+            {
+                prop_assert_eq!(earlier.height, later.height, "grid heights do not move");
+                prop_assert_eq!(
+                    earlier.sapling.root(),
+                    later.sapling.root(),
+                    "an entry's contents do not change as the target advances"
+                );
+            }
+
+            // Resuming reproduces the from-genesis walk exactly. That is the property the whole
+            // incremental path rests on: the cost accumulator resets at every emitted entry, so
+            // continuing at `last carried entry + 1` places the remainder identically.
+            let resumed_export = export_frontier_grid_to(
+                &legacy.db,
+                last_height,
+                GridSpacing::Uniform { blocks: 1 },
+                Some(&shorter_export.frontiers),
+                |_, _| {},
+            )
+            .expect("a published grid can be carried forward");
+            prop_assert_eq!(
+                resumed_export.frontiers.entries.len(),
+                anchored_export.frontiers.entries.len(),
+                "resuming publishes the same entries as a walk from genesis"
+            );
+            for (from_genesis, resumed) in anchored_export
+                .frontiers
+                .entries
+                .iter()
+                .zip(&resumed_export.frontiers.entries)
+            {
+                prop_assert_eq!(from_genesis.height, resumed.height);
+                prop_assert_eq!(from_genesis.sapling.root(), resumed.sapling.root());
+                prop_assert_eq!(from_genesis.orchard.root(), resumed.orchard.root());
+            }
+            prop_assert_eq!(
+                resumed_export.frontiers.encode(&network),
+                anchored_export.frontiers.encode(&network),
+                "a resumed artifact is byte-identical to the one a full walk produces"
+            );
+            prop_assert!(
+                resumed_export.replayed_blocks < anchored_export.replayed_blocks,
+                "resuming replays less than a walk from genesis"
+            );
+
+            // A grid that already reaches the requested checkpoint has nothing to extend, and
+            // carrying entries at or above it would describe heights the export does not cover.
+            prop_assert!(
+                matches!(
+                    export_frontier_grid_to(
+                        &legacy.db,
+                        Height(2),
+                        GridSpacing::Uniform { blocks: 1 },
+                        Some(&anchored_export.frontiers),
+                        |_, _| {},
+                    ),
+                    Err(FrontierGridExportError::ResumeAboveTarget { .. })
+                ),
+                "a grid reaching past the target is refused rather than truncated"
+            );
+
+            // One export can draw on every source at once. Narrowing the handoff leaves this
+            // database with stored trees on both sides of its absent band: entries below `U` and
+            // at or above the handoff are read, and only the band between them is replayed.
+            let narrow_handoff = Height(upgrade.0 + 2);
+            let mut batch = DiskWriteBatch::new();
+            batch.update_vct_sync_marker(&legacy.db, narrow_handoff);
+            legacy
+                .db
+                .write_batch(batch)
+                .expect("narrowing the absent band succeeds");
+            let mixed_export = export_frontier_grid_to(
+                &legacy.db,
+                last_height,
+                GridSpacing::Uniform { blocks: 1 },
+                None,
+                |_, _| {},
+            )
+            .expect("a database with trees on both sides of its band exports every height");
+            prop_assert!(
+                mixed_export.replayed_blocks
+                    <= u64::from(narrow_handoff.0 - upgrade.0),
+                "replay is confined to the absent band"
+            );
+            prop_assert!(
+                mixed_export.replayed_blocks < anchored_export.replayed_blocks,
+                "a narrower band means less replay for the same coverage"
+            );
+            prop_assert!(
+                mixed_export
+                    .frontiers
+                    .entries
+                    .last()
+                    .is_some_and(|entry| entry.height >= narrow_handoff),
+                "coverage continues above the handoff, where the trees are stored again"
+            );
+            for (band_generated, read_generated) in anchored_export
+                .frontiers
+                .entries
+                .iter()
+                .zip(&mixed_export.frontiers.entries)
+            {
+                prop_assert_eq!(band_generated.height, read_generated.height);
+                prop_assert_eq!(
+                    band_generated.sapling.root(),
+                    read_generated.sapling.root(),
+                    "a replayed entry and a read entry at the same height are the same frontier"
+                );
+            }
+
+            // Restore the fixture's handoff for the assertions that follow.
+            let mut batch = DiskWriteBatch::new();
+            batch.update_vct_sync_marker(&legacy.db, last_height);
+            legacy
+                .db
+                .write_batch(batch)
+                .expect("restoring the fixture handoff succeeds");
             let stitched = serve_block_roots(&legacy.db, serve_range);
             prop_assert_eq!(
                 stitched,
@@ -2776,6 +3024,14 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
                 .db
                 .write_batch(batch)
                 .expect("simulating a stale post-rollback upgrade marker succeeds");
+            prop_assert_eq!(
+                stored_frontier_before_absent_band(&legacy.db, stale_anchor).err(),
+                Some(HistoricalTreeDerivationError::MissingAnchor {
+                    height: stale_anchor,
+                    anchor: stale_anchor,
+                }),
+                "the shared stored-tree anchor rejects a stale upgrade marker"
+            );
             prop_assert_eq!(
                 derive_historical_frontiers(
                     &legacy.db,
@@ -2881,6 +3137,248 @@ fn vct_untrusted_fixture_drives_byte_identical_state() -> Result<()> {
 
             prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors from fixture roots match legacy");
             prop_assert_eq!(fast.db.history_tree().hash(), golden_history, "fast history from fixture roots match legacy");
+    });
+
+    Ok(())
+}
+
+/// Builds a [`crate::ReadStateService`] over `finalized_state`, so tests can exercise the real
+/// read handlers rather than the helpers underneath them.
+///
+/// The config gate, the artifact load, and the typed-error fallback all live in the handler, so
+/// testing only the helpers would leave the seam that actually serves `z_gettreestate` unproven.
+fn read_service_over(finalized_state: &FinalizedState) -> crate::ReadStateService {
+    use zakura_node_services::sync_lifecycle::{
+        HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+    };
+
+    use crate::service::{
+        non_finalized_state::NonFinalizedState, watch_receiver::WatchReceiver,
+        HeaderChainSubscriptions, ReadStateService, VctRootRepairStatus,
+    };
+
+    let (_non_finalized_sender, non_finalized_receiver) =
+        tokio::sync::watch::channel(NonFinalizedState::new(&finalized_state.network()));
+    let (_repair_sender, repair_receiver) =
+        tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+        tokio::sync::watch::channel(None);
+    let (_header_chain_view_sender, header_chain_view_receiver) = tokio::sync::watch::channel(None);
+    let (_header_runtime_status_sender, header_runtime_status_receiver) =
+        tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+            epoch: LifecycleEpoch::INITIAL,
+            reason: HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+        });
+    let (_header_chain_reader_sender, header_chain_reader_receiver) =
+        tokio::sync::watch::channel(None);
+
+    ReadStateService::new(
+        finalized_state,
+        None,
+        Arc::new(OnceLock::new()),
+        WatchReceiver::new(non_finalized_receiver),
+        repair_receiver,
+        HeaderChainSubscriptions {
+            snapshots: header_chain_snapshot_receiver,
+            views: header_chain_view_receiver,
+            runtime_status: header_runtime_status_receiver,
+            reader: header_chain_reader_receiver,
+        },
+        crate::service::load_historical_frontier_artifact(
+            &finalized_state.network(),
+            finalized_state.db.config(),
+            finalized_state.db.vct_synced_below().is_some(),
+        )
+        .expect("the test historical frontier artifact loads")
+        .discard_if_before_vct_handoff(finalized_state.db.config(), &finalized_state.db),
+    )
+}
+
+/// Writes a genesis-empty frontier grid, the anchor a deriving node needs before it will serve
+/// the absent band at all.
+///
+/// Height 0 is empty on this synthetic chain, so the entry root-checks and a below-handoff
+/// request still has to replay. The file must outlive the [`FinalizedState`] that points at it.
+fn write_genesis_frontier_artifact(
+    network: &zakura_chain::parameters::Network,
+    last_checkpoint: Height,
+) -> tempfile::NamedTempFile {
+    let artifact = FrontierArtifact {
+        spacing: 1,
+        last_checkpoint,
+        entries: vec![FrontierEntry {
+            height: Height(0),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
+        }],
+    };
+    let file = tempfile::NamedTempFile::new().expect("a temporary artifact file is created");
+    fs::write(file.path(), artifact.encode(network)).expect("the genesis frontier artifact writes");
+    file
+}
+
+/// The read service must serve absent-band treestates when derivation is enabled, and report the
+/// typed archive-mode error when it is not, including when the node is pruned.
+///
+/// This exercises the handler itself — config gating, derivation, the pruned-mode short-circuit,
+/// and the fallback to [`HistoricalTreeUnavailable`] — rather than the helpers underneath it,
+/// because that handler is what a wallet's `z_gettreestate` actually reaches.
+#[test]
+#[allow(clippy::needless_range_loop)] // the loops index blocks[i + 1] for the successor witness
+fn vct_read_service_serves_or_refuses_absent_band_treestates() -> Result<()> {
+    use tower::ServiceExt;
+
+    let _init_guard = zakura_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu6_3: Some(48),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 4).expect("test activation height fits in usize");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((blocks, network) in super::valid_commitment_chain(ledger_strategy.clone(), tested_block_count).no_shrink())| {
+
+        let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+        let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+        let last = (nu5 + 3) as usize;
+        prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+        let handoff = Height(last as u32);
+        let seed = (heartwood - 1) as usize;
+
+        // Legacy pass: the per-block fixture, and the golden trees to compare against.
+        let mut legacy = FinalizedState::new(&Config::ephemeral(), &network)
+            .expect("opening an ephemeral database should succeed");
+        let mut fixture = TestRootMap::new();
+        let mut handoff_trees = None;
+        for i in 0..=last {
+            let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+            let (_h, trees) = legacy
+                .commit_finalized_direct(cv.into(), None, None, "vct legacy")
+                .unwrap();
+            if i > seed {
+                fixture.insert(
+                    i as u32,
+                    (trees.sapling.root(), trees.orchard.root(), trees.ironwood.root()),
+                );
+            }
+            if i == last {
+                handoff_trees = Some(trees);
+            }
+        }
+        let handoff_trees = handoff_trees.expect("the handoff produced trees");
+
+        let commit_fast = |config: Config| {
+            let mut fast = FinalizedState::new(&config, &network)
+                .expect("opening an ephemeral database should succeed");
+            enable_vct_test_fixture_source_with_handoff(
+                &mut fast,
+                fixture.clone(),
+                handoff,
+                handoff_trees.sapling.clone(),
+                handoff_trees.orchard.clone(),
+                handoff_trees.sprout.clone(),
+                handoff_trees.ironwood.clone(),
+            );
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < last).then(|| vct_successor_witness(blocks[i + 1].block.clone()));
+                fast.commit_finalized_direct(cv.into(), None, next, "vct fast")
+                    .expect("verified fast commit succeeds");
+            }
+            fast
+        };
+
+        let probe = Height(last as u32 - 1);
+        let runtime = tokio::runtime::Runtime::new().expect("a test runtime starts");
+
+        // An archive node on the VCT fast path derives: the handler serves trees matching the
+        // legacy node's. A genesis-empty grid is enough to anchor on, and still leaves the probe
+        // as a replay rather than a zero-cost hit.
+        let artifact_file = write_genesis_frontier_artifact(&network, handoff);
+        let deriving = Config {
+            historical_frontier_artifact: Some(artifact_file.path().to_path_buf()),
+            ..Config::ephemeral()
+        };
+        let fast = commit_fast(deriving);
+        prop_assert!(fast.db.vct_tree_absent(probe), "the probe height is in the absent band");
+
+        let read_state = read_service_over(&fast);
+        let sapling = runtime
+            .block_on(read_state.clone().oneshot(ReadRequest::SaplingTree(probe.into())))
+            .expect("the read service answers");
+        let ReadResponse::SaplingTree(Some(tree)) = sapling else {
+            panic!("derivation is enabled, so the absent band must be served, got {sapling:?}")
+        };
+        prop_assert_eq!(
+            tree.root(),
+            legacy.db.sapling_tree_by_height(&probe).expect("legacy stores every tree").root(),
+            "the served Sapling treestate matches the legacy node"
+        );
+
+        let orchard = runtime
+            .block_on(read_state.oneshot(ReadRequest::OrchardTree(probe.into())))
+            .expect("the read service answers");
+        let ReadResponse::OrchardTree(Some(tree)) = orchard else {
+            panic!("derivation is enabled, so the absent band must be served, got {orchard:?}")
+        };
+        prop_assert_eq!(
+            tree.root(),
+            legacy.db.orchard_tree_by_height(&probe).expect("legacy stores every tree").root(),
+            "the served Orchard treestate matches the legacy node"
+        );
+
+        // Pruned mode, grid and all: bodies in the retention window may still be present on this
+        // short chain, but a pruned node cannot serve historical treestates. Fail with the typed
+        // archive-mode error rather than walking the replay until a missing body.
+        let pruned = Config {
+            historical_frontier_artifact: Some(artifact_file.path().to_path_buf()),
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            ..Config::ephemeral()
+        };
+        let fast = commit_fast(pruned);
+        let read_state = read_service_over(&fast);
+        let sapling_error = runtime
+            .block_on(read_state.clone().oneshot(ReadRequest::SaplingTree(probe.into())))
+            .expect_err("pruned mode must not derive historical treestates");
+        prop_assert!(
+            sapling_error.to_string().contains("fast-synced"),
+            "pruned mode reports the typed archive-mode error, got: {sapling_error}"
+        );
+        prop_assert!(
+            !sapling_error.to_string().contains("not retained"),
+            "pruned mode must not surface a per-height missing-body replay failure, got: {sapling_error}"
+        );
+        let orchard_error = runtime
+            .block_on(read_state.oneshot(ReadRequest::OrchardTree(probe.into())))
+            .expect_err("pruned mode must not derive historical treestates");
+        prop_assert!(
+            orchard_error.to_string().contains("fast-synced"),
+            "pruned mode reports the typed archive-mode error, got: {orchard_error}"
+        );
+
     });
 
     Ok(())

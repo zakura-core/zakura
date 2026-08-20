@@ -5,7 +5,10 @@
 //! those two sources works for both legacy and verified-commitment-trees databases, and does not
 //! need historical block bodies or per-height frontiers from the skipped range.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use thiserror::Error;
 
@@ -14,12 +17,18 @@ use zakura_chain::{
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
 };
 
+use crate::service::read::historical_tree::{
+    replay_with_subtrees, stored_frontier_before_absent_band, stored_frontiers_at,
+    verify_against_available_roots, DerivedFrontiers, HistoricalTreeDerivationError,
+};
+
 use super::{
     commitment_aux::{
         produce_settled_final_frontiers, FinalFrontiers, FinalFrontiersGenerationError,
     },
     treestate_artifact::{
-        embedded_historical_subtrees, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
+        embedded_historical_subtrees, FrontierArtifact, FrontierEntry, SubtreeArtifact,
+        SubtreeRecord, TreestateArtifactError,
     },
     ZakuraDb,
 };
@@ -558,6 +567,481 @@ mod tests {
                 expected: 2,
                 found: 1,
             })
+        );
+    }
+}
+
+/// Estimated replay cost of one block, in microseconds, independent of its shielded activity.
+///
+/// Covers reading the block and walking its transactions. Blocks with no shielded outputs cost
+/// about this much, which is what the constant is fitted to.
+const COST_PER_BLOCK_US: u64 = 1_500;
+
+/// Estimated replay cost of appending one note commitment, in microseconds.
+///
+/// Fitted so the model reproduces the measured whole-band replay time (6,879 s over 3,358,006
+/// blocks and ~124M Sapling and Orchard commitments) given [`COST_PER_BLOCK_US`]. Appending
+/// dominates wherever there is shielded activity.
+const COST_PER_COMMITMENT_US: u64 = 47;
+
+/// How the frontier grid's height spacing is chosen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GridSpacing {
+    /// One entry every `blocks` heights.
+    Uniform {
+        /// The height spacing.
+        blocks: u32,
+    },
+
+    /// One entry per `budget_us` of estimated replay cost.
+    ///
+    /// Replay cost varies by more than an order of magnitude across Mainnet, so a uniform grid
+    /// either wastes entries where blocks are cheap or leaves a long tail where they are not.
+    /// Spacing by estimated cost instead bounds the worst cold request rather than the average.
+    ///
+    /// The estimate is a deterministic function of the chain — block and commitment counts, not
+    /// wall-clock timing — so two generator runs on different hardware still produce byte-identical
+    /// artifacts.
+    Adaptive {
+        /// The per-entry cost budget, in microseconds.
+        budget_us: u64,
+    },
+}
+
+/// Why frontier grid generation could not complete.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum FrontierGridExportError {
+    /// The database has no finalized tip, so it holds nothing to generate from.
+    #[error("this database has no finalized tip to generate a frontier grid from")]
+    NoFinalizedTip,
+
+    /// The requested checkpoint is above what the database has finalized.
+    #[error("cannot generate a grid for {target:?}: this database is only finalized to {tip:?}")]
+    TargetAboveTip {
+        /// The requested checkpoint.
+        target: Height,
+        /// The database's finalized tip.
+        tip: Height,
+    },
+
+    /// The grid would cover no heights at all.
+    #[error("a grid at {target:?} covers no heights")]
+    EmptyRange {
+        /// The requested checkpoint.
+        target: Height,
+    },
+
+    /// The grid spacing or cost budget was zero, which would produce an entry at every height.
+    #[error("grid spacing and cost budget must be at least 1")]
+    ZeroSpacing,
+
+    /// The grid being resumed from reaches at or above the requested checkpoint.
+    #[error(
+        "cannot resume from a grid whose last entry {seed:?} is not below the requested \
+         checkpoint {target:?}"
+    )]
+    ResumeAboveTarget {
+        /// The highest entry in the grid being resumed from.
+        seed: Height,
+        /// The requested checkpoint.
+        target: Height,
+    },
+
+    /// A block body needed to place entries is not retained.
+    #[error(
+        "cannot place frontier grid entries: block body {missing:?} is not retained; generate \
+         from an archive database"
+    )]
+    UnretainedBlockBody {
+        /// The first height whose body was missing.
+        missing: Height,
+    },
+
+    /// A replay or its root check failed.
+    #[error("generation failed at height {height:?}: {source}")]
+    Derivation {
+        /// The height being produced when generation failed.
+        height: Height,
+        /// The underlying failure.
+        #[source]
+        source: HistoricalTreeDerivationError,
+    },
+}
+
+/// What one frontier grid generation run produced.
+#[derive(Clone, Debug)]
+pub struct FrontierGridExport {
+    /// The frontier grid.
+    pub frontiers: FrontierArtifact,
+
+    /// How long generation took.
+    pub elapsed: Duration,
+
+    /// How many blocks were replayed.
+    pub replayed_blocks: u64,
+}
+
+/// Next on-grid height at or below `last`, or `None` if only a partial cell remains.
+///
+/// A partial cell is not published. Clamping it to `last` would place a tip-local entry that a
+/// later export, at a higher `last`, would replace with the unclamped grid point — rewriting the
+/// seam and breaking the append-only prefix contract. Serving still covers that tail: it replays
+/// from the previous on-grid entry, which is already within one grid step.
+fn next_grid_target(
+    spacing: GridSpacing,
+    next: Height,
+    last: Height,
+    accrued_cost: &mut u64,
+    mut block_commitments: impl FnMut(Height) -> usize,
+) -> Option<Height> {
+    match spacing {
+        GridSpacing::Uniform { blocks } => {
+            let target = Height(next.0.saturating_add(blocks));
+            (target <= last).then_some(target)
+        }
+        GridSpacing::Adaptive { budget_us } => {
+            let mut candidate = next;
+            while candidate <= last {
+                let counts = block_commitments(candidate);
+                *accrued_cost = accrued_cost
+                    .saturating_add(COST_PER_BLOCK_US)
+                    // The count is bounded by a block's own commitments, so it fits in u64.
+                    .saturating_add(COST_PER_COMMITMENT_US.saturating_mul(counts as u64));
+                if *accrued_cost >= budget_us {
+                    *accrued_cost = 0;
+                    return Some(candidate);
+                }
+                if candidate == last {
+                    return None;
+                }
+                candidate = Height(candidate.0 + 1);
+            }
+            None
+        }
+    }
+}
+
+/// Generates the frontier grid covering `[0, target_checkpoint)` at the given `spacing`.
+///
+/// Each entry's frontiers come from whichever source the database actually holds at that height.
+/// Per-height trees are read wherever they exist; retained block bodies are replayed only across
+/// a verified-commitment-trees database's absent band `[U, H)`, where no tree was ever written.
+/// A legacy archive database has trees at every height, so it generates the whole grid from reads
+/// and never replays.
+///
+/// The walk always starts at genesis and its entry heights are a function of chain data alone, so
+/// databases of different shapes, and the same database at different tips, produce grids that are
+/// byte-prefix extensions of one another. That is the append-only contract the release-state
+/// pipeline checks, and it is why the walk does not start at whatever boundary this particular
+/// database happens to have.
+///
+/// A partial cell at `target_checkpoint` is omitted, so a later export at a higher checkpoint is
+/// a prefix of this one plus new on-grid entries. Each emitted entry is root-checked against the
+/// authenticated roots the database already holds, and generation stops at the first height that
+/// fails, so a returned artifact is one whose every entry matched. That is what lets the grid
+/// ship without trust: a consumer re-runs the same check before anchoring on an entry.
+///
+/// Completed subtree roots are not collected here. The release pipeline
+/// ([`produce_release_treestate_artifacts`]) owns that artifact, and it does not need historical
+/// block bodies to build it.
+///
+/// `resume_from` carries an earlier grid's entries forward instead of recomputing them. Each
+/// carried entry is re-checked against this database's authenticated roots before it is accepted, so
+/// resuming inherits no trust from the file it came from. Placement is unaffected: the cost
+/// accumulator resets at every emitted entry, so continuing at `last carried entry + 1` puts the
+/// remaining entries exactly where a walk from genesis would. Resuming also makes the output a
+/// prefix-extension of the input by construction rather than by both runs agreeing on a budget.
+///
+/// `on_progress` is called with each emitted entry's height and the running replay count, for
+/// long runs.
+pub fn export_frontier_grid_to(
+    db: &ZakuraDb,
+    target_checkpoint: Height,
+    spacing: GridSpacing,
+    resume_from: Option<&FrontierArtifact>,
+    mut on_progress: impl FnMut(Height, u64),
+) -> Result<FrontierGridExport, FrontierGridExportError> {
+    match spacing {
+        GridSpacing::Uniform { blocks: 0 } | GridSpacing::Adaptive { budget_us: 0 } => {
+            return Err(FrontierGridExportError::ZeroSpacing)
+        }
+        _ => {}
+    }
+
+    let tip = db
+        .finalized_tip_height()
+        .ok_or(FrontierGridExportError::NoFinalizedTip)?;
+    if target_checkpoint > tip {
+        return Err(FrontierGridExportError::TargetAboveTip {
+            target: target_checkpoint,
+            tip,
+        });
+    }
+    // The covered range is half-open, so the last height the grid can publish is `target - 1`.
+    let last = target_checkpoint.0.checked_sub(1).map(Height).ok_or(
+        FrontierGridExportError::EmptyRange {
+            target: target_checkpoint,
+        },
+    )?;
+
+    // Only a fast-synced database has heights with no stored tree. Everything outside that band
+    // is read rather than replayed, including the pre-upgrade range below `U`.
+    let absent_band = db
+        .vct_synced_below()
+        .map(|handoff| (db.vct_upgrade_height().unwrap_or(Height(0)), handoff));
+
+    let start = Instant::now();
+    let mut entries: Vec<FrontierEntry> = Vec::new();
+    let mut replayed_blocks = 0u64;
+
+    // The replay cursor, carried across grid steps so the band is covered by one contiguous pass
+    // anchored on the previous root-checked endpoint rather than restarted at every entry.
+    let mut replay: Option<(DerivedFrontiers, u32)> = None;
+
+    let mut next = Height(0);
+    let mut accrued_cost: u64 = 0;
+
+    if let Some(seed) = resume_from {
+        if let Some(top) = seed.entries.last() {
+            if top.height > last {
+                return Err(FrontierGridExportError::ResumeAboveTarget {
+                    seed: top.height,
+                    target: target_checkpoint,
+                });
+            }
+        }
+
+        // Carried entries are re-checked here, so a stale, truncated, or hostile input costs a
+        // failed export rather than an unverified entry in the published artifact.
+        for entry in &seed.entries {
+            let frontiers = DerivedFrontiers {
+                sapling: entry.sapling.clone(),
+                orchard: entry.orchard.clone(),
+                ironwood: entry.ironwood.clone(),
+            };
+            verify_against_available_roots(db, entry.height, &frontiers).map_err(|source| {
+                FrontierGridExportError::Derivation {
+                    height: entry.height,
+                    source,
+                }
+            })?;
+
+            // A carried entry inside the absent band is a verified frontier at its height, which
+            // is a nearer replay anchor than the trees below `U`.
+            if absent_band
+                .is_some_and(|(upgrade, handoff)| entry.height >= upgrade && entry.height < handoff)
+            {
+                replay = Some((frontiers, entry.height.0 + 1));
+            }
+
+            entries.push(entry.clone());
+        }
+
+        if let Some(top) = entries.last() {
+            next = Height(top.height.0 + 1);
+        }
+    }
+
+    // A pruned database answers the cost scan with a missing body, which would read as a free
+    // block and space entries far too widely. The artifact would still be valid — every entry is
+    // root-checked — but it would not bound cold requests, which is the only reason it exists.
+    // Record the first such height and fail instead.
+    let mut unretained: Option<Height> = None;
+
+    // Under a uniform grid the next entry is a fixed number of blocks ahead. Under an adaptive
+    // one it is wherever the estimated cost budget runs out, which needs a block-by-block scan
+    // of the commitment counts to find. Either way, a target past `last` is a partial cell and
+    // is not published.
+    while let Some(target) = next_grid_target(spacing, next, last, &mut accrued_cost, |height| {
+        match db.block(height.into()) {
+            Some(block) => {
+                block.sapling_note_commitments().count()
+                    + block.orchard_note_commitments().count()
+                    + block.ironwood_note_commitments().count()
+            }
+            None => {
+                unretained.get_or_insert(height);
+                0
+            }
+        }
+    }) {
+        if let Some(missing) = unretained {
+            return Err(FrontierGridExportError::UnretainedBlockBody { missing });
+        }
+
+        let in_absent_band =
+            absent_band.is_some_and(|(upgrade, handoff)| target >= upgrade && target < handoff);
+
+        let frontiers = if in_absent_band {
+            let (carried, replay_from) = match replay.take() {
+                Some(cursor) => cursor,
+                // Entering the band: anchor on the trees stored just below it, or on empty
+                // frontiers when the band starts at genesis.
+                None => {
+                    let upgrade = absent_band
+                        .expect("a height inside the band implies the band exists")
+                        .0;
+                    match stored_frontier_before_absent_band(db, upgrade).map_err(|source| {
+                        FrontierGridExportError::Derivation {
+                            height: upgrade,
+                            source,
+                        }
+                    })? {
+                        Some((anchor, frontiers)) => (frontiers, anchor.0 + 1),
+                        None => (DerivedFrontiers::empty(), 0),
+                    }
+                }
+            };
+
+            let derived = replay_with_subtrees(db, target, replay_from, carried, |_, _| {})
+                .map_err(|source| FrontierGridExportError::Derivation {
+                    height: target,
+                    source,
+                })?;
+            replayed_blocks += u64::from(target.0 - replay_from) + 1;
+            derived
+        } else {
+            stored_frontiers_at(db, target).map_err(|source| {
+                FrontierGridExportError::Derivation {
+                    height: target,
+                    source,
+                }
+            })?
+        };
+
+        // The root check is what makes this entry safe to publish.
+        verify_against_available_roots(db, target, &frontiers).map_err(|source| {
+            FrontierGridExportError::Derivation {
+                height: target,
+                source,
+            }
+        })?;
+
+        entries.push(FrontierEntry {
+            height: target,
+            sapling: frontiers.sapling.clone(),
+            orchard: frontiers.orchard.clone(),
+            ironwood: frontiers.ironwood.clone(),
+        });
+        on_progress(target, replayed_blocks);
+
+        if in_absent_band {
+            replay = Some((frontiers, target.0 + 1));
+        }
+
+        if target == last {
+            break;
+        }
+
+        next = Height(target.0 + 1);
+    }
+
+    if let Some(missing) = unretained {
+        return Err(FrontierGridExportError::UnretainedBlockBody { missing });
+    }
+
+    Ok(FrontierGridExport {
+        frontiers: FrontierArtifact {
+            spacing: match spacing {
+                GridSpacing::Uniform { blocks } => blocks,
+                // Recorded as provenance only; consumers locate entries by searching.
+                GridSpacing::Adaptive { .. } => 0,
+            },
+            last_checkpoint: target_checkpoint,
+            entries,
+        },
+        elapsed: start.elapsed(),
+        replayed_blocks,
+    })
+}
+
+#[cfg(test)]
+mod grid_target_tests {
+    use super::*;
+
+    fn published_grid_heights(
+        spacing: GridSpacing,
+        start: Height,
+        last: Height,
+        mut commitments: impl FnMut(Height) -> usize,
+    ) -> Vec<u32> {
+        let mut heights = Vec::new();
+        let mut next = start;
+        let mut accrued_cost = 0;
+        while let Some(target) =
+            next_grid_target(spacing, next, last, &mut accrued_cost, &mut commitments)
+        {
+            heights.push(target.0);
+            if target == last {
+                break;
+            }
+            next = Height(target.0 + 1);
+        }
+        heights
+    }
+
+    #[test]
+    fn uniform_grid_omits_a_partial_final_cell() {
+        let spacing = GridSpacing::Uniform { blocks: 10 };
+
+        assert_eq!(
+            published_grid_heights(spacing, Height(0), Height(25), |_| 0),
+            vec![10, 21],
+            "the cell that would clamp to 25 is not published"
+        );
+        assert_eq!(
+            published_grid_heights(spacing, Height(0), Height(10), |_| 0),
+            vec![10],
+            "a target that lands exactly on last is on-grid and is published"
+        );
+        assert!(
+            published_grid_heights(spacing, Height(0), Height(9), |_| 0).is_empty(),
+            "a band shorter than one step publishes nothing rather than a clamped entry"
+        );
+    }
+
+    #[test]
+    fn uniform_grid_heights_are_prefix_compatible_across_tips() {
+        let spacing = GridSpacing::Uniform { blocks: 10 };
+        let earlier = published_grid_heights(spacing, Height(0), Height(25), |_| 0);
+        let later = published_grid_heights(spacing, Height(0), Height(35), |_| 0);
+
+        assert_eq!(&later[..earlier.len()], earlier.as_slice());
+        assert_eq!(later, vec![10, 21, 32]);
+        assert!(
+            !later.contains(&25),
+            "the height a clamp would have published at the earlier tip is not a later grid point"
+        );
+    }
+
+    #[test]
+    fn adaptive_grid_omits_a_partial_final_cell() {
+        // Three empty blocks cost 4_500 µs, so a 4_000 µs budget fires every third height.
+        let spacing = GridSpacing::Adaptive { budget_us: 4_000 };
+
+        assert_eq!(
+            published_grid_heights(spacing, Height(0), Height(10), |_| 0),
+            vec![2, 5, 8],
+            "the incomplete cell ending at last is omitted"
+        );
+        assert_eq!(
+            published_grid_heights(spacing, Height(0), Height(11), |_| 0),
+            vec![2, 5, 8, 11],
+            "last is published when it is a real budget boundary"
+        );
+    }
+
+    #[test]
+    fn adaptive_grid_heights_are_prefix_compatible_across_tips() {
+        let spacing = GridSpacing::Adaptive { budget_us: 4_000 };
+        let earlier = published_grid_heights(spacing, Height(0), Height(10), |_| 0);
+        let later = published_grid_heights(spacing, Height(0), Height(11), |_| 0);
+
+        assert_eq!(&later[..earlier.len()], earlier.as_slice());
+        assert_eq!(later, vec![2, 5, 8, 11]);
+        assert!(
+            !later.contains(&10),
+            "the height a clamp would have published at the earlier tip is not a later grid point"
         );
     }
 }

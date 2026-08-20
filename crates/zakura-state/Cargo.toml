@@ -37,6 +37,7 @@ commit-metrics = []
 # Test-only features
 header-fuzz = []
 proptest-impl = [
+    "dep:halo2",
     "proptest",
     "proptest-derive",
     "zakura-test",
@@ -48,6 +49,7 @@ bincode = { workspace = true }
 chrono = { workspace = true, features = ["clock", "std"] }
 dirs = { workspace = true }
 futures = { workspace = true }
+halo2 = { workspace = true, optional = true }
 hex = { workspace = true }
 hex-literal = { workspace = true }
 humantime-serde = { workspace = true }

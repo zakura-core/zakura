@@ -963,7 +963,9 @@ async fn setup(
     // State
     // UTXO verification doesn't matter for these tests.
     let (state_service, _read_only_state_service, latest_chain_tip, chain_tip_change) =
-        zakura_state::init(state_config, &network, Height::MAX, 0).await;
+        zakura_state::init(state_config, &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
     let state_service = ServiceBuilder::new().buffer(10).service(state_service);
 
     // Network
@@ -1156,7 +1158,9 @@ mod submitblock_test {
         // State
         let state_config = StateConfig::ephemeral();
         let (_state_service, _read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zakura_state::init(state_config, &Network::Mainnet, Height::MAX, 0).await;
+            zakura_state::init(state_config, &Network::Mainnet, Height::MAX, 0)
+                .await
+                .expect("ephemeral state initialization succeeds");
 
         let config_listen_addr = "127.0.0.1:0".parse().unwrap();
 

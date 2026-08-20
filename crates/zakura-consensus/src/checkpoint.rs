@@ -82,6 +82,15 @@ struct RequestBlock {
 /// The CheckpointVerifier avoids creating zero-block lists.
 type QueuedBlockList = Vec<QueuedBlock>;
 
+/// A state-tip reset requested by a checkpoint commit from one verifier generation.
+#[derive(Copy, Clone, Debug)]
+struct CheckpointReset {
+    /// The verifier generation that submitted the failed commit.
+    generation: u64,
+    /// The durable state tip observed after the commit failed.
+    tip: Option<(block::Height, block::Hash)>,
+}
+
 /// The maximum number of queued blocks at any one height.
 ///
 /// This value is a tradeoff between:
@@ -152,10 +161,12 @@ where
 
     /// A channel to receive requests to reset the verifier,
     /// receiving the tip of the state.
-    reset_receiver: mpsc::Receiver<Option<(block::Height, block::Hash)>>,
+    reset_receiver: mpsc::Receiver<CheckpointReset>,
     /// A channel to send requests to reset the verifier,
     /// passing the tip of the state.
-    reset_sender: mpsc::Sender<Option<(block::Height, block::Hash)>>,
+    reset_sender: mpsc::Sender<CheckpointReset>,
+    /// The generation assigned to new checkpoint commits.
+    reset_generation: u64,
 
     /// Queued block height progress transmitter.
     #[cfg(feature = "progress-bar")]
@@ -286,6 +297,7 @@ where
             verifier_progress,
             reset_receiver: receiver,
             reset_sender: sender,
+            reset_generation: 0,
             #[cfg(feature = "progress-bar")]
             queued_blocks_bar,
             #[cfg(feature = "progress-bar")]
@@ -372,6 +384,42 @@ where
         self.verifier_progress = verifier_progress;
 
         self.verified_checkpoint_diagnostics(verifier_progress.height());
+    }
+
+    /// Apply one reset for the current generation and discard older reset requests.
+    ///
+    /// One checkpoint-range failure can make every sibling commit future fail.
+    /// Each sibling then requests a reset for the same generation.
+    /// The first recovery call drains those requests and advances the generation.
+    /// A late sibling request cannot rewind progress after recovery.
+    fn apply_pending_reset(&mut self) {
+        let generation = self.reset_generation;
+        let mut highest_tip = None;
+
+        while let Ok(reset) = self.reset_receiver.try_recv() {
+            if reset.generation != generation {
+                continue;
+            }
+
+            highest_tip = Some(match (highest_tip, reset.tip) {
+                (None, tip) => tip,
+                (Some(None), tip) => tip,
+                (Some(Some(current)), None) => Some(current),
+                (Some(Some(current)), Some(candidate)) => Some(if candidate.0 >= current.0 {
+                    candidate
+                } else {
+                    current
+                }),
+            });
+        }
+
+        if let Some(tip) = highest_tip {
+            self.reset_progress(tip);
+            self.reset_generation = self
+                .reset_generation
+                .checked_add(1)
+                .expect("checkpoint reset generation cannot exhaust u64");
+        }
     }
 
     /// Return the current verifier's progress.
@@ -1151,9 +1199,8 @@ where
     fn call(&mut self, block: Arc<Block>) -> Self::Future {
         // Reset the verifier back to the state tip if requested
         // (e.g. due to an error when committing a block to the state)
-        if let Ok(tip) = self.reset_receiver.try_recv() {
-            self.reset_progress(tip);
-        }
+        self.apply_pending_reset();
+        let reset_generation = self.reset_generation;
 
         // Immediately reject all incoming blocks that arrive after we've finished.
         if let FinalCheckpoint = self.previous_checkpoint_height() {
@@ -1267,7 +1314,10 @@ where
                     };
                     // Ignore errors since send() can fail only when the verifier
                     // is being dropped, and then it doesn't matter anymore.
-                    let _ = reset_sender.send(tip);
+                    let _ = reset_sender.send(CheckpointReset {
+                        generation: reset_generation,
+                        tip,
+                    });
                 }
             }
             result

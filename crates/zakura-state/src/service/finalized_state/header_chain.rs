@@ -2312,9 +2312,24 @@ impl HeaderChainRuntime {
         // and the auxiliary transition below advances that version. Provenance therefore has
         // to be checked against the pre-auxiliary snapshot the writer actually authorized.
         let before = transition_engine.snapshot();
-        if checkpoint_request.expected_version == before.state_version {
-            validate_full_state_finality_provenance(&checkpoint_request.event, &before)?;
+        if checkpoint_request.expected_version != before.state_version {
+            let branch = checkpoint_request
+                .event
+                .header_sync_owner()
+                .map(HeaderSyncWorkOwner::header_authority)
+                .map(|authority| authority.branch)
+                .or_else(|| {
+                    checkpoint_request
+                        .event
+                        .body_owner()
+                        .map(|owner| owner.branch)
+                });
+            return Ok(ApplyResult::Stale(StaleReceipt {
+                current_version: before.state_version,
+                branch,
+            }));
         }
+        validate_full_state_finality_provenance(&checkpoint_request.event, &before)?;
 
         let first_authority = StateIssuedAuthority {
             inner: first_context.full_state_authority,

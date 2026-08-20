@@ -1480,7 +1480,7 @@ fn repeated_compatible_finality_publications_preserve_body_work_epoch() {
 }
 
 #[test]
-fn combined_checkpoint_accepts_evidence_bound_to_the_pre_auxiliary_version() {
+fn combined_checkpoint_rejects_stale_version_and_accepts_pre_auxiliary_evidence() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
@@ -1612,6 +1612,53 @@ fn combined_checkpoint_accepts_evidence_bound_to_the_pre_auxiliary_version() {
             .expect("the auxiliary observation has an identity"),
     );
     let checkpoint_authority = Authority(checkpoint_evidence);
+
+    let stale_version = StateVersion::new(
+        before
+            .state_version
+            .get()
+            .checked_sub(1)
+            .expect("header insertion advanced the initial version"),
+    );
+    let mut stale_full_state_batch = DiskWriteBatch::new();
+    stage_full_state_canonical_hash(&runtime.store, &mut stale_full_state_batch, child);
+    let mut stale_memory_swapped = false;
+    let stale_result = runtime
+        .apply_aux_then_checkpoint_combined(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: aux_event.clone(),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&aux_authority),
+                retention_references: &[],
+            },
+            TransitionRequest {
+                expected_version: stale_version,
+                event: checkpoint_event.clone(),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&checkpoint_authority),
+                retention_references: &[],
+            },
+            stale_full_state_batch,
+            || stale_memory_swapped = true,
+        )
+        .expect("a stale checkpoint request returns a typed result");
+
+    assert_eq!(
+        stale_result,
+        ApplyResult::Stale(StaleReceipt {
+            current_version: before.state_version,
+            branch: None,
+        })
+    );
+    assert!(!stale_memory_swapped);
+    assert_eq!(runtime.publisher().snapshot(), before);
 
     let mut full_state_batch = DiskWriteBatch::new();
     stage_full_state_canonical_hash(&runtime.store, &mut full_state_batch, child);

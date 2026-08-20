@@ -1025,6 +1025,79 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
     Ok(())
 }
 
+/// A late reset from an earlier commit generation must not rewind recovered progress.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_commit_reset_must_not_rewind_recovered_checkpoint_progress() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let blockchain: Vec<_> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .iter()
+        .map(|(height, bytes)| {
+            let block = Arc::<Block>::zcash_deserialize(*bytes).expect("block deserializes");
+            let hash = block.hash();
+            let coinbase_height = block.coinbase_height().expect("block has a height");
+            assert_eq!(*height, coinbase_height.0);
+            (coinbase_height, hash)
+        })
+        .collect();
+    assert!(blockchain.len() > 10);
+
+    let checkpoint_list: BTreeMap<_, _> = [0usize, 3, 6, 10]
+        .into_iter()
+        .map(|index| blockchain[index])
+        .collect();
+    let state_service = zakura_state::init_test(&Mainnet).await;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        checkpoint_list,
+        &Mainnet,
+        Some(blockchain[3]),
+        state_service,
+    )
+    .map_err(|e| eyre!(e))?;
+
+    checkpoint_verifier
+        .reset_sender
+        .send(CheckpointReset {
+            generation: 0,
+            tip: Some(blockchain[3]),
+        })
+        .expect("the verifier owns the reset receiver");
+    checkpoint_verifier
+        .reset_sender
+        .send(CheckpointReset {
+            generation: 0,
+            tip: Some(blockchain[6]),
+        })
+        .expect("the verifier owns the reset receiver");
+    checkpoint_verifier.apply_pending_reset();
+
+    assert_eq!(checkpoint_verifier.reset_generation, 1);
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        InitialTip(block::Height(6)),
+        "one reset generation must use its highest durable tip"
+    );
+
+    checkpoint_verifier.verifier_progress = PreviousCheckpoint(block::Height(6));
+    checkpoint_verifier
+        .reset_sender
+        .send(CheckpointReset {
+            generation: 0,
+            tip: Some(blockchain[3]),
+        })
+        .expect("the verifier owns the reset receiver");
+    checkpoint_verifier.apply_pending_reset();
+
+    assert_eq!(checkpoint_verifier.reset_generation, 1);
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        PreviousCheckpoint(block::Height(6)),
+        "a late reset from the failed generation must not reopen a committed gap"
+    );
+
+    Ok(())
+}
+
 /// Duplicate block errors must stay classified as duplicate requests after the
 /// state wraps them, so they don't restart the syncer during checkpoint sync.
 #[test]

@@ -66,8 +66,19 @@ impl BlockAdmission {
 
     /// Marks the block as admitted to the active non-finalized write queue.
     pub(crate) fn admit(&self) {
-        self.0.state.store(Self::ADMITTED, Ordering::Release);
-        self.0.changed.notify_waiters();
+        if self
+            .0
+            .state
+            .compare_exchange(
+                Self::PENDING,
+                Self::ADMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.0.changed.notify_waiters();
+        }
     }
 
     /// Marks the block as rejected before admission.
@@ -787,6 +798,19 @@ mod tests {
         let checkpoint = checkpoint.with_precomputed_auth_data_root();
 
         assert_eq!(checkpoint.auth_data_root, Some(block.auth_data_root()));
+    }
+
+    #[tokio::test]
+    async fn block_admission_keeps_its_first_terminal_state() {
+        let rejected = BlockAdmission::pending();
+        rejected.reject();
+        rejected.admit();
+        assert!(!rejected.wait().await);
+
+        let admitted = BlockAdmission::pending();
+        admitted.admit();
+        admitted.reject();
+        assert!(admitted.wait().await);
     }
 }
 

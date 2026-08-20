@@ -128,7 +128,7 @@ impl PreparedCandidateCache {
             return;
         }
         let work_id = work_id.map(ToOwned::to_owned).or(existing_work_id);
-        inner.remove_matching(fingerprint, &immutable_bytes);
+        inner.remove_matching(work_id.as_deref(), fingerprint, &immutable_bytes);
 
         while inner.entries.len() >= MAX_ENTRIES || inner.bytes.saturating_add(size) > MAX_BYTES {
             if !inner.evict_oldest() {
@@ -160,9 +160,15 @@ impl CacheInner {
         }
     }
 
-    fn remove_matching(&mut self, fingerprint: [u8; 32], immutable_bytes: &[u8]) {
-        if let Some(index) = self.entries.iter().position(|entry| {
-            entry.fingerprint == fingerprint && entry.immutable_bytes == immutable_bytes
+    fn remove_matching(
+        &mut self,
+        work_id: Option<&str>,
+        fingerprint: [u8; 32],
+        immutable_bytes: &[u8],
+    ) {
+        while let Some(index) = self.entries.iter().position(|entry| {
+            work_id.is_some_and(|work_id| entry.work_id.as_deref() == Some(work_id))
+                || (entry.fingerprint == fingerprint && entry.immutable_bytes == immutable_bytes)
         }) {
             let entry = self
                 .entries
@@ -274,5 +280,39 @@ mod tests {
         assert!(cache
             .lookup(&changed_transactions, Some("work"), &network)
             .is_none());
+    }
+
+    #[test]
+    fn inserting_a_reused_work_id_replaces_the_old_candidate() {
+        let network = Network::Mainnet;
+        let original = test_block();
+        let mut replacement = original.clone();
+        Arc::make_mut(&mut replacement.header).version ^= 1;
+        let cache = PreparedCandidateCache::default();
+
+        cache.insert(
+            &original,
+            Some("work"),
+            SemanticallyVerifiedBlock::from(Arc::new(original.clone())),
+            &network,
+        );
+        cache.insert(
+            &replacement,
+            Some("work"),
+            SemanticallyVerifiedBlock::from(Arc::new(replacement.clone())),
+            &network,
+        );
+
+        assert!(cache.lookup(&replacement, Some("work"), &network).is_some());
+        assert!(cache.lookup(&original, Some("work"), &network).is_none());
+        assert_eq!(
+            cache
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entries
+                .len(),
+            1
+        );
     }
 }

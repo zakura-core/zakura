@@ -216,18 +216,15 @@ where
                     hash,
                     height,
                     early_advertised: false,
-                }) => {
-                    metrics::counter!("mining.optimistic_inventory.fallbacks").increment(1);
+                }) => (
                     (
-                        (
-                            (hash, height),
-                            "sending committed mined block broadcast",
-                            chain_state,
-                        ),
-                        true,
-                        None,
-                    )
-                }
+                        (hash, height),
+                        "sending committed mined block broadcast",
+                        chain_state,
+                    ),
+                    true,
+                    None,
+                ),
                 GossipEvent::MinedBlock(MinedBlockEvent::Failed {
                     hash,
                     height,

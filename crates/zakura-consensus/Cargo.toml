@@ -36,9 +36,10 @@ proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl", "z
 blake2b_simd = { workspace = true }
 bellman = { workspace = true }
 bls12_381 = { workspace = true }
-halo2 = { package = "halo2_proofs", version = "0.3" }
+halo2 = { workspace = true }
 jubjub = { workspace = true }
 rand = { workspace = true }
+rand_10 = { workspace = true }
 rayon = { workspace = true }
 mset.workspace = true
 

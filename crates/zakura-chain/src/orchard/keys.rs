@@ -6,7 +6,7 @@
 
 use std::{fmt, io};
 
-use group::{ff::PrimeField, prime::PrimeCurveAffine, Group, GroupEncoding};
+use group::{ff::PrimeField, CurveAffine as _, Group, GroupEncoding};
 use halo2::{
     arithmetic::{Coordinates, CurveAffine},
     pasta::pallas,

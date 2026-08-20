@@ -7,7 +7,6 @@ use chrono::{DateTime, Utc};
 use derive_getters::Getters;
 use derive_new::new;
 use hex::ToHex;
-use rand::rngs::OsRng;
 use zcash_script::script::Asm;
 
 use zakura_chain::{
@@ -254,7 +253,7 @@ impl TransactionTemplate<NegativeOrZero> {
             &Default::default(),
             Default::default(),
             Default::default(),
-            OsRng,
+            rand_10::rng(),
             sapling_prover,
             sapling_prover,
             &FeeRule::non_standard(Zatoshis::ZERO),

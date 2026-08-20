@@ -90,30 +90,9 @@ user-id = 169181
 user-login = "nuttycom"
 user-name = "Kris Nuttycombe"
 
-[[publisher.zcash_keys]]
-version = "0.16.0"
-when = "2026-07-25"
-user-id = 169181
-user-login = "nuttycom"
-user-name = "Kris Nuttycombe"
-
-[[publisher.zcash_primitives]]
-version = "0.30.0"
-when = "2026-07-24"
-user-id = 169181
-user-login = "nuttycom"
-user-name = "Kris Nuttycombe"
-
-[[publisher.zcash_proofs]]
-version = "0.30.0"
-when = "2026-07-24"
-user-id = 169181
-user-login = "nuttycom"
-user-name = "Kris Nuttycombe"
-
 [[publisher.zcash_protocol]]
-version = "0.10.1"
-when = "2026-07-24"
+version = "0.10.5"
+when = "2026-08-19"
 user-id = 169181
 user-login = "nuttycom"
 user-name = "Kris Nuttycombe"

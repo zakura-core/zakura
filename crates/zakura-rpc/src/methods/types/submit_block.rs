@@ -131,34 +131,42 @@ impl PendingBlockRegistry {
     }
 
     /// Waits for an early-advertised block to commit.
-    pub async fn wait(&self, hash: block::Hash) -> Option<Arc<block::Block>> {
-        let mut status = self
+    pub fn wait(
+        &self,
+        hash: block::Hash,
+    ) -> impl std::future::Future<Output = Option<Arc<block::Block>>> + Send + 'static {
+        let status = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&hash)
-            .map(|entry| entry.status.subscribe())?;
-        let start = std::time::Instant::now();
-        let result = tokio::time::timeout(PENDING_BLOCK_WAIT, async {
-            loop {
-                let current = status.borrow().clone();
-                match current {
-                    PendingStatus::Waiting => {
-                        if status.changed().await.is_err() {
-                            return None;
+            .map(|entry| entry.status.subscribe());
+        let deadline = tokio::time::Instant::now() + PENDING_BLOCK_WAIT;
+
+        async move {
+            let mut status = status?;
+            let start = std::time::Instant::now();
+            let result = tokio::time::timeout_at(deadline, async {
+                loop {
+                    let current = status.borrow().clone();
+                    match current {
+                        PendingStatus::Waiting => {
+                            if status.changed().await.is_err() {
+                                return None;
+                            }
                         }
+                        PendingStatus::Committed(block) => return Some(block),
+                        PendingStatus::Failed => return None,
                     }
-                    PendingStatus::Committed(block) => return Some(block),
-                    PendingStatus::Failed => return None,
                 }
-            }
-        })
-        .await
-        .ok()
-        .flatten();
-        metrics::histogram!("mining.pending_peer_wait.duration_seconds")
-            .record(start.elapsed().as_secs_f64());
-        result
+            })
+            .await
+            .ok()
+            .flatten();
+            metrics::histogram!("mining.pending_peer_wait.duration_seconds")
+                .record(start.elapsed().as_secs_f64());
+            result
+        }
     }
 }
 
@@ -268,6 +276,19 @@ mod tests {
         registry.resolve(hash, Ok(block.clone()));
 
         assert_eq!(wait.await.expect("wait task succeeds"), Some(block));
+    }
+
+    #[tokio::test]
+    async fn pending_block_wait_subscribes_before_polling() {
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let hash = block.hash();
+        assert!(registry.insert(block.clone()));
+
+        let wait = registry.wait(hash);
+        registry.resolve(hash, Ok(block.clone()));
+
+        assert_eq!(wait.await, Some(block));
     }
 
     #[tokio::test]

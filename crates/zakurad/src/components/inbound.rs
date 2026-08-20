@@ -623,6 +623,9 @@ impl Service<zn::Request> for Inbound {
                         let state = state.clone();
                         let pending_blocks = pending_blocks.clone();
                         lookups.push(async move {
+                            // Subscribe before the state lookup. A commit can complete and
+                            // remove the registry entry while state answers this request.
+                            let pending_wait = pending_blocks.wait(hash);
                             let response = state
                                 .clone()
                                 .ready()
@@ -634,7 +637,7 @@ impl Service<zn::Request> for Inbound {
                                     Ok::<_, zn::BoxError>((index, hash, Some(block)))
                                 }
                                 zs::Response::Block(None) => {
-                                    Ok((index, hash, pending_blocks.wait(hash).await))
+                                    Ok((index, hash, pending_wait.await))
                                 }
                                 _ => unreachable!("wrong response from state"),
                             }

@@ -100,18 +100,13 @@ impl PreparedCandidateCache {
     ) {
         let immutable_bytes = immutable_candidate_bytes(block, network);
         let fingerprint = fingerprint(&immutable_bytes);
-        // Count the canonical candidate and the derived verification inputs conservatively.
-        let size = immutable_bytes.len().saturating_mul(2);
-        if size > MAX_BYTES {
-            return;
-        }
 
         let mut inner = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.prune_expired();
-        let work_id = work_id.map(ToOwned::to_owned).or_else(|| {
+        let existing_work_id = if work_id.is_none() {
             inner
                 .entries
                 .iter()
@@ -119,7 +114,20 @@ impl PreparedCandidateCache {
                     entry.fingerprint == fingerprint && entry.immutable_bytes == immutable_bytes
                 })
                 .and_then(|entry| entry.work_id.clone())
-        });
+        } else {
+            None
+        };
+        // Count the canonical candidate, derived verification inputs, and caller-supplied work ID.
+        let size = immutable_bytes.len().saturating_mul(2).saturating_add(
+            work_id
+                .map(str::len)
+                .or_else(|| existing_work_id.as_ref().map(String::len))
+                .unwrap_or(0),
+        );
+        if size > MAX_BYTES {
+            return;
+        }
+        let work_id = work_id.map(ToOwned::to_owned).or(existing_work_id);
         inner.remove_matching(fingerprint, &immutable_bytes);
 
         while inner.entries.len() >= MAX_ENTRIES || inner.bytes.saturating_add(size) > MAX_BYTES {

@@ -2169,7 +2169,7 @@ impl Drop for PeerRoutine {
     /// The reactor owns entry insert (on connect) and remove (on disconnect/
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {
-        let outstanding_ranges: Vec<_> = self.window.outstanding.drain(..).collect();
+        let outstanding_ranges = std::mem::take(&mut self.window.outstanding);
         for outstanding in outstanding_ranges {
             let unreceived: Vec<_> = outstanding
                 .request

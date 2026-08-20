@@ -56,7 +56,7 @@ pub use error::{
 };
 pub use header_chain::*;
 pub use request::{
-    CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight,
+    BlockAdmission, CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight,
     HeaderChainBodyEvidenceAuthority, MappedRequest, PreparedHeaderChainBodyEvidence,
     PreparedHeaderChainInsert, ReadRequest, Request, SemanticallyVerifiedBlock,
 };

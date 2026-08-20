@@ -18,7 +18,7 @@ use derive_new::new;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::mpsc;
 use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
@@ -53,7 +53,7 @@ use crate::{
         default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
     },
     server::error::OkOrError,
-    SubmitBlockChannel,
+    MinedBlockEvent, PendingBlockRegistry, SubmitBlockChannel,
 };
 
 use constants::{
@@ -81,12 +81,8 @@ type InBlockTxDependenciesDepth = usize;
 pub struct BlockTemplateResponse {
     /// The getblocktemplate RPC capabilities supported by Zebra.
     ///
-    /// At the moment, Zebra does not support any of the extra capabilities from the specification:
-    /// - `proposal`: <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
-    /// - `longpoll`: <https://en.bitcoin.it/wiki/BIP_0022#Optional:_Long_Polling>
-    /// - `serverlist`: <https://en.bitcoin.it/wiki/BIP_0023#Logical_Services>
-    ///
-    /// By the above, Zebra will always return an empty vector here.
+    /// Zakura accepts proposal, long-poll, and work-ID fields without requiring miners to declare
+    /// those capabilities. Zakura does not support server lists.
     pub(crate) capabilities: Vec<String>,
 
     /// The version of the block format.
@@ -204,6 +200,10 @@ pub struct BlockTemplateResponse {
     #[getter(copy)]
     pub(crate) max_time: DateTime32,
 
+    /// Identifies this prepared mining candidate.
+    #[serde(rename = "workid")]
+    pub(crate) work_id: String,
+
     /// > only relevant for long poll responses:
     /// > indicates if work received prior to this response remains potentially valid (default)
     /// > and should have its shares submitted;
@@ -254,6 +254,7 @@ impl fmt::Debug for BlockTemplateResponse {
             .field("bits", &self.bits)
             .field("height", &self.height)
             .field("max_time", &self.max_time)
+            .field("work_id", &self.work_id)
             .field("submit_old", &self.submit_old)
             .finish()
     }
@@ -395,9 +396,17 @@ impl BlockTemplateResponse {
 
             max_time: chain_info.max_time,
 
+            work_id: new_work_id(),
+
             submit_old,
         }
     }
+}
+
+fn new_work_id() -> String {
+    let mut bytes = [0; 16];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -561,7 +570,13 @@ where
 
     /// A channel to send successful block submissions to the block gossip task,
     /// so they can be advertised to peers.
-    mined_block_sender: mpsc::Sender<(block::Hash, block::Height)>,
+    mined_block_sender: mpsc::Sender<MinedBlockEvent>,
+
+    /// Blocks whose hashes were advertised before contextual commit completed.
+    pending_blocks: PendingBlockRegistry,
+
+    /// Whether state admission can trigger an early inventory.
+    optimistic_block_inventory: bool,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -569,20 +584,24 @@ where
     BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
-    /// Creates a new [`GetBlockTemplateHandler`].
-    pub fn new(
+    /// Creates a handler with a registry shared by RPC and peer serving.
+    pub fn new_with_pending_blocks(
         net: &Network,
         conf: config::mining::Config,
         block_verifier_router: BlockVerifierRouter,
         sync_status: SyncStatus,
-        mined_block_sender: Option<mpsc::Sender<(block::Hash, block::Height)>>,
+        mined_block_sender: Option<mpsc::Sender<MinedBlockEvent>>,
+        pending_blocks: PendingBlockRegistry,
     ) -> Self {
+        let optimistic_block_inventory = conf.optimistic_block_inventory;
         Self {
             miner_params: MinerParams::new(net, conf).ok(),
             block_verifier_router,
             sync_status,
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
+            pending_blocks,
+            optimistic_block_inventory,
         }
     }
 
@@ -601,13 +620,19 @@ where
         self.block_verifier_router.clone()
     }
 
-    /// Advertises the mined block.
-    pub fn advertise_mined_block(
-        &self,
-        block: block::Hash,
-        height: block::Height,
-    ) -> Result<(), TrySendError<(block::Hash, block::Height)>> {
-        self.mined_block_sender.try_send((block, height))
+    /// Returns a sender for the owned mined-block lifecycle task.
+    pub fn mined_block_sender(&self) -> mpsc::Sender<MinedBlockEvent> {
+        self.mined_block_sender.clone()
+    }
+
+    /// Returns the shared pending-block registry.
+    pub fn pending_blocks(&self) -> PendingBlockRegistry {
+        self.pending_blocks.clone()
+    }
+
+    /// Returns whether early mined-block inventory is enabled.
+    pub fn optimistic_block_inventory(&self) -> bool {
+        self.optimistic_block_inventory
     }
 
     /// Randomizes the coinbase data, if miner parameters are set.
@@ -689,6 +714,7 @@ pub async fn validate_block_proposal<BlockVerifierRouter, Tip, SyncStatus>(
     net: &Network,
     latest_chain_tip: Tip,
     sync_status: SyncStatus,
+    work_id: Option<String>,
 ) -> RpcResult<GetBlockTemplateResponse>
 where
     BlockVerifierRouter: Service<
@@ -724,7 +750,10 @@ where
         .ready()
         .await
         .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
-        .call(zakura_consensus::Request::CheckProposal(Arc::new(block)))
+        .call(zakura_consensus::Request::Prepare {
+            block: Arc::new(block),
+            work_id,
+        })
         .await;
 
     Ok(block_verifier_router_response

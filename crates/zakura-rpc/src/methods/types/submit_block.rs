@@ -1,6 +1,12 @@
 //! Parameter and response types for the `submitblock` RPC.
 
-use tokio::sync::mpsc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use tokio::sync::{mpsc, oneshot, watch};
 
 use zakura_chain::block;
 
@@ -13,7 +19,7 @@ use crate::methods::GetBlockTemplateHandler;
 /// See the notes for the [`submit_block`](crate::methods::RpcServer::submit_block) RPC.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
 pub struct SubmitBlockParameters {
-    /// The workid for the block template. Currently unused.
+    /// The workid for the block template.
     ///
     /// > If the server provided a workid, it MUST be included with submissions,
     ///
@@ -26,7 +32,134 @@ pub struct SubmitBlockParameters {
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0022#Rationale>
     #[serde(rename = "workid")]
-    pub _work_id: Option<String>,
+    pub work_id: Option<String>,
+}
+
+/// The maximum time a peer waits for an early-advertised block to commit.
+pub const PENDING_BLOCK_WAIT: Duration = Duration::from_secs(15);
+
+const MAX_PENDING_BLOCKS: usize = 16;
+
+/// A mined-block lifecycle event consumed by the block gossip task.
+#[derive(Debug)]
+pub enum MinedBlockEvent {
+    /// State admitted the block, so peers can receive its inventory before commit completes.
+    Early {
+        /// The block hash.
+        hash: block::Hash,
+        /// The block height.
+        height: block::Height,
+        /// When the RPC accepted the submitted bytes.
+        submitted_at: std::time::Instant,
+        /// Reports whether the early network advertisement completed.
+        advertised: oneshot::Sender<bool>,
+    },
+    /// The contextual commit completed.
+    Committed {
+        /// The block hash.
+        hash: block::Hash,
+        /// The block height.
+        height: block::Height,
+        /// Whether the early advertisement completed successfully.
+        early_advertised: bool,
+    },
+    /// The contextual commit failed after state admission.
+    Failed {
+        /// The block hash.
+        hash: block::Hash,
+        /// The block height.
+        height: block::Height,
+        /// Whether peers received an early inventory.
+        early_advertised: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum PendingStatus {
+    Waiting,
+    Committed(Arc<block::Block>),
+    Failed,
+}
+
+#[derive(Debug)]
+struct PendingBlock {
+    status: watch::Sender<PendingStatus>,
+}
+
+/// Holds early-advertised block bodies until their contextual commits finish.
+#[derive(Clone, Debug, Default)]
+pub struct PendingBlockRegistry(Arc<Mutex<HashMap<block::Hash, PendingBlock>>>);
+
+impl PendingBlockRegistry {
+    /// Inserts a block before its early inventory is sent.
+    ///
+    /// Returns false when the bounded registry is full.
+    pub fn insert(&self, block: Arc<block::Block>) -> bool {
+        let hash = block.hash();
+        let mut entries = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.contains_key(&hash) {
+            return false;
+        }
+        if entries.len() >= MAX_PENDING_BLOCKS {
+            metrics::counter!("mining.pending_registry.saturated").increment(1);
+            return false;
+        }
+
+        let (status, _receiver) = watch::channel(PendingStatus::Waiting);
+        entries.insert(hash, PendingBlock { status });
+        true
+    }
+
+    /// Resolves peer waiters and removes a terminal entry.
+    pub fn resolve(&self, hash: block::Hash, result: Result<Arc<block::Block>, ()>) {
+        let entry = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&hash);
+        let Some(entry) = entry else {
+            return;
+        };
+        let status = match result {
+            Ok(block) => PendingStatus::Committed(block),
+            Err(()) => PendingStatus::Failed,
+        };
+        entry.status.send_replace(status);
+    }
+
+    /// Waits for an early-advertised block to commit.
+    pub async fn wait(&self, hash: block::Hash) -> Option<Arc<block::Block>> {
+        let mut status = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&hash)
+            .map(|entry| entry.status.subscribe())?;
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(PENDING_BLOCK_WAIT, async {
+            loop {
+                let current = status.borrow().clone();
+                match current {
+                    PendingStatus::Waiting => {
+                        if status.changed().await.is_err() {
+                            return None;
+                        }
+                    }
+                    PendingStatus::Committed(block) => return Some(block),
+                    PendingStatus::Failed => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        metrics::histogram!("mining.pending_peer_wait.duration_seconds")
+            .record(start.elapsed().as_secs_f64());
+        result
+    }
 }
 
 /// Response to a `submitblock` RPC request.
@@ -72,9 +205,9 @@ impl From<SubmitBlockErrorResponse> for SubmitBlockResponse {
 /// A submit block channel, used to inform the gossip task about mined blocks.
 pub struct SubmitBlockChannel {
     /// The channel sender
-    sender: mpsc::Sender<(block::Hash, block::Height)>,
+    sender: mpsc::Sender<MinedBlockEvent>,
     /// The channel receiver
-    receiver: mpsc::Receiver<(block::Hash, block::Height)>,
+    receiver: mpsc::Receiver<MinedBlockEvent>,
 }
 
 impl SubmitBlockChannel {
@@ -93,12 +226,12 @@ impl SubmitBlockChannel {
     }
 
     /// Get the channel sender
-    pub fn sender(&self) -> mpsc::Sender<(block::Hash, block::Height)> {
+    pub fn sender(&self) -> mpsc::Sender<MinedBlockEvent> {
         self.sender.clone()
     }
 
     /// Get the channel receiver
-    pub fn receiver(self) -> mpsc::Receiver<(block::Hash, block::Height)> {
+    pub fn receiver(self) -> mpsc::Receiver<MinedBlockEvent> {
         self.receiver
     }
 }
@@ -106,5 +239,67 @@ impl SubmitBlockChannel {
 impl Default for SubmitBlockChannel {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+
+    fn test_block() -> Arc<Block> {
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .expect("the genesis test vector is valid")
+    }
+
+    #[tokio::test]
+    async fn pending_block_waits_for_success() {
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let hash = block.hash();
+        assert!(registry.insert(block.clone()));
+
+        let wait = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.wait(hash).await }
+        });
+        tokio::task::yield_now().await;
+        registry.resolve(hash, Ok(block.clone()));
+
+        assert_eq!(wait.await.expect("wait task succeeds"), Some(block));
+    }
+
+    #[tokio::test]
+    async fn pending_block_failure_returns_not_found() {
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let hash = block.hash();
+        assert!(registry.insert(block));
+
+        let wait = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.wait(hash).await }
+        });
+        tokio::task::yield_now().await;
+        registry.resolve(hash, Err(()));
+
+        assert_eq!(wait.await.expect("wait task succeeds"), None);
+    }
+
+    #[test]
+    fn pending_registry_is_bounded() {
+        let registry = PendingBlockRegistry::default();
+        let original = test_block();
+        for nonce in 0..MAX_PENDING_BLOCKS {
+            let mut block = (*original).clone();
+            let nonce = u8::try_from(nonce).expect("the registry bound fits in u8");
+            Arc::make_mut(&mut block.header).nonce = [nonce; 32].into();
+            assert!(registry.insert(Arc::new(block)));
+        }
+
+        let mut overflow = (*original).clone();
+        Arc::make_mut(&mut overflow.header).nonce = [u8::MAX; 32].into();
+        assert!(!registry.insert(Arc::new(overflow)));
     }
 }

@@ -17,7 +17,7 @@ use std::{
 
 use futures::{
     future::{FutureExt, TryFutureExt},
-    stream::Stream,
+    stream::{FuturesUnordered, Stream, StreamExt},
 };
 use tokio::sync::oneshot::{self, error::TryRecvError};
 use tower::{buffer::Buffer, timeout::Timeout, util::BoxService, Service, ServiceExt};
@@ -33,6 +33,7 @@ use zakura_chain::{
 use zakura_consensus::{router::RouterError, VerifyBlockError};
 use zakura_network::{AddressBook, InventoryResponse};
 use zakura_node_services::mempool;
+use zakura_rpc::PendingBlockRegistry;
 
 use crate::BoxError;
 
@@ -55,7 +56,7 @@ use downloads::{Downloads as BlockDownloads, GossipedTipChildHeightMismatch};
 ///
 /// If the response takes longer than this time, it will be cancelled,
 /// and the peer might be disconnected.
-pub const MAX_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(5);
+pub const MAX_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(18);
 
 /// The number of bytes the [`Inbound`] service will queue in response to a single block or
 /// transaction request, before ignoring any additional block or transaction IDs in that request.
@@ -338,6 +339,9 @@ pub struct Inbound {
 
     /// Diagnostics for zcashd-compat requests that need pruned block bodies.
     pruned_block_not_found_logger: Arc<PrunedBlockNotFoundLogger>,
+
+    /// Early-advertised mined blocks waiting for contextual commit.
+    pending_blocks: PendingBlockRegistry,
 }
 
 impl Inbound {
@@ -351,6 +355,25 @@ impl Inbound {
         zcashd_compat_peer_ips: Vec<IpAddr>,
         setup: oneshot::Receiver<InboundSetupData>,
     ) -> Inbound {
+        Self::new_with_pending_blocks(
+            full_verify_concurrency_limit,
+            expose_peer_addresses,
+            zcashd_compat_pruning_retention,
+            zcashd_compat_peer_ips,
+            setup,
+            PendingBlockRegistry::default(),
+        )
+    }
+
+    /// Creates an inbound service with a pending-block registry shared with mining RPCs.
+    pub fn new_with_pending_blocks(
+        full_verify_concurrency_limit: usize,
+        expose_peer_addresses: bool,
+        zcashd_compat_pruning_retention: Option<u32>,
+        zcashd_compat_peer_ips: Vec<IpAddr>,
+        setup: oneshot::Receiver<InboundSetupData>,
+        pending_blocks: PendingBlockRegistry,
+    ) -> Inbound {
         Inbound {
             setup: Setup::Pending {
                 full_verify_concurrency_limit,
@@ -361,6 +384,7 @@ impl Inbound {
                 zcashd_compat_pruning_retention,
                 zcashd_compat_peer_ips,
             )),
+            pending_blocks,
         }
     }
 
@@ -536,6 +560,7 @@ impl Service<zn::Request> for Inbound {
     #[instrument(name = "inbound", skip(self, req))]
     fn call(&mut self, req: zn::Request) -> Self::Future {
         let pruned_block_not_found_logger = self.pruned_block_not_found_logger.clone();
+        let pending_blocks = self.pending_blocks.clone();
         let (cached_peer_addr_response, block_downloads, mempool, state) = match &mut self.setup {
             Setup::Initialized {
                 cached_peer_addr_response,
@@ -592,24 +617,48 @@ impl Service<zn::Request> for Inbound {
                 async move {
                     let mut blocks: Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
+                    let mut lookups = FuturesUnordered::new();
 
-                    // Ignore any block hashes past the response limit.
-                    // This saves us expensive database lookups.
-                    for &hash in hashes.iter().take(GETDATA_MAX_BLOCK_COUNT) {
-                        // We check the limit after including at least one block, so that we can
-                        // send blocks greater than 1 MB (but only one at a time)
+                    for (index, &hash) in hashes.iter().take(GETDATA_MAX_BLOCK_COUNT).enumerate() {
+                        let state = state.clone();
+                        let pending_blocks = pending_blocks.clone();
+                        lookups.push(async move {
+                            let response = state
+                                .clone()
+                                .ready()
+                                .await?
+                                .call(zs::Request::Block(hash.into()))
+                                .await?;
+                            match response {
+                                zs::Response::Block(Some(block)) => {
+                                    Ok::<_, zn::BoxError>((index, hash, Some(block)))
+                                }
+                                zs::Response::Block(None) => {
+                                    Ok((index, hash, pending_blocks.wait(hash).await))
+                                }
+                                _ => unreachable!("wrong response from state"),
+                            }
+                        });
+                    }
+
+                    // Start every state lookup and pending wait before awaiting any result.
+                    let mut lookup_results = Vec::with_capacity(lookups.len());
+                    while let Some(result) = lookups.next().await {
+                        lookup_results.push(result?);
+                    }
+                    lookup_results.sort_unstable_by_key(|(index, _, _)| *index);
+
+                    for (_, hash, block) in lookup_results {
                         if total_size >= GETDATA_SENT_BYTES_LIMIT {
-                            break;
+                            continue;
                         }
-
-                        let response = state.clone().ready().await?.call(zs::Request::Block(hash.into())).await?;
 
                         // Add the block responses to the list, while updating the size limit.
                         //
                         // If there was a database error, return the error,
                         // and stop processing further chunks.
-                        match response {
-                            zs::Response::Block(Some(block)) => {
+                        match block {
+                            Some(block) => {
                                 // If checking the serialized size of the block performs badly,
                                 // return the size from the state using a wrapper type.
                                 total_size += block.zcash_serialized_size();
@@ -619,7 +668,7 @@ impl Service<zn::Request> for Inbound {
                             // We don't need to limit the size of the missing block IDs list,
                             // because it is already limited to the size of the getdata request
                             // sent by the peer. (Their content and encodings are the same.)
-                            zs::Response::Block(None) => {
+                            None => {
                                 // A retained canonical header with no block body identifies
                                 // history removed by pruning. Unknown hashes remain ordinary
                                 // `notfound` responses without reserving a log interval.
@@ -642,9 +691,7 @@ impl Service<zn::Request> for Inbound {
 
                                 blocks.push(Missing(hash))
                             },
-                            _ => unreachable!("wrong response from state"),
                         }
-
                     }
 
                     // The network layer handles splitting this response into multiple `block`

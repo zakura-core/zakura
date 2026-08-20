@@ -5,10 +5,12 @@ use std::{
     ops::{Add, Deref, RangeInclusive},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
 };
+
+use tokio::sync::Notify;
 
 use tower::{BoxError, Service, ServiceExt};
 use zakura_chain::{
@@ -38,6 +40,82 @@ use crate::{
     constants::{MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS},
     ReadResponse, Response,
 };
+
+/// Notifies a mined-block submitter when state admits its block to the active write queue.
+#[derive(Clone)]
+pub struct BlockAdmission(Arc<BlockAdmissionInner>);
+
+#[derive(Debug)]
+struct BlockAdmissionInner {
+    state: AtomicU8,
+    changed: Notify,
+}
+
+impl BlockAdmission {
+    const PENDING: u8 = 0;
+    const ADMITTED: u8 = 1;
+    const REJECTED: u8 = 2;
+
+    /// Creates a pending admission notification.
+    pub fn pending() -> Self {
+        Self(Arc::new(BlockAdmissionInner {
+            state: AtomicU8::new(Self::PENDING),
+            changed: Notify::new(),
+        }))
+    }
+
+    /// Marks the block as admitted to the active non-finalized write queue.
+    pub(crate) fn admit(&self) {
+        self.0.state.store(Self::ADMITTED, Ordering::Release);
+        self.0.changed.notify_waiters();
+    }
+
+    /// Marks the block as rejected before admission.
+    pub(crate) fn reject(&self) {
+        if self
+            .0
+            .state
+            .compare_exchange(
+                Self::PENDING,
+                Self::REJECTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.0.changed.notify_waiters();
+        }
+    }
+
+    /// Waits until state admits or rejects the block.
+    pub async fn wait(&self) -> bool {
+        loop {
+            let notified = self.0.changed.notified();
+            match self.0.state.load(Ordering::Acquire) {
+                Self::ADMITTED => return true,
+                Self::REJECTED => return false,
+                Self::PENDING => notified.await,
+                _ => unreachable!("block admission state only uses declared constants"),
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for BlockAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BlockAdmission")
+            .field(&self.0.state.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl PartialEq for BlockAdmission {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for BlockAdmission {}
 use crate::{
     error::{CommitCheckpointVerifiedError, InvalidateError, LayeredStateError, ReconsiderError},
     CommitSemanticallyVerifiedError,
@@ -1105,6 +1183,14 @@ pub enum Request {
     /// [0]: (crate::error::CommitSemanticallyVerifiedError)
     CommitSemanticallyVerifiedBlock(SemanticallyVerifiedBlock),
 
+    /// Commits a mined block and reports when state admits it to the active write queue.
+    CommitSemanticallyVerifiedBlockWithAdmission {
+        /// The semantically verified mined block.
+        block: SemanticallyVerifiedBlock,
+        /// The admission notification.
+        admission: BlockAdmission,
+    },
+
     /// Commit a checkpointed block to the state, skipping most but not all
     /// contextual validation.
     ///
@@ -1363,6 +1449,9 @@ impl Request {
                 "retry_header_chain_body_availability"
             }
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
+            Request::CommitSemanticallyVerifiedBlockWithAdmission { .. } => {
+                "commit_semantically_verified_block_with_admission"
+            }
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
@@ -1992,6 +2081,7 @@ impl TryFrom<Request> for ReadRequest {
             | Request::RestartHeaderChainBodyAvailability { .. }
             | Request::RetryHeaderChainBodyAvailability { .. }
             | Request::CommitSemanticallyVerifiedBlock(_)
+            | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),

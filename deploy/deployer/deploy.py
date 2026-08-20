@@ -1024,6 +1024,173 @@ def cmd_status(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Observability endpoints
+# --------------------------------------------------------------------------- #
+
+# Fleets deployed with manage_config = false keep a hand-tuned config the
+# deployer must not touch, and the deployer does not even know its path. A
+# systemd drop-in setting ZAKURA_* env vars turns the endpoints on without
+# writing either the config or the unit: ZakuradConfig::load ranks env above the
+# TOML file.
+OBSERVABILITY_DROPIN = "10-observability.conf"
+
+OBSERVABILITY_SCRIPT = r"""
+set -euo pipefail
+
+SERVICE={service}
+DROPIN_DIR=/etc/systemd/system/${{SERVICE}}.service.d
+DROPIN="$DROPIN_DIR/{dropin}"
+METRICS={metrics}
+HEALTH={health}
+APPLY={apply}
+
+metrics_port="${{METRICS##*:}}"
+health_port="${{HEALTH##*:}}"
+
+probe() {{
+    curl -s -o /dev/null --max-time 4 "http://$1$2" 2>/dev/null && echo up || echo down
+}}
+
+metrics_state="$(probe "$METRICS" /metrics)"
+health_state="$(probe "$HEALTH" /healthy)"
+echo "before: metrics=$metrics_state health=$health_state dropin=$([ -f "$DROPIN" ] && echo present || echo absent)"
+
+if [ "$metrics_state" = up ] && [ "$health_state" = up ]; then
+    echo "result: already-enabled"
+    exit 0
+fi
+
+# Both servers panic if the bind fails, so never restart into a taken port.
+for port in "$metrics_port" "$health_port"; do
+    if ss -lntH "sport = :$port" 2>/dev/null | grep -q .; then
+        echo "result: port-busy ($port)"
+        exit 3
+    fi
+done
+
+if [ "$APPLY" != "1" ]; then
+    echo "result: would-enable"
+    exit 0
+fi
+
+systemctl is-active --quiet "$SERVICE" || {{ echo "result: service-inactive"; exit 4; }}
+
+mkdir -p "$DROPIN_DIR"
+cat > "$DROPIN" <<EOF
+# Managed by deploy/deployer/deploy.py (observability). Do not hand-edit.
+# Both endpoints are unauthenticated; keep them on loopback.
+[Service]
+Environment=ZAKURA_METRICS__ENDPOINT_ADDR=$METRICS
+Environment=ZAKURA_HEALTH__LISTEN_ADDR=$HEALTH
+EOF
+
+rollback() {{
+    echo "rolling back the drop-in and restarting" >&2
+    rm -f "$DROPIN"
+    rmdir "$DROPIN_DIR" 2>/dev/null || true
+    systemctl daemon-reload
+    systemctl restart "$SERVICE" || true
+    echo "result: reverted"
+    exit 5
+}}
+
+systemctl daemon-reload
+systemctl restart "$SERVICE" || rollback
+
+for _ in $(seq 1 60); do
+    sleep 2
+    systemctl is-active --quiet "$SERVICE" && break
+done
+systemctl is-active --quiet "$SERVICE" || rollback
+
+# The metrics exporter binds during config load, but the health server only
+# starts once state and the network are up, which on a mainnet node is tens of
+# seconds later. Wait for both rather than checking health the instant metrics
+# appears.
+for _ in $(seq 1 90); do
+    sleep 2
+    metrics_state="$(probe "$METRICS" /metrics)"
+    health_state="$(probe "$HEALTH" /healthy)"
+    [ "$metrics_state" = up ] && [ "$health_state" = up ] && break
+    systemctl is-active --quiet "$SERVICE" || rollback
+done
+
+metrics_state="$(probe "$METRICS" /metrics)"
+health_state="$(probe "$HEALTH" /healthy)"
+
+# Metrics binding is what proves the drop-in parsed and the process came up.
+# Without it the node is misconfigured and must go back.
+if [ "$metrics_state" != up ]; then
+    rollback
+fi
+
+echo "after: metrics=$metrics_state health=$health_state"
+if [ "$health_state" != up ]; then
+    # Still starting up. Rolling back a live node over a late-binding endpoint
+    # would be worse than reporting it.
+    echo "result: enabled-health-pending"
+    exit 0
+fi
+echo "result: enabled"
+"""
+
+
+def loopback_only(address: str, *, where: str) -> None:
+    """Both endpoints are unauthenticated, so refuse anything routable."""
+    host = address.rsplit(":", 1)[0].strip("[]")
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        raise DeployError(
+            f"{where}: refusing to expose an unauthenticated endpoint on {address!r}; "
+            f"use a loopback address"
+        )
+
+
+def cmd_observability(args) -> int:
+    nodes = load_nodes(Path(args.config), args.node)
+    apply = not args.check
+    failures = 0
+
+    for node in nodes:
+        if not node.metrics_endpoint or not node.health_listen_addr:
+            print(f"  {node.name}: skipped (no metrics_endpoint/health_listen_addr configured)")
+            continue
+        loopback_only(node.metrics_endpoint, where=f"[[nodes]] {node.name} metrics_endpoint")
+        loopback_only(node.health_listen_addr, where=f"[[nodes]] {node.name} health_listen_addr")
+        if node.manage_config:
+            print(f"  {node.name}: skipped (manage_config = true renders the endpoints already)")
+            continue
+        if node.deploy_kind != "systemd" or not node.service_name:
+            print(f"  {node.name}: skipped (drop-ins need a systemd service)")
+            continue
+
+        script = OBSERVABILITY_SCRIPT.format(
+            service=shlex.quote(node.service_name),
+            dropin=OBSERVABILITY_DROPIN,
+            metrics=shlex.quote(node.metrics_endpoint),
+            health=shlex.quote(node.health_listen_addr),
+            apply="1" if apply else "0",
+        )
+        # Sequential on purpose: this restarts a validator.
+        proc = ssh_capture_script(node, script)
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        result = next(
+            (line.split(":", 1)[1].strip() for line in lines if line.startswith("result:")),
+            "unknown",
+        )
+        detail = " | ".join(line for line in lines if not line.startswith("result:"))
+        print(f"  {node.name}: {result}" + (f" [{detail}]" if detail else ""))
+        if proc.returncode != 0:
+            failures += 1
+            print(f"    stderr: {proc.stderr.strip()[:400]}", file=sys.stderr)
+            if apply:
+                raise DeployError(
+                    f"{node.name} failed to enable its endpoints; stopping before the next node"
+                )
+
+    return 1 if failures else 0
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -1054,6 +1221,15 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status", help="show service state + version per node")
     add_common(s)
     s.set_defaults(func=cmd_status)
+
+    o = sub.add_parser(
+        "observability",
+        help="ensure each node serves its loopback metrics + health endpoints",
+    )
+    add_common(o)
+    o.add_argument("--check", action="store_true",
+                   help="report what would change without touching any node")
+    o.set_defaults(func=cmd_observability)
 
     logs = sub.add_parser("logs", help="pull logs from nodes")
     logs_sub = logs.add_subparsers(dest="logs_command", required=True)

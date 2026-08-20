@@ -190,6 +190,11 @@ jobs:
           # Verified on the fleet: the nine regional nodes keep state here, the
           # compat host does not. Used only for the dashboard's disk probe.
           state_cache_dir = "/mnt/data/zakura-cache"
+          # Loopback observability endpoints, installed by the `observability`
+          # step below as a systemd drop-in (manage_config = false renders no
+          # config) and read by the dashboard probe from inside each node.
+          metrics_endpoint   = "127.0.0.1:9999"
+          health_listen_addr = "127.0.0.1:8080"
 
           # Public mainnet node ids (crates/zakura-network/src/zakura/handler.rs). Used by
           # the dashboard to label each host; not deployed to the nodes.
@@ -325,6 +330,24 @@ jobs:
 
           python3 deploy.py status "${args[@]}"
 
+      - name: Ensure node observability endpoints
+        if: ${{ !inputs.no_restart }}
+        working-directory: deploy/deployer
+        env:
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+
+          # Runs after the deploy so a bad drop-in cannot survive the binary
+          # rollback. Idempotent: a node already serving both endpoints is left
+          # alone, so this only restarts a node the first time it is enabled.
+          args=(--config nodes.ci.toml)
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
+          fi
+
+          python3 deploy.py observability "${args[@]}"
+
       - name: Install cluster status dashboard
         if: always()
         run: |
@@ -360,6 +383,8 @@ jobs:
           rpc_auth = "cookie"
           rpc_config_path = "/mnt/data/runtime/zcashd/.cookie"
           state_cache_dir = "/mnt/data/runtime/zcashd"
+          metrics_endpoint = ""
+          health_listen_addr = ""
           # P2P sidecar (post -zebra-compat): supervised with -connect=127.0.0.1:8233.
           process_pattern = "zcashd .*-connect=127.0.0.1:8233"
           EOF

@@ -1,5 +1,7 @@
+import argparse
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -236,6 +238,106 @@ class ConfigKeyTests(unittest.TestCase):
 
             with self.assertRaises(deploy.DeployError):
                 deploy.load_nodes(path, None)
+
+
+class ObservabilityTests(NodeBuilder, unittest.TestCase):
+    """The drop-in restarts a validator, so the guards matter more than the happy path."""
+
+    def args(self, config_path, check=False, node=None):
+        return argparse.Namespace(config=str(config_path), node=node, check=check)
+
+    def write_config(self, tmp, body):
+        path = Path(tmp) / "nodes.toml"
+        path.write_text(body.replace("            ", ""))
+        return path
+
+    BASE = """
+            [defaults]
+            manage_config = false
+            metrics_endpoint = "127.0.0.1:9999"
+            health_listen_addr = "127.0.0.1:8080"
+
+            [[nodes]]
+            name = "node-a"
+            ssh_string = "root@example"
+            commit = "main"
+            """
+
+    def test_refuses_a_routable_metrics_endpoint(self):
+        with self.assertRaises(deploy.DeployError) as ctx:
+            deploy.loopback_only("0.0.0.0:9999", where="metrics_endpoint")
+
+        self.assertIn("loopback", str(ctx.exception))
+
+    def test_accepts_loopback_forms(self):
+        for address in ("127.0.0.1:9999", "[::1]:8080", "localhost:9999"):
+            deploy.loopback_only(address, where="metrics_endpoint")
+
+    def test_routable_endpoint_aborts_before_any_ssh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(
+                tmp, self.BASE.replace('"127.0.0.1:9999"', '"0.0.0.0:9999"')
+            )
+            with mock.patch.object(deploy, "ssh_capture_script") as ssh:
+                with self.assertRaises(deploy.DeployError):
+                    deploy.cmd_observability(self.args(path))
+
+            ssh.assert_not_called()
+
+    def test_managed_config_nodes_are_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(
+                tmp, self.BASE.replace("manage_config = false", "manage_config = true")
+            )
+            with mock.patch.object(deploy, "ssh_capture_script") as ssh:
+                self.assertEqual(deploy.cmd_observability(self.args(path)), 0)
+
+            # Their endpoints come from the rendered config, not a drop-in.
+            ssh.assert_not_called()
+
+    def test_check_mode_does_not_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, self.BASE)
+            captured = {}
+
+            def fake_ssh(node, script):
+                captured["script"] = script
+                return subprocess.CompletedProcess([], 0, "result: would-enable\n", "")
+
+            with mock.patch.object(deploy, "ssh_capture_script", fake_ssh):
+                self.assertEqual(deploy.cmd_observability(self.args(path, check=True)), 0)
+
+            self.assertIn("APPLY=0", captured["script"])
+
+    def test_apply_stops_the_run_when_a_node_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, self.BASE)
+
+            def fake_ssh(node, script):
+                return subprocess.CompletedProcess([], 5, "result: reverted\n", "boom")
+
+            with mock.patch.object(deploy, "ssh_capture_script", fake_ssh):
+                with self.assertRaises(deploy.DeployError):
+                    deploy.cmd_observability(self.args(path))
+
+    def test_script_carries_the_configured_addresses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, self.BASE)
+            captured = {}
+
+            def fake_ssh(node, script):
+                captured["script"] = script
+                return subprocess.CompletedProcess([], 0, "result: enabled\n", "")
+
+            with mock.patch.object(deploy, "ssh_capture_script", fake_ssh):
+                deploy.cmd_observability(self.args(path))
+
+            script = captured["script"]
+            self.assertIn("ZAKURA_METRICS__ENDPOINT_ADDR=$METRICS", script)
+            self.assertIn("ZAKURA_HEALTH__LISTEN_ADDR=$HEALTH", script)
+            self.assertIn("METRICS=127.0.0.1:9999", script)
+            self.assertIn("HEALTH=127.0.0.1:8080", script)
+            self.assertIn("APPLY=1", script)
 
 
 if __name__ == "__main__":

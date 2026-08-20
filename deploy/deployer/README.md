@@ -38,7 +38,9 @@ dashboard reads over its own ssh probe:
 
 Both are unauthenticated, so bind them to loopback. `zakurad` panics if either
 address is already in use, so check the port on the node before enabling one.
-Neither is rendered on a fleet running `manage_config = false`.
+Neither is rendered on a fleet running `manage_config = false`; there,
+`deploy.py observability` turns the same endpoints on through a systemd drop-in
+instead.
 
 ## Commands
 
@@ -56,6 +58,14 @@ python3 deploy.py deploy --config nodes.toml --no-restart    # stage only
 
 # Service state + version per node.
 python3 deploy.py status --config nodes.toml
+
+# Ensure each node serves its loopback metrics + health endpoints. On a
+# manage_config = false fleet this installs a systemd drop-in setting
+# ZAKURA_METRICS__ENDPOINT_ADDR / ZAKURA_HEALTH__LISTEN_ADDR, which outrank the
+# hand-tuned config the deployer must not touch. Sequential, and a no-op on a
+# node already serving both, so it restarts a node only the first time.
+python3 deploy.py observability --config nodes.toml
+python3 deploy.py observability --config nodes.toml --check   # report, change nothing
 
 # Pull logs (deterministic log_file from the rendered config).
 python3 deploy.py logs fetch  --config nodes.toml              # -> logs/<name>.log

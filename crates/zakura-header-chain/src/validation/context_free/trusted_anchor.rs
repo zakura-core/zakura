@@ -18,11 +18,21 @@ pub(crate) fn validate_trusted_anchor_observables(
         validate_compact_target(header, network).map_err(|_| "compact target and network limit")?;
     let pow_policy =
         PowPolicy::for_network(network).map_err(|_| "authenticated proof-of-work policy")?;
-    if !pow_policy.is_authenticated_custom_waiver() {
+
+    // A network seeded with unsolved blocks enforces proof of work only from its
+    // configured start height. The prepare pipeline, checkpoint verification, and
+    // semantic verification all make this exemption, so the trusted anchor has to
+    // as well: the seeded tip is itself an unsolved block, and rejecting it stops
+    // the seed chain from ever being attached.
+    let skip_pow = network.should_skip_pow_at_height(height);
+
+    if !skip_pow && !pow_policy.is_authenticated_custom_waiver() {
         validate_hash_filter(hash, target).map_err(|_| "header hash filter")?;
     }
-    pow_policy
-        .validate_solution(header)
-        .map_err(|_| "Equihash solution shape or proof")?;
+    if !skip_pow {
+        pow_policy
+            .validate_solution(header)
+            .map_err(|_| "Equihash solution shape or proof")?;
+    }
     Ok(hash)
 }

@@ -36,6 +36,19 @@ rust-version = "1.91"
 edition = "2021"
 
 [workspace.dependencies]
+# Zakura's published binary assets: the reviewed Mainnet historical frontier grid, which is too
+# large to carry in git history at the weekly cadence the release state advances.
+#
+# The version is `0.<last_checkpoint>.<revision>`, so the pin states which checkpoint the payload
+# covers and `scripts/check-release-state.sh` can hold it against the committed provenance
+# manifest without fetching anything. The requirement is exact because these are reviewed bytes,
+# not a compatible range; `Cargo.lock` carries the registry checksum that pins them.
+#
+# Renamed so that no Rust source or script mentions the published crate name. The package is
+# published from `assets/zakura-assets/` in this repository. TODO(#703 follow-up): retarget to
+# `zakura-assets` once its crates.io owner adds the Trusted Publisher entry, which is a one-line
+# change here.
+zakura-assets = { version = "=0.3453771.0", package = "valargroup-zakura-assets" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 orchard = { version = "1.0.0-rc.2", package = "zakura-orchard" }
 sapling-crypto = { version = "1.0.0-rc.2", package = "zakura-sapling-crypto" }

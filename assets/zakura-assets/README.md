@@ -26,6 +26,9 @@ sha256sum "$N-$V/src/mainnet-frontier-grid.bin"
 cat "$N-$V/.cargo_vcs_info.json"
 ```
 
+`.cargo_vcs_info.json` names the Zakura commit this package was built from. It is marked dirty
+because the payload is generated and gitignored, so the publish passes `--allow-dirty`.
+
 The digest must equal `frontier_grid_sha256` in Zakura's
 `crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json` at the commit
 that pins this version. See `docs/design/historical-treestate-serving.md` for the full

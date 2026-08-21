@@ -837,9 +837,10 @@ mod tests {
         subtrees_sha256: String,
         subtrees_size: u64,
         // The frontier grid joined the release state after the other artifacts, so a manifest
-        // without these is a valid older one. Unlike the others the grid is not embedded in the
-        // binary, so its bytes are bound to the manifest by `scripts/check-release-state.sh`
-        // rather than here.
+        // without these is a valid older one. Unlike the others the grid reaches the binary
+        // through a pinned crates.io dependency rather than from the tree, so this test binds it
+        // by way of that dependency and `scripts/check-release-state.sh` binds the pinned version
+        // to the same height without cargo.
         #[serde(default)]
         frontier_grid_sha256: Option<String>,
         #[serde(default)]
@@ -1028,6 +1029,42 @@ mod tests {
         );
         if let Some(entries) = provenance.frontier_grid_entries {
             assert!(entries > 0, "a recorded frontier grid must have entries");
+        }
+        // The grid is not in the tree, so this is what holds the bytes a build actually embeds
+        // against the checkpoint this manifest was reviewed for. The crate's own constants are
+        // checked too, so a crate that misdeclares its payload cannot pass by agreeing with
+        // itself.
+        if let (Some(digest), Some(size), Some(entries)) = (
+            provenance.frontier_grid_sha256.as_deref(),
+            provenance.frontier_grid_size,
+            provenance.frontier_grid_entries,
+        ) {
+            let grid = zakura_assets::MAINNET_FRONTIER_GRID;
+            assert_eq!(
+                size,
+                u64::try_from(grid.len()).expect("frontier grid length fits in u64"),
+                "manifest must describe the pinned frontier grid's length"
+            );
+            assert_eq!(
+                digest,
+                hex::encode(Sha256::digest(grid)),
+                "manifest must authenticate the pinned frontier grid bytes"
+            );
+            assert_eq!(
+                digest,
+                zakura_assets::MAINNET_FRONTIER_GRID_SHA256_HEX,
+                "the pinned crate must declare the digest the manifest reviewed"
+            );
+            assert_eq!(
+                entries,
+                zakura_assets::MAINNET_FRONTIER_GRID_ENTRIES,
+                "manifest must describe the pinned frontier grid's entry count"
+            );
+            assert_eq!(
+                zakura_assets::MAINNET_FRONTIER_GRID_CHECKPOINT,
+                frontiers.height.0,
+                "the pinned frontier grid must cover the embedded list's last checkpoint"
+            );
         }
         assert!(
             matches!(

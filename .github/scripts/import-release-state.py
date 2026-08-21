@@ -20,9 +20,6 @@ PROVENANCE = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-v
 SUBTREES = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin")
 EOS_FILE = Path("crates/zakurad/src/components/sync/end_of_support.rs")
 EOS_PATTERN = re.compile(r"(ESTIMATED_RELEASE_HEIGHT: u32 = )([0-9_]+)")
-FRONTIER_GRID = Path(
-    "crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier-grid.bin"
-)
 SUBTREE_BUNDLE_NAME = "mainnet-treestate-subtrees.bin"
 FRONTIER_GRID_BUNDLE_NAME = "mainnet-frontier-grid.bin"
 # magic, version, network, grid spacing, last checkpoint, entry count.
@@ -185,13 +182,17 @@ def _frontier_grid(data: bytes, label: str) -> tuple[int, bytes]:
 
 
 def _prepare_frontier_grid_import(
-    repo_root: Path,
+    previous_grid: Path | None,
     bundle: Path,
     expected_last_checkpoint: int,
 ) -> bytes:
-    """Validate the bundle's frontier grid against the committed one and the checkpoint."""
+    """Validate the bundle's frontier grid against the published one and the checkpoint.
 
-    committed_path = repo_root / FRONTIER_GRID
+    The grid is not committed: it ships as a pinned crates.io package. The append-only check
+    therefore compares against whatever grid the repository currently pins, which the caller
+    materialises and passes in, rather than against a file in the tree.
+    """
+
     bundle_path = bundle / FRONTIER_GRID_BUNDLE_NAME
 
     try:
@@ -209,17 +210,18 @@ def _prepare_frontier_grid_import(
             f"bundle's checkpoint height {expected_last_checkpoint}"
         )
 
-    if committed_path.exists():
+    if previous_grid is not None:
         try:
-            committed_bytes = committed_path.read_bytes()
+            previous_bytes = previous_grid.read_bytes()
         except OSError as error:
-            raise BundleImportError(f"cannot read {FRONTIER_GRID}: {error}") from error
-        _, committed_payload = _frontier_grid(committed_bytes, str(FRONTIER_GRID))
+            raise BundleImportError(f"cannot read {previous_grid}: {error}") from error
+        _, previous_payload = _frontier_grid(previous_bytes, str(previous_grid))
         # Entry heights are a function of the chain, so a later export extends an earlier one
         # rather than rewriting it. A payload that is not a prefix means the generator changed
         # grid, or the entries themselves moved.
-        if not bundle_payload.startswith(committed_payload):
-            raise BundleImportError("bundle rewrites committed frontier grid entries")
+        # A prefix match also rules out a shorter grid, so truncation needs no separate check.
+        if not bundle_payload.startswith(previous_payload):
+            raise BundleImportError("bundle rewrites published frontier grid entries")
 
     return bundle_bytes
 
@@ -268,6 +270,7 @@ def import_bundle(
     resolution_path: Path,
     *,
     floor_eos: bool = True,
+    previous_frontier_grid: Path | None = None,
 ) -> dict[str, Any]:
     """Import a newer bundle while requiring an append-only checkpoint history."""
 
@@ -276,7 +279,6 @@ def import_bundle(
     frontier_path = repo_root / FRONTIER
     provenance_path = repo_root / PROVENANCE
     subtree_path = repo_root / SUBTREES
-    grid_path = repo_root / FRONTIER_GRID
 
     try:
         committed_checkpoints = checkpoint_path.read_bytes()
@@ -306,14 +308,14 @@ def import_bundle(
         raise BundleImportError("bundle checkpoint height does not match the resolution")
 
     subtree_bytes = _prepare_subtree_import(repo_root, bundle, bundle_height)
-    grid_bytes = _prepare_frontier_grid_import(repo_root, bundle, bundle_height)
+    grid_bytes = _prepare_frontier_grid_import(previous_frontier_grid, bundle, bundle_height)
 
     checkpoint_path.write_bytes(bundle_checkpoints)
     frontier_path.write_bytes(bundle_frontier)
     subtree_path.parent.mkdir(parents=True, exist_ok=True)
     subtree_path.write_bytes(subtree_bytes)
     print("imported subtree-root artifact")
-    grid_path.write_bytes(grid_bytes)
+    # The grid itself is published to crates.io by the workflow, not written into the tree.
     print("imported frontier grid")
 
     _write_json(
@@ -336,6 +338,12 @@ def import_bundle(
             "meta_sha256": resolution["meta_sha256"],
         },
     )
+
+    # The publish step names a crate version from this, and the PR body quotes it, so the
+    # identity of the grid that was validated has to leave this function.
+    result["frontier_grid_sha256"] = hashlib.sha256(grid_bytes).hexdigest()
+    result["frontier_grid_size"] = len(grid_bytes)
+    result["frontier_grid_entries"] = FRONTIER_GRID_HEADER_PREFIX.unpack_from(grid_bytes)[5]
 
     if floor_eos:
         eos_path = repo_root / EOS_FILE
@@ -395,12 +403,15 @@ def _self_test() -> int:
         def setUp(self) -> None:
             self.scratch = tempfile.TemporaryDirectory()
             self.root = Path(self.scratch.name)
-            for relative in (CHECKPOINTS, FRONTIER, PROVENANCE, FRONTIER_GRID, EOS_FILE):
+            for relative in (CHECKPOINTS, FRONTIER, PROVENANCE, SUBTREES, EOS_FILE):
                 (self.root / relative).parent.mkdir(parents=True, exist_ok=True)
             (self.root / CHECKPOINTS).write_text("1 aa\n", encoding="utf-8")
             (self.root / FRONTIER).write_bytes(b"old")
             (self.root / SUBTREES).write_bytes(subtree_artifact(1, b"", b"", b""))
-            (self.root / FRONTIER_GRID).write_bytes(
+            # Stands in for the grid the repository currently pins, which the workflow
+            # materialises from the registry before importing.
+            self.previous_grid = self.root / "previous-frontier-grid.bin"
+            self.previous_grid.write_bytes(
                 frontier_grid(1, grid_entry(0, b"s", b"o", b"i"))
             )
             (self.root / EOS_FILE).write_text(
@@ -500,21 +511,39 @@ def _self_test() -> int:
             with self.assertRaisesRegex(BundleImportError, SUBTREE_BUNDLE_NAME):
                 import_bundle(self.root, self.bundle, self.resolution)
 
-        def test_frontier_grid_is_imported_append_only(self) -> None:
-            import_bundle(self.root, self.bundle, self.resolution)
+        def test_frontier_grid_is_recorded_but_not_written(self) -> None:
+            result = import_bundle(
+                self.root,
+                self.bundle,
+                self.resolution,
+                previous_frontier_grid=self.previous_grid,
+            )
 
-            imported = (self.root / FRONTIER_GRID).read_bytes()
-            self.assertEqual(
-                imported,
-                (self.bundle / FRONTIER_GRID_BUNDLE_NAME).read_bytes(),
+            bundled = (self.bundle / FRONTIER_GRID_BUNDLE_NAME).read_bytes()
+            # The grid ships as a published crate, so importing must record it without ever
+            # putting the bytes in the tree.
+            self.assertFalse(
+                (
+                    self.root
+                    / "crates/zakura-state/src/service/finalized_state/vct"
+                    / FRONTIER_GRID_BUNDLE_NAME
+                ).exists()
             )
             provenance = json.loads((self.root / PROVENANCE).read_text())
             self.assertEqual(
                 provenance["frontier_grid_sha256"],
-                hashlib.sha256(imported).hexdigest(),
+                hashlib.sha256(bundled).hexdigest(),
             )
-            self.assertEqual(provenance["frontier_grid_size"], len(imported))
+            self.assertEqual(provenance["frontier_grid_size"], len(bundled))
             self.assertEqual(provenance["frontier_grid_entries"], 2)
+            self.assertEqual(result["frontier_grid_sha256"], provenance["frontier_grid_sha256"])
+            self.assertEqual(result["frontier_grid_entries"], 2)
+
+        def test_frontier_grid_append_only_check_is_optional(self) -> None:
+            # The very first publish has nothing to extend, so the check has to be skippable
+            # without silently accepting a rewrite when a previous grid is available.
+            result = import_bundle(self.root, self.bundle, self.resolution)
+            self.assertEqual(result["frontier_grid_entries"], 2)
 
         def test_rewritten_frontier_grid_is_rejected(self) -> None:
             (self.bundle / FRONTIER_GRID_BUNDLE_NAME).write_bytes(
@@ -524,8 +553,34 @@ def _self_test() -> int:
                     grid_entry(1, b"ss", b"oo", b"ii"),
                 )
             )
-            with self.assertRaisesRegex(BundleImportError, "rewrites committed frontier grid"):
-                import_bundle(self.root, self.bundle, self.resolution)
+            with self.assertRaisesRegex(BundleImportError, "rewrites published frontier grid"):
+                import_bundle(
+                    self.root,
+                    self.bundle,
+                    self.resolution,
+                    previous_frontier_grid=self.previous_grid,
+                )
+
+        def test_truncated_frontier_grid_is_rejected(self) -> None:
+            # Replacing a published grid with a shorter one drops entries that consumers may
+            # already anchor on, so it has to fail the same way a rewrite does.
+            self.previous_grid.write_bytes(
+                frontier_grid(
+                    2,
+                    grid_entry(0, b"s", b"o", b"i"),
+                    grid_entry(1, b"ssss", b"oooo", b"iiii"),
+                )
+            )
+            (self.bundle / FRONTIER_GRID_BUNDLE_NAME).write_bytes(
+                frontier_grid(2, grid_entry(0, b"s", b"o", b"i"))
+            )
+            with self.assertRaisesRegex(BundleImportError, "rewrites published frontier grid"):
+                import_bundle(
+                    self.root,
+                    self.bundle,
+                    self.resolution,
+                    previous_frontier_grid=self.previous_grid,
+                )
 
         def test_frontier_grid_for_another_checkpoint_is_rejected(self) -> None:
             (self.bundle / FRONTIER_GRID_BUNDLE_NAME).write_bytes(
@@ -596,6 +651,11 @@ def main() -> int:
     parser.add_argument("--resolution", type=Path)
     parser.add_argument("--result-out", type=Path)
     parser.add_argument(
+        "--previous-frontier-grid",
+        type=Path,
+        help="grid the repository currently pins, for the append-only check",
+    )
+    parser.add_argument(
         "--no-eos-floor",
         action="store_true",
         help="leave ESTIMATED_RELEASE_HEIGHT unchanged",
@@ -611,6 +671,7 @@ def main() -> int:
             args.bundle,
             args.resolution,
             floor_eos=not args.no_eos_floor,
+            previous_frontier_grid=args.previous_frontier_grid,
         )
         _write_json(args.result_out, result)
     except BundleImportError as error:

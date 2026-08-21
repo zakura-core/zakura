@@ -18,6 +18,11 @@ members = [
         "crates/zakura-jsonl-trace",
 ]
 
+# The asset packaging crate publishes on the release-state cadence rather than with the
+# workspace, and its payload is generated rather than committed, so it is deliberately not a
+# member. Zakura consumes the published crate from crates.io like any other dependency.
+exclude = ["assets/zakura-assets"]
+
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
 resolver = "2"
 

@@ -1440,9 +1440,7 @@ impl ReadStateService {
             .borrow_mapped(|non_finalized_state| non_finalized_state.best_chain().cloned())
     }
 
-    /// Test-only access to the inner database.
-    /// Can be used to modify the database without doing any consensus checks.
-    #[cfg(any(test, feature = "proptest-impl"))]
+    /// Returns the shared finalized database handle.
     pub fn db(&self) -> &ZakuraDb {
         &self.db
     }

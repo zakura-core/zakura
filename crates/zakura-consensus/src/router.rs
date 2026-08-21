@@ -388,10 +388,10 @@ where
 /// Block and transaction verification requests should be wrapped in a timeout,
 /// so that out-of-order and invalid requests do not hang indefinitely.
 /// See the [`router`](`crate::router`) module documentation for details.
-#[instrument(skip(state_service, transaction_state, mempool))]
+#[instrument(skip(network, state_service, transaction_state, mempool))]
 async fn init_with_transaction_state<S, TransactionState, Mempool>(
     config: Config,
-    network: &Network,
+    network: impl std::borrow::Borrow<Network>,
     mut state_service: S,
     transaction_state: TransactionState,
     mempool: oneshot::Receiver<Mempool>,
@@ -416,6 +416,7 @@ where
         + 'static,
     Mempool::Future: Send + 'static,
 {
+    let network = network.borrow();
     // Give other tasks priority before spawning the checkpoint task.
     tokio::task::yield_now().await;
 
@@ -574,7 +575,7 @@ where
 /// Initializes verification and routes transaction read-only queries through `read_state_service`.
 pub async fn init_with_read_state<S, R, Mempool>(
     config: Config,
-    network: &Network,
+    network: impl std::borrow::Borrow<Network>,
     state_service: S,
     read_state_service: R,
     mempool: oneshot::Receiver<Mempool>,

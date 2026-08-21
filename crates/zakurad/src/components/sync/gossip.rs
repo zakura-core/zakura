@@ -194,6 +194,7 @@ where
                     hash,
                     height,
                     submitted_at,
+                    submission,
                     advertised,
                 }) => (
                     (
@@ -202,7 +203,7 @@ where
                         chain_state,
                     ),
                     true,
-                    Some((advertised, submitted_at)),
+                    Some((advertised, submitted_at, submission)),
                 ),
                 GossipEvent::MinedBlock(MinedBlockEvent::Committed {
                     hash,
@@ -273,12 +274,15 @@ where
                 if succeeded {
                     let _ = mark_tx.send(submission_hash).await;
                 }
-                if let Some((advertised, submitted_at)) = early_ack {
+                if let Some((advertised, submitted_at, submission)) = early_ack {
                     if succeeded {
                         metrics::counter!("mining.optimistic_inventory.early_inventories")
                             .increment(1);
-                        metrics::histogram!("mining.submit_to_inventory.duration_seconds")
-                            .record(submitted_at.elapsed().as_secs_f64());
+                        metrics::histogram!(
+                            "mining.submit_to_inventory.duration_seconds",
+                            "method" => submission.rpc_method()
+                        )
+                        .record(submitted_at.elapsed().as_secs_f64());
                     }
                     let _ = advertised.send(succeeded);
                 }

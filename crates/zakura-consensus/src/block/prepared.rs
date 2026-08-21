@@ -1,5 +1,6 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
+    mem::size_of,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -15,8 +16,12 @@ use zakura_chain::{
 use zakura_state::SemanticallyVerifiedBlock;
 
 const MAX_ENTRIES: usize = 32;
+// One 219 ms preparation at a time can produce fewer than 2,800 aliases per TTL.
+const MAX_WORK_IDS: usize = 4_096;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const ENTRY_TTL: Duration = Duration::from_secs(10 * 60);
+
+type EntryId = u64;
 
 #[derive(Clone, Default)]
 pub(super) struct PreparedCandidateCache(Arc<Mutex<CacheInner>>);
@@ -29,35 +34,122 @@ impl std::fmt::Debug for PreparedCandidateCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         f.debug_struct("PreparedCandidateCache")
             .field("entries", &inner.entries.len())
+            .field("work_ids", &inner.work_ids.len())
             .field("bytes", &inner.bytes)
             .finish()
     }
 }
 
+/// Resolves compact mined-block submissions from the consensus candidate cache.
+#[derive(Clone, Default)]
+pub struct PreparedCandidateResolver(Arc<Mutex<CacheInner>>);
+
+impl std::fmt::Debug for PreparedCandidateResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f.debug_struct("PreparedCandidateResolver")
+            .field("entries", &inner.entries.len())
+            .field("work_ids", &inner.work_ids.len())
+            .finish()
+    }
+}
+
+/// An error returned when a compact submission cannot use a prepared candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ResolvePreparedCandidateError {
+    /// The cache no longer contains the supplied `workid`.
+    #[error("the prepared candidate is no longer available")]
+    StaleWork,
+
+    /// The solved header changed a field that compact submission must preserve.
+    #[error("the solved header does not match the prepared candidate")]
+    CandidateMismatch,
+}
+
 #[derive(Default)]
 struct CacheInner {
     entries: VecDeque<Entry>,
+    work_ids: HashMap<String, WorkIdAlias>,
+    work_id_order: VecDeque<String>,
     bytes: usize,
+    next_entry_id: EntryId,
 }
 
 struct Entry {
-    work_id: Option<String>,
+    id: EntryId,
     fingerprint: [u8; 32],
-    immutable_bytes: Vec<u8>,
     prepared: SemanticallyVerifiedBlock,
     size: usize,
     expires_at: Instant,
 }
 
+struct WorkIdAlias {
+    entry_id: EntryId,
+    size: usize,
+    expires_at: Instant,
+}
+
+impl PreparedCandidateResolver {
+    /// Reconstructs a mined block from a cached candidate and a solved header.
+    pub fn resolve(
+        &self,
+        work_id: &str,
+        solved_header: Header,
+    ) -> Result<Arc<Block>, ResolvePreparedCandidateError> {
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.prune_expired();
+
+        let entry_id = inner
+            .work_ids
+            .get(work_id)
+            .map(|alias| alias.entry_id)
+            .ok_or(ResolvePreparedCandidateError::StaleWork)?;
+        let entry = inner
+            .entries
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .ok_or(ResolvePreparedCandidateError::StaleWork)?;
+
+        if !preserved_header_fields_match(&entry.prepared.block.header, &solved_header) {
+            return Err(ResolvePreparedCandidateError::CandidateMismatch);
+        }
+
+        Ok(Arc::new(Block {
+            header: Arc::new(solved_header),
+            transactions: entry.prepared.block.transactions.clone(),
+        }))
+    }
+
+    /// Inserts a candidate for cross-crate tests.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    #[doc(hidden)]
+    pub fn insert_for_test(&self, block: Arc<Block>, work_id: &str, network: &Network) {
+        PreparedCandidateCache(self.0.clone()).insert(
+            &block,
+            Some(work_id),
+            SemanticallyVerifiedBlock::from(block.clone()),
+            network,
+        );
+    }
+}
+
 impl PreparedCandidateCache {
+    pub(super) fn resolver(&self) -> PreparedCandidateResolver {
+        PreparedCandidateResolver(self.0.clone())
+    }
+
     pub(super) fn lookup(
         &self,
         block: &Block,
         work_id: Option<&str>,
         network: &Network,
     ) -> Option<SemanticallyVerifiedBlock> {
-        let immutable_bytes = immutable_candidate_bytes(block, network);
-        let fingerprint = fingerprint(&immutable_bytes);
         let mut inner = self
             .0
             .lock()
@@ -65,23 +157,22 @@ impl PreparedCandidateCache {
         inner.prune_expired();
 
         if let Some(work_id) = work_id {
-            if let Some(entry) = inner
-                .entries
-                .iter()
-                .find(|entry| entry.work_id.as_deref() == Some(work_id))
-            {
-                if entry.immutable_bytes == immutable_bytes {
-                    metrics::counter!("mining.prepared_cache.hits").increment(1);
-                    return Some(entry.prepared.clone());
-                }
+            if let Some(entry_id) = inner.work_ids.get(work_id).map(|alias| alias.entry_id) {
+                if let Some(entry) = inner.entries.iter().find(|entry| entry.id == entry_id) {
+                    if candidates_match(&entry.prepared.block, block) {
+                        metrics::counter!("mining.prepared_cache.hits").increment(1);
+                        return Some(entry.prepared.clone());
+                    }
 
-                metrics::counter!("mining.prepared_cache.mismatches").increment(1);
-                return None;
+                    metrics::counter!("mining.prepared_cache.mismatches").increment(1);
+                    return None;
+                }
             }
         }
 
+        let fingerprint = candidate_fingerprint(block, network);
         if let Some(entry) = inner.entries.iter().find(|entry| {
-            entry.fingerprint == fingerprint && entry.immutable_bytes == immutable_bytes
+            entry.fingerprint == fingerprint && candidates_match(&entry.prepared.block, block)
         }) {
             metrics::counter!("mining.prepared_cache.hits").increment(1);
             return Some(entry.prepared.clone());
@@ -98,116 +189,268 @@ impl PreparedCandidateCache {
         prepared: SemanticallyVerifiedBlock,
         network: &Network,
     ) {
-        let immutable_bytes = immutable_candidate_bytes(block, network);
-        let fingerprint = fingerprint(&immutable_bytes);
-
+        let fingerprint = candidate_fingerprint(block, network);
         let mut inner = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.prune_expired();
-        let existing_work_id = if work_id.is_none() {
-            inner
-                .entries
-                .iter()
-                .find(|entry| {
-                    entry.fingerprint == fingerprint && entry.immutable_bytes == immutable_bytes
-                })
-                .and_then(|entry| entry.work_id.clone())
-        } else {
-            None
-        };
-        // Count the canonical candidate, derived verification inputs, and caller-supplied work ID.
-        let size = immutable_bytes.len().saturating_mul(2).saturating_add(
-            work_id
-                .map(str::len)
-                .or_else(|| existing_work_id.as_ref().map(String::len))
-                .unwrap_or(0),
-        );
-        if size > MAX_BYTES {
+
+        let conflicting_work_id = work_id.is_some_and(|work_id| {
+            inner.work_ids.get(work_id).is_some_and(|alias| {
+                inner
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == alias.entry_id)
+                    .is_some_and(|entry| !candidates_match(&entry.prepared.block, block))
+            })
+        });
+        if conflicting_work_id {
+            metrics::counter!("mining.prepared_cache.work_id_conflicts").increment(1);
             return;
         }
-        let work_id = work_id.map(ToOwned::to_owned).or(existing_work_id);
-        inner.remove_matching(work_id.as_deref(), fingerprint, &immutable_bytes);
 
-        while inner.entries.len() >= MAX_ENTRIES || inner.bytes.saturating_add(size) > MAX_BYTES {
-            if !inner.evict_oldest() {
-                break;
+        let existing_entry = inner
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.fingerprint == fingerprint && candidates_match(&entry.prepared.block, block)
+            })
+            .map(|entry| entry.id);
+        let entry_id = match existing_entry {
+            Some(entry_id) => {
+                inner.refresh_candidate(entry_id, prepared);
+                Some(entry_id)
             }
-        }
+            None => inner.insert_candidate(fingerprint, prepared),
+        };
 
-        inner.bytes = inner.bytes.saturating_add(size);
-        inner.entries.push_back(Entry {
-            work_id,
-            fingerprint,
-            immutable_bytes,
-            prepared,
-            size,
-            expires_at: Instant::now() + ENTRY_TTL,
-        });
+        if let (Some(entry_id), Some(work_id)) = (entry_id, work_id) {
+            inner.insert_work_id(work_id, entry_id);
+        }
     }
 }
 
 impl CacheInner {
     fn prune_expired(&mut self) {
         let now = Instant::now();
-        while self
+        let expired_entries: Vec<_> = self
             .entries
-            .front()
-            .is_some_and(|entry| entry.expires_at <= now)
-        {
-            self.evict_oldest();
+            .iter()
+            .filter(|entry| entry.expires_at <= now)
+            .map(|entry| entry.id)
+            .collect();
+        for entry_id in expired_entries {
+            self.remove_entry(entry_id);
+        }
+
+        let expired_work_ids: Vec<_> = self
+            .work_ids
+            .iter()
+            .filter(|(_, alias)| alias.expires_at <= now)
+            .map(|(work_id, _)| work_id.clone())
+            .collect();
+        for work_id in expired_work_ids {
+            self.remove_work_id(&work_id);
         }
     }
 
-    fn remove_matching(
+    fn insert_candidate(
         &mut self,
-        work_id: Option<&str>,
         fingerprint: [u8; 32],
-        immutable_bytes: &[u8],
-    ) {
-        while let Some(index) = self.entries.iter().position(|entry| {
-            work_id.is_some_and(|work_id| entry.work_id.as_deref() == Some(work_id))
-                || (entry.fingerprint == fingerprint && entry.immutable_bytes == immutable_bytes)
-        }) {
-            let entry = self
-                .entries
-                .remove(index)
-                .expect("entry exists because its index came from the same deque");
-            self.bytes = self.bytes.saturating_sub(entry.size);
+        prepared: SemanticallyVerifiedBlock,
+    ) -> Option<EntryId> {
+        let size = prepared_candidate_size(&prepared);
+        if size > MAX_BYTES {
+            return None;
         }
+
+        while self.entries.len() >= MAX_ENTRIES {
+            if !self.evict_oldest_entry() {
+                return None;
+            }
+        }
+
+        while self.bytes.saturating_add(size) > MAX_BYTES {
+            if !self.evict_oldest_entry() {
+                return None;
+            }
+        }
+
+        let id = self.next_entry_id;
+        self.next_entry_id = self.next_entry_id.wrapping_add(1);
+        self.bytes = self.bytes.saturating_add(size);
+        self.entries.push_back(Entry {
+            id,
+            fingerprint,
+            prepared,
+            size,
+            expires_at: Instant::now() + ENTRY_TTL,
+        });
+        Some(id)
     }
 
-    fn evict_oldest(&mut self) -> bool {
-        let Some(entry) = self.entries.pop_front() else {
+    fn refresh_candidate(&mut self, entry_id: EntryId, prepared: SemanticallyVerifiedBlock) {
+        let Some(index) = self.entries.iter().position(|entry| entry.id == entry_id) else {
+            return;
+        };
+        let mut entry = self
+            .entries
+            .remove(index)
+            .expect("entry exists because its index came from the same deque");
+        let retained_bytes = self.bytes.saturating_sub(entry.size);
+        let replacement_size = prepared_candidate_size(&prepared);
+        if retained_bytes.saturating_add(replacement_size) <= MAX_BYTES {
+            self.bytes = retained_bytes.saturating_add(replacement_size);
+            entry.size = replacement_size;
+            entry.prepared = prepared;
+        }
+        entry.expires_at = Instant::now() + ENTRY_TTL;
+        self.entries.push_back(entry);
+    }
+
+    fn insert_work_id(&mut self, work_id: &str, entry_id: EntryId) {
+        if self.work_ids.contains_key(work_id) {
+            return;
+        }
+
+        let size = work_id_alias_size(work_id);
+        while self.work_ids.len() >= MAX_WORK_IDS || self.bytes.saturating_add(size) > MAX_BYTES {
+            if !self.evict_oldest_work_id() {
+                return;
+            }
+        }
+
+        self.bytes = self.bytes.saturating_add(size);
+        self.work_id_order.push_back(work_id.to_owned());
+        self.work_ids.insert(
+            work_id.to_owned(),
+            WorkIdAlias {
+                entry_id,
+                size,
+                expires_at: Instant::now() + ENTRY_TTL,
+            },
+        );
+    }
+
+    fn remove_entry(&mut self, entry_id: EntryId) -> bool {
+        let Some(index) = self.entries.iter().position(|entry| entry.id == entry_id) else {
             return false;
         };
+        let entry = self
+            .entries
+            .remove(index)
+            .expect("entry exists because its index came from the same deque");
         self.bytes = self.bytes.saturating_sub(entry.size);
-        metrics::counter!("mining.prepared_cache.evictions").increment(1);
+
+        let work_ids: HashSet<_> = self
+            .work_ids
+            .iter()
+            .filter(|(_, alias)| alias.entry_id == entry_id)
+            .map(|(work_id, _)| work_id.clone())
+            .collect();
+        for work_id in &work_ids {
+            if let Some(alias) = self.work_ids.remove(work_id) {
+                self.bytes = self.bytes.saturating_sub(alias.size);
+            }
+        }
+        self.work_id_order
+            .retain(|work_id| !work_ids.contains(work_id));
         true
+    }
+
+    fn remove_work_id(&mut self, work_id: &str) -> bool {
+        let Some(alias) = self.work_ids.remove(work_id) else {
+            return false;
+        };
+        self.bytes = self.bytes.saturating_sub(alias.size);
+        if let Some(index) = self
+            .work_id_order
+            .iter()
+            .position(|candidate| candidate == work_id)
+        {
+            self.work_id_order.remove(index);
+        }
+        true
+    }
+
+    fn evict_oldest_entry(&mut self) -> bool {
+        let Some(entry_id) = self.entries.front().map(|entry| entry.id) else {
+            return false;
+        };
+        let removed = self.remove_entry(entry_id);
+        if removed {
+            metrics::counter!("mining.prepared_cache.evictions").increment(1);
+        }
+        removed
+    }
+
+    fn evict_oldest_work_id(&mut self) -> bool {
+        let Some(work_id) = self.work_id_order.front().cloned() else {
+            return false;
+        };
+        let removed = self.remove_work_id(&work_id);
+        if removed {
+            metrics::counter!("mining.prepared_cache.work_id_evictions").increment(1);
+        }
+        removed
     }
 }
 
-fn immutable_candidate_bytes(block: &Block, network: &Network) -> Vec<u8> {
+fn candidates_match(cached: &Block, submitted: &Block) -> bool {
+    preserved_header_fields_match(&cached.header, &submitted.header)
+        && cached.transactions == submitted.transactions
+}
+
+fn preserved_header_fields_match(cached: &Header, submitted: &Header) -> bool {
+    cached.version == submitted.version
+        && cached.previous_block_hash == submitted.previous_block_hash
+        && cached.merkle_root == submitted.merkle_root
+        && cached.commitment_bytes == submitted.commitment_bytes
+        && cached.difficulty_threshold == submitted.difficulty_threshold
+}
+
+fn candidate_fingerprint(block: &Block, network: &Network) -> [u8; 32] {
     let mut header: Header = *block.header;
     header.time =
         DateTime::<Utc>::from_timestamp(0, 0).expect("the Unix epoch is a valid UTC timestamp");
     header.nonce = [0; 32].into();
     header.solution = Solution::for_proposal_for_network(network);
 
-    Block {
+    let bytes = Block {
         header: Arc::new(header),
         transactions: block.transactions.clone(),
     }
     .zcash_serialize_to_vec()
-    .expect("serialization to memory cannot fail")
-}
-
-fn fingerprint(bytes: &[u8]) -> [u8; 32] {
-    let hash = Params::new().hash_length(32).hash(bytes);
+    .expect("serialization to memory cannot fail");
+    let hash = Params::new().hash_length(32).hash(&bytes);
     let mut fingerprint = [0; 32];
     fingerprint.copy_from_slice(hash.as_bytes());
     fingerprint
+}
+
+fn prepared_candidate_size(prepared: &SemanticallyVerifiedBlock) -> usize {
+    let block_size =
+        usize::try_from(prepared.block.attributed_memory_size_bytes()).unwrap_or(usize::MAX);
+    let transaction_hashes = prepared
+        .transaction_hashes
+        .len()
+        .saturating_mul(size_of::<zakura_chain::transaction::Hash>());
+    let new_outputs = prepared.new_outputs.capacity().saturating_mul(
+        size_of::<zakura_chain::transparent::OutPoint>()
+            .saturating_add(size_of::<zakura_chain::transparent::OrderedUtxo>()),
+    );
+
+    size_of::<Entry>()
+        .saturating_add(block_size)
+        .saturating_add(transaction_hashes)
+        .saturating_add(new_outputs)
+}
+
+fn work_id_alias_size(work_id: &str) -> usize {
+    size_of::<WorkIdAlias>()
+        .saturating_add(size_of::<String>().saturating_mul(2))
+        .saturating_add(work_id.len().saturating_mul(2))
 }
 
 #[cfg(test)]
@@ -222,13 +465,21 @@ mod tests {
             .expect("the genesis test vector is valid")
     }
 
+    fn insert(cache: &PreparedCandidateCache, block: &Block, work_id: &str) {
+        cache.insert(
+            block,
+            Some(work_id),
+            SemanticallyVerifiedBlock::from(Arc::new(block.clone())),
+            &Network::Mainnet,
+        );
+    }
+
     #[test]
     fn solved_header_fields_reuse_prepared_candidate() {
         let network = Network::Mainnet;
         let original = test_block();
-        let prepared = SemanticallyVerifiedBlock::from(Arc::new(original.clone()));
         let cache = PreparedCandidateCache::default();
-        cache.insert(&original, Some("work"), prepared, &network);
+        insert(&cache, &original, "work");
 
         let mut solved = original;
         let header = Arc::make_mut(&mut solved.header);
@@ -241,12 +492,11 @@ mod tests {
     }
 
     #[test]
-    fn immutable_candidate_changes_do_not_reuse_work_id() {
+    fn preserved_candidate_changes_do_not_reuse_work_id() {
         let network = Network::Mainnet;
         let original = test_block();
-        let prepared = SemanticallyVerifiedBlock::from(Arc::new(original.clone()));
         let cache = PreparedCandidateCache::default();
-        cache.insert(&original, Some("work"), prepared, &network);
+        insert(&cache, &original, "work");
 
         let mut changed_parent = original.clone();
         Arc::make_mut(&mut changed_parent.header).previous_block_hash = Hash([1; 32]);
@@ -283,36 +533,134 @@ mod tests {
     }
 
     #[test]
-    fn inserting_a_reused_work_id_replaces_the_old_candidate() {
-        let network = Network::Mainnet;
+    fn repeated_candidates_keep_every_work_id() {
+        let block = test_block();
+        let cache = PreparedCandidateCache::default();
+        insert(&cache, &block, "first");
+        insert(&cache, &block, "second");
+
+        assert!(cache.resolver().resolve("first", *block.header).is_ok());
+        assert!(cache.resolver().resolve("second", *block.header).is_ok());
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(inner.entries.len(), 1);
+        assert_eq!(inner.work_ids.len(), 2);
+    }
+
+    #[test]
+    fn reused_work_id_cannot_replace_its_candidate() {
         let original = test_block();
         let mut replacement = original.clone();
         Arc::make_mut(&mut replacement.header).version ^= 1;
         let cache = PreparedCandidateCache::default();
+        insert(&cache, &original, "work");
+        insert(&cache, &replacement, "work");
 
-        cache.insert(
-            &original,
-            Some("work"),
-            SemanticallyVerifiedBlock::from(Arc::new(original.clone())),
-            &network,
-        );
-        cache.insert(
-            &replacement,
-            Some("work"),
-            SemanticallyVerifiedBlock::from(Arc::new(replacement.clone())),
-            &network,
-        );
-
-        assert!(cache.lookup(&replacement, Some("work"), &network).is_some());
-        assert!(cache.lookup(&original, Some("work"), &network).is_none());
+        assert!(cache.resolver().resolve("work", *original.header).is_ok());
         assert_eq!(
-            cache
+            cache.resolver().resolve("work", *replacement.header),
+            Err(ResolvePreparedCandidateError::CandidateMismatch)
+        );
+    }
+
+    #[test]
+    fn resolver_reconstructs_only_solved_header_fields() {
+        let block = test_block();
+        let cache = PreparedCandidateCache::default();
+        insert(&cache, &block, "work");
+
+        let mut solved_header = *block.header;
+        solved_header.time += chrono::Duration::seconds(1);
+        solved_header.nonce = [9; 32].into();
+        solved_header.solution = Solution::for_proposal_for_network(&Network::Mainnet);
+        let solved = cache
+            .resolver()
+            .resolve("work", solved_header)
+            .expect("the solved header preserves the prepared candidate");
+
+        assert_eq!(*solved.header, solved_header);
+        assert_eq!(solved.transactions, block.transactions);
+
+        solved_header.merkle_root = Default::default();
+        assert_eq!(
+            cache.resolver().resolve("work", solved_header),
+            Err(ResolvePreparedCandidateError::CandidateMismatch)
+        );
+        assert_eq!(
+            cache.resolver().resolve("missing", *block.header),
+            Err(ResolvePreparedCandidateError::StaleWork)
+        );
+    }
+
+    #[test]
+    fn work_id_aliases_are_bounded() {
+        let block = test_block();
+        let cache = PreparedCandidateCache::default();
+        for index in 0..=MAX_WORK_IDS {
+            insert(&cache, &block, &format!("work-{index}"));
+        }
+
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(inner.work_ids.len(), MAX_WORK_IDS);
+        assert!(!inner.work_ids.contains_key("work-0"));
+        assert!(inner.work_ids.contains_key(&format!("work-{MAX_WORK_IDS}")));
+        assert!(inner.bytes <= MAX_BYTES);
+    }
+
+    #[test]
+    fn candidate_eviction_removes_its_work_id() {
+        let original = test_block();
+        let cache = PreparedCandidateCache::default();
+        for index in 0..=MAX_ENTRIES {
+            let mut block = original.clone();
+            Arc::make_mut(&mut block.header).version = u32::try_from(index)
+                .expect("the candidate bound fits in u32")
+                .saturating_add(4);
+            insert(&cache, &block, &format!("work-{index}"));
+        }
+
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(inner.entries.len(), MAX_ENTRIES);
+        assert!(!inner.work_ids.contains_key("work-0"));
+        assert!(inner.work_ids.contains_key(&format!("work-{MAX_ENTRIES}")));
+        assert!(inner.bytes <= MAX_BYTES);
+    }
+
+    #[test]
+    fn candidate_expiry_removes_its_work_ids() {
+        let block = test_block();
+        let cache = PreparedCandidateCache::default();
+        insert(&cache, &block, "work");
+        {
+            let mut inner = cache
                 .0
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner
                 .entries
-                .len(),
-            1
+                .front_mut()
+                .expect("the inserted candidate exists")
+                .expires_at = Instant::now();
+        }
+
+        assert_eq!(
+            cache.resolver().resolve("work", *block.header),
+            Err(ResolvePreparedCandidateError::StaleWork)
         );
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(inner.entries.is_empty());
+        assert!(inner.work_ids.is_empty());
+        assert_eq!(inner.bytes, 0);
     }
 }

@@ -38,6 +38,7 @@ mod prepared;
 pub mod request;
 pub mod subsidy;
 
+pub use prepared::{PreparedCandidateResolver, ResolvePreparedCandidateError};
 pub use request::Request;
 
 #[cfg(test)]
@@ -227,14 +228,26 @@ where
     V: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     V::Future: Send + 'static,
 {
-    /// Creates a new SemanticBlockVerifier
+    /// Creates a semantic block verifier for tests.
+    #[cfg(test)]
     pub fn new(network: &Network, state_service: S, transaction_verifier: V) -> Self {
-        Self {
+        Self::new_with_prepared_candidates(network, state_service, transaction_verifier).0
+    }
+
+    pub(crate) fn new_with_prepared_candidates(
+        network: &Network,
+        state_service: S,
+        transaction_verifier: V,
+    ) -> (Self, PreparedCandidateResolver) {
+        let prepared_candidates = prepared::PreparedCandidateCache::default();
+        let resolver = prepared_candidates.resolver();
+        let verifier = Self {
             network: network.clone(),
             state_service,
             transaction_verifier,
-            prepared_candidates: Default::default(),
-        }
+            prepared_candidates,
+        };
+        (verifier, resolver)
     }
 }
 

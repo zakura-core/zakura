@@ -35,7 +35,7 @@ pub const MUTABLE_FIELD: &[&str] = &[
 /// A hardcoded list of Zebra's getblocktemplate RPC capabilities.
 ///
 /// <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
-pub const CAPABILITIES_FIELD: &[&str] = &["proposal"];
+pub const CAPABILITIES_FIELD: &[&str] = &["proposal", "submitsolution"];
 
 /// The max estimated distance to the chain tip for the getblocktemplate method.
 ///

@@ -188,7 +188,13 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh
+        run: >-
+          shellcheck scripts/*.sh scripts/lib/*.sh
+          .github/workflows/scripts/*.sh
+          .github/actions/setup-zakura-build/*.sh
+      - name: Setup action retry tests
+        if: ${{ !cancelled() }}
+        run: bash .github/actions/setup-zakura-build/test-install-ubuntu-packages.sh
       # Stdlib-only, so there is nothing to install.
       - name: Mempool load harness tests
         if: ${{ !cancelled() }}

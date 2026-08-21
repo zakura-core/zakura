@@ -345,19 +345,23 @@ Four levels, in increasing strength. The first three are available to anyone.
 
 **A. The same bytes at every hop**, no node required:
 
-```console
-$ V=<pinned version>; N=<published crate name>
-$ curl -sLO "https://static.crates.io/crates/$N/$N-$V.crate"
-$ sha256sum "$N-$V.crate"            # equals Cargo.lock's checksum for $N
-$ tar xzf "$N-$V.crate"
-$ sha256sum "$N-$V/src/mainnet-frontier-grid.bin"   # equals frontier_grid_sha256
-$ cat "$N-$V/.cargo_vcs_info.json"   # the Zakura commit CI packaged from
+```sh
+V=<pinned version>; N=<published crate name>
+curl -sLO "https://static.crates.io/crates/$N/$N-$V.crate"
+sha256sum "$N-$V.crate"            # equals Cargo.lock's checksum for $N
+tar xzf "$N-$V.crate"
+sha256sum "$N-$V/src/mainnet-frontier-grid.bin"   # equals frontier_grid_sha256
+cat "$N-$V/.cargo_vcs_info.json"   # the Zakura commit CI packaged from
 ```
 
 Then re-resolve the bundle the manifest names and compare the same digest:
 
-```console
-$ python3 .github/scripts/fetch-release-state.py     --meta-url <manifest bundle meta URL> --meta-sha256 <manifest meta_sha256>     --output-dir /tmp/bundle --metadata-out /tmp/resolution.json
+```sh
+python3 .github/scripts/fetch-release-state.py \
+    --meta-url <manifest bundle meta URL> \
+    --meta-sha256 <manifest meta_sha256> \
+    --output-dir /tmp/bundle \
+    --metadata-out /tmp/resolution.json
 ```
 
 `.cargo_vcs_info.json` names the Zakura commit the package was built from, and marks the tree
@@ -372,12 +376,12 @@ whether the bytes are right.
 deterministic function of the chain rather than of timing, so a run against any Mainnet archive
 node produces byte-identical output:
 
-```console
-$ cargo run --release -p zakura-utils --bin zakura-checkpoints -- \
+```sh
+cargo run --release -p zakura-utils --bin zakura-checkpoints -- \
     --state-cache-dir <archive cache> \
     --mainnet-frontier-grid-checkpoint <height> \
     --mainnet-frontier-grid-output /tmp/regenerated.bin
-$ cmp /tmp/regenerated.bin /tmp/bundle/mainnet-frontier-grid.bin
+cmp /tmp/regenerated.bin /tmp/bundle/mainnet-frontier-grid.bin
 ```
 
 **C. Offline bundle consistency** — `zakurad verify-historical-treestates` checks the grid's

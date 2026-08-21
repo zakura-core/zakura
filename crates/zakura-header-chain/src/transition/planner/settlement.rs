@@ -28,6 +28,7 @@ pub(super) struct SettlementInputs<'engine, 'ctx> {
     pub(super) context: &'ctx TransitionContext<'ctx>,
     pub(super) old_selected: &'engine [Frontier],
     pub(super) old_verified: &'engine [Frontier],
+    pub(super) full_state_authorization_version: Option<crate::StateVersion>,
 }
 
 /// Evidence that an appended finality record continues the prior projections.
@@ -87,6 +88,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
         context,
         old_selected,
         old_verified,
+        full_state_authorization_version,
     } = inputs;
     let work_rebased = projected.work_coordinates_rebased();
     if work_rebased {
@@ -133,7 +135,8 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
             FinalitySource::FullState {
                 provenance: FullStateFinalityProvenance {
                     evidence,
-                    state_version: snapshot_before_commit.state_version,
+                    state_version: full_state_authorization_version
+                        .unwrap_or(snapshot_before_commit.state_version),
                     kind,
                 },
             },

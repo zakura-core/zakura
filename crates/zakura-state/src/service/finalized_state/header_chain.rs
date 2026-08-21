@@ -296,12 +296,21 @@ struct StateIssuedAuthority<'a> {
     inner: Option<&'a dyn FullStateEvidenceAuthority>,
     validation_leases: &'a [ValidationLease],
     active_retention_references: &'a [block::Hash],
+    full_state_authorization_version: Option<StateVersion>,
 }
 
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.inner
             .is_some_and(|inner| inner.authorizes_full_state(event))
+    }
+
+    fn full_state_authorization_version(&self, event: &TransitionEvent) -> Option<StateVersion> {
+        if self.authorizes_full_state(event) {
+            self.full_state_authorization_version
+        } else {
+            None
+        }
     }
 
     fn authorizes_scheduler_retry(&self, retry: &zakura_header_chain::OperatorBodyRetry) -> bool {
@@ -2335,6 +2344,7 @@ impl HeaderChainRuntime {
             inner: first_context.full_state_authority,
             validation_leases: &[],
             active_retention_references: lease_references.as_ref(),
+            full_state_authorization_version: None,
         };
         let first_context = TransitionContext {
             config: first_context.config,
@@ -2374,6 +2384,7 @@ impl HeaderChainRuntime {
             inner: checkpoint_context.full_state_authority,
             validation_leases: validation_leases.as_slice(),
             active_retention_references: lease_references.as_ref(),
+            full_state_authorization_version: Some(before.state_version),
         };
         let checkpoint_context = TransitionContext {
             config: checkpoint_context.config,
@@ -2698,6 +2709,7 @@ impl HeaderChainRuntime {
             inner: base_context.full_state_authority,
             validation_leases: &validation_leases,
             active_retention_references: lease_references.as_deref().unwrap_or_default(),
+            full_state_authorization_version: Some(before.state_version),
         };
         let transition_context = TransitionContext {
             config: base_context.config,

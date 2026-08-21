@@ -1481,7 +1481,13 @@ fn repeated_compatible_finality_publications_preserve_body_work_epoch() {
 
 #[test]
 fn combined_checkpoint_rejects_stale_version_and_accepts_pre_auxiliary_evidence() {
-    let db_config = Config::ephemeral();
+    let cache = tempfile::tempdir().expect("the test cache directory is created");
+    let db_config = Config {
+        cache_dir: cache.path().to_owned(),
+        ephemeral: false,
+        debug_skip_non_finalized_state_backup_task: true,
+        ..Config::default()
+    };
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
     store
@@ -1698,6 +1704,13 @@ fn combined_checkpoint_rejects_stale_version_and_accepts_pre_auxiliary_evidence(
         before.state_version.get() + 2,
         "the auxiliary transition must advance the version the checkpoint evidence was bound to"
     );
+
+    drop(runtime);
+    let (reopened, report) = HeaderChainStore::new(open(&db_config, engine_config.network()))
+        .startup(&engine_config)
+        .expect("recovery authenticates the pre-auxiliary checkpoint provenance");
+    assert_eq!(report.current, after);
+    assert_eq!(reopened.publisher().snapshot(), after);
 }
 
 #[test]

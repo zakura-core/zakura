@@ -21,6 +21,8 @@ pub(super) struct AdmittedRequest {
     pub(super) event: TransitionEvent,
     /// Caller-observed durable version when the input is version-qualified.
     pub(super) expected_version: Option<crate::StateVersion>,
+    /// Durable version whose snapshot authorized full-state evidence.
+    pub(super) full_state_authorization_version: Option<crate::StateVersion>,
 }
 
 /// How a pure header insertion related to newer monotone finality.
@@ -73,12 +75,16 @@ pub(super) fn authenticate_and_admit(
     let event = input.event();
     validate_event_resource_bounds(engine, &event, context.config.limits)?;
     validate_authority(&event, context)?;
+    let full_state_authorization_version = context
+        .full_state_authority
+        .and_then(|authority| authority.full_state_authorization_version(&event));
     Ok((
         snapshot_before_commit,
         metadata,
         AdmittedRequest {
             event,
             expected_version: input.expected_version(),
+            full_state_authorization_version,
         },
     ))
 }

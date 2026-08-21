@@ -391,6 +391,55 @@ jobs:
              RPC_CONFIG_PATH='$RPC_CONFIG_PATH' EXPECTED_COMMIT='$expected_commit' bash -s" <<'EOF'
           set -euo pipefail
 
+          # How long the node may take to answer RPC after the restart, and the
+          # separate window it must then stay up for. Keeping them independent means a
+          # node that is slow to open RPC still gets a full settle observation.
+          readonly RPC_READY_TIMEOUT=90
+          readonly SETTLE_SECONDS=90
+
+          # deploy.py keeps the previous binary at ${BIN_PATH}.bak, but rolls back
+          # on its own only when the service dies within its ~3s post-start check.
+          # Everything this canary adds -- a wrong commit, RPC never answering, a
+          # crash-loop during the settle window -- surfaces after that check has
+          # already passed, so without this the node keeps running the binary we
+          # just proved bad. Restart sequence mirrors deploy.py.
+          restart_service() {
+            systemctl stop "$SERVICE_NAME" || true
+            # Let the old process release the state DB before starting again.
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              systemctl is-active --quiet "$SERVICE_NAME" || break
+              sleep 1
+            done
+            systemctl start "$SERVICE_NAME"
+            sleep 3
+            systemctl is-active --quiet "$SERVICE_NAME"
+          }
+
+          rollback() {
+            if [ ! -x "${BIN_PATH}.bak" ]; then
+              echo "No ${BIN_PATH}.bak to roll back to; ${SERVICE_NAME} is still running the binary that failed validation." >&2
+              return
+            fi
+            echo "Rolling ${SERVICE_NAME} back to ${BIN_PATH}.bak" >&2
+            install -m 755 "${BIN_PATH}.bak" "$BIN_PATH"
+            if restart_service; then
+              echo "Rolled back to $("$BIN_PATH" --version)." >&2
+            else
+              echo "Rollback of ${SERVICE_NAME} failed; the node needs manual recovery." >&2
+            fi
+          }
+
+          # Roll back on any failure below, then re-raise the original status so
+          # the canary still reports failure. Clearing the trap first keeps the
+          # handler from re-entering through its own exit.
+          on_exit() {
+            status=$?
+            trap - EXIT
+            [ "$status" -eq 0 ] || rollback
+            exit "$status"
+          }
+          trap on_exit EXIT
+
           expected_short="${EXPECTED_COMMIT:0:9}"
           version="$("$BIN_PATH" --version)"
           if [[ ! "$version" =~ \+([0-9]+\.)?g${expected_short} ]]; then
@@ -398,11 +447,42 @@ jobs:
             exit 1
           fi
 
+          # `systemctl is-active --quiet` says nothing on failure, and under `set -e` a
+          # bare call aborts the whole check silently -- worst in the case this canary
+          # exists to catch. Report the unit state instead.
+          require_active() {
+            local state
+            if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+              state="$(systemctl is-active "$SERVICE_NAME" || true)"
+              echo "${SERVICE_NAME} is ${state:-unknown} after deploy, expected active." >&2
+              exit 1
+            fi
+          }
+
           rpc_port="${RPC_LISTEN_ADDR##*:}"
           rpc_url="http://127.0.0.1:${rpc_port}/"
           rpc_payload='{"jsonrpc":"1.0","id":"release-start-canary","method":"getblockchaininfo","params":[]}'
 
+          # Held in a variable using double quotes only. Inlined after `python3 -c` it
+          # would need nested single quotes, which the enclosing shell strips out.
+          rpc_check_py='
+          import json
+          import sys
+
+          response = json.load(sys.stdin)
+          error = response.get("error")
+          if error is not None:
+              raise SystemExit(f"RPC error: {error}")
+          result = response.get("result")
+          if not isinstance(result, dict) or not isinstance(result.get("blocks"), int):
+              raise SystemExit("getblockchaininfo returned an invalid result")
+          '
+
+          # Pass `quiet` while polling a node that is still starting: otherwise every
+          # five-second attempt logs a connection error and a full Python traceback.
           rpc_ready() {
+            local quiet="${1:-}"
+            local body
             local curl_args=(
               --fail
               --silent
@@ -414,52 +494,45 @@ jobs:
             if [ "$RPC_AUTH" = "cookie" ]; then
               curl_args+=(--user "$(tr -d '\n' < "$RPC_CONFIG_PATH")")
             fi
-            curl "${curl_args[@]}" "$rpc_url" \
-              | python3 -c '
-          import json
-          import sys
-
-          response = json.load(sys.stdin)
-          error = response.get("error")
-          if error is not None:
-              # Bind the value first. This script is passed as a
-              # single-quoted python3 -c argument, so a nested single quote
-              # would be spliced out by the shell before Python sees it, and
-              # nesting double quotes inside an f-string needs Python 3.12.
-              raise SystemExit(f"RPC error: {error}")
-          result = response.get("result")
-          if not isinstance(result, dict) or not isinstance(result.get("blocks"), int):
-              raise SystemExit("getblockchaininfo returned an invalid result")
-          '
+            if [ -n "$quiet" ]; then
+              body="$(curl "${curl_args[@]}" "$rpc_url" 2>/dev/null)" || return 1
+              printf '%s' "$body" | python3 -c "$rpc_check_py" 2>/dev/null
+            else
+              body="$(curl "${curl_args[@]}" "$rpc_url")" || return 1
+              printf '%s' "$body" | python3 -c "$rpc_check_py"
+            fi
           }
 
-          started_at="$(date +%s)"
-          deadline="$((started_at + 90))"
+          ready_deadline="$(( $(date +%s) + RPC_READY_TIMEOUT ))"
           while true; do
-            systemctl is-active --quiet "$SERVICE_NAME"
-            if rpc_ready; then
+            require_active
+            if rpc_ready quiet; then
               break
             fi
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "RPC did not become ready within 90 seconds." >&2
+            if [ "$(date +%s)" -ge "$ready_deadline" ]; then
+              echo "RPC did not become ready within ${RPC_READY_TIMEOUT} seconds:" >&2
+              rpc_ready || true
               exit 1
             fi
             sleep 5
           done
 
-          while [ "$(date +%s)" -lt "$deadline" ]; do
-            systemctl is-active --quiet "$SERVICE_NAME"
+          # Restart the clock here: the settle window measures uptime once the node is
+          # actually serving, not time already spent waiting for it to get there.
+          settle_deadline="$(( $(date +%s) + SETTLE_SECONDS ))"
+          while [ "$(date +%s)" -lt "$settle_deadline" ]; do
+            require_active
             sleep 5
           done
 
           restart_count="$(systemctl show "$SERVICE_NAME" --property=NRestarts --value)"
-          if [ "$restart_count" != "0" ]; then
+          if [ "${restart_count:-0}" != "0" ]; then
             echo "${SERVICE_NAME} restarted ${restart_count} time(s) after deploy." >&2
             exit 1
           fi
-          systemctl is-active --quiet "$SERVICE_NAME"
+          require_active
           rpc_ready
-          echo "${SERVICE_NAME} stayed active with working RPC and no restarts for 90 seconds."
+          echo "${SERVICE_NAME} stayed active with working RPC and no restarts for ${SETTLE_SECONDS} seconds."
           EOF
 
       - name: Install cluster status dashboard

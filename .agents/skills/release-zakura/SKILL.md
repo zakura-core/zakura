@@ -251,6 +251,9 @@ start canary as well as the asset build. The start canary finishes before the
 `release` environment requests approval, so review its linked deploy run before
 approving. Its failure is intentionally advisory: investigate it, but
 infrastructure or fleet reliability issues do not block release publication.
+A canary failure restores `us-east-0` to the previously deployed binary before
+reporting, so the fleet is not left on an unvalidated build; if the rollback
+itself fails the run says so explicitly and the node needs manual recovery.
 The independently dispatched handoff canary also remains advisory and alerts
 `#zakura-alerts` on failure.
 

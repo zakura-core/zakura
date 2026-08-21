@@ -133,13 +133,18 @@ impl PendingBlockRegistry {
     }
 
     /// Removes a block after its contextual commit settles.
-    pub fn remove(&self, hash: block::Hash, committed: bool) {
-        let removed = self
+    ///
+    /// A distinct submission with the same hash cannot remove the registered block.
+    pub fn remove(&self, block: &Arc<block::Block>, committed: bool) {
+        let hash = block.hash();
+        let mut entries = self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&hash)
-            .is_some();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owns_entry = entries
+            .get(&hash)
+            .is_some_and(|registered| Arc::ptr_eq(registered, block));
+        let removed = owns_entry && entries.remove(&hash).is_some();
 
         if removed && !committed {
             metrics::counter!("mining.pending_registry.uncommitted").increment(1);
@@ -318,9 +323,9 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block));
+        assert!(registry.insert(block.clone()));
 
-        registry.remove(hash, true);
+        registry.remove(&block, true);
 
         assert_eq!(registry.get(hash), None);
     }
@@ -330,11 +335,25 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block));
+        assert!(registry.insert(block.clone()));
 
-        registry.remove(hash, false);
+        registry.remove(&block, false);
 
         assert_eq!(registry.get(hash), None);
+    }
+
+    #[test]
+    fn duplicate_submission_cannot_remove_registered_block() {
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let duplicate = Arc::new((*block).clone());
+        let hash = block.hash();
+        assert!(registry.insert(block.clone()));
+        assert!(!registry.insert(duplicate.clone()));
+
+        registry.remove(&duplicate, false);
+
+        assert_eq!(registry.get(hash), Some(block));
     }
 
     #[test]

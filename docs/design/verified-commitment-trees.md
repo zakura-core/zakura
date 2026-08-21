@@ -818,11 +818,14 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
 
 ## 16. Mainnet release-state pipeline
 
-The embedded Mainnet frontier and completed-subtree roots are release artifacts coupled to the
-terminal Mainnet checkpoint. Whenever `main-checkpoints.txt`'s max height advances, the matching
-`mainnet-frontier.bin` and `mainnet-subtrees.bin` must advance to the same height, and all three
-must land in the same PR. The offline exporter below produces the coupled set; the publisher,
-refresh workflow, and release gate below consume it.
+The Mainnet release-state export couples a terminal checkpoint to its final frontier,
+completed-subtree roots, and historical frontier grid. The exporter and publisher produce four
+data files as one set: `main-checkpoints.txt`, `mainnet-frontier.bin`,
+`mainnet-treestate-subtrees.bin`, and `mainnet-frontier-grid.bin`. The checkpoint, final frontier,
+and subtree roots are committed together; the root-checked grid carries no trust weight and is
+distributed from the release-state bundle for historical serving. The offline exporter below
+produces the coupled set; the publisher, refresh workflow, and release gate below consume the
+parts they own.
 
 ### 16.1 Offline export (`zakura-checkpoints --state-cache-dir`)
 
@@ -835,13 +838,17 @@ zakura-checkpoints \
   --full-list \
   --mainnet-frontier-output /out/mainnet-frontier.bin \
   --mainnet-subtree-output /out/mainnet-treestate-subtrees.bin \
+  --mainnet-frontier-grid-output /out/mainnet-frontier-grid.bin \
   > /out/main-checkpoints.txt
 ```
 
 - Offline mode reads canonical hashes and `BlockInfo` sizes straight from the finalized
-  database (read-only), so it works on pruned state and needs no RPC or running node. The
-  quiesced database tip is by construction `MAX_BLOCK_REORG_HEIGHT` (1000) blocks behind the
-  network tip, which keeps every emitted checkpoint reorg-safe.
+  database (read-only) and needs no RPC or running node. Checkpoint selection and the
+  final-frontier/subtree pair can operate on pruned state, but the required historical frontier
+  grid scans retained block bodies to place adaptive entries and replays bodies across the VCT
+  absent band. The coupled command therefore requires a quiesced **archive** database. Its tip is
+  by construction `MAX_BLOCK_REORG_HEIGHT` (1000) blocks behind the network tip, which keeps every
+  emitted checkpoint reorg-safe.
 - New checkpoints continue the same cumulative byte-count / 400-block height-gap selection as
   the RPC mode, starting from the embedded Mainnet max checkpoint. Selection state fully
   resets at every selected checkpoint, so exports taken at different tips are byte-for-byte
@@ -861,8 +868,9 @@ zakura-checkpoints \
 - Frontier correctness inherits the finalized database's trust boundary: the exporter reads
   trees produced by Zakura's validated, atomic finalized-state commits rather than replaying
   historical transaction bodies. The parser validates framing and height, not the tree roots'
-  provenance. This deliberate trust model keeps the exporter compatible with pruned databases;
-  operators must only export from a quiesced state produced by a trusted Zakura node.
+  provenance. This keeps final-frontier generation itself compatible with pruned databases, but
+  does not remove the coupled frontier grid's archive-body requirement. Operators must only
+  export from a quiesced state produced by a trusted Zakura node.
 - The subtree artifact starts with the reviewed roots already embedded in the binary, then appends
   subtree rows the database retained after that checkpoint. Any overlapping database row must
   match the embedded record. The new frontier supplies the exact number of roots needed, and the
@@ -874,11 +882,11 @@ zakura-checkpoints \
 ### 16.2 Bundle, pointer, and refresh workflow
 
 The publisher (`deploy/release-state/`) uploads each export to R2 as an immutable bundle containing
-`meta.json`, `main-checkpoints.txt`, `mainnet-frontier.bin`, and
-`mainnet-treestate-subtrees.bin`. `meta.json` binds the network, terminal height/hash, an RFC 3339
-generation time, and each file's size and SHA-256. The publisher then atomically replaces the
-mutable `release-state/latest.json` pointer (height, hash, `meta_url`, `meta_sha256`), keeping the
-newest few bundles.
+`meta.json`, `main-checkpoints.txt`, `mainnet-frontier.bin`,
+`mainnet-treestate-subtrees.bin`, and `mainnet-frontier-grid.bin`. `meta.json` binds the network,
+terminal height/hash, an RFC 3339 generation time, and each data file's size and SHA-256. The
+publisher then atomically replaces the mutable `release-state/latest.json` pointer (height, hash,
+`meta_url`, `meta_sha256`), keeping the newest few bundles.
 
 The `update-release-state.yml` workflow (manual dispatch plus a weekly cron) and
 `prepare-release-pr.yml` both resolve the pointer once over a pinned HTTPS host with no
@@ -886,8 +894,11 @@ redirects, bounded reads, digest verification at every hop, and a maximum bundle
 exit green without release-state changes when the bundle does not advance the committed
 list. Otherwise their shared importer verifies the committed `main-checkpoints.txt` is a
 byte-identical prefix of the bundle's list, requires each pool's subtree bytes to retain the
-committed prefix, replaces all three artifacts, and writes `vct/mainnet-vct-manifest.json`
-provenance (source `release-state-bundle`, heights, digests, bundle binding).
+committed prefix, replaces the three committed release-state data files, and writes
+`vct/mainnet-vct-manifest.json` provenance (source `release-state-bundle`, heights, digests, bundle
+binding). During the frontier-grid cutover, the fetcher accepts both legacy bundles without a grid
+and new four-data-file bundles; the historical-serving path consumes the grid separately rather
+than embedding it as consensus-critical source.
 
 The standalone update workflow also floors `ESTIMATED_RELEASE_HEIGHT`, validates everything
 — including proving the candidate subtree roots against its frontier — restricts the diff to

@@ -229,6 +229,74 @@ jobs:
             --ref "$SOURCE_REF" \
             -f target_ref="$TARGET_SHA"
 
+  start-canary:
+    name: Validate release starts on us-east-0
+    needs: [validate]
+    if: ${{ !inputs.source_first_release }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Deploy and wait for the non-blocking start canary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ github.ref_name }}
+          TARGET_SHA: ${{ needs.validate.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          run_url="$(
+            gh workflow run zakura-mainnet-deploy.yml \
+              --repo "$GITHUB_REPOSITORY" \
+              --ref "$SOURCE_REF" \
+              -f ref="$TARGET_SHA" \
+              -f node=us-east-0 \
+              -f validate_start=true
+          )"
+          run_id="${run_url##*/}"
+          if ! [[ "$run_id" =~ ^[0-9]+$ ]]; then
+            echo "::warning title=Release start canary unavailable::Could not resolve the dispatched deploy run from: ${run_url}"
+            {
+              echo "## Mainnet start canary"
+              echo
+              echo "Could not resolve the dispatched deploy run. This advisory failure does not block release publication."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "## Mainnet start canary"
+            echo
+            echo "Deploying the release commit to \`us-east-0\`: ${run_url}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          set +e
+          timeout 40m gh run watch "$run_id" \
+            --repo "$GITHUB_REPOSITORY" \
+            --exit-status
+          canary_status=$?
+          set -e
+          if [ "$canary_status" -ne 0 ]; then
+            if [ "$canary_status" -eq 124 ]; then
+              gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY" || true
+              echo "::warning title=Release start canary timed out::The us-east-0 canary exceeded 40 minutes and was cancelled. Review ${run_url} before approving the release."
+            fi
+            echo "::warning title=Release start canary failed::The us-east-0 deploy or startup validation failed. Review ${run_url} before approving the release."
+            {
+              echo
+              echo "Result: **failed**. Review the deploy run before approving. This advisory failure does not block release publication."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo
+            echo "Result: **passed**. The deployed service remained active, exposed RPC, and did not restart during its settle window."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build-assets:
     name: Build and verify release assets
     needs: [validate]
@@ -253,10 +321,11 @@ jobs:
   publish:
     name: Publish release and create tag
     runs-on: ubuntu-latest
-    needs: [validate, build-assets]
+    needs: [validate, build-assets, start-canary]
     # Tolerate asset staging being skipped only when emergency Mode B asked for
-    # the source-first path. The separately dispatched handoff canary is
-    # advisory and reports failures without delaying publication.
+    # the source-first path. The start canary finishes before release approval
+    # but is advisory, so its failure or Mode B skip never blocks publication.
+    # The separately dispatched handoff canary also remains advisory.
     if: >-
       ${{
         !cancelled()
@@ -264,6 +333,10 @@ jobs:
         && (
           needs.build-assets.result == 'success'
           || (inputs.source_first_release && needs.build-assets.result == 'skipped')
+        )
+        && contains(
+          fromJSON('["success", "failure", "skipped"]'),
+          needs.start-canary.result
         )
       }}
     environment: release

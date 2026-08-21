@@ -235,19 +235,24 @@ The workflow must:
 1. validate the tag against the `zakura` package version
 2. boot from a retained Mainnet state below the VCT handoff and prove finalized
    state crosses it using the Zakura P2P stack
-3. build and verify assets before tag creation
-4. wait for approval of the `release` environment
-5. create the immutable tag and GitHub pre-release
-6. publish the release assets; the tag push then triggers
+3. deploy the release commit to `us-east-0` and verify that the service remains
+   active with working RPC and no restarts for the settle window
+4. build and verify assets before tag creation
+5. wait for approval of the `release` environment
+6. create the immutable tag and GitHub pre-release
+7. publish the release assets; the tag push then triggers
    `release-binaries.yml`, which publishes the Docker images
-7. dispatch `publish-crates.yml` for the new tag, unless `publish_crates` is
+8. dispatch `publish-crates.yml` for the new tag, unless `publish_crates` is
    `never`, the tag is a release candidate under the default `auto`, or
    `allow_unpublishable_crate_graph` is set
 
 The documented emergency source-first mode skips the pre-tag VCT crossing and
-asset build. A handoff-canary failure in the normal path blocks release
-publication and alerts `#zakura-alerts`; investigate it rather than bypassing
-the gate.
+start canary as well as the asset build. The start canary finishes before the
+`release` environment requests approval, so review its linked deploy run before
+approving. Its failure is intentionally advisory: investigate it, but
+infrastructure or fleet reliability issues do not block release publication.
+The independently dispatched handoff canary also remains advisory and alerts
+`#zakura-alerts` on failure.
 
 Before a Mode A hotfix from an older release line, confirm the PR-node assets
 include a database-compatible snapshot below that branch's checkpoint. If

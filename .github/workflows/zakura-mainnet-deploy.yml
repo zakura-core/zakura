@@ -44,6 +44,11 @@ on:
         required: false
         type: string
         default: ""
+      validate_start:
+        description: "After a single-node restart, verify the deployed binary remains healthy"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -73,6 +78,8 @@ jobs:
         env:
           REF: ${{ inputs.ref }}
           NODE: ${{ inputs.node }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          VALIDATE_START: ${{ inputs.validate_start }}
         run: |
           set -euo pipefail
           if ! [[ "${REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
@@ -81,6 +88,14 @@ jobs:
           fi
           if [ -n "${NODE}" ] && ! [[ "${NODE}" =~ ^[A-Za-z0-9._-]+$ ]]; then
             echo "invalid node: allowed chars [A-Za-z0-9._-]" >&2
+            exit 1
+          fi
+          if [ "${VALIDATE_START}" = "true" ] && [ -z "${NODE}" ]; then
+            echo "validate_start requires one explicit node." >&2
+            exit 1
+          fi
+          if [ "${VALIDATE_START}" = "true" ] && [ "${NO_RESTART}" = "true" ]; then
+            echo "validate_start cannot be combined with no_restart." >&2
             exit 1
           fi
 
@@ -324,6 +339,123 @@ jobs:
           fi
 
           python3 deploy.py status "${args[@]}"
+
+      - name: Validate deployed node startup
+        if: ${{ inputs.validate_start && inputs.node != '' && !inputs.no_restart }}
+        env:
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+
+          eval "$(
+            python3 - "$NODE" <<'PY'
+          import shlex
+          import sys
+          import tomllib
+
+          with open("deploy/deployer/nodes.ci.toml", "rb") as config_file:
+              config = tomllib.load(config_file)
+
+          defaults = config["defaults"]
+          node_name = sys.argv[1]
+          node = next(
+              (candidate for candidate in config["nodes"] if candidate["name"] == node_name),
+              None,
+          )
+          if node is None:
+              raise SystemExit(f"unknown node: {node_name}")
+
+          values = {
+              "SSH_TARGET": node["ssh_string"],
+              "SERVICE_NAME": node.get("service_name", defaults["service_name"]),
+              "BIN_PATH": node.get("bin_path", defaults["bin_path"]),
+              "RPC_LISTEN_ADDR": node.get(
+                  "rpc_listen_addr", defaults["rpc_listen_addr"]
+              ),
+              "RPC_AUTH": "cookie" if node_name == "zakura-compat" else "",
+              "RPC_CONFIG_PATH": (
+                  "/root/.cache/zakura/.cookie"
+                  if node_name == "zakura-compat"
+                  else ""
+              ),
+          }
+          for key, value in values.items():
+              print(f"{key}={shlex.quote(str(value))}")
+          PY
+          )"
+
+          expected_commit="$(git rev-parse HEAD)"
+          ssh -o BatchMode=yes -o ConnectTimeout=20 -- "$SSH_TARGET" \
+            "SERVICE_NAME='$SERVICE_NAME' BIN_PATH='$BIN_PATH' \
+             RPC_LISTEN_ADDR='$RPC_LISTEN_ADDR' RPC_AUTH='$RPC_AUTH' \
+             RPC_CONFIG_PATH='$RPC_CONFIG_PATH' EXPECTED_COMMIT='$expected_commit' bash -s" <<'EOF'
+          set -euo pipefail
+
+          expected_short="${EXPECTED_COMMIT:0:9}"
+          version="$("$BIN_PATH" --version)"
+          if [[ "$version" != *"+g${expected_short}"* ]]; then
+            echo "deployed version does not match ${expected_short}: ${version}" >&2
+            exit 1
+          fi
+
+          rpc_port="${RPC_LISTEN_ADDR##*:}"
+          rpc_url="http://127.0.0.1:${rpc_port}/"
+          rpc_payload='{"jsonrpc":"1.0","id":"release-start-canary","method":"getblockchaininfo","params":[]}'
+
+          rpc_ready() {
+            local curl_args=(
+              --fail
+              --silent
+              --show-error
+              --max-time 10
+              --header "content-type: application/json"
+              --data "$rpc_payload"
+            )
+            if [ "$RPC_AUTH" = "cookie" ]; then
+              curl_args+=(--user "$(tr -d '\n' < "$RPC_CONFIG_PATH")")
+            fi
+            curl "${curl_args[@]}" "$rpc_url" \
+              | python3 -c '
+          import json
+          import sys
+
+          response = json.load(sys.stdin)
+          if response.get("error") is not None:
+              raise SystemExit(f"RPC error: {response['error']}")
+          result = response.get("result")
+          if not isinstance(result, dict) or not isinstance(result.get("blocks"), int):
+              raise SystemExit("getblockchaininfo returned an invalid result")
+          '
+          }
+
+          started_at="$(date +%s)"
+          deadline="$((started_at + 90))"
+          while true; do
+            systemctl is-active --quiet "$SERVICE_NAME"
+            if rpc_ready; then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "RPC did not become ready within 90 seconds." >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            systemctl is-active --quiet "$SERVICE_NAME"
+            sleep 5
+          done
+
+          restart_count="$(systemctl show "$SERVICE_NAME" --property=NRestarts --value)"
+          if [ "$restart_count" != "0" ]; then
+            echo "${SERVICE_NAME} restarted ${restart_count} time(s) after deploy." >&2
+            exit 1
+          fi
+          systemctl is-active --quiet "$SERVICE_NAME"
+          rpc_ready
+          echo "${SERVICE_NAME} stayed active with working RPC and no restarts for 90 seconds."
+          EOF
 
       - name: Install cluster status dashboard
         if: always()

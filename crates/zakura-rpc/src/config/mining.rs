@@ -24,6 +24,18 @@ pub(crate) const ZAKURA_COINBASE_MARKER: &str = "🌸";
 /// Present only when that is set.
 pub(crate) const ZAKURA_COINBASE_SEPARATOR: &str = ": ";
 
+/// The state milestone that lets a mined-block RPC return success.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmitAcknowledgement {
+    /// Return success only after contextual validation and state commit complete.
+    #[default]
+    Committed,
+
+    /// Return success after the active state writer owns the block.
+    Queued,
+}
+
 /// The maximum length of the user-configurable `extra_coinbase_data`.
 ///
 /// The coinbase data is the marker, separator, and user data in a single push,
@@ -64,8 +76,11 @@ pub struct Config {
     #[serde(default)]
     pub internal_miner: bool,
 
-    /// Advertise mined block hashes after state admission and before contextual commit completes.
+    /// Advertise mined block hashes after verifier relay authorization.
     pub optimistic_block_inventory: bool,
+
+    /// The state milestone that lets `submitblock` and `submitsolution` return success.
+    pub submit_acknowledgement: SubmitAcknowledgement,
 }
 
 impl Default for Config {
@@ -76,6 +91,7 @@ impl Default for Config {
             miner_memo: None,
             internal_miner: false,
             optimistic_block_inventory: true,
+            submit_acknowledgement: SubmitAcknowledgement::Committed,
         }
     }
 }
@@ -191,7 +207,7 @@ lazy_static::lazy_static! {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, SubmitAcknowledgement};
 
     #[test]
     fn optimistic_block_inventory_defaults_on_and_can_be_disabled() {
@@ -201,5 +217,20 @@ mod tests {
         let disabled: Config = toml::from_str("optimistic_block_inventory = false")
             .expect("the optimistic inventory option is valid");
         assert!(!disabled.optimistic_block_inventory);
+    }
+
+    #[test]
+    fn submit_acknowledgement_defaults_to_committed_and_queued_roundtrips() {
+        let default: Config = toml::from_str("").expect("empty mining config uses defaults");
+        assert_eq!(
+            default.submit_acknowledgement,
+            SubmitAcknowledgement::Committed
+        );
+
+        let queued: Config = toml::from_str("submit_acknowledgement = 'queued'")
+            .expect("the queued acknowledgement option is valid");
+        assert_eq!(queued.submit_acknowledgement, SubmitAcknowledgement::Queued);
+        let serialized = toml::to_string(&queued).expect("the mining config serializes");
+        assert!(serialized.contains("submit_acknowledgement = \"queued\""));
     }
 }

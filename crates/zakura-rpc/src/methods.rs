@@ -132,9 +132,9 @@ use types::{
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
     submit_block::{
-        MinedBlockEvent, MinedBlockSubmission, PendingBlockRegistry, SubmitBlockErrorResponse,
-        SubmitBlockParameters, SubmitBlockResponse, SubmitSolutionErrorResponse,
-        SubmitSolutionParameters, SubmitSolutionResponse,
+        BlockRelayEvent, BlockRelaySource, MinedBlockSubmission, PendingBlockRegistry,
+        SubmitBlockErrorResponse, SubmitBlockParameters, SubmitBlockResponse,
+        SubmitSolutionErrorResponse, SubmitSolutionParameters, SubmitSolutionResponse,
     },
     subsidy::GetBlockSubsidyResponse,
     transaction::TransactionObject,
@@ -957,7 +957,7 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::Sender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::Sender<BlockRelayEvent>>,
     ) -> (Self, JoinHandle<()>)
     where
         VersionString: ToString + Clone + Send + 'static,
@@ -998,7 +998,7 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::Sender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::Sender<BlockRelayEvent>>,
         pending_blocks: PendingBlockRegistry,
     ) -> (Self, JoinHandle<()>)
     where
@@ -1041,7 +1041,7 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::Sender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::Sender<BlockRelayEvent>>,
         pending_blocks: PendingBlockRegistry,
         prepared_candidates: PreparedCandidateResolver,
     ) -> (Self, JoinHandle<()>)
@@ -1143,16 +1143,18 @@ where
             .coinbase_height()
             .ok_or_error(0, "coinbase height not found")?;
         let block_hash = block.hash();
-        let admission = zakura_state::BlockAdmission::pending();
+        let (lifecycle_handle, lifecycle_reporter) = zakura_state::BlockLifecycleHandle::new();
         let request = zakura_consensus::Request::CommitMined {
             block: block.clone(),
             work_id,
-            admission: admission.clone(),
+            lifecycle: lifecycle_reporter,
         };
         let mut block_verifier_router = self.gbt.block_verifier_router();
         let pending_blocks = self.gbt.pending_blocks();
         let mined_block_sender = self.gbt.mined_block_sender();
         let optimistic_block_inventory = self.gbt.optimistic_block_inventory();
+        let submit_acknowledgement = self.gbt.submit_acknowledgement();
+        let acknowledgement_lifecycle = lifecycle_handle.clone();
 
         // This task owns the commit and registry lifecycle. RPC cancellation only detaches it.
         let lifecycle = tokio::spawn(async move {
@@ -1160,27 +1162,44 @@ where
                 async move { block_verifier_router.ready().await?.call(request).await };
             tokio::pin!(verification);
 
-            let admission_start = std::time::Instant::now();
+            let state_queue_start = std::time::Instant::now();
+            let state_queue_lifecycle = lifecycle_handle.clone();
+            tokio::spawn(async move {
+                if state_queue_lifecycle
+                    .wait_for(zakura_state::BlockLifecycleMilestone::StateQueued)
+                    .await
+                    .is_ok()
+                {
+                    metrics::histogram!("mining.state_admission.duration_seconds")
+                        .record(state_queue_start.elapsed().as_secs_f64());
+                }
+            });
+
             let mut early_result = None;
             let verification_result = tokio::select! {
                 biased;
 
-                admitted = admission.wait() => {
-                    metrics::histogram!("mining.state_admission.duration_seconds")
-                        .record(admission_start.elapsed().as_secs_f64());
-                    if admitted && optimistic_block_inventory && pending_blocks.insert(block.clone()) {
+                authorized = lifecycle_handle.wait_for(
+                    zakura_state::BlockLifecycleMilestone::RelayAuthorized,
+                ) => {
+                    if authorized.is_ok()
+                        && optimistic_block_inventory
+                        && pending_blocks.insert(block.clone())
+                    {
                         let (advertised, receiver) = tokio::sync::oneshot::channel();
-                        let event = MinedBlockEvent::Early {
+                        let event = BlockRelayEvent::Early {
                             hash: block_hash,
                             height,
-                            submitted_at,
-                            submission,
+                            source: BlockRelaySource::Mined {
+                                submitted_at,
+                                submission,
+                            },
                             advertised,
                         };
                         if mined_block_sender.try_send(event).is_ok() {
                             early_result = Some(receiver);
                         } else {
-                            pending_blocks.remove(&block, false);
+                            pending_blocks.cancel_relay_reservation(&block);
                         }
                     }
                     verification.await
@@ -1204,10 +1223,14 @@ where
                     if optimistic_block_inventory && !early_advertised {
                         metrics::counter!("mining.optimistic_inventory.fallbacks").increment(1);
                     }
-                    MinedBlockEvent::Committed {
+                    BlockRelayEvent::Committed {
                         hash: block_hash,
                         height,
                         early_advertised,
+                        source: BlockRelaySource::Mined {
+                            submitted_at,
+                            submission,
+                        },
                     }
                 } else {
                     if early_advertised {
@@ -1219,16 +1242,59 @@ where
                             "mined block failed contextual commit after early inventory"
                         );
                     }
-                    MinedBlockEvent::Failed {
+                    BlockRelayEvent::Failed {
                         hash: block_hash,
                         height,
                         early_advertised,
+                        source: BlockRelaySource::Mined {
+                            submitted_at,
+                            submission,
+                        },
                     }
                 };
                 let _ = mined_block_sender.send(event).await;
             });
             verification_result
         });
+
+        if submit_acknowledgement == crate::config::mining::SubmitAcknowledgement::Queued
+            && acknowledgement_lifecycle
+                .wait_for(zakura_state::BlockLifecycleMilestone::StateQueued)
+                .await
+                .is_ok()
+        {
+            tracing::info!(
+                ?block_hash,
+                ?height,
+                method = submission.rpc_method(),
+                "mined block queued for contextual commit"
+            );
+            tokio::spawn(async move {
+                match lifecycle.await {
+                    Ok(Ok(hash)) => tracing::info!(
+                        ?hash,
+                        ?height,
+                        method = submission.rpc_method(),
+                        "queued mined block committed"
+                    ),
+                    Ok(Err(error)) => tracing::error!(
+                        ?error,
+                        ?block_hash,
+                        ?height,
+                        method = submission.rpc_method(),
+                        "queued mined block failed after RPC acknowledgement"
+                    ),
+                    Err(error) => tracing::error!(
+                        ?error,
+                        ?block_hash,
+                        ?height,
+                        method = submission.rpc_method(),
+                        "queued mined block lifecycle task failed after RPC acknowledgement"
+                    ),
+                }
+            });
+            return Ok(SubmitBlockResponse::Accepted);
+        }
 
         let block_verifier_router_response = lifecycle.await.map_err(|error| {
             ErrorObject::owned(

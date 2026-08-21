@@ -62,8 +62,10 @@ tx_cost_limit = 80000000
 [mining]
 internal_miner = false
 optimistic_block_inventory = true
+submit_acknowledgement = "committed"
 
 [network]
+block_relay = "semantic"
 cache_dir = true
 crawl_new_peer_interval = "1m 1s"
 expose_peer_addresses = false

@@ -56,9 +56,11 @@ pub use error::{
 };
 pub use header_chain::*;
 pub use request::{
-    BlockAdmission, CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight,
-    HeaderChainBodyEvidenceAuthority, MappedRequest, PreparedHeaderChainBodyEvidence,
-    PreparedHeaderChainInsert, ReadRequest, Request, SemanticallyVerifiedBlock,
+    BlockLifecycleFailure, BlockLifecycleFailureClass, BlockLifecycleHandle,
+    BlockLifecycleMilestone, BlockLifecycleReporter, BlockLifecycleResult, CheckpointVerifiedBlock,
+    CommitSemanticallyVerifiedBlockRequest, HashOrHeight, HeaderChainBodyEvidenceAuthority,
+    MappedRequest, PreparedHeaderChainBodyEvidence, PreparedHeaderChainInsert, ReadRequest,
+    Request, SemanticallyVerifiedBlock,
 };
 
 #[cfg(feature = "indexer")]

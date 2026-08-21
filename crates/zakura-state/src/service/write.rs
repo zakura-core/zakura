@@ -5,7 +5,7 @@ use std::{
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use indexmap::IndexMap;
@@ -49,6 +49,7 @@ use crate::{
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
+    BlockLifecycleFailureClass, BlockLifecycleMilestone, BlockLifecycleReporter,
     CheckpointVerifiedBlock, CommitBlockError, CommitCheckpointVerifiedError,
     SemanticallyVerifiedBlock, ValidateContextError,
 };
@@ -223,6 +224,7 @@ impl PreparedFullStateTransition {
         runtime: &HeaderChainRuntime,
         live_non_finalized: &mut NonFinalizedState,
         context: &TransitionContext<'_>,
+        lifecycle: Option<&BlockLifecycleReporter>,
     ) -> Result<ApplyResult, HeaderChainStoreError> {
         let finalized_after = match &self.header_request.event {
             TransitionEvent::FullStateFinalized(event) => Some(event.new_finalized),
@@ -259,14 +261,47 @@ impl PreparedFullStateTransition {
             full_state_authority: Some(&authority),
             retention_references: &retention_references,
         };
-        match runtime.apply_combined_expected(
+        let storage_start = Instant::now();
+        let apply_result = runtime.apply_combined_expected(
             header_request,
             &guarded_context,
             finalized_batch.unwrap_or_else(DiskWriteBatch::new),
             expected_verified,
             &staged_headers,
-            || *live_non_finalized = non_finalized_after,
-        )? {
+            || {
+                if let Some(lifecycle) = lifecycle {
+                    lifecycle.reach(BlockLifecycleMilestone::StorageApplied);
+                }
+                *live_non_finalized = non_finalized_after;
+            },
+        );
+        metrics::histogram!("state.header_transition.storage_apply.duration_seconds")
+            .record(storage_start.elapsed().as_secs_f64());
+        tracing::debug!(
+            elapsed = ?storage_start.elapsed(),
+            success = apply_result.is_ok(),
+            "applied integrated header and full-state storage transition"
+        );
+        if let (Some(lifecycle), Err(error)) = (lifecycle, apply_result.as_ref()) {
+            let class = if matches!(
+                error,
+                HeaderChainStoreError::RocksDb(_)
+                    | HeaderChainStoreError::Store(StoreError::Unavailable(_))
+            ) {
+                BlockLifecycleFailureClass::StorageFailed
+            } else {
+                BlockLifecycleFailureClass::HeaderTransitionFailed
+            };
+            lifecycle.fail(
+                BlockLifecycleMilestone::StorageApplied,
+                class,
+                error.to_string(),
+            );
+            metrics::counter!("state.block_lifecycle.storage_failures").increment(1);
+            tracing::error!(?error, "block storage transition failed");
+        }
+
+        match apply_result? {
             ApplyResult::Stale(receipt) => Err(HeaderChainStoreError::StaleFullStateTransition {
                 current_version: receipt.current_version,
             }),
@@ -381,6 +416,36 @@ fn header_chain_finalization_failure(error: CommitCheckpointVerifiedError) -> Bl
         "unexpected finalized block commit error after note commitment and history trees were \
          checked by the non-finalized state: {error:?}"
     );
+}
+
+fn header_chain_block_failure(error: &HeaderChainStoreError) -> Option<BlockWriteTaskFailure> {
+    matches!(
+        error,
+        HeaderChainStoreError::CommittedTransition(_)
+            | HeaderChainStoreError::Store(_)
+            | HeaderChainStoreError::RocksDb(_)
+            | HeaderChainStoreError::WriterPoisoned
+            | HeaderChainStoreError::Recovery(_)
+            | HeaderChainStoreError::MigratedPinRefuted { .. }
+    )
+    .then(|| {
+        BlockWriteTaskFailure::runtime(
+            "storage uncertainty stopped the non-finalized state writer",
+            error,
+        )
+    })
+}
+
+fn map_header_chain_block_error(
+    error: HeaderChainStoreError,
+    writer_failure: &mut Option<BlockWriteTaskFailure>,
+) -> CommitBlockError {
+    if writer_failure.is_none() {
+        *writer_failure = header_chain_block_failure(&error);
+    }
+    CommitBlockError::HeaderChainError {
+        error: error.to_string(),
+    }
 }
 
 impl HeaderChainWriter {
@@ -1191,7 +1256,7 @@ fn commit_contextual_finalization(
             .map_err(|error| CommitBlockError::HeaderChainError {
                 error: error.to_string(),
             })?
-            .commit(&writer.runtime, live, &writer.context())
+            .commit(&writer.runtime, live, &writer.context(), None)
             .map(|_| ())
             .map_err(|error| CommitBlockError::HeaderChainError {
                 error: error.to_string(),
@@ -1252,7 +1317,7 @@ fn commit_operator_change(
         },
     )
     .map_err(|_| HeaderChainStoreError::Incoherent("staged operator transition disagrees"))?
-    .commit(&writer.runtime, live, &writer.context())
+    .commit(&writer.runtime, live, &writer.context(), None)
 }
 
 /// The maximum size of the rejected ancestor map.
@@ -2502,7 +2567,7 @@ impl WriteBlockWorkerTask {
                 }
             };
 
-            let Some((queued_child, rsp_tx, _admission)) = queued_child_and_rsp_tx else {
+            let Some((queued_child, rsp_tx, lifecycle)) = queued_child_and_rsp_tx else {
                 continue;
             };
 
@@ -2510,71 +2575,108 @@ impl WriteBlockWorkerTask {
             let parent_hash = queued_child.block.header.previous_block_hash;
             let child_height = queued_child.height;
             let rejected_ancestor_hash = rejected_ancestor_map.get(&parent_hash).copied();
+            let contextual_commit_start = Instant::now();
+            let mut writer_failure = None;
 
             // If the parent block was marked as rejected, also reject all its children.
             //
             // At this point, we know that all the block's descendants
             // are invalid, because we checked all the consensus rules before
             // committing the failing ancestor block to the non-finalized state.
-            let result: Result<(), CommitBlockError> =
-                if let Some(ancestor_hash) = rejected_ancestor_hash {
-                    Err(Box::new(ValidateContextError::InvalidAncestorBlock(ancestor_hash)).into())
-                } else {
-                    tracing::trace!(?child_hash, "validating queued child");
-                    if let Some(writer) = header_chain.as_ref() {
-                        let mut staged = non_finalized_state.clone();
-                        validate_and_commit_non_finalized(
-                            &finalized_state.db,
-                            &mut staged,
-                            queued_child,
+            let result: Result<(), CommitBlockError> = if let Some(ancestor_hash) =
+                rejected_ancestor_hash
+            {
+                Err(Box::new(ValidateContextError::InvalidAncestorBlock(ancestor_hash)).into())
+            } else {
+                tracing::trace!(?child_hash, "validating queued child");
+                if let Some(writer) = header_chain.as_ref() {
+                    let mut staged = non_finalized_state.clone();
+                    validate_and_commit_non_finalized(
+                        &finalized_state.db,
+                        &mut staged,
+                        queued_child,
+                    )
+                    .map_err(|error| CommitBlockError::from(Box::new(error)))
+                    .and_then(|()| {
+                        if let Some(lifecycle) = lifecycle.as_ref() {
+                            lifecycle.reach(BlockLifecycleMilestone::ContextuallyValid);
+                        }
+                        let accepted = Frontier::new(child_height, child_hash);
+                        let (evidence, event_path, request) =
+                            verified_request(writer, non_finalized_state, &staged, accepted)
+                                .map_err(|error| {
+                                    map_header_chain_block_error(error, &mut writer_failure)
+                                })?;
+                        PreparedFullStateTransition::new(
+                            evidence,
+                            writer
+                                .runtime
+                                .publisher()
+                                .snapshot()
+                                .frontiers
+                                .verified_best,
+                            event_path,
+                            staged,
+                            None,
+                            request,
                         )
-                        .map_err(|error| CommitBlockError::from(Box::new(error)))
-                        .and_then(|()| {
-                            let accepted = Frontier::new(child_height, child_hash);
-                            let (evidence, event_path, request) =
-                                verified_request(writer, non_finalized_state, &staged, accepted)
-                                    .map_err(|error| CommitBlockError::HeaderChainError {
-                                        error: error.to_string(),
-                                    })?;
-                            PreparedFullStateTransition::new(
-                                evidence,
-                                writer
-                                    .runtime
-                                    .publisher()
-                                    .snapshot()
-                                    .frontiers
-                                    .verified_best,
-                                event_path,
-                                staged,
-                                None,
-                                request,
-                            )
-                            .map_err(|error| CommitBlockError::HeaderChainError {
-                                error: error.to_string(),
-                            })?
-                            .commit(&writer.runtime, non_finalized_state, &writer.context())
-                            .map(|_| ())
-                            .map_err(|error| {
-                                CommitBlockError::HeaderChainError {
-                                    error: error.to_string(),
-                                }
-                            })
-                        })
-                    } else {
-                        validate_and_commit_non_finalized(
-                            &finalized_state.db,
+                        .map_err(|error| CommitBlockError::HeaderChainError {
+                            error: error.to_string(),
+                        })?
+                        .commit(
+                            &writer.runtime,
                             non_finalized_state,
-                            queued_child,
+                            &writer.context(),
+                            lifecycle.as_ref(),
                         )
-                        .map_err(|error| CommitBlockError::from(Box::new(error)))
+                        .map(|_| ())
+                        .map_err(|error| map_header_chain_block_error(error, &mut writer_failure))
+                    })
+                } else {
+                    let result = validate_and_commit_non_finalized(
+                        &finalized_state.db,
+                        non_finalized_state,
+                        queued_child,
+                    )
+                    .map_err(|error| CommitBlockError::from(Box::new(error)));
+                    if result.is_ok() {
+                        if let Some(lifecycle) = lifecycle.as_ref() {
+                            lifecycle.reach(BlockLifecycleMilestone::ContextuallyValid);
+                            lifecycle.reach(BlockLifecycleMilestone::StorageApplied);
+                        }
                     }
-                };
+                    result
+                }
+            };
+
+            metrics::histogram!("state.contextual_commit.duration_seconds")
+                .record(contextual_commit_start.elapsed().as_secs_f64());
+            tracing::debug!(
+                ?child_hash,
+                ?child_height,
+                elapsed = ?contextual_commit_start.elapsed(),
+                success = result.is_ok(),
+                "finished contextual validation and staged state commit"
+            );
 
             // TODO: fix the test timing bugs that require the result to be sent
             //       after `update_latest_chain_channels()`,
             //       and send the result on rsp_tx here
 
             if result.is_err() {
+                if let (Some(lifecycle), Err(error)) = (lifecycle.as_ref(), result.as_ref()) {
+                    let (stage, class) = match error {
+                        CommitBlockError::HeaderChainError { .. } => (
+                            BlockLifecycleMilestone::StorageApplied,
+                            BlockLifecycleFailureClass::HeaderTransitionFailed,
+                        ),
+                        _ => (
+                            BlockLifecycleMilestone::ContextuallyValid,
+                            BlockLifecycleFailureClass::ContextualRejected,
+                        ),
+                    };
+                    lifecycle.fail(stage, class, error.to_string());
+                }
                 // If the block is invalid, mark any descendant blocks as rejected.
                 if matches!(result, Err(CommitBlockError::ValidateContextError(_))) {
                     rejected_ancestor_map
@@ -2601,6 +2703,15 @@ impl WriteBlockWorkerTask {
                 // Update the caller with the error.
                 let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
 
+                if let Some(failure) = writer_failure {
+                    metrics::counter!("state.block_writer.fail_stop").increment(1);
+                    tracing::error!(
+                        ?failure,
+                        "stopping state writer after a storage-uncertain block commit failure"
+                    );
+                    return BlockWriteTaskExit::HeaderChainRuntimeFailed(failure);
+                }
+
                 // Skip the things we only need to do for successfully committed blocks
                 continue;
             }
@@ -2615,12 +2726,18 @@ impl WriteBlockWorkerTask {
             // TODO: if this causes state request errors due to chain conflicts,
             //       fix the `service::read` bugs,
             //       or do the channel update after the finalized state commit
+            let publication_start = Instant::now();
             let tip_block_height = update_latest_chain_channels(
                 non_finalized_state,
                 chain_tip_sender,
                 non_finalized_state_sender,
                 backup_dir_path.as_deref(),
             );
+            if let Some(lifecycle) = lifecycle.as_ref() {
+                lifecycle.reach(BlockLifecycleMilestone::PublishedInMemory);
+            }
+            metrics::histogram!("state.tip_publication.duration_seconds")
+                .record(publication_start.elapsed().as_secs_f64());
 
             // Update the caller with the result.
             let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));

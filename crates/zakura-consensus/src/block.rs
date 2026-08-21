@@ -196,6 +196,11 @@ fn map_commit_error(source: BoxError, hash: block::Hash) -> VerifyBlockError {
     {
         return VerifyBlockError::Commit(commit_err.clone());
     }
+    if let Some(context_err) = source.downcast_ref::<zs::ValidateContextError>() {
+        return VerifyBlockError::Commit(zs::CommitBlockError::ValidateContextError(Box::new(
+            context_err.clone(),
+        )));
+    }
 
     VerifyBlockError::StateService { source, hash }
 }
@@ -275,6 +280,7 @@ where
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
         let prepared_candidates = self.prepared_candidates.clone();
+        let failure_lifecycle = request.lifecycle();
 
         let block = request.block();
 
@@ -285,23 +291,6 @@ where
             let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
                 .map_err(BlockError::from)?;
             let preparation_start = request.should_cache().then(std::time::Instant::now);
-            // Check that this block is actually a new block.
-            tracing::trace!("checking that block is not already in state");
-            match state_service
-                .ready()
-                .await
-                .map_err(|source| VerifyBlockError::Depth { source, hash })?
-                .call(zs::Request::KnownBlock(hash))
-                .await
-                .map_err(|source| VerifyBlockError::Depth { source, hash })?
-            {
-                zs::Response::KnownBlock(Some(location)) => {
-                    return Err(BlockError::AlreadyInChain(hash, location).into())
-                }
-                zs::Response::KnownBlock(None) => {}
-                _ => unreachable!("wrong response to Request::KnownBlock"),
-            }
-
             tracing::trace!("performing block checks");
             let height = block
                 .coinbase_height()
@@ -342,16 +331,25 @@ where
                     prepared_block.block = block;
                     prepared_block.hash = hash;
                     prepared_block.height = height;
+                    if let Some(lifecycle) = request.lifecycle() {
+                        lifecycle.reach(zs::BlockLifecycleMilestone::PowAndBodyBound);
+                        lifecycle.reach(zs::BlockLifecycleMilestone::SemanticallyValid);
+                        lifecycle.reach(zs::BlockLifecycleMilestone::RelayAuthorized);
+                    }
+                    check_known_block(&mut state_service, hash).await?;
                     return commit_prepared_block(
                         state_service,
                         prepared_block,
-                        request.admission(),
+                        request.is_mined_commit(),
+                        request.lifecycle(),
                     )
                     .await;
                 }
                 metrics::histogram!("mining.solved_header_check.duration_seconds")
                     .record(solved_header_start.elapsed().as_secs_f64());
             }
+
+            check_known_block(&mut state_service, hash).await?;
 
             // > The block data MUST be validated and checked against the server's usual
             // > acceptance rules (excluding the check for a valid proof-of-work).
@@ -490,13 +488,13 @@ where
                 .expect("all verification tasks using known_utxos are complete");
 
             let prepared_block = zs::SemanticallyVerifiedBlock {
+                auth_data_root: Some(block.auth_data_root()),
                 block,
                 hash,
                 height,
                 new_outputs,
                 transaction_hashes,
                 deferred_pool_balance_change: Some(deferred_pool_balance_change),
-                auth_data_root: None,
             };
 
             // Return early for proposal requests.
@@ -526,9 +524,72 @@ where
                 return response;
             }
 
-            commit_prepared_block(state_service, prepared_block, request.admission()).await
+            if let Some(lifecycle) = request.lifecycle() {
+                check_block_commitment(&mut state_service, prepared_block.clone()).await?;
+                lifecycle.reach(zs::BlockLifecycleMilestone::PowAndBodyBound);
+                lifecycle.reach(zs::BlockLifecycleMilestone::SemanticallyValid);
+                lifecycle.reach(zs::BlockLifecycleMilestone::RelayAuthorized);
+            }
+
+            commit_prepared_block(
+                state_service,
+                prepared_block,
+                request.is_mined_commit(),
+                request.lifecycle(),
+            )
+            .await
         }
         .instrument(span)
+        .map(move |result| {
+            if let (Some(lifecycle), Err(error)) = (failure_lifecycle.as_ref(), result.as_ref()) {
+                let (stage, class) = match error {
+                    VerifyBlockError::Block {
+                        source: BlockError::AlreadyInChain(..),
+                    } => (
+                        zs::BlockLifecycleMilestone::StateQueued,
+                        zs::BlockLifecycleFailureClass::Duplicate,
+                    ),
+                    VerifyBlockError::Commit(zs::CommitBlockError::ValidateContextError(error))
+                        if matches!(
+                            error.body_verification_class(),
+                            zakura_header_chain::BodyVerificationClass::Retryable(
+                                zakura_header_chain::TransientBodyFailureKind::MissingContext
+                            )
+                        ) =>
+                    {
+                        (
+                            zs::BlockLifecycleMilestone::PowAndBodyBound,
+                            zs::BlockLifecycleFailureClass::ParentUnavailable,
+                        )
+                    }
+                    VerifyBlockError::Commit(zs::CommitBlockError::ValidateContextError(error))
+                        if matches!(
+                            error.body_verification_class(),
+                            zakura_header_chain::BodyVerificationClass::PayloadMismatch(_)
+                        ) =>
+                    {
+                        (
+                            zs::BlockLifecycleMilestone::PowAndBodyBound,
+                            zs::BlockLifecycleFailureClass::SemanticRejected,
+                        )
+                    }
+                    VerifyBlockError::Commit(_) => (
+                        zs::BlockLifecycleMilestone::ContextuallyValid,
+                        zs::BlockLifecycleFailureClass::ContextualRejected,
+                    ),
+                    VerifyBlockError::Depth { .. } | VerifyBlockError::StateService { .. } => (
+                        zs::BlockLifecycleMilestone::PowAndBodyBound,
+                        zs::BlockLifecycleFailureClass::ParentUnavailable,
+                    ),
+                    _ => (
+                        zs::BlockLifecycleMilestone::SemanticallyValid,
+                        zs::BlockLifecycleFailureClass::SemanticRejected,
+                    ),
+                };
+                lifecycle.fail(stage, class, error.to_string());
+            }
+            result
+        })
         .boxed()
     }
 }
@@ -536,39 +597,103 @@ where
 async fn commit_prepared_block<S>(
     mut state_service: S,
     prepared_block: zs::SemanticallyVerifiedBlock,
-    admission: Option<zs::BlockAdmission>,
+    is_mined_commit: bool,
+    lifecycle: Option<zs::BlockLifecycleReporter>,
 ) -> Result<block::Hash, VerifyBlockError>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
 {
     let hash = prepared_block.hash;
-    let is_mined_commit = admission.is_some();
-    let request = match admission {
-        Some(admission) => zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
+    let request = match lifecycle.clone() {
+        Some(lifecycle) => zs::Request::CommitSemanticallyVerifiedBlockWithLifecycle {
             block: prepared_block,
-            admission,
+            lifecycle,
         },
         None => zs::Request::CommitSemanticallyVerifiedBlock(prepared_block),
     };
-    let commit_start = std::time::Instant::now();
-    let response = state_service
+    let state_ready_start = std::time::Instant::now();
+    let ready_state = state_service
         .ready()
         .await
-        .map_err(|source| VerifyBlockError::StateService { source, hash })?
-        .call(request)
-        .await;
+        .map_err(|source| VerifyBlockError::StateService { source, hash })?;
+    metrics::histogram!("block.state_ready.duration_seconds")
+        .record(state_ready_start.elapsed().as_secs_f64());
+
+    let state_request_start = std::time::Instant::now();
+    let response = ready_state.call(request).await;
+    metrics::histogram!("block.state_request.duration_seconds")
+        .record(state_request_start.elapsed().as_secs_f64());
     if is_mined_commit {
         metrics::histogram!("mining.contextual_commit.duration_seconds")
-            .record(commit_start.elapsed().as_secs_f64());
+            .record(state_request_start.elapsed().as_secs_f64());
     }
 
     match response {
         Ok(zs::Response::Committed(committed_hash)) => {
             assert_eq!(committed_hash, hash, "state must commit correct hash");
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.commit();
+            }
             Ok(hash)
         }
-        Err(source) => Err(map_commit_error(source, hash)),
+        Err(source) => {
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.fail(
+                    zs::BlockLifecycleMilestone::ContextuallyValid,
+                    zs::BlockLifecycleFailureClass::ContextualRejected,
+                    source.to_string(),
+                );
+            }
+            Err(map_commit_error(source, hash))
+        }
         _ => unreachable!("wrong response for semantic block commit"),
+    }
+}
+
+async fn check_known_block<S>(
+    state_service: &mut S,
+    hash: block::Hash,
+) -> Result<(), VerifyBlockError>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    tracing::trace!("checking that block is not already in state");
+    match state_service
+        .ready()
+        .await
+        .map_err(|source| VerifyBlockError::Depth { source, hash })?
+        .call(zs::Request::KnownBlock(hash))
+        .await
+        .map_err(|source| VerifyBlockError::Depth { source, hash })?
+    {
+        zs::Response::KnownBlock(Some(location)) => {
+            Err(BlockError::AlreadyInChain(hash, location).into())
+        }
+        zs::Response::KnownBlock(None) => Ok(()),
+        _ => unreachable!("wrong response to Request::KnownBlock"),
+    }
+}
+
+async fn check_block_commitment<S>(
+    state_service: &mut S,
+    block: zs::SemanticallyVerifiedBlock,
+) -> Result<(), VerifyBlockError>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    let hash = block.hash;
+    match state_service
+        .ready()
+        .await
+        .map_err(|source| VerifyBlockError::StateService { source, hash })?
+        .call(zs::Request::CheckBlockCommitment(block))
+        .await
+        .map_err(|source| map_commit_error(source, hash))?
+    {
+        zs::Response::ValidBlockCommitment => Ok(()),
+        _ => unreachable!("wrong response to Request::CheckBlockCommitment"),
     }
 }

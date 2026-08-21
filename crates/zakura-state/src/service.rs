@@ -62,9 +62,10 @@ use crate::{
         read::find,
         watch_receiver::WatchReceiver,
     },
-    BlockAdmission, BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config,
-    KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
-    StateInitError,
+    BlockLifecycleFailureClass, BlockLifecycleMilestone, BlockLifecycleReporter, BoxError,
+    CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, KnownBlock, ReadRequest,
+    ReadResponse, Request, Response, SemanticallyVerifiedBlock, StateInitError,
+    ValidateContextError,
 };
 
 pub mod block_iter;
@@ -807,10 +808,14 @@ impl StateService {
         queued: QueuedSemanticallyVerified,
         error: impl Into<CommitSemanticallyVerifiedError>,
     ) {
-        let (finalized, rsp_tx, admission) = queued;
+        let (finalized, rsp_tx, lifecycle) = queued;
 
-        if let Some(admission) = admission {
-            admission.reject();
+        if let Some(lifecycle) = lifecycle {
+            lifecycle.fail(
+                BlockLifecycleMilestone::StateQueued,
+                BlockLifecycleFailureClass::CancelledBeforeOwnership,
+                "state rejected the block before writer admission",
+            );
         }
 
         // The block sender might have already given up on this block,
@@ -896,7 +901,7 @@ impl StateService {
     fn queue_and_commit_to_non_finalized_state(
         &mut self,
         semantically_verified: SemanticallyVerifiedBlock,
-        admission: Option<BlockAdmission>,
+        lifecycle: Option<BlockLifecycleReporter>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
         let parent_hash = semantically_verified.block.header.previous_block_hash;
@@ -911,8 +916,12 @@ impl StateService {
             .non_finalized_block_write_sent_hashes
             .contains(&semantically_verified.hash)
         {
-            if let Some(admission) = admission {
-                admission.reject();
+            if let Some(lifecycle) = lifecycle.as_ref() {
+                lifecycle.fail(
+                    BlockLifecycleMilestone::StateQueued,
+                    BlockLifecycleFailureClass::Duplicate,
+                    "state already sent this block hash to the write channel",
+                );
             }
             let (rsp_tx, rsp_rx) = oneshot::channel();
             let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
@@ -928,8 +937,12 @@ impl StateService {
             .db
             .contains_height(semantically_verified.height)
         {
-            if let Some(admission) = admission {
-                admission.reject();
+            if let Some(lifecycle) = lifecycle.as_ref() {
+                lifecycle.fail(
+                    BlockLifecycleMilestone::StateQueued,
+                    BlockLifecycleFailureClass::Duplicate,
+                    "state already contains a block at this finalized height",
+                );
             }
             let (rsp_tx, rsp_rx) = oneshot::channel();
             let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
@@ -943,18 +956,24 @@ impl StateService {
         // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
         // has been queued but not yet committed to the state fails the older request and replaces
         // it with the newer request.
-        let rsp_rx = if let Some((_, old_rsp_tx, _)) = self
+        let rsp_rx = if let Some((old_block, old_rsp_tx, old_lifecycle)) = self
             .non_finalized_state_queued_blocks
             .get_mut(&semantically_verified.hash)
         {
-            if let Some(admission) = admission {
-                admission.reject();
+            if let Some(old_lifecycle) = old_lifecycle.take() {
+                old_lifecycle.fail(
+                    BlockLifecycleMilestone::StateQueued,
+                    BlockLifecycleFailureClass::Duplicate,
+                    "a newer request replaced this queued block hash",
+                );
             }
             tracing::debug!("replacing older queued request with new request");
+            *old_block = semantically_verified;
+            *old_lifecycle = lifecycle;
             let (mut rsp_tx, rsp_rx) = oneshot::channel();
             std::mem::swap(old_rsp_tx, &mut rsp_tx);
             let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
-                Some(semantically_verified.hash.into()),
+                Some(old_block.hash.into()),
                 KnownBlock::Queue,
             )
             .into()));
@@ -964,7 +983,7 @@ impl StateService {
             self.non_finalized_state_queued_blocks.queue((
                 semantically_verified,
                 rsp_tx,
-                admission,
+                lifecycle,
             ));
             rsp_rx
         };
@@ -1033,7 +1052,7 @@ impl StateService {
 
                     self.non_finalized_block_write_sent_hashes
                         .add(&queued_child.0);
-                    let admission = queued_child.2.clone();
+                    let lifecycle = queued_child.2.clone();
                     let send_result = non_finalized_block_write_sender.send(queued_child.into());
 
                     if let Err(SendError(NonFinalizedWriteMessage::Commit(queued))) = send_result {
@@ -1048,8 +1067,8 @@ impl StateService {
                         return;
                     };
 
-                    if let Some(admission) = admission {
-                        admission.admit();
+                    if let Some(lifecycle) = lifecycle {
+                        lifecycle.reach(BlockLifecycleMilestone::StateQueued);
                     }
 
                     new_parents.push(hash);
@@ -1506,18 +1525,18 @@ impl Service<Request> for StateService {
                 .boxed()
             }
 
-            Request::CommitSemanticallyVerifiedBlockWithAdmission { block, admission } => {
+            Request::CommitSemanticallyVerifiedBlockWithLifecycle { block, lifecycle } => {
                 let timer = CodeTimer::start();
                 self.assert_block_can_be_validated(&block);
                 self.pending_utxos.check_against_ordered(&block.new_outputs);
 
                 let rsp_rx = tokio::task::block_in_place(move || {
                     span.in_scope(|| {
-                        self.queue_and_commit_to_non_finalized_state(block, Some(admission))
+                        self.queue_and_commit_to_non_finalized_state(block, Some(lifecycle))
                     })
                 });
 
-                timer.finish_desc("CommitSemanticallyVerifiedBlockWithAdmission");
+                timer.finish_desc("CommitSemanticallyVerifiedBlockWithLifecycle");
                 let span = Span::current();
                 async move {
                     rsp_rx
@@ -1745,6 +1764,7 @@ impl Service<Request> for StateService {
             | Request::FindBlockHashes { .. }
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
+            | Request::CheckBlockCommitment(_)
             | Request::CheckBlockProposalValidity(_) => {
                 // Redirect the request to the concurrent ReadStateService
                 let read_service = self.read_service.clone();
@@ -2824,6 +2844,36 @@ impl Service<ReadRequest> for ReadStateService {
                 )?;
 
                 Ok(ReadResponse::ValidBlockProposal)
+            }
+
+            ReadRequest::CheckBlockCommitment(semantically_verified) => {
+                let latest_non_finalized_state = state.latest_non_finalized_state();
+                let parent_hash = semantically_verified.block.header.previous_block_hash;
+                let parent_chain = latest_non_finalized_state
+                    .find_chain(|chain| chain.contains_block_hash(parent_hash));
+                let history_tree =
+                    read::tree::history_tree(parent_chain, &state.db, parent_hash.into());
+                let history_tree = match history_tree {
+                    Some(history_tree) => history_tree,
+                    None if matches!(
+                        semantically_verified.block.commitment(&state.network)?,
+                        block::Commitment::PreSaplingReserved(_)
+                            | block::Commitment::FinalSaplingRoot(_)
+                            | block::Commitment::ChainHistoryActivationReserved
+                    ) =>
+                    {
+                        Arc::new(zakura_chain::history_tree::HistoryTree::default())
+                    }
+                    None => return Err(ValidateContextError::NotReadyToBeCommitted.into()),
+                };
+                check::block_commitment_is_valid_for_chain_history(
+                    semantically_verified.block,
+                    &state.network,
+                    &history_tree,
+                    semantically_verified.auth_data_root,
+                )?;
+
+                Ok(ReadResponse::ValidBlockCommitment)
             }
 
             ReadRequest::TipBlockSize => {

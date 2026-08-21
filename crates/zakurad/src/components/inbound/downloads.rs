@@ -15,7 +15,7 @@ use futures::{
 };
 use pin_project::pin_project;
 use tokio::{
-    sync::{oneshot, Mutex},
+    sync::{mpsc, oneshot, Mutex},
     task::JoinHandle,
 };
 use tower::{Service, ServiceExt};
@@ -23,12 +23,17 @@ use tracing::Instrument;
 
 use zakura_chain::{
     block::{self, HeightDiff},
+    chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
 };
 use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_rpc::{BlockRelayEvent, BlockRelaySource, PendingBlockRegistry};
 use zakura_state as zs;
 
-use crate::components::{auth_download_height::tip_child_mismatch, sync::MIN_CONCURRENCY_LIMIT};
+use crate::components::{
+    auth_download_height::tip_child_mismatch,
+    sync::{SyncStatus, MIN_CONCURRENCY_LIMIT},
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -48,6 +53,23 @@ pub struct GossipedTipChildHeightMismatch {
     pub height: block::Height,
     pub expected_height: block::Height,
     pub hash: block::Hash,
+}
+
+/// A block relayed after semantic verification later failed contextual commit.
+///
+/// The inbound service uses this wrapper to avoid assigning a later local or contextual failure
+/// to the peer that supplied a semantically valid block.
+#[derive(Debug, thiserror::Error)]
+#[error("early-relayed block failed contextual commit: {source}")]
+pub struct EarlyRelayedBlockCommitError {
+    #[source]
+    source: BoxError,
+}
+
+impl EarlyRelayedBlockCommitError {
+    pub(crate) fn new(source: BoxError) -> Self {
+        Self { source }
+    }
 }
 
 /// Source key used for inbound block download ordering.
@@ -254,6 +276,9 @@ where
     /// Whether legacy peer address labels in logs are unredacted.
     expose_peer_addresses: bool,
 
+    /// The configured relay boundary for blocks received from peers.
+    block_relay: zn::config::BlockRelayPolicy,
+
     // Services
     //
     /// A service that forwards requests to connected peers, and returns their
@@ -268,6 +293,15 @@ where
 
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: zs::LatestChainTip,
+
+    /// Reports whether the node is close enough to the network tip for optimistic relay.
+    sync_status: Option<SyncStatus>,
+
+    /// Sends relay lifecycle events to the block gossip task.
+    block_relay_sender: Option<mpsc::Sender<BlockRelayEvent>>,
+
+    /// Serves early-relayed block bodies until their state commits finish.
+    pending_blocks: PendingBlockRegistry,
 
     // Internal downloads state
     //
@@ -381,6 +415,34 @@ where
         state: ZS,
         latest_chain_tip: zs::LatestChainTip,
     ) -> Self {
+        Self::new_with_relay(
+            full_verify_concurrency_limit,
+            expose_peer_addresses,
+            network,
+            verifier,
+            state,
+            latest_chain_tip,
+            None,
+            zn::config::BlockRelayPolicy::Committed,
+            None,
+            PendingBlockRegistry::default(),
+        )
+    }
+
+    /// Initializes a download stream with an optional pre-commit peer relay path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_relay(
+        full_verify_concurrency_limit: usize,
+        expose_peer_addresses: bool,
+        network: ZN,
+        verifier: ZV,
+        state: ZS,
+        latest_chain_tip: zs::LatestChainTip,
+        sync_status: Option<SyncStatus>,
+        block_relay: zn::config::BlockRelayPolicy,
+        block_relay_sender: Option<mpsc::Sender<BlockRelayEvent>>,
+        pending_blocks: PendingBlockRegistry,
+    ) -> Self {
         // The syncer already warns about the minimum.
         let full_verify_concurrency_limit =
             full_verify_concurrency_limit.clamp(MIN_CONCURRENCY_LIMIT, MAX_INBOUND_CONCURRENCY);
@@ -388,10 +450,14 @@ where
         Self {
             full_verify_concurrency_limit,
             expose_peer_addresses,
+            block_relay,
             network,
             verifier,
             state,
             latest_chain_tip,
+            sync_status,
+            block_relay_sender,
+            pending_blocks,
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             source_locks: HashMap::new(),
@@ -597,7 +663,11 @@ where
         let verifier = self.verifier.clone();
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
+        let sync_status = self.sync_status.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
+        let block_relay = self.block_relay;
+        let block_relay_sender = self.block_relay_sender.clone();
+        let pending_blocks = self.pending_blocks.clone();
 
         let fut = async move {
             // Check if the full block body is already in the state. `KnownBlock`
@@ -612,6 +682,7 @@ where
             .map_err(|e| (e, None))?;
 
             let request_hashes = std::iter::once(hash).collect();
+            let relay_advertiser = download_source.clone();
             let request = match download_source {
                 Some(source) => zn::Request::BlocksByHashFrom {
                     hashes: request_hashes,
@@ -780,16 +851,138 @@ where
                     .map_err(|e| (e.into(), None))?;
             }
 
+            // Relay only blocks that extend our committed tip. The syncer and competing forks
+            // keep the strict commit-first path.
+            let relay_tip_child =
+                best_tip.is_some_and(|(_, tip_hash)| block.header.previous_block_hash == tip_hash);
+
             let _source_guard = match source_lock {
                 Some(source_lock) => Some(source_lock.lock_owned().await),
                 None => None,
             };
 
-            verifier
-                .oneshot(zakura_consensus::Request::Commit(block))
-                .await
+            let semantic_relay_sender = if block_relay == zn::config::BlockRelayPolicy::Semantic
+                && relay_tip_child
+                && sync_status
+                    .as_ref()
+                    .is_some_and(ChainSyncStatus::is_close_to_tip)
+            {
+                block_relay_sender
+            } else {
+                None
+            };
+            let (verification_result, suppress_peer_misbehavior) =
+                if let Some(relay_sender) = semantic_relay_sender {
+                    let (lifecycle_handle, lifecycle) = zs::BlockLifecycleHandle::new();
+                    let mut verification = Box::pin(verifier.oneshot(
+                        zakura_consensus::Request::CommitWithLifecycle {
+                            block: block.clone(),
+                            lifecycle,
+                        },
+                    ));
+
+                    enum AuthorizationRace {
+                        Authorized(Result<(), zs::BlockLifecycleResult>),
+                        Verification(Result<block::Hash, BoxError>),
+                    }
+
+                    let race = tokio::select! {
+                        biased;
+
+                        authorized = lifecycle_handle.wait_for(
+                            zs::BlockLifecycleMilestone::RelayAuthorized,
+                        ) => {
+                            AuthorizationRace::Authorized(authorized)
+                        },
+                        result = &mut verification => AuthorizationRace::Verification(result),
+                    };
+
+                    match race {
+                        AuthorizationRace::Verification(result) => (result, false),
+                        AuthorizationRace::Authorized(authorized) => {
+                            let source = BlockRelaySource::Peer {
+                                authorized_at: std::time::Instant::now(),
+                                advertiser: relay_advertiser,
+                            };
+                            let mut early_result = None;
+                            if authorized.is_ok() && pending_blocks.insert(block.clone()) {
+                                let (advertised, receiver) = oneshot::channel();
+                                let event = BlockRelayEvent::Early {
+                                    hash,
+                                    height: block_height,
+                                    source: source.clone(),
+                                    advertised,
+                                };
+                                if relay_sender.try_send(event).is_ok() {
+                                    early_result = Some(receiver);
+                                } else {
+                                    pending_blocks.cancel_relay_reservation(&block);
+                                }
+                            }
+
+                            let early_relayed = early_result.is_some();
+                            let (result_sender, result_receiver) = oneshot::channel();
+                            tokio::spawn(async move {
+                                let result = verification.await;
+                                let committed = result.is_ok();
+                                pending_blocks.remove(&block, committed);
+                                tokio::spawn(async move {
+                                    let early_advertised = match early_result {
+                                        Some(receiver) => tokio::time::timeout(
+                                            std::time::Duration::from_secs(20),
+                                            receiver,
+                                        )
+                                        .await
+                                        .ok()
+                                        .and_then(|result| result.ok())
+                                        .unwrap_or(false),
+                                        None => false,
+                                    };
+                                    let event = if committed {
+                                        BlockRelayEvent::Committed {
+                                            hash,
+                                            height: block_height,
+                                            early_advertised,
+                                            source,
+                                        }
+                                    } else {
+                                        BlockRelayEvent::Failed {
+                                            hash,
+                                            height: block_height,
+                                            early_advertised,
+                                            source,
+                                        }
+                                    };
+                                    let _ = relay_sender.send(event).await;
+                                });
+                                let _ = result_sender.send(result);
+                            });
+
+                            let result = result_receiver.await.unwrap_or_else(|_| {
+                                Err("owned semantic block commit task exited".into())
+                            });
+                            (result, early_relayed)
+                        }
+                    }
+                } else {
+                    (
+                        verifier
+                            .oneshot(zakura_consensus::Request::Commit(block))
+                            .await,
+                        false,
+                    )
+                };
+
+            verification_result
                 .map(|hash| (hash, block_height))
-                .map_err(|e| (e, advertiser_addr))
+                .map_err(|source| {
+                    let error = if suppress_peer_misbehavior {
+                        BoxError::from(EarlyRelayedBlockCommitError::new(source))
+                    } else {
+                        source
+                    };
+                    (error, advertiser_addr)
+                })
         }
         .map_ok(|(hash, height)| {
             info!(?height, "downloaded and verified gossiped block");
@@ -1229,6 +1422,242 @@ mod tests {
             }
         );
         poll_task.abort();
+    }
+
+    #[tokio::test]
+    async fn semantic_peer_relay_commit_survives_download_cancellation() -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let network_block = block.clone();
+        let network = BoxCloneService::new(service_fn(move |_request: zn::Request| {
+            let block = network_block.clone();
+            async move { Ok(zn::Response::Blocks(vec![Available((block, None))])) }
+        }));
+        let commit_started = Arc::new(tokio::sync::Notify::new());
+        let release_commit = Arc::new(tokio::sync::Notify::new());
+        let verifier = BoxCloneService::new(service_fn({
+            let commit_started = commit_started.clone();
+            let release_commit = release_commit.clone();
+            move |request: zakura_consensus::Request| {
+                let commit_started = commit_started.clone();
+                let release_commit = release_commit.clone();
+                async move {
+                    let zakura_consensus::Request::CommitWithLifecycle { block, lifecycle } =
+                        request
+                    else {
+                        return Err("semantic relay requires a lifecycle request".into());
+                    };
+                    lifecycle.reach(zs::BlockLifecycleMilestone::SemanticallyValid);
+                    lifecycle.reach(zs::BlockLifecycleMilestone::RelayAuthorized);
+                    commit_started.notify_one();
+                    release_commit.notified().await;
+                    Ok(block.hash())
+                }
+            }
+        }));
+        let state = BoxCloneService::new(service_fn(|request| async move {
+            match request {
+                zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                request => Err(format!("unexpected state request: {request:?}").into()),
+            }
+        }));
+        let (_tip_sender, latest_chain_tip) =
+            chain_tip_at(block::Height(0), block.header.previous_block_hash);
+        let (sync_status, mut recent_syncs) = SyncStatus::new();
+        SyncStatus::sync_close_to_tip(&mut recent_syncs);
+        let (relay_sender, mut relay_receiver) = mpsc::channel(4);
+        let pending_blocks = PendingBlockRegistry::default();
+        let source = zn::PeerSource::LegacySocket(([192, 0, 2, 1], 8233).into());
+        let mut downloads = Downloads::new_with_relay(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            network,
+            verifier,
+            state,
+            latest_chain_tip,
+            Some(sync_status),
+            zn::config::BlockRelayPolicy::Semantic,
+            Some(relay_sender),
+            pending_blocks.clone(),
+        );
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(source.clone())),
+            DownloadAction::AddedToQueue
+        );
+        let download = tokio::spawn(async move { downloads.next().await });
+
+        tokio::time::timeout(Duration::from_secs(1), commit_started.notified())
+            .await
+            .expect("semantic verification reaches the held commit");
+        let early = tokio::time::timeout(Duration::from_secs(1), relay_receiver.recv())
+            .await
+            .expect("semantic verification promptly emits a relay event")
+            .expect("the relay channel remains open");
+        let advertised = match early {
+            BlockRelayEvent::Early {
+                hash: event_hash,
+                source: BlockRelaySource::Peer { advertiser, .. },
+                advertised,
+                ..
+            } => {
+                assert_eq!(event_hash, hash);
+                assert_eq!(advertiser, Some(source));
+                advertised
+            }
+            event => panic!("unexpected relay event: {event:?}"),
+        };
+        assert_eq!(pending_blocks.get(hash), Some(block));
+        assert!(!download.is_finished(), "the verifier commit remains held");
+        advertised
+            .send(true)
+            .expect("the relay lifecycle waits for the advertisement result");
+
+        download.abort();
+        release_commit.notify_one();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), relay_receiver.recv())
+                .await
+                .expect("commit promptly emits its completion event"),
+            Some(BlockRelayEvent::Committed {
+                hash: event_hash,
+                early_advertised: true,
+                ..
+            }) if event_hash == hash
+        ));
+        assert_eq!(pending_blocks.get(hash), None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_policy_keeps_no_tip_downloads_strict() -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let network = BoxCloneService::new(service_fn({
+            let block = block.clone();
+            move |_request: zn::Request| {
+                let block = block.clone();
+                async move { Ok(zn::Response::Blocks(vec![Available((block, None))])) }
+            }
+        }));
+        let (request_sender, mut request_receiver) = mpsc::unbounded_channel();
+        let verifier =
+            BoxCloneService::new(service_fn(move |request: zakura_consensus::Request| {
+                let request_sender = request_sender.clone();
+                async move {
+                    let is_strict = matches!(request, zakura_consensus::Request::Commit(_));
+                    let hash = request.block().hash();
+                    request_sender.send(is_strict)?;
+                    Ok(hash)
+                }
+            }));
+        let state = BoxCloneService::new(service_fn(|request| async move {
+            match request {
+                zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                request => Err(format!("unexpected state request: {request:?}").into()),
+            }
+        }));
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let (sync_status, mut recent_syncs) = SyncStatus::new();
+        SyncStatus::sync_close_to_tip(&mut recent_syncs);
+        let (relay_sender, mut relay_receiver) = mpsc::channel(4);
+        let mut downloads = Downloads::new_with_relay(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            network,
+            verifier,
+            state,
+            latest_chain_tip,
+            Some(sync_status),
+            zn::config::BlockRelayPolicy::Semantic,
+            Some(relay_sender),
+            PendingBlockRegistry::default(),
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(hash, None),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(
+            downloads
+                .next()
+                .await
+                .expect("the download stream remains open")
+                .expect("the strict commit succeeds"),
+            hash
+        );
+        assert_eq!(request_receiver.recv().await, Some(true));
+        assert!(relay_receiver.try_recv().is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn semantic_policy_keeps_syncing_downloads_strict() -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let network = BoxCloneService::new(service_fn({
+            let block = block.clone();
+            move |_request: zn::Request| {
+                let block = block.clone();
+                async move { Ok(zn::Response::Blocks(vec![Available((block, None))])) }
+            }
+        }));
+        let (request_sender, mut request_receiver) = mpsc::unbounded_channel();
+        let verifier =
+            BoxCloneService::new(service_fn(move |request: zakura_consensus::Request| {
+                let request_sender = request_sender.clone();
+                async move {
+                    let is_strict = matches!(request, zakura_consensus::Request::Commit(_));
+                    let hash = request.block().hash();
+                    request_sender.send(is_strict)?;
+                    Ok(hash)
+                }
+            }));
+        let state = BoxCloneService::new(service_fn(|request| async move {
+            match request {
+                zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                request => Err(format!("unexpected state request: {request:?}").into()),
+            }
+        }));
+        let (_tip_sender, latest_chain_tip) =
+            chain_tip_at(block::Height(0), block.header.previous_block_hash);
+        let (sync_status, mut recent_syncs) = SyncStatus::new();
+        SyncStatus::sync_far_from_tip(&mut recent_syncs);
+        let (relay_sender, mut relay_receiver) = mpsc::channel(4);
+        let mut downloads = Downloads::new_with_relay(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            network,
+            verifier,
+            state,
+            latest_chain_tip,
+            Some(sync_status),
+            zn::config::BlockRelayPolicy::Semantic,
+            Some(relay_sender),
+            PendingBlockRegistry::default(),
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(hash, None),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(
+            downloads
+                .next()
+                .await
+                .expect("the download stream remains open")
+                .expect("the strict commit succeeds"),
+            hash
+        );
+        assert_eq!(request_receiver.recv().await, Some(true));
+        assert!(relay_receiver.try_recv().is_err());
+
+        Ok(())
     }
 
     #[tokio::test]

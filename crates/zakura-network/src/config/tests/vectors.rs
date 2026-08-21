@@ -20,7 +20,7 @@ use crate::{
         DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
         DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
-    CacheDir, Config, P2pStack,
+    BlockRelayPolicy, CacheDir, Config, P2pStack,
 };
 
 use super::super::load_or_generate_zakura_secret_key;
@@ -273,6 +273,28 @@ fn p2p_stack_defaults_by_network_and_roundtrips() {
 
     let serialized = toml::to_string(&Config::default()).unwrap();
     assert!(serialized.contains("p2p_stack = \"default\""));
+}
+
+#[test]
+fn block_relay_defaults_to_semantic_and_committed_roundtrips() {
+    let default = Config::default();
+    assert_eq!(default.block_relay, BlockRelayPolicy::Semantic);
+
+    let committed: Config = toml::from_str("block_relay = 'committed'")
+        .expect("the committed peer relay policy parses");
+    assert_eq!(committed.block_relay, BlockRelayPolicy::Committed);
+    let serialized = toml::to_string(&committed).expect("the network config serializes");
+    assert!(serialized.contains("block_relay = \"committed\""));
+    assert_eq!(
+        toml::from_str::<Config>(&serialized)
+            .expect("the serialized network config parses")
+            .block_relay,
+        BlockRelayPolicy::Committed
+    );
+
+    let error = toml::from_str::<Config>("block_relay = 'pow_bound'")
+        .expect_err("pow-bound relay stays disabled until body-binding verification lands");
+    assert!(error.to_string().contains("body-binding verifier phase"));
 }
 
 #[test]

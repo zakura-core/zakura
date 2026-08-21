@@ -32,6 +32,19 @@ fn header_chain_finalization_errors_become_failed_writer_exits() {
 }
 
 #[test]
+fn storage_uncertainty_stops_non_finalized_writes() {
+    let unavailable = HeaderChainStoreError::Store(zakura_header_chain::StoreError::Unavailable(
+        "test storage read failed",
+    ));
+    assert!(header_chain_block_failure(&unavailable).is_some());
+
+    let stale = HeaderChainStoreError::StaleFullStateTransition {
+        current_version: StateVersion::default(),
+    };
+    assert!(header_chain_block_failure(&stale).is_none());
+}
+
+#[test]
 #[should_panic(expected = "unexpected finalized block commit error")]
 fn legacy_finalization_invariant_failures_remain_explicit_panics() {
     let error = CommitCheckpointVerifiedError::from(CommitBlockError::WriteTaskExited);

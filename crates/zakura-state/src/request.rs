@@ -5,12 +5,13 @@ use std::{
     ops::{Add, Deref, RangeInclusive},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use tower::{BoxError, Service, ServiceExt};
 use zakura_chain::{
@@ -41,99 +42,235 @@ use crate::{
     ReadResponse, Response,
 };
 
-/// Notifies a mined-block submitter when state admits its block to the active write queue.
-#[derive(Clone)]
-pub struct BlockAdmission(Arc<BlockAdmissionInner>);
-
-#[derive(Debug)]
-struct BlockAdmissionInner {
-    state: AtomicU8,
-    changed: Notify,
+/// One independently observable stage in a block's verification and commit lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum BlockLifecycleMilestone {
+    /// Proof of work and the exact block body are bound to the submitted header.
+    PowAndBodyBound = 1 << 0,
+    /// Semantic verification completed.
+    SemanticallyValid = 1 << 1,
+    /// The verifier authorized network relay.
+    RelayAuthorized = 1 << 2,
+    /// State admitted the block to the active write channel.
+    StateQueued = 1 << 3,
+    /// Contextual validation completed.
+    ContextuallyValid = 1 << 4,
+    /// The matching storage write returned successfully.
+    StorageApplied = 1 << 5,
+    /// State published the in-memory change.
+    PublishedInMemory = 1 << 6,
 }
 
-impl BlockAdmission {
-    const PENDING: u8 = 0;
-    const ADMITTED: u8 = 1;
-    const REJECTED: u8 = 2;
-
-    /// Creates a pending admission notification.
-    pub fn pending() -> Self {
-        Self(Arc::new(BlockAdmissionInner {
-            state: AtomicU8::new(Self::PENDING),
-            changed: Notify::new(),
-        }))
+impl BlockLifecycleMilestone {
+    fn mask(self) -> u8 {
+        self as u8
     }
 
-    /// Marks the block as admitted to the active non-finalized write queue.
-    pub(crate) fn admit(&self) {
-        if self
-            .0
-            .state
-            .compare_exchange(
-                Self::PENDING,
-                Self::ADMITTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.0.changed.notify_waiters();
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::PowAndBodyBound => "pow_and_body_bound",
+            Self::SemanticallyValid => "semantically_valid",
+            Self::RelayAuthorized => "relay_authorized",
+            Self::StateQueued => "state_queued",
+            Self::ContextuallyValid => "contextually_valid",
+            Self::StorageApplied => "storage_applied",
+            Self::PublishedInMemory => "published_in_memory",
         }
     }
+}
 
-    /// Marks the block as rejected before admission.
-    pub(crate) fn reject(&self) {
-        if self
-            .0
-            .state
-            .compare_exchange(
-                Self::PENDING,
-                Self::REJECTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.0.changed.notify_waiters();
-        }
+/// The stable class of a terminal block lifecycle failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockLifecycleFailureClass {
+    /// Semantic verification rejected the block.
+    SemanticRejected,
+    /// State rejected a duplicate request.
+    Duplicate,
+    /// State could not admit the block because its parent was unavailable.
+    ParentUnavailable,
+    /// Contextual validation rejected the block.
+    ContextualRejected,
+    /// The header transition failed.
+    HeaderTransitionFailed,
+    /// A storage operation failed.
+    StorageFailed,
+    /// The state writer exited.
+    WriterExited,
+    /// The owner stopped before another component accepted the work.
+    CancelledBeforeOwnership,
+}
+
+/// A terminal block lifecycle failure that can cross task and crate boundaries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockLifecycleFailure {
+    /// The stage that failed.
+    pub stage: BlockLifecycleMilestone,
+    /// The stable failure class.
+    pub class: BlockLifecycleFailureClass,
+    /// A diagnostic message. The component that owns the original error logs its full chain.
+    pub diagnostic: Arc<str>,
+}
+
+/// A terminal block lifecycle result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlockLifecycleResult {
+    /// State committed the block.
+    Committed,
+    /// The lifecycle terminated with a failure.
+    Failed(BlockLifecycleFailure),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct BlockLifecycleSnapshot {
+    milestones: u8,
+    terminal: Option<BlockLifecycleResult>,
+}
+
+/// Observes block lifecycle milestones without granting permission to report them.
+#[derive(Clone, Debug)]
+pub struct BlockLifecycleHandle {
+    receiver: watch::Receiver<BlockLifecycleSnapshot>,
+}
+
+/// Reports block lifecycle milestones to every observer.
+#[derive(Clone, Debug)]
+pub struct BlockLifecycleReporter {
+    sender: watch::Sender<BlockLifecycleSnapshot>,
+    started_at: Instant,
+}
+
+impl BlockLifecycleHandle {
+    /// Creates a pending lifecycle and returns its observer and reporter capabilities.
+    pub fn new() -> (Self, BlockLifecycleReporter) {
+        let (sender, receiver) = watch::channel(BlockLifecycleSnapshot::default());
+        (
+            Self { receiver },
+            BlockLifecycleReporter {
+                sender,
+                started_at: Instant::now(),
+            },
+        )
     }
 
-    /// Waits until state admits or rejects the block.
-    pub async fn wait(&self) -> bool {
+    /// Returns true when the lifecycle reached `milestone`.
+    pub fn has_reached(&self, milestone: BlockLifecycleMilestone) -> bool {
+        self.receiver.borrow().milestones & milestone.mask() != 0
+    }
+
+    /// Waits for `milestone` or returns the terminal result that prevented it.
+    pub async fn wait_for(
+        &self,
+        milestone: BlockLifecycleMilestone,
+    ) -> Result<(), BlockLifecycleResult> {
+        let mut receiver = self.receiver.clone();
         loop {
-            let notified = self.0.changed.notified();
-            match self.0.state.load(Ordering::Acquire) {
-                Self::ADMITTED => return true,
-                Self::REJECTED => return false,
-                Self::PENDING => notified.await,
-                _ => unreachable!("block admission state only uses declared constants"),
+            {
+                let snapshot = receiver.borrow_and_update();
+                if snapshot.milestones & milestone.mask() != 0 {
+                    return Ok(());
+                }
+                if let Some(terminal) = snapshot.terminal.clone() {
+                    return Err(terminal);
+                }
+            }
+
+            if receiver.changed().await.is_err() {
+                return Err(BlockLifecycleResult::Failed(BlockLifecycleFailure {
+                    stage: milestone,
+                    class: BlockLifecycleFailureClass::WriterExited,
+                    diagnostic: "all block lifecycle reporters were dropped".into(),
+                }));
             }
         }
     }
 
-    /// Marks the block as admitted in cross-crate lifecycle tests.
-    #[cfg(any(test, feature = "proptest-impl"))]
-    #[doc(hidden)]
-    pub fn admit_for_test(&self) {
-        self.admit();
+    /// Returns the terminal result when the lifecycle has finished.
+    pub fn terminal(&self) -> Option<BlockLifecycleResult> {
+        self.receiver.borrow().terminal.clone()
     }
 }
 
-impl std::fmt::Debug for BlockAdmission {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("BlockAdmission")
-            .field(&self.0.state.load(Ordering::Acquire))
-            .finish()
+impl BlockLifecycleReporter {
+    /// Records an independently reached milestone once.
+    pub fn reach(&self, milestone: BlockLifecycleMilestone) {
+        let mut first_report = false;
+        self.sender.send_modify(|snapshot| {
+            if snapshot.terminal.is_none() && snapshot.milestones & milestone.mask() == 0 {
+                snapshot.milestones |= milestone.mask();
+                first_report = true;
+            }
+        });
+        if first_report {
+            metrics::histogram!(
+                "block.lifecycle.milestone.duration_seconds",
+                "milestone" => milestone.metric_label()
+            )
+            .record(self.started_at.elapsed().as_secs_f64());
+        }
+    }
+
+    /// Marks the block as committed.
+    pub fn commit(&self) {
+        let mut first_terminal = false;
+        self.sender.send_modify(|snapshot| {
+            if snapshot.terminal.is_none() {
+                snapshot.terminal = Some(BlockLifecycleResult::Committed);
+                first_terminal = true;
+            }
+        });
+        if first_terminal {
+            metrics::histogram!(
+                "block.lifecycle.terminal.duration_seconds",
+                "result" => "committed"
+            )
+            .record(self.started_at.elapsed().as_secs_f64());
+        }
+    }
+
+    /// Marks the lifecycle as failed. The first terminal result wins.
+    pub fn fail(
+        &self,
+        stage: BlockLifecycleMilestone,
+        class: BlockLifecycleFailureClass,
+        diagnostic: impl Into<Arc<str>>,
+    ) {
+        let mut first_terminal = false;
+        self.sender.send_modify(|snapshot| {
+            if snapshot.terminal.is_none() {
+                snapshot.terminal = Some(BlockLifecycleResult::Failed(BlockLifecycleFailure {
+                    stage,
+                    class,
+                    diagnostic: diagnostic.into(),
+                }));
+                first_terminal = true;
+            }
+        });
+        if first_terminal {
+            metrics::histogram!(
+                "block.lifecycle.terminal.duration_seconds",
+                "result" => "failed"
+            )
+            .record(self.started_at.elapsed().as_secs_f64());
+        }
     }
 }
 
-impl PartialEq for BlockAdmission {
+impl PartialEq for BlockLifecycleHandle {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        self.receiver.same_channel(&other.receiver)
     }
 }
 
-impl Eq for BlockAdmission {}
+impl Eq for BlockLifecycleHandle {}
+
+impl PartialEq for BlockLifecycleReporter {
+    fn eq(&self, other: &Self) -> bool {
+        self.sender.same_channel(&other.sender)
+    }
+}
+
+impl Eq for BlockLifecycleReporter {}
 use crate::{
     error::{CommitCheckpointVerifiedError, InvalidateError, LayeredStateError, ReconsiderError},
     CommitSemanticallyVerifiedError,
@@ -440,6 +577,9 @@ pub struct ContextuallyVerifiedBlock {
     /// in the same order as `block.transactions`.
     pub(crate) transaction_hashes: Arc<[transaction::Hash]>,
 
+    /// The precomputed ZIP-244 authorizing-data commitment root for this block.
+    pub(crate) auth_data_root: Option<AuthDataRoot>,
+
     /// The sum of the chain value pool changes of all transactions in this block.
     pub(crate) chain_value_pool_change: ValueBalance<NegativeAllowed>,
 }
@@ -618,7 +758,7 @@ impl ContextuallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change,
-            auth_data_root: _,
+            auth_data_root,
         } = semantically_verified;
 
         // This is redundant for the non-finalized state,
@@ -634,6 +774,7 @@ impl ContextuallyVerifiedBlock {
             new_outputs,
             spent_outputs: spent_outputs.clone(),
             transaction_hashes,
+            auth_data_root,
             chain_value_pool_change: block.chain_value_pool_change(
                 &utxos_from_ordered_utxos(spent_outputs),
                 deferred_pool_balance_change,
@@ -790,6 +931,28 @@ mod tests {
     }
 
     #[test]
+    fn contextual_block_preserves_precomputed_auth_data_root() {
+        let _init_guard = zakura_test::init();
+
+        let block = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                .zcash_deserialize_into::<Block>()
+                .expect("the genesis block deserializes"),
+        );
+        let semantic = SemanticallyVerifiedBlock::from(block.clone());
+        let expected_auth_data_root = semantic.auth_data_root;
+        let contextual =
+            ContextuallyVerifiedBlock::with_block_and_spent_utxos(semantic, HashMap::new())
+                .expect("the test block's value balance can be calculated");
+
+        assert_eq!(contextual.auth_data_root, expected_auth_data_root);
+        assert_eq!(
+            SemanticallyVerifiedBlock::from(contextual).auth_data_root,
+            expected_auth_data_root
+        );
+    }
+
+    #[test]
     fn checkpoint_precomputed_auth_data_root_matches_its_block() {
         let _init_guard = zakura_test::init();
 
@@ -808,16 +971,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn block_admission_keeps_its_first_terminal_state() {
-        let rejected = BlockAdmission::pending();
-        rejected.reject();
-        rejected.admit();
-        assert!(!rejected.wait().await);
+    async fn block_lifecycle_keeps_independent_milestones_and_first_terminal_result() {
+        let (handle, reporter) = BlockLifecycleHandle::new();
+        reporter.reach(BlockLifecycleMilestone::SemanticallyValid);
+        reporter.reach(BlockLifecycleMilestone::RelayAuthorized);
 
-        let admitted = BlockAdmission::pending();
-        admitted.admit();
-        admitted.reject();
-        assert!(admitted.wait().await);
+        handle
+            .wait_for(BlockLifecycleMilestone::RelayAuthorized)
+            .await
+            .expect("the reporter authorized relay");
+        assert!(handle.has_reached(BlockLifecycleMilestone::SemanticallyValid));
+        assert!(!handle.has_reached(BlockLifecycleMilestone::StateQueued));
+
+        reporter.fail(
+            BlockLifecycleMilestone::StateQueued,
+            BlockLifecycleFailureClass::Duplicate,
+            "duplicate",
+        );
+        reporter.commit();
+        assert!(matches!(
+            handle.terminal(),
+            Some(BlockLifecycleResult::Failed(BlockLifecycleFailure {
+                class: BlockLifecycleFailureClass::Duplicate,
+                ..
+            }))
+        ));
     }
 }
 
@@ -832,7 +1010,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             deferred_pool_balance_change: Some(DeferredPoolBalanceChange::new(
                 valid.chain_value_pool_change.deferred_amount(),
             )),
-            auth_data_root: None,
+            auth_data_root: valid.auth_data_root,
         }
     }
 }
@@ -1214,12 +1392,12 @@ pub enum Request {
     /// [0]: (crate::error::CommitSemanticallyVerifiedError)
     CommitSemanticallyVerifiedBlock(SemanticallyVerifiedBlock),
 
-    /// Commits a mined block and reports when state admits it to the active write queue.
-    CommitSemanticallyVerifiedBlockWithAdmission {
-        /// The semantically verified mined block.
+    /// Commits a semantically verified block and reports its state lifecycle milestones.
+    CommitSemanticallyVerifiedBlockWithLifecycle {
+        /// The semantically verified block.
         block: SemanticallyVerifiedBlock,
-        /// The admission notification.
-        admission: BlockAdmission,
+        /// The lifecycle reporter.
+        lifecycle: BlockLifecycleReporter,
     },
 
     /// Commit a checkpointed block to the state, skipping most but not all
@@ -1418,6 +1596,9 @@ pub enum Request {
     /// Returns [`Response::ValidBestChainTipNullifiersAndAnchors`]
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
+    /// Checks that the block header commits to its exact body and parent history tree.
+    CheckBlockCommitment(SemanticallyVerifiedBlock),
+
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
     /// Returns [`Response::BestChainNextMedianTimePast`] when successful.
@@ -1480,8 +1661,8 @@ impl Request {
                 "retry_header_chain_body_availability"
             }
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
-            Request::CommitSemanticallyVerifiedBlockWithAdmission { .. } => {
-                "commit_semantically_verified_block_with_admission"
+            Request::CommitSemanticallyVerifiedBlockWithLifecycle { .. } => {
+                "commit_semantically_verified_block_with_lifecycle"
             }
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::AwaitUtxo(_) => "await_utxo",
@@ -1498,6 +1679,7 @@ impl Request {
             Request::CheckBestChainTipNullifiersAndAnchors(_) => {
                 "best_chain_tip_nullifiers_anchors"
             }
+            Request::CheckBlockCommitment(_) => "check_block_commitment",
             Request::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             Request::BestChainBlockHash(_) => "best_chain_block_hash",
             Request::KnownBlock(_) => "known_block",
@@ -1937,6 +2119,9 @@ pub enum ReadRequest {
     /// Returns [`ReadResponse::ValidBestChainTipNullifiersAndAnchors`].
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
+    /// Checks that the block header commits to its exact body and parent history tree.
+    CheckBlockCommitment(SemanticallyVerifiedBlock),
+
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
     /// Returns [`ReadResponse::BestChainNextMedianTimePast`] when successful.
@@ -2047,6 +2232,7 @@ impl ReadRequest {
             ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {
                 "best_chain_tip_nullifiers_anchors"
             }
+            ReadRequest::CheckBlockCommitment(_) => "check_block_commitment",
             ReadRequest::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             ReadRequest::BestChainBlockHash(_) => "best_chain_block_hash",
             #[cfg(feature = "indexer")]
@@ -2105,6 +2291,7 @@ impl TryFrom<Request> for ReadRequest {
             Request::CheckBestChainTipNullifiersAndAnchors(tx) => {
                 Ok(ReadRequest::CheckBestChainTipNullifiersAndAnchors(tx))
             }
+            Request::CheckBlockCommitment(block) => Ok(ReadRequest::CheckBlockCommitment(block)),
 
             Request::ApplyHeaderChainInsert { .. }
             | Request::RecordHeaderChainBodyUnavailable { .. }
@@ -2112,7 +2299,7 @@ impl TryFrom<Request> for ReadRequest {
             | Request::RestartHeaderChainBodyAvailability { .. }
             | Request::RetryHeaderChainBodyAvailability { .. }
             | Request::CommitSemanticallyVerifiedBlock(_)
-            | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
+            | Request::CommitSemanticallyVerifiedBlockWithLifecycle { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),

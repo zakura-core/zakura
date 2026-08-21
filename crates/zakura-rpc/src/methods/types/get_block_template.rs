@@ -55,7 +55,7 @@ use crate::{
         default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
     },
     server::error::OkOrError,
-    MinedBlockEvent, PendingBlockRegistry, SubmitBlockChannel,
+    BlockRelayChannel, BlockRelayEvent, PendingBlockRegistry,
 };
 
 use constants::{
@@ -594,13 +594,16 @@ where
 
     /// A channel to send successful block submissions to the block gossip task,
     /// so they can be advertised to peers.
-    mined_block_sender: mpsc::Sender<MinedBlockEvent>,
+    mined_block_sender: mpsc::Sender<BlockRelayEvent>,
 
     /// Blocks whose hashes were advertised before contextual commit completed.
     pending_blocks: PendingBlockRegistry,
 
-    /// Whether state admission can trigger an early inventory.
+    /// Whether verifier relay authorization can trigger an early inventory.
     optimistic_block_inventory: bool,
+
+    /// The state milestone that lets a mined-block RPC return success.
+    submit_acknowledgement: config::mining::SubmitAcknowledgement,
 
     /// Limits detached template preparation work.
     template_preparation_limiter: TemplatePreparationLimiter,
@@ -618,20 +621,21 @@ where
         conf: config::mining::Config,
         block_verifier_router: BlockVerifierRouter,
         sync_status: SyncStatus,
-        mined_block_sender: Option<mpsc::Sender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::Sender<BlockRelayEvent>>,
         pending_blocks: PendingBlockRegistry,
         prepared_candidates: PreparedCandidateResolver,
     ) -> Self {
         let optimistic_block_inventory = conf.optimistic_block_inventory;
+        let submit_acknowledgement = conf.submit_acknowledgement;
         Self {
             miner_params: MinerParams::new(net, conf).ok(),
             block_verifier_router,
             prepared_candidates,
             sync_status,
-            mined_block_sender: mined_block_sender
-                .unwrap_or(SubmitBlockChannel::default().sender()),
+            mined_block_sender: mined_block_sender.unwrap_or(BlockRelayChannel::default().sender()),
             pending_blocks,
             optimistic_block_inventory,
+            submit_acknowledgement,
             template_preparation_limiter: TemplatePreparationLimiter::default(),
         }
     }
@@ -657,7 +661,7 @@ where
     }
 
     /// Returns a sender for the owned mined-block lifecycle task.
-    pub fn mined_block_sender(&self) -> mpsc::Sender<MinedBlockEvent> {
+    pub fn mined_block_sender(&self) -> mpsc::Sender<BlockRelayEvent> {
         self.mined_block_sender.clone()
     }
 
@@ -669,6 +673,11 @@ where
     /// Returns whether early mined-block inventory is enabled.
     pub fn optimistic_block_inventory(&self) -> bool {
         self.optimistic_block_inventory
+    }
+
+    /// Returns the configured mined-block RPC acknowledgement milestone.
+    pub fn submit_acknowledgement(&self) -> config::mining::SubmitAcknowledgement {
+        self.submit_acknowledgement
     }
 
     /// Reserves the background template preparation slot.

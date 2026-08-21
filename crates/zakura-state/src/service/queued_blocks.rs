@@ -12,7 +12,7 @@ use zakura_chain::{block, transparent};
 
 use crate::{
     error::{CommitBlockError, CommitCheckpointVerifiedError},
-    BlockAdmission, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, KnownBlock,
+    BlockLifecycleReporter, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, KnownBlock,
     NonFinalizedState, SemanticallyVerifiedBlock,
 };
 
@@ -29,7 +29,7 @@ pub type QueuedCheckpointVerified = (
 pub type QueuedSemanticallyVerified = (
     SemanticallyVerifiedBlock,
     oneshot::Sender<Result<block::Hash, CommitSemanticallyVerifiedError>>,
-    Option<BlockAdmission>,
+    Option<BlockLifecycleReporter>,
 );
 
 /// A queue of blocks, awaiting the arrival of parent blocks.
@@ -149,12 +149,16 @@ impl QueuedBlocks {
         mem::swap(&mut self.by_height, &mut by_height);
 
         for hash in by_height.into_values().flatten() {
-            let (expired_block, expired_sender, admission) =
+            let (expired_block, expired_sender, lifecycle) =
                 self.blocks.remove(&hash).expect("block is present");
             let parent_hash = &expired_block.block.header.previous_block_hash;
 
-            if let Some(admission) = admission {
-                admission.reject();
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.fail(
+                    crate::BlockLifecycleMilestone::StateQueued,
+                    crate::BlockLifecycleFailureClass::Duplicate,
+                    "state pruned the queued block below the finalized tip",
+                );
             }
 
             // we don't care if the receiver was dropped

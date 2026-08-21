@@ -153,6 +153,24 @@ impl P2pStack {
     }
 }
 
+/// The validation boundary that authorizes relay of blocks received from peers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockRelayPolicy {
+    /// Relay only after state commits the block.
+    Committed,
+
+    /// Relay after semantic verification and before contextual state commit.
+    #[default]
+    Semantic,
+
+    /// Relay after proof of work binds the exact body to the header.
+    ///
+    /// This policy is reserved for the body-binding verifier phase. Until that phase lands,
+    /// startup rejects this value.
+    PowBound,
+}
+
 /// Configuration for networking code.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, default, into = "DConfig")]
@@ -287,6 +305,12 @@ pub struct Config {
     /// See [`P2pStack::resolve`] for the current defaults, and [`legacy_p2p`](Self::legacy_p2p)
     /// and [`v2_p2p`](Self::v2_p2p) for the resolved stack.
     pub p2p_stack: P2pStack,
+
+    /// The validation boundary for relaying blocks received from peers.
+    ///
+    /// `"semantic"` is the default. Use `"committed"` to wait for state commit.
+    /// `"pow_bound"` remains reserved and causes startup to reject the config.
+    pub block_relay: BlockRelayPolicy,
 
     /// Native Zakura endpoint, connection, and bootstrap settings.
     ///
@@ -893,6 +917,7 @@ impl Default for Config {
             identity_dir: default_network_identity_dir(),
             zakura_node_secret_key: None,
             p2p_stack: P2pStack::Default,
+            block_relay: BlockRelayPolicy::Semantic,
             zakura: ZakuraConfig::default(),
             crawl_new_peer_interval: DEFAULT_CRAWL_NEW_PEER_INTERVAL,
 
@@ -1013,6 +1038,7 @@ struct DConfig {
     zakura_node_secret_key: Option<ZakuraNodeSecretKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     p2p_stack: Option<P2pStack>,
+    block_relay: BlockRelayPolicy,
     /// Deprecated, superseded by `p2p_stack`. Accepted so configs written for older releases
     /// keep loading, and never written back out.
     #[serde(default, skip_serializing)]
@@ -1042,6 +1068,7 @@ impl Default for DConfig {
             identity_dir: config.identity_dir,
             zakura_node_secret_key: config.zakura_node_secret_key,
             p2p_stack: Some(config.p2p_stack),
+            block_relay: config.block_relay,
             legacy_p2p: None,
             v2_p2p: None,
             zakura: config.zakura,
@@ -1105,6 +1132,7 @@ impl From<Config> for DConfig {
             identity_dir,
             zakura_node_secret_key,
             p2p_stack,
+            block_relay,
             zakura,
             peerset_initial_target_size,
             crawl_new_peer_interval,
@@ -1144,6 +1172,7 @@ impl From<Config> for DConfig {
             identity_dir,
             zakura_node_secret_key,
             p2p_stack: Some(p2p_stack),
+            block_relay,
             legacy_p2p: None,
             v2_p2p: None,
             zakura,
@@ -1171,6 +1200,7 @@ impl<'de> Deserialize<'de> for Config {
             identity_dir,
             zakura_node_secret_key,
             p2p_stack,
+            block_relay,
             legacy_p2p,
             v2_p2p,
             zakura,
@@ -1181,6 +1211,13 @@ impl<'de> Deserialize<'de> for Config {
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
+
+        if block_relay == BlockRelayPolicy::PowBound {
+            return Err(de::Error::custom(
+                "network.block_relay = \"pow_bound\" requires the body-binding verifier phase; \
+                 use \"semantic\" or \"committed\"",
+            ));
+        }
 
         let network = match (dnetwork, testnet_parameters) {
             (DNetwork::ConfiguredTestnet(params), _) => {
@@ -1294,6 +1331,7 @@ impl<'de> Deserialize<'de> for Config {
             identity_dir,
             zakura_node_secret_key,
             p2p_stack,
+            block_relay,
             zakura,
             peerset_initial_target_size,
             crawl_new_peer_interval,

@@ -26,7 +26,7 @@ use zakura_network::{
     AddressBook, InventoryResponse, PeerSocketAddr, Request, Response,
 };
 use zakura_node_services::mempool;
-use zakura_rpc::SubmitBlockChannel;
+use zakura_rpc::BlockRelayChannel;
 use zakura_state::{ChainTipChange, Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -1198,6 +1198,7 @@ async fn caches_getaddr_response() {
             mempool: buffered_mempool_service.clone(),
             state: state_service.clone(),
             latest_chain_tip,
+            sync_status: SyncStatus::new().0,
             misbehavior_sender,
         };
         let r = setup_tx.send(setup_data);
@@ -1420,7 +1421,7 @@ async fn setup_with_misbehavior_receiver(
     // Pretend we're close to tip
     SyncStatus::sync_close_to_tip(&mut recent_syncs);
 
-    let submitblock_channel = SubmitBlockChannel::new();
+    let submitblock_channel = BlockRelayChannel::new();
     let sync_gossip_task_handle = tokio::spawn(
         sync::gossip_best_tip_block_hashes(
             sync_status.clone(),
@@ -1486,6 +1487,7 @@ async fn setup_with_misbehavior_receiver(
         mempool: mempool_service.clone(),
         state: state_service.clone(),
         latest_chain_tip,
+        sync_status: sync_status.clone(),
         misbehavior_sender,
     };
     let r = setup_tx.send(setup_data);

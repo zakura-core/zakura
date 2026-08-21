@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::downloads::EarlyRelayedBlockCommitError;
 use super::{
     block_by_hash_or_pending, block_misbehavior, canonical_ip, PrunedBlockNotFoundLogger,
     ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL,
@@ -110,6 +111,14 @@ fn direct_consensus_invalid_gossip_keeps_advertiser_score() {
             zakura_network::constants::MAX_PEER_MISBEHAVIOR_SCORE,
         )),
     );
+}
+
+#[test]
+fn post_relay_contextual_failure_does_not_score_advertiser() {
+    let advertiser = "192.0.2.1:8233".parse().expect("valid peer address");
+    let error = EarlyRelayedBlockCommitError::new("contextual commit failed".into());
+
+    assert_eq!(block_misbehavior(Box::new(error), Some(advertiser)), None);
 }
 
 #[test]

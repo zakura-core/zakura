@@ -12,7 +12,7 @@ use tracing::Instrument;
 
 use zakura_chain::block;
 use zakura_network as zn;
-use zakura_rpc::MinedBlockEvent;
+use zakura_rpc::{BlockRelayEvent, BlockRelaySource};
 use zakura_state::ChainTipChange;
 
 use crate::{
@@ -33,12 +33,12 @@ const MINED_BLOCK_MARK_CHANNEL_CAPACITY: usize = 16;
 #[derive(Debug)]
 enum GossipEvent<T> {
     MinedBlockBroadcastCompleted(block::Hash),
-    MinedBlock(MinedBlockEvent),
+    BlockRelay(BlockRelayEvent),
     CommittedTip(T),
 }
 
 async fn next_gossip_event<T>(
-    mined_block_receiver: Option<&mut mpsc::Receiver<MinedBlockEvent>>,
+    mined_block_receiver: Option<&mut mpsc::Receiver<BlockRelayEvent>>,
     mined_block_mark_receiver: &mut mpsc::Receiver<block::Hash>,
     committed_tip_fut: impl Future<Output = T>,
 ) -> GossipEvent<T> {
@@ -51,7 +51,7 @@ async fn next_gossip_event<T>(
             },
 
             Some(tip_change) = mined_block_receiver.recv() => {
-                GossipEvent::MinedBlock(tip_change)
+                GossipEvent::BlockRelay(tip_change)
             },
 
             committed_tip = committed_tip_fut => {
@@ -103,7 +103,7 @@ pub async fn gossip_best_tip_block_hashes<ZN>(
     sync_status: SyncStatus,
     mut chain_state: ChainTipChange,
     broadcast_network: ZN,
-    mut mined_block_receiver: Option<mpsc::Receiver<MinedBlockEvent>>,
+    mut mined_block_receiver: Option<mpsc::Receiver<BlockRelayEvent>>,
 ) -> Result<(), BlockGossipError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
@@ -178,7 +178,7 @@ where
         // Prefer mined-block completions and submissions when multiple
         // branches are ready. The committed-tip path is a fallback, so
         // selecting it first can duplicate a mined-block broadcast.
-        let (((hash, height), log_msg, updated_chain_state), is_block_submission, early_ack) =
+        let (((hash, height), log_msg, updated_chain_state), relay_source, early_ack) =
             match next_gossip_event(
                 mined_block_receiver.as_mut(),
                 &mut mined_block_mark_receiver,
@@ -190,11 +190,10 @@ where
                     chain_state.mark_last_change_hash(mark_hash);
                     continue;
                 }
-                GossipEvent::MinedBlock(MinedBlockEvent::Early {
+                GossipEvent::BlockRelay(BlockRelayEvent::Early {
                     hash,
                     height,
-                    submitted_at,
-                    submission,
+                    source,
                     advertised,
                 }) => (
                     (
@@ -202,34 +201,37 @@ where
                         "sending early mined block broadcast",
                         chain_state,
                     ),
-                    true,
-                    Some((advertised, submitted_at, submission)),
+                    Some(source.clone()),
+                    Some((advertised, source)),
                 ),
-                GossipEvent::MinedBlock(MinedBlockEvent::Committed {
+                GossipEvent::BlockRelay(BlockRelayEvent::Committed {
                     hash,
                     height: _,
                     early_advertised: true,
+                    source: _,
                 }) => {
                     chain_state.mark_last_change_hash(hash);
                     continue;
                 }
-                GossipEvent::MinedBlock(MinedBlockEvent::Committed {
+                GossipEvent::BlockRelay(BlockRelayEvent::Committed {
                     hash,
                     height,
                     early_advertised: false,
+                    source,
                 }) => (
                     (
                         (hash, height),
                         "sending committed mined block broadcast",
                         chain_state,
                     ),
-                    true,
+                    Some(source),
                     None,
                 ),
-                GossipEvent::MinedBlock(MinedBlockEvent::Failed {
+                GossipEvent::BlockRelay(BlockRelayEvent::Failed {
                     hash,
                     height,
                     early_advertised,
+                    source: _,
                 }) => {
                     tracing::debug!(
                         ?hash,
@@ -240,7 +242,7 @@ where
                     continue;
                 }
                 GossipEvent::CommittedTip(tip_change_close_to_network_tip) => {
-                    (tip_change_close_to_network_tip?, false, None)
+                    (tip_change_close_to_network_tip?, None, None)
                 }
             };
 
@@ -250,10 +252,12 @@ where
 
         // block broadcasts inform other nodes about new blocks,
         // so our internal Grow or Reset state doesn't matter to them
-        let request = if is_block_submission {
-            zn::Request::AdvertiseBlockToAll(hash)
-        } else {
-            zn::Request::AdvertiseBlock(hash, None)
+        let request = match relay_source.as_ref() {
+            Some(BlockRelaySource::Mined { .. }) => zn::Request::AdvertiseBlockToAll(hash),
+            Some(BlockRelaySource::Peer { advertiser, .. }) => {
+                zn::Request::AdvertiseBlock(hash, advertiser.clone())
+            }
+            None => zn::Request::AdvertiseBlock(hash, None),
         };
 
         info!(?height, ?request, log_msg);
@@ -266,7 +270,7 @@ where
         // Await the broadcast future in a spawned task to avoid waiting on
         // `AdvertiseBlockToAll` requests when there are unready peers.
         // Broadcast requests don't return errors, and we'd just want to ignore them anyway.
-        if is_block_submission {
+        if relay_source.is_some() {
             let mark_tx = mined_block_mark_sender.clone();
             let submission_hash = hash;
             tokio::spawn(async move {
@@ -274,15 +278,30 @@ where
                 if succeeded {
                     let _ = mark_tx.send(submission_hash).await;
                 }
-                if let Some((advertised, submitted_at, submission)) = early_ack {
+                if let Some((advertised, source)) = early_ack {
                     if succeeded {
-                        metrics::counter!("mining.optimistic_inventory.early_inventories")
-                            .increment(1);
-                        metrics::histogram!(
-                            "mining.submit_to_inventory.duration_seconds",
-                            "method" => submission.rpc_method()
-                        )
-                        .record(submitted_at.elapsed().as_secs_f64());
+                        match source {
+                            BlockRelaySource::Mined {
+                                submitted_at,
+                                submission,
+                            } => {
+                                metrics::counter!("mining.optimistic_inventory.early_inventories")
+                                    .increment(1);
+                                metrics::histogram!(
+                                    "mining.submit_to_inventory.duration_seconds",
+                                    "method" => submission.rpc_method()
+                                )
+                                .record(submitted_at.elapsed().as_secs_f64());
+                            }
+                            BlockRelaySource::Peer { authorized_at, .. } => {
+                                metrics::counter!("gossip.semantic_relay.early_inventories")
+                                    .increment(1);
+                                metrics::histogram!(
+                                    "gossip.semantic_relay.to_inventory.duration_seconds"
+                                )
+                                .record(authorized_at.elapsed().as_secs_f64());
+                            }
+                        }
                     }
                     let _ = advertised.send(succeeded);
                 }
@@ -301,7 +320,7 @@ mod tests {
 
     use tokio::sync::mpsc;
     use zakura_chain::block;
-    use zakura_rpc::MinedBlockEvent;
+    use zakura_rpc::{BlockRelayEvent, BlockRelaySource, MinedBlockSubmission};
 
     // Repeat the vector so removing `biased;` reliably exposes randomized
     // selection among the ready events.
@@ -316,10 +335,14 @@ mod tests {
             let (mark_sender, mut mark_receiver) = mpsc::channel(1);
 
             mined_block_sender
-                .send(MinedBlockEvent::Committed {
+                .send(BlockRelayEvent::Committed {
                     hash: submitted_hash,
                     height: block::Height(1),
                     early_advertised: false,
+                    source: BlockRelaySource::Mined {
+                        submitted_at: std::time::Instant::now(),
+                        submission: MinedBlockSubmission::FullBlock,
+                    },
                 })
                 .await
                 .unwrap();
@@ -346,10 +369,11 @@ mod tests {
 
             assert!(matches!(
                 event,
-                GossipEvent::MinedBlock(MinedBlockEvent::Committed {
+                GossipEvent::BlockRelay(BlockRelayEvent::Committed {
                     hash,
                     height: block::Height(1),
                     early_advertised: false,
+                    ..
                 }) if hash == submitted_hash
             ));
 

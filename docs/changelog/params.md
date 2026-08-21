@@ -28,6 +28,8 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `mining.submit_acknowledgement` | `crates/zakura-rpc/src/config/mining.rs` | new → `committed` | [#773](https://github.com/zakura-core/zakura/pull/773) | Preserve strict RPC responses by default while letting experiments return after the active state writer owns the block. |
+| `network.block_relay` | `crates/zakura-network/src/config.rs` | new → `semantic` | [#773](https://github.com/zakura-core/zakura/pull/773) | Relay tip children after semantic verification by default while retaining explicit commit-before-relay configuration. |
 | `MAX_WORK_IDS` | `crates/zakura-consensus/src/block/prepared.rs` | new → `4096` aliases | [#754](https://github.com/zakura-core/zakura/pull/754) | Retain every alias that one 219 ms single-flight preparation lane can create during the 10-minute candidate lifetime, while bounding memory and explicit proposal aliases. |
 | `MAX_INBOUND_RESPONSE_TIME` | `crates/zakurad/src/components/inbound.rs` | `18 s` → `5 s` | [#754](https://github.com/zakura-core/zakura/pull/754) | Restore the peer timeout after admitted block bodies stopped waiting for contextual commit. |
 | `MAX_PENDING_WAITERS` / `PENDING_BLOCK_WAIT` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | `32` waiters / `15 s` → removed | [#754](https://github.com/zakura-core/zakura/pull/754) | Serve admitted block bodies immediately, so peer requests no longer need pending-commit waiter slots or a wait timeout. |

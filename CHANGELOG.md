@@ -15,6 +15,20 @@ independently.
 
 ### Fixed
 
+- Fixed a sync halt on nodes running the Zakura header chain. Checkpoint finality
+  evidence is bound to the state version the state writer read, but the combined
+  auxiliary-then-checkpoint path installed the auxiliary transition before it
+  planned finality. The auxiliary transition advanced the version and caused the
+  planner to persist mismatched checkpoint provenance. The combined path now
+  validates and records provenance against the pre-auxiliary snapshot. The
+  combined path returns `Stale` before staging the auxiliary transition when the
+  checkpoint request names an old state version
+  ([#746](https://github.com/zakura-core/zakura/pull/746)).
+- Fixed checkpoint recovery after a hard state commit error. Sibling checkpoint
+  commits could queue late reset requests that rewound the recovered verifier and
+  reopened a permanent block gap. The verifier now coalesces resets by commit
+  generation and ignores late resets from an earlier generation
+  ([#746](https://github.com/zakura-core/zakura/pull/746)).
 - Fixed header-chain startup when a release migrates an older disk format and
   extends the checkpoint list in the same binary, so nodes can upgrade without
   a resync

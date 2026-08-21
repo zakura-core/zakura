@@ -440,11 +440,18 @@ fn prepared_candidate_size(prepared: &SemanticallyVerifiedBlock) -> usize {
         size_of::<zakura_chain::transparent::OutPoint>()
             .saturating_add(size_of::<zakura_chain::transparent::OrderedUtxo>()),
     );
+    // The output map owns cloned scripts in addition to the scripts stored in the block.
+    let new_output_scripts = prepared
+        .new_outputs
+        .values()
+        .map(|output| output.utxo.output.lock_script.as_raw_bytes().len())
+        .fold(0usize, usize::saturating_add);
 
     size_of::<Entry>()
         .saturating_add(block_size)
         .saturating_add(transaction_hashes)
         .saturating_add(new_outputs)
+        .saturating_add(new_output_scripts)
 }
 
 fn work_id_alias_size(work_id: &str) -> usize {
@@ -662,5 +669,27 @@ mod tests {
         assert!(inner.entries.is_empty());
         assert!(inner.work_ids.is_empty());
         assert_eq!(inner.bytes, 0);
+    }
+
+    #[test]
+    fn candidate_size_counts_cloned_output_scripts() {
+        let block = Arc::new(test_block());
+        let mut prepared = SemanticallyVerifiedBlock::from(block);
+        let original_size = prepared_candidate_size(&prepared);
+        let output = prepared
+            .new_outputs
+            .values_mut()
+            .next()
+            .expect("the genesis block creates a transparent output");
+        let original_script_len = output.utxo.output.lock_script.as_raw_bytes().len();
+        let replacement_script = [0; 4_096];
+        let replacement_script_len = replacement_script.len();
+        output.utxo.output.lock_script =
+            zakura_chain::transparent::Script::new(&replacement_script);
+
+        assert_eq!(
+            prepared_candidate_size(&prepared).saturating_sub(original_size),
+            replacement_script_len.saturating_sub(original_script_len),
+        );
     }
 }

@@ -59,6 +59,18 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+async fn update_initial_candidates<S>(
+    mut candidates: CandidateSet<S>,
+    active_initial_peer_count: usize,
+) -> CandidateSet<S>
+where
+    S: Service<Request, Response = Response, Error = BoxError> + Send + 'static,
+    S::Future: Send + 'static,
+{
+    let _ = candidates.update_initial(active_initial_peer_count).await;
+    candidates
+}
+
 mod recent_by_ip;
 
 /// A successful outbound peer connection attempt or inbound connection handshake.
@@ -428,7 +440,7 @@ where
             AbortOnDropHandle::new(tokio::spawn(initial_peers_fut.in_current_span()));
 
         // 3. Outgoing peers we connect to in response to load.
-        let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
+        let candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
 
         // Wait for the initial seed peer count
         let mut active_outbound_connections = initial_peers_join
@@ -449,7 +461,13 @@ where
             ?active_initial_peer_count,
             "sending initial request for peers"
         );
-        let _ = candidates.update_initial(active_initial_peer_count).await;
+        let initial_candidates_join = AbortOnDropHandle::new(tokio::spawn(
+            update_initial_candidates(candidates, active_initial_peer_count).in_current_span(),
+        ));
+        let candidates = initial_candidates_join
+            .await
+            .panic_if_task_has_panicked()
+            .expect("initial peer candidate update is not cancelled");
 
         // Compute remaining connections to open.
         let demand_count = config

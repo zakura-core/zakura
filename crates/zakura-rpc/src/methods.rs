@@ -1184,7 +1184,7 @@ where
                         if mined_block_sender.try_send(event).is_ok() {
                             early_result = Some(receiver);
                         } else {
-                            pending_blocks.remove(block_hash, false);
+                            pending_blocks.remove(&block, false);
                         }
                     }
                     verification.await
@@ -1193,7 +1193,7 @@ where
             };
 
             let committed = verification_result.is_ok();
-            pending_blocks.remove(block_hash, committed);
+            pending_blocks.remove(&block, committed);
 
             tokio::spawn(async move {
                 let early_advertised = match early_result {

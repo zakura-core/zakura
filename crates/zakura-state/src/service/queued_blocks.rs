@@ -156,7 +156,7 @@ impl QueuedBlocks {
             if let Some(lifecycle) = lifecycle {
                 lifecycle.fail(
                     crate::BlockLifecycleMilestone::StateQueued,
-                    crate::BlockLifecycleFailureClass::Duplicate,
+                    crate::BlockLifecycleFailureClass::SupersededByFinality,
                     "state pruned the queued block below the finalized tip",
                 );
             }

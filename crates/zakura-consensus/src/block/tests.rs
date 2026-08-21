@@ -1174,6 +1174,14 @@ fn verify_block_error_misbehavior_scores() {
         location: zakura_state::KnownBlock::BestChain,
     };
     assert_eq!(VerifyBlockError::Commit(dup_err).misbehavior_score(), 0);
+    assert_eq!(
+        VerifyBlockError::StateService {
+            source: "storage unavailable".into(),
+            hash: zakura_chain::block::Hash([0; 32]),
+        }
+        .misbehavior_score(),
+        0,
+    );
 }
 
 /// Duplicate block errors must stay classified as duplicate requests after the

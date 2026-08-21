@@ -24,7 +24,7 @@ use crate::{
     },
     peer_set::{inventory_registry::InventoryStatus, stall_tracker::FIND_RESPONSE_STALL_THRESHOLD},
     protocol::external::{types::Version, InventoryHash},
-    BannedIps, BoxError, PeerSocketAddr, Request, Response, SharedPeerError,
+    BannedIps, BoxError, PeerSocketAddr, PeerSource, Request, Response, SharedPeerError,
 };
 
 use super::{PeerSetBuilder, PeerVersions};
@@ -1514,6 +1514,40 @@ fn sidecar_and_ordinary_discovery() -> (
         sidecar_handle,
         ordinary_handle,
     )
+}
+
+#[test]
+fn relayed_block_gossip_excludes_the_legacy_supplier() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered, _sidecar_addr, ordinary_addr, mut sidecar_handle, mut ordinary_handle) =
+        sidecar_and_ordinary_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum_peer_version)
+            .max_conns_per_ip(max(2, DEFAULT_MAX_CONNS_PER_IP))
+            .with_block_gossip_peer_ips(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+            .build();
+
+        peer_set.ready().await.expect("peer set is ready");
+        let hash = block::Hash([0x31; 32]);
+        let _fut = peer_set.route_block_broadcast(Request::AdvertiseBlock(
+            hash,
+            Some(PeerSource::LegacySocket(ordinary_addr)),
+        ));
+
+        assert_eq!(recv_advertise_block(&mut sidecar_handle), Some(hash));
+        assert_eq!(
+            recv_advertise_block(&mut ordinary_handle),
+            None,
+            "relay must exclude the supplying legacy peer"
+        );
+    });
 }
 
 /// A block gossip that fires while a configured sidecar peer is unready must be

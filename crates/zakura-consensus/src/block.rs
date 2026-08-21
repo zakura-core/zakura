@@ -525,7 +525,7 @@ where
             }
 
             if let Some(lifecycle) = request.lifecycle() {
-                check_block_commitment(&mut state_service, prepared_block.clone()).await?;
+                check_block_commitment(&mut state_service, &prepared_block).await?;
                 lifecycle.reach(zs::BlockLifecycleMilestone::PowAndBodyBound);
                 lifecycle.reach(zs::BlockLifecycleMilestone::SemanticallyValid);
                 lifecycle.reach(zs::BlockLifecycleMilestone::RelayAuthorized);
@@ -678,7 +678,7 @@ where
 
 async fn check_block_commitment<S>(
     state_service: &mut S,
-    block: zs::SemanticallyVerifiedBlock,
+    block: &zs::SemanticallyVerifiedBlock,
 ) -> Result<(), VerifyBlockError>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
@@ -689,7 +689,7 @@ where
         .ready()
         .await
         .map_err(|source| VerifyBlockError::StateService { source, hash })?
-        .call(zs::Request::CheckBlockCommitment(block))
+        .call(zs::Request::CheckBlockCommitment(block.into()))
         .await
         .map_err(|source| map_commit_error(source, hash))?
     {

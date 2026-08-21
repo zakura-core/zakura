@@ -22,6 +22,6 @@ pub use methods::types::{
     get_block_template::{fetch_chain_info, proposal::proposal_block_from_template, MinerParams},
     submit_block::{
         BlockRelayChannel, BlockRelayEvent, BlockRelaySource, MinedBlockSubmission,
-        PendingBlockRegistry,
+        PendingBlockAdmission, PendingBlockClaim, PendingBlockRegistry,
     },
 };

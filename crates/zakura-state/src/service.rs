@@ -62,10 +62,10 @@ use crate::{
         read::find,
         watch_receiver::WatchReceiver,
     },
-    BlockLifecycleFailureClass, BlockLifecycleMilestone, BlockLifecycleReporter, BoxError,
-    CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, KnownBlock, ReadRequest,
-    ReadResponse, Request, Response, SemanticallyVerifiedBlock, StateInitError,
-    ValidateContextError,
+    BlockCommitmentData, BlockLifecycleFailureClass, BlockLifecycleMilestone,
+    BlockLifecycleReporter, BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError,
+    Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
+    StateInitError, ValidateContextError,
 };
 
 pub mod block_iter;
@@ -2848,29 +2848,11 @@ impl Service<ReadRequest> for ReadStateService {
 
             ReadRequest::CheckBlockCommitment(semantically_verified) => {
                 let latest_non_finalized_state = state.latest_non_finalized_state();
-                let parent_hash = semantically_verified.block.header.previous_block_hash;
-                let parent_chain = latest_non_finalized_state
-                    .find_chain(|chain| chain.contains_block_hash(parent_hash));
-                let history_tree =
-                    read::tree::history_tree(parent_chain, &state.db, parent_hash.into());
-                let history_tree = match history_tree {
-                    Some(history_tree) => history_tree,
-                    None if matches!(
-                        semantically_verified.block.commitment(&state.network)?,
-                        block::Commitment::PreSaplingReserved(_)
-                            | block::Commitment::FinalSaplingRoot(_)
-                            | block::Commitment::ChainHistoryActivationReserved
-                    ) =>
-                    {
-                        Arc::new(zakura_chain::history_tree::HistoryTree::default())
-                    }
-                    None => return Err(ValidateContextError::NotReadyToBeCommitted.into()),
-                };
-                check::block_commitment_is_valid_for_chain_history(
-                    semantically_verified.block,
+                check_block_commitment_for_state(
                     &state.network,
-                    &history_tree,
-                    semantically_verified.auth_data_root,
+                    &latest_non_finalized_state,
+                    &state.db,
+                    semantically_verified,
                 )?;
 
                 Ok(ReadResponse::ValidBlockCommitment)
@@ -2909,6 +2891,39 @@ impl Service<ReadRequest> for ReadStateService {
 
         timed_span.spawn_blocking(request_handler)
     }
+}
+
+fn check_block_commitment_for_state(
+    network: &Network,
+    non_finalized_state: &NonFinalizedState,
+    db: &ZakuraDb,
+    commitment: BlockCommitmentData,
+) -> Result<(), BoxError> {
+    let parent_hash = commitment.block.header.previous_block_hash;
+    let parent_chain =
+        non_finalized_state.find_chain(|chain| chain.contains_block_hash(parent_hash));
+    let history_tree = read::tree::history_tree(parent_chain, db, parent_hash.into());
+    let history_tree = match history_tree {
+        Some(history_tree) => history_tree,
+        None if matches!(
+            commitment.block.commitment(network)?,
+            block::Commitment::PreSaplingReserved(_)
+                | block::Commitment::FinalSaplingRoot(_)
+                | block::Commitment::ChainHistoryActivationReserved
+        ) =>
+        {
+            Arc::new(zakura_chain::history_tree::HistoryTree::default())
+        }
+        None => return Err(ValidateContextError::NotReadyToBeCommitted.into()),
+    };
+    check::block_commitment_is_valid_for_chain_history(
+        commitment.block,
+        network,
+        &history_tree,
+        commitment.auth_data_root,
+    )?;
+
+    Ok(())
 }
 
 /// Initialize a state service from the provided [`Config`].

@@ -1176,30 +1176,33 @@ where
             });
 
             let mut early_result = None;
+            let mut pending_claim = None;
             let verification_result = tokio::select! {
                 biased;
 
                 authorized = lifecycle_handle.wait_for(
                     zakura_state::BlockLifecycleMilestone::RelayAuthorized,
                 ) => {
-                    if authorized.is_ok()
-                        && optimistic_block_inventory
-                        && pending_blocks.insert(block.clone())
-                    {
-                        let (advertised, receiver) = tokio::sync::oneshot::channel();
-                        let event = BlockRelayEvent::Early {
-                            hash: block_hash,
-                            height,
-                            source: BlockRelaySource::Mined {
-                                submitted_at,
-                                submission,
-                            },
-                            advertised,
-                        };
-                        if mined_block_sender.try_send(event).is_ok() {
-                            early_result = Some(receiver);
-                        } else {
-                            pending_blocks.cancel_relay_reservation(&block);
+                    if authorized.is_ok() && optimistic_block_inventory {
+                        if let Some(admission) = pending_blocks.admit(block.clone()) {
+                            if admission.relay_reserved {
+                                let (advertised, receiver) = tokio::sync::oneshot::channel();
+                                let event = BlockRelayEvent::Early {
+                                    hash: block_hash,
+                                    height,
+                                    source: BlockRelaySource::Mined {
+                                        submitted_at,
+                                        submission,
+                                    },
+                                    advertised,
+                                };
+                                if mined_block_sender.try_send(event).is_ok() {
+                                    early_result = Some(receiver);
+                                } else {
+                                    admission.claim.cancel_relay_reservation();
+                                }
+                            }
+                            pending_claim = Some(admission.claim);
                         }
                     }
                     verification.await
@@ -1208,7 +1211,9 @@ where
             };
 
             let committed = verification_result.is_ok();
-            pending_blocks.remove(&block, committed);
+            if let Some(claim) = pending_claim {
+                claim.settle(committed);
+            }
 
             tokio::spawn(async move {
                 let early_advertised = match early_result {

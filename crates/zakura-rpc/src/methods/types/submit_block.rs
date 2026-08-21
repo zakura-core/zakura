@@ -1,7 +1,7 @@
 //! Parameter, response, and lifecycle types for mined-block RPCs.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -142,6 +142,7 @@ struct PendingBlockRegistryInner {
     entries: HashMap<block::Hash, PendingBlock>,
     relayed: HashMap<block::Hash, Instant>,
     total_bytes: usize,
+    next_claim_token: u64,
 }
 
 #[derive(Debug)]
@@ -149,7 +150,56 @@ struct PendingBlock {
     block: Arc<block::Block>,
     inserted_at: Instant,
     serialized_size: usize,
-    active_claims: HashMap<usize, usize>,
+    active_claims: HashSet<u64>,
+    relay_owner: Option<u64>,
+}
+
+/// One admitted pending-block claim and its relay reservation result.
+#[derive(Debug)]
+pub struct PendingBlockAdmission {
+    /// The claim that keeps the pending body available until verification settles.
+    pub claim: PendingBlockClaim,
+    /// Whether this claim reserved the one permitted early relay.
+    pub relay_reserved: bool,
+}
+
+/// A unique claim on a pending block body.
+///
+/// Dropping this guard releases an unsettled claim. Call [`Self::settle`] after
+/// verification finishes to distinguish a successful commit from a failed claim.
+#[derive(Debug)]
+pub struct PendingBlockClaim {
+    registry: PendingBlockRegistry,
+    hash: block::Hash,
+    token: u64,
+    settled: bool,
+}
+
+impl PendingBlockClaim {
+    /// Release this claim's relay reservation without releasing the body claim.
+    pub fn cancel_relay_reservation(&self) {
+        self.registry
+            .cancel_relay_reservation(self.hash, self.token);
+    }
+
+    /// Settle this claim after verification finishes.
+    ///
+    /// A successful commit clears the whole pending entry. A failed verification
+    /// releases only this claim.
+    pub fn settle(mut self, committed: bool) {
+        self.registry.settle_claim(self.hash, self.token, committed);
+        self.settled = true;
+    }
+}
+
+impl Drop for PendingBlockClaim {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.registry
+                .cancel_relay_reservation(self.hash, self.token);
+            self.registry.settle_claim(self.hash, self.token, false);
+        }
+    }
 }
 
 impl PendingBlockRegistryInner {
@@ -175,39 +225,53 @@ impl PendingBlockRegistryInner {
 }
 
 impl PendingBlockRegistry {
-    /// Inserts a block before its early inventory is sent.
+    /// Claims a block before its early inventory is sent.
     ///
-    /// Returns true when this caller reserved the hash and should originate its advertisement.
-    /// An active duplicate acquires an independent claim and returns true only when the previous
-    /// relay reservation expired or was canceled. A recent settled hash or a full bound returns
-    /// false without a claim.
-    pub fn insert(&self, block: Arc<block::Block>) -> bool {
+    /// The admission reports whether this caller reserved the hash and should
+    /// originate its advertisement. An active duplicate acquires an independent
+    /// claim. A recent settled hash or a full bound returns no admission.
+    pub fn admit(&self, block: Arc<block::Block>) -> Option<PendingBlockAdmission> {
         let hash = block.hash();
-        let claimant = Arc::as_ptr(&block) as usize;
         let mut entries = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         entries.prune_expired(now);
-        if let Some(pending) = entries.entries.get_mut(&hash) {
-            if let Some(claims) = pending.active_claims.get_mut(&claimant) {
-                *claims = claims.saturating_add(1);
-            } else if pending.active_claims.len() < MAX_PENDING_CLAIMANTS_PER_BLOCK {
-                pending.active_claims.insert(claimant, 1);
-            } else {
+        let token = entries.next_claim_token;
+        entries.next_claim_token = entries.next_claim_token.checked_add(1)?;
+        let PendingBlockRegistryInner {
+            entries: pending_entries,
+            relayed,
+            ..
+        } = &mut *entries;
+        if let Some(pending) = pending_entries.get_mut(&hash) {
+            if pending.active_claims.len() >= MAX_PENDING_CLAIMANTS_PER_BLOCK {
                 metrics::counter!("block_relay.pending_registry.claimants_saturated").increment(1);
-                return false;
+                return None;
             }
-            pending.inserted_at = now;
-            if entries.relayed.insert(hash, now).is_none() {
-                return true;
-            }
-            return false;
+            pending.active_claims.insert(token);
+            let relay_reserved = match relayed.entry(hash) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(pending.inserted_at);
+                    pending.relay_owner = Some(token);
+                    true
+                }
+                std::collections::hash_map::Entry::Occupied(_) => false,
+            };
+            return Some(PendingBlockAdmission {
+                claim: PendingBlockClaim {
+                    registry: self.clone(),
+                    hash,
+                    token,
+                    settled: false,
+                },
+                relay_reserved,
+            });
         }
         if entries.relayed.contains_key(&hash) {
             metrics::counter!("block_relay.relay_once.suppressed").increment(1);
-            return false;
+            return None;
         }
         let serialized_size = block.zcash_serialized_size();
         if entries.entries.len() >= MAX_PENDING_BLOCKS
@@ -215,7 +279,7 @@ impl PendingBlockRegistry {
             || entries.relayed.len() >= MAX_RELAY_ONCE_RECORDS
         {
             metrics::counter!("block_relay.pending_registry.saturated").increment(1);
-            return false;
+            return None;
         }
 
         entries.total_bytes += serialized_size;
@@ -226,16 +290,22 @@ impl PendingBlockRegistry {
                 block,
                 inserted_at: now,
                 serialized_size,
-                active_claims: HashMap::from([(claimant, 1)]),
+                active_claims: HashSet::from([token]),
+                relay_owner: Some(token),
             },
         );
-        true
+        Some(PendingBlockAdmission {
+            claim: PendingBlockClaim {
+                registry: self.clone(),
+                hash,
+                token,
+                settled: false,
+            },
+            relay_reserved: true,
+        })
     }
 
-    /// Releases a relay reservation when the gossip queue rejects its event.
-    pub fn cancel_relay_reservation(&self, block: &Arc<block::Block>) {
-        let hash = block.hash();
-        let claimant = Arc::as_ptr(block) as usize;
+    fn cancel_relay_reservation(&self, hash: block::Hash, token: u64) {
         let mut entries = self
             .0
             .lock()
@@ -243,18 +313,16 @@ impl PendingBlockRegistry {
         if entries
             .entries
             .get(&hash)
-            .is_some_and(|pending| pending.active_claims.contains_key(&claimant))
+            .is_some_and(|pending| pending.relay_owner == Some(token))
         {
             entries.relayed.remove(&hash);
+            if let Some(pending) = entries.entries.get_mut(&hash) {
+                pending.relay_owner = None;
+            }
         }
     }
 
-    /// Removes a block after its contextual commit settles.
-    ///
-    /// The registry keeps the body while another relay-authorized submission still owns a claim.
-    pub fn remove(&self, block: &Arc<block::Block>, committed: bool) {
-        let hash = block.hash();
-        let claimant = Arc::as_ptr(block) as usize;
+    fn settle_claim(&self, hash: block::Hash, token: u64, committed: bool) {
         let mut entries = self
             .0
             .lock()
@@ -263,13 +331,8 @@ impl PendingBlockRegistry {
             if committed {
                 return true;
             }
-
-            let Some(claims) = pending.active_claims.get_mut(&claimant) else {
+            if !pending.active_claims.remove(&token) {
                 return false;
-            };
-            *claims -= 1;
-            if *claims == 0 {
-                pending.active_claims.remove(&claimant);
             }
             pending.active_claims.is_empty()
         });
@@ -450,7 +513,7 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
+        let _admission = registry.admit(block.clone()).expect("block is admitted");
 
         assert_eq!(registry.get(hash), Some(block));
     }
@@ -460,9 +523,8 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
-
-        registry.remove(&block, true);
+        let admission = registry.admit(block.clone()).expect("block is admitted");
+        admission.claim.settle(true);
 
         assert_eq!(registry.get(hash), None);
     }
@@ -472,11 +534,26 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
-
-        registry.remove(&block, false);
+        let admission = registry.admit(block.clone()).expect("block is admitted");
+        admission.claim.settle(false);
 
         assert_eq!(registry.get(hash), None);
+    }
+
+    #[test]
+    fn dropped_claim_releases_the_pending_body() {
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let hash = block.hash();
+        let admission = registry.admit(block.clone()).expect("block is admitted");
+
+        drop(admission);
+
+        assert_eq!(registry.get(hash), None);
+        let replacement = registry
+            .admit(block)
+            .expect("abandoned claim releases its relay reservation");
+        assert!(replacement.relay_reserved);
     }
 
     #[test]
@@ -485,10 +562,13 @@ mod tests {
         let block = test_block();
         let duplicate = Arc::new((*block).clone());
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
-        assert!(!registry.insert(duplicate.clone()));
-
-        registry.remove(&duplicate, false);
+        let original = registry.admit(block.clone()).expect("block is admitted");
+        let duplicate = registry
+            .admit(duplicate)
+            .expect("duplicate claim is admitted");
+        assert!(original.relay_reserved);
+        assert!(!duplicate.relay_reserved);
+        duplicate.claim.settle(false);
 
         assert_eq!(registry.get(hash), Some(block));
     }
@@ -499,13 +579,14 @@ mod tests {
         let block = test_block();
         let duplicate = Arc::new((*block).clone());
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
-        assert!(!registry.insert(duplicate.clone()));
-
-        registry.remove(&block, false);
+        let original = registry.admit(block.clone()).expect("block is admitted");
+        let duplicate = registry
+            .admit(duplicate)
+            .expect("duplicate claim is admitted");
+        original.claim.settle(false);
 
         assert_eq!(registry.get(hash), Some(block));
-        registry.remove(&duplicate, false);
+        duplicate.claim.settle(false);
         assert_eq!(registry.get(hash), None);
     }
 
@@ -514,13 +595,14 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
-        assert!(!registry.insert(block.clone()));
-
-        registry.remove(&block, false);
+        let first = registry.admit(block.clone()).expect("block is admitted");
+        let second = registry
+            .admit(block.clone())
+            .expect("repeated Arc claim is admitted");
+        first.claim.settle(false);
         assert_eq!(registry.get(hash), Some(block.clone()));
 
-        registry.remove(&block, false);
+        second.claim.settle(false);
         assert_eq!(registry.get(hash), None);
     }
 
@@ -530,10 +612,10 @@ mod tests {
         let block = test_block();
         let duplicate = Arc::new((*block).clone());
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
-        registry.remove(&block, false);
+        let admission = registry.admit(block).expect("block is admitted");
+        admission.claim.settle(false);
 
-        assert!(!registry.insert(duplicate));
+        assert!(registry.admit(duplicate).is_none());
         assert_eq!(registry.get(hash), None);
     }
 
@@ -542,10 +624,45 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let duplicate = Arc::new((*block).clone());
-        assert!(registry.insert(block.clone()));
-        registry.cancel_relay_reservation(&block);
+        let admission = registry.admit(block).expect("block is admitted");
+        admission.claim.cancel_relay_reservation();
 
-        assert!(registry.insert(duplicate));
+        let replacement = registry
+            .admit(duplicate)
+            .expect("duplicate claim is admitted");
+        assert!(replacement.relay_reserved);
+    }
+
+    #[test]
+    fn duplicate_claim_does_not_refresh_absolute_expiry() {
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let hash = block.hash();
+        let first = registry.admit(block.clone()).expect("block is admitted");
+        let original_time = Instant::now() - Duration::from_secs(60);
+        {
+            let mut entries = registry
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries
+                .entries
+                .get_mut(&hash)
+                .expect("entry exists")
+                .inserted_at = original_time;
+            entries.relayed.insert(hash, original_time);
+        }
+
+        let second = registry.admit(block).expect("duplicate claim is admitted");
+
+        let entries = registry
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(entries.entries[&hash].inserted_at, original_time);
+        assert_eq!(entries.relayed[&hash], original_time);
+        drop(entries);
+        drop((first, second));
     }
 
     #[test]
@@ -553,13 +670,23 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let original = test_block();
         let hash = original.hash();
-        assert!(registry.insert(original.clone()));
+        let first = registry
+            .admit(original.clone())
+            .expect("original is admitted");
         let duplicates: Vec<_> = (0..MAX_PENDING_CLAIMANTS_PER_BLOCK)
             .map(|_| Arc::new((*original).clone()))
             .collect();
-        for duplicate in &duplicates {
-            assert!(!registry.insert(duplicate.clone()));
+        let mut admissions = vec![first];
+        for duplicate in duplicates.iter().take(MAX_PENDING_CLAIMANTS_PER_BLOCK - 1) {
+            admissions.push(
+                registry
+                    .admit(duplicate.clone())
+                    .expect("claim below the bound is admitted"),
+            );
         }
+        assert!(registry
+            .admit(duplicates.last().expect("one overflow claim").clone())
+            .is_none());
 
         let entries = registry
             .0
@@ -574,6 +701,8 @@ mod tests {
                 .len(),
             MAX_PENDING_CLAIMANTS_PER_BLOCK
         );
+        drop(entries);
+        drop(admissions);
     }
 
     #[test]
@@ -602,16 +731,21 @@ mod tests {
     fn pending_registry_is_bounded() {
         let registry = PendingBlockRegistry::default();
         let original = test_block();
+        let mut admissions = Vec::new();
         for nonce in 0..MAX_PENDING_BLOCKS {
             let mut block = (*original).clone();
             let nonce = u8::try_from(nonce).expect("the registry bound fits in u8");
             Arc::make_mut(&mut block.header).nonce = [nonce; 32].into();
-            assert!(registry.insert(Arc::new(block)));
+            admissions.push(
+                registry
+                    .admit(Arc::new(block))
+                    .expect("block below the bound is admitted"),
+            );
         }
 
         let mut overflow = (*original).clone();
         Arc::make_mut(&mut overflow.header).nonce = [u8::MAX; 32].into();
-        assert!(!registry.insert(Arc::new(overflow)));
+        assert!(registry.admit(Arc::new(overflow)).is_none());
     }
 
     #[test]
@@ -619,7 +753,7 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block));
+        let _admission = registry.admit(block).expect("block is admitted");
 
         {
             let mut entries = registry

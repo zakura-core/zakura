@@ -1020,6 +1020,39 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn zakura_block_advertisement_does_not_start_the_legacy_downloader(
+) -> Result<(), crate::BoxError> {
+    let (
+        inbound_service,
+        _mempool,
+        _committed_blocks,
+        _added_transactions,
+        mut tx_verifier,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        _sync_gossip_task_handle,
+        _tx_gossip_task_handle,
+    ) = setup(false).await;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    let peer_id =
+        zakura_network::zakura::ZakuraPeerId::new(vec![0x22; 32]).expect("test peer id is valid");
+
+    let response = inbound_service
+        .oneshot(Request::AdvertiseBlock(
+            block.hash(),
+            Some(zakura_network::PeerSource::Zakura(peer_id)),
+        ))
+        .await?;
+
+    assert_eq!(response, Response::Nil);
+    tokio::task::yield_now().await;
+    peer_set.expect_no_requests().await;
+    tx_verifier.expect_no_requests().await;
+    Ok(())
+}
+
 /// Test that the inbound downloader rejects blocks above the lookahead limit.
 ///
 /// TODO: also test that it rejects blocks behind the tip limit. (Needs ~100 fake blocks.)

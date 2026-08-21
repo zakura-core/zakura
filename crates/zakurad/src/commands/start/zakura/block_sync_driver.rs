@@ -15,13 +15,16 @@ use tokio::{pin, select, sync::mpsc};
 use tower::{util::BoxCloneService, Service, ServiceExt};
 use tracing::{debug, error, warn};
 
-use zakura_chain::{block, chain_tip::ChainTip};
+use zakura_chain::{block, chain_sync_status::ChainSyncStatus, chain_tip::ChainTip};
 use zakura_network::zakura::{
     BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSizeEstimate, BlockSyncAction,
     BlockSyncBlockMeta, BlockSyncEvent, BlockSyncHandle, ZakuraEndpoint, ZakuraTrace,
 };
 
-use crate::components::sync;
+use crate::components::{
+    block_relay::{verify_peer_block, PeerRelayContext},
+    sync::{self, SyncStatus},
+};
 
 use super::{
     block_verify_error_class, block_verify_error_diagnostic,
@@ -47,6 +50,28 @@ struct PendingBlockApply {
     class: BlockApplyClass,
     block: Arc<block::Block>,
     operation: Option<super::BlockApplyOperation>,
+    relay: Option<BlockSyncRelayContext>,
+}
+
+/// Relay configuration shared by native block-sync applies.
+#[derive(Clone, Debug)]
+pub(crate) struct BlockSyncRelayContext {
+    pub(crate) policy: zakura_network::config::BlockRelayPolicy,
+    pub(crate) sync_status: SyncStatus,
+    pub(crate) peer_relay: PeerRelayContext,
+}
+
+fn native_semantic_relay_allowed(
+    policy: zakura_network::config::BlockRelayPolicy,
+    class: BlockApplyClass,
+    is_close_to_tip: bool,
+    committed_tip: Option<block::Hash>,
+    parent: block::Hash,
+) -> bool {
+    policy == zakura_network::config::BlockRelayPolicy::Semantic
+        && class == BlockApplyClass::Full
+        && is_close_to_tip
+        && committed_tip == Some(parent)
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -76,6 +101,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     combined_apply_limit: usize,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
+    relay: Option<BlockSyncRelayContext>,
     block_sync_handoff: std::sync::Arc<super::SyncCoordinator>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) where
@@ -591,6 +617,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         class,
                         block,
                         operation: None,
+                        relay: None,
                     };
                     if let Some(height) = height {
                         pending_probe_applies.insert(height, pending);
@@ -632,6 +659,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     class,
                     block,
                     operation: Some(operation),
+                    relay: relay.clone(),
                 });
                 drain_pending_block_applies(
                     &block_sync_handoff,
@@ -1114,6 +1142,7 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
             class,
             trace.clone(),
             throughput_probe.clone(),
+            pending.relay,
         );
         in_flight_applies.push(
             async move {
@@ -1265,6 +1294,7 @@ where
         pending.class,
         trace,
         Some(throughput_probe),
+        None,
     )
     .await
 }
@@ -1286,7 +1316,7 @@ pub(crate) fn block_apply_class(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
     block_verifier: BlockVerifier,
-    _latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
+    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
     _endpoint: Option<ZakuraEndpoint>,
     _read_state: ReadState,
     block_sync: BlockSyncHandle,
@@ -1297,6 +1327,7 @@ pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
     class: BlockApplyClass,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
+    relay: Option<BlockSyncRelayContext>,
 ) -> BlockApplyCompletion
 where
     BlockVerifier:
@@ -1334,6 +1365,17 @@ where
             probe_body_outcome(owner, source, expected_hash, result)
         }
         None => {
+            let relay = relay.filter(|relay| {
+                native_semantic_relay_allowed(
+                    relay.policy,
+                    class,
+                    relay.sync_status.is_close_to_tip(),
+                    latest_chain_tip
+                        .best_tip_height_and_hash()
+                        .map(|(_, hash)| hash),
+                    block.header.previous_block_hash,
+                )
+            });
             commit_block_sync_body_with_stall_trace(
                 block_verifier.clone(),
                 block,
@@ -1344,6 +1386,7 @@ where
                 token,
                 height,
                 expected_hash,
+                relay,
             )
             .await
         }
@@ -1396,6 +1439,7 @@ async fn commit_block_sync_body_with_stall_trace<BlockVerifier>(
     token: BlockApplyToken,
     height: block::Height,
     expected_hash: block::Hash,
+    relay: Option<BlockSyncRelayContext>,
 ) -> BlockApplyOutcome
 where
     BlockVerifier:
@@ -1403,9 +1447,24 @@ where
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
-    let commit = block_verifier
-        .clone()
-        .oneshot(zakura_consensus::Request::Commit(block));
+    let commit = async move {
+        if let Some(relay) = relay {
+            let peer_id = zakura_network::zakura::ZakuraPeerId::new(source.digest().to_vec())
+                .expect("native block-sync sources are authenticated 32-byte peer identities");
+            verify_peer_block(
+                block_verifier.clone(),
+                block,
+                Some(zakura_network::PeerSource::Zakura(peer_id)),
+                relay.peer_relay,
+            )
+            .await
+        } else {
+            block_verifier
+                .clone()
+                .oneshot(zakura_consensus::Request::Commit(block))
+                .await
+        }
+    };
 
     tokio::pin!(commit);
     tokio::select! {
@@ -1810,6 +1869,49 @@ mod tests {
     }
 
     #[test]
+    fn native_semantic_relay_requires_a_full_tip_child_near_the_tip() {
+        use zakura_network::config::BlockRelayPolicy::{Committed, Semantic};
+
+        let tip = block::Hash([3; 32]);
+        let side_parent = block::Hash([4; 32]);
+        assert!(native_semantic_relay_allowed(
+            Semantic,
+            BlockApplyClass::Full,
+            true,
+            Some(tip),
+            tip,
+        ));
+        assert!(!native_semantic_relay_allowed(
+            Committed,
+            BlockApplyClass::Full,
+            true,
+            Some(tip),
+            tip,
+        ));
+        assert!(!native_semantic_relay_allowed(
+            Semantic,
+            BlockApplyClass::Checkpoint,
+            true,
+            Some(tip),
+            tip,
+        ));
+        assert!(!native_semantic_relay_allowed(
+            Semantic,
+            BlockApplyClass::Full,
+            false,
+            Some(tip),
+            tip,
+        ));
+        assert!(!native_semantic_relay_allowed(
+            Semantic,
+            BlockApplyClass::Full,
+            true,
+            Some(tip),
+            side_parent,
+        ));
+    }
+
+    #[test]
     fn body_apply_evidence_is_canonical_or_attempt_scoped_by_outcome_kind() {
         let owner = test_owner();
         let source = test_source();
@@ -1927,6 +2029,7 @@ mod tests {
                 class: BlockApplyClass::Full,
                 block: block1,
                 operation: None,
+                relay: None,
             },
             PendingBlockApply {
                 owner: test_owner(),
@@ -1935,6 +2038,7 @@ mod tests {
                 class: BlockApplyClass::Full,
                 block: block2,
                 operation: None,
+                relay: None,
             },
         ]);
 

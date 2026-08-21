@@ -53,9 +53,7 @@ use cached_peer_addr_response::CachedPeerAddrResponse;
 #[cfg(test)]
 mod tests;
 
-use downloads::{
-    Downloads as BlockDownloads, EarlyRelayedBlockCommitError, GossipedTipChildHeightMismatch,
-};
+use downloads::{Downloads as BlockDownloads, GossipedTipChildHeightMismatch};
 
 /// The maximum amount of time an inbound service response can take.
 ///
@@ -114,10 +112,6 @@ fn block_misbehavior(
     err: BoxError,
     advertiser_addr: Option<PeerSocketAddr>,
 ) -> Option<(PeerSocketAddr, u32)> {
-    if err.is::<EarlyRelayedBlockCommitError>() {
-        return None;
-    }
-
     let advertiser_addr = advertiser_addr?;
     let score = if let Some(err) = err.downcast_ref::<RouterError>() {
         err.misbehavior_score()
@@ -861,20 +855,12 @@ impl Service<zn::Request> for Inbound {
                     .boxed()
             }
             zn::Request::AdvertiseBlock(hash, Some(zn::PeerSource::Zakura(peer_id))) => {
-                if self.block_relay == zn::config::BlockRelayPolicy::Semantic {
-                    block_downloads.download_and_verify(
-                        hash,
-                        Some(zn::PeerSource::Zakura(peer_id)),
-                    );
-                    metrics::counter!("gossip.zakura.semantic_relay.block.hash.count").increment(1);
-                } else {
-                    debug!(
-                        ?hash,
-                        ?peer_id,
-                        "ignoring Zakura block advertisement because native block sync owns block bodies",
-                    );
-                    metrics::counter!("gossip.zakura.native_sync.block.hash.count").increment(1);
-                }
+                debug!(
+                    ?hash,
+                    ?peer_id,
+                    "recorded Zakura block advertisement; native block sync owns block bodies",
+                );
+                metrics::counter!("gossip.zakura.native_sync.block.hash.count").increment(1);
                 async { Ok(zn::Response::Nil) }.boxed()
             }
             zn::Request::AdvertiseBlock(hash, advertiser) => {

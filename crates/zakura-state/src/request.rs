@@ -87,6 +87,8 @@ pub enum BlockLifecycleFailureClass {
     SemanticRejected,
     /// State rejected a duplicate request.
     Duplicate,
+    /// Finality superseded a queued block before it could commit.
+    SupersededByFinality,
     /// State could not admit the block because its parent was unavailable.
     ParentUnavailable,
     /// Contextual validation rejected the block.
@@ -508,6 +510,27 @@ pub struct SemanticallyVerifiedBlock {
     /// finalized committer. `None` means the committer falls back to computing
     /// it from the block's transactions.
     pub auth_data_root: Option<AuthDataRoot>,
+}
+
+/// The data needed to check a block header's body and history commitment.
+///
+/// This compact payload avoids cloning the contextual-validation caches in
+/// [`SemanticallyVerifiedBlock`] for the read-only state request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockCommitmentData {
+    /// The block whose header commitment must be checked.
+    pub block: Arc<Block>,
+    /// The precomputed ZIP-244 authorizing-data commitment root, when available.
+    pub auth_data_root: Option<AuthDataRoot>,
+}
+
+impl From<&SemanticallyVerifiedBlock> for BlockCommitmentData {
+    fn from(block: &SemanticallyVerifiedBlock) -> Self {
+        Self {
+            block: block.block.clone(),
+            auth_data_root: block.auth_data_root,
+        }
+    }
 }
 
 /// A block ready to be committed directly to the finalized state with
@@ -1597,7 +1620,7 @@ pub enum Request {
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
     /// Checks that the block header commits to its exact body and parent history tree.
-    CheckBlockCommitment(SemanticallyVerifiedBlock),
+    CheckBlockCommitment(BlockCommitmentData),
 
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
@@ -2120,7 +2143,7 @@ pub enum ReadRequest {
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
     /// Checks that the block header commits to its exact body and parent history tree.
-    CheckBlockCommitment(SemanticallyVerifiedBlock),
+    CheckBlockCommitment(BlockCommitmentData),
 
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///

@@ -56,7 +56,7 @@ pub use error::{
 };
 pub use header_chain::*;
 pub use request::{
-    BlockLifecycleFailure, BlockLifecycleFailureClass, BlockLifecycleHandle,
+    BlockCommitmentData, BlockLifecycleFailure, BlockLifecycleFailureClass, BlockLifecycleHandle,
     BlockLifecycleMilestone, BlockLifecycleReporter, BlockLifecycleResult, CheckpointVerifiedBlock,
     CommitSemanticallyVerifiedBlockRequest, HashOrHeight, HeaderChainBodyEvidenceAuthority,
     MappedRequest, PreparedHeaderChainBodyEvidence, PreparedHeaderChainInsert, ReadRequest,

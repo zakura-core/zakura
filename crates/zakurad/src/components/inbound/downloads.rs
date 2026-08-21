@@ -27,11 +27,14 @@ use zakura_chain::{
     chain_tip::ChainTip,
 };
 use zakura_network::{self as zn, PeerSocketAddr};
-use zakura_rpc::{BlockRelayEvent, BlockRelaySource, PendingBlockRegistry};
+#[cfg(test)]
+use zakura_rpc::BlockRelaySource;
+use zakura_rpc::{BlockRelayEvent, PendingBlockRegistry};
 use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
+    block_relay::{verify_peer_block, PeerRelayContext},
     sync::{SyncStatus, MIN_CONCURRENCY_LIMIT},
 };
 
@@ -53,23 +56,6 @@ pub struct GossipedTipChildHeightMismatch {
     pub height: block::Height,
     pub expected_height: block::Height,
     pub hash: block::Hash,
-}
-
-/// A block relayed after semantic verification later failed contextual commit.
-///
-/// The inbound service uses this wrapper to avoid assigning a later local or contextual failure
-/// to the peer that supplied a semantically valid block.
-#[derive(Debug, thiserror::Error)]
-#[error("early-relayed block failed contextual commit: {source}")]
-pub struct EarlyRelayedBlockCommitError {
-    #[source]
-    source: BoxError,
-}
-
-impl EarlyRelayedBlockCommitError {
-    pub(crate) fn new(source: BoxError) -> Self {
-        Self { source }
-    }
 }
 
 /// Source key used for inbound block download ordering.
@@ -871,118 +857,26 @@ where
             } else {
                 None
             };
-            let (verification_result, suppress_peer_misbehavior) =
-                if let Some(relay_sender) = semantic_relay_sender {
-                    let (lifecycle_handle, lifecycle) = zs::BlockLifecycleHandle::new();
-                    let mut verification = Box::pin(verifier.oneshot(
-                        zakura_consensus::Request::CommitWithLifecycle {
-                            block: block.clone(),
-                            lifecycle,
-                        },
-                    ));
-
-                    enum AuthorizationRace {
-                        Authorized(Result<(), zs::BlockLifecycleResult>),
-                        Verification(Result<block::Hash, BoxError>),
-                    }
-
-                    let race = tokio::select! {
-                        biased;
-
-                        authorized = lifecycle_handle.wait_for(
-                            zs::BlockLifecycleMilestone::RelayAuthorized,
-                        ) => {
-                            AuthorizationRace::Authorized(authorized)
-                        },
-                        result = &mut verification => AuthorizationRace::Verification(result),
-                    };
-
-                    match race {
-                        AuthorizationRace::Verification(result) => (result, false),
-                        AuthorizationRace::Authorized(authorized) => {
-                            let source = BlockRelaySource::Peer {
-                                authorized_at: std::time::Instant::now(),
-                                advertiser: relay_advertiser,
-                            };
-                            let mut early_result = None;
-                            if authorized.is_ok() && pending_blocks.insert(block.clone()) {
-                                let (advertised, receiver) = oneshot::channel();
-                                let event = BlockRelayEvent::Early {
-                                    hash,
-                                    height: block_height,
-                                    source: source.clone(),
-                                    advertised,
-                                };
-                                if relay_sender.try_send(event).is_ok() {
-                                    early_result = Some(receiver);
-                                } else {
-                                    pending_blocks.cancel_relay_reservation(&block);
-                                }
-                            }
-
-                            let early_relayed = early_result.is_some();
-                            let (result_sender, result_receiver) = oneshot::channel();
-                            tokio::spawn(async move {
-                                let result = verification.await;
-                                let committed = result.is_ok();
-                                pending_blocks.remove(&block, committed);
-                                tokio::spawn(async move {
-                                    let early_advertised = match early_result {
-                                        Some(receiver) => tokio::time::timeout(
-                                            std::time::Duration::from_secs(20),
-                                            receiver,
-                                        )
-                                        .await
-                                        .ok()
-                                        .and_then(|result| result.ok())
-                                        .unwrap_or(false),
-                                        None => false,
-                                    };
-                                    let event = if committed {
-                                        BlockRelayEvent::Committed {
-                                            hash,
-                                            height: block_height,
-                                            early_advertised,
-                                            source,
-                                        }
-                                    } else {
-                                        BlockRelayEvent::Failed {
-                                            hash,
-                                            height: block_height,
-                                            early_advertised,
-                                            source,
-                                        }
-                                    };
-                                    let _ = relay_sender.send(event).await;
-                                });
-                                let _ = result_sender.send(result);
-                            });
-
-                            let result = result_receiver.await.unwrap_or_else(|_| {
-                                Err("owned semantic block commit task exited".into())
-                            });
-                            (result, early_relayed)
-                        }
-                    }
-                } else {
-                    (
-                        verifier
-                            .oneshot(zakura_consensus::Request::Commit(block))
-                            .await,
-                        false,
-                    )
-                };
+            let verification_result = if let Some(relay_sender) = semantic_relay_sender {
+                verify_peer_block(
+                    verifier,
+                    block,
+                    relay_advertiser,
+                    PeerRelayContext {
+                        pending_blocks,
+                        sender: relay_sender,
+                    },
+                )
+                .await
+            } else {
+                verifier
+                    .oneshot(zakura_consensus::Request::Commit(block))
+                    .await
+            };
 
             verification_result
                 .map(|hash| (hash, block_height))
-                .map_err(|source| {
-                    let error = if suppress_peer_misbehavior {
-                        BoxError::from(EarlyRelayedBlockCommitError::new(source))
-                    } else {
-                        source
-                    };
-                    (error, advertiser_addr)
-                })
+                .map_err(|source| (source, advertiser_addr))
         }
         .map_ok(|(hash, height)| {
             info!(?height, "downloaded and verified gossiped block");

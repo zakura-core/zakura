@@ -560,6 +560,17 @@ impl StartCmd {
         .await;
         node_tasks.track(&consensus_task_handles.state_checkpoint_verify_handle);
 
+        info!("initializing syncer");
+        let (mut syncer, sync_status) = ChainSync::new(
+            &config,
+            max_checkpoint_height,
+            peer_set.clone(),
+            block_verifier_router.clone(),
+            state.clone(),
+            latest_chain_tip.clone(),
+            misbehavior_sender.clone(),
+        );
+
         if let Some(endpoint) = zakura_endpoint.clone() {
             let trace = endpoint.trace();
             if endpoint.header_sync().is_some() {
@@ -567,6 +578,14 @@ impl StartCmd {
                     endpoint.block_sync(),
                     endpoint.take_block_sync_actions().await,
                 ) {
+                    let relay = zakura::BlockSyncRelayContext {
+                        policy: config.network.block_relay,
+                        sync_status: sync_status.clone(),
+                        peer_relay: crate::components::block_relay::PeerRelayContext {
+                            pending_blocks: pending_blocks.clone(),
+                            sender: block_relay_channel.sender(),
+                        },
+                    };
                     let block_driver_task = tokio::spawn(
                         drive_block_sync_actions(
                             block_actions,
@@ -584,6 +603,7 @@ impl StartCmd {
                             config.sync.zakura_block_apply_concurrency_limit,
                             trace.clone(),
                             blocksync_throughput_probe.clone(),
+                            Some(relay),
                             zakura_block_sync_handoff.clone(),
                             shutdown.clone().cancelled_owned(),
                         )
@@ -593,17 +613,6 @@ impl StartCmd {
                 }
             }
         }
-
-        info!("initializing syncer");
-        let (mut syncer, sync_status) = ChainSync::new(
-            &config,
-            max_checkpoint_height,
-            peer_set.clone(),
-            block_verifier_router.clone(),
-            state.clone(),
-            latest_chain_tip.clone(),
-            misbehavior_sender.clone(),
-        );
 
         info!("initializing mempool");
         let (mempool, mempool_transaction_subscriber) = Mempool::new(
@@ -2379,6 +2388,7 @@ mod zakura_header_sync_driver_tests {
                 self.combined_apply_limit,
                 self.trace,
                 self.throughput_probe,
+                None,
                 self.handoff,
                 async move {
                     let _ = shutdown_rx.await;
@@ -4373,6 +4383,7 @@ mod zakura_header_sync_driver_tests {
             BlockApplyClass::Checkpoint,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
+            None,
         )
         .await;
 
@@ -4431,6 +4442,7 @@ mod zakura_header_sync_driver_tests {
             block,
             BlockApplyClass::Full,
             trace,
+            None,
             None,
         )
         .await;
@@ -4511,6 +4523,7 @@ mod zakura_header_sync_driver_tests {
             block,
             BlockApplyClass::Full,
             trace,
+            None,
             None,
         ));
 
@@ -4596,6 +4609,7 @@ mod zakura_header_sync_driver_tests {
                 block,
                 BlockApplyClass::Full,
                 zakura_network::zakura::ZakuraTrace::noop(),
+                None,
                 None,
             )
             .await

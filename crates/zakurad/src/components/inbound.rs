@@ -56,7 +56,7 @@ use downloads::{Downloads as BlockDownloads, GossipedTipChildHeightMismatch};
 ///
 /// If the response takes longer than this time, it will be cancelled,
 /// and the peer might be disconnected.
-pub const MAX_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(18);
+pub const MAX_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(5);
 
 /// The number of bytes the [`Inbound`] service will queue in response to a single block or
 /// transaction request, before ignoring any additional block or transaction IDs in that request.
@@ -197,15 +197,16 @@ async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<bl
     }
 }
 
-/// Returns a committed block from any active chain or waits for its pending commit.
+/// Returns an admitted block or a committed block from any active chain.
 async fn block_by_hash_or_pending(
     mut state: State,
     pending_blocks: PendingBlockRegistry,
     hash: block::Hash,
 ) -> Result<Option<Arc<Block>>, zn::BoxError> {
-    // Subscribe before the state lookup. A commit can remove the registry entry while state
-    // answers this request.
-    let pending_wait = pending_blocks.wait(hash);
+    if let Some(block) = pending_blocks.get(hash) {
+        return Ok(Some(block));
+    }
+
     let response = state
         .ready()
         .await?
@@ -214,7 +215,7 @@ async fn block_by_hash_or_pending(
 
     match response {
         zs::Response::Block(Some(block)) => Ok(Some(block)),
-        zs::Response::Block(None) => Ok(pending_wait.await),
+        zs::Response::Block(None) => Ok(None),
         _ => unreachable!("wrong response from state"),
     }
 }
@@ -651,7 +652,7 @@ impl Service<zn::Request> for Inbound {
                         });
                     }
 
-                    // Start every state lookup and pending wait before awaiting any result.
+                    // Start every lookup before awaiting any result.
                     let mut lookup_results = Vec::with_capacity(lookups.len());
                     while let Some(result) = lookups.next().await {
                         lookup_results.push(result?);

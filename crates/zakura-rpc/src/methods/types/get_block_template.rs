@@ -40,7 +40,9 @@ use zcash_script::{opcode::PushValue, pv::push_value};
 #[allow(unused_imports)]
 use zakura_chain::serialization::BytesInDisplayOrder;
 
-use zakura_consensus::{router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS};
+use zakura_consensus::{
+    router::service_trait::BlockVerifierService, PreparedCandidateResolver, MAX_BLOCK_SIGOPS,
+};
 use zakura_node_services::mempool::{self, TransactionDependencies};
 use zakura_state::GetBlockTemplateChainInfo;
 
@@ -584,6 +586,9 @@ where
     /// The chain verifier, used for submitting blocks.
     block_verifier_router: BlockVerifierRouter,
 
+    /// Resolves compact submissions from the verifier's prepared candidates.
+    prepared_candidates: PreparedCandidateResolver,
+
     /// The chain sync status, used for checking if Zebra is likely close to the network chain tip.
     sync_status: SyncStatus,
 
@@ -606,19 +611,22 @@ where
     BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
-    /// Creates a handler with a registry shared by RPC and peer serving.
-    pub fn new_with_pending_blocks(
+    /// Creates a mining handler with shared pending and prepared candidates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_prepared_candidates(
         net: &Network,
         conf: config::mining::Config,
         block_verifier_router: BlockVerifierRouter,
         sync_status: SyncStatus,
         mined_block_sender: Option<mpsc::Sender<MinedBlockEvent>>,
         pending_blocks: PendingBlockRegistry,
+        prepared_candidates: PreparedCandidateResolver,
     ) -> Self {
         let optimistic_block_inventory = conf.optimistic_block_inventory;
         Self {
             miner_params: MinerParams::new(net, conf).ok(),
             block_verifier_router,
+            prepared_candidates,
             sync_status,
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
@@ -641,6 +649,11 @@ where
     /// Returns the block verifier router.
     pub fn block_verifier_router(&self) -> BlockVerifierRouter {
         self.block_verifier_router.clone()
+    }
+
+    /// Returns the prepared-candidate resolver.
+    pub fn prepared_candidates(&self) -> PreparedCandidateResolver {
+        self.prepared_candidates.clone()
     }
 
     /// Returns a sender for the owned mined-block lifecycle task.

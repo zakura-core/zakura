@@ -1,14 +1,15 @@
-//! Parameter and response types for the `submitblock` RPC.
+//! Parameter, response, and lifecycle types for mined-block RPCs.
 
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
-use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot};
 
 use zakura_chain::block;
+
+use crate::methods::hex_data::HexData;
 
 // Allow doc links to these imports.
 #[allow(unused_imports)]
@@ -35,11 +36,39 @@ pub struct SubmitBlockParameters {
     pub work_id: Option<String>,
 }
 
-/// The maximum time a peer waits for an early-advertised block to commit.
-pub const PENDING_BLOCK_WAIT: Duration = Duration::from_secs(15);
+/// A compact mined-block submission.
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+pub struct SubmitSolutionParameters {
+    /// The prepared candidate identifier returned by `getblocktemplate`.
+    #[serde(rename = "workid")]
+    pub work_id: String,
+
+    /// The complete hex-encoded solved block header.
+    pub header: HexData,
+}
 
 const MAX_PENDING_BLOCKS: usize = 16;
-const MAX_PENDING_BLOCK_WAITS: usize = 32;
+
+/// The RPC path that admitted a mined block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MinedBlockSubmission {
+    /// The miner submitted a complete block.
+    FullBlock,
+    /// The miner submitted a compact solved header.
+    CompactHeader,
+}
+
+impl MinedBlockSubmission {
+    /// Returns the RPC method name for metrics.
+    pub const fn rpc_method(self) -> &'static str {
+        match self {
+            Self::FullBlock => "submitblock",
+            Self::CompactHeader => "submitsolution",
+        }
+    }
+}
 
 /// A mined-block lifecycle event consumed by the block gossip task.
 #[derive(Debug)]
@@ -52,6 +81,8 @@ pub enum MinedBlockEvent {
         height: block::Height,
         /// When the RPC accepted the submitted bytes.
         submitted_at: std::time::Instant,
+        /// The RPC method that accepted the submission.
+        submission: MinedBlockSubmission,
         /// Reports whether the early network advertisement completed.
         advertised: oneshot::Sender<bool>,
     },
@@ -75,37 +106,9 @@ pub enum MinedBlockEvent {
     },
 }
 
-#[derive(Clone, Debug)]
-enum PendingStatus {
-    Waiting,
-    Committed(Arc<block::Block>),
-    Failed,
-}
-
-#[derive(Debug)]
-struct PendingBlock {
-    status: watch::Sender<PendingStatus>,
-}
-
-/// Stores pending blocks and bounds peer waits.
-#[derive(Debug)]
-struct PendingBlockRegistryInner {
-    entries: Mutex<HashMap<block::Hash, PendingBlock>>,
-    wait_permits: Arc<Semaphore>,
-}
-
-/// Holds early-advertised block bodies until their contextual commits finish.
-#[derive(Clone, Debug)]
-pub struct PendingBlockRegistry(Arc<PendingBlockRegistryInner>);
-
-impl Default for PendingBlockRegistry {
-    fn default() -> Self {
-        Self(Arc::new(PendingBlockRegistryInner {
-            entries: Mutex::new(HashMap::new()),
-            wait_permits: Arc::new(Semaphore::new(MAX_PENDING_BLOCK_WAITS)),
-        }))
-    }
-}
+/// Holds admitted block bodies until their contextual commits finish.
+#[derive(Clone, Debug, Default)]
+pub struct PendingBlockRegistry(Arc<Mutex<HashMap<block::Hash, Arc<block::Block>>>>);
 
 impl PendingBlockRegistry {
     /// Inserts a block before its early inventory is sent.
@@ -115,7 +118,6 @@ impl PendingBlockRegistry {
         let hash = block.hash();
         let mut entries = self
             .0
-            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if entries.contains_key(&hash) {
@@ -126,78 +128,37 @@ impl PendingBlockRegistry {
             return false;
         }
 
-        let (status, _receiver) = watch::channel(PendingStatus::Waiting);
-        entries.insert(hash, PendingBlock { status });
+        entries.insert(hash, block);
         true
     }
 
-    /// Resolves peer waiters and removes a terminal entry.
-    pub fn resolve(&self, hash: block::Hash, result: Result<Arc<block::Block>, ()>) {
-        let entry = self
+    /// Removes a block after its contextual commit settles.
+    pub fn remove(&self, hash: block::Hash, committed: bool) {
+        let removed = self
             .0
-            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&hash);
-        let Some(entry) = entry else {
-            return;
-        };
-        let status = match result {
-            Ok(block) => PendingStatus::Committed(block),
-            Err(()) => PendingStatus::Failed,
-        };
-        entry.status.send_replace(status);
+            .remove(&hash)
+            .is_some();
+
+        if removed && !committed {
+            metrics::counter!("mining.pending_registry.uncommitted").increment(1);
+        }
     }
 
-    /// Waits for an early-advertised block to commit.
-    pub fn wait(
-        &self,
-        hash: block::Hash,
-    ) -> impl std::future::Future<Output = Option<Arc<block::Block>>> + Send + 'static {
-        let status = self
+    /// Returns an admitted block body before contextual commit finishes.
+    pub fn get(&self, hash: block::Hash) -> Option<Arc<block::Block>> {
+        let block = self
             .0
-            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&hash)
-            .map(|entry| entry.status.subscribe());
-        let wait_permit = status.as_ref().and_then(|_| {
-            self.0
-                .wait_permits
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| {
-                    metrics::counter!("mining.pending_peer_wait.saturated").increment(1);
-                })
-                .ok()
-        });
-        let deadline = tokio::time::Instant::now() + PENDING_BLOCK_WAIT;
+            .cloned();
 
-        async move {
-            let mut status = status?;
-            let _wait_permit: OwnedSemaphorePermit = wait_permit?;
-            let start = std::time::Instant::now();
-            let result = tokio::time::timeout_at(deadline, async {
-                loop {
-                    let current = status.borrow().clone();
-                    match current {
-                        PendingStatus::Waiting => {
-                            if status.changed().await.is_err() {
-                                return None;
-                            }
-                        }
-                        PendingStatus::Committed(block) => return Some(block),
-                        PendingStatus::Failed => return None,
-                    }
-                }
-            })
-            .await
-            .ok()
-            .flatten();
-            metrics::histogram!("mining.pending_peer_wait.duration_seconds")
-                .record(start.elapsed().as_secs_f64());
-            result
+        if block.is_some() {
+            metrics::counter!("mining.pending_registry.served").increment(1);
         }
+        block
     }
 }
 
@@ -238,6 +199,56 @@ impl Default for SubmitBlockResponse {
 impl From<SubmitBlockErrorResponse> for SubmitBlockResponse {
     fn from(error_response: SubmitBlockErrorResponse) -> Self {
         Self::ErrorResponse(error_response)
+    }
+}
+
+/// A compact submission rejection reason.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubmitSolutionErrorResponse {
+    /// The block was already committed.
+    Duplicate,
+    /// The block was already queued but has not committed.
+    DuplicateInconclusive,
+    /// The block committed to a side chain.
+    Inconclusive,
+    /// Consensus rejected the block.
+    Rejected,
+    /// The prepared candidate no longer exists.
+    StaleWork,
+    /// The solved header changed a preserved candidate field.
+    CandidateMismatch,
+}
+
+/// A `submitsolution` response.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum SubmitSolutionResponse {
+    /// The compact submission failed.
+    ErrorResponse(SubmitSolutionErrorResponse),
+    /// The compact submission committed successfully and returns `null`.
+    Accepted,
+}
+
+impl From<SubmitSolutionErrorResponse> for SubmitSolutionResponse {
+    fn from(error: SubmitSolutionErrorResponse) -> Self {
+        Self::ErrorResponse(error)
+    }
+}
+
+impl From<SubmitBlockResponse> for SubmitSolutionResponse {
+    fn from(response: SubmitBlockResponse) -> Self {
+        match response {
+            SubmitBlockResponse::Accepted => Self::Accepted,
+            SubmitBlockResponse::ErrorResponse(error) => Self::ErrorResponse(match error {
+                SubmitBlockErrorResponse::Duplicate => SubmitSolutionErrorResponse::Duplicate,
+                SubmitBlockErrorResponse::DuplicateInconclusive => {
+                    SubmitSolutionErrorResponse::DuplicateInconclusive
+                }
+                SubmitBlockErrorResponse::Inconclusive => SubmitSolutionErrorResponse::Inconclusive,
+                SubmitBlockErrorResponse::Rejected => SubmitSolutionErrorResponse::Rejected,
+            }),
+        }
     }
 }
 
@@ -292,69 +303,60 @@ mod tests {
             .expect("the genesis test vector is valid")
     }
 
-    #[tokio::test]
-    async fn pending_block_waits_for_success() {
+    #[test]
+    fn pending_block_is_served_before_commit() {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
         assert!(registry.insert(block.clone()));
 
-        let wait = tokio::spawn({
-            let registry = registry.clone();
-            async move { registry.wait(hash).await }
-        });
-        tokio::task::yield_now().await;
-        registry.resolve(hash, Ok(block.clone()));
-
-        assert_eq!(wait.await.expect("wait task succeeds"), Some(block));
+        assert_eq!(registry.get(hash), Some(block));
     }
 
-    #[tokio::test]
-    async fn pending_block_wait_subscribes_before_polling() {
-        let registry = PendingBlockRegistry::default();
-        let block = test_block();
-        let hash = block.hash();
-        assert!(registry.insert(block.clone()));
-
-        let wait = registry.wait(hash);
-        registry.resolve(hash, Ok(block.clone()));
-
-        assert_eq!(wait.await, Some(block));
-    }
-
-    #[tokio::test]
-    async fn pending_block_failure_returns_not_found() {
+    #[test]
+    fn committed_block_leaves_the_registry() {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
         assert!(registry.insert(block));
 
-        let wait = tokio::spawn({
-            let registry = registry.clone();
-            async move { registry.wait(hash).await }
-        });
-        tokio::task::yield_now().await;
-        registry.resolve(hash, Err(()));
+        registry.remove(hash, true);
 
-        assert_eq!(wait.await.expect("wait task succeeds"), None);
+        assert_eq!(registry.get(hash), None);
     }
 
-    #[tokio::test]
-    async fn pending_block_waits_are_bounded() {
+    #[test]
+    fn uncommitted_block_leaves_the_registry() {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
+        assert!(registry.insert(block));
 
-        let waits: Vec<_> = (0..MAX_PENDING_BLOCK_WAITS)
-            .map(|_| registry.wait(hash))
-            .collect();
-        assert_eq!(registry.wait(hash).await, None);
+        registry.remove(hash, false);
 
-        drop(waits);
-        let wait = registry.wait(hash);
-        registry.resolve(hash, Ok(block.clone()));
-        assert_eq!(wait.await, Some(block));
+        assert_eq!(registry.get(hash), None);
+    }
+
+    #[test]
+    fn unknown_hash_is_not_served() {
+        let registry = PendingBlockRegistry::default();
+        assert_eq!(registry.get(test_block().hash()), None);
+    }
+
+    #[test]
+    fn submit_solution_responses_match_mining_rpc_conventions() {
+        assert_eq!(
+            serde_json::to_value(SubmitSolutionResponse::Accepted)
+                .expect("accepted response serialization succeeds"),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            serde_json::to_value(SubmitSolutionResponse::from(
+                SubmitSolutionErrorResponse::StaleWork
+            ))
+            .expect("rejection response serialization succeeds"),
+            serde_json::Value::String("stale-work".to_owned())
+        );
     }
 
     #[test]

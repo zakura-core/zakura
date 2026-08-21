@@ -20,5 +20,7 @@ mod tests;
 
 pub use methods::types::{
     get_block_template::{fetch_chain_info, proposal::proposal_block_from_template, MinerParams},
-    submit_block::{MinedBlockEvent, PendingBlockRegistry, SubmitBlockChannel},
+    submit_block::{
+        MinedBlockEvent, MinedBlockSubmission, PendingBlockRegistry, SubmitBlockChannel,
+    },
 };

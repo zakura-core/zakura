@@ -35,7 +35,7 @@ use zakura_node_services::mempool;
 use zakura_state as zs;
 
 use crate::{
-    block::{Request, SemanticBlockVerifier, VerifyBlockError},
+    block::{PreparedCandidateResolver, Request, SemanticBlockVerifier, VerifyBlockError},
     checkpoint::{CheckpointVerifier, VerifyCheckpointError},
     error::TransactionError,
     transaction, BoxError, Config,
@@ -259,7 +259,7 @@ where
 /// so that out-of-order and invalid requests do not hang indefinitely.
 /// See the [`router`](`crate::router`) module documentation for details.
 #[instrument(skip(state_service, mempool))]
-pub async fn init<S, Mempool>(
+pub async fn init_with_prepared_candidates<S, Mempool>(
     config: Config,
     network: &Network,
     mut state_service: S,
@@ -272,6 +272,7 @@ pub async fn init<S, Mempool>(
     >,
     BackgroundTaskHandles,
     Height,
+    PreparedCandidateResolver,
 )
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
@@ -390,7 +391,11 @@ where
         "initializing block verifier router"
     );
 
-    let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
+    let (block, prepared_candidates) = SemanticBlockVerifier::new_with_prepared_candidates(
+        network,
+        state_service.clone(),
+        transaction.clone(),
+    );
     let checkpoint = CheckpointVerifier::from_checkpoint_list(list, network, tip, state_service);
     let router = BlockVerifierRouter {
         checkpoint,
@@ -404,6 +409,43 @@ where
         state_checkpoint_verify_handle,
     };
 
+    (
+        router,
+        transaction,
+        task_handles,
+        max_checkpoint_height,
+        prepared_candidates,
+    )
+}
+
+/// Initializes verifier services without exporting the mining candidate resolver.
+///
+/// Use [`init_with_prepared_candidates`] when the mining RPC needs compact submission.
+pub async fn init<S, Mempool>(
+    config: Config,
+    network: &Network,
+    state_service: S,
+    mempool: oneshot::Receiver<Mempool>,
+) -> (
+    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<
+        BoxService<transaction::Request, transaction::Response, TransactionError>,
+        transaction::Request,
+    >,
+    BackgroundTaskHandles,
+    Height,
+)
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+    Mempool: Service<mempool::Request, Response = mempool::Response, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    Mempool::Future: Send + 'static,
+{
+    let (router, transaction, task_handles, max_checkpoint_height, _) =
+        init_with_prepared_candidates(config, network, state_service, mempool).await;
     (router, transaction, task_handles, max_checkpoint_height)
 }
 

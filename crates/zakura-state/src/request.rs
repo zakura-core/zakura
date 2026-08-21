@@ -110,6 +110,13 @@ impl BlockAdmission {
             }
         }
     }
+
+    /// Marks the block as admitted in cross-crate lifecycle tests.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    #[doc(hidden)]
+    pub fn admit_for_test(&self) {
+        self.admit();
+    }
 }
 
 impl std::fmt::Debug for BlockAdmission {

@@ -148,7 +148,7 @@ where
     service.oneshot(request).await.map_misc_error()
 }
 
-include!(concat!(env!("OUT_DIR"), "/rpc_openrpc.rs"));
+include!("methods/rpc_openrpc.rs");
 
 // TODO: Review the parameter descriptions below, and update them as needed:
 // https://github.com/ZcashFoundation/zebra/issues/10320

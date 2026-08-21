@@ -48,7 +48,7 @@ pub struct Config {
     /// Storage mode is controlled separately by [`storage_mode`](Config::storage_mode).
     ///
     /// The default directory is platform dependent, based on
-    /// [`dirs::cache_dir()`](https://docs.rs/dirs/3.0.1/dirs/fn.cache_dir.html):
+    /// [the platform cache directory](https://docs.rs/dirs/3.0.1/dirs/fn.cache_dir.html):
     ///
     /// |Platform | Value                                           | Example                              |
     /// | ------- | ----------------------------------------------- | ------------------------------------ |

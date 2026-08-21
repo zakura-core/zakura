@@ -27,7 +27,7 @@ json-conversion = [
 
 # Async error handling convenience traits
 async-error = [
-    "tokio",
+    "tokio/rt",
 ]
 
 # Experimental internal miner support
@@ -38,8 +38,8 @@ internal-miner = ["equihash/solver"]
 proptest-impl = [
     "proptest",
     "proptest-derive",
-    "rand",
-    "rand_chacha",
+    "rand_chacha_10",
+    "rand_core_10",
     "tokio/tracing",
     "zakura-test",
 ]
@@ -65,12 +65,10 @@ group = { workspace = true }
 incrementalmerkletree.workspace = true
 jubjub = { workspace = true }
 dirs = { workspace = true }
-num-integer = { workspace = true }
 primitive-types = { workspace = true }
 rand_core = { workspace = true }
-rand_10 = { workspace = true }
-rand_chacha_10 = { workspace = true }
-rand_core_10 = { workspace = true }
+rand_chacha_10 = { workspace = true, optional = true }
+rand_core_10 = { workspace = true, optional = true }
 ripemd = { workspace = true }
 # Matches version used by hdwallet
 secp256k1 = { workspace = true, features = ["serde"] }
@@ -84,7 +82,6 @@ zcash_script.workspace = true
 # ECC deps
 halo2 = { workspace = true }
 orchard.workspace = true
-zcash_encoding.workspace = true
 zcash_history.workspace = true
 zcash_note_encryption = { workspace = true }
 zcash_primitives = { workspace = true, features = ["transparent-inputs"] }
@@ -99,7 +96,6 @@ chrono = { workspace = true, features = ["clock", "std", "serde"] }
 humantime = { workspace = true }
 
 # Error Handling & Formatting
-static_assertions = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
@@ -113,7 +109,7 @@ serde-big-array = { workspace = true }
 futures = { workspace = true }
 itertools = { workspace = true }
 rayon = { workspace = true }
-strum = { version = "0.27.2", features = ["derive"] }
+strum = { workspace = true, features = ["derive"] }
 
 # ZF deps
 ed25519-zebra = { workspace = true }
@@ -130,9 +126,6 @@ tokio = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
-rand = { workspace = true, optional = true }
-rand_chacha = { workspace = true, optional = true }
-
 zakura-test = { path = "../zakura-test/", version = "2.1.0", optional = true }
 bounded-vec = { version = "0.9.0", features = ["serde"] }
 
@@ -143,14 +136,15 @@ criterion = { workspace = true, features = ["html_reports"] }
 # Error Handling & Formatting
 color-eyre = { workspace = true }
 spandoc = { workspace = true }
-tracing = { workspace = true }
 
 # Make the optional testing dependencies required
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 
 rand = { workspace = true }
-rand_chacha = { workspace = true }
+rand_10 = { workspace = true }
+rand_chacha_10 = { workspace = true }
+rand_core_10 = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 

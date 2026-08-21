@@ -39,24 +39,20 @@ header-fuzz = []
 proptest-impl = [
     "proptest",
     "proptest-derive",
-    "zakura-test",
     "zakura-chain/proptest-impl"
 ]
 
 [dependencies]
 bincode = { workspace = true }
 chrono = { workspace = true, features = ["clock", "std"] }
-dirs = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 hex-literal = { workspace = true }
 humantime-serde = { workspace = true }
-human_bytes = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 metrics = { workspace = true }
-mset = { workspace = true }
 regex = { workspace = true }
 rlimit = { workspace = true }
 rocksdb = { workspace = true, features = ["lz4"] }
@@ -83,7 +79,6 @@ zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0-rc0" }
 howudoin = { workspace = true, optional = true }
 
 # test feature proptest-impl
-zakura-test = { path = "../zakura-test/", version = "2.1.0", optional = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 derive-getters.workspace = true
@@ -106,7 +101,6 @@ proptest-derive = { workspace = true }
 rand = { workspace = true }
 
 halo2 = { workspace = true }
-jubjub = { workspace = true }
 orchard = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }

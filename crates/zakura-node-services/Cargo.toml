@@ -22,6 +22,9 @@ default = []
 
 # Tool and test features
 
+# Retain the published feature name after removing its unused dependency.
+color-eyre = []
+
 rpc-client = [
     "color-eyre",
     "jsonrpsee-types",
@@ -38,7 +41,6 @@ tower = { workspace = true }
 # Optional dependencies
 
 # Tool and test feature rpc-client
-color-eyre = { workspace = true, optional = true }
 jsonrpsee-types = { workspace = true, optional = true }
 # Security: avoid default dependency on openssl
 reqwest = { workspace = true, features = ["rustls-tls"], optional = true }
@@ -48,7 +50,6 @@ tokio = { workspace = true, features = ["time", "sync"] }
 
 [dev-dependencies]
 
-color-eyre = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

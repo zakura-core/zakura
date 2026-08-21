@@ -7,7 +7,7 @@ use std::{cmp::min, time::Duration};
 use color_eyre::eyre::{eyre, Report};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::time::timeout;
-use tracing_futures::Instrument;
+use tracing::Instrument;
 
 use zakura_chain::{
     local_genesis::{generate_local_testnet_with_funded_keys, LocalTestnetGenesisOptions},

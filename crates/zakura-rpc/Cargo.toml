@@ -35,7 +35,6 @@ internal-miner = []
 
 # Test-only features
 proptest-impl = [
-    "proptest",
     "zakura-consensus/proptest-impl",
     "zakura-state/proptest-impl",
     "zakura-network/proptest-impl",
@@ -105,13 +104,9 @@ sapling-crypto = { workspace = true }
 zcash_address = { workspace = true }
 zcash_keys = { workspace = true, features = ["orchard", "sapling"] }
 zcash_primitives = { workspace = true, features = ["transparent-inputs", "non-standard-fees"] }
-zcash_proofs = { workspace = true }
 zcash_protocol = { workspace = true }
 zcash_script = { workspace = true }
 zcash_transparent = { workspace = true }
-
-# Test-only feature proptest-impl
-proptest = { workspace = true, optional = true }
 
 zakura-chain = { path = "../zakura-chain", version = "6.0.0-rc0", features = [
     "json-conversion",
@@ -123,15 +118,10 @@ zakura-node-services = { path = "../zakura-node-services", version = "3.2.1-rc0"
 ] }
 zakura-script = { path = "../zakura-script", version = "3.2.1-rc0" }
 zakura-state = { path = "../zakura-state", version = "7.0.0-rc0" }
-rustls = "0.23.40"
-tokio-rustls = "0.26.4"
+rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"] }
 # Only used to read the validity dates of the configured RPC TLS certificates.
 der = "0.7.10"
-
-[build-dependencies]
-openrpsee = { workspace = true }
-tonic-prost-build = { workspace = true }
-which = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }

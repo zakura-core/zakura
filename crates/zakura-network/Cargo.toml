@@ -56,7 +56,6 @@ indexmap = { workspace = true, features = ["serde"] }
 iroh = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
-num-integer = { workspace = true }
 pin-project = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
@@ -64,7 +63,6 @@ regex = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 serde_json = { workspace = true }
-tempfile = { workspace = true }
 thiserror = { workspace = true }
 
 futures = { workspace = true }
@@ -74,7 +72,6 @@ tokio-util = { workspace = true, features = ["codec"] }
 tower = { workspace = true, features = ["retry", "discover", "load", "load-shed", "timeout", "util", "buffer"] }
 
 metrics = { workspace = true }
-tracing-futures = { workspace = true }
 tracing-error = { workspace = true, features = ["traced-error"] }
 tracing = { workspace = true }
 
@@ -91,12 +88,11 @@ zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0-rc0" }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.1-rc0" }
 
 [dev-dependencies]
-anyhow = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 criterion = { workspace = true }
 
-static_assertions = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 toml = { workspace = true }
 tracing-subscriber = { workspace = true }

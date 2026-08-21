@@ -5,7 +5,7 @@
 
 use std::ops::Deref;
 
-use crate::service::finalized_state::disk_db::{DiskDb, DB};
+use crate::service::finalized_state::disk_db::{format_bytes, DiskDb, DB};
 
 // Enable older test code to automatically access the inner database via Deref coercion.
 impl Deref for DiskDb {
@@ -24,6 +24,19 @@ impl DiskDb {
 
         rocksdb::DB::list_cf(&opts, path)
     }
+}
+
+#[test]
+fn format_bytes_preserves_decimal_unit_boundaries() {
+    assert_eq!(format_bytes(0), "0 B");
+    assert_eq!(format_bytes(999), "999 B");
+    assert_eq!(format_bytes(1_000), "1 KB");
+    assert_eq!(format_bytes(1_049), "1 KB");
+    assert_eq!(format_bytes(1_050), "1.1 KB");
+    assert_eq!(format_bytes(999_949), "999.9 KB");
+    assert_eq!(format_bytes(999_950), "1000 KB");
+    assert_eq!(format_bytes(1_000_000), "1 MB");
+    assert_eq!(format_bytes(u64::MAX), "18.4 EB");
 }
 
 /// Check that zs_iter_opts returns an upper bound one greater than provided inclusive end bounds.

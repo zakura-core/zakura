@@ -185,7 +185,7 @@ zcash_script = { workspace = true }
 # Required for crates.io publishing, but it's only used in tests
 zakura-utils = { path = "../zakura-utils", version = "2.2.1-rc0", optional = true }
 
-abscissa_core = { workspace = true }
+abscissa_core = { workspace = true, default-features = false, features = ["application"] }
 clap = { workspace = true, features = ["cargo"] }
 chrono = { workspace = true, features = ["clock", "std"] }
 humantime-serde = { workspace = true }
@@ -211,7 +211,6 @@ thiserror = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing-appender = { workspace = true }
 tracing-error = { workspace = true }
-tracing-futures = { workspace = true }
 tracing = { workspace = true }
 
 metrics = { workspace = true }
@@ -231,7 +230,6 @@ hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
 # Configuration management
 config = { workspace = true }
 
-num-integer = { workspace = true }
 rand = { workspace = true }
 nix = { workspace = true, features = ["fs"] }
 
@@ -239,7 +237,7 @@ nix = { workspace = true, features = ["fs"] }
 thread-priority = { workspace = true, optional = true }
 
 # prod feature sentry
-sentry = { workspace = true, features = ["backtrace", "contexts", "logs", "rustls", "tracing", "ureq"], optional = true }
+sentry = { workspace = true, features = ["backtrace", "logs", "rustls", "tracing", "ureq"], optional = true }
 
 # prod feature flamegraph
 tracing-flame = { workspace = true, optional = true }
@@ -281,36 +279,23 @@ derive-new.workspace = true
 hex.workspace = true
 
 [build-dependencies]
-vergen-gitcl = { workspace = true, features = ["cargo", "rustc"] }
-
 # test feature lightwalletd-grpc-tests
 tonic-prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
-abscissa_core = { workspace = true, features = ["testing"] }
-anyhow = { workspace = true }
+abscissa_core = { workspace = true, default-features = false, features = ["testing"] }
 hex-literal = { workspace = true }
 jsonrpsee-types = { workspace = true }
-once_cell = { workspace = true }
 regex = { workspace = true }
 insta = { workspace = true, features = ["json"] }
-bytes = { workspace = true }
-http-body-util = { workspace = true }
-hyper-util = { workspace = true }
-strum = { workspace = true }
-strum_macros = { workspace = true }
 
 # zakura-rpc needs the preserve_order feature, it also makes test results more stable
 serde_json = { workspace = true, features = ["preserve_order"] }
-tempfile = { workspace = true }
-
 hyper = { workspace = true, features = ["http1", "http2", "server"] }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 tokio-stream = { workspace = true }
-
-zcash_keys = { workspace = true }
 
 # test feature lightwalletd-grpc-tests
 prost = { workspace = true }
@@ -319,9 +304,6 @@ tonic-prost = { workspace = true }
 
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
-
-# enable span traces and track caller in tests
-color-eyre = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "6.0.0-rc0", features = ["proptest-impl"] }
 zakura-consensus = { path = "../zakura-consensus", version = "7.0.0-rc0", features = ["proptest-impl"] }

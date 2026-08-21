@@ -137,7 +137,7 @@ impl Item {
     /// Encodes the primary input for the JoinSplit proof statement as Bls12_381 base
     /// field elements, to match [`bellman::groth16::verify_proof()`].
     ///
-    /// NB: [`jubjub::Fq`] is a type alias for [`bls12_381::Scalar`].
+    /// NB: Jubjub's base field is a type alias for [`bls12_381::Scalar`].
     ///
     /// `joinsplit_pub_key`: the JoinSplit public validation key for this JoinSplit, from
     /// the transaction. (All JoinSplits in a transaction share the same validation key.)

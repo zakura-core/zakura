@@ -99,6 +99,9 @@ jobs:
       - name: Check locked all-feature build
         if: ${{ !cancelled() }}
         run: cargo check --locked --all-features --all-targets
+      - name: Check generated RPC artifacts
+        if: ${{ !cancelled() }}
+        run: cargo xtask check-rpc-artifacts
 
   # NOTE: per-crate default / no-default-features checks moved to
   # `test-crates.yml`, which runs `cargo hack check --workspace` (and again with

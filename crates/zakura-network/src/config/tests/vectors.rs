@@ -2,7 +2,6 @@
 
 use std::{collections::HashSet, fs, net::SocketAddr, time::Duration};
 
-use static_assertions::const_assert;
 use zakura_chain::{
     block::Height,
     parameters::{
@@ -79,10 +78,12 @@ fn ensure_peer_connection_limits_consistent() {
 
     // Zakura accepts more inbound connections than it opens outbound connections,
     // so peers which can not accept inbound connections can still reach these nodes.
-    const_assert!(
-        INBOUND_PEER_LIMIT_MULTIPLIER * OUTBOUND_PEER_LIMIT_DIVISOR
-            >= OUTBOUND_PEER_LIMIT_MULTIPLIER
-    );
+    const {
+        assert!(
+            INBOUND_PEER_LIMIT_MULTIPLIER * OUTBOUND_PEER_LIMIT_DIVISOR
+                >= OUTBOUND_PEER_LIMIT_MULTIPLIER
+        );
+    }
 
     let config = Config::default();
 

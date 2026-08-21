@@ -9,7 +9,6 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use mset::MultiSet;
 use tracing::instrument;
 
 use zakura_chain::{
@@ -43,8 +42,9 @@ use crate::{
 #[cfg(feature = "indexer")]
 use crate::request::Spend;
 
-use self::index::TransparentTransfers;
+use self::{counted_set::CountedSet, index::TransparentTransfers};
 
+mod counted_set;
 pub mod index;
 
 /// A single non-finalized partial chain, from the child of the finalized tip,
@@ -166,7 +166,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) sprout_anchors: MultiSet<sprout::tree::Root>,
+    pub(crate) sprout_anchors: CountedSet<sprout::tree::Root>,
     /// The Sprout anchors created by each block in `blocks`.
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
@@ -177,7 +177,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) sapling_anchors: MultiSet<sapling::tree::Root>,
+    pub(crate) sapling_anchors: CountedSet<sapling::tree::Root>,
     /// The Sapling anchors created by each block in `blocks`.
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
@@ -191,7 +191,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) orchard_anchors: MultiSet<orchard::tree::Root>,
+    pub(crate) orchard_anchors: CountedSet<orchard::tree::Root>,
     /// The Orchard anchors created by each block in `blocks`.
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
@@ -209,7 +209,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) ironwood_anchors: MultiSet<ironwood::tree::Root>,
+    pub(crate) ironwood_anchors: CountedSet<ironwood::tree::Root>,
 
     /// The Ironwood anchors created by each block in `blocks`.
     ///
@@ -278,19 +278,19 @@ impl Chain {
             tx_loc_by_hash: Default::default(),
             created_utxos: Default::default(),
             spent_utxos: Default::default(),
-            sprout_anchors: MultiSet::new(),
+            sprout_anchors: CountedSet::new(),
             sprout_anchors_by_height: Default::default(),
             sprout_trees_by_anchor: Default::default(),
             sprout_trees_by_height: Default::default(),
-            sapling_anchors: MultiSet::new(),
+            sapling_anchors: CountedSet::new(),
             sapling_anchors_by_height: Default::default(),
             sapling_trees_by_height: Default::default(),
             sapling_subtrees: Default::default(),
-            orchard_anchors: MultiSet::new(),
+            orchard_anchors: CountedSet::new(),
             orchard_anchors_by_height: Default::default(),
             orchard_trees_by_height: Default::default(),
             orchard_subtrees: Default::default(),
-            ironwood_anchors: MultiSet::new(),
+            ironwood_anchors: CountedSet::new(),
             ironwood_anchors_by_height: Default::default(),
             ironwood_trees_by_height: Default::default(),
             ironwood_subtrees: Default::default(),

@@ -32,8 +32,14 @@ default = []
 
 zakura-checkpoints = [
     "clap",
+    "dep:color-eyre",
+    "dep:hex",
     "itertools",
+    "dep:serde_json",
+    "dep:thiserror",
     "tokio",
+    "dep:zakura-chain",
+    "dep:zakura-node-services",
     "zakura-chain/json-conversion",
     "zakura-node-services/rpc-client"
 ]
@@ -46,6 +52,8 @@ zakura-checkpoints-offline = [
 ]
 
 # Preserve published feature names after removing the obsolete developer tools.
+clap = ["dep:clap"]
+itertools = ["dep:itertools"]
 search-issue-refs = [
     "regex",
     "reqwest",
@@ -53,19 +61,21 @@ search-issue-refs = [
 ]
 regex = []
 reqwest = []
+tokio = ["dep:tokio"]
+zcash_primitives = ["dep:zcash_primitives"]
 
 [dependencies]
-color-eyre = { workspace = true }
+color-eyre = { workspace = true, optional = true }
 
 clap = { workspace = true, features = ["derive"], optional = true }
-hex = { workspace = true }
-serde_json = { workspace = true }
+hex = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 tracing-error = { workspace = true }
 tracing-subscriber = { workspace = true }
-thiserror = { workspace = true }
+thiserror = { workspace = true, optional = true }
 
-zakura-node-services = { path = "../zakura-node-services", version = "3.2.1-rc0" }
-zakura-chain = { path = "../zakura-chain", version = "6.0.0-rc0" }
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.1-rc0", optional = true }
+zakura-chain = { path = "../zakura-chain", version = "6.0.0-rc0", optional = true }
 
 # These crates are needed for the zakura-checkpoints binary
 itertools = { workspace = true, optional = true }
@@ -74,10 +84,9 @@ itertools = { workspace = true, optional = true }
 zakura-state = { path = "../zakura-state", version = "7.0.0-rc0", optional = true }
 
 # This crate is needed for the zakura-checkpoints binary
-tokio = { workspace = true, features = ["full"], optional = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"], optional = true }
 
 zcash_primitives = { workspace = true, optional = true }
-zcash_protocol.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }

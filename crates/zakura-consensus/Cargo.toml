@@ -37,11 +37,9 @@ blake2b_simd = { workspace = true }
 bellman = { workspace = true }
 bls12_381 = { workspace = true }
 halo2 = { workspace = true }
-jubjub = { workspace = true }
 rand = { workspace = true }
 rand_10 = { workspace = true }
 rayon = { workspace = true }
-mset.workspace = true
 
 chrono = { workspace = true, features = ["clock", "std"] }
 lazy_static = { workspace = true }
@@ -54,7 +52,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "tracing", "rt-multi-thread"] }
 tower = { workspace = true, features = ["timeout", "util", "buffer"] }
 tracing = { workspace = true }
-tracing-futures = { workspace = true }
 derive-getters = { workspace = true, features = ["auto_copy_getters"] }
 
 sapling-crypto = { workspace = true, features = ["multicore"]}
@@ -88,15 +85,12 @@ proptest-derive = { workspace = true, optional = true }
 color-eyre = { workspace = true }
 
 hex = { workspace = true }
-num-integer = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 spandoc = { workspace = true }
 toml = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
-tracing-error = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 zakura-state = { path = "../zakura-state", version = "7.0.0-rc0", features = ["proptest-impl"] }
 zakura-chain = { path = "../zakura-chain", version = "6.0.0-rc0", features = ["proptest-impl"] }

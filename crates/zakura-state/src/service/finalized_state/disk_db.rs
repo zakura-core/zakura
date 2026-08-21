@@ -47,6 +47,33 @@ use super::{TypedColumnFamily, WriteTypedBatch};
 #[cfg(test)]
 mod tests;
 
+/// Decimal byte units used by database size logs.
+const DECIMAL_BYTE_UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+
+/// Formats an integer byte count with one optional decimal digit.
+fn format_bytes(bytes: u64) -> String {
+    const UNIT_SCALE: u64 = 1_000;
+
+    let mut unit_index = 0;
+    let mut unit_size = 1;
+    while unit_index + 1 < DECIMAL_BYTE_UNITS.len() && bytes >= unit_size * UNIT_SCALE {
+        unit_index += 1;
+        unit_size *= UNIT_SCALE;
+    }
+
+    let rounded_tenths =
+        (u128::from(bytes) * 10 + u128::from(unit_size) / 2) / u128::from(unit_size);
+    let whole_units = rounded_tenths / 10;
+    let fractional_tenth = rounded_tenths % 10;
+    let unit = DECIMAL_BYTE_UNITS[unit_index];
+
+    if fractional_tenth == 0 {
+        format!("{whole_units} {unit}")
+    } else {
+        format!("{whole_units}.{fractional_tenth} {unit}")
+    }
+}
+
 /// The [`rocksdb::ThreadMode`] used by the database.
 pub type DBThreadMode = rocksdb::SingleThreaded;
 
@@ -645,8 +672,8 @@ impl DiskDb {
                 column_families_log_string,
                 "{} (Disk: {}, Memory: {})",
                 cf_name,
-                human_bytes::human_bytes(cf_disk_size as f64),
-                human_bytes::human_bytes(mem_table_size.unwrap_or(0) as f64)
+                format_bytes(cf_disk_size),
+                format_bytes(mem_table_size.unwrap_or(0))
             )
             .unwrap();
         }
@@ -654,15 +681,15 @@ impl DiskDb {
         debug!("{}", column_families_log_string);
         info!(
             "Total Database Disk Size: {}",
-            human_bytes::human_bytes(total_size_on_disk as f64)
+            format_bytes(total_size_on_disk)
         );
         info!(
             "Total Live Data Disk Size: {}",
-            human_bytes::human_bytes(total_live_size_on_disk as f64)
+            format_bytes(total_live_size_on_disk)
         );
         info!(
             "Total Database Memory Size: {}",
-            human_bytes::human_bytes(total_size_in_mem as f64)
+            format_bytes(total_size_in_mem)
         );
     }
 

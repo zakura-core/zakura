@@ -33,7 +33,7 @@ use tokio_util::task::AbortOnDropHandle;
 use tower::{
     buffer::Buffer, discover::Change, layer::Layer, util::BoxService, Service, ServiceExt,
 };
-use tracing_futures::Instrument;
+use tracing::Instrument;
 
 use zakura_chain::{
     chain_tip::ChainTip,

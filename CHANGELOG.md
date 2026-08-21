@@ -11,6 +11,15 @@ independently.
 
 ## [Unreleased]
 
+## [1.3.0-rc1] - 2026-08-21
+
+### Fixed
+
+- Fixed header-chain startup when a release migrates an older disk format and
+  extends the checkpoint list in the same binary, so nodes can upgrade without
+  a resync
+  ([#765](https://github.com/zakura-core/zakura/pull/765)).
+
 ## [1.3.0-rc0] - 2026-08-20
 
 ### Added

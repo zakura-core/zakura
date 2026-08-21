@@ -235,26 +235,29 @@ The workflow must:
 1. validate the tag against the `zakura` package version
 2. boot from a retained Mainnet state below the VCT handoff and prove finalized
    state crosses it using the Zakura P2P stack
-3. deploy the release commit to `us-east-0` and verify that the service remains
-   active with working RPC and no restarts for the settle window
-4. build and verify assets before tag creation
-5. wait for approval of the `release` environment
-6. create the immutable tag and GitHub pre-release
-7. publish the release assets; the tag push then triggers
+3. build and verify assets before tag creation
+4. wait for approval of the `release` environment
+5. create the immutable tag and GitHub pre-release
+6. publish the release assets; the tag push then triggers
    `release-binaries.yml`, which publishes the Docker images
-8. dispatch `publish-crates.yml` for the new tag, unless `publish_crates` is
+7. dispatch `publish-crates.yml` for the new tag, unless `publish_crates` is
    `never`, the tag is a release candidate under the default `auto`, or
    `allow_unpublishable_crate_graph` is set
 
-The documented emergency source-first mode skips the pre-tag VCT crossing and
-start canary as well as the asset build. The start canary finishes before the
-`release` environment requests approval, so review its linked deploy run before
-approving. Its failure is intentionally advisory: investigate it, but
-infrastructure or fleet reliability issues do not block release publication.
-A canary failure restores `us-east-0` to the previously deployed binary before
-reporting, so the fleet is not left on an unvalidated build; if the rollback
-itself fails the run says so explicitly and the node needs manual recovery.
-The independently dispatched handoff canary also remains advisory and alerts
+Merging the normal `release/v*` PR independently runs
+`release-start-canary.yml` against the exact merged commit. It deploys to
+`us-east-0` and verifies that the service remains active with working RPC and
+no restarts for the settle window. Review that post-merge run before
+publishing, but it intentionally does not delay the `release` environment
+approval. Non-source-first hotfix releases dispatch the same independent
+canary from `create-release.yml`.
+
+A start-canary failure restores `us-east-0` to the previously deployed binary
+before reporting, so the fleet is not left on an unvalidated build; if the
+rollback itself fails the run says so explicitly and the node needs manual
+recovery. The documented emergency source-first mode skips the pre-tag VCT
+crossing, the hotfix start-canary dispatch, and the asset build. The
+independently dispatched handoff canary also remains advisory and alerts
 `#zakura-alerts` on failure.
 
 Before a Mode A hotfix from an older release line, confirm the PR-node assets

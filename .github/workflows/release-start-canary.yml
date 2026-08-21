@@ -1,0 +1,98 @@
+name: Release start canary
+
+# Release PRs run the Mainnet startup check after their exact merged commit
+# reaches main. The check stays visible and actionable without delaying the
+# protected approval in Create release.
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] -- no checkout of PR code; only an exact merged commit from a same-repository release PR is passed to a trusted workflow on main
+    branches: [main]
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Exact commit SHA to deploy and validate"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-start-canary-${{ github.event.pull_request.merge_commit_sha || inputs.target_ref || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  start-canary:
+    name: Validate release starts on us-east-0
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch'
+        || (
+          github.event.pull_request.merged
+          && github.event.pull_request.head.repo.full_name == github.repository
+          && startsWith(github.event.pull_request.head.ref, 'release/v')
+          && contains(github.event.pull_request.labels.*.name, 'A-release')
+          && !contains(github.event.pull_request.labels.*.name, 'A-release-state')
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Deploy and wait for the advisory start canary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REF: ${{ github.event.pull_request.merge_commit_sha || inputs.target_ref }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$TARGET_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "target_ref must be an exact 40-character commit SHA, got '${TARGET_REF}'." >&2
+            exit 1
+          fi
+
+          run_url="$(
+            gh workflow run zakura-mainnet-deploy.yml \
+              --repo "$GITHUB_REPOSITORY" \
+              --ref main \
+              -f ref="$TARGET_REF" \
+              -f node=us-east-0 \
+              -f validate_start=true
+          )"
+          run_id="${run_url##*/}"
+          if ! [[ "$run_id" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Release start canary unavailable::Could not resolve the dispatched deploy run from: ${run_url}"
+            exit 1
+          fi
+
+          {
+            echo "## Mainnet start canary"
+            echo
+            echo "Deploying commit \`${TARGET_REF}\` to \`us-east-0\`: ${run_url}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          set +e
+          timeout 40m gh run watch "$run_id" \
+            --repo "$GITHUB_REPOSITORY" \
+            --exit-status
+          canary_status=$?
+          set -e
+          if [ "$canary_status" -ne 0 ]; then
+            if [ "$canary_status" -eq 124 ]; then
+              gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY" || true
+              echo "::error title=Release start canary timed out::The us-east-0 canary exceeded 40 minutes and was cancelled. Review ${run_url}."
+            fi
+            echo "::error title=Release start canary failed::The us-east-0 deploy or startup validation failed. Review ${run_url} before creating the release."
+            {
+              echo
+              echo "Result: **failed**. This advisory does not block release approval; investigate the deploy run before publishing."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo
+            echo "Result: **passed**. The deployed service remained active, exposed RPC, and did not restart during its settle window."
+          } >> "$GITHUB_STEP_SUMMARY"

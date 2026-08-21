@@ -420,8 +420,13 @@ jobs:
           import sys
 
           response = json.load(sys.stdin)
-          if response.get("error") is not None:
-              raise SystemExit(f"RPC error: {response['error']}")
+          error = response.get("error")
+          if error is not None:
+              # Bind the value first. This script is passed as a
+              # single-quoted python3 -c argument, so a nested single quote
+              # would be spliced out by the shell before Python sees it, and
+              # nesting double quotes inside an f-string needs Python 3.12.
+              raise SystemExit(f"RPC error: {error}")
           result = response.get("result")
           if not isinstance(result, dict) or not isinstance(result.get("blocks"), int):
               raise SystemExit("getblockchaininfo returned an invalid result")

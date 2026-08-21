@@ -393,7 +393,7 @@ jobs:
 
           expected_short="${EXPECTED_COMMIT:0:9}"
           version="$("$BIN_PATH" --version)"
-          if [[ "$version" != *"+g${expected_short}"* ]]; then
+          if [[ ! "$version" =~ \+([0-9]+\.)?g${expected_short} ]]; then
             echo "deployed version does not match ${expected_short}: ${version}" >&2
             exit 1
           fi

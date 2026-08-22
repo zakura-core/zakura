@@ -86,6 +86,7 @@ const DEFAULT_BENCH_THREADS: usize = 4;
 
 const RAYON_THREADS_VAR: &str = "ZAKURA_BENCH_RAYON_THREADS";
 const TOKIO_THREADS_VAR: &str = "ZAKURA_BENCH_TOKIO_THREADS";
+const WARM_CACHES_VAR: &str = "ZAKURA_BENCH_WARM_CACHES";
 
 const BENCHMARK_CASES: &[BenchmarkCase] = &[
     BenchmarkCase {
@@ -242,6 +243,7 @@ impl Service<zs::Request> for BenchmarkState {
 
 fn worst_case_tx_verification(c: &mut Criterion) {
     init_rayon(rayon_threads());
+    let warm_caches = std::env::var_os(WARM_CACHES_VAR).is_some();
 
     let (candidates, load_stats) = load_mainnet_candidates();
     println!(
@@ -277,20 +279,27 @@ fn worst_case_tx_verification(c: &mut Criterion) {
 
         let mut sample_seconds = Vec::new();
 
+        let benchmark_group = if warm_caches {
+            "tx_verifier_repeated_workload_warm_caches"
+        } else {
+            "tx_verifier_repeated_workload"
+        };
+
         c.bench_with_input(
-            BenchmarkId::new("tx_verifier_repeated_workload", case.name),
+            BenchmarkId::new(benchmark_group, case.name),
             &workload.requests,
             |b, requests| {
                 b.iter_custom(|iterations| {
                     let start = Instant::now();
 
                     for _ in 0..iterations {
-                        // Every iteration replays the same workload, and every shielded bundle
-                        // verified once is remembered process-wide. Without this the first
-                        // iteration measures verification and the rest measure cache hits — the
-                        // opposite of the worst case these numbers size the block limits
-                        // against, which is a block of transactions the node has never seen.
-                        clear_shielded_verification_caches();
+                        // The default mode clears process-wide verification caches because the
+                        // worst case is a block of transactions the node has never seen. The
+                        // opt-in warm mode measures the production block path after the mempool
+                        // has verified each shielded bundle.
+                        if !warm_caches {
+                            clear_shielded_verification_caches();
+                        }
 
                         let verified = runtime.block_on(async {
                             let verifier =

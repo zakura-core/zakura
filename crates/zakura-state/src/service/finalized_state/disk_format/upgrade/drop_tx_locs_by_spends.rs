@@ -77,7 +77,9 @@ fn delete_transparent_spend_indexes(zakura_db: &ZakuraDb) -> Result<(), FormatCh
 
 /// Runs disk format upgrade for tracking transaction locations by their inputs and revealed nullifiers.
 ///
-/// Returns `Ok` if the upgrade completed, and an error if it was cancelled or a write failed.
+/// Returns `Ok` if the upgrade completed, and an error if it was cancelled or the transparent
+/// range deletion failed.
+#[allow(clippy::unwrap_in_result)]
 #[instrument(skip(zakura_db, cancel_receiver))]
 pub fn run(
     initial_finalized_tip_height: Height,
@@ -119,7 +121,7 @@ pub fn run(
 
             zakura_db
                 .write_batch(batch)
-                .map_err(|error| FormatChangeError::MigrationStorage(error.to_string()))?;
+                .expect("unexpected database write failure");
 
             if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
                 return Err(CancelFormatChange.into());
@@ -137,17 +139,17 @@ mod tests {
 
     use super::*;
     use crate::{
-        constants::state_database_format_version_in_code,
+        config::database_format_version_on_disk,
+        constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
         service::finalized_state::{
-            disk_format::upgrade::{DbFormatChange, FormatChangeError},
-            FinalizedState,
+            disk_format::upgrade::FormatChangeError, FinalizedState, STATE_COLUMN_FAMILIES_IN_CODE,
         },
-        CheckpointVerifiedBlock, Config,
+        CheckpointVerifiedBlock, Config, StateInitError,
     };
     use zakura_chain::{block, parameters::Network, serialization::ZcashDeserializeInto};
     use zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES;
 
-    fn mainnet_state_with_genesis() -> (tempfile::TempDir, FinalizedState) {
+    fn persistent_config() -> (tempfile::TempDir, Config) {
         let cache = tempfile::tempdir().expect("temporary cache directory is created");
         let config = Config {
             cache_dir: cache.path().to_owned(),
@@ -155,7 +157,28 @@ mod tests {
             debug_skip_non_finalized_state_backup_task: true,
             ..Config::default()
         };
-        let mut state = FinalizedState::new(&config, &Network::Mainnet)
+        (cache, config)
+    }
+
+    fn open_persistent(
+        config: &Config,
+        debug_skip_format_upgrades: bool,
+    ) -> Result<ZakuraDb, StateInitError> {
+        ZakuraDb::new(
+            config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &Network::Mainnet,
+            debug_skip_format_upgrades,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+    }
+
+    fn mainnet_state_with_genesis(config: &Config) -> FinalizedState {
+        let mut state = FinalizedState::new(config, &Network::Mainnet)
             .expect("temporary finalized state opens");
         let genesis: Arc<block::Block> = BLOCK_MAINNET_GENESIS_BYTES
             .zcash_deserialize_into()
@@ -168,12 +191,13 @@ mod tests {
                 "index removal range-delete failure test",
             )
             .expect("mainnet genesis commits");
-        (cache, state)
+        state
     }
 
     #[test]
-    fn range_delete_error_preserves_the_indexer_marker() {
-        let (_cache, state) = mainnet_state_with_genesis();
+    fn range_delete_error_preserves_indexer_marker_and_retries_on_startup() {
+        let (_cache, config) = persistent_config();
+        let state = mainnet_state_with_genesis(&config);
         let db = &state.db;
         let running_version = state_database_format_version_in_code();
         let mut indexed_version = running_version.clone();
@@ -192,63 +216,64 @@ mod tests {
             .write_batch()
             .expect("transparent index fixture writes");
 
-        let hook = register_range_delete_hook(
-            db.path(),
-            std::sync::Arc::new(|| Err("injected transparent range-delete failure".to_string())),
-        );
-        let (_cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
-        let format_change =
-            DbFormatChange::open_database(&running_version, Some(indexed_version.clone()));
-
         assert_eq!(db.finalized_tip_height(), Some(Height::MIN));
         assert_eq!(
             db.format_version_on_disk()
                 .expect("the indexed fixture version is readable"),
             Some(indexed_version.clone())
         );
-        assert_eq!(
-            format_change,
-            DbFormatChange::CheckOpenCurrent {
-                running_version: running_version.clone()
-            }
-        );
+        let db_path = db.path().to_owned();
+        drop(state);
 
-        let result = format_change.run_format_change_or_check(db, Some(Height::MIN), &cancel_rx);
-
-        assert!(
-            matches!(
-                &result,
-                Err(FormatChangeError::MigrationStorage(message))
-                    if message == "injected transparent range-delete failure"
-            ),
-            "a transparent range-delete failure must stop index removal: {result:?}"
+        let hook = register_range_delete_hook(
+            db_path,
+            std::sync::Arc::new(|| Err("injected transparent range-delete failure".to_string())),
         );
+        let Err(StateInitError::DatabaseFormatUpgrade { source, .. }) =
+            open_persistent(&config, false)
+        else {
+            panic!("a transparent range-delete failure must stop database startup");
+        };
+        assert!(matches!(
+            source.downcast_ref::<FormatChangeError>(),
+            Some(FormatChangeError::MigrationStorage(message))
+                if message == "injected transparent range-delete failure"
+        ));
         assert_eq!(
-            db.format_version_on_disk()
-                .expect("the indexed version remains readable"),
-            Some(indexed_version),
+            database_format_version_on_disk(
+                &config,
+                STATE_DATABASE_KIND,
+                running_version.major,
+                &Network::Mainnet,
+            )
+            .expect("the indexed version remains readable"),
+            Some(indexed_version.clone()),
             "failed index removal must preserve the +indexer marker"
         );
+
+        let preserved = open_persistent(&config, true)
+            .expect("the failed removal database opens when format changes are disabled");
         assert_eq!(
-            db.tx_location_by_spent_output_location(&spent_output),
+            preserved.tx_location_by_spent_output_location(&spent_output),
             Some(spending_transaction),
             "the injected failure must leave the transparent index entry readable"
         );
+        drop(preserved);
 
         drop(hook);
-        format_change
-            .run_format_change_or_check(db, Some(Height::MIN), &cancel_rx)
-            .expect("index removal retries after the injected failure is cleared");
+        let reopened = open_persistent(&config, false)
+            .expect("the next writable startup retries index removal");
         assert_eq!(
-            db.format_version_on_disk()
+            reopened
+                .format_version_on_disk()
                 .expect("the updated version is readable"),
             Some(running_version),
             "successful retry must remove the +indexer marker"
         );
         assert_eq!(
-            db.tx_location_by_spent_output_location(&spent_output),
+            reopened.tx_location_by_spent_output_location(&spent_output),
             None,
-            "successful retry must remove the transparent index entry"
+            "the marker must not be cleared until the transparent rebuild skip-trigger is removed"
         );
     }
 }

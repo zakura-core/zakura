@@ -7,6 +7,7 @@ use std::{
     mem,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use indexmap::IndexMap;
@@ -579,28 +580,41 @@ impl NonFinalizedState {
         // Reads from disk
         //
         // TODO: if these disk reads show up in profiles, run them in parallel, using std::thread::spawn()
+        let transparent_spend_start = Instant::now();
         let spent_utxos = check::utxo::transparent_spend(
             &prepared,
             &new_chain.unspent_utxos(),
             &new_chain.spent_utxos,
             finalized_state,
-        )?;
+        );
+        metrics::histogram!("state.contextual.transparent_spend.duration_seconds")
+            .record(transparent_spend_start.elapsed().as_secs_f64());
+        let spent_utxos = spent_utxos?;
 
         // Reads from disk
-        check::anchors::block_sapling_orchard_ironwood_anchors_refer_to_final_treestates(
-            finalized_state,
-            &new_chain,
-            &prepared,
-        )?;
+        let shielded_anchor_start = Instant::now();
+        let shielded_anchors =
+            check::anchors::block_sapling_orchard_ironwood_anchors_refer_to_final_treestates(
+                finalized_state,
+                &new_chain,
+                &prepared,
+            );
+        metrics::histogram!("state.contextual.shielded_anchors.duration_seconds")
+            .record(shielded_anchor_start.elapsed().as_secs_f64());
+        shielded_anchors?;
 
         // Reads from disk
+        let sprout_anchor_fetch_start = Instant::now();
         let sprout_final_treestates = check::anchors::block_fetch_sprout_final_treestates(
             finalized_state,
             &new_chain,
             &prepared,
         );
+        metrics::histogram!("state.contextual.sprout_anchor_fetch.duration_seconds")
+            .record(sprout_anchor_fetch_start.elapsed().as_secs_f64());
 
         // Quick check that doesn't read from disk
+        let contextual_block_start = Instant::now();
         let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
             prepared.clone(),
             spent_utxos.clone(),
@@ -613,9 +627,17 @@ impl NonFinalizedState {
                 transaction_count: prepared.block.transactions.len(),
                 spent_utxo_count: spent_utxos.len(),
             }
-        })?;
+        });
+        metrics::histogram!("state.contextual.block_construction.duration_seconds")
+            .record(contextual_block_start.elapsed().as_secs_f64());
+        let contextual = contextual?;
 
-        Self::validate_and_update_parallel(new_chain, contextual, sprout_final_treestates)
+        let parallel_update_start = Instant::now();
+        let result =
+            Self::validate_and_update_parallel(new_chain, contextual, sprout_final_treestates);
+        metrics::histogram!("state.contextual.parallel_update.duration_seconds")
+            .record(parallel_update_start.elapsed().as_secs_f64());
+        result
     }
 
     /// Validate `contextual` and update `new_chain`, doing CPU-intensive work in parallel batches.
@@ -641,22 +663,25 @@ impl NonFinalizedState {
 
         rayon::in_place_scope_fifo(|scope| {
             scope.spawn_fifo(|_scope| {
-                block_commitment_result = Some(check::block_commitment_is_valid_for_chain_history(
+                let start = Instant::now();
+                let result = check::block_commitment_is_valid_for_chain_history(
                     block,
                     &network,
                     &history_tree,
                     None,
-                ));
+                );
+                block_commitment_result = Some((result, start.elapsed()));
             });
 
             scope.spawn_fifo(|_scope| {
-                sprout_anchor_result =
-                    Some(check::anchors::block_sprout_anchors_refer_to_treestates(
-                        sprout_final_treestates,
-                        block2,
-                        transaction_hashes,
-                        height,
-                    ));
+                let start = Instant::now();
+                let result = check::anchors::block_sprout_anchors_refer_to_treestates(
+                    sprout_final_treestates,
+                    block2,
+                    transaction_hashes,
+                    height,
+                );
+                sprout_anchor_result = Some((result, start.elapsed()));
             });
 
             // We're pretty sure the new block is valid,
@@ -665,19 +690,35 @@ impl NonFinalizedState {
             // Pushing a block onto a Chain can launch additional parallel batches.
             // TODO: should we pass _scope into Chain::push()?
             scope.spawn_fifo(|_scope| {
+                let start = Instant::now();
                 // TODO: Replace with Arc::unwrap_or_clone() when it stabilises:
                 // https://github.com/rust-lang/rust/issues/93610
                 let new_chain = Arc::try_unwrap(new_chain)
                     .unwrap_or_else(|shared_chain| (*shared_chain).clone());
-                chain_push_result = Some(new_chain.push(contextual).map(Arc::new));
+                let result = new_chain.push(contextual).map(Arc::new);
+                chain_push_result = Some((result, start.elapsed()));
             });
         });
 
         // Don't return the updated Chain unless all the parallel results were Ok
-        block_commitment_result.expect("scope has finished")?;
-        sprout_anchor_result.expect("scope has finished")?;
+        let (block_commitment_result, block_commitment_duration) =
+            block_commitment_result.expect("scope has finished");
+        let (sprout_anchor_result, sprout_anchor_duration) =
+            sprout_anchor_result.expect("scope has finished");
+        let (chain_push_result, chain_push_duration) =
+            chain_push_result.expect("scope has finished");
 
-        chain_push_result.expect("scope has finished")
+        metrics::histogram!("state.contextual.block_commitment.duration_seconds")
+            .record(block_commitment_duration.as_secs_f64());
+        metrics::histogram!("state.contextual.sprout_anchor_check.duration_seconds")
+            .record(sprout_anchor_duration.as_secs_f64());
+        metrics::histogram!("state.contextual.chain_push.duration_seconds")
+            .record(chain_push_duration.as_secs_f64());
+
+        block_commitment_result?;
+        sprout_anchor_result?;
+
+        chain_push_result
     }
 
     /// Returns the length of the non-finalized portion of the current best chain

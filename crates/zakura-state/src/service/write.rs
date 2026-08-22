@@ -1276,7 +1276,12 @@ pub(crate) fn validate_and_commit_non_finalized(
     non_finalized_state: &mut NonFinalizedState,
     prepared: SemanticallyVerifiedBlock,
 ) -> Result<(), ValidateContextError> {
-    check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared)?;
+    let initial_checks_start = Instant::now();
+    let initial_checks =
+        check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared);
+    metrics::histogram!("state.contextual.initial_checks.duration_seconds")
+        .record(initial_checks_start.elapsed().as_secs_f64());
+    initial_checks?;
     let parent_hash = prepared.block.header.previous_block_hash;
 
     if finalized_state.finalized_tip_hash() == parent_hash {
@@ -2538,7 +2543,10 @@ impl WriteBlockWorkerTask {
                 } else {
                     tracing::trace!(?child_hash, "validating queued child");
                     if let Some(writer) = header_chain.as_ref() {
+                        let snapshot_clone_start = Instant::now();
                         let mut staged = non_finalized_state.clone();
+                        metrics::histogram!("state.contextual.snapshot_clone.duration_seconds")
+                            .record(snapshot_clone_start.elapsed().as_secs_f64());
                         validate_and_commit_non_finalized(
                             &finalized_state.db,
                             &mut staged,
@@ -2547,12 +2555,13 @@ impl WriteBlockWorkerTask {
                         .map_err(|error| CommitBlockError::from(Box::new(error)))
                         .and_then(|()| {
                             let accepted = Frontier::new(child_height, child_hash);
+                            let transition_prepare_start = Instant::now();
                             let (evidence, event_path, request) =
                                 verified_request(writer, non_finalized_state, &staged, accepted)
                                     .map_err(|error| CommitBlockError::HeaderChainError {
                                         error: error.to_string(),
                                     })?;
-                            PreparedFullStateTransition::new(
+                            let transition = PreparedFullStateTransition::new(
                                 evidence,
                                 writer
                                     .runtime
@@ -2565,16 +2574,21 @@ impl WriteBlockWorkerTask {
                                 None,
                                 request,
                             )
-                            .map_err(|error| CommitBlockError::HeaderChainError {
-                                error: error.to_string(),
-                            })?
-                            .commit(&writer.runtime, non_finalized_state, &writer.context())
-                            .map(|_| ())
                             .map_err(|error| {
                                 CommitBlockError::HeaderChainError {
                                     error: error.to_string(),
                                 }
-                            })
+                            })?;
+                            metrics::histogram!(
+                                "state.contextual.header_transition_prepare.duration_seconds"
+                            )
+                            .record(transition_prepare_start.elapsed().as_secs_f64());
+                            transition
+                                .commit(&writer.runtime, non_finalized_state, &writer.context())
+                                .map(|_| ())
+                                .map_err(|error| CommitBlockError::HeaderChainError {
+                                    error: error.to_string(),
+                                })
                         })
                     } else {
                         validate_and_commit_non_finalized(

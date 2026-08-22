@@ -1006,7 +1006,7 @@ impl TransactionObject {
                     let mut nullifier = spend.nullifier.as_bytes();
                     nullifier.reverse();
 
-                    let mut rk: [u8; 32] = spend.clone().rk.into();
+                    let mut rk: [u8; 32] = (&spend.rk).into();
                     rk.reverse();
 
                     let spend_auth_sig: [u8; 64] = spend.spend_auth_sig.into();

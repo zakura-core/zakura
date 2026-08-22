@@ -545,7 +545,7 @@ fn hash_sapling_spends(
             if let Some(anchor) = &anchor {
                 nh.update(anchor);
             }
-            nh.update(&<[u8; 32]>::from(spend.rk.clone()));
+            nh.update(&<[u8; 32]>::from(&spend.rk));
         }
         h.update(ch.finalize().as_bytes());
         h.update(nh.finalize().as_bytes());

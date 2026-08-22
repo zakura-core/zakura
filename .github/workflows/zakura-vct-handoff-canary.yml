@@ -10,7 +10,8 @@ on:
     paths:
       - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier-grid.bin
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
   workflow_call:
     inputs:
       target_ref:

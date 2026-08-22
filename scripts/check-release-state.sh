@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verify the committed Mainnet release state without cargo: the checkpoint
-# list, VCT frontier, historical subtree roots, and manifest must identify the
-# same finalized block. Used by `make pre-release-state` and the update-release-state
+# list, VCT frontier, historical subtree roots, frontier grid, and manifest must
+# identify the same finalized block. Used by `make pre-release-state` and the update-release-state
 # workflow; the cargo-side twin is the `embedded_mainnet_final_frontiers_parse`
 # unit test. See docs/design/verified-commitment-trees.md, section 16.3.
 #
@@ -26,6 +26,9 @@ from datetime import datetime, timedelta, timezone
 CHECKPOINTS = "crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt"
 FRONTIER = "crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin"
 SUBTREES = "crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin"
+FRONTIER_GRID = (
+    "crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier-grid.bin"
+)
 PROVENANCE = "crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json"
 REQUIRED_KEYS = {
     "schema_version",
@@ -40,7 +43,14 @@ REQUIRED_KEYS = {
     "subtrees_sha256",
     "subtrees_size",
 }
-OPTIONAL_KEYS = {"meta_sha256"}
+# The frontier grid joined the bundle after the other three artifacts, so a manifest
+# without it is a valid older one. Half a record, or a record without its file, is not.
+FRONTIER_GRID_KEYS = {
+    "frontier_grid_sha256",
+    "frontier_grid_size",
+    "frontier_grid_entries",
+}
+OPTIONAL_KEYS = {"meta_sha256"} | FRONTIER_GRID_KEYS
 STALE_WARNING = timedelta(days=14)
 # NetworkUpgrade::Nu6_3 (Ironwood) activation on Mainnet; kept in sync with
 # crates/zakura-chain/src/parameters/constants.rs. Frontiers at or above activation
@@ -168,6 +178,79 @@ if (
     != subtrees[subtree_prefix.size:subtree_header_len]
 ):
     fail(f"{SUBTREES} digest does not match its header")
+
+grid_keys = FRONTIER_GRID_KEYS & set(provenance)
+if grid_keys and grid_keys != FRONTIER_GRID_KEYS:
+    fail(
+        "provenance has a partial frontier grid record, missing "
+        f"{', '.join(sorted(FRONTIER_GRID_KEYS - grid_keys))}"
+    )
+if not grid_keys:
+    if os.path.exists(FRONTIER_GRID):
+        fail(f"{FRONTIER_GRID} is committed but the provenance record does not describe it")
+else:
+    try:
+        grid = open(FRONTIER_GRID, "rb").read()
+    except OSError as error:
+        fail(f"cannot read {FRONTIER_GRID}: {error}")
+    if len(grid) != provenance["frontier_grid_size"]:
+        fail(f"{FRONTIER_GRID} size {len(grid)} does not match the provenance record")
+    if hashlib.sha256(grid).hexdigest() != provenance["frontier_grid_sha256"]:
+        fail(f"{FRONTIER_GRID} digest does not match the provenance record")
+
+    grid_prefix = struct.Struct("<8sHBIII")
+    grid_header_len = grid_prefix.size + 32
+    if len(grid) < grid_header_len:
+        fail(f"{FRONTIER_GRID} is truncated before its payload")
+    magic, version, network, _spacing, grid_checkpoint, grid_entries = grid_prefix.unpack_from(
+        grid
+    )
+    if magic != b"ZKVCTFR1" or version != 1 or network != 1:
+        fail(f"{FRONTIER_GRID} has invalid Mainnet frontier grid framing")
+    if grid_entries != provenance["frontier_grid_entries"]:
+        fail(
+            f"{FRONTIER_GRID} declares {grid_entries} entries, but the provenance record "
+            f"says {provenance['frontier_grid_entries']}"
+        )
+    # A node refuses to start when its own fast-sync handoff is above the grid's checkpoint,
+    # so the grid has to describe the same block as the checkpoint list beside it.
+    if grid_checkpoint != height:
+        fail(
+            f"{FRONTIER_GRID} covers checkpoint {grid_checkpoint}, not provenance "
+            f"finalized_height {height}"
+        )
+    grid_payload = grid[grid_header_len:]
+    if (
+        hashlib.sha256(grid[:grid_prefix.size] + grid_payload).digest()
+        != grid[grid_prefix.size:grid_header_len]
+    ):
+        fail(f"{FRONTIER_GRID} digest does not match its header")
+
+    # Walk the length-prefixed entries so truncation or padding cannot pass as framing.
+    offset = 0
+    previous_entry = None
+    for _ in range(grid_entries):
+        if offset + 4 > len(grid_payload):
+            fail(f"{FRONTIER_GRID} is truncated inside its entries")
+        (entry_height,) = struct.unpack_from("<I", grid_payload, offset)
+        offset += 4
+        if previous_entry is not None and entry_height <= previous_entry:
+            fail(f"{FRONTIER_GRID} entries are not in increasing height order")
+        previous_entry = entry_height
+        for _pool in range(3):
+            if offset + 4 > len(grid_payload):
+                fail(f"{FRONTIER_GRID} is truncated inside its entries")
+            (blob_len,) = struct.unpack_from("<I", grid_payload, offset)
+            offset += 4 + blob_len
+            if offset > len(grid_payload):
+                fail(f"{FRONTIER_GRID} is truncated inside its entries")
+    if offset != len(grid_payload):
+        fail(f"{FRONTIER_GRID} has trailing bytes after its entries")
+    if previous_entry is not None and previous_entry >= grid_checkpoint:
+        fail(
+            f"{FRONTIER_GRID} has an entry at height {previous_entry}, at or above its "
+            f"checkpoint {grid_checkpoint}"
+        )
 
 source = provenance["source"]
 meta_sha256 = provenance.get("meta_sha256")

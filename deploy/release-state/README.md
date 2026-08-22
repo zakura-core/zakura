@@ -36,17 +36,22 @@ whole-band replay — hours on Mainnet.
 
 ## Cutover order
 
-This change makes the publisher emit `mainnet-frontier-grid.bin`. Import and provenance checks that
-_require_ the fourth file land in a follow-up, so today's importer still accepts a three-file
-bundle and a four-file one alike. Deploy when convenient after merge:
+The importer requires every bundle to carry all four files and fails closed on one that does not,
+so the publisher has to be updated around the same time as the repository. It cannot be updated
+_first_: `deploy-snapshot-host.sh` refuses to install an exporter whose revision is not already an
+ancestor of `origin/main`, which is a supply-chain control worth keeping.
 
-1. Merge this repository change.
+So the order is:
+
+1. Merge the repository change.
 2. Run `deploy-snapshot-host.sh`, now buildable from `main`.
 3. Set `RELEASE_STATE_ARCHIVE_CACHE` and enable the timer.
+4. Dispatch `update-release-state.yml` once the first new bundle exists.
 
-Until the import follow-up merges, scheduled imports ignore the new grid file. Once that follow-up
-lands, prefer deploying the publisher the same day so the first required four-file bundle already
-exists.
+Between 1 and 3 a scheduled import will fail with `meta.files is missing keys:
+mainnet-frontier-grid.bin`. Nothing is committed and nothing in production changes — it is a red
+scheduled job that clears as soon as the new publisher publishes — but prefer merging and
+deploying the same day over leaving it red for a week.
 
 ## One-time host setup
 

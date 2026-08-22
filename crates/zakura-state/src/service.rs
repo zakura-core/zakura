@@ -2063,12 +2063,13 @@ fn frontier_grid_gap_exceeds_replay_limit(
     (blocks > limit).then_some(blocks)
 }
 
-/// Loads the configured frontier grid into a fresh cache.
+/// Loads the configured frontier grid override or the embedded Mainnet grid into a fresh cache.
 ///
-/// An unreadable or invalid configured artifact is fatal for a node that derives
-/// ([`Config::derive_historical_trees`]) and a warning for one that does not. Without a configured
-/// grid, the node keeps reporting the absent band as unavailable. A well-framed artifact is still
-/// refused unless its entries tile genesis through
+/// Mainnet needs no deployment-time file: its reviewed grid is part of the binary. An explicit
+/// path overrides that grid, and an unreadable or invalid override is fatal for a node that
+/// derives ([`Config::derive_historical_trees`]) and a warning for one that does not. Networks
+/// without an embedded or configured grid keep reporting the absent band as unavailable. A
+/// well-framed artifact is still refused unless its entries tile genesis through
 /// `last_checkpoint` at gaps of at most [`MAX_HISTORICAL_TREE_REPLAY_BLOCKS`].
 fn load_historical_frontier_artifact(
     network: &Network,
@@ -2098,12 +2099,25 @@ fn load_historical_frontier_artifact_if_enabled(
                 }),
             path.clone(),
         )
-    } else {
-        if derivation_enabled {
+    } else if derivation_enabled {
+        let Some(artifact) = finalized_state::embedded_historical_frontier_artifact(network) else {
             tracing::info!(
-                "historical tree derivation is idle: no historical frontier artifact is configured"
+                "historical tree derivation is idle: this network has no embedded historical \
+                 frontier artifact"
             );
-        }
+
+            return Ok(LoadedHistoricalFrontierArtifact {
+                cache: Arc::new(Mutex::new(read::HistoricalTreeCache::default())),
+                last_checkpoint: None,
+                source_path: None,
+            });
+        };
+
+        (
+            Ok(artifact),
+            PathBuf::from("embedded Mainnet historical frontier artifact"),
+        )
+    } else {
         return Ok(LoadedHistoricalFrontierArtifact {
             cache: Arc::new(Mutex::new(read::HistoricalTreeCache::default())),
             last_checkpoint: None,

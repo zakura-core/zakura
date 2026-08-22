@@ -1,4 +1,4 @@
-//! Tracks transaction locations by their inputs and revealed nullifiers.
+//! Removes transaction-location indexes for spent outputs and revealed nullifiers.
 
 use crossbeam_channel::{Receiver, TryRecvError};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -9,73 +9,21 @@ use crate::service::finalized_state::ZakuraDb;
 
 use super::{super::super::DiskWriteBatch, CancelFormatChange, FormatChangeError};
 
-#[cfg(all(test, not(feature = "indexer")))]
-type RangeDeleteHook = std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
-
-#[cfg(all(test, not(feature = "indexer")))]
-static RANGE_DELETE_HOOKS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, RangeDeleteHook>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-#[cfg(all(test, not(feature = "indexer")))]
-struct RangeDeleteHookGuard {
-    database_path: std::path::PathBuf,
-}
-
-#[cfg(all(test, not(feature = "indexer")))]
-impl Drop for RangeDeleteHookGuard {
-    fn drop(&mut self) {
-        RANGE_DELETE_HOOKS
-            .lock()
-            .expect("range-delete hook mutex is not poisoned")
-            .remove(&self.database_path);
-    }
-}
-
-#[cfg(all(test, not(feature = "indexer")))]
-fn register_range_delete_hook(
-    database_path: impl Into<std::path::PathBuf>,
-    hook: RangeDeleteHook,
-) -> RangeDeleteHookGuard {
-    let database_path = database_path.into();
-    let replaced = RANGE_DELETE_HOOKS
-        .lock()
-        .expect("range-delete hook mutex is not poisoned")
-        .insert(database_path.clone(), hook);
-    assert!(
-        replaced.is_none(),
-        "database already has a range-delete hook"
-    );
-
-    RangeDeleteHookGuard { database_path }
-}
-
-#[cfg(all(test, not(feature = "indexer")))]
-fn run_range_delete_hook(database_path: &std::path::Path) -> Result<(), String> {
-    let hook = RANGE_DELETE_HOOKS
-        .lock()
-        .map_err(|_| "range-delete hook mutex is poisoned".to_string())?
-        .get(database_path)
-        .cloned();
-    hook.map_or(Ok(()), |hook| hook())
-}
-
 fn delete_transparent_spend_indexes(zakura_db: &ZakuraDb) -> Result<(), FormatChangeError> {
-    #[cfg(all(test, not(feature = "indexer")))]
-    run_range_delete_hook(zakura_db.path()).map_err(FormatChangeError::MigrationStorage)?;
-
     zakura_db
         .tx_loc_by_spent_output_loc_cf()
         .new_batch_for_writing()
         .zs_delete_range(
             &crate::OutputLocation::from_output_index(crate::TransactionLocation::MIN, 0),
+            // This upper bound is exclusive, but its transaction and output indexes cannot occur
+            // in a valid block because they exceed the consensus block size limit.
             &crate::OutputLocation::from_output_index(crate::TransactionLocation::MAX, u32::MAX),
         )
         .write_batch()
         .map_err(|error| FormatChangeError::MigrationStorage(error.to_string()))
 }
 
-/// Runs disk format upgrade for tracking transaction locations by their inputs and revealed nullifiers.
+/// Removes transaction-location indexes for spent outputs and revealed nullifiers.
 ///
 /// Returns `Ok` if the upgrade completed, and an error if it was cancelled or the transparent
 /// range deletion failed.
@@ -142,7 +90,8 @@ mod tests {
         config::database_format_version_on_disk,
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
         service::finalized_state::{
-            disk_format::upgrade::FormatChangeError, FinalizedState, STATE_COLUMN_FAMILIES_IN_CODE,
+            column_family::register_typed_batch_write_error, FinalizedState,
+            STATE_COLUMN_FAMILIES_IN_CODE, TX_LOC_BY_SPENT_OUT_LOC,
         },
         CheckpointVerifiedBlock, Config, StateInitError,
     };
@@ -194,6 +143,13 @@ mod tests {
         state
     }
 
+    fn injected_rocksdb_error() -> rocksdb::Error {
+        match rocksdb::DB::open_default(std::path::Path::new("\0")) {
+            Ok(_) => panic!("a path containing a null byte must be rejected"),
+            Err(error) => error,
+        }
+    }
+
     #[test]
     fn range_delete_error_preserves_indexer_marker_and_retries_on_startup() {
         let (_cache, config) = persistent_config();
@@ -225,10 +181,10 @@ mod tests {
         let db_path = db.path().to_owned();
         drop(state);
 
-        let hook = register_range_delete_hook(
-            db_path,
-            std::sync::Arc::new(|| Err("injected transparent range-delete failure".to_string())),
-        );
+        let injected_error = injected_rocksdb_error();
+        let injected_error_message = injected_error.to_string();
+        let write_error =
+            register_typed_batch_write_error(db_path, TX_LOC_BY_SPENT_OUT_LOC, injected_error);
         let Err(StateInitError::DatabaseFormatUpgrade { source, .. }) =
             open_persistent(&config, false)
         else {
@@ -237,7 +193,7 @@ mod tests {
         assert!(matches!(
             source.downcast_ref::<FormatChangeError>(),
             Some(FormatChangeError::MigrationStorage(message))
-                if message == "injected transparent range-delete failure"
+                if message == &injected_error_message
         ));
         assert_eq!(
             database_format_version_on_disk(
@@ -260,7 +216,7 @@ mod tests {
         );
         drop(preserved);
 
-        drop(hook);
+        drop(write_error);
         let reopened = open_persistent(&config, false)
             .expect("the next writable startup retries index removal");
         assert_eq!(

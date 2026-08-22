@@ -109,6 +109,21 @@ fn durable_vct_marker_keeps_historical_derivation_enabled_after_config_change() 
     let initial_config = Config::ephemeral();
     let finalized_state =
         FinalizedState::new(&initial_config, &network).expect("ephemeral finalized state opens");
+    let artifact_checkpoint = Height(11);
+    let artifact_file =
+        tempfile::NamedTempFile::new().expect("temporary frontier artifact is created");
+    let artifact = FrontierArtifact {
+        spacing: 1,
+        last_checkpoint: artifact_checkpoint,
+        entries: vec![FrontierEntry {
+            height: Height(0),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
+        }],
+    };
+    std::fs::write(artifact_file.path(), artifact.encode(&network))
+        .expect("historical frontier artifact is written");
 
     let mut batch = DiskWriteBatch::new();
     batch.update_vct_sync_marker(&finalized_state.db, Height(10));
@@ -120,6 +135,7 @@ fn durable_vct_marker_keeps_historical_derivation_enabled_after_config_change() 
     let reopened_config = Config {
         checkpoint_sync: false,
         vct_fast_sync: false,
+        historical_frontier_artifact: Some(artifact_file.path().to_path_buf()),
         ..initial_config
     };
     assert!(
@@ -132,10 +148,10 @@ fn durable_vct_marker_keeps_historical_derivation_enabled_after_config_change() 
         &reopened_config,
         finalized_state.db.vct_synced_below().is_some(),
     )
-    .expect("the durable marker loads the embedded grid after sync settings change");
+    .expect("the durable marker loads the configured grid after sync settings change");
     assert_eq!(
         loaded.last_checkpoint,
-        Some(network.checkpoint_list().max_height()),
+        Some(artifact_checkpoint),
         "the reopened archive keeps the grid needed to serve its absent band"
     );
 }

@@ -30,7 +30,7 @@ use zakura_chain::{
     sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
     transaction::{self, UnminedTx},
-    transparent::{self, utxos_from_ordered_utxos},
+    transparent,
     value_balance::{ValueBalance, ValueBalanceError},
 };
 
@@ -772,7 +772,7 @@ impl ContextuallyVerifiedBlock {
     /// [`Chain::push()`](crate::service::non_finalized_state::Chain::push) returns success.
     pub fn with_block_and_spent_utxos(
         semantically_verified: SemanticallyVerifiedBlock,
-        mut spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+        spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     ) -> Result<Self, ValueBalanceError> {
         let SemanticallyVerifiedBlock {
             block,
@@ -784,24 +784,20 @@ impl ContextuallyVerifiedBlock {
             auth_data_root,
         } = semantically_verified;
 
-        // This is redundant for the non-finalized state,
-        // but useful to make some tests pass more easily.
-        //
-        // TODO: fix the tests, and stop adding unrelated outputs.
-        spent_outputs.extend(new_outputs.clone());
+        let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
+            &spent_outputs,
+            deferred_pool_balance_change,
+        )?;
 
         Ok(Self {
-            block: block.clone(),
+            block,
             hash,
             height,
             new_outputs,
-            spent_outputs: spent_outputs.clone(),
+            spent_outputs,
             transaction_hashes,
             auth_data_root,
-            chain_value_pool_change: block.chain_value_pool_change(
-                &utxos_from_ordered_utxos(spent_outputs),
-                deferred_pool_balance_change,
-            )?,
+            chain_value_pool_change,
         })
     }
 }
@@ -969,6 +965,10 @@ mod tests {
                 .expect("the test block's value balance can be calculated");
 
         assert_eq!(contextual.auth_data_root, expected_auth_data_root);
+        assert!(
+            contextual.spent_outputs.is_empty(),
+            "coinbase outputs are new outputs, not spent outputs",
+        );
         assert_eq!(
             SemanticallyVerifiedBlock::from(contextual).auth_data_root,
             expected_auth_data_root

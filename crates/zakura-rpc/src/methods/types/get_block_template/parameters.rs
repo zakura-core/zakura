@@ -102,10 +102,9 @@ pub struct GetBlockTemplateParameters {
 
     /// The workid for the block template.
     ///
-    /// currently unused.
     #[serde(rename = "workid")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) _work_id: Option<String>,
+    pub(crate) work_id: Option<String>,
 }
 
 impl GetBlockTemplateParameters {

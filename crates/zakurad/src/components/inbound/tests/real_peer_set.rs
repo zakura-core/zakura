@@ -1127,7 +1127,7 @@ async fn setup(
 mod submitblock_test {
     use tracing::{Instrument, Level};
     use tracing_subscriber::fmt;
-    use zakura_rpc::SubmitBlockChannel;
+    use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
 
     use super::*;
 
@@ -1196,7 +1196,11 @@ mod submitblock_test {
         // Send a block to the channel
         submitblock_channel
             .sender()
-            .send((block::Hash([1; 32]), block::Height(1)))
+            .send(MinedBlockEvent::Committed {
+                hash: block::Hash([1; 32]),
+                height: block::Height(1),
+                early_advertised: false,
+            })
             .await
             .unwrap();
         let gossip_task_handle = tokio::spawn(
@@ -1217,7 +1221,7 @@ mod submitblock_test {
                 let sent_mined_block = {
                     let captured_logs = logs.lock().unwrap();
                     String::from_utf8_lossy(&captured_logs)
-                        .contains("sending mined block broadcast")
+                        .contains("sending committed mined block broadcast")
                 };
 
                 if sent_mined_block {
@@ -1237,7 +1241,7 @@ mod submitblock_test {
         };
 
         assert!(log_output.contains("initializing block gossip task"));
-        assert!(log_output.contains("sending mined block broadcast"));
+        assert!(log_output.contains("sending committed mined block broadcast"));
 
         gossip_task_handle.abort();
         let gossip_task_error = gossip_task_handle

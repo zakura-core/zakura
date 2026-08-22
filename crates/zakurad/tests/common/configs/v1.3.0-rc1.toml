@@ -61,6 +61,7 @@ tx_cost_limit = 80000000
 
 [mining]
 internal_miner = false
+optimistic_block_inventory = true
 
 [network]
 cache_dir = true

@@ -15,7 +15,7 @@ use zakura_chain::{
     serialization::ZcashDeserializeInto,
 };
 use zakura_network::{Request, Response};
-use zakura_rpc::SubmitBlockChannel;
+use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
 use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -27,7 +27,7 @@ const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
 struct GossipTestSetup {
     peer_set: MockService<Request, Response, PanicAssertion>,
-    submitblock_sender: tokio::sync::mpsc::Sender<(zakura_chain::block::Hash, Height)>,
+    submitblock_sender: tokio::sync::mpsc::Sender<MinedBlockEvent>,
     state_service: BoxService<zakura_state::Request, zakura_state::Response, crate::BoxError>,
     gossip_task_handle: JoinHandle<Result<(), BlockGossipError>>,
 }
@@ -139,7 +139,11 @@ async fn mined_block_marks_tip_after_successful_broadcast() {
         .unwrap();
 
     submitblock_sender
-        .send((block_two.hash(), block_two.coinbase_height().unwrap()))
+        .send(MinedBlockEvent::Committed {
+            hash: block_two.hash(),
+            height: block_two.coinbase_height().unwrap(),
+            early_advertised: false,
+        })
         .await
         .expect("mined block notification should be accepted");
 
@@ -185,7 +189,11 @@ async fn mined_block_mark_survives_pending_submit_queue() {
 
     // First mined notification — start AdvertiseBlockToAll but hold the response open.
     submitblock_sender
-        .send((hash, height))
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height,
+            early_advertised: false,
+        })
         .await
         .expect("mined block notification should be accepted");
 
@@ -196,7 +204,11 @@ async fn mined_block_mark_survives_pending_submit_queue() {
     // Queue a second notification while the first broadcast is still in flight so the
     // submit-block channel is nonempty when the first mark arrives.
     submitblock_sender
-        .send((hash, height))
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height,
+            early_advertised: false,
+        })
         .await
         .expect("second mined block notification should be accepted");
 
@@ -243,7 +255,11 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
         .unwrap();
 
     submitblock_sender
-        .send((block_two.hash(), block_two.coinbase_height().unwrap()))
+        .send(MinedBlockEvent::Committed {
+            hash: block_two.hash(),
+            height: block_two.coinbase_height().unwrap(),
+            early_advertised: false,
+        })
         .await
         .expect("mined block notification should be accepted");
 

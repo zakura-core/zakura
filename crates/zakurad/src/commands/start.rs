@@ -542,10 +542,11 @@ impl StartCmd {
         info!("initializing verifiers");
         let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();
         let (block_verifier_router, tx_verifier, consensus_task_handles, max_checkpoint_height) =
-            zakura_consensus::router::init(
+            zakura_consensus::router::init_with_read_state(
                 config.consensus.clone(),
                 &config.network.network,
                 state.clone(),
+                read_only_state_service.clone(),
                 tx_verifier_setup_rx,
             )
             .await;

@@ -60,6 +60,8 @@ pub enum BlockLifecycleMilestone {
     StorageApplied = 1 << 5,
     /// State published the in-memory change.
     PublishedInMemory = 1 << 6,
+    /// The serialized state writer started processing the block.
+    WriterStarted = 1 << 7,
 }
 
 impl BlockLifecycleMilestone {
@@ -76,6 +78,7 @@ impl BlockLifecycleMilestone {
             Self::ContextuallyValid => "contextually_valid",
             Self::StorageApplied => "storage_applied",
             Self::PublishedInMemory => "published_in_memory",
+            Self::WriterStarted => "writer_started",
         }
     }
 }

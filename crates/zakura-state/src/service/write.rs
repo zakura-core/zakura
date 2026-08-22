@@ -1627,7 +1627,12 @@ pub enum NonFinalizedWriteMessage {
     },
     /// A newly downloaded and semantically verified block prepared for
     /// contextual validation and insertion into the non-finalized state.
-    Commit(QueuedSemanticallyVerified),
+    Commit {
+        /// The block, response channel, and optional lifecycle reporter.
+        queued: QueuedSemanticallyVerified,
+        /// The instant immediately before the state service attempted the channel send.
+        queued_at: Instant,
+    },
     /// The hash of a block that should be invalidated and removed from
     /// the non-finalized state, if present.
     Invalidate {
@@ -1644,7 +1649,10 @@ pub enum NonFinalizedWriteMessage {
 
 impl From<QueuedSemanticallyVerified> for NonFinalizedWriteMessage {
     fn from(block: QueuedSemanticallyVerified) -> Self {
-        NonFinalizedWriteMessage::Commit(block)
+        NonFinalizedWriteMessage::Commit {
+            queued: block,
+            queued_at: Instant::now(),
+        }
     }
 }
 
@@ -2518,7 +2526,9 @@ impl WriteBlockWorkerTask {
                     let _ = rsp_tx.send(result);
                     None
                 }
-                NonFinalizedWriteMessage::Commit(queued_child) => Some(queued_child),
+                NonFinalizedWriteMessage::Commit { queued, queued_at } => {
+                    Some((queued, queued_at))
+                }
                 NonFinalizedWriteMessage::Invalidate { hash, rsp_tx } => {
                     tracing::info!(?hash, "invalidating a block in the non-finalized state");
                     let result = if let Some(writer) = header_chain.as_ref() {
@@ -2583,9 +2593,16 @@ impl WriteBlockWorkerTask {
                 }
             };
 
-            let Some((queued_child, rsp_tx, lifecycle)) = queued_child_and_rsp_tx else {
+            let Some(((queued_child, rsp_tx, lifecycle), queued_at)) = queued_child_and_rsp_tx
+            else {
                 continue;
             };
+
+            metrics::histogram!("state.block_writer.queue.duration_seconds")
+                .record(queued_at.elapsed().as_secs_f64());
+            if let Some(lifecycle) = lifecycle.as_ref() {
+                lifecycle.reach(BlockLifecycleMilestone::WriterStarted);
+            }
 
             let child_hash = queued_child.hash;
             let parent_hash = queued_child.block.header.previous_block_hash;

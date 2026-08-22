@@ -4106,6 +4106,12 @@ criteria = "safe-to-deploy"
 delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
 notes = "Reviewed the complete packaged delta. It changes only the declared package version, the pasta-curves dependency version, matching lockfile data, release note, and source commit metadata. Rust source, features, and build behavior are unchanged."
 
+[[audits.zakura-halo2-proofs]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
+notes = "Reviewed the complete packaged delta. The two-lane batch inversion matches Montgomery inversion, skips zeros, handles odd tails, and has direct equality tests against ff::BatchInvert. Its prover inputs are challenge-blinded, and the dependency's inversion is already variable-time. Moving public inverse-FFT normalization to the affine inputs preserves the linear transform. The evaluator reuses cache slots only when the prior slot's last load precedes the new store, and the lower cache threshold changes only the plan workspace. All 76 executable all-feature tests pass. The no-default library target compiles; the no-default integration command fails because its existing plonk_api test imports the default-only BatchVerifier."
+
 [[audits.zakura-jubjub]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"

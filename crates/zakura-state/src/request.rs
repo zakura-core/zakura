@@ -27,7 +27,7 @@ use zakura_chain::{
     sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
     transaction::{self, UnminedTx},
-    transparent::{self, utxos_from_ordered_utxos},
+    transparent,
     value_balance::{ValueBalance, ValueBalanceError},
 };
 
@@ -513,7 +513,7 @@ impl ContextuallyVerifiedBlock {
     /// [`Chain::push()`](crate::service::non_finalized_state::Chain::push) returns success.
     pub fn with_block_and_spent_utxos(
         semantically_verified: SemanticallyVerifiedBlock,
-        mut spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+        spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     ) -> Result<Self, ValueBalanceError> {
         let SemanticallyVerifiedBlock {
             block,
@@ -525,23 +525,19 @@ impl ContextuallyVerifiedBlock {
             auth_data_root: _,
         } = semantically_verified;
 
-        // This is redundant for the non-finalized state,
-        // but useful to make some tests pass more easily.
-        //
-        // TODO: fix the tests, and stop adding unrelated outputs.
-        spent_outputs.extend(new_outputs.clone());
+        let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
+            &spent_outputs,
+            deferred_pool_balance_change,
+        )?;
 
         Ok(Self {
-            block: block.clone(),
+            block,
             hash,
             height,
             new_outputs,
-            spent_outputs: spent_outputs.clone(),
+            spent_outputs,
             transaction_hashes,
-            chain_value_pool_change: block.chain_value_pool_change(
-                &utxos_from_ordered_utxos(spent_outputs),
-                deferred_pool_balance_change,
-            )?,
+            chain_value_pool_change,
         })
     }
 }

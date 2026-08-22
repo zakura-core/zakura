@@ -167,6 +167,10 @@ harness = false
 name = "note_commitment_hash"
 harness = false
 
+[[bench]]
+name = "orchard_tree_update"
+harness = false
+
 [lints]
 workspace = true
 

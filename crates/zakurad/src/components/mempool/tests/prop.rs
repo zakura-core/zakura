@@ -9,7 +9,10 @@ use proptest_derive::Arbitrary;
 
 use chrono::Duration;
 use tokio::time;
-use tower::{buffer::Buffer, util::BoxService};
+use tower::{
+    buffer::Buffer,
+    util::{BoxCloneService, BoxService},
+};
 
 use zakura_chain::{
     block::{self, Block},
@@ -34,7 +37,7 @@ use crate::components::{
 type MockPeerSet = MockService<zn::Request, zn::Response, PropTestAssertion>;
 
 /// A [`MockService`] representing the Zebra state service.
-type MockState = MockService<zs::Request, zs::Response, PropTestAssertion>;
+type MockState = MockService<zs::ReadRequest, zs::ReadResponse, PropTestAssertion>;
 
 /// A [`MockService`] representing the Zebra transaction verifier service.
 type MockTxVerifier = MockService<tx::Request, tx::Response, PropTestAssertion, TransactionError>;
@@ -267,6 +270,7 @@ fn setup(
 ) {
     let peer_set = MockService::build().for_prop_tests();
     let state_service = MockService::build().for_prop_tests();
+    let state_guard = MockService::build().for_prop_tests();
     let tx_verifier = MockService::build().for_prop_tests();
 
     let (sync_status, recent_syncs) = SyncStatus::new();
@@ -281,7 +285,8 @@ fn setup(
         },
         false,
         Buffer::new(BoxService::new(peer_set.clone()), 1),
-        Buffer::new(BoxService::new(state_service.clone()), 1),
+        Buffer::new(BoxService::new(state_guard), 1),
+        BoxCloneService::new(state_service.clone()),
         Buffer::new(BoxService::new(tx_verifier.clone()), 1),
         sync_status,
         latest_chain_tip,

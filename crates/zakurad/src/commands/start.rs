@@ -603,6 +603,7 @@ impl StartCmd {
             config.network.expose_peer_addresses,
             peer_set.clone(),
             state.clone(),
+            tower::util::BoxCloneService::new(read_only_state_service.clone()),
             tx_verifier,
             sync_status.clone(),
             latest_chain_tip.clone(),

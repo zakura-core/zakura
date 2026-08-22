@@ -176,7 +176,10 @@ where
     ZN::Future: Send,
     ZV: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     ZV::Future: Send,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    ZS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     ZS::Future: Send,
 {
     // Services
@@ -187,7 +190,7 @@ where
     /// A service that verifies downloaded transactions.
     verifier: ZV,
 
-    /// A service that manages cached blockchain state.
+    /// A service that reads cached blockchain state.
     state: ZS,
 
     /// Whether legacy peer address labels in logs are unredacted.
@@ -243,7 +246,10 @@ where
     ZN::Future: Send,
     ZV: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     ZV::Future: Send,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    ZS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     ZS::Future: Send,
 {
     type Item = Result<
@@ -321,7 +327,10 @@ where
     ZN::Future: Send,
     ZV: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     ZV::Future: Send,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    ZS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     ZS::Future: Send,
 {
     /// Initialize a new download stream with the provided services.
@@ -443,9 +452,9 @@ where
 
             trace!(?txid, "transaction is not in best chain");
 
-            let (tip_height, next_height) = match state.oneshot(zs::Request::Tip).await {
-                Ok(zs::Response::Tip(None)) => Ok((None, Height(0))),
-                Ok(zs::Response::Tip(Some((height, _hash)))) => {
+            let (tip_height, next_height) = match state.oneshot(zs::ReadRequest::Tip).await {
+                Ok(zs::ReadResponse::Tip(None)) => Ok((None, Height(0))),
+                Ok(zs::ReadResponse::Tip(Some((height, _hash)))) => {
                     let next_height =
                         (height + 1).expect("valid heights are far below the maximum");
                     Ok((Some(height), next_height))
@@ -706,11 +715,13 @@ where
             .await
             .map_err(CloneError::from)
             .map_err(TransactionDownloadVerifyError::StateError)?
-            .call(zs::Request::Transaction(txid.mined_id()))
+            .call(zs::ReadRequest::Transaction(txid.mined_id()))
             .await
         {
-            Ok(zs::Response::Transaction(None)) => Ok(()),
-            Ok(zs::Response::Transaction(Some(_))) => Err(TransactionDownloadVerifyError::InState),
+            Ok(zs::ReadResponse::Transaction(None)) => Ok(()),
+            Ok(zs::ReadResponse::Transaction(Some(_))) => {
+                Err(TransactionDownloadVerifyError::InState)
+            }
             Ok(_) => unreachable!("wrong response"),
             Err(e) => Err(TransactionDownloadVerifyError::StateError(e.into())),
         }?;
@@ -726,7 +737,10 @@ where
     ZN::Future: Send,
     ZV: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     ZV::Future: Send,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    ZS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     ZS::Future: Send,
 {
     fn drop(mut self: Pin<&mut Self>) {
@@ -751,7 +765,7 @@ mod tests {
 
     type PendingNetwork = BoxCloneService<zn::Request, zn::Response, BoxError>;
     type PendingVerifier = BoxCloneService<tx::Request, tx::Response, BoxError>;
-    type PendingState = BoxCloneService<zs::Request, zs::Response, BoxError>;
+    type PendingState = BoxCloneService<zs::ReadRequest, zs::ReadResponse, BoxError>;
 
     fn tx_id(index: u64) -> UnminedTxId {
         let mut bytes = [0; 32];
@@ -786,7 +800,7 @@ mod tests {
                 future::pending::<Result<tx::Response, BoxError>>()
             })),
             BoxCloneService::new(service_fn(|_request| {
-                future::pending::<Result<zs::Response, BoxError>>()
+                future::pending::<Result<zs::ReadResponse, BoxError>>()
             })),
             false,
             u64::MAX,
@@ -852,8 +866,8 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
-                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -902,8 +916,8 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
-                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -961,8 +975,8 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
-                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1097,8 +1111,8 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
-                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1153,8 +1167,8 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
-                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),

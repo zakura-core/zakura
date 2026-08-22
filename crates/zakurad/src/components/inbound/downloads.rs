@@ -847,7 +847,7 @@ where
                 None => None,
             };
 
-            let contextual_relay_sender = if block_relay == zn::config::BlockRelayPolicy::Contextual
+            let optimistic_relay_sender = if block_relay == zn::config::BlockRelayPolicy::Optimistic
                 && relay_tip_child
                 && sync_status
                     .as_ref()
@@ -857,7 +857,7 @@ where
             } else {
                 None
             };
-            let verification_result = if let Some(relay_sender) = contextual_relay_sender {
+            let verification_result = if let Some(relay_sender) = optimistic_relay_sender {
                 verify_peer_block(
                     verifier,
                     block,
@@ -1319,7 +1319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contextual_peer_relay_commit_survives_download_cancellation() -> Result<(), BoxError> {
+    async fn optimistic_peer_relay_commit_survives_download_cancellation() -> Result<(), BoxError> {
         let block: Arc<block::Block> =
             zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
         let hash = block.hash();
@@ -1340,7 +1340,7 @@ mod tests {
                     let zakura_consensus::Request::CommitWithLifecycle { block, lifecycle } =
                         request
                     else {
-                        return Err("contextual relay requires a lifecycle request".into());
+                        return Err("optimistic relay requires a lifecycle request".into());
                     };
                     lifecycle.reach(zs::BlockLifecycleMilestone::SemanticallyValid);
                     lifecycle.reach(zs::BlockLifecycleMilestone::RelayAuthorized);
@@ -1371,7 +1371,7 @@ mod tests {
             state,
             latest_chain_tip,
             Some(sync_status),
-            zn::config::BlockRelayPolicy::Contextual,
+            zn::config::BlockRelayPolicy::Optimistic,
             Some(relay_sender),
             pending_blocks.clone(),
         );
@@ -1425,7 +1425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contextual_policy_keeps_no_tip_downloads_strict() -> Result<(), BoxError> {
+    async fn optimistic_policy_keeps_no_tip_downloads_strict() -> Result<(), BoxError> {
         let block: Arc<block::Block> =
             zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
         let hash = block.hash();
@@ -1466,7 +1466,7 @@ mod tests {
             state,
             latest_chain_tip,
             Some(sync_status),
-            zn::config::BlockRelayPolicy::Contextual,
+            zn::config::BlockRelayPolicy::Optimistic,
             Some(relay_sender),
             PendingBlockRegistry::default(),
         );
@@ -1490,7 +1490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contextual_policy_keeps_syncing_downloads_strict() -> Result<(), BoxError> {
+    async fn optimistic_policy_keeps_syncing_downloads_strict() -> Result<(), BoxError> {
         let block: Arc<block::Block> =
             zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
         let hash = block.hash();
@@ -1531,7 +1531,7 @@ mod tests {
             state,
             latest_chain_tip,
             Some(sync_status),
-            zn::config::BlockRelayPolicy::Contextual,
+            zn::config::BlockRelayPolicy::Optimistic,
             Some(relay_sender),
             PendingBlockRegistry::default(),
         );

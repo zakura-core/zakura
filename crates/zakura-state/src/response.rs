@@ -34,6 +34,24 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// State's decision after checking the consensus rules required for optimistic relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptimisticRelayEligibility {
+    /// The block proves expected work and still extends the selected tip.
+    Authorized,
+    /// The block proves expected work but does not extend the selected tip.
+    CommitFirst,
+    /// State cannot prove expected work because context is unavailable or PoW is waived.
+    Unavailable,
+}
+
+impl OptimisticRelayEligibility {
+    /// Returns true when state proved the expected-work boundary.
+    pub fn proves_expected_work(self) -> bool {
+        matches!(self, Self::Authorized | Self::CommitFirst)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
 pub enum Response {
@@ -113,8 +131,8 @@ pub enum Response {
     /// Does not check transparent UTXO inputs
     ValidBestChainTipNullifiersAndAnchors,
 
-    /// Response to [`Request::CheckBlockCommitment`].
-    ValidBlockCommitment,
+    /// Response to [`Request::CheckOptimisticRelayEligibility`].
+    OptimisticRelayEligibility(OptimisticRelayEligibility),
 
     /// Response to [`Request::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
@@ -582,8 +600,8 @@ pub enum ReadResponse {
     /// Does not check transparent UTXO inputs
     ValidBestChainTipNullifiersAndAnchors,
 
-    /// Response to [`ReadRequest::CheckBlockCommitment`].
-    ValidBlockCommitment,
+    /// Response to [`ReadRequest::CheckOptimisticRelayEligibility`].
+    OptimisticRelayEligibility(OptimisticRelayEligibility),
 
     /// Response to [`ReadRequest::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
@@ -697,7 +715,9 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::BlockHeaders(headers) => Ok(Response::BlockHeaders(headers)),
 
             ReadResponse::ValidBestChainTipNullifiersAndAnchors => Ok(Response::ValidBestChainTipNullifiersAndAnchors),
-            ReadResponse::ValidBlockCommitment => Ok(Response::ValidBlockCommitment),
+            ReadResponse::OptimisticRelayEligibility(eligibility) => {
+                Ok(Response::OptimisticRelayEligibility(eligibility))
+            }
 
             ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }

@@ -115,6 +115,27 @@ fn direct_consensus_invalid_gossip_keeps_advertiser_score() {
 }
 
 #[test]
+fn strict_peer_does_not_score_a_post_eligibility_rejection() {
+    let advertiser = "192.0.2.1:8233".parse().expect("valid peer address");
+    let context_error = zakura_state::ValidateContextError::InvalidBlockCommitment(
+        zakura_chain::block::CommitmentError::InvalidChainHistoryActivationReserved {
+            actual: [1; 32],
+        },
+    );
+    let error = zakura_consensus::VerifyBlockError::CommitAfterOptimisticEligibility(
+        zakura_state::CommitBlockError::ValidateContextError(Box::new(context_error)),
+    );
+    let router_error = zakura_consensus::RouterError::Block {
+        source: Box::new(error),
+    };
+
+    assert_eq!(
+        block_misbehavior(Box::new(router_error), Some(advertiser)),
+        None
+    );
+}
+
+#[test]
 fn pruned_block_not_found_log_is_rate_limited() {
     let logger = PrunedBlockNotFoundLogger::new(Some(10_000), Vec::new());
     let start = Instant::now();

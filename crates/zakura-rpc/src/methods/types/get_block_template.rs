@@ -596,7 +596,7 @@ where
     /// so they can be advertised to peers.
     mined_block_sender: mpsc::Sender<BlockRelayEvent>,
 
-    /// Blocks whose hashes were advertised before contextual commit completed.
+    /// Blocks whose hashes were advertised before commit completed.
     pending_blocks: PendingBlockRegistry,
 
     /// Whether state relay authorization can trigger an early inventory.

@@ -160,15 +160,9 @@ pub enum BlockRelayPolicy {
     /// Relay only after state commits the block.
     Committed,
 
-    /// Relay after contextual validation and staged best-chain selection.
+    /// Relay after the block proves expected work and binds its exact body to its parent history.
     #[default]
-    Contextual,
-
-    /// Relay after proof of work binds the exact body to the header.
-    ///
-    /// This policy is reserved for the body-binding verifier phase. Until that phase lands,
-    /// startup rejects this value.
-    PowBound,
+    Optimistic,
 }
 
 /// Configuration for networking code.
@@ -308,8 +302,7 @@ pub struct Config {
 
     /// The validation boundary for relaying blocks received from peers.
     ///
-    /// `"contextual"` is the default. Use `"committed"` to wait for state commit.
-    /// `"pow_bound"` remains reserved and causes startup to reject the config.
+    /// `"optimistic"` is the default. Use `"committed"` to wait for state commit.
     pub block_relay: BlockRelayPolicy,
 
     /// Native Zakura endpoint, connection, and bootstrap settings.
@@ -917,7 +910,7 @@ impl Default for Config {
             identity_dir: default_network_identity_dir(),
             zakura_node_secret_key: None,
             p2p_stack: P2pStack::Default,
-            block_relay: BlockRelayPolicy::Contextual,
+            block_relay: BlockRelayPolicy::Optimistic,
             zakura: ZakuraConfig::default(),
             crawl_new_peer_interval: DEFAULT_CRAWL_NEW_PEER_INTERVAL,
 
@@ -1211,13 +1204,6 @@ impl<'de> Deserialize<'de> for Config {
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
-
-        if block_relay == BlockRelayPolicy::PowBound {
-            return Err(de::Error::custom(
-                "network.block_relay = \"pow_bound\" requires the body-binding verifier phase; \
-                 use \"semantic\" or \"committed\"",
-            ));
-        }
 
         let network = match (dnetwork, testnet_parameters) {
             (DNetwork::ConfiguredTestnet(params), _) => {

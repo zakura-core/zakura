@@ -1249,6 +1249,24 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
     assert_eq!(err.misbehavior_score(), 100);
 }
 
+#[test]
+fn post_eligibility_context_errors_do_not_score_the_supplier() {
+    let context_error = zakura_state::ValidateContextError::InvalidBlockCommitment(
+        zakura_chain::block::CommitmentError::InvalidChainHistoryActivationReserved {
+            actual: [1; 32],
+        },
+    );
+    let commit_error =
+        zakura_state::CommitBlockError::ValidateContextError(Box::new(context_error));
+    let error = VerifyBlockError::CommitAfterOptimisticEligibility(commit_error);
+
+    assert_eq!(error.misbehavior_score(), 0);
+    assert_eq!(
+        crate::router::RouterError::from(error).misbehavior_score(),
+        0
+    );
+}
+
 #[tokio::test]
 async fn prepared_mined_block_waits_for_state_relay_authorization() {
     let _init_guard = zakura_test::init();
@@ -1257,21 +1275,25 @@ async fn prepared_mined_block_waits_for_state_relay_authorization() {
         .zcash_deserialize_into()
         .expect("the genesis block is valid");
     let hash = block.hash();
-    let commit_started = Arc::new(tokio::sync::Notify::new());
+    let preflight_started = Arc::new(tokio::sync::Notify::new());
     let authorize_relay = Arc::new(tokio::sync::Notify::new());
     let finish_commit = Arc::new(tokio::sync::Notify::new());
     let state = tower::service_fn({
-        let commit_started = commit_started.clone();
+        let preflight_started = preflight_started.clone();
         let authorize_relay = authorize_relay.clone();
         let finish_commit = finish_commit.clone();
         move |request: zs::Request| {
-            let commit_started = commit_started.clone();
+            let preflight_started = preflight_started.clone();
             let authorize_relay = authorize_relay.clone();
             let finish_commit = finish_commit.clone();
             async move {
                 match request {
-                    zs::Request::CheckBlockCommitment(_) => {
-                        Ok::<_, BoxError>(zs::Response::ValidBlockCommitment)
+                    zs::Request::CheckOptimisticRelayEligibility(_) => {
+                        preflight_started.notify_one();
+                        authorize_relay.notified().await;
+                        Ok::<_, BoxError>(zs::Response::OptimisticRelayEligibility(
+                            zs::OptimisticRelayEligibility::Authorized,
+                        ))
                     }
                     zs::Request::KnownBlock(requested_hash) => {
                         assert_eq!(requested_hash, hash);
@@ -1281,10 +1303,7 @@ async fn prepared_mined_block_waits_for_state_relay_authorization() {
                         block,
                         lifecycle,
                     } => {
-                        commit_started.notify_one();
-                        authorize_relay.notified().await;
                         lifecycle.reach(zs::BlockLifecycleMilestone::ContextuallyValid);
-                        lifecycle.reach(zs::BlockLifecycleMilestone::RelayAuthorized);
                         finish_commit.notified().await;
                         Ok(zs::Response::Committed(block.hash))
                     }
@@ -1309,19 +1328,22 @@ async fn prepared_mined_block_waits_for_state_relay_authorization() {
         lifecycle,
     }));
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), commit_started.notified())
-        .await
-        .expect("the prepared block reaches contextual commit");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        preflight_started.notified(),
+    )
+    .await
+    .expect("the prepared block reaches optimistic relay preflight");
     assert!(
         !lifecycle_handle.has_reached(zs::BlockLifecycleMilestone::RelayAuthorized),
-        "semantic verification must not authorize relay"
+        "semantic verification alone must not authorize relay"
     );
 
     authorize_relay.notify_one();
     lifecycle_handle
         .wait_for(zs::BlockLifecycleMilestone::RelayAuthorized)
         .await
-        .expect("state authorizes relay after contextual validation");
+        .expect("state authorizes relay after expected-work preflight");
     assert!(
         !verification.is_finished(),
         "relay authorization must precede commit completion"

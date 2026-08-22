@@ -46,11 +46,11 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum BlockLifecycleMilestone {
-    /// Proof of work and the exact block body are bound to the submitted header.
+    /// Expected proof of work and the exact block body are bound to the parent history.
     PowAndBodyBound = 1 << 0,
     /// Semantic verification completed.
     SemanticallyValid = 1 << 1,
-    /// State authorized relay after contextual validation and staged branch selection.
+    /// State authorized optimistic relay after expected-work and selected-tip checks.
     RelayAuthorized = 1 << 2,
     /// State admitted the block to the active write channel.
     StateQueued = 1 << 3,
@@ -1619,8 +1619,8 @@ pub enum Request {
     /// Returns [`Response::ValidBestChainTipNullifiersAndAnchors`]
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
-    /// Checks that the block header commits to its exact body and parent history tree.
-    CheckBlockCommitment(BlockCommitmentData),
+    /// Checks the expected-work, exact-body, parent-history, and selected-tip relay boundary.
+    CheckOptimisticRelayEligibility(BlockCommitmentData),
 
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
@@ -1702,7 +1702,7 @@ impl Request {
             Request::CheckBestChainTipNullifiersAndAnchors(_) => {
                 "best_chain_tip_nullifiers_anchors"
             }
-            Request::CheckBlockCommitment(_) => "check_block_commitment",
+            Request::CheckOptimisticRelayEligibility(_) => "check_optimistic_relay_eligibility",
             Request::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             Request::BestChainBlockHash(_) => "best_chain_block_hash",
             Request::KnownBlock(_) => "known_block",
@@ -2142,8 +2142,8 @@ pub enum ReadRequest {
     /// Returns [`ReadResponse::ValidBestChainTipNullifiersAndAnchors`].
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
-    /// Checks that the block header commits to its exact body and parent history tree.
-    CheckBlockCommitment(BlockCommitmentData),
+    /// Checks the expected-work, exact-body, parent-history, and selected-tip relay boundary.
+    CheckOptimisticRelayEligibility(BlockCommitmentData),
 
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
@@ -2255,7 +2255,7 @@ impl ReadRequest {
             ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {
                 "best_chain_tip_nullifiers_anchors"
             }
-            ReadRequest::CheckBlockCommitment(_) => "check_block_commitment",
+            ReadRequest::CheckOptimisticRelayEligibility(_) => "check_optimistic_relay_eligibility",
             ReadRequest::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             ReadRequest::BestChainBlockHash(_) => "best_chain_block_hash",
             #[cfg(feature = "indexer")]
@@ -2314,7 +2314,9 @@ impl TryFrom<Request> for ReadRequest {
             Request::CheckBestChainTipNullifiersAndAnchors(tx) => {
                 Ok(ReadRequest::CheckBestChainTipNullifiersAndAnchors(tx))
             }
-            Request::CheckBlockCommitment(block) => Ok(ReadRequest::CheckBlockCommitment(block)),
+            Request::CheckOptimisticRelayEligibility(block) => {
+                Ok(ReadRequest::CheckOptimisticRelayEligibility(block))
+            }
 
             Request::ApplyHeaderChainInsert { .. }
             | Request::RecordHeaderChainBodyUnavailable { .. }

@@ -1353,22 +1353,6 @@ pub(crate) fn validate_and_commit_non_finalized(
     Ok(())
 }
 
-fn staged_block_extends_selected_tip(
-    finalized_tip_hash: block::Hash,
-    current: &NonFinalizedState,
-    staged: &NonFinalizedState,
-    parent_hash: block::Hash,
-    child_height: block::Height,
-    child_hash: block::Hash,
-) -> bool {
-    let current_tip_hash = current
-        .best_tip()
-        .map(|(_, hash)| hash)
-        .unwrap_or(finalized_tip_hash);
-
-    current_tip_hash == parent_hash && staged.best_tip() == Some((child_height, child_hash))
-}
-
 /// Update the [`LatestChainTip`], [`ChainTipChange`], and `non_finalized_state_sender`
 /// channels with the latest non-finalized [`ChainTipBlock`] and
 /// [`Chain`].
@@ -2616,14 +2600,6 @@ impl WriteBlockWorkerTask {
                             if let Some(lifecycle) = lifecycle.as_ref() {
                                 lifecycle.reach(BlockLifecycleMilestone::ContextuallyValid);
                             }
-                            let relay_authorized = staged_block_extends_selected_tip(
-                                finalized_state.db.finalized_tip_hash(),
-                                non_finalized_state,
-                                &staged,
-                                parent_hash,
-                                child_height,
-                                child_hash,
-                            );
                             let accepted = Frontier::new(child_height, child_hash);
                             let (evidence, event_path, request) =
                                 verified_request(writer, non_finalized_state, &staged, accepted)
@@ -2648,11 +2624,6 @@ impl WriteBlockWorkerTask {
                                     error: error.to_string(),
                                 }
                             })?;
-                            if relay_authorized {
-                                if let Some(lifecycle) = lifecycle.as_ref() {
-                                    lifecycle.reach(BlockLifecycleMilestone::RelayAuthorized);
-                                }
-                            }
                             transition
                                 .commit(
                                     &writer.runtime,
@@ -2676,16 +2647,6 @@ impl WriteBlockWorkerTask {
                             .map_err(|error| CommitBlockError::from(Box::new(error)));
                             if result.is_ok() {
                                 lifecycle.reach(BlockLifecycleMilestone::ContextuallyValid);
-                                if staged_block_extends_selected_tip(
-                                    finalized_state.db.finalized_tip_hash(),
-                                    non_finalized_state,
-                                    &staged,
-                                    parent_hash,
-                                    child_height,
-                                    child_hash,
-                                ) {
-                                    lifecycle.reach(BlockLifecycleMilestone::RelayAuthorized);
-                                }
                                 *non_finalized_state = staged;
                                 lifecycle.reach(BlockLifecycleMilestone::StorageApplied);
                             }

@@ -85,6 +85,10 @@ pub enum VerifyBlockError {
     #[error("unable to commit block after semantic verification: {0}")]
     Commit(#[from] zs::CommitBlockError),
 
+    /// Error after the block proved the consensus rules required for optimistic relay.
+    #[error("unable to commit block after optimistic relay eligibility: {0}")]
+    CommitAfterOptimisticEligibility(zs::CommitBlockError),
+
     #[error("unable to validate block proposal: failed semantic verification (proof of work is not checked for proposals): {0}")]
     // TODO: make this into a concrete type (see #5732)
     ValidateProposal(#[source] BoxError),
@@ -141,7 +145,9 @@ impl VerifyBlockError {
             Self::Equihash { .. } | Self::PowPolicy(_) | Self::Time(_) => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
-            Self::Commit(error) => error.body_verification_class(),
+            Self::Commit(error) | Self::CommitAfterOptimisticEligibility(error) => {
+                error.body_verification_class()
+            }
             Self::ValidateProposal(_) | Self::StateService { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
@@ -155,7 +161,10 @@ impl VerifyBlockError {
     pub fn is_duplicate_request(&self) -> bool {
         match self {
             VerifyBlockError::Block { source, .. } => source.is_duplicate_request(),
-            VerifyBlockError::Commit(commit_err) => commit_err.is_duplicate_request(),
+            VerifyBlockError::Commit(commit_err)
+            | VerifyBlockError::CommitAfterOptimisticEligibility(commit_err) => {
+                commit_err.is_duplicate_request()
+            }
             _ => false,
         }
     }
@@ -163,7 +172,10 @@ impl VerifyBlockError {
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&zs::KnownBlock> {
         match self {
-            VerifyBlockError::Commit(commit_err) => commit_err.duplicate_location(),
+            VerifyBlockError::Commit(commit_err)
+            | VerifyBlockError::CommitAfterOptimisticEligibility(commit_err) => {
+                commit_err.duplicate_location()
+            }
             _ => None,
         }
     }
@@ -176,6 +188,7 @@ impl VerifyBlockError {
             Equihash { .. } | Subsidy(_) => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             Commit(err) => err.misbehavior_score(),
+            CommitAfterOptimisticEligibility(_) => 0,
             _other => 0,
         }
     }
@@ -203,6 +216,16 @@ fn map_commit_error(source: BoxError, hash: block::Hash) -> VerifyBlockError {
     }
 
     VerifyBlockError::StateService { source, hash }
+}
+
+/// Record that the supplier crossed the optimistic relay boundary before state rejected the block.
+fn mark_post_eligibility_commit_error(error: VerifyBlockError) -> VerifyBlockError {
+    match error {
+        VerifyBlockError::Commit(error) => {
+            VerifyBlockError::CommitAfterOptimisticEligibility(error)
+        }
+        error => error,
+    }
 }
 
 /// The maximum number of transparent signature operations allowed in a block.
@@ -332,16 +355,21 @@ where
                     prepared_block.hash = hash;
                     prepared_block.height = height;
                     if let Some(lifecycle) = request.lifecycle() {
-                        check_block_commitment(&mut state_service, &prepared_block).await?;
-                        lifecycle.reach(zs::BlockLifecycleMilestone::PowAndBodyBound);
                         lifecycle.reach(zs::BlockLifecycleMilestone::SemanticallyValid);
                     }
                     check_known_block(&mut state_service, hash).await?;
+                    let proved_expected_work = check_optimistic_relay_eligibility(
+                        &mut state_service,
+                        (&prepared_block).into(),
+                        request.lifecycle(),
+                    )
+                    .await?;
                     return commit_prepared_block(
                         state_service,
                         prepared_block,
                         request.is_mined_commit(),
                         request.lifecycle(),
+                        proved_expected_work,
                     )
                     .await;
                 }
@@ -525,16 +553,21 @@ where
             }
 
             if let Some(lifecycle) = request.lifecycle() {
-                check_block_commitment(&mut state_service, &prepared_block).await?;
-                lifecycle.reach(zs::BlockLifecycleMilestone::PowAndBodyBound);
                 lifecycle.reach(zs::BlockLifecycleMilestone::SemanticallyValid);
             }
+            let proved_expected_work = check_optimistic_relay_eligibility(
+                &mut state_service,
+                (&prepared_block).into(),
+                request.lifecycle(),
+            )
+            .await?;
 
             commit_prepared_block(
                 state_service,
                 prepared_block,
                 request.is_mined_commit(),
                 request.lifecycle(),
+                proved_expected_work,
             )
             .await
         }
@@ -573,8 +606,32 @@ where
                         )
                     }
                     VerifyBlockError::Commit(_) => (
+                        zs::BlockLifecycleMilestone::PowAndBodyBound,
+                        zs::BlockLifecycleFailureClass::SemanticRejected,
+                    ),
+                    VerifyBlockError::CommitAfterOptimisticEligibility(
+                        zs::CommitBlockError::ValidateContextError(_),
+                    ) => (
                         zs::BlockLifecycleMilestone::ContextuallyValid,
                         zs::BlockLifecycleFailureClass::ContextualRejected,
+                    ),
+                    VerifyBlockError::CommitAfterOptimisticEligibility(
+                        zs::CommitBlockError::Duplicate { .. },
+                    ) => (
+                        zs::BlockLifecycleMilestone::StateQueued,
+                        zs::BlockLifecycleFailureClass::Duplicate,
+                    ),
+                    VerifyBlockError::CommitAfterOptimisticEligibility(
+                        zs::CommitBlockError::HeaderChainError { .. },
+                    ) => (
+                        zs::BlockLifecycleMilestone::StorageApplied,
+                        zs::BlockLifecycleFailureClass::HeaderTransitionFailed,
+                    ),
+                    VerifyBlockError::CommitAfterOptimisticEligibility(
+                        zs::CommitBlockError::WriteTaskExited { .. },
+                    ) => (
+                        zs::BlockLifecycleMilestone::StateQueued,
+                        zs::BlockLifecycleFailureClass::WriterExited,
                     ),
                     VerifyBlockError::Depth { .. } | VerifyBlockError::StateService { .. } => (
                         zs::BlockLifecycleMilestone::PowAndBodyBound,
@@ -598,12 +655,14 @@ async fn commit_prepared_block<S>(
     prepared_block: zs::SemanticallyVerifiedBlock,
     is_mined_commit: bool,
     lifecycle: Option<zs::BlockLifecycleReporter>,
+    proved_expected_work: bool,
 ) -> Result<block::Hash, VerifyBlockError>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
 {
     let hash = prepared_block.hash;
+    let eligibility_data = (&prepared_block).into();
     let request = match lifecycle.clone() {
         Some(lifecycle) => zs::Request::CommitSemanticallyVerifiedBlockWithLifecycle {
             block: prepared_block,
@@ -637,14 +696,16 @@ where
             Ok(hash)
         }
         Err(source) => {
-            if let Some(lifecycle) = lifecycle {
-                lifecycle.fail(
-                    zs::BlockLifecycleMilestone::ContextuallyValid,
-                    zs::BlockLifecycleFailureClass::ContextualRejected,
-                    source.to_string(),
-                );
-            }
-            Err(map_commit_error(source, hash))
+            let error = map_commit_error(source, hash);
+            let proved_expected_work = proved_expected_work
+                || check_optimistic_relay_eligibility(&mut state_service, eligibility_data, None)
+                    .await
+                    .unwrap_or(false);
+            Err(if proved_expected_work {
+                mark_post_eligibility_commit_error(error)
+            } else {
+                error
+            })
         }
         _ => unreachable!("wrong response for semantic block commit"),
     }
@@ -675,24 +736,33 @@ where
     }
 }
 
-async fn check_block_commitment<S>(
+async fn check_optimistic_relay_eligibility<S>(
     state_service: &mut S,
-    block: &zs::SemanticallyVerifiedBlock,
-) -> Result<(), VerifyBlockError>
+    block: zs::BlockCommitmentData,
+    lifecycle: Option<zs::BlockLifecycleReporter>,
+) -> Result<bool, VerifyBlockError>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
 {
-    let hash = block.hash;
+    let hash = block.block.hash();
     match state_service
         .ready()
         .await
         .map_err(|source| VerifyBlockError::StateService { source, hash })?
-        .call(zs::Request::CheckBlockCommitment(block.into()))
+        .call(zs::Request::CheckOptimisticRelayEligibility(block))
         .await
         .map_err(|source| map_commit_error(source, hash))?
     {
-        zs::Response::ValidBlockCommitment => Ok(()),
-        _ => unreachable!("wrong response to Request::CheckBlockCommitment"),
+        zs::Response::OptimisticRelayEligibility(eligibility) => {
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.reach(zs::BlockLifecycleMilestone::PowAndBodyBound);
+                if eligibility == zs::OptimisticRelayEligibility::Authorized {
+                    lifecycle.reach(zs::BlockLifecycleMilestone::RelayAuthorized);
+                }
+            }
+            Ok(eligibility.proves_expected_work())
+        }
+        _ => unreachable!("wrong response to Request::CheckOptimisticRelayEligibility"),
     }
 }

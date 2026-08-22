@@ -64,8 +64,8 @@ use crate::{
     },
     BlockCommitmentData, BlockLifecycleFailureClass, BlockLifecycleMilestone,
     BlockLifecycleReporter, BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError,
-    Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
-    StateInitError, ValidateContextError,
+    Config, KnownBlock, OptimisticRelayEligibility, ReadRequest, ReadResponse, Request, Response,
+    SemanticallyVerifiedBlock, StateInitError, ValidateContextError,
 };
 
 pub mod block_iter;
@@ -1764,7 +1764,7 @@ impl Service<Request> for StateService {
             | Request::FindBlockHashes { .. }
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
-            | Request::CheckBlockCommitment(_)
+            | Request::CheckOptimisticRelayEligibility(_)
             | Request::CheckBlockProposalValidity(_) => {
                 // Redirect the request to the concurrent ReadStateService
                 let read_service = self.read_service.clone();
@@ -2846,16 +2846,16 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::ValidBlockProposal)
             }
 
-            ReadRequest::CheckBlockCommitment(semantically_verified) => {
+            ReadRequest::CheckOptimisticRelayEligibility(commitment) => {
                 let latest_non_finalized_state = state.latest_non_finalized_state();
-                check_block_commitment_for_state(
+                let eligibility = check_optimistic_relay_eligibility_for_state(
                     &state.network,
                     &latest_non_finalized_state,
                     &state.db,
-                    semantically_verified,
+                    commitment,
                 )?;
 
-                Ok(ReadResponse::ValidBlockCommitment)
+                Ok(ReadResponse::OptimisticRelayEligibility(eligibility))
             }
 
             ReadRequest::TipBlockSize => {
@@ -2893,12 +2893,12 @@ impl Service<ReadRequest> for ReadStateService {
     }
 }
 
-fn check_block_commitment_for_state(
+fn check_optimistic_relay_eligibility_for_state(
     network: &Network,
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
     commitment: BlockCommitmentData,
-) -> Result<(), BoxError> {
+) -> Result<OptimisticRelayEligibility, BoxError> {
     let parent_hash = commitment.block.header.previous_block_hash;
     let parent_chain =
         non_finalized_state.find_chain(|chain| chain.contains_block_hash(parent_hash));
@@ -2914,16 +2914,47 @@ fn check_block_commitment_for_state(
         {
             Arc::new(zakura_chain::history_tree::HistoryTree::default())
         }
-        None => return Err(ValidateContextError::NotReadyToBeCommitted.into()),
+        None => return Ok(OptimisticRelayEligibility::Unavailable),
     };
     check::block_commitment_is_valid_for_chain_history(
-        commitment.block,
+        commitment.block.clone(),
         network,
         &history_tree,
         commitment.auth_data_root,
     )?;
 
-    Ok(())
+    let relevant_chain: Vec<_> =
+        any_ancestor_blocks(non_finalized_state, db, parent_hash).collect();
+    if relevant_chain.is_empty() {
+        return Ok(OptimisticRelayEligibility::Unavailable);
+    }
+    let candidate_height = commitment
+        .block
+        .coinbase_height()
+        .ok_or(ValidateContextError::NotReadyToBeCommitted)?;
+    let finalized_tip_height = db.finalized_tip_height().or_else(|| {
+        relevant_chain
+            .last()
+            .and_then(|block| block.coinbase_height())
+    });
+    check::block_is_valid_for_recent_chain_data(
+        &commitment.block,
+        candidate_height,
+        network,
+        finalized_tip_height,
+        relevant_chain,
+    )?;
+
+    if network.disable_pow() {
+        return Ok(OptimisticRelayEligibility::Unavailable);
+    }
+    let extends_selected_tip = read::best_tip(non_finalized_state, db)
+        .is_some_and(|(_, selected_tip_hash)| selected_tip_hash == parent_hash);
+    if extends_selected_tip {
+        Ok(OptimisticRelayEligibility::Authorized)
+    } else {
+        Ok(OptimisticRelayEligibility::CommitFirst)
+    }
 }
 
 /// Initialize a state service from the provided [`Config`].

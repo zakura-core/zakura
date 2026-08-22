@@ -276,16 +276,16 @@ fn p2p_stack_defaults_by_network_and_roundtrips() {
 }
 
 #[test]
-fn block_relay_defaults_to_contextual_and_committed_roundtrips() {
+fn block_relay_defaults_to_optimistic_and_committed_roundtrips() {
     let default = Config::default();
-    assert_eq!(default.block_relay, BlockRelayPolicy::Contextual);
+    assert_eq!(default.block_relay, BlockRelayPolicy::Optimistic);
     let serialized = toml::to_string(&default).expect("the default network config serializes");
-    assert!(serialized.contains("block_relay = \"contextual\""));
+    assert!(serialized.contains("block_relay = \"optimistic\""));
     assert_eq!(
         toml::from_str::<Config>(&serialized)
             .expect("the serialized default network config parses")
             .block_relay,
-        BlockRelayPolicy::Contextual
+        BlockRelayPolicy::Optimistic
     );
 
     let committed: Config = toml::from_str("block_relay = 'committed'")
@@ -299,10 +299,6 @@ fn block_relay_defaults_to_contextual_and_committed_roundtrips() {
             .block_relay,
         BlockRelayPolicy::Committed
     );
-
-    let error = toml::from_str::<Config>("block_relay = 'pow_bound'")
-        .expect_err("pow-bound relay stays disabled until body-binding verification lands");
-    assert!(error.to_string().contains("body-binding verifier phase"));
 }
 
 #[test]

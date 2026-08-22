@@ -1211,8 +1211,26 @@ where
             };
 
             let committed = verification_result.is_ok();
+            let contextually_rejected = matches!(
+                lifecycle_handle.terminal(),
+                Some(zakura_state::BlockLifecycleResult::Failed(
+                    zakura_state::BlockLifecycleFailure {
+                        class: zakura_state::BlockLifecycleFailureClass::ContextualRejected,
+                        ..
+                    }
+                ))
+            );
             if let Some(claim) = pending_claim {
-                claim.settle(committed);
+                if contextually_rejected {
+                    claim.reject();
+                } else {
+                    claim.settle(committed);
+                }
+            } else if contextually_rejected
+                && lifecycle_handle
+                    .has_reached(zakura_state::BlockLifecycleMilestone::RelayAuthorized)
+            {
+                pending_blocks.reject(block_hash);
             }
 
             tokio::spawn(async move {

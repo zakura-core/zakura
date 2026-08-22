@@ -3819,17 +3819,17 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         "valid block should be accepted"
     );
 
-    // Check that the submitblock channel received the submitted block
+    // PoW-waived networks keep the commit-first relay path.
     let mut submit_block_receiver = submitblock_channel.receiver();
     let submit_block_channel_data = submit_block_receiver.recv().await.expect("channel is open");
     assert!(
         matches!(
             submit_block_channel_data,
-            BlockRelayEvent::Early { hash, height, .. }
+            BlockRelayEvent::Committed { hash, height, .. }
                 if hash == proposal_block.hash()
                     && height == proposal_block.coinbase_height().unwrap()
         ),
-        "submitblock channel should receive the early submitted-block event"
+        "submitblock channel should receive the committed submitted-block event"
     );
 
     // Use an invalid coinbase transaction (with an output value greater than the `block_subsidy + miner_fees - expected_lockbox_funding_stream`)

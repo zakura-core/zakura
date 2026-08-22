@@ -88,7 +88,7 @@ fn commitment_test_state() -> (
 }
 
 #[test]
-fn block_commitment_accepts_a_side_chain_parent() {
+fn optimistic_relay_preflight_accepts_expected_work_on_a_side_chain() {
     use crate::tests::FakeChainHelper;
 
     let _init_guard = zakura_test::init();
@@ -106,7 +106,7 @@ fn block_commitment_accepts_a_side_chain_parent() {
         .into();
     let child = side.make_fake_child().set_block_commitment(commitment);
 
-    super::check_block_commitment_for_state(
+    let eligibility = super::check_optimistic_relay_eligibility_for_state(
         &network,
         &non_finalized,
         &finalized.db,
@@ -116,19 +116,30 @@ fn block_commitment_accepts_a_side_chain_parent() {
         },
     )
     .expect("the side-chain parent selects its own history tree");
+    assert_eq!(eligibility, crate::OptimisticRelayEligibility::CommitFirst);
 }
 
 #[test]
-fn block_commitment_reports_an_unavailable_parent() {
+fn optimistic_relay_preflight_authorizes_a_selected_tip_child() {
     use crate::tests::FakeChainHelper;
 
     let _init_guard = zakura_test::init();
-    let (network, finalized, non_finalized, side) = commitment_test_state();
-    let mut child = side.make_fake_child();
-    Arc::make_mut(&mut Arc::make_mut(&mut child).header).previous_block_hash =
-        block::Hash([0x55; 32]);
+    let (network, finalized, non_finalized, _) = commitment_test_state();
+    let best = non_finalized
+        .best_tip_block()
+        .expect("the test state has a best tip")
+        .block
+        .clone();
+    let commitment: [u8; 32] = non_finalized
+        .best_chain()
+        .expect("the best chain exists")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the best chain has a history root")
+        .into();
+    let child = best.make_fake_child().set_block_commitment(commitment);
 
-    let error = super::check_block_commitment_for_state(
+    let eligibility = super::check_optimistic_relay_eligibility_for_state(
         &network,
         &non_finalized,
         &finalized.db,
@@ -137,23 +148,120 @@ fn block_commitment_reports_an_unavailable_parent() {
             auth_data_root: None,
         },
     )
-    .expect_err("an unavailable Canopy parent is not ready");
+    .expect("the selected tip child passes optimistic relay preflight");
+
+    assert_eq!(eligibility, crate::OptimisticRelayEligibility::Authorized);
+}
+
+#[test]
+fn optimistic_relay_preflight_rejects_an_easier_claimed_target() {
+    use crate::tests::FakeChainHelper;
+    use zakura_header_chain::POW_ADJUSTMENT_BLOCK_SPAN;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let heartwood_height = NetworkUpgrade::Heartwood
+        .activation_height(&network)
+        .expect("Heartwood activates")
+        .0;
+    let root = Arc::new(
+        network.block_map()[&(heartwood_height - 1)]
+            .zcash_deserialize_into::<Block>()
+            .expect("pre-Heartwood test block is valid"),
+    );
+    let finalized = super::finalized_state::FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("ephemeral finalized state opens");
+    let mut non_finalized = super::non_finalized_state::NonFinalizedState::new(&network);
+    non_finalized
+        .commit_new_chain(root.clone().prepare(), &finalized)
+        .expect("root commits");
+    let mut tip = root;
+    for context_index in 0..POW_ADJUSTMENT_BLOCK_SPAN {
+        let commitment = if context_index == 0 {
+            [0; 32]
+        } else {
+            non_finalized
+                .best_chain()
+                .expect("the context chain exists")
+                .history_block_commitment_tree()
+                .hash()
+                .expect("the context chain has a history root")
+                .into()
+        };
+        let mut child = tip.make_fake_child().set_block_commitment(commitment);
+        let child_height = child.coinbase_height().expect("the child has a height");
+        Arc::make_mut(&mut Arc::make_mut(&mut child).header).time =
+            tip.header.time + NetworkUpgrade::target_spacing_for_height(&network, child_height);
+        non_finalized
+            .commit_block(child.clone().prepare(), &finalized)
+            .expect("difficulty context block commits");
+        tip = child;
+    }
+    let commitment: [u8; 32] = non_finalized
+        .best_chain()
+        .expect("the best chain exists")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the best chain has a history root")
+        .into();
+    let mut child = tip
+        .make_fake_child()
+        .set_block_commitment(commitment)
+        .set_work(1);
+    let child_height = child.coinbase_height().expect("the child has a height");
+    Arc::make_mut(&mut Arc::make_mut(&mut child).header).time =
+        tip.header.time + NetworkUpgrade::target_spacing_for_height(&network, child_height);
+
+    let error = super::check_optimistic_relay_eligibility_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect_err("an easier claimed target fails optimistic relay preflight");
 
     assert!(matches!(
         error.downcast_ref::<ValidateContextError>(),
-        Some(ValidateContextError::NotReadyToBeCommitted)
+        Some(ValidateContextError::InvalidDifficultyThreshold { .. })
     ));
 }
 
 #[test]
-fn block_commitment_rejects_a_forged_compact_payload() {
+fn optimistic_relay_preflight_uses_commit_first_for_an_unavailable_parent() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, side) = commitment_test_state();
+    let mut child = side.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut child).header).previous_block_hash =
+        block::Hash([0x55; 32]);
+
+    let eligibility = super::check_optimistic_relay_eligibility_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect("missing parent context is a commit-first outcome");
+
+    assert_eq!(eligibility, crate::OptimisticRelayEligibility::Unavailable);
+}
+
+#[test]
+fn optimistic_relay_preflight_rejects_a_forged_compact_payload() {
     use crate::tests::FakeChainHelper;
 
     let _init_guard = zakura_test::init();
     let (network, finalized, non_finalized, side) = commitment_test_state();
     let child = side.make_fake_child().set_block_commitment([0x42; 32]);
 
-    let error = super::check_block_commitment_for_state(
+    let error = super::check_optimistic_relay_eligibility_for_state(
         &network,
         &non_finalized,
         &finalized.db,

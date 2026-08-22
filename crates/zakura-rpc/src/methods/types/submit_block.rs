@@ -55,7 +55,9 @@ const MAX_PENDING_BLOCKS: usize = 16;
 const MAX_PENDING_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_CLAIMANTS_PER_BLOCK: usize = 16;
 const MAX_RELAY_ONCE_RECORDS: usize = 1_024;
+const MAX_REJECTED_BLOCKS: usize = 4_096;
 const PENDING_BLOCK_TTL: Duration = Duration::from_secs(10 * 60);
+const REJECTED_BLOCK_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// The RPC path that admitted a mined block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,7 +100,7 @@ pub enum BlockRelaySource {
 /// A block lifecycle event consumed by the block gossip task.
 #[derive(Debug)]
 pub enum BlockRelayEvent {
-    /// State authorized relay, so peers can receive inventory before state commit.
+    /// State authorized optimistic relay, so peers can receive inventory before state commit.
     Early {
         /// The block hash.
         hash: block::Hash,
@@ -133,7 +135,7 @@ pub enum BlockRelayEvent {
     },
 }
 
-/// Holds relay-authorized block bodies until their contextual commits finish.
+/// Holds relay-authorized block bodies until their commits finish.
 #[derive(Clone, Debug, Default)]
 pub struct PendingBlockRegistry(Arc<Mutex<PendingBlockRegistryInner>>);
 
@@ -141,8 +143,14 @@ pub struct PendingBlockRegistry(Arc<Mutex<PendingBlockRegistryInner>>);
 struct PendingBlockRegistryInner {
     entries: HashMap<block::Hash, PendingBlock>,
     relayed: HashMap<block::Hash, Instant>,
+    rejected: HashMap<block::Hash, RejectedBlock>,
     total_bytes: usize,
     next_claim_token: u64,
+}
+
+#[derive(Debug)]
+struct RejectedBlock {
+    rejected_at: Instant,
 }
 
 #[derive(Debug)]
@@ -190,6 +198,12 @@ impl PendingBlockClaim {
         self.registry.settle_claim(self.hash, self.token, committed);
         self.settled = true;
     }
+
+    /// Reject this block and suppress its known descendants after contextual consensus failure.
+    pub fn reject(mut self) {
+        self.registry.reject_claim(self.hash);
+        self.settled = true;
+    }
 }
 
 impl Drop for PendingBlockClaim {
@@ -221,10 +235,18 @@ impl PendingBlockRegistryInner {
 
         self.relayed
             .retain(|_, relayed_at| now.saturating_duration_since(*relayed_at) < PENDING_BLOCK_TTL);
+        self.rejected.retain(|_, rejected| {
+            now.saturating_duration_since(rejected.rejected_at) < REJECTED_BLOCK_TTL
+        });
     }
 }
 
 impl PendingBlockRegistry {
+    /// Record a contextually rejected block and remove its pending descendants.
+    pub fn reject(&self, hash: block::Hash) {
+        self.reject_claim(hash);
+    }
+
     /// Claims a block before its early inventory is sent.
     ///
     /// The admission reports whether this caller reserved the hash and should
@@ -243,8 +265,17 @@ impl PendingBlockRegistry {
         let PendingBlockRegistryInner {
             entries: pending_entries,
             relayed,
+            rejected,
             ..
         } = &mut *entries;
+        let parent_hash = block.header.previous_block_hash;
+        if rejected.contains_key(&hash) || rejected.contains_key(&parent_hash) {
+            if !rejected.contains_key(&hash) {
+                insert_rejected(rejected, hash, now);
+            }
+            metrics::counter!("block_relay.known_invalid.suppressed").increment(1);
+            return None;
+        }
         if let Some(pending) = pending_entries.get_mut(&hash) {
             if pending.active_claims.len() >= MAX_PENDING_CLAIMANTS_PER_BLOCK {
                 metrics::counter!("block_relay.pending_registry.claimants_saturated").increment(1);
@@ -348,7 +379,37 @@ impl PendingBlockRegistry {
         }
     }
 
-    /// Returns an admitted block body before contextual commit finishes.
+    fn reject_claim(&self, hash: block::Hash) {
+        let mut entries = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        entries.prune_expired(now);
+
+        let mut rejected_hashes = vec![hash];
+        let mut next = 0;
+        while let Some(parent_hash) = rejected_hashes.get(next).copied() {
+            for (candidate_hash, pending) in &entries.entries {
+                if pending.block.header.previous_block_hash == parent_hash
+                    && !rejected_hashes.contains(candidate_hash)
+                {
+                    rejected_hashes.push(*candidate_hash);
+                }
+            }
+            next += 1;
+        }
+
+        for rejected_hash in rejected_hashes {
+            if let Some(removed) = entries.entries.remove(&rejected_hash) {
+                entries.total_bytes = entries.total_bytes.saturating_sub(removed.serialized_size);
+            }
+            insert_rejected(&mut entries.rejected, rejected_hash, now);
+        }
+        metrics::counter!("block_relay.known_invalid.recorded").increment(1);
+    }
+
+    /// Returns an admitted block body before commit finishes.
     pub fn get(&self, hash: block::Hash) -> Option<Arc<block::Block>> {
         let mut entries = self
             .0
@@ -365,6 +426,26 @@ impl PendingBlockRegistry {
         }
         block
     }
+}
+
+fn insert_rejected(
+    rejected: &mut HashMap<block::Hash, RejectedBlock>,
+    hash: block::Hash,
+    now: Instant,
+) {
+    if rejected.contains_key(&hash) {
+        return;
+    }
+    if rejected.len() >= MAX_REJECTED_BLOCKS {
+        if let Some(oldest_hash) = rejected
+            .iter()
+            .min_by_key(|(_, rejected)| rejected.rejected_at)
+            .map(|(hash, _)| *hash)
+        {
+            rejected.remove(&oldest_hash);
+        }
+    }
+    rejected.insert(hash, RejectedBlock { rejected_at: now });
 }
 
 /// Response to a `submitblock` RPC request.
@@ -617,6 +698,58 @@ mod tests {
 
         assert!(registry.admit(duplicate).is_none());
         assert_eq!(registry.get(hash), None);
+    }
+
+    #[test]
+    fn contextual_rejection_suppresses_the_block_and_its_descendants() {
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let hash = block.hash();
+        let admission = registry.admit(block.clone()).expect("block is admitted");
+        admission.claim.reject();
+
+        assert_eq!(registry.get(hash), None);
+        assert!(registry.admit(block).is_none());
+
+        let mut child = test_block();
+        Arc::make_mut(&mut Arc::make_mut(&mut child).header).previous_block_hash = hash;
+        assert!(
+            registry.admit(child).is_none(),
+            "a known-invalid parent suppresses its descendant"
+        );
+        assert!(REJECTED_BLOCK_TTL > PENDING_BLOCK_TTL);
+    }
+
+    #[test]
+    fn repeated_rejected_body_does_not_refresh_absolute_expiry() {
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let hash = block.hash();
+        registry
+            .admit(block.clone())
+            .expect("block is admitted")
+            .claim
+            .reject();
+        let original_time = Instant::now() - Duration::from_secs(60);
+        registry
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rejected
+            .get_mut(&hash)
+            .expect("rejected record exists")
+            .rejected_at = original_time;
+
+        assert!(registry.admit(block).is_none());
+        assert_eq!(
+            registry
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .rejected[&hash]
+                .rejected_at,
+            original_time
+        );
     }
 
     #[test]

@@ -16,11 +16,11 @@ pub(crate) struct PeerRelayContext {
     pub(crate) sender: mpsc::Sender<BlockRelayEvent>,
 }
 
-/// Verify a peer block and advertise it after contextual relay authorization.
+/// Verify a peer block and advertise it after optimistic relay authorization.
 ///
 /// Once consensus authorizes relay, this function transfers verification to an
 /// owned task. Cancellation of the original inbound request cannot abandon the
-/// contextual commit or its pending-body claim.
+/// commit or its pending-body claim.
 pub(crate) async fn verify_peer_block<V>(
     verifier: V,
     block: Arc<block::Block>,
@@ -35,7 +35,7 @@ where
     let hash = block.hash();
     let height = block
         .coinbase_height()
-        .expect("contextual relay candidates have a coinbase height");
+        .expect("optimistic relay candidates have a coinbase height");
     let (lifecycle_handle, lifecycle) = zakura_state::BlockLifecycleHandle::new();
     let mut verification = Box::pin(verifier.oneshot(
         zakura_consensus::Request::CommitWithLifecycle {
@@ -58,7 +58,25 @@ where
     };
 
     match race {
-        AuthorizationRace::Verification(result) => result,
+        AuthorizationRace::Verification(result) => {
+            if result.is_err()
+                && lifecycle_handle
+                    .has_reached(zakura_state::BlockLifecycleMilestone::RelayAuthorized)
+                && matches!(
+                    lifecycle_handle.terminal(),
+                    Some(zakura_state::BlockLifecycleResult::Failed(
+                        zakura_state::BlockLifecycleFailure {
+                            class: zakura_state::BlockLifecycleFailureClass::ContextualRejected,
+                            ..
+                        }
+                    ))
+                )
+            {
+                metrics::counter!("block_relay.post_authorization_rejected").increment(1);
+                relay.pending_blocks.reject(hash);
+            }
+            result
+        }
         AuthorizationRace::Authorized(authorized) => {
             let source = BlockRelaySource::Peer {
                 authorized_at: std::time::Instant::now(),
@@ -90,7 +108,21 @@ where
                 let result = verification.await;
                 let committed = result.is_ok();
                 if let Some(claim) = pending_claim {
-                    claim.settle(committed);
+                    let contextually_rejected = matches!(
+                        lifecycle_handle.terminal(),
+                        Some(zakura_state::BlockLifecycleResult::Failed(
+                            zakura_state::BlockLifecycleFailure {
+                                class: zakura_state::BlockLifecycleFailureClass::ContextualRejected,
+                                ..
+                            }
+                        ))
+                    );
+                    if contextually_rejected {
+                        metrics::counter!("block_relay.post_authorization_rejected").increment(1);
+                        claim.reject();
+                    } else {
+                        claim.settle(committed);
+                    }
                 }
 
                 tokio::spawn(async move {
@@ -189,7 +221,7 @@ mod tests {
         let BlockRelayEvent::Early { advertised, .. } = receiver
             .recv()
             .await
-            .expect("contextual authorization emits early relay")
+            .expect("optimistic authorization emits early relay")
         else {
             panic!("expected early relay event")
         };
@@ -286,7 +318,7 @@ mod tests {
                     lifecycle.reach(zakura_state::BlockLifecycleMilestone::RelayAuthorized);
                     finish.notified().await;
                     Err::<block::Hash, zakura_consensus::BoxError>(Box::new(
-                        zakura_consensus::VerifyBlockError::Commit(
+                        zakura_consensus::VerifyBlockError::CommitAfterOptimisticEligibility(
                             zakura_state::CommitBlockError::HeaderChainError {
                                 error: "stale local transition".to_owned(),
                             },
@@ -309,7 +341,7 @@ mod tests {
             .expect("dummy event fills the gossip queue");
         let task = tokio::spawn(verify_peer_block(
             verifier,
-            block,
+            block.clone(),
             Some(peer()),
             PeerRelayContext {
                 pending_blocks: registry.clone(),
@@ -340,6 +372,13 @@ mod tests {
             }) if failed_hash == hash
         ));
         assert_eq!(registry.get(hash), None);
+        let admission = registry
+            .admit(block)
+            .expect("a local failure must not enter the known-invalid cache");
+        assert!(
+            admission.relay_reserved,
+            "a failed enqueue released the relay reservation"
+        );
     }
 
     #[tokio::test]
@@ -384,5 +423,69 @@ mod tests {
         );
         assert!(receiver.try_recv().is_err());
         assert_eq!(registry.get(hash), None);
+    }
+
+    #[tokio::test]
+    async fn contextual_rejection_after_authorization_is_cached_without_scoring() {
+        let block = test_block();
+        let hash = block.hash();
+        let registry = PendingBlockRegistry::default();
+        let verifier = service_fn(move |request| async move {
+            let zakura_consensus::Request::CommitWithLifecycle { lifecycle, .. } = request else {
+                panic!("peer relay must use a lifecycle commit")
+            };
+            lifecycle.reach(zakura_state::BlockLifecycleMilestone::RelayAuthorized);
+            lifecycle.fail(
+                zakura_state::BlockLifecycleMilestone::ContextuallyValid,
+                zakura_state::BlockLifecycleFailureClass::ContextualRejected,
+                "test post-authorization rejection",
+            );
+            tokio::task::yield_now().await;
+            Err::<block::Hash, zakura_consensus::BoxError>(Box::new(
+                zakura_consensus::VerifyBlockError::CommitAfterOptimisticEligibility(
+                    zakura_state::CommitBlockError::ValidateContextError(Box::new(
+                        zakura_state::ValidateContextError::InvalidBlockCommitment(
+                            zakura_chain::block::CommitmentError::InvalidChainHistoryActivationReserved {
+                                actual: [1; 32],
+                            },
+                        ),
+                    )),
+                ),
+            ))
+        });
+        let (sender, mut receiver) = mpsc::channel(2);
+
+        let error = verify_peer_block(
+            verifier,
+            block.clone(),
+            Some(peer()),
+            PeerRelayContext {
+                pending_blocks: registry.clone(),
+                sender,
+            },
+        )
+        .await
+        .expect_err("contextual verification rejects the block");
+        let error = error
+            .downcast_ref::<zakura_consensus::VerifyBlockError>()
+            .expect("the helper returns the typed verifier error");
+        assert_eq!(error.misbehavior_score(), 0);
+        assert!(registry.admit(block).is_none());
+
+        let early = receiver
+            .recv()
+            .await
+            .expect("authorization emits early relay");
+        let BlockRelayEvent::Early { advertised, .. } = early else {
+            panic!("expected early relay event")
+        };
+        let _ = advertised.send(true);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(BlockRelayEvent::Failed {
+                hash: failed_hash,
+                ..
+            }) if failed_hash == hash
+        ));
     }
 }

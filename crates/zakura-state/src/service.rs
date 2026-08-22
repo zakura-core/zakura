@@ -18,8 +18,9 @@ use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
     ops::Bound,
+    path::PathBuf,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -44,7 +45,7 @@ use zakura_chain::{
 use crate::{
     constants::{
         MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS,
-        MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_LEGACY_CHAIN_BLOCKS,
+        MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MAX_LEGACY_CHAIN_BLOCKS,
     },
     error::{CommitBlockError, CommitCheckpointVerifiedError, InvalidateError, ReconsiderError},
     request::TimedSpan,
@@ -62,8 +63,9 @@ use crate::{
         read::find,
         watch_receiver::WatchReceiver,
     },
-    BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, KnownBlock,
-    ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock, StateInitError,
+    BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, HashOrHeight,
+    HistoricalTreeUnavailable, KnownBlock, ReadRequest, ReadResponse, Request, Response,
+    SemanticallyVerifiedBlock, StateInitError,
 };
 
 pub mod block_iter;
@@ -260,6 +262,14 @@ pub struct ReadStateService {
     /// Shared fail-closed attachment result, visible to every clone without joining the worker.
     block_write_failure: Arc<OnceLock<write::BlockWriteTaskFailure>>,
 
+    /// Note commitment frontiers this service has derived and root-checked for heights in a
+    /// verified-commitment-trees fast-synced database's absent band.
+    ///
+    /// Shared across clones so a wallet's sequential scan anchors each request on the previous
+    /// one. Empty, and never written, on a node that does not derive
+    /// ([`Config::derive_historical_trees`]) or has no frontier grid configured.
+    historical_trees: Arc<Mutex<read::HistoricalTreeCache>>,
+
     /// Published completed subtree roots for heights below the last checkpoint.
     ///
     /// `None` on networks without an embedded artifact, in which case `z_getsubtreesbyindex`
@@ -377,13 +387,18 @@ impl StateService {
     ///
     /// Returns the read-write and read-only state services,
     /// and read-only watch channels for its best chain tip.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StateInitError`] if historical tree derivation is misconfigured or its
+    /// frontier artifact cannot be loaded.
     pub async fn new(
         config: Config,
         network: &Network,
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
-    ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
-        let (finalized_state, finalized_tip, timer) = {
+    ) -> Result<(Self, ReadStateService, LatestChainTip, ChainTipChange), StateInitError> {
+        let (finalized_state, finalized_tip, historical_trees, timer) = {
             let config = config.clone();
             let network = network.clone();
             tokio::task::spawn_blocking(move || {
@@ -408,11 +423,18 @@ impl StateService {
 
                 let timer = CodeTimer::start();
                 let finalized_tip = finalized_chain_tip(&finalized_state.db);
+                let historical_trees = load_historical_frontier_artifact(
+                    &network,
+                    &config,
+                    finalized_state.db.vct_synced_below().is_some(),
+                )?;
+                let historical_trees =
+                    historical_trees.discard_if_before_vct_handoff(&config, &finalized_state.db);
 
-                (finalized_state, finalized_tip, timer)
+                Ok::<_, StateInitError>((finalized_state, finalized_tip, historical_trees, timer))
             })
             .await
-            .expect("failed to join blocking task")
+            .expect("failed to join blocking task")?
         };
 
         // # Correctness
@@ -514,6 +536,7 @@ impl StateService {
                 runtime_status: header_runtime_status_receiver,
                 reader: header_chain_reader_receiver,
             },
+            historical_trees,
         );
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
@@ -594,7 +617,7 @@ impl StateService {
             }
         });
 
-        (state, read_service, latest_chain_tip, chain_tip_change)
+        Ok((state, read_service, latest_chain_tip, chain_tip_change))
     }
 
     /// Call read only state service to log rocksdb database metrics.
@@ -1225,6 +1248,7 @@ impl ReadStateService {
         non_finalized_state_receiver: WatchReceiver<NonFinalizedState>,
         vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
         header_chain: HeaderChainSubscriptions,
+        historical_trees: Arc<Mutex<read::HistoricalTreeCache>>,
     ) -> Self {
         let historical_subtrees =
             finalized_state::embedded_historical_subtrees(&finalized_state.network()).map(Arc::new);
@@ -1235,6 +1259,7 @@ impl ReadStateService {
             non_finalized_state_receiver,
             block_write_task,
             block_write_failure,
+            historical_trees,
             historical_subtrees,
             vct_root_repair_receiver,
             header_chain_snapshot_receiver: header_chain.snapshots,
@@ -1273,6 +1298,34 @@ impl ReadStateService {
         let vct_applied_below = self.db.vct_synced_below()?;
 
         (artifact.last_checkpoint >= vct_applied_below).then_some((artifact, vct_applied_below))
+    }
+
+    /// Whether a published frontier grid is loaded and covers the durable VCT handoff.
+    ///
+    /// A marker written after construction can make the loaded grid too old. The first request
+    /// that observes that transition reports it and discards the grid, so later requests see the
+    /// absent band as unavailable without repeatedly checking the stale artifact.
+    fn has_usable_historical_frontier_grid(&self) -> bool {
+        let mut historical_trees = self
+            .historical_trees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let artifact_checkpoint = historical_trees.last_checkpoint();
+        if let Some((artifact_checkpoint, vct_handoff)) =
+            frontier_grid_ends_before_vct_handoff(artifact_checkpoint, self.db.vct_synced_below())
+        {
+            tracing::warn!(
+                ?artifact_checkpoint,
+                ?vct_handoff,
+                "discarding historical frontier artifact that does not cover the database's VCT \
+                 handoff"
+            );
+            metrics::counter!("state.historical_tree.artifact_before_vct_handoff").increment(1);
+            *historical_trees = read::HistoricalTreeCache::default();
+            return false;
+        }
+
+        artifact_checkpoint.is_some()
     }
 
     /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.
@@ -1941,6 +1994,212 @@ fn subtrees_with_published_fallback<Node, Error>(
     }
 }
 
+/// A decoded frontier artifact waiting for the database-dependent coverage check.
+struct LoadedHistoricalFrontierArtifact {
+    cache: Arc<Mutex<read::HistoricalTreeCache>>,
+    last_checkpoint: Option<block::Height>,
+    source_path: Option<PathBuf>,
+}
+
+impl LoadedHistoricalFrontierArtifact {
+    /// Discards a frontier grid that ends below this database's durable VCT handoff, leaving
+    /// historical trees in the absent band unavailable instead of preventing startup.
+    ///
+    /// When the handoff marker has not been written yet, the grid is retained because its coverage
+    /// cannot be checked. Serving checks again after ordinary fast-sync commits write the marker
+    /// and reports the affected historical trees as unavailable if the grid is too old.
+    fn discard_if_before_vct_handoff(
+        self,
+        config: &Config,
+        db: &ZakuraDb,
+    ) -> Arc<Mutex<read::HistoricalTreeCache>> {
+        if config.derive_historical_trees(db.vct_synced_below().is_some()) {
+            if let Some((artifact_checkpoint, vct_handoff)) =
+                frontier_grid_ends_before_vct_handoff(self.last_checkpoint, db.vct_synced_below())
+            {
+                let source_path = self
+                    .source_path
+                    .expect("a loaded artifact has a source description");
+                tracing::warn!(
+                    path = ?source_path,
+                    ?artifact_checkpoint,
+                    ?vct_handoff,
+                    "ignoring historical frontier artifact that does not cover the database's VCT \
+                     handoff"
+                );
+                return Arc::new(Mutex::new(read::HistoricalTreeCache::default()));
+            }
+        }
+
+        self.cache
+    }
+}
+
+/// Returns the artifact checkpoint and database handoff when the published grid ends below this
+/// database's skip band.
+///
+/// `None` means the comparison cannot be made yet — the grid is unloaded, or the durable last
+/// checkpoint marker has not been written — or the grid already covers the band.
+fn frontier_grid_ends_before_vct_handoff(
+    artifact_checkpoint: Option<block::Height>,
+    vct_handoff: Option<block::Height>,
+) -> Option<(block::Height, block::Height)> {
+    artifact_checkpoint
+        .zip(vct_handoff)
+        .filter(|(artifact_checkpoint, vct_handoff)| artifact_checkpoint < vct_handoff)
+}
+
+/// Returns the cold-request replay length when it exceeds `limit`.
+///
+/// Gaps are measured from genesis: a published grid is a chain-shaped artifact, so a file that
+/// starts at a mid-chain `U` cannot serve a from-scratch node below `U`. `limit` is the same
+/// bound serving applies per request, so a grid that passes here cannot produce a cold request
+/// the read path would then refuse.
+fn frontier_grid_gap_exceeds_replay_limit(
+    artifact: &finalized_state::FrontierArtifact,
+    limit: u64,
+) -> Option<u64> {
+    let blocks = artifact.max_cold_replay_blocks();
+    (blocks > limit).then_some(blocks)
+}
+
+/// Loads the configured frontier grid into a fresh cache.
+///
+/// An unreadable or invalid configured artifact is fatal for a node that derives
+/// ([`Config::derive_historical_trees`]) and a warning for one that does not. Without a configured
+/// grid, the node keeps reporting the absent band as unavailable. A well-framed artifact is still
+/// refused unless its entries tile genesis through
+/// `last_checkpoint` at gaps of at most [`MAX_HISTORICAL_TREE_REPLAY_BLOCKS`].
+fn load_historical_frontier_artifact(
+    network: &Network,
+    config: &Config,
+    database_was_vct_fast_synced: bool,
+) -> Result<LoadedHistoricalFrontierArtifact, StateInitError> {
+    load_historical_frontier_artifact_if_enabled(
+        network,
+        config,
+        config.derive_historical_trees(database_was_vct_fast_synced),
+    )
+}
+
+fn load_historical_frontier_artifact_if_enabled(
+    network: &Network,
+    config: &Config,
+    derivation_enabled: bool,
+) -> Result<LoadedHistoricalFrontierArtifact, StateInitError> {
+    let (artifact, source_path) = if let Some(path) = config.historical_frontier_artifact.as_ref() {
+        (
+            std::fs::read(path)
+                .map_err(|error| Box::new(error) as BoxError)
+                .and_then(|bytes| {
+                    finalized_state::FrontierArtifact::decode(&bytes, network)
+                        .map(Arc::new)
+                        .map_err(|error| Box::new(error) as BoxError)
+                }),
+            path.clone(),
+        )
+    } else {
+        if derivation_enabled {
+            tracing::info!(
+                "historical tree derivation is idle: no historical frontier artifact is configured"
+            );
+        }
+        return Ok(LoadedHistoricalFrontierArtifact {
+            cache: Arc::new(Mutex::new(read::HistoricalTreeCache::default())),
+            last_checkpoint: None,
+            source_path: None,
+        });
+    };
+
+    match artifact {
+        Ok(artifact) => {
+            if derivation_enabled {
+                if let Some(blocks) = frontier_grid_gap_exceeds_replay_limit(
+                    &artifact,
+                    MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+                ) {
+                    return Err(StateInitError::HistoricalFrontierArtifactTooSparse {
+                        path: source_path,
+                        blocks,
+                        limit: MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+                    });
+                }
+            }
+
+            tracing::info!(
+                ?source_path,
+                entries = artifact.entries.len(),
+                spacing = artifact.spacing,
+                "loaded historical frontier artifact"
+            );
+            Ok(LoadedHistoricalFrontierArtifact {
+                last_checkpoint: Some(artifact.last_checkpoint),
+                cache: Arc::new(Mutex::new(read::HistoricalTreeCache::with_artifact(
+                    artifact,
+                ))),
+                source_path: Some(source_path),
+            })
+        }
+        Err(source) if derivation_enabled => Err(StateInitError::HistoricalFrontierArtifact {
+            path: source_path,
+            source,
+        }),
+        Err(error) => {
+            tracing::warn!(?source_path, %error, "ignoring historical frontier artifact");
+            Ok(LoadedHistoricalFrontierArtifact {
+                cache: Arc::new(Mutex::new(read::HistoricalTreeCache::default())),
+                last_checkpoint: None,
+                source_path: None,
+            })
+        }
+    }
+}
+
+/// Derives the note commitment frontiers for `hash_or_height`, whose stored per-height trees are
+/// absent because this is a verified-commitment-trees fast-synced database.
+///
+/// Callers reach this only once a tree read has already reported the absent band, so `unavailable`
+/// is the error that stands if derivation is switched off or this node is pruned. Inside the band
+/// the request either derives a root-checked frontier or fails: an absent tree there must never
+/// reach a client as an empty treestate (see [`crate::HistoricalTreeUnavailable`]).
+fn historical_frontiers(
+    state: &ReadStateService,
+    hash_or_height: HashOrHeight,
+    unavailable: HistoricalTreeUnavailable,
+) -> Result<Arc<read::DerivedFrontiers>, BoxError> {
+    // Archive mode is part of this: replay needs every block body from the selected anchor through
+    // the requested height, and pruned mode does not guarantee that range.
+    if !state
+        .db
+        .config()
+        .derive_historical_trees(state.db.vct_synced_below().is_some())
+    {
+        return Err(unavailable.into());
+    }
+
+    // Derivation anchors on the published grid. Without one the nearest anchor is the stored
+    // frontier below the absent band, so a cold request would replay the band end to end — the
+    // cost this design exists to avoid. Report the band as unavailable instead.
+    if !state.has_usable_historical_frontier_grid() {
+        return Err(unavailable.into());
+    }
+
+    let Some(height) = hash_or_height.height_or_else(|hash| state.db.height(hash)) else {
+        // The absent-band check resolved this block to a height, so failing to resolve it again
+        // means the database changed underneath the read. Report the original error rather than
+        // an empty tree.
+        return Err(unavailable.into());
+    };
+
+    read::derive_historical_frontiers(
+        &state.db,
+        &state.historical_trees,
+        height,
+        MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    )
+    .map_err(BoxError::from)
+}
+
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -2468,20 +2727,48 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::SaplingTree(hash_or_height) => {
-                let tree =
-                    read::sapling_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
+                let tree = match read::sapling_tree(
+                    state.latest_best_chain(),
+                    &state.db,
+                    hash_or_height,
+                ) {
+                    Ok(tree) => tree,
+                    Err(unavailable) => Some(
+                        historical_frontiers(&state, hash_or_height, unavailable)?
+                            .sapling
+                            .clone(),
+                    ),
+                };
                 Ok(ReadResponse::SaplingTree(tree))
             }
 
             ReadRequest::OrchardTree(hash_or_height) => {
-                let tree =
-                    read::orchard_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
+                let tree = match read::orchard_tree(
+                    state.latest_best_chain(),
+                    &state.db,
+                    hash_or_height,
+                ) {
+                    Ok(tree) => tree,
+                    Err(unavailable) => Some(
+                        historical_frontiers(&state, hash_or_height, unavailable)?
+                            .orchard
+                            .clone(),
+                    ),
+                };
                 Ok(ReadResponse::OrchardTree(tree))
             }
 
             ReadRequest::IronwoodTree(hash_or_height) => {
                 let tree =
-                    read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height)?;
+                    match read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height)
+                    {
+                        Ok(tree) => tree,
+                        Err(unavailable) => Some(
+                            historical_frontiers(&state, hash_or_height, unavailable)?
+                                .ironwood
+                                .clone(),
+                        ),
+                    };
                 Ok(ReadResponse::IronwoodTree(tree))
             }
 
@@ -2827,17 +3114,25 @@ impl Service<ReadRequest> for ReadStateService {
 /// It's possible to construct multiple state services in the same application (as
 /// long as they, e.g., use different storage locations), but doing so is
 /// probably not what you want.
+///
+/// # Errors
+///
+/// Returns a [`StateInitError`] if historical tree derivation is misconfigured or its frontier
+/// artifact cannot be loaded.
 pub async fn init(
     config: Config,
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
-) -> (
-    BoxService<Request, Response, BoxError>,
-    ReadStateService,
-    LatestChainTip,
-    ChainTipChange,
-) {
+) -> Result<
+    (
+        BoxService<Request, Response, BoxError>,
+        ReadStateService,
+        LatestChainTip,
+        ChainTipChange,
+    ),
+    StateInitError,
+> {
     let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
         StateService::new(
             config,
@@ -2845,44 +3140,52 @@ pub async fn init(
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
         )
-        .await;
+        .await?;
 
-    (
+    Ok((
         BoxService::new(state_service),
         read_only_state_service,
         latest_chain_tip,
         chain_tip_change,
-    )
+    ))
 }
 
 /// Initialize state and return the separate capability used to seal completion-gated body
 /// evidence before it enters the general-purpose state request service.
+///
+/// # Errors
+///
+/// Returns a [`StateInitError`] if historical tree derivation is misconfigured or its frontier
+/// artifact cannot be loaded.
 pub async fn init_with_header_chain_body_evidence(
     config: Config,
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
-) -> (
-    BoxService<Request, Response, BoxError>,
-    ReadStateService,
-    LatestChainTip,
-    ChainTipChange,
-    crate::HeaderChainBodyEvidenceAuthority,
-) {
+) -> Result<
+    (
+        BoxService<Request, Response, BoxError>,
+        ReadStateService,
+        LatestChainTip,
+        ChainTipChange,
+        crate::HeaderChainBodyEvidenceAuthority,
+    ),
+    StateInitError,
+> {
     let (state, read_state, latest_chain_tip, chain_tip_change) = init(
         config,
         network,
         max_checkpoint_height,
         checkpoint_verify_concurrency_limit,
     )
-    .await;
-    (
+    .await?;
+    Ok((
         state,
         read_state,
         latest_chain_tip,
         chain_tip_change,
         crate::HeaderChainBodyEvidenceAuthority::new(),
-    )
+    ))
 }
 
 /// Initialize a read state service from the provided [`Config`].
@@ -2903,6 +3206,13 @@ pub fn init_read_only(
     StateInitError,
 > {
     let finalized_state = FinalizedState::new_with_debug(&config, network, true, true)?;
+    let historical_trees = load_historical_frontier_artifact(
+        network,
+        &config,
+        finalized_state.db.vct_synced_below().is_some(),
+    )?;
+    let historical_trees =
+        historical_trees.discard_if_before_vct_handoff(&config, &finalized_state.db);
     let (non_finalized_state_sender, non_finalized_state_receiver) =
         tokio::sync::watch::channel(NonFinalizedState::new(network));
     let (_vct_root_repair_sender, vct_root_repair_receiver) =
@@ -2933,6 +3243,7 @@ pub fn init_read_only(
                 runtime_status: header_runtime_status_receiver,
                 reader: header_chain_reader_receiver,
             },
+            historical_trees,
         ),
         finalized_state.db.clone(),
         non_finalized_state_sender,
@@ -2972,7 +3283,9 @@ pub async fn init_test(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, _, _, _) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
     Buffer::new(BoxService::new(state_service), 1)
 }
@@ -2993,7 +3306,9 @@ pub async fn init_test_services(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, read_state_service, latest_chain_tip, chain_tip_change) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0).await;
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
 

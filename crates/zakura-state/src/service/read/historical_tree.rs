@@ -30,14 +30,16 @@ use zakura_chain::{
 
 use zakura_chain::subtree::NoteCommitmentSubtreeIndex;
 
-use crate::service::finalized_state::{serve_block_roots, TransactionLocation, ZakuraDb};
+use crate::service::finalized_state::{
+    serve_block_roots, FrontierArtifact, TransactionLocation, ZakuraDb,
+};
 
-/// The most derived frontiers to keep memoized per node.
+/// The most derived frontiers to keep in the per-node cache.
 ///
 /// Wallet access is sequential, so a single entry already collapses a scan's steady-state cost to
 /// one batch of replay. The rest of the budget covers concurrent clients scanning different parts
 /// of the band. Each entry is a few kilobytes, so this is a negligible amount of memory.
-pub const MAX_MEMOIZED_FRONTIERS: usize = 64;
+pub const MAX_CACHED_FRONTIERS: usize = 64;
 
 /// Which shielded pool a replay event belongs to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,39 +183,77 @@ pub enum HistoricalTreeDerivationError {
     },
 }
 
-/// A bounded memo of frontiers this node has already derived and root-checked.
+/// A bounded in-memory cache of frontiers this node has already derived and root-checked.
 ///
-/// Entries double as anchors: a derivation for height `h` starts from the highest memoized height
-/// at or below `h`, so a wallet scanning forward replays only from the end of its previous batch.
+/// Entries double as anchors. A derivation for height `h` starts from the highest verified
+/// frontier at or below `h` across this cache and the published grid, so a wallet scanning forward
+/// replays only from the end of its previous batch, and a cold request still takes the nearest
+/// grid entry rather than a distant cache hit.
 #[derive(Debug, Default)]
 pub struct HistoricalTreeCache {
     /// Verified frontiers, keyed by the height they are the state at the end of.
     frontiers: BTreeMap<Height, Arc<DerivedFrontiers>>,
+
+    /// A published frontier grid to fall back on when the cache has nothing nearby.
+    ///
+    /// Entries here are *not* trusted: one is root-checked before it anchors anything, exactly
+    /// like a locally derived frontier, which is what lets the grid be coarse and distributed
+    /// outside the binary.
+    artifact: Option<Arc<FrontierArtifact>>,
 }
 
 impl HistoricalTreeCache {
-    /// Returns the highest memoized frontier at or below `height`, if any.
-    fn anchor_at_or_below(&self, height: Height) -> Option<(Height, Arc<DerivedFrontiers>)> {
+    /// Returns a cache that can also anchor on `artifact`'s published grid.
+    pub fn with_artifact(artifact: Arc<FrontierArtifact>) -> Self {
+        Self {
+            frontiers: BTreeMap::new(),
+            artifact: Some(artifact),
+        }
+    }
+
+    /// The last checkpoint encoded in the published grid, if one is loaded.
+    pub(crate) fn last_checkpoint(&self) -> Option<Height> {
+        self.artifact
+            .as_ref()
+            .map(|artifact| artifact.last_checkpoint)
+    }
+
+    /// Returns the highest published grid entry at or below `height`, if any.
+    fn artifact_anchor_at_or_below(&self, height: Height) -> Option<(Height, DerivedFrontiers)> {
+        let entry = self.artifact.as_ref()?.anchor_at_or_below(height)?;
+
+        Some((
+            entry.height,
+            DerivedFrontiers {
+                sapling: entry.sapling.clone(),
+                orchard: entry.orchard.clone(),
+                ironwood: entry.ironwood.clone(),
+            },
+        ))
+    }
+
+    /// Returns the highest cached frontier at or below `height`, if any.
+    fn cached_anchor_at_or_below(&self, height: Height) -> Option<(Height, Arc<DerivedFrontiers>)> {
         self.frontiers
             .range(..=height)
             .next_back()
             .map(|(anchor, frontiers)| (*anchor, frontiers.clone()))
     }
 
-    /// Memoizes `frontiers` as the verified state at the end of `height`.
+    /// Caches `frontiers` as the verified state at the end of `height`.
     ///
     /// Evicts the lowest height when full. Clients sweep forward, so the lowest entry is the one
     /// least likely to anchor the next request.
     fn insert(&mut self, height: Height, frontiers: Arc<DerivedFrontiers>) {
         self.frontiers.insert(height, frontiers);
 
-        while self.frontiers.len() > MAX_MEMOIZED_FRONTIERS {
+        while self.frontiers.len() > MAX_CACHED_FRONTIERS {
             self.frontiers.pop_first();
         }
     }
 }
 
-/// Locks the memo, recovering from poisoning.
+/// Locks the cache, recovering from poisoning.
 ///
 /// The cache holds only root-checked frontiers keyed by height, so a panic elsewhere cannot leave
 /// it in a state that would make a later derivation wrong. Refusing to serve because an unrelated
@@ -224,13 +264,24 @@ fn lock(cache: &Mutex<HistoricalTreeCache>) -> std::sync::MutexGuard<'_, Histori
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Returns whether a published grid entry is strictly closer to the target than a cached one.
+///
+/// Equal heights prefer the cache: it is already root-checked and already resident. A cache hit at
+/// any lower height is not closer; that is the case that used to skip the grid entirely.
+fn published_is_nearer(cached: Option<Height>, published: Option<Height>) -> bool {
+    published.is_some_and(|published_height| {
+        cached.is_none_or(|cached_height| published_height > cached_height)
+    })
+}
+
 /// Derives the note commitment frontiers as of the end of block `height`, verified against the
 /// authenticated root stored for that height.
 ///
-/// Replays block bodies forward from the nearest anchor: the highest memoized frontier at or below
-/// `height`, else the last frontier stored below the absent band, else empty frontiers at genesis.
-/// The result is memoized in `cache` only after it reproduces the authenticated root, so a
-/// derivation can never be anchored on an unverified frontier.
+/// Replays block bodies forward from the nearest anchor: the higher of the highest cached
+/// frontier and the highest published grid entry at or below `height`, else the last frontier
+/// stored below the absent band, else empty frontiers at genesis. The result is stored in
+/// `cache` only after it reproduces the authenticated root, so a derivation can never be anchored
+/// on an unverified frontier.
 ///
 /// `max_replay_blocks` bounds the work one request can cost. It is a serving limit, not a
 /// correctness one.
@@ -254,7 +305,7 @@ pub struct Derivation {
     ///
     /// Zero when the requested height was already available as an anchor. Callers measuring cost
     /// must read this rather than infer it from the height, because the anchor may have come from
-    /// the memo or from a published grid rather than from genesis.
+    /// the cache or from a published grid rather than from genesis.
     pub replayed_blocks: u64,
 }
 
@@ -272,7 +323,7 @@ pub fn derive_historical_frontiers_measured(
     if let Some((anchor_height, frontiers)) = &anchor {
         match anchor_height.cmp(&height) {
             std::cmp::Ordering::Equal => {
-                // Memoized entries have already passed this check, but a database fallback has
+                // Cached entries have already passed this check, but a database fallback has
                 // not. Keep the check here so a zero-replay result follows the same acceptance
                 // rule as every replayed result.
                 verify_against_index(db, height, frontiers)?;
@@ -330,51 +381,81 @@ pub fn derive_historical_frontiers_measured(
 ///
 /// `None` means start from empty frontiers at genesis, which is correct when this binary committed
 /// every block from genesis (`U == 0`) and so stored no per-height trees to anchor on.
+///
+/// Published grid entries at or above the VCT upgrade height are tried nearest-first. Entries
+/// below the upgrade cannot be checked against the VCT roots index and are also lower than the
+/// stored `U - 1` frontier, so they are never useful anchors. A failed root check skips that cell
+/// and tries the next-lower eligible one while it stays nearer than the cache. The grid is the
+/// bound on cold replay; ignoring it and restarting at genesis is the expensive path it exists to
+/// avoid.
 fn anchor_for(
     db: &ZakuraDb,
     cache: &Mutex<HistoricalTreeCache>,
     height: Height,
 ) -> Result<Option<(Height, Arc<DerivedFrontiers>)>, HistoricalTreeDerivationError> {
-    let memoized = lock(cache).anchor_at_or_below(height);
+    let cached = lock(cache).cached_anchor_at_or_below(height);
+    let cached_height = cached.as_ref().map(|(anchor_height, _)| *anchor_height);
+    let published_floor = db.vct_upgrade_height().unwrap_or(Height(0));
 
-    if memoized.is_some() {
-        return Ok(memoized);
+    let mut skip_at_or_above: Option<Height> = None;
+    loop {
+        let search_height = match skip_at_or_above {
+            None => Some(height),
+            Some(Height(0)) => None,
+            Some(skipped) => Some(Height(skipped.0 - 1)),
+        };
+        let Some(search_height) = search_height else {
+            break;
+        };
+
+        let published = lock(cache).artifact_anchor_at_or_below(search_height);
+        let Some((anchor_height, frontiers)) = published else {
+            break;
+        };
+
+        // The roots index starts at U, and the durable U - 1 frontier is nearer than every
+        // published entry below U. Since artifact entries are sorted, all remaining entries are
+        // also below the floor.
+        if anchor_height < published_floor {
+            break;
+        }
+
+        if !published_is_nearer(cached_height, Some(anchor_height)) {
+            break;
+        }
+
+        // The entry is checked against this node's own authenticated root before it anchors
+        // anything, so a wrong or hostile artifact cannot steer a derivation.
+        //
+        // A failed check is deliberately *not* fatal: the artifact is an optimization with no
+        // trust weight, so a bad entry is ignored and the derivation tries the next-lower cell.
+        // Making it fatal would hand anyone who can supply a corrupt artifact a denial of service
+        // over a node that is perfectly capable of answering without one.
+        match verify_against_index(db, anchor_height, &frontiers) {
+            Ok(()) => {
+                let frontiers = Arc::new(frontiers);
+                lock(cache).insert(anchor_height, frontiers.clone());
+
+                return Ok(Some((anchor_height, frontiers)));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?anchor_height,
+                    %error,
+                    "ignoring a published frontier entry that does not match the authenticated root",
+                );
+                metrics::counter!("state.historical_tree.artifact_entry_rejected").increment(1);
+                skip_at_or_above = Some(anchor_height);
+            }
+        }
     }
 
-    // Below the upgrade height `U` this binary did not run, so per-height trees are present. The
-    // tree at `U - 1` is therefore the last stored frontier before the absent band starts.
-    let Some(upgrade) = db.vct_upgrade_height().filter(|upgrade| upgrade.0 > 0) else {
-        return Ok(None);
-    };
-
-    let anchor = Height(upgrade.0 - 1);
-    // Rollback can move the tip below the write-once upgrade marker. In that case a backwards tree
-    // lookup would return a retained row below the rollback target and mislabel it as `anchor`.
-    if db
-        .finalized_tip_height()
-        .is_none_or(|tip_height| anchor > tip_height)
-    {
-        return Err(HistoricalTreeDerivationError::MissingAnchor { height, anchor });
+    if cached.is_some() {
+        return Ok(cached);
     }
 
-    // These reads intentionally search backwards because unchanged trees are deduplicated. The tip
-    // check above establishes that the chain still reaches `anchor`, so such a row is its state.
-    let (Some(sapling), Some(orchard), Some(ironwood)) = (
-        db.latest_stored_sapling_tree(&anchor),
-        db.latest_stored_orchard_tree(&anchor),
-        db.latest_stored_ironwood_tree(&anchor),
-    ) else {
-        return Err(HistoricalTreeDerivationError::MissingAnchor { height, anchor });
-    };
-
-    Ok(Some((
-        anchor,
-        Arc::new(DerivedFrontiers {
-            sapling,
-            orchard,
-            ironwood,
-        }),
-    )))
+    stored_frontier_before_absent_band(db, height)
+        .map(|anchor| anchor.map(|(height, frontiers)| (height, Arc::new(frontiers))))
 }
 
 /// Returns the stored frontier immediately before the absent band, if the band starts above
@@ -645,15 +726,33 @@ fn authenticated_roots(
 
 #[cfg(test)]
 mod tests {
-    use zakura_chain::{block::Height, parameters::Network};
+    use std::sync::{Arc, Mutex};
+
+    use zakura_chain::{
+        block::{merkle::AuthDataRoot, Height},
+        orchard,
+        parameters::Network,
+    };
 
     use crate::{
         config::Config,
-        constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
-        service::finalized_state::{DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE},
+        constants::{
+            state_database_format_version_in_code, MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+            STATE_DATABASE_KIND,
+        },
+        service::finalized_state::{
+            DiskWriteBatch, FrontierArtifact, FrontierEntry, STATE_COLUMN_FAMILIES_IN_CODE,
+        },
     };
 
     use super::*;
+
+    /// A low cache fill, matching the "request U+1000 first" case.
+    const LOW: Height = Height(1_000);
+    /// A grid cell between LOW and HIGH.
+    const MID: Height = Height(2_000_000);
+    /// A later high request, matching the "then ask for 3,000,000" case.
+    const HIGH: Height = Height(3_000_000);
 
     fn ephemeral_db() -> ZakuraDb {
         ZakuraDb::new(
@@ -668,6 +767,78 @@ mod tests {
             false,
         )
         .expect("opening an ephemeral database should succeed")
+    }
+
+    fn mismatched_frontiers() -> DerivedFrontiers {
+        let mut orchard = orchard::tree::NoteCommitmentTree::default();
+        orchard
+            .append(halo2::pasta::pallas::Base::from(1u64))
+            .expect("test tree is not full");
+        DerivedFrontiers {
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(orchard),
+            ironwood: Arc::new(Default::default()),
+        }
+    }
+
+    fn seed_roots(db: &ZakuraDb, height: Height, frontiers: &DerivedFrontiers) {
+        let mut batch = DiskWriteBatch::new();
+        batch.insert_commitment_roots_by_height(
+            db,
+            height,
+            &frontiers.sapling.root(),
+            &frontiers.orchard.root(),
+            &frontiers.ironwood.root(),
+            0,
+            0,
+            0,
+            &AuthDataRoot::from([0; 32]),
+        );
+        db.write_batch(batch)
+            .expect("seeding authenticated roots succeeds");
+    }
+
+    fn artifact_at(height: Height, frontiers: &DerivedFrontiers) -> Arc<FrontierArtifact> {
+        artifact_entries(Height(height.0 + 1), &[(height, frontiers)])
+    }
+
+    fn artifact_entries(
+        last_checkpoint: Height,
+        entries: &[(Height, &DerivedFrontiers)],
+    ) -> Arc<FrontierArtifact> {
+        Arc::new(FrontierArtifact {
+            spacing: 1,
+            last_checkpoint,
+            entries: entries
+                .iter()
+                .map(|(height, frontiers)| FrontierEntry {
+                    height: *height,
+                    sapling: frontiers.sapling.clone(),
+                    orchard: frontiers.orchard.clone(),
+                    ironwood: frontiers.ironwood.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    fn cache_with(
+        artifact: Arc<FrontierArtifact>,
+        cached_height: Height,
+        cached: DerivedFrontiers,
+    ) -> Mutex<HistoricalTreeCache> {
+        let mut cache = HistoricalTreeCache::with_artifact(artifact);
+        cache.insert(cached_height, Arc::new(cached));
+        Mutex::new(cache)
+    }
+
+    #[test]
+    fn published_is_nearer_takes_the_higher_height() {
+        assert!(published_is_nearer(None, Some(HIGH)));
+        assert!(published_is_nearer(Some(LOW), Some(HIGH)));
+        assert!(!published_is_nearer(Some(HIGH), Some(LOW)));
+        assert!(!published_is_nearer(Some(HIGH), Some(HIGH)));
+        assert!(!published_is_nearer(Some(LOW), None));
+        assert!(!published_is_nearer(None, None));
     }
 
     #[test]
@@ -687,5 +858,160 @@ mod tests {
         assert!(stored_frontier_before_absent_band(&db, Height(0))
             .expect("a genesis upgrade starts replay at genesis")
             .is_none());
+    }
+
+    /// The bug: a cache hit at or below the target used to win unconditionally, so a later high
+    /// request replayed from the low fill instead of the nearby grid entry.
+    #[test]
+    fn nearer_grid_entry_wins_over_a_lower_cache_entry() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_db();
+        let frontiers = DerivedFrontiers::empty();
+        seed_roots(&db, HIGH, &frontiers);
+
+        let cache = cache_with(artifact_at(HIGH, &frontiers), LOW, frontiers);
+        let derivation = derive_historical_frontiers_measured(&db, &cache, HIGH, 0)
+            .expect("a grid entry at the target is a zero-replay hit");
+
+        assert_eq!(derivation.replayed_blocks, 0);
+    }
+
+    /// Published entries below U have no VCT roots-index rows and are farther away than the
+    /// durable U - 1 frontier. They must not be considered even if an unexpected stale index row
+    /// would make one pass verification.
+    #[test]
+    fn grid_entries_below_the_vct_upgrade_height_are_not_anchors() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_db();
+        let cached_height = Height(500);
+        let published_height = Height(1_500);
+        let upgrade = Height(2_000);
+        let frontiers = DerivedFrontiers::empty();
+
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_upgrade_marker(&db, upgrade);
+        db.write_batch(batch)
+            .expect("seeding the VCT upgrade marker succeeds");
+
+        // This row is deliberately inconsistent with the production layout. It makes accepting
+        // the below-U grid entry observable instead of merely producing the same final fallback.
+        seed_roots(&db, published_height, &frontiers);
+
+        let cache = cache_with(
+            artifact_at(published_height, &frontiers),
+            cached_height,
+            frontiers,
+        );
+        let (anchor_height, _) = anchor_for(&db, &cache, upgrade)
+            .expect("the cached anchor is available")
+            .unwrap();
+
+        assert_eq!(
+            anchor_height, cached_height,
+            "a published entry below U must not displace an eligible fallback"
+        );
+    }
+
+    /// Sequential scans still prefer a higher cache entry over a coarser grid point behind it.
+    #[test]
+    fn nearer_cache_entry_wins_over_a_lower_grid_entry() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_db();
+        let frontiers = DerivedFrontiers::empty();
+        seed_roots(&db, LOW, &frontiers);
+        seed_roots(&db, HIGH, &frontiers);
+
+        let cache = cache_with(artifact_at(LOW, &frontiers), HIGH, frontiers);
+        let derivation = derive_historical_frontiers_measured(&db, &cache, HIGH, 0)
+            .expect("a cached target is a zero-replay hit");
+
+        assert_eq!(derivation.replayed_blocks, 0);
+    }
+
+    /// A rejected nearer grid entry must not discard a usable cache entry. Genesis replay from
+    /// height 0 would be one block longer than replay from the low cache entry.
+    #[test]
+    fn rejected_nearer_grid_entry_falls_back_to_the_cache() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_db();
+        let frontiers = DerivedFrontiers::empty();
+        seed_roots(&db, HIGH, &frontiers);
+
+        let cache = cache_with(artifact_at(HIGH, &mismatched_frontiers()), LOW, frontiers);
+        let error = derive_historical_frontiers_measured(&db, &cache, HIGH, 0)
+            .expect_err("replay from the low cache entry exceeds a zero-block bound");
+
+        assert_eq!(
+            error,
+            HistoricalTreeDerivationError::ReplayTooLong {
+                height: HIGH,
+                blocks: u64::from(HIGH.0 - LOW.0),
+                limit: 0,
+            }
+        );
+    }
+
+    /// A rejected nearer grid entry must try the next-lower cell rather than restart at genesis.
+    #[test]
+    fn rejected_nearer_grid_entry_falls_back_to_the_previous_grid_entry() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_db();
+        let frontiers = DerivedFrontiers::empty();
+        let mismatched = mismatched_frontiers();
+        seed_roots(&db, MID, &frontiers);
+        seed_roots(&db, HIGH, &frontiers);
+
+        let cache = Mutex::new(HistoricalTreeCache::with_artifact(artifact_entries(
+            Height(HIGH.0 + 1),
+            &[(MID, &frontiers), (HIGH, &mismatched)],
+        )));
+        let error = derive_historical_frontiers_measured(&db, &cache, HIGH, 0)
+            .expect_err("replay from the previous grid entry exceeds a zero-block bound");
+
+        assert_eq!(
+            error,
+            HistoricalTreeDerivationError::ReplayTooLong {
+                height: HIGH,
+                blocks: u64::from(HIGH.0 - MID.0),
+                limit: 0,
+            }
+        );
+    }
+
+    /// A grid whose every entry fails its root check falls through to a genesis replay, and the
+    /// serving bound must refuse that rather than replaying the whole absent band.
+    ///
+    /// This is what ties the load-time grid-gap check to the request path: a stale or wrong-chain
+    /// grid can pass the gap check at startup and still verify against nothing here, so the same
+    /// constant has to hold on both sides.
+    #[test]
+    fn a_wholly_unverifiable_grid_cannot_replay_past_the_serving_bound() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_db();
+        let mismatched = mismatched_frontiers();
+        seed_roots(&db, HIGH, &DerivedFrontiers::empty());
+
+        // Gaps of one block, so this grid passes the load-time check, yet no entry anchors.
+        let cache = Mutex::new(HistoricalTreeCache::with_artifact(artifact_entries(
+            Height(HIGH.0 + 1),
+            &[(MID, &mismatched), (HIGH, &mismatched)],
+        )));
+        let error = derive_historical_frontiers_measured(
+            &db,
+            &cache,
+            HIGH,
+            MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+        )
+        .expect_err("a genesis fall-through must not be served");
+
+        assert_eq!(
+            error,
+            HistoricalTreeDerivationError::ReplayTooLong {
+                height: HIGH,
+                blocks: u64::from(HIGH.0) + 1,
+                limit: MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+            },
+            "the serving bound is what stops a fall-through to genesis"
+        );
     }
 }

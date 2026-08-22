@@ -146,6 +146,18 @@ pub struct Config {
     #[serde(skip)]
     pub vct_fast_sync: bool,
 
+    /// Optional path to a frontier artifact used to anchor historical tree derivation.
+    ///
+    /// When unset, historical tree derivation remains idle and the absent band is reported as
+    /// unavailable. The artifact holds note commitment frontiers at a sparse height grid, so a
+    /// cold request replays from the nearest grid entry rather than from genesis. Every entry is
+    /// checked against the authenticated root this node already stores before it is used, so a
+    /// corrupt or hostile artifact is rejected rather than absorbed.
+    ///
+    /// Completed subtree roots need no equivalent setting: they ship embedded in the binary and
+    /// are loaded without operator configuration.
+    pub historical_frontier_artifact: Option<PathBuf>,
+
     /// Whether to delete the old database directories when present.
     ///
     /// Set to `true` by default. If this is set to `false`,
@@ -296,6 +308,25 @@ impl Config {
 
         Ok(())
     }
+
+    /// Whether this node rebuilds historical note commitment trees on demand for RPC queries.
+    ///
+    /// True when an archive node either currently uses the verified-commitment-trees fast path or
+    /// has a durable marker showing that its database previously completed a VCT fast sync. The
+    /// marker keeps an existing absent tree band serviceable after sync settings change. A legacy
+    /// database has no marker, so disabling either setting keeps derivation off.
+    ///
+    /// This is derived rather than configured because it grants no capability an operator needs to
+    /// weigh: a derived frontier is served only when it reproduces the authenticated root this node
+    /// already stores, so the answer is verified rather than trusted, and a node that can answer a
+    /// treestate query correctly has no reason to refuse it. What an operator does choose is the
+    /// cost bound: derivation anchors on [`Self::historical_frontier_artifact`], and
+    /// [`crate::MAX_HISTORICAL_TREE_REPLAY_BLOCKS`] bounds it from both ends, refusing a grid whose
+    /// gaps are too wide at startup and a request that would replay too far at serving time.
+    pub fn derive_historical_trees(&self, database_was_vct_fast_synced: bool) -> bool {
+        self.pruning_config().is_none()
+            && ((self.checkpoint_sync && self.vct_fast_sync) || database_was_vct_fast_synced)
+    }
 }
 
 /// Selects whether Zebra keeps all historical block data, or stores only the data
@@ -431,6 +462,7 @@ impl Default for Config {
             enable_zakura_header_seed_from_committed_blocks: false,
             checkpoint_sync: true,
             vct_fast_sync: true,
+            historical_frontier_artifact: None,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,
@@ -510,6 +542,69 @@ mod tests {
             !serialized.contains("vct_fast_sync"),
             "vct_fast_sync is configured under [consensus], not [state]"
         );
+    }
+
+    #[test]
+    fn historical_tree_derivation_follows_storage_mode_and_vct() {
+        assert!(
+            Config::default().derive_historical_trees(false),
+            "an archive node on the VCT fast path can rebuild the trees it skipped storing"
+        );
+
+        let legacy_recompute = Config {
+            vct_fast_sync: false,
+            ..Config::default()
+        };
+        assert!(
+            !legacy_recompute.derive_historical_trees(false),
+            "a node that recomputes every per-height tree has no absent band to derive"
+        );
+        assert!(
+            legacy_recompute.derive_historical_trees(true),
+            "a durable VCT marker preserves derivation after the fast path is disabled"
+        );
+
+        let full_verification = Config {
+            checkpoint_sync: false,
+            ..Config::default()
+        };
+        assert!(
+            !full_verification.derive_historical_trees(false),
+            "without checkpoint sync the VCT mirror is inert, so no band is skipped"
+        );
+        assert!(
+            full_verification.derive_historical_trees(true),
+            "a durable VCT marker preserves derivation after checkpoint sync is disabled"
+        );
+
+        let pruned = Config {
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            ..Config::default()
+        };
+        assert!(
+            !pruned.derive_historical_trees(false),
+            "replay reads block bodies that pruned mode deletes"
+        );
+        assert!(
+            !pruned.derive_historical_trees(true),
+            "a durable VCT marker cannot make pruned block bodies available"
+        );
+    }
+
+    #[test]
+    fn retired_historical_tree_settings_are_rejected() {
+        // Both keys were only ever available in pre-release builds, so a config carrying one is a
+        // preview config that must be updated. Silently ignoring it would leave an operator
+        // believing they had turned derivation off, or capped its replay.
+        for retired in [
+            "derive_historical_trees = true",
+            "max_historical_tree_replay_blocks = 100",
+        ] {
+            assert!(
+                toml::from_str::<Config>(retired).is_err(),
+                "{retired} is no longer a state setting and must not parse"
+            );
+        }
     }
 }
 

@@ -5,7 +5,7 @@ use std::{
     env,
     error::Error,
     fs,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use tempfile::TempDir;
@@ -28,7 +28,7 @@ use zakura_chain::{
 use zakura_test::prelude::*;
 
 use crate::{
-    config::Config,
+    config::{Config, PruningConfig, StorageMode},
     error::HistoricalTreeUnavailable,
     service::{
         arbitrary::PreparedChain,
@@ -41,14 +41,14 @@ use crate::{
         },
     },
     tests::FakeChainHelper,
-    HashOrHeight,
+    HashOrHeight, ReadRequest, ReadResponse,
 };
 
 use super::super::{
     commitment_aux, export_frontier_grid_to, serve_block_roots,
     vct::validate_final_frontiers_bytes, verify_subtrees_against_stored, CheckpointVerifiedBlock,
-    DiskWriteBatch, FinalizedState, FrontierGridExportError, GridSpacing, VctAuxiliaryWindow,
-    VctSuccessorWitness,
+    DiskWriteBatch, FinalizedState, FrontierArtifact, FrontierEntry, FrontierGridExportError,
+    GridSpacing, VctAuxiliaryWindow, VctSuccessorWitness,
 };
 
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -3137,6 +3137,248 @@ fn vct_untrusted_fixture_drives_byte_identical_state() -> Result<()> {
 
             prop_assert_eq!(fast.db.vct_anchor_digest(), golden_anchors, "fast anchors from fixture roots match legacy");
             prop_assert_eq!(fast.db.history_tree().hash(), golden_history, "fast history from fixture roots match legacy");
+    });
+
+    Ok(())
+}
+
+/// Builds a [`crate::ReadStateService`] over `finalized_state`, so tests can exercise the real
+/// read handlers rather than the helpers underneath them.
+///
+/// The config gate, the artifact load, and the typed-error fallback all live in the handler, so
+/// testing only the helpers would leave the seam that actually serves `z_gettreestate` unproven.
+fn read_service_over(finalized_state: &FinalizedState) -> crate::ReadStateService {
+    use zakura_node_services::sync_lifecycle::{
+        HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+    };
+
+    use crate::service::{
+        non_finalized_state::NonFinalizedState, watch_receiver::WatchReceiver,
+        HeaderChainSubscriptions, ReadStateService, VctRootRepairStatus,
+    };
+
+    let (_non_finalized_sender, non_finalized_receiver) =
+        tokio::sync::watch::channel(NonFinalizedState::new(&finalized_state.network()));
+    let (_repair_sender, repair_receiver) =
+        tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+        tokio::sync::watch::channel(None);
+    let (_header_chain_view_sender, header_chain_view_receiver) = tokio::sync::watch::channel(None);
+    let (_header_runtime_status_sender, header_runtime_status_receiver) =
+        tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+            epoch: LifecycleEpoch::INITIAL,
+            reason: HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+        });
+    let (_header_chain_reader_sender, header_chain_reader_receiver) =
+        tokio::sync::watch::channel(None);
+
+    ReadStateService::new(
+        finalized_state,
+        None,
+        Arc::new(OnceLock::new()),
+        WatchReceiver::new(non_finalized_receiver),
+        repair_receiver,
+        HeaderChainSubscriptions {
+            snapshots: header_chain_snapshot_receiver,
+            views: header_chain_view_receiver,
+            runtime_status: header_runtime_status_receiver,
+            reader: header_chain_reader_receiver,
+        },
+        crate::service::load_historical_frontier_artifact(
+            &finalized_state.network(),
+            finalized_state.db.config(),
+            finalized_state.db.vct_synced_below().is_some(),
+        )
+        .expect("the test historical frontier artifact loads")
+        .discard_if_before_vct_handoff(finalized_state.db.config(), &finalized_state.db),
+    )
+}
+
+/// Writes a genesis-empty frontier grid, the anchor a deriving node needs before it will serve
+/// the absent band at all.
+///
+/// Height 0 is empty on this synthetic chain, so the entry root-checks and a below-handoff
+/// request still has to replay. The file must outlive the [`FinalizedState`] that points at it.
+fn write_genesis_frontier_artifact(
+    network: &zakura_chain::parameters::Network,
+    last_checkpoint: Height,
+) -> tempfile::NamedTempFile {
+    let artifact = FrontierArtifact {
+        spacing: 1,
+        last_checkpoint,
+        entries: vec![FrontierEntry {
+            height: Height(0),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
+        }],
+    };
+    let file = tempfile::NamedTempFile::new().expect("a temporary artifact file is created");
+    fs::write(file.path(), artifact.encode(network)).expect("the genesis frontier artifact writes");
+    file
+}
+
+/// The read service must serve absent-band treestates when derivation is enabled, and report the
+/// typed archive-mode error when it is not, including when the node is pruned.
+///
+/// This exercises the handler itself — config gating, derivation, the pruned-mode short-circuit,
+/// and the fallback to [`HistoricalTreeUnavailable`] — rather than the helpers underneath it,
+/// because that handler is what a wallet's `z_gettreestate` actually reaches.
+#[test]
+#[allow(clippy::needless_range_loop)] // the loops index blocks[i + 1] for the successor witness
+fn vct_read_service_serves_or_refuses_absent_band_treestates() -> Result<()> {
+    use tower::ServiceExt;
+
+    let _init_guard = zakura_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu6_3: Some(48),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let nu5_height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("NU5 activation height is configured");
+    let tested_block_count =
+        usize::try_from(nu5_height.0 + 4).expect("test activation height fits in usize");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((blocks, network) in super::valid_commitment_chain(ledger_strategy.clone(), tested_block_count).no_shrink())| {
+
+        let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+        let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
+        let last = (nu5 + 3) as usize;
+        prop_assert!(blocks.len() > last, "generated chain unexpectedly short");
+        let handoff = Height(last as u32);
+        let seed = (heartwood - 1) as usize;
+
+        // Legacy pass: the per-block fixture, and the golden trees to compare against.
+        let mut legacy = FinalizedState::new(&Config::ephemeral(), &network)
+            .expect("opening an ephemeral database should succeed");
+        let mut fixture = TestRootMap::new();
+        let mut handoff_trees = None;
+        for i in 0..=last {
+            let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+            let (_h, trees) = legacy
+                .commit_finalized_direct(cv.into(), None, None, "vct legacy")
+                .unwrap();
+            if i > seed {
+                fixture.insert(
+                    i as u32,
+                    (trees.sapling.root(), trees.orchard.root(), trees.ironwood.root()),
+                );
+            }
+            if i == last {
+                handoff_trees = Some(trees);
+            }
+        }
+        let handoff_trees = handoff_trees.expect("the handoff produced trees");
+
+        let commit_fast = |config: Config| {
+            let mut fast = FinalizedState::new(&config, &network)
+                .expect("opening an ephemeral database should succeed");
+            enable_vct_test_fixture_source_with_handoff(
+                &mut fast,
+                fixture.clone(),
+                handoff,
+                handoff_trees.sapling.clone(),
+                handoff_trees.orchard.clone(),
+                handoff_trees.sprout.clone(),
+                handoff_trees.ironwood.clone(),
+            );
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < last).then(|| vct_successor_witness(blocks[i + 1].block.clone()));
+                fast.commit_finalized_direct(cv.into(), None, next, "vct fast")
+                    .expect("verified fast commit succeeds");
+            }
+            fast
+        };
+
+        let probe = Height(last as u32 - 1);
+        let runtime = tokio::runtime::Runtime::new().expect("a test runtime starts");
+
+        // An archive node on the VCT fast path derives: the handler serves trees matching the
+        // legacy node's. A genesis-empty grid is enough to anchor on, and still leaves the probe
+        // as a replay rather than a zero-cost hit.
+        let artifact_file = write_genesis_frontier_artifact(&network, handoff);
+        let deriving = Config {
+            historical_frontier_artifact: Some(artifact_file.path().to_path_buf()),
+            ..Config::ephemeral()
+        };
+        let fast = commit_fast(deriving);
+        prop_assert!(fast.db.vct_tree_absent(probe), "the probe height is in the absent band");
+
+        let read_state = read_service_over(&fast);
+        let sapling = runtime
+            .block_on(read_state.clone().oneshot(ReadRequest::SaplingTree(probe.into())))
+            .expect("the read service answers");
+        let ReadResponse::SaplingTree(Some(tree)) = sapling else {
+            panic!("derivation is enabled, so the absent band must be served, got {sapling:?}")
+        };
+        prop_assert_eq!(
+            tree.root(),
+            legacy.db.sapling_tree_by_height(&probe).expect("legacy stores every tree").root(),
+            "the served Sapling treestate matches the legacy node"
+        );
+
+        let orchard = runtime
+            .block_on(read_state.oneshot(ReadRequest::OrchardTree(probe.into())))
+            .expect("the read service answers");
+        let ReadResponse::OrchardTree(Some(tree)) = orchard else {
+            panic!("derivation is enabled, so the absent band must be served, got {orchard:?}")
+        };
+        prop_assert_eq!(
+            tree.root(),
+            legacy.db.orchard_tree_by_height(&probe).expect("legacy stores every tree").root(),
+            "the served Orchard treestate matches the legacy node"
+        );
+
+        // Pruned mode, grid and all: bodies in the retention window may still be present on this
+        // short chain, but a pruned node cannot serve historical treestates. Fail with the typed
+        // archive-mode error rather than walking the replay until a missing body.
+        let pruned = Config {
+            historical_frontier_artifact: Some(artifact_file.path().to_path_buf()),
+            storage_mode: StorageMode::Pruned(PruningConfig::default()),
+            ..Config::ephemeral()
+        };
+        let fast = commit_fast(pruned);
+        let read_state = read_service_over(&fast);
+        let sapling_error = runtime
+            .block_on(read_state.clone().oneshot(ReadRequest::SaplingTree(probe.into())))
+            .expect_err("pruned mode must not derive historical treestates");
+        prop_assert!(
+            sapling_error.to_string().contains("fast-synced"),
+            "pruned mode reports the typed archive-mode error, got: {sapling_error}"
+        );
+        prop_assert!(
+            !sapling_error.to_string().contains("not retained"),
+            "pruned mode must not surface a per-height missing-body replay failure, got: {sapling_error}"
+        );
+        let orchard_error = runtime
+            .block_on(read_state.oneshot(ReadRequest::OrchardTree(probe.into())))
+            .expect_err("pruned mode must not derive historical treestates");
+        prop_assert!(
+            orchard_error.to_string().contains("fast-synced"),
+            "pruned mode reports the typed archive-mode error, got: {orchard_error}"
+        );
+
     });
 
     Ok(())

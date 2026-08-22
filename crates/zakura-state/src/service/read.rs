@@ -44,7 +44,7 @@ pub use find::{
     non_finalized_state_contains_block_hash, tip, tip_height, tip_with_value_balance,
 };
 pub use historical_tree::{
-    derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_MEMOIZED_FRONTIERS,
+    derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_CACHED_FRONTIERS,
 };
 pub(crate) use tree::{
     check_historical_ironwood_subtrees_available, check_historical_orchard_subtrees_available,

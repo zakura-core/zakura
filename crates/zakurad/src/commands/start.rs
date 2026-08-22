@@ -401,7 +401,8 @@ impl StartCmd {
             config.sync.checkpoint_verify_concurrency_limit
                 * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
         )
-        .await;
+        .await
+        .map_err(|error| eyre!("state initialization failed: {error}"))?;
 
         state_service
             .ready()
@@ -1803,7 +1804,8 @@ mod zakura_header_sync_driver_tests {
                     block::Height(0),
                     2,
                 )
-                .await;
+                .await
+                .expect("persistent test state initialization succeeds");
             let committed = state_service
                 .ready()
                 .await
@@ -1894,7 +1896,8 @@ mod zakura_header_sync_driver_tests {
                     block::Height(0),
                     2,
                 )
-                .await;
+                .await
+                .expect("persistent test state reopens");
             state_service
                 .ready()
                 .await

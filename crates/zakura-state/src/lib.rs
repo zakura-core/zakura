@@ -45,8 +45,8 @@ pub use config::{
     StorageMode,
 };
 pub use constants::{
-    state_database_format_version_in_code, DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
-    MAX_BLOCK_REORG_HEIGHT,
+    state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT,
+    MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 pub use error::{
     BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
@@ -114,7 +114,7 @@ pub use service::finalized_state::{
     validate_final_frontiers_bytes, FinalFrontiersGenerationError, FinalFrontiersValidationError,
 };
 pub use service::read::{
-    derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_MEMOIZED_FRONTIERS,
+    derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_CACHED_FRONTIERS,
 };
 pub use service::{
     finalized_state::{DiskWriteBatch, FallibleDiskValue, FromDisk, IntoDisk, WriteDisk, ZakuraDb},

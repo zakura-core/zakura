@@ -2587,6 +2587,10 @@ impl WriteBlockWorkerTask {
                 continue;
             };
 
+            if let Some(lifecycle) = lifecycle.as_ref() {
+                lifecycle.reach(BlockLifecycleMilestone::WriterStarted);
+            }
+
             let child_hash = queued_child.hash;
             let parent_hash = queued_child.block.header.previous_block_hash;
             let child_height = queued_child.height;

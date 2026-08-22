@@ -1059,7 +1059,9 @@ impl StateService {
                     let admission = queued_child.2.clone();
                     let send_result = non_finalized_block_write_sender.send(queued_child.into());
 
-                    if let Err(SendError(NonFinalizedWriteMessage::Commit(queued))) = send_result {
+                    if let Err(SendError(NonFinalizedWriteMessage::Commit { queued, .. })) =
+                        send_result
+                    {
                         // If Zebra is shutting down, drop blocks and return an error.
                         Self::send_semantically_verified_block_error(
                             queued,

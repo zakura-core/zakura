@@ -153,7 +153,7 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     deprecated: false,
 },
 "getblocktemplate" => openrpsee::openrpc::RpcMethod {
-    description: "Returns a block template for mining new Zcash blocks.\n\n# Parameters\n\n- `jsonrequestobject`: (string, optional) A JSON object containing arguments.\n\nzcashd reference: [`getblocktemplate`](https://zcash-rpc.github.io/getblocktemplate.html)\nmethod: post\ntags: mining\n\n# Notes\n\nArguments to this RPC are currently ignored.\nLong polling, block proposals, server lists, and work IDs are not supported.\n\nMiners can make arbitrary changes to blocks, as long as:\n- the data sent to `submitblock` is a valid Zcash block, and\n- the parent block is a valid block that Zebra already has, or will receive soon.\n\nZebra verifies blocks in parallel, and keeps recent chains in parallel,\nso moving between chains and forking chains is very cheap.\n",
+    description: "Returns a block template for mining new Zcash blocks.\n\n# Parameters\n\n- `jsonrequestobject`: (string, optional) A JSON object containing arguments.\n\nzcashd reference: [`getblocktemplate`](https://zcash-rpc.github.io/getblocktemplate.html)\nmethod: post\ntags: mining\n\n# Notes\n\nServer lists are not supported. Long polling, block proposals, and work IDs are supported.\n\nMiners can make arbitrary changes to blocks, as long as:\n- the data sent to `submitblock` is a valid Zcash block, and\n- the parent block is a valid block that Zebra already has, or will receive soon.\n\nZebra verifies blocks in parallel, and keeps recent chains in parallel,\nso moving between chains and forking chains is very cheap.\n",
     params: |_g| vec![
         _g.param::<GetBlockTemplateParameters>("parameters", crate::methods::PARAM_PARAMETERS_DESC, false),
     ],
@@ -161,7 +161,7 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     deprecated: false,
 },
 "submitblock" => openrpsee::openrpc::RpcMethod {
-    description: "Submits block to the node to be validated and committed.\nReturns the [`SubmitBlockResponse`] for the operation, as a JSON string.\n\nzcashd reference: [`submitblock`](https://zcash.github.io/rpc/submitblock.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `hexdata`: (string, required)\n- `jsonparametersobject`: (string, optional) - currently ignored\n\n# Notes\n\n - `jsonparametersobject` holds a single field, workid, that must be included in submissions if provided by the server.\n",
+    description: "Submits block to the node to be validated and committed.\nReturns the [`SubmitBlockResponse`] for the operation, as a JSON string.\n\nzcashd reference: [`submitblock`](https://zcash.github.io/rpc/submitblock.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `hexdata`: (string, required)\n- `jsonparametersobject`: (string, optional)\n\n# Notes\n\n - `jsonparametersobject` holds a single field, workid, that must be included in submissions if provided by the server.\n",
     params: |_g| vec![
         _g.param::<HexData>("hex_data", crate::methods::PARAM_HEX_DATA_DESC, true),
         _g.param::<SubmitBlockParameters>("_parameters", crate::methods::PARAM__PARAMETERS_DESC, false),

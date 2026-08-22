@@ -303,9 +303,91 @@ introduced for a release state that predates it, without a checkpoint advance ri
 
 **Distribution** — the release-state publisher uploads all four files as one immutable
 bundle, and `update-release-state.yml` imports them into one reviewable draft PR
-(verified-commitment-trees design §16). The grid is committed like the other artifacts,
-with its digest, size, and entry count recorded in `mainnet-vct-manifest.json`. It carries
-no trust weight either way: a consuming node re-checks every entry it anchors on.
+(verified-commitment-trees design §16). Three of the four are committed. The grid is not: at
+~4.7 MB regenerated on every refresh, committing it would add that much to the repository's
+history every week, permanently. It is published instead as an exact-pinned crates.io package
+built from `assets/zakura-assets/`, whose payload is generated at publish time and never enters
+git. Its digest, size, and entry count are still recorded in `mainnet-vct-manifest.json`; the
+pin and the record are held together by the checks in the next section.
+
+Cargo can only resolve a version that already exists, so the package is published _before_ the
+pull request that pins it is opened, and the refresh workflow does both in one run. A candidate
+a reviewer rejects is a yanked, unreferenced version. That publish is unattended, which is
+acceptable for the same reason everything else about this artifact is: the grid carries no trust
+weight, and a consuming node re-checks every entry it anchors on.
+
+### 5.1 Keeping the pin and the checkpoint together
+
+Nothing here trusts the pin; these checks stop it from drifting away from the checkpoint the
+rest of the release state describes.
+
+- The version is `0.<last_checkpoint>.<revision>`, so the pin itself states which checkpoint the
+  payload covers. `scripts/check-release-state.sh` requires that height to equal the manifest's
+  `finalized_height`, requires the requirement to be exact rather than a range, and requires
+  `Cargo.lock` to resolve it from crates.io with a checksum, which rules out a committed path or
+  git override. All of that runs without cargo, on every PR, through `lint.yml`.
+- `embedded_mainnet_final_frontiers_parse` hashes the bytes the dependency actually supplies and
+  holds them against the manifest's `frontier_grid_sha256`, size, and entry count, and holds the
+  payload's own declared checkpoint against the embedded checkpoint list. The crate's constants
+  are checked too, so a crate that misdeclares its payload cannot pass by agreeing with itself.
+- `import-release-state.py` proves each new grid is a byte prefix-extension of the one the
+  repository currently pins, which the workflow materialises from the registry rather than the
+  tree.
+- Finally, none of the above is what makes a wrong grid safe. Every entry is checked against the
+  node's own authenticated root for that height before it anchors anything, and a failed entry is
+  skipped rather than fatal.
+
+### 5.2 Verifying a published grid
+
+Four levels, in increasing strength. The first three are available to anyone.
+
+**A. The same bytes at every hop**, no node required:
+
+```sh
+V=<pinned version>; N=<published crate name>
+curl -sLO "https://static.crates.io/crates/$N/$N-$V.crate"
+sha256sum "$N-$V.crate"            # equals Cargo.lock's checksum for $N
+tar xzf "$N-$V.crate"
+sha256sum "$N-$V/src/mainnet-frontier-grid.bin"   # equals frontier_grid_sha256
+cat "$N-$V/.cargo_vcs_info.json"   # the Zakura commit CI packaged from
+```
+
+Then re-resolve the bundle the manifest names and compare the same digest:
+
+```sh
+python3 .github/scripts/fetch-release-state.py \
+    --meta-url <manifest bundle meta URL> \
+    --meta-sha256 <manifest meta_sha256> \
+    --output-dir /tmp/bundle \
+    --metadata-out /tmp/resolution.json
+```
+
+`.cargo_vcs_info.json` names the Zakura commit the package was built from, and marks the tree
+dirty: the payload is generated and gitignored, so cargo sees uncommitted files and the publish
+passes `--allow-dirty`. The commit is what identifies the reviewed packaging code; the payload's
+own identity comes from the digests above.
+
+This proves byte identity across repository, registry, and bundle. It proves nothing about
+whether the bytes are right.
+
+**B. Independent reproduction** — the strongest check, and it trusts nobody. Entry placement is a
+deterministic function of the chain rather than of timing, so a run against any Mainnet archive
+node produces byte-identical output:
+
+```sh
+cargo run --release -p zakura-utils --bin zakura-checkpoints -- \
+    --state-cache-dir <archive cache> \
+    --mainnet-frontier-grid-checkpoint <height> \
+    --mainnet-frontier-grid-output /tmp/regenerated.bin
+cmp /tmp/regenerated.bin /tmp/bundle/mainnet-frontier-grid.bin
+```
+
+**C. Offline bundle consistency** — `zakurad verify-historical-treestates` checks the grid's
+framing and that it covers the same checkpoint as the rest of the bundle, and proves the subtree
+roots against the frontier.
+
+**D. Continuous and automatic** — every entry is root-checked on every node, forever. This is the
+only one of the four that cannot be skipped.
 
 This remains the design's central trade: the ordered pass happens once, on one host, and is
 verified independently by every consumer.

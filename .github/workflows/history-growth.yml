@@ -62,8 +62,9 @@ jobs:
         run: |
           set -euo pipefail
           sort > "${RUNNER_TEMP}/release-state-files" <<'EOF'
+          Cargo.lock
+          Cargo.toml
           crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
-          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier-grid.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
@@ -73,8 +74,11 @@ jobs:
             > "${RUNNER_TEMP}/changed-files"
           OUTSIDE=$(comm -23 "${RUNNER_TEMP}/changed-files" "${RUNNER_TEMP}/release-state-files")
           if [ -s "${RUNNER_TEMP}/changed-files" ] && [ -z "${OUTSIDE}" ]; then
-            echo "Release-state-only change; allowing 8 MiB of history growth."
-            echo "bytes=8388608" >> "${GITHUB_OUTPUT}"
+            # The frontier grid used to dominate this budget. It now ships as a pinned crates.io
+            # dependency, so a refresh is an appended checkpoint list plus small artifacts, and
+            # the headroom shrinks accordingly: a grid committed by mistake must fail here.
+            echo "Release-state-only change; allowing 3 MiB of history growth."
+            echo "bytes=3145728" >> "${GITHUB_OUTPUT}"
           else
             echo "bytes=2097152" >> "${GITHUB_OUTPUT}"
           fi

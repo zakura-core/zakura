@@ -17,8 +17,17 @@ Production host wiring, operations, and rollback:
   then atomically replaces `release-state/latest.json`. Bundles are retained
   newest-4 by default (`RELEASE_STATE_KEEP`).
 - **GitHub (repository):** the workflow resolves `latest.json` over a pinned
-  HTTPS host, verifies every digest, and opens a draft PR. Humans review and
-  merge; releases build only committed source.
+  HTTPS host, verifies every digest, publishes the bundle's frontier grid to
+  crates.io, and opens a draft PR that imports the other three artifacts and
+  repins the grid. Humans review and merge; releases build only committed
+  source and the exact versions the lockfile pins.
+
+  The grid is published rather than committed because it is regenerated on
+  every refresh at ~4.7 MB, which the repository would carry in its history
+  forever. Cargo can only resolve a version that already exists, so the
+  publish necessarily precedes the PR that pins it; a candidate the reviewer
+  rejects is a yanked, unreferenced version. See
+  `docs/design/historical-treestate-serving.md` §5.
 
 ## Why an archive node, and why it need not be stopped
 

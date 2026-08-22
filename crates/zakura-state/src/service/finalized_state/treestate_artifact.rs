@@ -74,7 +74,12 @@ const FRONTIER_DIGEST_OFFSET: usize = 8 + 2 + 1 + 4 + 4 + 4;
 pub(super) const MAINNET_SUBTREES: &[u8] = include_bytes!("vct/mainnet-subtrees.bin");
 
 /// Reviewed historical frontier grid shipped with the Mainnet last checkpoint.
-const MAINNET_FRONTIER_GRID: &[u8] = include_bytes!("vct/mainnet-frontier-grid.bin");
+///
+/// Published as a crates.io package rather than committed here: it is regenerated on every
+/// release-state refresh, and at ~4.7 MB per revision that is history the repository would carry
+/// forever. `Cargo.lock` pins the exact bytes, and `mainnet-vct-manifest.json` records the digest
+/// this checkpoint was reviewed with.
+const MAINNET_FRONTIER_GRID: &[u8] = zakura_assets::MAINNET_FRONTIER_GRID;
 
 /// The format version treestate artifacts are written at.
 const VERSION: u16 = 1;

@@ -66,7 +66,7 @@ pub use request::Spend;
 
 pub use response::{
     AnyTx, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock, MinedTx,
-    NonFinalizedBlocksListener, ReadResponse, Response,
+    NonFinalizedBlocksListener, ReadResponse, Response, TreestateAnchor, TreestateReconstruction,
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use service::finalized_state::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};

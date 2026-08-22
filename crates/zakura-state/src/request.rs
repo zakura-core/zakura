@@ -1733,6 +1733,22 @@ pub enum ReadRequest {
     /// * [`ReadResponse::IronwoodTree(None)`](crate::ReadResponse::IronwoodTree) otherwise.
     IronwoodTree(HashOrHeight),
 
+    /// Gathers everything a client needs to rebuild the note commitment treestate at
+    /// `hash_or_height` for itself: the authenticated target roots, plus the highest frontier at
+    /// or below the target that this node has already verified against them.
+    ///
+    /// This is the wallet-side counterpart of the per-height tree reads above, for the band where
+    /// a fast-synced node has no stored tree. It does no replay — the client does that — so it
+    /// stays cheap even when the target is far above anything this node has derived.
+    ///
+    /// Returns
+    ///
+    /// * [`ReadResponse::TreestateReconstruction(Some(_))`](crate::ReadResponse::TreestateReconstruction)
+    ///   when the block is in the best chain and this node holds authenticated roots for it.
+    /// * [`ReadResponse::TreestateReconstruction(None)`](crate::ReadResponse::TreestateReconstruction)
+    ///   when the block is not in the best chain.
+    TreestateReconstruction(HashOrHeight),
+
     /// Returns a list of Sapling note commitment subtrees by their indexes, starting at
     /// `start_index`, and returning up to `limit` subtrees.
     ///
@@ -1918,6 +1934,7 @@ impl ReadRequest {
             ReadRequest::SaplingTree { .. } => "sapling_tree",
             ReadRequest::OrchardTree { .. } => "orchard_tree",
             ReadRequest::IronwoodTree { .. } => "ironwood_tree",
+            ReadRequest::TreestateReconstruction { .. } => "treestate_reconstruction",
             ReadRequest::SaplingSubtrees { .. } => "sapling_subtrees",
             ReadRequest::OrchardSubtrees { .. } => "orchard_subtrees",
             ReadRequest::IronwoodSubtrees { .. } => "ironwood_subtrees",

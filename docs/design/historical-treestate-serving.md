@@ -184,7 +184,8 @@ read service, and RPC requests do not repeat the proof.
 
 ### 3.5 Serving the three RPCs
 
-- **`z_gettreestate`** is served directly by §3.3.
+- **`z_gettreestate`** is served directly by §3.3, or reconstructed client-side from
+  `z_gettreestateanchor` (§6a) on a node that would rather not replay.
 - **`getblock` / `getblockheader` sizes** need only a count, not a frontier. A frontier
   knows its own position, so the size at `h` is the nearest anchor's `tree_size()` plus the
   commitments added in between, which requires no hashing at all.
@@ -324,6 +325,55 @@ cheapest first step.
 One trade-off to weigh: the node's sizes currently act as a loose cross-check on the
 client's tree position. It is a weak check, since those sizes are unauthenticated on every
 backend, but dropping it should be a deliberate decision rather than a silent side effect.
+
+**Prototyped (2026-08-05).** zecd derives sizes locally _only_ inside the band — that is, only
+when the node cannot serve the tree state just below a scan range, which is exactly when its
+per-block `trees` query would fail anyway. Everywhere else the node's sizes are still used, so the
+cross-check is kept where it costs nothing and dropped only where it does not exist.
+
+## 6a. Wallet-side reconstruction
+
+A second consumer of §3.1's verification property, and the one that makes the absent band
+serviceable without the node paying for §3.3 at all: **the client can run the replay.**
+
+The node exposes a Zakura-specific `z_gettreestateanchor(hash | height)` returning, in one state
+read so the pieces cannot straddle a reorg:
+
+- the canonical target height and hash, its header time, and the three authenticated roots;
+- the highest frontier at or below the target that the node has already verified — from its
+  memo, from the published grid, or from the last stored tree below `U` — with its own canonical
+  hash and `finalState` in `z_gettreestate`'s encoding;
+- `replayFrom`, the first height the client must replay.
+
+`z_gettreestate` is untouched: same response, same errors, same codes. A client tries it first and
+falls back here only on the typed historical-tree-unavailable message from §3.6.
+
+The client then replays the canonical blocks from `replayFrom` to the target and accepts the result
+only if all three roots match. **This is the same check as §3.1, run on the other side of the RPC**,
+so it carries the same weight: a frontier that reproduces an authenticated root is the frontier,
+and a wrong or stale anchor cannot survive it. The trust boundary therefore does not move. The
+node's roots are authenticated against its own header chain and the client already relies on that
+node for its view of the chain; what it does _not_ have to do is believe an unverified frontier.
+
+Three properties follow, and they are why this is worth having alongside §3.3 rather than instead
+of it:
+
+1. **The node does no replay.** Answering costs one root lookup plus, at most, one root check of a
+   published grid entry. The measured per-request cost of §3.3 (median 1.07 s, p90 2.50 s) does not
+   apply, so an operator can serve the band without a replay budget or an RPC-timeout risk.
+2. **The client's cache is self-invalidating.** A wallet memoizes each verified end state and
+   anchors the next batch on it. A stale entry — from an abandoned fork, or from before a reorg —
+   cannot corrupt anything, because it would have to replay into the _new_ chain's authenticated
+   roots. It can only make a request fail, never succeed wrongly. No explicit reorg invalidation is
+   needed.
+3. **It composes with the anchor grid.** The client's anchor is whichever is higher: its own
+   previous batch end, or whatever the node offers. Sequential wallet access (§3.3) makes the first
+   the common case, so grid spacing again only costs the first request of a sweep.
+
+The cost the client pays is the replay itself, and the block bodies it needs for it. A pruned node
+still cannot supply those, so this widens _who can serve_ the band but not _which nodes_ can.
+Subtree roots (§3.4) are unaffected: they cannot be checked this way on either side, so they still
+ship as a reviewed artifact.
 
 ## Appendix A: measurements (2026-08-03)
 

@@ -112,7 +112,9 @@ pub(crate) mod trees;
 pub(crate) mod types;
 
 use hex_data::HexData;
-use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
+use trees::{
+    GetSubtreesByIndexResponse, GetTreestateAnchorResponse, GetTreestateResponse, SubtreeRpcData,
+};
 use types::{
     get_block_template::{
         constants::{
@@ -415,6 +417,36 @@ pub trait Rpc {
     /// state is available for the requested block.
     #[method(name = "z_gettreestate")]
     async fn z_get_treestate(&self, hash_or_height: String) -> Result<GetTreestateResponse>;
+
+    /// Returns the material a client needs to reconstruct a block's note commitment treestate
+    /// itself: the authenticated per-pool roots at that block, and the highest frontier at or
+    /// below it that this node has already verified against them.
+    ///
+    /// Zakura-specific; `zcashd` and `lightwalletd` have no equivalent. It exists for the height
+    /// band where a verified-commitment-trees fast-synced node stores no per-height tree and
+    /// `z_gettreestate` therefore reports the tree unavailable. A client falls back here, replays
+    /// the canonical blocks from `replayFrom` to the target, and accepts the result only if all
+    /// three target roots match — so what it ends up with is verified, not trusted.
+    ///
+    /// method: post
+    /// tags: blockchain
+    ///
+    /// # Parameters
+    ///
+    /// - `hash | height`: (string, required, example="1500000") The block hash or height.
+    ///
+    /// # Notes
+    ///
+    /// This does no replay of its own, so it stays cheap however far the target is from anything
+    /// this node has derived. Replaying is the client's job, and it needs the canonical block
+    /// bodies for `replayFrom..=height` to do it — which a pruned node cannot supply.
+    ///
+    /// `anchor` is omitted when the replay must start from genesis.
+    #[method(name = "z_gettreestateanchor")]
+    async fn z_get_treestate_anchor(
+        &self,
+        hash_or_height: String,
+    ) -> Result<GetTreestateAnchorResponse>;
 
     /// Returns information about a range of shielded subtrees.
     ///
@@ -2129,6 +2161,98 @@ where
             Treestate::new(trees::Commitments::new(sapling_root, sapling_tree)),
             Treestate::new(trees::Commitments::new(orchard_root, orchard_tree)),
             ironwood,
+        ))
+    }
+
+    async fn z_get_treestate_anchor(
+        &self,
+        hash_or_height: String,
+    ) -> Result<GetTreestateAnchorResponse> {
+        let mut read_state = self.read_state.clone();
+
+        let hash_or_height =
+            HashOrHeight::new(&hash_or_height, self.latest_chain_tip.best_tip_height())
+                .map_error(server::error::LegacyCode::InvalidParameter)?;
+
+        // One state request, deliberately: the anchor and the target roots have to describe the
+        // same chain, and assembling them from separate reads would let a reorg between the two
+        // hand a client an anchor that cannot reach the target it was given.
+        let material = match read_state
+            .ready()
+            .and_then(|service| {
+                service.call(zakura_state::ReadRequest::TreestateReconstruction(
+                    hash_or_height,
+                ))
+            })
+            .await
+            .map_misc_error()?
+        {
+            zakura_state::ReadResponse::TreestateReconstruction(Some(material)) => material,
+            zakura_state::ReadResponse::TreestateReconstruction(None) => {
+                return Err("the requested block is not in the main chain")
+                    .map_error(server::error::LegacyCode::InvalidParameter);
+            }
+            _ => unreachable!("unmatched response to a treestate reconstruction request"),
+        };
+
+        // Roots only: `finalState` at the target is precisely what the client is about to derive.
+        let root_only = |root: Vec<u8>| Treestate::new(trees::Commitments::new(Some(root), None));
+
+        let target = trees::TreestateTarget::new(
+            material.target_hash,
+            material.target_height,
+            material.target_time,
+            root_only(
+                material
+                    .target_roots
+                    .sapling_root
+                    .bytes_in_display_order()
+                    .to_vec(),
+            ),
+            root_only(
+                material
+                    .target_roots
+                    .orchard_root
+                    .bytes_in_display_order()
+                    .to_vec(),
+            ),
+            root_only(
+                material
+                    .target_roots
+                    .ironwood_root
+                    .bytes_in_display_order()
+                    .to_vec(),
+            ),
+        );
+
+        let anchor = material.anchor.map(|anchor| {
+            let frontiers = &anchor.frontiers;
+            let pool = |state: Vec<u8>, root: Vec<u8>| {
+                Treestate::new(trees::Commitments::new(Some(root), Some(state)))
+            };
+
+            trees::TreestateAnchorFrontiers::new(
+                anchor.hash,
+                anchor.height,
+                pool(
+                    frontiers.sapling.to_rpc_bytes(),
+                    frontiers.sapling.root().bytes_in_display_order().to_vec(),
+                ),
+                pool(
+                    frontiers.orchard.to_rpc_bytes(),
+                    frontiers.orchard.root().bytes_in_display_order().to_vec(),
+                ),
+                pool(
+                    frontiers.ironwood.to_rpc_bytes(),
+                    frontiers.ironwood.root().bytes_in_display_order().to_vec(),
+                ),
+            )
+        });
+
+        Ok(GetTreestateAnchorResponse::new(
+            target,
+            anchor,
+            material.replay_from,
         ))
     }
 

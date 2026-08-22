@@ -66,7 +66,7 @@ pub struct CompletedSubtree {
 }
 
 /// Per-pool note commitment frontiers as of the end of one block.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DerivedFrontiers {
     /// The Sapling frontier.
     pub sapling: Arc<sapling::tree::NoteCommitmentTree>,
@@ -293,6 +293,74 @@ pub fn derive_historical_frontiers(
 ) -> Result<Arc<DerivedFrontiers>, HistoricalTreeDerivationError> {
     derive_historical_frontiers_measured(db, cache, height, max_replay_blocks)
         .map(|derivation| derivation.frontiers)
+}
+
+/// A verified frontier a replay can start from, and the block it is the state at the end of.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedAnchor {
+    /// The height the frontiers are the state at the end of.
+    pub height: Height,
+
+    /// The frontiers themselves, already checked against this node's authenticated roots.
+    pub frontiers: Arc<DerivedFrontiers>,
+}
+
+/// Everything a client needs to rebuild the treestate at a target height for itself.
+///
+/// This is the wallet-side counterpart of [`derive_historical_frontiers`]: instead of replaying to
+/// the target here, the node hands over the nearest verified anchor and the authenticated roots
+/// the client must reproduce. The roots are what make that safe — a frontier that reproduces them
+/// *is* the frontier, wherever the replay ran — so a wallet accepting a reconstruction under this
+/// check extends the node no more trust than it already extends its own header chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconstructionMaterial {
+    /// The authenticated per-pool roots at the target height.
+    pub target_roots: BlockCommitmentRoots,
+
+    /// The highest verified anchor at or below the target, or `None` to replay from genesis.
+    pub anchor: Option<VerifiedAnchor>,
+
+    /// The first height the client has to replay.
+    pub replay_from: Height,
+}
+
+/// Returns the material for reconstructing the treestate at `height` on the client side.
+///
+/// Does no replay: the anchor is whatever this node already holds verified, so the cost is one
+/// root lookup plus, at most, one root check of a published grid entry.
+pub fn reconstruction_material(
+    db: &ZakuraDb,
+    cache: &Mutex<HistoricalTreeCache>,
+    height: Height,
+) -> Result<ReconstructionMaterial, HistoricalTreeDerivationError> {
+    // Read the roots first. Without them there is nothing for the client to verify against, and
+    // serving an anchor it could not check would be exactly the silent-corruption path this whole
+    // design exists to close.
+    let target_roots = authenticated_roots(db, height)?;
+
+    let anchor = anchor_for(db, cache, height)?
+        .map(|(height, frontiers)| VerifiedAnchor { height, frontiers });
+
+    // The anchor is the state at the end of its own height, so one above the target cannot start
+    // the client's replay. Report which anchor was in the way rather than handing back a range it
+    // cannot walk; `derive_historical_frontiers_measured` rejects the same case for the same
+    // reason.
+    if let Some(anchor) = anchor.as_ref().filter(|anchor| anchor.height > height) {
+        return Err(HistoricalTreeDerivationError::MissingAnchor {
+            height,
+            anchor: anchor.height,
+        });
+    }
+
+    // The anchor is the state at the *end* of its height, so the client replays from the next
+    // block. With no anchor it replays from genesis.
+    let replay_from = Height(anchor.as_ref().map_or(0, |anchor| anchor.height.0 + 1));
+
+    Ok(ReconstructionMaterial {
+        target_roots,
+        anchor,
+        replay_from,
+    })
 }
 
 /// A completed derivation, and what it cost.

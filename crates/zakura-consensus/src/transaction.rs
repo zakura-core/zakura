@@ -582,8 +582,19 @@ where
             }
 
             let nu = req.upgrade(&network);
-            let cached_ffi_transaction =
-                Arc::new(CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
+            let ffi_tx = tx.clone();
+            let cached_ffi_transaction = Arc::new(
+                primitives::spawn_fifo(move || {
+                    CachedFfiTransaction::new(ffi_tx, Arc::new(spent_outputs), nu)
+                })
+                .await
+                .map_err(|_| {
+                    TransactionError::Other(
+                        "transaction parser worker dropped its response".to_string(),
+                    )
+                })?
+                .map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?,
+            );
 
             tracing::trace!(?tx_id, "got state UTXOs");
 

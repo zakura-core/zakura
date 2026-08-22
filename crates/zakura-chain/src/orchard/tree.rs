@@ -17,6 +17,7 @@ use std::{
     io,
 };
 
+#[cfg(test)]
 use bitvec::prelude::*;
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use hex::ToHex;
@@ -27,8 +28,6 @@ use incrementalmerkletree::{
 use lazy_static::lazy_static;
 use thiserror::Error;
 use zcash_primitives::merkle_tree::HashSer;
-
-use sinsemilla::HashDomain;
 
 use crate::{
     serialization::{
@@ -48,17 +47,6 @@ pub type NoteCommitmentUpdate = pallas::Base;
 
 pub(super) const MERKLE_DEPTH: u8 = 32;
 
-lazy_static! {
-    /// The Sinsemilla hash domain for `MerkleCRH^Orchard`.
-    ///
-    /// The domain's `Q` generator is derived once (via `hash_to_curve` of the
-    /// constant domain string) and reused for every node hash. Constructing a
-    /// fresh [`HashDomain`] per hash would recompute that `hash_to_curve` on the
-    /// hot path, which is pure waste since the domain never changes.
-    static ref ORCHARD_MERKLE_CRH_DOMAIN: HashDomain =
-        HashDomain::new("z.cash:Orchard-MerkleCRH");
-}
-
 /// MerkleCRH^Orchard Hash Function
 ///
 /// Used to hash incremental Merkle tree hash values for Orchard.
@@ -74,21 +62,19 @@ lazy_static! {
 /// <https://zips.z.cash/protocol/protocol.pdf#orchardmerklecrh>
 /// <https://zips.z.cash/protocol/protocol.pdf#constants>
 fn merkle_crh_orchard(layer: u8, left: pallas::Base, right: pallas::Base) -> pallas::Base {
-    let mut s = bitvec![u8, Lsb0;];
+    let level = incrementalmerkletree::Level::from(MERKLE_DEPTH - 1 - layer);
+    let left = Option::from(orchard::tree::MerkleHashOrchard::from_bytes(
+        &left.to_repr(),
+    ))
+    .expect("an Orchard tree node contains a canonical Pallas field element");
+    let right = Option::from(orchard::tree::MerkleHashOrchard::from_bytes(
+        &right.to_repr(),
+    ))
+    .expect("an Orchard tree node contains a canonical Pallas field element");
+    let hash = orchard::tree::MerkleHashOrchard::combine(level, &left, &right);
 
-    // Prefix: l = I2LEBSP_10(MerkleDepth^Orchard − 1 − layer)
-    let l = MERKLE_DEPTH - 1 - layer;
-    s.extend_from_bitslice(&BitArray::<_, Lsb0>::from([l, 0])[0..10]);
-    s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(left.to_repr())[0..255]);
-    s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(right.to_repr())[0..255]);
-
-    // Hash with the cached domain instead of `sinsemilla_hash`, which would
-    // rebuild the `HashDomain` (and its `Q` generator) on every call.
-    let hash: Option<pallas::Base> = ORCHARD_MERKLE_CRH_DOMAIN
-        .hash(s.iter().map(|b| *b.as_ref()))
-        .into();
-
-    hash.unwrap_or_else(pallas::Base::zero)
+    Option::from(pallas::Base::from_repr(hash.to_bytes()))
+        .expect("an Orchard Merkle hash contains a canonical Pallas field element")
 }
 
 lazy_static! {
@@ -863,10 +849,8 @@ mod tests {
         assert_eq!(rebuilt.root(), original.root());
     }
 
-    /// Verbatim copy of the pre-cache `merkle_crh_orchard`: it rebuilds the
-    /// Sinsemilla [`HashDomain`](sinsemilla::HashDomain) (and its `Q` generator)
-    /// from the domain string on every call. The production `merkle_crh_orchard`
-    /// caches that domain and must stay byte-identical to this.
+    /// Reference implementation that builds the Sinsemilla message directly.
+    /// The library implementation must stay byte-identical to this function.
     fn merkle_crh_orchard_uncached(
         layer: u8,
         left: pallas::Base,
@@ -888,7 +872,7 @@ mod tests {
     /// Field elements that exercise the full 255-bit width of `pallas::Base`,
     /// which the small-integer `node(..)` helper never reaches (it only sets the
     /// low 8 bytes). Real note-commitment x-coordinates are full-width, so the
-    /// cached domain must stay byte-identical on these too. `from_raw` reduces
+    /// library implementation must stay byte-identical on these too. `from_raw` reduces
     /// mod the field modulus, so every value here is canonical.
     fn full_width_field_elements() -> Vec<pallas::Base> {
         vec![
@@ -910,12 +894,10 @@ mod tests {
         ]
     }
 
-    /// The cached-domain `merkle_crh_orchard` must produce byte-identical output
-    /// to recomputing the `HashDomain` from scratch on every call, across all
-    /// layers and a spread of input values — small integers, edge cases, and
-    /// full-width field elements.
+    /// The library implementation must produce byte-identical output across all
+    /// layers and a spread of small, edge-case, and full-width field elements.
     #[test]
-    fn cached_domain_merkle_crh_matches_fresh_domain() {
+    fn library_merkle_crh_matches_reference() {
         let mut values: Vec<pallas::Base> = [0u64, 1, 2, 7, 65_535, u64::MAX]
             .iter()
             .map(|&v| node(v).0)
@@ -928,7 +910,7 @@ mod tests {
                     assert_eq!(
                         merkle_crh_orchard(layer, left, right).to_repr(),
                         merkle_crh_orchard_uncached(layer, left, right).to_repr(),
-                        "cached domain must match fresh domain at layer {layer}",
+                        "library hash must match the reference at layer {layer}",
                     );
                 }
             }
@@ -937,11 +919,11 @@ mod tests {
 
     proptest::proptest! {
         /// Randomized differential check: across random layers and random
-        /// full-width field elements (raw limbs reduced mod p), the cached
-        /// domain must stay byte-identical to a freshly rebuilt one. This covers
+        /// full-width field elements (raw limbs reduced mod p), the library
+        /// implementation must stay byte-identical to the reference. This covers
         /// the whole input domain that the fixed table above only samples.
         #[test]
-        fn cached_domain_merkle_crh_matches_fresh_domain_random(
+        fn library_merkle_crh_matches_reference_random(
             layer in 0u8..MERKLE_DEPTH,
             left_limbs in proptest::prelude::any::<[u64; 4]>(),
             right_limbs in proptest::prelude::any::<[u64; 4]>(),
@@ -952,7 +934,7 @@ mod tests {
             proptest::prop_assert_eq!(
                 merkle_crh_orchard(layer, left, right).to_repr(),
                 merkle_crh_orchard_uncached(layer, left, right).to_repr(),
-                "cached domain must match fresh domain at layer {}", layer
+                "library hash must match the reference at layer {}", layer
             );
         }
     }

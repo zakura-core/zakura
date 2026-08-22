@@ -1353,6 +1353,22 @@ pub(crate) fn validate_and_commit_non_finalized(
     Ok(())
 }
 
+fn staged_block_extends_selected_tip(
+    finalized_tip_hash: block::Hash,
+    current: &NonFinalizedState,
+    staged: &NonFinalizedState,
+    parent_hash: block::Hash,
+    child_height: block::Height,
+    child_hash: block::Hash,
+) -> bool {
+    let current_tip_hash = current
+        .best_tip()
+        .map(|(_, hash)| hash)
+        .unwrap_or(finalized_tip_hash);
+
+    current_tip_hash == parent_hash && staged.best_tip() == Some((child_height, child_hash))
+}
+
 /// Update the [`LatestChainTip`], [`ChainTipChange`], and `non_finalized_state_sender`
 /// channels with the latest non-finalized [`ChainTipBlock`] and
 /// [`Chain`].
@@ -2583,71 +2599,107 @@ impl WriteBlockWorkerTask {
             // At this point, we know that all the block's descendants
             // are invalid, because we checked all the consensus rules before
             // committing the failing ancestor block to the non-finalized state.
-            let result: Result<(), CommitBlockError> = if let Some(ancestor_hash) =
-                rejected_ancestor_hash
-            {
-                Err(Box::new(ValidateContextError::InvalidAncestorBlock(ancestor_hash)).into())
-            } else {
-                tracing::trace!(?child_hash, "validating queued child");
-                if let Some(writer) = header_chain.as_ref() {
-                    let mut staged = non_finalized_state.clone();
-                    validate_and_commit_non_finalized(
-                        &finalized_state.db,
-                        &mut staged,
-                        queued_child,
-                    )
-                    .map_err(|error| CommitBlockError::from(Box::new(error)))
-                    .and_then(|()| {
-                        if let Some(lifecycle) = lifecycle.as_ref() {
-                            lifecycle.reach(BlockLifecycleMilestone::ContextuallyValid);
-                        }
-                        let accepted = Frontier::new(child_height, child_hash);
-                        let (evidence, event_path, request) =
-                            verified_request(writer, non_finalized_state, &staged, accepted)
+            let result: Result<(), CommitBlockError> =
+                if let Some(ancestor_hash) = rejected_ancestor_hash {
+                    Err(Box::new(ValidateContextError::InvalidAncestorBlock(ancestor_hash)).into())
+                } else {
+                    tracing::trace!(?child_hash, "validating queued child");
+                    if let Some(writer) = header_chain.as_ref() {
+                        let mut staged = non_finalized_state.clone();
+                        validate_and_commit_non_finalized(
+                            &finalized_state.db,
+                            &mut staged,
+                            queued_child,
+                        )
+                        .map_err(|error| CommitBlockError::from(Box::new(error)))
+                        .and_then(|()| {
+                            if let Some(lifecycle) = lifecycle.as_ref() {
+                                lifecycle.reach(BlockLifecycleMilestone::ContextuallyValid);
+                            }
+                            let relay_authorized = staged_block_extends_selected_tip(
+                                finalized_state.db.finalized_tip_hash(),
+                                non_finalized_state,
+                                &staged,
+                                parent_hash,
+                                child_height,
+                                child_hash,
+                            );
+                            let accepted = Frontier::new(child_height, child_hash);
+                            let (evidence, event_path, request) =
+                                verified_request(writer, non_finalized_state, &staged, accepted)
+                                    .map_err(|error| {
+                                        map_header_chain_block_error(error, &mut writer_failure)
+                                    })?;
+                            let transition = PreparedFullStateTransition::new(
+                                evidence,
+                                writer
+                                    .runtime
+                                    .publisher()
+                                    .snapshot()
+                                    .frontiers
+                                    .verified_best,
+                                event_path,
+                                staged,
+                                None,
+                                request,
+                            )
+                            .map_err(|error| {
+                                CommitBlockError::HeaderChainError {
+                                    error: error.to_string(),
+                                }
+                            })?;
+                            if relay_authorized {
+                                if let Some(lifecycle) = lifecycle.as_ref() {
+                                    lifecycle.reach(BlockLifecycleMilestone::RelayAuthorized);
+                                }
+                            }
+                            transition
+                                .commit(
+                                    &writer.runtime,
+                                    non_finalized_state,
+                                    &writer.context(),
+                                    lifecycle.as_ref(),
+                                )
+                                .map(|_| ())
                                 .map_err(|error| {
                                     map_header_chain_block_error(error, &mut writer_failure)
-                                })?;
-                        PreparedFullStateTransition::new(
-                            evidence,
-                            writer
-                                .runtime
-                                .publisher()
-                                .snapshot()
-                                .frontiers
-                                .verified_best,
-                            event_path,
-                            staged,
-                            None,
-                            request,
-                        )
-                        .map_err(|error| CommitBlockError::HeaderChainError {
-                            error: error.to_string(),
-                        })?
-                        .commit(
-                            &writer.runtime,
-                            non_finalized_state,
-                            &writer.context(),
-                            lifecycle.as_ref(),
-                        )
-                        .map(|_| ())
-                        .map_err(|error| map_header_chain_block_error(error, &mut writer_failure))
-                    })
-                } else {
-                    let result = validate_and_commit_non_finalized(
-                        &finalized_state.db,
-                        non_finalized_state,
-                        queued_child,
-                    )
-                    .map_err(|error| CommitBlockError::from(Box::new(error)));
-                    if result.is_ok() {
+                                })
+                        })
+                    } else {
                         if let Some(lifecycle) = lifecycle.as_ref() {
-                            lifecycle.reach(BlockLifecycleMilestone::ContextuallyValid);
-                            lifecycle.reach(BlockLifecycleMilestone::StorageApplied);
+                            let mut staged = non_finalized_state.clone();
+                            let result = validate_and_commit_non_finalized(
+                                &finalized_state.db,
+                                &mut staged,
+                                queued_child,
+                            )
+                            .map_err(|error| CommitBlockError::from(Box::new(error)));
+                            if result.is_ok() {
+                                lifecycle.reach(BlockLifecycleMilestone::ContextuallyValid);
+                                if staged_block_extends_selected_tip(
+                                    finalized_state.db.finalized_tip_hash(),
+                                    non_finalized_state,
+                                    &staged,
+                                    parent_hash,
+                                    child_height,
+                                    child_hash,
+                                ) {
+                                    lifecycle.reach(BlockLifecycleMilestone::RelayAuthorized);
+                                }
+                                *non_finalized_state = staged;
+                                lifecycle.reach(BlockLifecycleMilestone::StorageApplied);
+                            }
+                            result
+                        } else {
+                            validate_and_commit_non_finalized(
+                                &finalized_state.db,
+                                non_finalized_state,
+                                queued_child,
+                            )
+                            .map_err(|error| CommitBlockError::from(Box::new(error)))
                         }
                     }
-                    result
-                }
-            };
+                };
 
             metrics::histogram!("state.contextual_commit.duration_seconds")
                 .record(contextual_commit_start.elapsed().as_secs_f64());

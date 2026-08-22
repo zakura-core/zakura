@@ -88,7 +88,7 @@ pub enum BlockRelaySource {
     },
     /// A block received from a peer.
     Peer {
-        /// When semantic verification authorized relay.
+        /// When state authorized relay.
         authorized_at: std::time::Instant,
         /// The peer that supplied the block, when known.
         advertiser: Option<zn::PeerSource>,
@@ -98,7 +98,7 @@ pub enum BlockRelaySource {
 /// A block lifecycle event consumed by the block gossip task.
 #[derive(Debug)]
 pub enum BlockRelayEvent {
-    /// Consensus authorized relay, so peers can receive inventory before state commit.
+    /// State authorized relay, so peers can receive inventory before state commit.
     Early {
         /// The block hash.
         hash: block::Hash,
@@ -120,7 +120,7 @@ pub enum BlockRelayEvent {
         /// The relay source and timing context.
         source: BlockRelaySource,
     },
-    /// Verification or commit failed after relay authorization.
+    /// A local commit step failed after relay authorization.
     Failed {
         /// The block hash.
         hash: block::Hash,

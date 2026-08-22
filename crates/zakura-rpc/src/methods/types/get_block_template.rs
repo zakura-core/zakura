@@ -599,7 +599,7 @@ where
     /// Blocks whose hashes were advertised before contextual commit completed.
     pending_blocks: PendingBlockRegistry,
 
-    /// Whether verifier relay authorization can trigger an early inventory.
+    /// Whether state relay authorization can trigger an early inventory.
     optimistic_block_inventory: bool,
 
     /// The state milestone that lets a mined-block RPC return success.

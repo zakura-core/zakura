@@ -294,10 +294,10 @@ where
                                 .record(submitted_at.elapsed().as_secs_f64());
                             }
                             BlockRelaySource::Peer { authorized_at, .. } => {
-                                metrics::counter!("gossip.semantic_relay.early_inventories")
+                                metrics::counter!("gossip.contextual_relay.early_inventories")
                                     .increment(1);
                                 metrics::histogram!(
-                                    "gossip.semantic_relay.to_inventory.duration_seconds"
+                                    "gossip.contextual_relay.to_inventory.duration_seconds"
                                 )
                                 .record(authorized_at.elapsed().as_secs_f64());
                             }

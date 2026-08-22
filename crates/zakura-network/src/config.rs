@@ -160,9 +160,9 @@ pub enum BlockRelayPolicy {
     /// Relay only after state commits the block.
     Committed,
 
-    /// Relay after semantic verification and before contextual state commit.
+    /// Relay after contextual validation and staged best-chain selection.
     #[default]
-    Semantic,
+    Contextual,
 
     /// Relay after proof of work binds the exact body to the header.
     ///
@@ -308,7 +308,7 @@ pub struct Config {
 
     /// The validation boundary for relaying blocks received from peers.
     ///
-    /// `"semantic"` is the default. Use `"committed"` to wait for state commit.
+    /// `"contextual"` is the default. Use `"committed"` to wait for state commit.
     /// `"pow_bound"` remains reserved and causes startup to reject the config.
     pub block_relay: BlockRelayPolicy,
 
@@ -917,7 +917,7 @@ impl Default for Config {
             identity_dir: default_network_identity_dir(),
             zakura_node_secret_key: None,
             p2p_stack: P2pStack::Default,
-            block_relay: BlockRelayPolicy::Semantic,
+            block_relay: BlockRelayPolicy::Contextual,
             zakura: ZakuraConfig::default(),
             crawl_new_peer_interval: DEFAULT_CRAWL_NEW_PEER_INTERVAL,
 

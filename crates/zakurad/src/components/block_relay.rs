@@ -16,7 +16,7 @@ pub(crate) struct PeerRelayContext {
     pub(crate) sender: mpsc::Sender<BlockRelayEvent>,
 }
 
-/// Verify a peer block and advertise it after semantic relay authorization.
+/// Verify a peer block and advertise it after contextual relay authorization.
 ///
 /// Once consensus authorizes relay, this function transfers verification to an
 /// owned task. Cancellation of the original inbound request cannot abandon the
@@ -35,7 +35,7 @@ where
     let hash = block.hash();
     let height = block
         .coinbase_height()
-        .expect("semantic relay candidates have a coinbase height");
+        .expect("contextual relay candidates have a coinbase height");
     let (lifecycle_handle, lifecycle) = zakura_state::BlockLifecycleHandle::new();
     let mut verification = Box::pin(verifier.oneshot(
         zakura_consensus::Request::CommitWithLifecycle {
@@ -189,7 +189,7 @@ mod tests {
         let BlockRelayEvent::Early { advertised, .. } = receiver
             .recv()
             .await
-            .expect("semantic authorization emits early relay")
+            .expect("contextual authorization emits early relay")
         else {
             panic!("expected early relay event")
         };
@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gossip_pressure_preserves_consensus_invalid_errors() {
+    async fn post_authorization_local_failures_remain_unscored() {
         let block = test_block();
         let hash = block.hash();
         let height = block.coinbase_height().expect("test block has a height");
@@ -286,9 +286,11 @@ mod tests {
                     lifecycle.reach(zakura_state::BlockLifecycleMilestone::RelayAuthorized);
                     finish.notified().await;
                     Err::<block::Hash, zakura_consensus::BoxError>(Box::new(
-                        zakura_consensus::VerifyBlockError::Block {
-                            source: zakura_consensus::BlockError::NoTransactions,
-                        },
+                        zakura_consensus::VerifyBlockError::Commit(
+                            zakura_state::CommitBlockError::HeaderChainError {
+                                error: "stale local transition".to_owned(),
+                            },
+                        ),
                     ))
                 }
             }
@@ -326,10 +328,7 @@ mod tests {
         let error = error
             .downcast_ref::<zakura_consensus::VerifyBlockError>()
             .expect("the helper returns the original verifier error");
-        assert_eq!(
-            error.misbehavior_score(),
-            zakura_network::constants::MAX_PEER_MISBEHAVIOR_SCORE,
-        );
+        assert_eq!(error.misbehavior_score(), 0);
 
         let _dummy = receiver.recv().await.expect("dummy event remains queued");
         assert!(matches!(
@@ -340,6 +339,50 @@ mod tests {
                 ..
             }) if failed_hash == hash
         ));
+        assert_eq!(registry.get(hash), None);
+    }
+
+    #[tokio::test]
+    async fn consensus_rejection_before_authorization_does_not_relay() {
+        let block = test_block();
+        let hash = block.hash();
+        let registry = PendingBlockRegistry::default();
+        let verifier = service_fn(move |request| async move {
+            let zakura_consensus::Request::CommitWithLifecycle { lifecycle, .. } = request else {
+                panic!("peer relay must use a lifecycle commit")
+            };
+            lifecycle.fail(
+                zakura_state::BlockLifecycleMilestone::SemanticallyValid,
+                zakura_state::BlockLifecycleFailureClass::SemanticRejected,
+                "test consensus rejection",
+            );
+            Err::<block::Hash, zakura_consensus::BoxError>(Box::new(
+                zakura_consensus::VerifyBlockError::Block {
+                    source: zakura_consensus::BlockError::NoTransactions,
+                },
+            ))
+        });
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let error = verify_peer_block(
+            verifier,
+            block,
+            Some(peer()),
+            PeerRelayContext {
+                pending_blocks: registry.clone(),
+                sender,
+            },
+        )
+        .await
+        .expect_err("the verifier rejects the block");
+        let error = error
+            .downcast_ref::<zakura_consensus::VerifyBlockError>()
+            .expect("the helper returns the original verifier error");
+        assert_eq!(
+            error.misbehavior_score(),
+            zakura_network::constants::MAX_PEER_MISBEHAVIOR_SCORE,
+        );
+        assert!(receiver.try_recv().is_err());
         assert_eq!(registry.get(hash), None);
     }
 }

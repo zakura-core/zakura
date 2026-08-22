@@ -1250,30 +1250,42 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
 }
 
 #[tokio::test]
-async fn prepared_mined_block_authorizes_relay_before_state_lookup_finishes() {
+async fn prepared_mined_block_waits_for_state_relay_authorization() {
     let _init_guard = zakura_test::init();
 
     let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .expect("the genesis block is valid");
     let hash = block.hash();
-    let known_block_started = Arc::new(tokio::sync::Notify::new());
-    let release_known_block = Arc::new(tokio::sync::Notify::new());
+    let commit_started = Arc::new(tokio::sync::Notify::new());
+    let authorize_relay = Arc::new(tokio::sync::Notify::new());
+    let finish_commit = Arc::new(tokio::sync::Notify::new());
     let state = tower::service_fn({
-        let known_block_started = known_block_started.clone();
-        let release_known_block = release_known_block.clone();
+        let commit_started = commit_started.clone();
+        let authorize_relay = authorize_relay.clone();
+        let finish_commit = finish_commit.clone();
         move |request: zs::Request| {
-            let known_block_started = known_block_started.clone();
-            let release_known_block = release_known_block.clone();
+            let commit_started = commit_started.clone();
+            let authorize_relay = authorize_relay.clone();
+            let finish_commit = finish_commit.clone();
             async move {
                 match request {
+                    zs::Request::CheckBlockCommitment(_) => {
+                        Ok::<_, BoxError>(zs::Response::ValidBlockCommitment)
+                    }
                     zs::Request::KnownBlock(requested_hash) => {
                         assert_eq!(requested_hash, hash);
-                        known_block_started.notify_one();
-                        release_known_block.notified().await;
                         Ok::<_, BoxError>(zs::Response::KnownBlock(None))
                     }
-                    zs::Request::CommitSemanticallyVerifiedBlockWithLifecycle { block, .. } => {
+                    zs::Request::CommitSemanticallyVerifiedBlockWithLifecycle {
+                        block,
+                        lifecycle,
+                    } => {
+                        commit_started.notify_one();
+                        authorize_relay.notified().await;
+                        lifecycle.reach(zs::BlockLifecycleMilestone::ContextuallyValid);
+                        lifecycle.reach(zs::BlockLifecycleMilestone::RelayAuthorized);
+                        finish_commit.notified().await;
                         Ok(zs::Response::Committed(block.hash))
                     }
                     request => panic!("unexpected state request: {request:?}"),
@@ -1297,25 +1309,25 @@ async fn prepared_mined_block_authorizes_relay_before_state_lookup_finishes() {
         lifecycle,
     }));
 
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        lifecycle_handle.wait_for(zs::BlockLifecycleMilestone::RelayAuthorized),
-    )
-    .await
-    .expect("the prepared path authorizes relay promptly")
-    .expect("the prepared path reaches relay authorization");
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        known_block_started.notified(),
-    )
-    .await
-    .expect("the verifier starts the state lookup after relay authorization");
+    tokio::time::timeout(std::time::Duration::from_secs(1), commit_started.notified())
+        .await
+        .expect("the prepared block reaches contextual commit");
     assert!(
-        !verification.is_finished(),
-        "the held state lookup must keep commit incomplete"
+        !lifecycle_handle.has_reached(zs::BlockLifecycleMilestone::RelayAuthorized),
+        "semantic verification must not authorize relay"
     );
 
-    release_known_block.notify_one();
+    authorize_relay.notify_one();
+    lifecycle_handle
+        .wait_for(zs::BlockLifecycleMilestone::RelayAuthorized)
+        .await
+        .expect("state authorizes relay after contextual validation");
+    assert!(
+        !verification.is_finished(),
+        "relay authorization must precede commit completion"
+    );
+
+    finish_commit.notify_one();
     assert_eq!(
         verification
             .await

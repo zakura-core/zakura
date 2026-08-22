@@ -185,3 +185,77 @@ fn header_writer(
         .expect("the fixture header store audits");
     HeaderChainWriter::new(runtime, config)
 }
+
+#[test]
+fn relay_requires_the_staged_winner_to_extend_the_selected_tip() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let finalized = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("the ephemeral finalized state opens");
+    let heartwood_height = NetworkUpgrade::Heartwood
+        .activation_height(&network)
+        .expect("Heartwood activates")
+        .0;
+    let root: Arc<Block> = network.block_map()[&(heartwood_height - 1)]
+        .zcash_deserialize_into()
+        .expect("the pre-Heartwood checkpoint block is valid");
+    let mut current = NonFinalizedState::new(&network);
+    current
+        .commit_new_chain(root.clone().prepare(), &finalized.db)
+        .expect("the root enters the non-finalized state");
+    let activation = root.make_fake_child().set_block_commitment([0; 32]);
+    current
+        .commit_block(activation.clone().prepare(), &finalized.db)
+        .expect("the Heartwood activation block enters the non-finalized state");
+    let child_commitment: [u8; 32] = current
+        .best_chain()
+        .expect("the activation chain exists")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the activation creates a history root")
+        .into();
+
+    let child = activation
+        .make_fake_child()
+        .set_block_commitment(child_commitment)
+        .set_work(100);
+    let child_height = child.coinbase_height().expect("the child has a height");
+    let child_hash = child.hash();
+    let mut staged_child = current.clone();
+    staged_child
+        .commit_block(child.clone().prepare(), &finalized.db)
+        .expect("the tip child enters the staged state");
+    assert!(staged_block_extends_selected_tip(
+        finalized.db.finalized_tip_hash(),
+        &current,
+        &staged_child,
+        activation.hash(),
+        child_height,
+        child_hash,
+    ));
+
+    current = staged_child;
+    let sibling = activation
+        .make_fake_child()
+        .set_block_commitment(child_commitment)
+        .set_work(1_000);
+    let sibling_height = sibling.coinbase_height().expect("the sibling has a height");
+    let sibling_hash = sibling.hash();
+    let mut staged_sibling = current.clone();
+    staged_sibling
+        .commit_block(sibling.prepare(), &finalized.db)
+        .expect("the harder sibling enters the staged state");
+    assert_eq!(
+        staged_sibling.best_tip(),
+        Some((sibling_height, sibling_hash)),
+        "the staged branch selection must choose the harder sibling"
+    );
+    assert!(!staged_block_extends_selected_tip(
+        finalized.db.finalized_tip_hash(),
+        &current,
+        &staged_sibling,
+        activation.hash(),
+        sibling_height,
+        sibling_hash,
+    ));
+}

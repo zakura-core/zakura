@@ -76,7 +76,7 @@ pub struct Config {
     #[serde(default)]
     pub internal_miner: bool,
 
-    /// Advertise mined block hashes after verifier relay authorization.
+    /// Advertise mined block hashes after state relay authorization.
     pub optimistic_block_inventory: bool,
 
     /// The state milestone that lets `submitblock` and `submitsolution` return success.

@@ -61,14 +61,14 @@ pub(crate) struct BlockSyncRelayContext {
     pub(crate) peer_relay: PeerRelayContext,
 }
 
-fn native_semantic_relay_allowed(
+fn native_contextual_relay_allowed(
     policy: zakura_network::config::BlockRelayPolicy,
     class: BlockApplyClass,
     is_close_to_tip: bool,
     committed_tip: Option<block::Hash>,
     parent: block::Hash,
 ) -> bool {
-    policy == zakura_network::config::BlockRelayPolicy::Semantic
+    policy == zakura_network::config::BlockRelayPolicy::Contextual
         && class == BlockApplyClass::Full
         && is_close_to_tip
         && committed_tip == Some(parent)
@@ -1366,7 +1366,7 @@ where
         }
         None => {
             let relay = relay.filter(|relay| {
-                native_semantic_relay_allowed(
+                native_contextual_relay_allowed(
                     relay.policy,
                     class,
                     relay.sync_status.is_close_to_tip(),
@@ -1869,41 +1869,41 @@ mod tests {
     }
 
     #[test]
-    fn native_semantic_relay_requires_a_full_tip_child_near_the_tip() {
-        use zakura_network::config::BlockRelayPolicy::{Committed, Semantic};
+    fn native_contextual_relay_requires_a_full_tip_child_near_the_tip() {
+        use zakura_network::config::BlockRelayPolicy::{Committed, Contextual};
 
         let tip = block::Hash([3; 32]);
         let side_parent = block::Hash([4; 32]);
-        assert!(native_semantic_relay_allowed(
-            Semantic,
+        assert!(native_contextual_relay_allowed(
+            Contextual,
             BlockApplyClass::Full,
             true,
             Some(tip),
             tip,
         ));
-        assert!(!native_semantic_relay_allowed(
+        assert!(!native_contextual_relay_allowed(
             Committed,
             BlockApplyClass::Full,
             true,
             Some(tip),
             tip,
         ));
-        assert!(!native_semantic_relay_allowed(
-            Semantic,
+        assert!(!native_contextual_relay_allowed(
+            Contextual,
             BlockApplyClass::Checkpoint,
             true,
             Some(tip),
             tip,
         ));
-        assert!(!native_semantic_relay_allowed(
-            Semantic,
+        assert!(!native_contextual_relay_allowed(
+            Contextual,
             BlockApplyClass::Full,
             false,
             Some(tip),
             tip,
         ));
-        assert!(!native_semantic_relay_allowed(
-            Semantic,
+        assert!(!native_contextual_relay_allowed(
+            Contextual,
             BlockApplyClass::Full,
             true,
             Some(tip),

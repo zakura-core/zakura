@@ -276,9 +276,17 @@ fn p2p_stack_defaults_by_network_and_roundtrips() {
 }
 
 #[test]
-fn block_relay_defaults_to_semantic_and_committed_roundtrips() {
+fn block_relay_defaults_to_contextual_and_committed_roundtrips() {
     let default = Config::default();
-    assert_eq!(default.block_relay, BlockRelayPolicy::Semantic);
+    assert_eq!(default.block_relay, BlockRelayPolicy::Contextual);
+    let serialized = toml::to_string(&default).expect("the default network config serializes");
+    assert!(serialized.contains("block_relay = \"contextual\""));
+    assert_eq!(
+        toml::from_str::<Config>(&serialized)
+            .expect("the serialized default network config parses")
+            .block_relay,
+        BlockRelayPolicy::Contextual
+    );
 
     let committed: Config = toml::from_str("block_relay = 'committed'")
         .expect("the committed peer relay policy parses");

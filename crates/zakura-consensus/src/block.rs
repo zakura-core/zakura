@@ -332,9 +332,9 @@ where
                     prepared_block.hash = hash;
                     prepared_block.height = height;
                     if let Some(lifecycle) = request.lifecycle() {
+                        check_block_commitment(&mut state_service, &prepared_block).await?;
                         lifecycle.reach(zs::BlockLifecycleMilestone::PowAndBodyBound);
                         lifecycle.reach(zs::BlockLifecycleMilestone::SemanticallyValid);
-                        lifecycle.reach(zs::BlockLifecycleMilestone::RelayAuthorized);
                     }
                     check_known_block(&mut state_service, hash).await?;
                     return commit_prepared_block(
@@ -528,7 +528,6 @@ where
                 check_block_commitment(&mut state_service, &prepared_block).await?;
                 lifecycle.reach(zs::BlockLifecycleMilestone::PowAndBodyBound);
                 lifecycle.reach(zs::BlockLifecycleMilestone::SemanticallyValid);
-                lifecycle.reach(zs::BlockLifecycleMilestone::RelayAuthorized);
             }
 
             commit_prepared_block(

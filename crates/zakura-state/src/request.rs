@@ -50,7 +50,7 @@ pub enum BlockLifecycleMilestone {
     PowAndBodyBound = 1 << 0,
     /// Semantic verification completed.
     SemanticallyValid = 1 << 1,
-    /// The verifier authorized network relay.
+    /// State authorized relay after contextual validation and staged branch selection.
     RelayAuthorized = 1 << 2,
     /// State admitted the block to the active write channel.
     StateQueued = 1 << 3,

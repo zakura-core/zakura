@@ -28,6 +28,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `MAX_HISTORICAL_TREE_REPLAY_BLOCKS` | `crates/zakura-state/src/constants.rs` | `DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS = 4_000_000` → `100_000` | [#775](https://github.com/zakura-core/zakura/pull/775) | Use one bound for startup grid-gap validation and per-request replay, preventing a grid whose anchors fail verification from falling back to replaying the entire absent band. |
 | `TLS_HANDSHAKE_TIMEOUT` | `crates/zakura-rpc/src/indexer/server.rs` | new → `10 s` | [#596](https://github.com/zakura-core/zakura/pull/596) | Drop indexer connections that do not complete the unauthenticated TLS handshake promptly, so stalled handshakes cannot retain a bounded connection slot indefinitely. |
 | `MAX_CONCURRENT_STREAMS_PER_CONNECTION` | `crates/zakura-rpc/src/indexer/server.rs` | new → `64` streams | [#596](https://github.com/zakura-core/zakura/pull/596) | Let trusted indexers multiplex long-lived subscriptions, parallel block-range backfills, and unary queries on one HTTP/2 connection while retaining a finite per-connection task and response-buffer bound. |
 | `MAX_CONNECTIONS` | `crates/zakura-rpc/src/indexer/server.rs` | new → `64` connections | [#596](https://github.com/zakura-core/zakura/pull/596) | Leave ample capacity for trusted indexer clients and operational probes while bounding accepted sockets, TLS handshakes, and HTTP/2 connection tasks server-wide. |

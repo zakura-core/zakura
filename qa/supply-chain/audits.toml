@@ -4174,6 +4174,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
 
+[[audits.zakura-sinsemilla]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
+notes = "Reviewed the complete packaged delta. Streaming MessageWords preserves padding and length rejection. Batch extraction applies Montgomery inversion while skipping identity points. The two-lane nonzero inversion is algebraically equivalent to independent Montgomery inversions. The affine batch path applies the standard chord formula and retains the weighted evaluator's documented discrete-logarithm assumption for exceptional inputs. Word bounds precede table indexing, allocation remains input-bounded, and batch tests compare both execution paths with individual evaluation. All 16 tests pass with all features and with no default features."
+
 [[audits.zakura-state]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"

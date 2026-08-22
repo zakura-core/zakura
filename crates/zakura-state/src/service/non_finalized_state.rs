@@ -601,19 +601,20 @@ impl NonFinalizedState {
         );
 
         // Quick check that doesn't read from disk
-        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
-            prepared.clone(),
-            spent_utxos.clone(),
-        )
-        .map_err(|value_balance_error| {
-            ValidateContextError::CalculateBlockChainValueChange {
-                value_balance_error,
-                height: prepared.height,
-                block_hash: prepared.hash,
-                transaction_count: prepared.block.transactions.len(),
-                spent_utxo_count: spent_utxos.len(),
-            }
-        })?;
+        let height = prepared.height;
+        let block_hash = prepared.hash;
+        let transaction_count = prepared.block.transactions.len();
+        let spent_utxo_count = spent_utxos.len();
+        let contextual =
+            ContextuallyVerifiedBlock::with_block_and_spent_utxos(prepared, spent_utxos).map_err(
+                |value_balance_error| ValidateContextError::CalculateBlockChainValueChange {
+                    value_balance_error,
+                    height,
+                    block_hash,
+                    transaction_count,
+                    spent_utxo_count,
+                },
+            )?;
 
         Self::validate_and_update_parallel(new_chain, contextual, sprout_final_treestates)
     }

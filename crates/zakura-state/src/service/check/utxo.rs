@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use zakura_chain::{
     amount,
-    transparent::{self, utxos_from_ordered_utxos, CoinbaseSpendRestriction::*},
+    transparent::{self, CoinbaseSpendRestriction::*},
 };
 
 use crate::{
@@ -232,8 +232,6 @@ pub fn remaining_transaction_value(
     semantically_verified: &SemanticallyVerifiedBlock,
     utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
 ) -> Result<(), ValidateContextError> {
-    let utxos = utxos_from_ordered_utxos(utxos.clone());
-
     for (tx_index_in_block, transaction) in
         semantically_verified.block.transactions.iter().enumerate()
     {
@@ -242,7 +240,7 @@ pub fn remaining_transaction_value(
         }
 
         // Check the remaining transparent value pool for this transaction
-        let value_balance = transaction.value_balance(&utxos);
+        let value_balance = transaction.value_balance_from_ordered_utxos(utxos);
         match value_balance {
             Ok(vb) => match vb.remaining_transaction_value() {
                 Ok(_) => Ok(()),

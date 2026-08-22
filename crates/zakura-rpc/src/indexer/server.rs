@@ -27,8 +27,9 @@ use zakura_node_services::mempool::MempoolTxSubscriber;
 use zakura_state::ReadState;
 
 use crate::{
-    config::rpc::IndexerTlsConfig, indexer::indexer_server::IndexerServer,
-    server::OPENED_RPC_ENDPOINT_MSG,
+    config::rpc::IndexerTlsConfig,
+    indexer::indexer_server::IndexerServer,
+    server::{warn_if_pem_certificates_are_not_current, OPENED_RPC_ENDPOINT_MSG},
 };
 
 type ServerTask = JoinHandle<Result<(), BoxError>>;
@@ -200,13 +201,18 @@ fn validate_transport(
 fn load_mtls_config(tls: IndexerTlsConfig) -> Result<ServerTlsConfig, BoxError> {
     install_tls_crypto_provider();
 
-    let cert = read_tls_file(&tls.cert_file, "server certificate")?;
-    let key = read_tls_file(&tls.key_file, "server private key")?;
-    let client_ca = read_tls_file(&tls.client_ca_file, "client CA certificate")?;
+    let server_certificate_pem = read_tls_file(&tls.cert_file, "server certificate")?;
+    let server_private_key_pem = read_tls_file(&tls.key_file, "server private key")?;
+    let client_ca_certificate_pem = read_tls_file(&tls.client_ca_file, "client CA certificate")?;
+
+    warn_if_pem_certificates_are_not_current(&server_certificate_pem, &tls.cert_file);
 
     Ok(ServerTlsConfig::new()
-        .identity(Identity::from_pem(cert, key))
-        .client_ca_root(Certificate::from_pem(client_ca))
+        .identity(Identity::from_pem(
+            server_certificate_pem,
+            server_private_key_pem,
+        ))
+        .client_ca_root(Certificate::from_pem(client_ca_certificate_pem))
         .timeout(TLS_HANDSHAKE_TIMEOUT))
 }
 

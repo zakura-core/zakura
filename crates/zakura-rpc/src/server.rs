@@ -355,6 +355,26 @@ fn parse_tls_private_key(
         .transpose()
 }
 
+/// Warns when a certificate in `certificate_pem` is outside its validity window.
+///
+/// PEM parsing failures are ignored because this check is a best-effort diagnostic;
+/// the TLS implementation remains responsible for rejecting invalid certificate input.
+pub(crate) fn warn_if_pem_certificates_are_not_current(
+    certificate_pem: &[u8],
+    certificate_file: &Path,
+) {
+    match parse_tls_cert_chain(certificate_pem) {
+        Ok(certificate_chain) => {
+            warn_if_certificates_are_not_current(&certificate_chain, certificate_file)
+        }
+        Err(error) => debug!(
+            ?error,
+            cert_file = %certificate_file.display(),
+            "could not parse RPC TLS certificate PEM while checking validity dates",
+        ),
+    }
+}
+
 /// Whether a certificate is inside its validity window.
 #[derive(Debug, Eq, PartialEq)]
 enum CertificateValidity {

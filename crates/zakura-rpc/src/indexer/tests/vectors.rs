@@ -25,8 +25,8 @@ use crate::indexer::{self, indexer_client::IndexerClient, BlockRangeRequest, Blo
 use crate::{
     config::rpc::IndexerTlsConfig,
     indexer::tests::certs::{
-        CA_CERT, CLIENT_CERT, CLIENT_KEY, SERVER_CERT, SERVER_KEY, UNTRUSTED_CLIENT_CERT,
-        UNTRUSTED_CLIENT_KEY,
+        CA_CERT, CLIENT_CERT, CLIENT_KEY, EXPIRED_SERVER_CERT, NOT_YET_VALID_SERVER_CERT,
+        SERVER_CERT, SERVER_KEY, UNTRUSTED_CLIENT_CERT, UNTRUSTED_CLIENT_KEY,
     },
     sync::{IndexerClientConfig, IndexerClientTlsConfig},
 };
@@ -167,6 +167,61 @@ async fn indexer_server_requires_a_trusted_client_certificate() -> Result<()> {
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
 
     server_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn indexer_server_warns_for_server_certificates_outside_their_validity_window() -> Result<()>
+{
+    let _init_guard = zakura_test::init();
+    let captured_logs = zakura_test::log_capture::LogCapture::new();
+    let certificate_cases = [
+        (
+            "expired",
+            "expired-server.pem",
+            EXPIRED_SERVER_CERT,
+            "RPC TLS certificate has expired",
+        ),
+        (
+            "not yet valid",
+            "not-yet-valid-server.pem",
+            NOT_YET_VALID_SERVER_CERT,
+            "RPC TLS certificate is not valid yet",
+        ),
+    ];
+    let mut missing_certificate_warnings = Vec::new();
+
+    for (certificate_state, certificate_file_name, server_certificate, expected_warning) in
+        certificate_cases
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let ca_file = temp_dir.path().join("ca.pem");
+        let server_cert_file = temp_dir.path().join(certificate_file_name);
+        let server_key_file = temp_dir.path().join("server-key.pem");
+        fs::write(&ca_file, CA_CERT)?;
+        fs::write(&server_cert_file, server_certificate)?;
+        fs::write(&server_key_file, SERVER_KEY)?;
+
+        let server_tls = IndexerTlsConfig {
+            cert_file: server_cert_file,
+            key_file: server_key_file,
+            client_ca_file: ca_file,
+        };
+        let (server_task, _listen_addr, _read_state, _tip_sender, _mempool_sender) =
+            start_server(Some(server_tls)).await?;
+        server_task.abort();
+
+        if !captured_logs.contains(expected_warning) {
+            missing_certificate_warnings.push(certificate_state);
+        }
+    }
+
+    assert!(
+        missing_certificate_warnings.is_empty(),
+        "indexer listeners started, but startup did not warn for these server certificates: {}",
+        missing_certificate_warnings.join(", ")
+    );
+
     Ok(())
 }
 

@@ -4134,6 +4134,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
 
+[[audits.zakura-orchard]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
+notes = "Reviewed the complete packaged delta. Direct Merkle word decoding preserves the canonical level-left-right bit stream, bounds every fixed index, and matches scalar hashing, external vectors, edge vectors, every tree level, and batch widths through 1024. Batched key agreement preserves input order, undecodable lanes, fallback lanes, and nonidentity results while sharing only the decomposed viewing scalar. Generated Lagrange tables match fresh interpolation for every base and window kind. New allocations are bounded by caller-provided batch sizes. All 182 executable all-feature tests pass. The no-default production library target compiles; its test target fails only because an ignored vector printer references std without the std feature."
+
 [[audits.zakura-pairing]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"

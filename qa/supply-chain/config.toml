@@ -432,9 +432,9 @@ criteria = "safe-to-deploy"
 notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
 
 [[exemptions.zakura-orchard]]
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
 
 [[exemptions.zakura-pairing]]
 version = "1.0.0-rc.2"

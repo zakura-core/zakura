@@ -542,14 +542,19 @@ impl StartCmd {
 
         info!("initializing verifiers");
         let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();
-        let (block_verifier_router, tx_verifier, consensus_task_handles, max_checkpoint_height) =
-            zakura_consensus::router::init(
-                config.consensus.clone(),
-                &config.network.network,
-                state.clone(),
-                tx_verifier_setup_rx,
-            )
-            .await;
+        let (
+            block_verifier_router,
+            tx_verifier,
+            consensus_task_handles,
+            max_checkpoint_height,
+            prepared_candidates,
+        ) = zakura_consensus::router::init_with_prepared_candidates(
+            config.consensus.clone(),
+            &config.network.network,
+            state.clone(),
+            tx_verifier_setup_rx,
+        )
+        .await;
         node_tasks.track(&consensus_task_handles.state_checkpoint_verify_handle);
 
         if let Some(endpoint) = zakura_endpoint.clone() {
@@ -639,7 +644,7 @@ impl StartCmd {
         let submit_block_channel = SubmitBlockChannel::new();
 
         // Launch RPC server
-        let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new_with_pending_blocks(
+        let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new_with_prepared_candidates(
             config.network.network.clone(),
             config.mining.clone(),
             config.rpc.debug_force_finished_sync,
@@ -655,6 +660,7 @@ impl StartCmd {
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
             pending_blocks,
+            prepared_candidates,
         );
         node_tasks.track(&rpc_tx_queue_handle);
         let rpc_impl = rpc_impl.with_end_of_support_height(

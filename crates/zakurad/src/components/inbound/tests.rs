@@ -40,6 +40,40 @@ async fn peer_block_lookup_queries_all_active_chains() {
     );
 }
 
+#[tokio::test]
+async fn peer_block_lookup_serves_admitted_block_before_state() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use tower::{buffer::Buffer, util::BoxService};
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+    use zakura_rpc::PendingBlockRegistry;
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis block is valid");
+    let hash = block.hash();
+    let state_called = Arc::new(AtomicBool::new(false));
+    let state_called_for_service = state_called.clone();
+    let state = tower::service_fn(move |_request: zakura_state::Request| {
+        state_called_for_service.store(true, Ordering::SeqCst);
+        async { Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(None)) }
+    });
+    let state = Buffer::new(BoxService::new(state), 1);
+    let pending_blocks = PendingBlockRegistry::default();
+    assert!(pending_blocks.insert(block.clone()));
+
+    assert_eq!(
+        block_by_hash_or_pending(state, pending_blocks, hash)
+            .await
+            .expect("the pending lookup succeeds"),
+        Some(block),
+    );
+    assert!(!state_called.load(Ordering::SeqCst));
+}
+
 mod fake_peer_set;
 mod real_peer_set;
 

@@ -329,7 +329,7 @@ pub struct ContextuallyVerifiedBlock {
     /// earlier transaction.
     ///
     /// This field can also contain unrelated outputs, which are ignored.
-    pub(crate) new_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    pub(crate) new_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
 
     /// The outputs spent by this block, indexed by the [`transparent::Input`]'s
     /// [`OutPoint`](transparent::OutPoint).
@@ -338,7 +338,7 @@ pub struct ContextuallyVerifiedBlock {
     /// or earlier blocks in the chain.
     ///
     /// This field can also contain unrelated outputs, which are ignored.
-    pub(crate) spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    pub(crate) spent_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
 
     /// A precomputed list of the hashes of the transactions in this block,
     /// in the same order as `block.transactions`.
@@ -538,8 +538,8 @@ impl ContextuallyVerifiedBlock {
             block,
             hash,
             height,
-            new_outputs,
-            spent_outputs,
+            new_outputs: Arc::new(new_outputs),
+            spent_outputs: Arc::new(spent_outputs),
             transaction_hashes,
             chain_value_pool_change,
         })
@@ -694,6 +694,32 @@ mod tests {
     }
 
     #[test]
+    fn contextual_block_clone_shares_immutable_utxo_maps() {
+        let _init_guard = zakura_test::init();
+
+        let block = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                .zcash_deserialize_into::<Block>()
+                .expect("the genesis block deserializes"),
+        );
+        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            SemanticallyVerifiedBlock::from(block),
+            HashMap::new(),
+        )
+        .expect("the test block's value balance can be calculated");
+        let cloned = contextual.clone();
+
+        assert!(Arc::ptr_eq(&contextual.new_outputs, &cloned.new_outputs));
+        assert!(Arc::ptr_eq(
+            &contextual.spent_outputs,
+            &cloned.spent_outputs
+        ));
+
+        let semantic = SemanticallyVerifiedBlock::from(cloned);
+        assert_eq!(&semantic.new_outputs, contextual.new_outputs.as_ref());
+    }
+
+    #[test]
     fn checkpoint_precomputed_auth_data_root_matches_its_block() {
         let _init_guard = zakura_test::init();
 
@@ -718,7 +744,8 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             block: valid.block,
             hash: valid.hash,
             height: valid.height,
-            new_outputs: valid.new_outputs,
+            new_outputs: Arc::try_unwrap(valid.new_outputs)
+                .unwrap_or_else(|shared_outputs| (*shared_outputs).clone()),
             transaction_hashes: valid.transaction_hashes,
             deferred_pool_balance_change: Some(DeferredPoolBalanceChange::new(
                 valid.chain_value_pool_change.deferred_amount(),

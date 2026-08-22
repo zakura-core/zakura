@@ -22,7 +22,7 @@ fn commit_verified_change(
         request,
     )
     .expect("the generated full-state and header paths agree")
-    .commit(&writer.runtime, live, &writer.context())
+    .commit(&writer.runtime, live, &writer.context(), None)
     .expect("the generated full-state and header transition commits");
 }
 

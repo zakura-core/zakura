@@ -19,7 +19,10 @@ use futures::{
     future::{FutureExt, TryFutureExt},
     stream::{FuturesUnordered, Stream, StreamExt},
 };
-use tokio::sync::oneshot::{self, error::TryRecvError};
+use tokio::sync::{
+    mpsc,
+    oneshot::{self, error::TryRecvError},
+};
 use tower::{buffer::Buffer, timeout::Timeout, util::BoxService, Service, ServiceExt};
 
 use zakura_network::{self as zn, PeerSocketAddr};
@@ -33,7 +36,7 @@ use zakura_chain::{
 use zakura_consensus::{router::RouterError, VerifyBlockError};
 use zakura_network::{AddressBook, InventoryResponse};
 use zakura_node_services::mempool;
-use zakura_rpc::PendingBlockRegistry;
+use zakura_rpc::{BlockRelayEvent, PendingBlockRegistry};
 
 use crate::BoxError;
 
@@ -251,6 +254,9 @@ pub struct InboundSetupData {
     /// Allows efficient access to the best tip of the blockchain.
     pub latest_chain_tip: zs::LatestChainTip,
 
+    /// Reports whether the node is close enough to the network tip for optimistic relay.
+    pub sync_status: super::sync::SyncStatus,
+
     /// A channel to send misbehavior reports to the [`AddressBook`].
     pub misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
 }
@@ -363,8 +369,14 @@ pub struct Inbound {
     /// Diagnostics for zcashd-compat requests that need pruned block bodies.
     pruned_block_not_found_logger: Arc<PrunedBlockNotFoundLogger>,
 
-    /// Early-advertised mined blocks waiting for contextual commit.
+    /// Early-advertised block bodies waiting for contextual commit.
     pending_blocks: PendingBlockRegistry,
+
+    /// The configured validation boundary for peer block relay.
+    block_relay: zn::config::BlockRelayPolicy,
+
+    /// Sends pre-commit peer relay events to the block gossip task.
+    block_relay_sender: Option<mpsc::Sender<BlockRelayEvent>>,
 }
 
 impl Inbound {
@@ -397,6 +409,30 @@ impl Inbound {
         setup: oneshot::Receiver<InboundSetupData>,
         pending_blocks: PendingBlockRegistry,
     ) -> Inbound {
+        Self::new_with_block_relay(
+            full_verify_concurrency_limit,
+            expose_peer_addresses,
+            zcashd_compat_pruning_retention,
+            zcashd_compat_peer_ips,
+            setup,
+            pending_blocks,
+            zn::config::BlockRelayPolicy::Committed,
+            None,
+        )
+    }
+
+    /// Creates an inbound service with a shared pre-commit block relay path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_block_relay(
+        full_verify_concurrency_limit: usize,
+        expose_peer_addresses: bool,
+        zcashd_compat_pruning_retention: Option<u32>,
+        zcashd_compat_peer_ips: Vec<IpAddr>,
+        setup: oneshot::Receiver<InboundSetupData>,
+        pending_blocks: PendingBlockRegistry,
+        block_relay: zn::config::BlockRelayPolicy,
+        block_relay_sender: Option<mpsc::Sender<BlockRelayEvent>>,
+    ) -> Inbound {
         Inbound {
             setup: Setup::Pending {
                 full_verify_concurrency_limit,
@@ -408,6 +444,8 @@ impl Inbound {
                 zcashd_compat_peer_ips,
             )),
             pending_blocks,
+            block_relay,
+            block_relay_sender,
         }
     }
 
@@ -448,18 +486,23 @@ impl Service<zn::Request> for Inbound {
                         mempool,
                         state,
                         latest_chain_tip,
+                        sync_status,
                         misbehavior_sender,
                     } = setup_data;
 
                     let cached_peer_addr_response = CachedPeerAddrResponse::new(address_book);
 
-                    let block_downloads = Box::pin(BlockDownloads::new(
+                    let block_downloads = Box::pin(BlockDownloads::new_with_relay(
                         full_verify_concurrency_limit,
                         self.expose_peer_addresses,
                         Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
                         Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
                         state.clone(),
                         latest_chain_tip,
+                        Some(sync_status),
+                        self.block_relay,
+                        self.block_relay_sender.clone(),
+                        self.pending_blocks.clone(),
                     ));
 
                     result = Ok(());
@@ -815,7 +858,7 @@ impl Service<zn::Request> for Inbound {
                 debug!(
                     ?hash,
                     ?peer_id,
-                    "ignoring Zakura block advertisement because native block sync owns block bodies",
+                    "recorded Zakura block advertisement; native block sync owns block bodies",
                 );
                 metrics::counter!("gossip.zakura.native_sync.block.hash.count").increment(1);
                 async { Ok(zn::Response::Nil) }.boxed()

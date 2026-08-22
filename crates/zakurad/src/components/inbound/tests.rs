@@ -63,7 +63,9 @@ async fn peer_block_lookup_serves_admitted_block_before_state() {
     });
     let state = Buffer::new(BoxService::new(state), 1);
     let pending_blocks = PendingBlockRegistry::default();
-    assert!(pending_blocks.insert(block.clone()));
+    let _admission = pending_blocks
+        .admit(block.clone())
+        .expect("the block is admitted");
 
     assert_eq!(
         block_by_hash_or_pending(state, pending_blocks, hash)

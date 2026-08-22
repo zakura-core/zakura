@@ -96,7 +96,7 @@ use tracing::Instrument;
 use zakura_chain::block::{self, genesis::regtest_genesis_block};
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_network::types::PeerServices;
-use zakura_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
+use zakura_rpc::{methods::RpcImpl, server::RpcServer, BlockRelayChannel};
 use zakura_state::StorageMode;
 
 use zakura::{
@@ -495,17 +495,20 @@ impl StartCmd {
             .flatten()
             .map(|pruning| pruning.tx_retention);
         let pending_blocks = zakura_rpc::PendingBlockRegistry::default();
+        let block_relay_channel = BlockRelayChannel::new();
         let inbound = ServiceBuilder::new()
             .load_shed()
             .buffer(inbound::downloads::MAX_INBOUND_CONCURRENCY)
             .timeout(MAX_INBOUND_RESPONSE_TIME)
-            .service(Inbound::new_with_pending_blocks(
+            .service(Inbound::new_with_block_relay(
                 config.sync.full_verify_concurrency_limit,
                 config.network.expose_peer_addresses,
                 zcashd_compat_pruning_retention,
                 zcashd_compat_block_gossip_peer_ips.clone(),
                 setup_rx,
                 pending_blocks.clone(),
+                config.network.block_relay,
+                Some(block_relay_channel.sender()),
             ));
 
         let advertised_services = Self::advertised_services(&config);
@@ -557,6 +560,17 @@ impl StartCmd {
         .await;
         node_tasks.track(&consensus_task_handles.state_checkpoint_verify_handle);
 
+        info!("initializing syncer");
+        let (mut syncer, sync_status) = ChainSync::new(
+            &config,
+            max_checkpoint_height,
+            peer_set.clone(),
+            block_verifier_router.clone(),
+            state.clone(),
+            latest_chain_tip.clone(),
+            misbehavior_sender.clone(),
+        );
+
         if let Some(endpoint) = zakura_endpoint.clone() {
             let trace = endpoint.trace();
             if endpoint.header_sync().is_some() {
@@ -564,6 +578,14 @@ impl StartCmd {
                     endpoint.block_sync(),
                     endpoint.take_block_sync_actions().await,
                 ) {
+                    let relay = zakura::BlockSyncRelayContext {
+                        policy: config.network.block_relay,
+                        sync_status: sync_status.clone(),
+                        peer_relay: crate::components::block_relay::PeerRelayContext {
+                            pending_blocks: pending_blocks.clone(),
+                            sender: block_relay_channel.sender(),
+                        },
+                    };
                     let block_driver_task = tokio::spawn(
                         drive_block_sync_actions(
                             block_actions,
@@ -581,6 +603,7 @@ impl StartCmd {
                             config.sync.zakura_block_apply_concurrency_limit,
                             trace.clone(),
                             blocksync_throughput_probe.clone(),
+                            Some(relay),
                             zakura_block_sync_handoff.clone(),
                             shutdown.clone().cancelled_owned(),
                         )
@@ -590,17 +613,6 @@ impl StartCmd {
                 }
             }
         }
-
-        info!("initializing syncer");
-        let (mut syncer, sync_status) = ChainSync::new(
-            &config,
-            max_checkpoint_height,
-            peer_set.clone(),
-            block_verifier_router.clone(),
-            state.clone(),
-            latest_chain_tip.clone(),
-            misbehavior_sender.clone(),
-        );
 
         info!("initializing mempool");
         let (mempool, mempool_transaction_subscriber) = Mempool::new(
@@ -632,6 +644,7 @@ impl StartCmd {
             mempool: mempool.clone(),
             state: state.clone(),
             latest_chain_tip: latest_chain_tip.clone(),
+            sync_status: sync_status.clone(),
             misbehavior_sender,
         };
         setup_tx
@@ -639,9 +652,6 @@ impl StartCmd {
             .map_err(|_| eyre!("could not send setup data to inbound service"))?;
         // And give it time to clear its queue
         tokio::task::yield_now().await;
-
-        // Create a channel to send mined blocks to the gossip task
-        let submit_block_channel = SubmitBlockChannel::new();
 
         // Launch RPC server
         let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new_with_prepared_candidates(
@@ -658,7 +668,7 @@ impl StartCmd {
             latest_chain_tip.clone(),
             address_book.clone(),
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
-            Some(submit_block_channel.sender()),
+            Some(block_relay_channel.sender()),
             pending_blocks,
             prepared_candidates,
         );
@@ -737,7 +747,7 @@ impl StartCmd {
                 sync_status.clone(),
                 chain_tip_change.clone(),
                 peer_set.clone(),
-                Some(submit_block_channel.receiver()),
+                Some(block_relay_channel.receiver()),
             )
             .in_current_span(),
         );
@@ -2378,6 +2388,7 @@ mod zakura_header_sync_driver_tests {
                 self.combined_apply_limit,
                 self.trace,
                 self.throughput_probe,
+                None,
                 self.handoff,
                 async move {
                     let _ = shutdown_rx.await;
@@ -4372,6 +4383,7 @@ mod zakura_header_sync_driver_tests {
             BlockApplyClass::Checkpoint,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
+            None,
         )
         .await;
 
@@ -4430,6 +4442,7 @@ mod zakura_header_sync_driver_tests {
             block,
             BlockApplyClass::Full,
             trace,
+            None,
             None,
         )
         .await;
@@ -4510,6 +4523,7 @@ mod zakura_header_sync_driver_tests {
             block,
             BlockApplyClass::Full,
             trace,
+            None,
             None,
         ));
 
@@ -4595,6 +4609,7 @@ mod zakura_header_sync_driver_tests {
                 block,
                 BlockApplyClass::Full,
                 zakura_network::zakura::ZakuraTrace::noop(),
+                None,
                 None,
             )
             .await

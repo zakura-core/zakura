@@ -322,7 +322,7 @@ fn contextual_finalization_commits_full_state_header_rows_and_memory_together() 
         request,
     )
     .expect("block two staging facts agree")
-    .commit(&writer.runtime, &mut live, &writer.context())
+    .commit(&writer.runtime, &mut live, &writer.context(), None)
     .expect("block two commits to both live views");
 
     commit_contextual_finalization(&writer, &mut finalized_state, &mut live, None)

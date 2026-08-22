@@ -7,7 +7,6 @@ pub(crate) mod header_sync_driver;
 pub(crate) mod throughput_probe;
 pub(crate) mod trace;
 
-pub(crate) use block_sync_driver::drive_block_sync_actions;
 #[cfg(test)]
 pub(crate) use block_sync_driver::{
     abandoned_block_apply_finished_event, apply_block_sync_body, block_apply_class,
@@ -16,6 +15,7 @@ pub(crate) use block_sync_driver::{
     commit_block_sync_body, query_block_sync_needed_blocks, BlockApplyClass,
     ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
 };
+pub(crate) use block_sync_driver::{drive_block_sync_actions, BlockSyncRelayContext};
 pub(crate) use coordinator::{
     BlockApplyOperation, BlockApplyTerminal, LegacyFallbackLease, SyncCoordinator,
 };

@@ -27,6 +27,13 @@ static COMMIT_FINALIZED_BLOCK_MAINNET: Lazy<
     let hash = block.hash();
     vec![
         (
+            Request::CheckBlockCommitment(BlockCommitmentData {
+                block: block.clone(),
+                auth_data_root: None,
+            }),
+            Ok(Response::ValidBlockCommitment),
+        ),
+        (
             Request::CommitCheckpointVerifiedBlock(block.into()),
             Ok(Response::Committed(hash)),
         ),
@@ -47,6 +54,13 @@ static COMMIT_FINALIZED_BLOCK_TESTNET: Lazy<
     let block2 = block.clone();
     let hash = block.hash();
     vec![
+        (
+            Request::CheckBlockCommitment(BlockCommitmentData {
+                block: block.clone(),
+                auth_data_root: None,
+            }),
+            Ok(Response::ValidBlockCommitment),
+        ),
         (
             Request::CommitCheckpointVerifiedBlock(block.into()),
             Ok(Response::Committed(hash)),

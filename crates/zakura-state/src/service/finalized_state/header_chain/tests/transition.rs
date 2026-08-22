@@ -777,7 +777,7 @@ fn prepared_full_state_swaps_only_after_combined_commit() {
         retention_references: &[],
     };
     let result = prepared
-        .commit(&runtime, &mut live, &context)
+        .commit(&runtime, &mut live, &context, None)
         .expect("the staged mutation commits");
     assert_eq!(result, ApplyResult::Committed);
     let committed = runtime.publisher().snapshot();
@@ -1207,6 +1207,7 @@ fn stale_prepared_full_state_transition_is_a_hard_error() {
                 full_state_authority: None,
                 retention_references: &[],
             },
+            None,
         )
         .expect_err("stale prepared mutations must not look committed");
 
@@ -1283,6 +1284,7 @@ fn no_change_header_plan_still_commits_full_state_then_swaps_without_publication
                 full_state_authority: None,
                 retention_references: &[],
             },
+            None,
         )
         .expect("the full-state-only mutation commits");
 

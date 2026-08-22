@@ -138,6 +138,39 @@ fn prune_removes_right_children() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn finality_pruning_reports_superseded_lifecycle() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
+    let height = block.coinbase_height().expect("test block has a height");
+    let (handle, reporter) = crate::BlockLifecycleHandle::new();
+    let (rsp_tx, rsp_rx) = oneshot::channel();
+    let mut queue = QueuedBlocks::default();
+    queue.queue((block.prepare(), rsp_tx, Some(reporter)));
+
+    queue.prune_by_height(height);
+
+    let failure = handle
+        .wait_for(crate::BlockLifecycleMilestone::StateQueued)
+        .await
+        .expect_err("finality terminates the queued lifecycle");
+    assert!(matches!(
+        failure,
+        crate::BlockLifecycleResult::Failed(crate::BlockLifecycleFailure {
+            class: crate::BlockLifecycleFailureClass::SupersededByFinality,
+            ..
+        })
+    ));
+    let external_error = rsp_rx.await.expect("queue sends the external result");
+    assert!(matches!(
+        external_error,
+        Err(error) if matches!(error.inner(), crate::CommitBlockError::Duplicate { .. })
+    ));
+
+    Ok(())
+}
+
 /// `SentHashes::remove` must drop the hash, its outpoints from `known_utxos`,
 /// and the corresponding `(hash, height)` entry from `curr_buf` (or whichever
 /// batch buffer holds it). Without this, a rejected same-hash block would

@@ -136,7 +136,7 @@ use crate::{
     },
     protocol::{
         external::{canonical_ip, canonical_socket_addr, InventoryHash},
-        internal::{Request, Response},
+        internal::{PeerSource, Request, Response},
     },
     BannedIps, BoxError, Config, PeerError, PeerSocketAddr, SharedPeerError,
 };
@@ -972,12 +972,17 @@ where
 
     /// Randomly chooses ready peers for block gossip, always including configured
     /// zcashd compat sidecar peers.
-    fn select_block_broadcast_peers(&self, max_peers: usize) -> Vec<D::Key> {
+    fn select_block_broadcast_peers(
+        &self,
+        max_peers: usize,
+        exclude: Option<PeerSocketAddr>,
+    ) -> Vec<D::Key> {
         use rand::seq::IteratorRandom;
 
         let mut selected_peers: Vec<_> = self
             .ready_services
             .iter()
+            .filter(|(key, _)| exclude != Some(**key))
             .filter_map(|(key, service)| self.is_zcashd_compat_peer(service).then_some(*key))
             .collect();
 
@@ -985,7 +990,7 @@ where
         selected_peers.extend(
             self.ready_services
                 .keys()
-                .filter(|key| !zcashd_compat_peers.contains(key))
+                .filter(|key| exclude != Some(**key) && !zcashd_compat_peers.contains(key))
                 .copied()
                 .choose_multiple(&mut rand::thread_rng(), max_peers),
         );
@@ -1323,7 +1328,12 @@ where
 
     /// Broadcasts a block inventory request to sampled peers and configured sidecars.
     fn route_block_broadcast(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        let selected_peers = self.select_block_broadcast_peers(self.number_of_peers_to_broadcast());
+        let exclude = match &req {
+            Request::AdvertiseBlock(_, Some(PeerSource::LegacySocket(peer))) => Some(*peer),
+            _ => None,
+        };
+        let selected_peers =
+            self.select_block_broadcast_peers(self.number_of_peers_to_broadcast(), exclude);
         // `select_block_broadcast_peers` can only include sidecar peers that are
         // ready right now. A sidecar that is unready would silently miss this
         // gossip, and a single-upstream sidecar has no other way to learn the
@@ -1455,6 +1465,13 @@ where
             .into_iter()
             .filter(|key| self.is_block_gossip_sidecar_ip(key))
             .filter(|key| !already_selected.contains(key))
+            .filter(|key| {
+                !matches!(
+                    req,
+                    Request::AdvertiseBlock(_, Some(PeerSource::LegacySocket(peer)))
+                        if peer == key
+                )
+            })
             .collect();
 
         // A ready sidecar was just served directly, so a newer gossip supersedes

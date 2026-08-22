@@ -1709,7 +1709,17 @@ impl Service<Request> for LegacyGossipAdapter {
     fn call(&mut self, request: Request) -> Self::Future {
         let broadcast = self.broadcast.clone();
         Box::pin(async move {
+            let authorized_supplier = match &request {
+                Request::AdvertiseBlock(_, Some(PeerSource::Zakura(peer_id))) => {
+                    Some(peer_id.clone())
+                }
+                _ => None,
+            };
             let frame = LegacyGossipFrame::from_request(request)?;
+            if let Some(supplier) = authorized_supplier.as_ref() {
+                broadcast.broadcast(frame, Some(supplier)).await?;
+                return Ok(Response::Nil);
+            }
             let Some(frame) = broadcast.record_first_seen(&frame).await else {
                 return Ok(Response::Nil);
             };
@@ -2774,8 +2784,10 @@ async fn handle_legacy_gossip<Inbound>(
     }
 
     forwarder.mark_seen(&unseen_frame).await;
-    if let Err(error) = forwarder.forward(&gossip.peer_id, unseen_frame).await {
-        debug!(?error, "legacy gossip forward failed");
+    if matches!(&unseen_frame, LegacyGossipFrame::AdvertiseTransactionIds(_)) {
+        if let Err(error) = forwarder.forward(&gossip.peer_id, unseen_frame).await {
+            debug!(?error, "legacy transaction gossip forward failed");
+        }
     }
 }
 
@@ -4304,7 +4316,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_seen_gossip_forwards_across_line_and_drops_duplicates() -> Result<(), BoxError> {
+    async fn block_gossip_waits_for_authorization_while_transactions_forward(
+    ) -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let (node_a, mut rx_a) = legacy_node(21).await?;
         let (node_b, mut rx_b) = legacy_node(22).await?;
@@ -4332,22 +4345,54 @@ mod tests {
             }
             request => panic!("unexpected B request: {request:?}"),
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            rx_c.try_recv().is_err(),
+            "B must not forward an unverified block"
+        );
+        assert!(rx_a.try_recv().is_err());
+
+        let mut authorized = LegacyGossipAdapter::new(node_b.supervisor());
+        authorized
+            .ready()
+            .await?
+            .call(Request::AdvertiseBlock(
+                block_hash,
+                Some(PeerSource::Zakura(a_peer_id.clone())),
+            ))
+            .await?;
         match recv_request(&mut rx_c).await? {
             Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
                 assert_eq!(hash, block_hash);
                 assert_eq!(peer_id, b_peer_id);
             }
-            request => panic!("unexpected C request: {request:?}"),
+            request => panic!("unexpected authorized C request: {request:?}"),
         }
-        assert!(rx_a.try_recv().is_err());
+        assert!(
+            rx_a.try_recv().is_err(),
+            "authorized relay must exclude the supplying peer"
+        );
 
+        let ids = HashSet::from([legacy_tx_id(43)]);
         adapter
             .ready()
             .await?
-            .call(Request::AdvertiseBlockToAll(block_hash))
+            .call(Request::AdvertiseTransactionIds(ids.clone(), None))
             .await?;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(rx_c.try_recv().is_err());
+        match recv_request(&mut rx_b).await? {
+            Request::AdvertiseTransactionIds(received, Some(PeerSource::Zakura(peer_id))) => {
+                assert_eq!(received, ids);
+                assert_eq!(peer_id, a_peer_id);
+            }
+            request => panic!("unexpected B request: {request:?}"),
+        }
+        match recv_request(&mut rx_c).await? {
+            Request::AdvertiseTransactionIds(received, Some(PeerSource::Zakura(peer_id))) => {
+                assert_eq!(received, ids);
+                assert_eq!(peer_id, b_peer_id);
+            }
+            request => panic!("unexpected C request: {request:?}"),
+        }
 
         node_a.shutdown().await;
         node_b.shutdown().await;

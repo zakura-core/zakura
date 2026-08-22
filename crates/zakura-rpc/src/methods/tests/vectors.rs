@@ -3094,6 +3094,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
         miner_memo: None,
         internal_miner: true,
         optimistic_block_inventory: true,
+        submit_acknowledgement: Default::default(),
     };
 
     // nu5 block height
@@ -3456,7 +3457,7 @@ async fn rpc_submitsolution_uses_prepared_candidate() {
     prepared_candidates.insert_for_test(candidate.clone(), "prepared-work", &Mainnet);
     let mut block_verifier_router: MockService<_, _, _, BoxError> =
         MockService::build().for_unit_tests();
-    let submit_block_channel = types::submit_block::SubmitBlockChannel::new();
+    let submit_block_channel = types::submit_block::BlockRelayChannel::new();
     let mined_block_sender = submit_block_channel.sender();
     let mut mined_block_events = submit_block_channel.receiver();
     let pending_blocks = PendingBlockRegistry::default();
@@ -3549,25 +3550,25 @@ async fn rpc_submitsolution_uses_prepared_candidate() {
             )
         })
         .await;
-    let admission = match verifier_response.request() {
-        zakura_consensus::Request::CommitMined { admission, .. } => admission.clone(),
+    let lifecycle = match verifier_response.request() {
+        zakura_consensus::Request::CommitMined { lifecycle, .. } => lifecycle.clone(),
         _ => unreachable!("the request matcher requires CommitMined"),
     };
-    admission.admit_for_test();
+    lifecycle.reach(zakura_state::BlockLifecycleMilestone::RelayAuthorized);
 
     let early_event =
         tokio::time::timeout(std::time::Duration::from_secs(1), mined_block_events.recv())
             .await
-            .expect("state admission promptly sends an early inventory event")
-            .expect("state admission sends an early inventory event");
+            .expect("relay authorization promptly sends an early inventory event")
+            .expect("relay authorization sends an early inventory event");
     let advertised = match early_event {
-        MinedBlockEvent::Early {
+        BlockRelayEvent::Early {
             hash, advertised, ..
         } => {
             assert_eq!(hash, candidate_hash);
             advertised
         }
-        _ => panic!("state admission must send the early event first"),
+        _ => panic!("relay authorization must send the early event first"),
     };
     assert_eq!(
         pending_blocks.get(candidate_hash).map(|block| block.hash()),
@@ -3590,11 +3591,97 @@ async fn rpc_submitsolution_uses_prepared_candidate() {
         )
         .await
         .expect("commit promptly sends its lifecycle event"),
-        Some(MinedBlockEvent::Committed {
+        Some(BlockRelayEvent::Committed {
             hash,
             early_advertised: true,
             ..
         }) if hash == candidate_hash
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_submit_acknowledgement_returns_before_commit() {
+    let _init_guard = zakura_test::init();
+
+    let candidate: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis test vector is valid");
+    let candidate_hash = candidate.hash();
+    let prepared_candidates = PreparedCandidateResolver::default();
+    prepared_candidates.insert_for_test(candidate.clone(), "queued-work", &Mainnet);
+    let mut block_verifier_router: MockService<_, _, _, BoxError> =
+        MockService::build().for_unit_tests();
+    let relay_channel = types::submit_block::BlockRelayChannel::new();
+    let relay_sender = relay_channel.sender();
+    let mut relay_events = relay_channel.receiver();
+    let mining_config = crate::config::mining::Config {
+        submit_acknowledgement: crate::config::mining::SubmitAcknowledgement::Queued,
+        ..Default::default()
+    };
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _) = RpcImpl::new_with_prepared_candidates(
+        Mainnet,
+        mining_config,
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        block_verifier_router.clone(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        Some(relay_sender),
+        PendingBlockRegistry::default(),
+        prepared_candidates,
+    );
+
+    let submission = tokio::spawn(async move {
+        rpc.submit_solution(SubmitSolutionParameters {
+            work_id: "queued-work".to_owned(),
+            header: HexData(
+                candidate
+                    .header
+                    .zcash_serialize_to_vec()
+                    .expect("header serialization succeeds"),
+            ),
+        })
+        .await
+    });
+    let verifier_response = block_verifier_router
+        .expect_request_that(|request| {
+            matches!(
+                request,
+                zakura_consensus::Request::CommitMined {
+                    block,
+                    work_id: Some(work_id),
+                    ..
+                } if block.hash() == candidate_hash && work_id == "queued-work"
+            )
+        })
+        .await;
+    let lifecycle = match verifier_response.request() {
+        zakura_consensus::Request::CommitMined { lifecycle, .. } => lifecycle.clone(),
+        _ => unreachable!("the request matcher requires CommitMined"),
+    };
+    lifecycle.reach(zakura_state::BlockLifecycleMilestone::StateQueued);
+
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), submission)
+            .await
+            .expect("the queued acknowledgement returns before verifier completion")
+            .expect("the RPC task does not panic"),
+        Ok(SubmitSolutionResponse::Accepted)
+    );
+    verifier_response.respond(candidate_hash);
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay_events.recv())
+            .await
+            .expect("the detached lifecycle reports commit completion"),
+        Some(BlockRelayEvent::Committed { hash, .. }) if hash == candidate_hash
     ));
 }
 
@@ -3938,6 +4025,7 @@ async fn rpc_getdifficulty() {
         miner_memo: None,
         internal_miner: true,
         optimistic_block_inventory: true,
+        submit_acknowledgement: Default::default(),
     };
 
     // nu5 block height

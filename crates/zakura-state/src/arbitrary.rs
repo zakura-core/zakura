@@ -98,7 +98,7 @@ impl ContextuallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: _,
-            auth_data_root: _,
+            auth_data_root,
         } = block.into();
 
         Self {
@@ -111,6 +111,7 @@ impl ContextuallyVerifiedBlock {
             // TODO: fix the tests, and stop adding unrelated inputs and outputs.
             spent_outputs: new_outputs,
             transaction_hashes,
+            auth_data_root,
             chain_value_pool_change: ValueBalance::zero(),
         }
     }

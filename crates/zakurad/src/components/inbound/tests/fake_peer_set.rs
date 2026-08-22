@@ -26,7 +26,7 @@ use zakura_network::{
     AddressBook, InventoryResponse, PeerSocketAddr, Request, Response,
 };
 use zakura_node_services::mempool;
-use zakura_rpc::SubmitBlockChannel;
+use zakura_rpc::BlockRelayChannel;
 use zakura_state::{ChainTipChange, Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -1020,6 +1020,39 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn zakura_block_advertisement_does_not_start_the_legacy_downloader(
+) -> Result<(), crate::BoxError> {
+    let (
+        inbound_service,
+        _mempool,
+        _committed_blocks,
+        _added_transactions,
+        mut tx_verifier,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        _sync_gossip_task_handle,
+        _tx_gossip_task_handle,
+    ) = setup(false).await;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    let peer_id =
+        zakura_network::zakura::ZakuraPeerId::new(vec![0x22; 32]).expect("test peer id is valid");
+
+    let response = inbound_service
+        .oneshot(Request::AdvertiseBlock(
+            block.hash(),
+            Some(zakura_network::PeerSource::Zakura(peer_id)),
+        ))
+        .await?;
+
+    assert_eq!(response, Response::Nil);
+    tokio::task::yield_now().await;
+    peer_set.expect_no_requests().await;
+    tx_verifier.expect_no_requests().await;
+    Ok(())
+}
+
 /// Test that the inbound downloader rejects blocks above the lookahead limit.
 ///
 /// TODO: also test that it rejects blocks behind the tip limit. (Needs ~100 fake blocks.)
@@ -1198,6 +1231,7 @@ async fn caches_getaddr_response() {
             mempool: buffered_mempool_service.clone(),
             state: state_service.clone(),
             latest_chain_tip,
+            sync_status: SyncStatus::new().0,
             misbehavior_sender,
         };
         let r = setup_tx.send(setup_data);
@@ -1420,7 +1454,7 @@ async fn setup_with_misbehavior_receiver(
     // Pretend we're close to tip
     SyncStatus::sync_close_to_tip(&mut recent_syncs);
 
-    let submitblock_channel = SubmitBlockChannel::new();
+    let submitblock_channel = BlockRelayChannel::new();
     let sync_gossip_task_handle = tokio::spawn(
         sync::gossip_best_tip_block_hashes(
             sync_status.clone(),
@@ -1486,6 +1520,7 @@ async fn setup_with_misbehavior_receiver(
         mempool: mempool_service.clone(),
         state: state_service.clone(),
         latest_chain_tip,
+        sync_status: sync_status.clone(),
         misbehavior_sender,
     };
     let r = setup_tx.send(setup_data);

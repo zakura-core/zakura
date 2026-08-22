@@ -113,6 +113,9 @@ pub enum Response {
     /// Does not check transparent UTXO inputs
     ValidBestChainTipNullifiersAndAnchors,
 
+    /// Response to [`Request::CheckBlockCommitment`].
+    ValidBlockCommitment,
+
     /// Response to [`Request::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
     BestChainNextMedianTimePast(DateTime32),
@@ -579,6 +582,9 @@ pub enum ReadResponse {
     /// Does not check transparent UTXO inputs
     ValidBestChainTipNullifiersAndAnchors,
 
+    /// Response to [`ReadRequest::CheckBlockCommitment`].
+    ValidBlockCommitment,
+
     /// Response to [`ReadRequest::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
     BestChainNextMedianTimePast(DateTime32),
@@ -691,6 +697,7 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::BlockHeaders(headers) => Ok(Response::BlockHeaders(headers)),
 
             ReadResponse::ValidBestChainTipNullifiersAndAnchors => Ok(Response::ValidBestChainTipNullifiersAndAnchors),
+            ReadResponse::ValidBlockCommitment => Ok(Response::ValidBlockCommitment),
 
             ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }

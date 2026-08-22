@@ -177,7 +177,7 @@ use zakura_rpc::{
     methods::{RpcImpl, RpcServer},
     proposal_block_from_template,
     server::OPENED_RPC_ENDPOINT_MSG,
-    MinedBlockEvent, MinerParams, SubmitBlockChannel,
+    BlockRelayChannel, BlockRelayEvent, MinerParams,
 };
 use zakura_state::{constants::LOCK_FILE_ERROR, state_database_format_version_in_code};
 use zakura_test::{
@@ -3740,7 +3740,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
     let mut mock_sync_status = MockSyncStatus::default();
     mock_sync_status.set_is_close_to_tip(true);
 
-    let submitblock_channel = SubmitBlockChannel::new();
+    let submitblock_channel = BlockRelayChannel::new();
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
 
@@ -3825,7 +3825,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
     assert!(
         matches!(
             submit_block_channel_data,
-            MinedBlockEvent::Early { hash, height, .. }
+            BlockRelayEvent::Early { hash, height, .. }
                 if hash == proposal_block.hash()
                     && height == proposal_block.coinbase_height().unwrap()
         ),

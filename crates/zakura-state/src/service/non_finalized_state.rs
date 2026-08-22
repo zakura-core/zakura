@@ -634,6 +634,7 @@ impl NonFinalizedState {
         let block = contextual.block.clone();
         let network = new_chain.network();
         let history_tree = new_chain.history_block_commitment_tree();
+        let auth_data_root = contextual.auth_data_root;
 
         let block2 = contextual.block.clone();
         let height = contextual.height;
@@ -645,7 +646,7 @@ impl NonFinalizedState {
                     block,
                     &network,
                     &history_tree,
-                    None,
+                    auth_data_root,
                 ));
             });
 

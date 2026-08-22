@@ -33,7 +33,7 @@ use zakura_network::{
     Response, SharedPeerError,
 };
 use zakura_node_services::mempool;
-use zakura_rpc::SubmitBlockChannel;
+use zakura_rpc::BlockRelayChannel;
 use zakura_state::{Config as StateConfig, PruningConfig, StorageMode};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -1053,13 +1053,14 @@ async fn setup(
         mempool: mempool_service.clone(),
         state: state_service.clone(),
         latest_chain_tip,
+        sync_status: sync_status.clone(),
         misbehavior_sender,
     };
     let r = setup_tx.send(setup_data);
     // We can't expect or unwrap because the returned Result does not implement Debug
     assert!(r.is_ok(), "unexpected setup channel send failure");
 
-    let submitblock_channel = SubmitBlockChannel::new();
+    let submitblock_channel = BlockRelayChannel::new();
 
     let block_gossip_task_handle = tokio::spawn(sync::gossip_best_tip_block_hashes(
         sync_status.clone(),
@@ -1127,7 +1128,7 @@ async fn setup(
 mod submitblock_test {
     use tracing::{Instrument, Level};
     use tracing_subscriber::fmt;
-    use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
+    use zakura_rpc::{BlockRelayChannel, BlockRelayEvent, BlockRelaySource, MinedBlockSubmission};
 
     use super::*;
 
@@ -1191,15 +1192,19 @@ mod submitblock_test {
         )
         .await;
 
-        // Start the block gossip task with a SubmitBlockChannel
-        let submitblock_channel = SubmitBlockChannel::new();
+        // Start the block gossip task with a BlockRelayChannel
+        let submitblock_channel = BlockRelayChannel::new();
         // Send a block to the channel
         submitblock_channel
             .sender()
-            .send(MinedBlockEvent::Committed {
+            .send(BlockRelayEvent::Committed {
                 hash: block::Hash([1; 32]),
                 height: block::Height(1),
                 early_advertised: false,
+                source: BlockRelaySource::Mined {
+                    submitted_at: std::time::Instant::now(),
+                    submission: MinedBlockSubmission::FullBlock,
+                },
             })
             .await
             .unwrap();

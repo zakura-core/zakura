@@ -27,10 +27,148 @@ use crate::{
     service::{arbitrary::populated_state, chain_tip::TipAction, StateService},
     tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
     BoxError, CheckpointVerifiedBlock, Config, Request, Response, SemanticallyVerifiedBlock,
-    CHAIN_TIP_UPDATE_WAIT_LIMIT,
+    ValidateContextError, CHAIN_TIP_UPDATE_WAIT_LIMIT,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+fn commitment_test_state() -> (
+    Network,
+    super::finalized_state::FinalizedState,
+    super::non_finalized_state::NonFinalizedState,
+    Arc<Block>,
+) {
+    use crate::tests::FakeChainHelper;
+    use zakura_chain::parameters::NetworkUpgrade;
+
+    let network = Network::Mainnet;
+    let heartwood_height = NetworkUpgrade::Heartwood
+        .activation_height(&network)
+        .expect("Heartwood activates")
+        .0;
+    let root = Arc::new(
+        network.block_map()[&(heartwood_height - 1)]
+            .zcash_deserialize_into::<Block>()
+            .expect("pre-Heartwood test block is valid"),
+    );
+    let finalized = super::finalized_state::FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("ephemeral finalized state opens");
+    let mut non_finalized = super::non_finalized_state::NonFinalizedState::new(&network);
+    non_finalized
+        .commit_new_chain(root.clone().prepare(), &finalized)
+        .expect("root commits");
+    let activation = root.make_fake_child().set_block_commitment([0; 32]);
+    non_finalized
+        .commit_block(activation.clone().prepare(), &finalized)
+        .expect("Heartwood activation commits");
+    let sibling_commitment: [u8; 32] = non_finalized
+        .best_chain()
+        .expect("activation chain exists")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("activation creates a history root")
+        .into();
+    let best = activation
+        .make_fake_child()
+        .set_block_commitment(sibling_commitment)
+        .set_work(100);
+    let side = activation
+        .make_fake_child()
+        .set_block_commitment(sibling_commitment)
+        .set_work(50);
+    non_finalized
+        .commit_block(best.prepare(), &finalized)
+        .expect("best child commits");
+    non_finalized
+        .commit_block(side.clone().prepare(), &finalized)
+        .expect("side child commits");
+    assert_eq!(non_finalized.chain_count(), 2);
+
+    (network, finalized, non_finalized, side)
+}
+
+#[test]
+fn block_commitment_accepts_a_side_chain_parent() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, side) = commitment_test_state();
+    let parent_hash = side.hash();
+    let parent_chain = non_finalized
+        .find_chain(|chain| chain.contains_block_hash(parent_hash))
+        .expect("side parent chain exists");
+    let history_tree =
+        super::read::tree::history_tree(Some(parent_chain), &finalized.db, parent_hash.into())
+            .expect("side parent has a history tree");
+    let commitment: [u8; 32] = history_tree
+        .hash()
+        .expect("Canopy history tree has a root")
+        .into();
+    let child = side.make_fake_child().set_block_commitment(commitment);
+
+    super::check_block_commitment_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect("the side-chain parent selects its own history tree");
+}
+
+#[test]
+fn block_commitment_reports_an_unavailable_parent() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, side) = commitment_test_state();
+    let mut child = side.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut child).header).previous_block_hash =
+        block::Hash([0x55; 32]);
+
+    let error = super::check_block_commitment_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect_err("an unavailable Canopy parent is not ready");
+
+    assert!(matches!(
+        error.downcast_ref::<ValidateContextError>(),
+        Some(ValidateContextError::NotReadyToBeCommitted)
+    ));
+}
+
+#[test]
+fn block_commitment_rejects_a_forged_compact_payload() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, side) = commitment_test_state();
+    let child = side.make_fake_child().set_block_commitment([0x42; 32]);
+
+    let error = super::check_block_commitment_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect_err("a forged compact commitment payload fails");
+
+    assert!(matches!(
+        error.downcast_ref::<ValidateContextError>(),
+        Some(ValidateContextError::InvalidBlockCommitment(_))
+    ));
+}
 
 #[test]
 fn block_sync_body_anchor_rolls_back_to_the_selected_fork_intersection() {

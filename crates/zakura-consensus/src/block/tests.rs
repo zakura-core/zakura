@@ -1174,6 +1174,14 @@ fn verify_block_error_misbehavior_scores() {
         location: zakura_state::KnownBlock::BestChain,
     };
     assert_eq!(VerifyBlockError::Commit(dup_err).misbehavior_score(), 0);
+    assert_eq!(
+        VerifyBlockError::StateService {
+            source: "storage unavailable".into(),
+            hash: zakura_chain::block::Hash([0; 32]),
+        }
+        .misbehavior_score(),
+        0,
+    );
 }
 
 /// Duplicate block errors must stay classified as duplicate requests after the
@@ -1211,15 +1219,17 @@ fn state_commit_duplicate_errors_are_duplicate_requests() {
 /// the state wraps them for the consensus verifier.
 #[test]
 fn state_commit_context_errors_keep_misbehavior_scores() {
-    let invalid_commitment = zakura_state::CommitBlockError::ValidateContextError(Box::new(
+    let invalid_commitment = || {
         zakura_state::ValidateContextError::InvalidBlockCommitment(
             zakura_chain::block::CommitmentError::InvalidChainHistoryActivationReserved {
                 actual: [1; 32],
             },
-        ),
-    ));
+        )
+    };
+    let commit_error =
+        zakura_state::CommitBlockError::ValidateContextError(Box::new(invalid_commitment()));
     let source: BoxError = Box::new(zakura_state::CommitSemanticallyVerifiedError::from(
-        invalid_commitment,
+        commit_error,
     ));
 
     let err = map_commit_error(source, zakura_chain::block::Hash([0; 32]));
@@ -1232,4 +1242,101 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
 
     let router_error = crate::router::RouterError::from(err);
     assert_eq!(router_error.misbehavior_score(), 100);
+
+    let direct_state_error: BoxError = Box::new(invalid_commitment());
+    let err = map_commit_error(direct_state_error, zakura_chain::block::Hash([0; 32]));
+    assert!(matches!(err, VerifyBlockError::Commit(_)));
+    assert_eq!(err.misbehavior_score(), 100);
+}
+
+#[tokio::test]
+async fn prepared_mined_block_waits_for_state_relay_authorization() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis block is valid");
+    let hash = block.hash();
+    let commit_started = Arc::new(tokio::sync::Notify::new());
+    let authorize_relay = Arc::new(tokio::sync::Notify::new());
+    let finish_commit = Arc::new(tokio::sync::Notify::new());
+    let state = tower::service_fn({
+        let commit_started = commit_started.clone();
+        let authorize_relay = authorize_relay.clone();
+        let finish_commit = finish_commit.clone();
+        move |request: zs::Request| {
+            let commit_started = commit_started.clone();
+            let authorize_relay = authorize_relay.clone();
+            let finish_commit = finish_commit.clone();
+            async move {
+                match request {
+                    zs::Request::CheckBlockCommitment(_) => {
+                        Ok::<_, BoxError>(zs::Response::ValidBlockCommitment)
+                    }
+                    zs::Request::KnownBlock(requested_hash) => {
+                        assert_eq!(requested_hash, hash);
+                        Ok::<_, BoxError>(zs::Response::KnownBlock(None))
+                    }
+                    zs::Request::CommitSemanticallyVerifiedBlockWithLifecycle {
+                        block,
+                        lifecycle,
+                    } => {
+                        commit_started.notify_one();
+                        authorize_relay.notified().await;
+                        lifecycle.reach(zs::BlockLifecycleMilestone::ContextuallyValid);
+                        lifecycle.reach(zs::BlockLifecycleMilestone::RelayAuthorized);
+                        finish_commit.notified().await;
+                        Ok(zs::Response::Committed(block.hash))
+                    }
+                    request => panic!("unexpected state request: {request:?}"),
+                }
+            }
+        }
+    });
+    let transaction = tower::service_fn(|_request: tx::Request| async move {
+        Err::<tx::Response, BoxError>(
+            "prepared candidate unexpectedly used transaction verifier".into(),
+        )
+    });
+    let (verifier, prepared_candidates) =
+        SemanticBlockVerifier::new_with_prepared_candidates(&Network::Mainnet, state, transaction);
+    prepared_candidates.insert_for_test(block.clone(), "prepared-work", &Network::Mainnet);
+    let (lifecycle_handle, lifecycle) = zs::BlockLifecycleHandle::new();
+
+    let verification = tokio::spawn(verifier.oneshot(Request::CommitMined {
+        block,
+        work_id: Some("prepared-work".to_owned()),
+        lifecycle,
+    }));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), commit_started.notified())
+        .await
+        .expect("the prepared block reaches contextual commit");
+    assert!(
+        !lifecycle_handle.has_reached(zs::BlockLifecycleMilestone::RelayAuthorized),
+        "semantic verification must not authorize relay"
+    );
+
+    authorize_relay.notify_one();
+    lifecycle_handle
+        .wait_for(zs::BlockLifecycleMilestone::RelayAuthorized)
+        .await
+        .expect("state authorizes relay after contextual validation");
+    assert!(
+        !verification.is_finished(),
+        "relay authorization must precede commit completion"
+    );
+
+    finish_commit.notify_one();
+    assert_eq!(
+        verification
+            .await
+            .expect("the verifier task does not panic")
+            .expect("the prepared block commits"),
+        hash
+    );
+    assert_eq!(
+        lifecycle_handle.terminal(),
+        Some(zs::BlockLifecycleResult::Committed)
+    );
 }

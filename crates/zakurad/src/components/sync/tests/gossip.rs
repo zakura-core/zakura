@@ -15,7 +15,7 @@ use zakura_chain::{
     serialization::ZcashDeserializeInto,
 };
 use zakura_network::{Request, Response};
-use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
+use zakura_rpc::{BlockRelayChannel, BlockRelayEvent, BlockRelaySource, MinedBlockSubmission};
 use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -25,9 +25,16 @@ use crate::components::sync::{
 
 const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
+fn mined_relay_source() -> BlockRelaySource {
+    BlockRelaySource::Mined {
+        submitted_at: std::time::Instant::now(),
+        submission: MinedBlockSubmission::FullBlock,
+    }
+}
+
 struct GossipTestSetup {
     peer_set: MockService<Request, Response, PanicAssertion>,
-    submitblock_sender: tokio::sync::mpsc::Sender<MinedBlockEvent>,
+    submitblock_sender: tokio::sync::mpsc::Sender<BlockRelayEvent>,
     state_service: BoxService<zakura_state::Request, zakura_state::Response, crate::BoxError>,
     gossip_task_handle: JoinHandle<Result<(), BlockGossipError>>,
 }
@@ -86,7 +93,7 @@ async fn setup_gossip_test() -> GossipTestSetup {
         .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
         .for_unit_tests();
 
-    let submitblock_channel = SubmitBlockChannel::new();
+    let submitblock_channel = BlockRelayChannel::new();
     let submitblock_sender = submitblock_channel.sender();
     let gossip_task_handle = tokio::spawn(
         sync::gossip_best_tip_block_hashes(
@@ -139,10 +146,11 @@ async fn mined_block_marks_tip_after_successful_broadcast() {
         .unwrap();
 
     submitblock_sender
-        .send(MinedBlockEvent::Committed {
+        .send(BlockRelayEvent::Committed {
             hash: block_two.hash(),
             height: block_two.coinbase_height().unwrap(),
             early_advertised: false,
+            source: mined_relay_source(),
         })
         .await
         .expect("mined block notification should be accepted");
@@ -189,10 +197,11 @@ async fn mined_block_mark_survives_pending_submit_queue() {
 
     // First mined notification — start AdvertiseBlockToAll but hold the response open.
     submitblock_sender
-        .send(MinedBlockEvent::Committed {
+        .send(BlockRelayEvent::Committed {
             hash,
             height,
             early_advertised: false,
+            source: mined_relay_source(),
         })
         .await
         .expect("mined block notification should be accepted");
@@ -204,10 +213,11 @@ async fn mined_block_mark_survives_pending_submit_queue() {
     // Queue a second notification while the first broadcast is still in flight so the
     // submit-block channel is nonempty when the first mark arrives.
     submitblock_sender
-        .send(MinedBlockEvent::Committed {
+        .send(BlockRelayEvent::Committed {
             hash,
             height,
             early_advertised: false,
+            source: mined_relay_source(),
         })
         .await
         .expect("second mined block notification should be accepted");
@@ -255,10 +265,11 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
         .unwrap();
 
     submitblock_sender
-        .send(MinedBlockEvent::Committed {
+        .send(BlockRelayEvent::Committed {
             hash: block_two.hash(),
             height: block_two.coinbase_height().unwrap(),
             early_advertised: false,
+            source: mined_relay_source(),
         })
         .await
         .expect("mined block notification should be accepted");

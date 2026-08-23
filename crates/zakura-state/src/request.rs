@@ -505,12 +505,16 @@ impl ContextuallyVerifiedBlock {
     /// Create a block that's ready for non-finalized `Chain` contextual validation,
     /// using a [`SemanticallyVerifiedBlock`] and the UTXOs it spends.
     ///
-    /// When combined, `semantically_verified.new_outputs` and `spent_utxos` must contain
-    /// the [`Utxo`](transparent::Utxo)s spent by every transparent input in this block,
-    /// including UTXOs created by earlier transactions in this block.
+    /// `spent_outputs` must contain the [`Utxo`](transparent::Utxo) spent by
+    /// every transparent input in this block. This includes UTXOs created by
+    /// earlier transactions in the same block.
     ///
     /// Note: a [`ContextuallyVerifiedBlock`] isn't actually contextually valid until
     /// [`Chain::push()`](crate::service::non_finalized_state::Chain::push) returns success.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if `spent_outputs` omits a transparent input's UTXO.
     pub fn with_block_and_spent_utxos(
         semantically_verified: SemanticallyVerifiedBlock,
         spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,

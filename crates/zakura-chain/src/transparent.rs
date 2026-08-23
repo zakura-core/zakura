@@ -283,7 +283,12 @@ impl Input {
         if let Some(outpoint) = self.outpoint() {
             utxos
                 .get(&outpoint)
-                .expect("provided Utxos don't have spent OutPoint")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "spent outpoint {outpoint:?} is missing from the {} provided UTXOs; the caller must supply every spent UTXO",
+                        utxos.len()
+                    )
+                })
                 .as_ref()
                 .output
                 .value

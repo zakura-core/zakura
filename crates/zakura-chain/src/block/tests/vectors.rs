@@ -143,8 +143,20 @@ fn ordered_utxo_value_balances_match_plain_utxo_value_balances() {
         lock_time: LockTime::unlocked(),
     });
     let plain_utxos = HashMap::from([(outpoint, spent_utxo.clone())]);
-    let ordered_utxos =
-        HashMap::from([(outpoint, transparent::OrderedUtxo::from_utxo(spent_utxo, 0))]);
+    let unrelated_outpoint = transparent::OutPoint {
+        hash: crate::transaction::Hash([2; 32]),
+        index: 1,
+    };
+    let ordered_utxos = HashMap::from([
+        (
+            outpoint,
+            transparent::OrderedUtxo::from_utxo(spent_utxo.clone(), 0),
+        ),
+        (
+            unrelated_outpoint,
+            transparent::OrderedUtxo::from_utxo(spent_utxo, 1),
+        ),
+    ]);
 
     assert_eq!(
         transaction.value_balance(&plain_utxos),

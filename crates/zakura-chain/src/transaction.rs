@@ -1752,6 +1752,15 @@ impl Transaction {
     }
 
     /// Returns the value balances for this transaction using borrowed ordered UTXOs.
+    ///
+    /// `utxos` must contain the [`transparent::OrderedUtxo`] of every input in
+    /// the transaction. This includes UTXOs created by earlier transactions in
+    /// the same block. The map can also contain unrelated UTXOs, which this
+    /// method ignores.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if `utxos` omits a transparent input's UTXO.
     pub fn value_balance_from_ordered_utxos(
         &self,
         utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,

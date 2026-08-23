@@ -296,6 +296,15 @@ impl Block {
     }
 
     /// Returns the overall chain value pool change using borrowed ordered UTXOs.
+    ///
+    /// The given `utxos` must contain the [`transparent::OrderedUtxo`]s of every
+    /// input in this block. This includes UTXOs created by earlier transactions
+    /// in the same block. The map can also contain unrelated UTXOs, which this
+    /// method ignores.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if `utxos` omits a transparent input's UTXO.
     pub fn chain_value_pool_change_from_ordered_utxos(
         &self,
         utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,

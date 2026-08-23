@@ -3553,6 +3553,7 @@ async fn rpc_submitsolution_uses_prepared_candidate() {
         zakura_consensus::Request::CommitMined { admission, .. } => admission.clone(),
         _ => unreachable!("the request matcher requires CommitMined"),
     };
+    admission.authorize_optimistic_relay();
     admission.admit_for_test();
 
     let early_event =

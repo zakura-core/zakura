@@ -1145,6 +1145,7 @@ impl StartCmd {
     /// based on the configurations of the services that use the state concurrently.
     fn state_buffer_bound(config: &ZakuradConfig) -> usize {
         // Ignore the checkpoint verify limit, because it is very large.
+        // Mempool read traffic bypasses this buffer.
         //
         // TODO: do we also need to account for concurrent use across services?
         //       we could multiply the maximum by 3/2, or add a fixed constant
@@ -1152,7 +1153,6 @@ impl StartCmd {
             config.sync.download_concurrency_limit,
             config.sync.full_verify_concurrency_limit,
             inbound::downloads::MAX_INBOUND_CONCURRENCY,
-            mempool::downloads::MAX_INBOUND_CONCURRENCY,
         ]
         .into_iter()
         .max()

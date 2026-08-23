@@ -39,6 +39,9 @@ type MockPeerSet = MockService<zn::Request, zn::Response, PropTestAssertion>;
 /// A [`MockService`] representing the Zebra state service.
 type MockState = MockService<zs::ReadRequest, zs::ReadResponse, PropTestAssertion>;
 
+/// A [`MockService`] representing the retained read-write state service.
+type MockStateGuard = MockService<zs::Request, zs::Response, PropTestAssertion>;
+
 /// A [`MockService`] representing the Zebra transaction verifier service.
 type MockTxVerifier = MockService<tx::Request, tx::Response, PropTestAssertion, TransactionError>;
 
@@ -75,6 +78,7 @@ proptest! {
                 mut mempool,
                 _peer_set,
                 _state_service,
+                _state_guard,
                 _tx_verifier,
                 mut recent_syncs,
                 mut chain_tip_sender,
@@ -125,6 +129,7 @@ proptest! {
                 mut mempool,
                 _peer_set,
                 _state_service,
+                _state_guard,
                 _tx_verifier,
                 mut recent_syncs,
                 mut chain_tip_sender,
@@ -210,6 +215,7 @@ proptest! {
                 mut mempool,
                 mut peer_set,
                 mut state_service,
+                mut state_guard,
                 mut tx_verifier,
                 mut recent_syncs,
                 _chain_tip_sender,
@@ -242,6 +248,7 @@ proptest! {
 
             peer_set.expect_no_requests().await?;
             state_service.expect_no_requests().await?;
+            state_guard.expect_no_requests().await?;
             tx_verifier.expect_no_requests().await?;
 
             Ok(())
@@ -264,6 +271,7 @@ fn setup(
     Mempool,
     MockPeerSet,
     MockState,
+    MockStateGuard,
     MockTxVerifier,
     RecentSyncLengths,
     ChainTipSender,
@@ -285,7 +293,7 @@ fn setup(
         },
         false,
         Buffer::new(BoxService::new(peer_set.clone()), 1),
-        Buffer::new(BoxService::new(state_guard), 1),
+        Buffer::new(BoxService::new(state_guard.clone()), 1),
         BoxCloneService::new(state_service.clone()),
         Buffer::new(BoxService::new(tx_verifier.clone()), 1),
         sync_status,
@@ -304,6 +312,7 @@ fn setup(
         mempool,
         peer_set,
         state_service,
+        state_guard,
         tx_verifier,
         recent_syncs,
         chain_tip_sender,

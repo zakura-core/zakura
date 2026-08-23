@@ -1346,6 +1346,7 @@ impl Transaction {
     /// using the outputs spent by this transaction.
     ///
     /// See `transparent_value_balance` for details.
+    #[cfg(any(test, feature = "proptest-impl"))]
     #[allow(clippy::unwrap_in_result)]
     fn transparent_value_balance_from_outputs(
         &self,
@@ -1713,6 +1714,7 @@ impl Transaction {
     }
 
     /// Returns the value balances for this transaction using the provided transparent outputs.
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub(crate) fn value_balance_from_outputs(
         &self,
         outputs: &HashMap<transparent::OutPoint, transparent::Output>,

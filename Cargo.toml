@@ -21,7 +21,7 @@ members = [
 # The asset packaging crate publishes on the release-state cadence rather than with the
 # workspace, and its payload is generated rather than committed, so it is deliberately not a
 # member. Zakura consumes the published crate from crates.io like any other dependency.
-exclude = ["assets/zakura-assets"]
+exclude = ["crates/zakura-assets"]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
 resolver = "2"
@@ -45,7 +45,7 @@ edition = "2021"
 # not a compatible range; `Cargo.lock` carries the registry checksum that pins them.
 #
 # Renamed so that no Rust source or script mentions the published crate name. The package is
-# published from `assets/zakura-assets/` in this repository. TODO(#703 follow-up): retarget to
+# published from `crates/zakura-assets/` in this repository. TODO(#703 follow-up): retarget to
 # `zakura-assets` once its crates.io owner adds the Trusted Publisher entry, which is a one-line
 # change here.
 zakura-assets = { version = "=0.3453771.0", package = "valargroup-zakura-assets" }

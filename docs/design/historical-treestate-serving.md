@@ -308,7 +308,7 @@ bundle, and `update-release-state.yml` imports them into one reviewable draft PR
 (verified-commitment-trees design §16). Three of the four are committed. The grid is not: at
 ~2.1 MB regenerated on every refresh, committing it would add that much to the repository's
 history every week, permanently. It is published instead as an exact-pinned crates.io package
-built from `assets/zakura-assets/`, whose payload is generated at publish time and never enters
+built from `crates/zakura-assets/`, whose payload is generated at publish time and never enters
 git. Its digest, size, and entry count are still recorded in `mainnet-vct-manifest.json`; the
 pin and the record are held together by the checks in the next section.
 

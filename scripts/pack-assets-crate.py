@@ -2,7 +2,7 @@
 """Pack a verified Mainnet frontier grid into the publishable asset crate.
 
 The payload never enters git. This script materialises it, and the constants that declare its
-identity, into `assets/zakura-assets/` immediately before `cargo publish`, so the bytes live only
+identity, into `crates/zakura-assets/` immediately before `cargo publish`, so the bytes live only
 in the release-state bundle they came from and in the crates.io archive they are published to.
 
 The crate version is derived from the grid rather than passed in: `0.<last_checkpoint>.<revision>`.
@@ -23,7 +23,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-CRATE_DIR = Path("assets/zakura-assets")
+CRATE_DIR = Path("crates/zakura-assets")
 GRID_NAME = "mainnet-frontier-grid.bin"
 GENERATED_NAME = "generated.rs"
 

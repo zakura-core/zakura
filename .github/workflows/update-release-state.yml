@@ -191,7 +191,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           cargo publish \
-            --manifest-path assets/zakura-assets/Cargo.toml \
+            --manifest-path crates/zakura-assets/Cargo.toml \
             --allow-dirty \
             --no-verify
 

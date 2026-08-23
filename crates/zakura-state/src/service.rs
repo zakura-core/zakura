@@ -1561,16 +1561,29 @@ impl Service<Request> for StateService {
                 .boxed()
             }
 
-            Request::CommitSemanticallyVerifiedBlockWithAdmission { block, admission } => {
+            Request::CommitSemanticallyVerifiedBlockWithAdmission {
+                block,
+                admission,
+                requested_at,
+            } => {
                 let timer = CodeTimer::start();
+                metrics::histogram!("state.semantic_commit.dispatch.duration_seconds")
+                    .record(requested_at.elapsed().as_secs_f64());
+
+                let prequeue_checks_start = Instant::now();
                 self.assert_block_can_be_validated(&block);
                 self.pending_utxos.check_against_ordered(&block.new_outputs);
+                metrics::histogram!("state.semantic_commit.prequeue_checks.duration_seconds")
+                    .record(prequeue_checks_start.elapsed().as_secs_f64());
 
+                let queue_send_start = Instant::now();
                 let rsp_rx = tokio::task::block_in_place(move || {
                     span.in_scope(|| {
                         self.queue_and_commit_to_non_finalized_state(block, Some(admission))
                     })
                 });
+                metrics::histogram!("state.semantic_commit.queue_send.duration_seconds")
+                    .record(queue_send_start.elapsed().as_secs_f64());
 
                 timer.finish_desc("CommitSemanticallyVerifiedBlockWithAdmission");
                 let span = Span::current();

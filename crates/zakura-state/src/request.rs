@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
 use tokio::sync::Notify;
@@ -1249,6 +1250,8 @@ pub enum Request {
         block: SemanticallyVerifiedBlock,
         /// The admission notification.
         admission: BlockAdmission,
+        /// When consensus submitted this request to the buffered state service.
+        requested_at: Instant,
     },
 
     /// Commit a checkpointed block to the state, skipping most but not all

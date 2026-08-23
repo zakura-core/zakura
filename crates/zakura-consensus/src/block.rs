@@ -571,6 +571,7 @@ where
         Some(admission) => zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
             block: prepared_block,
             admission,
+            requested_at: std::time::Instant::now(),
         },
         None => zs::Request::CommitSemanticallyVerifiedBlock(prepared_block),
     };

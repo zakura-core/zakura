@@ -39,6 +39,16 @@ mod tests;
 pub(crate) use backup::write_semantically_verified_backup_block;
 pub(crate) use chain::{Chain, SpendingTransactionId};
 
+macro_rules! record_contextual_duration {
+    ($metric_name:literal, $mined_metric_name:literal, $duration:expr, $is_mined:expr $(,)?) => {{
+        let duration = $duration.as_secs_f64();
+        metrics::histogram!($metric_name).record(duration);
+        if $is_mined {
+            metrics::histogram!($mined_metric_name).record(duration);
+        }
+    }};
+}
+
 /// The state of the chains in memory, including queued blocks.
 ///
 /// Clones of the non-finalized state contain independent copies of the chains.
@@ -351,20 +361,42 @@ impl NonFinalizedState {
     /// Commit block to the non-finalized state, on top of:
     /// - an existing chain's tip, or
     /// - a newly forked chain.
-    #[tracing::instrument(level = "debug", skip(self, finalized_state, prepared))]
     pub fn commit_block(
         &mut self,
         prepared: SemanticallyVerifiedBlock,
         finalized_state: &ZakuraDb,
     ) -> Result<(), ValidateContextError> {
+        self.commit_block_with_metrics(prepared, finalized_state, false)
+    }
+
+    #[tracing::instrument(
+        name = "commit_block",
+        level = "debug",
+        skip(self, finalized_state, prepared)
+    )]
+    pub(crate) fn commit_block_with_metrics(
+        &mut self,
+        prepared: SemanticallyVerifiedBlock,
+        finalized_state: &ZakuraDb,
+        is_mined: bool,
+    ) -> Result<(), ValidateContextError> {
         let parent_hash = prepared.block.header.previous_block_hash;
         let (height, hash) = (prepared.height, prepared.hash);
 
-        let parent_chain = self.parent_chain(parent_hash)?;
+        let parent_chain_start = Instant::now();
+        let parent_chain = self.parent_chain(parent_hash);
+        record_contextual_duration!(
+            "state.contextual.parent_chain.duration_seconds",
+            "state.contextual.mined.parent_chain.duration_seconds",
+            parent_chain_start.elapsed(),
+            is_mined,
+        );
+        let parent_chain = parent_chain?;
 
         // If the block is invalid, return the error,
         // and drop the cloned parent Arc, or newly created chain fork.
-        let modified_chain = self.validate_and_commit(parent_chain, prepared, finalized_state)?;
+        let modified_chain =
+            self.validate_and_commit(parent_chain, prepared, finalized_state, is_mined)?;
 
         // If the block is valid:
         // - add the new chain fork or updated chain to the set of recent chains
@@ -517,36 +549,63 @@ impl NonFinalizedState {
 
     /// Commit block to the non-finalized state as a new chain where its parent
     /// is the finalized tip.
-    #[tracing::instrument(level = "debug", skip(self, finalized_state, prepared))]
     #[allow(clippy::unwrap_in_result)]
     pub fn commit_new_chain(
         &mut self,
         prepared: SemanticallyVerifiedBlock,
         finalized_state: &ZakuraDb,
     ) -> Result<(), ValidateContextError> {
-        let finalized_tip_height = finalized_state.finalized_tip_height();
+        self.commit_new_chain_with_metrics(prepared, finalized_state, false)
+    }
 
-        // TODO: fix tests that don't initialize the finalized state
-        #[cfg(not(test))]
-        let finalized_tip_height = finalized_tip_height.expect("finalized state contains blocks");
-        #[cfg(test)]
-        let finalized_tip_height = finalized_tip_height.unwrap_or(zakura_chain::block::Height(0));
+    #[tracing::instrument(
+        name = "commit_new_chain",
+        level = "debug",
+        skip(self, finalized_state, prepared)
+    )]
+    #[allow(clippy::unwrap_in_result)]
+    pub(crate) fn commit_new_chain_with_metrics(
+        &mut self,
+        prepared: SemanticallyVerifiedBlock,
+        finalized_state: &ZakuraDb,
+        is_mined: bool,
+    ) -> Result<(), ValidateContextError> {
+        let chain_new_start = Instant::now();
+        let chain: Result<Chain, ValidateContextError> = (|| {
+            let finalized_tip_height = finalized_state.finalized_tip_height();
 
-        let chain = Chain::new(
-            &self.network,
-            finalized_tip_height,
-            finalized_state.sprout_tree_for_tip()?,
-            finalized_state.sapling_tree_for_tip(),
-            finalized_state.orchard_tree_for_tip(),
-            finalized_state.ironwood_tree_for_tip(),
-            finalized_state.history_tree(),
-            finalized_state.finalized_value_pool(),
+            // TODO: fix tests that don't initialize the finalized state
+            #[cfg(not(test))]
+            let finalized_tip_height =
+                finalized_tip_height.expect("finalized state contains blocks");
+            #[cfg(test)]
+            let finalized_tip_height =
+                finalized_tip_height.unwrap_or(zakura_chain::block::Height(0));
+
+            Ok(Chain::new(
+                &self.network,
+                finalized_tip_height,
+                finalized_state.sprout_tree_for_tip()?,
+                finalized_state.sapling_tree_for_tip(),
+                finalized_state.orchard_tree_for_tip(),
+                finalized_state.ironwood_tree_for_tip(),
+                finalized_state.history_tree(),
+                finalized_state.finalized_value_pool(),
+            ))
+        })();
+        record_contextual_duration!(
+            "state.contextual.chain_new.duration_seconds",
+            "state.contextual.mined.chain_new.duration_seconds",
+            chain_new_start.elapsed(),
+            is_mined,
         );
+        let chain = chain?;
 
         let (height, hash) = (prepared.height, prepared.hash);
 
         // If the block is invalid, return the error, and drop the newly created chain fork
-        let chain = self.validate_and_commit(Arc::new(chain), prepared, finalized_state)?;
+        let chain =
+            self.validate_and_commit(Arc::new(chain), prepared, finalized_state, is_mined)?;
 
         // If the block is valid, add the new chain fork to the set of recent chains.
         self.insert(chain);
@@ -566,6 +625,7 @@ impl NonFinalizedState {
         new_chain: Arc<Chain>,
         prepared: SemanticallyVerifiedBlock,
         finalized_state: &ZakuraDb,
+        is_mined: bool,
     ) -> Result<Arc<Chain>, ValidateContextError> {
         if self
             .invalidated_blocks
@@ -580,15 +640,28 @@ impl NonFinalizedState {
         // Reads from disk
         //
         // TODO: if these disk reads show up in profiles, run them in parallel, using std::thread::spawn()
+        let unspent_utxo_snapshot_start = Instant::now();
+        let unspent_utxos = new_chain.unspent_utxos();
+        record_contextual_duration!(
+            "state.contextual.unspent_utxo_snapshot.duration_seconds",
+            "state.contextual.mined.unspent_utxo_snapshot.duration_seconds",
+            unspent_utxo_snapshot_start.elapsed(),
+            is_mined,
+        );
+
         let transparent_spend_start = Instant::now();
         let spent_utxos = check::utxo::transparent_spend(
             &prepared,
-            &new_chain.unspent_utxos(),
+            &unspent_utxos,
             &new_chain.spent_utxos,
             finalized_state,
         );
-        metrics::histogram!("state.contextual.transparent_spend.duration_seconds")
-            .record(transparent_spend_start.elapsed().as_secs_f64());
+        record_contextual_duration!(
+            "state.contextual.transparent_spend.duration_seconds",
+            "state.contextual.mined.transparent_spend.duration_seconds",
+            transparent_spend_start.elapsed(),
+            is_mined,
+        );
         let spent_utxos = spent_utxos?;
 
         // Reads from disk
@@ -599,8 +672,12 @@ impl NonFinalizedState {
                 &new_chain,
                 &prepared,
             );
-        metrics::histogram!("state.contextual.shielded_anchors.duration_seconds")
-            .record(shielded_anchor_start.elapsed().as_secs_f64());
+        record_contextual_duration!(
+            "state.contextual.shielded_anchors.duration_seconds",
+            "state.contextual.mined.shielded_anchors.duration_seconds",
+            shielded_anchor_start.elapsed(),
+            is_mined,
+        );
         shielded_anchors?;
 
         // Reads from disk
@@ -610,8 +687,12 @@ impl NonFinalizedState {
             &new_chain,
             &prepared,
         );
-        metrics::histogram!("state.contextual.sprout_anchor_fetch.duration_seconds")
-            .record(sprout_anchor_fetch_start.elapsed().as_secs_f64());
+        record_contextual_duration!(
+            "state.contextual.sprout_anchor_fetch.duration_seconds",
+            "state.contextual.mined.sprout_anchor_fetch.duration_seconds",
+            sprout_anchor_fetch_start.elapsed(),
+            is_mined,
+        );
 
         // Quick check that doesn't read from disk
         let contextual_block_start = Instant::now();
@@ -628,15 +709,27 @@ impl NonFinalizedState {
                 spent_utxo_count: spent_utxos.len(),
             }
         });
-        metrics::histogram!("state.contextual.block_construction.duration_seconds")
-            .record(contextual_block_start.elapsed().as_secs_f64());
+        record_contextual_duration!(
+            "state.contextual.block_construction.duration_seconds",
+            "state.contextual.mined.block_construction.duration_seconds",
+            contextual_block_start.elapsed(),
+            is_mined,
+        );
         let contextual = contextual?;
 
         let parallel_update_start = Instant::now();
-        let result =
-            Self::validate_and_update_parallel(new_chain, contextual, sprout_final_treestates);
-        metrics::histogram!("state.contextual.parallel_update.duration_seconds")
-            .record(parallel_update_start.elapsed().as_secs_f64());
+        let result = Self::validate_and_update_parallel(
+            new_chain,
+            contextual,
+            sprout_final_treestates,
+            is_mined,
+        );
+        record_contextual_duration!(
+            "state.contextual.parallel_update.duration_seconds",
+            "state.contextual.mined.parallel_update.duration_seconds",
+            parallel_update_start.elapsed(),
+            is_mined,
+        );
         result
     }
 
@@ -647,6 +740,7 @@ impl NonFinalizedState {
         new_chain: Arc<Chain>,
         contextual: ContextuallyVerifiedBlock,
         sprout_final_treestates: HashMap<sprout::tree::Root, Arc<sprout::tree::NoteCommitmentTree>>,
+        is_mined: bool,
     ) -> Result<Arc<Chain>, ValidateContextError> {
         let mut block_commitment_result = None;
         let mut sprout_anchor_result = None;
@@ -690,13 +784,14 @@ impl NonFinalizedState {
             // Pushing a block onto a Chain can launch additional parallel batches.
             // TODO: should we pass _scope into Chain::push()?
             scope.spawn_fifo(|_scope| {
-                let start = Instant::now();
-                // TODO: Replace with Arc::unwrap_or_clone() when it stabilises:
-                // https://github.com/rust-lang/rust/issues/93610
-                let new_chain = Arc::try_unwrap(new_chain)
-                    .unwrap_or_else(|shared_chain| (*shared_chain).clone());
+                let chain_clone_start = Instant::now();
+                let new_chain = Arc::unwrap_or_clone(new_chain);
+                let chain_clone_duration = chain_clone_start.elapsed();
+
+                let chain_push_start = Instant::now();
                 let result = new_chain.push(contextual).map(Arc::new);
-                chain_push_result = Some((result, start.elapsed()));
+                chain_push_result =
+                    Some((result, chain_clone_duration, chain_push_start.elapsed()));
             });
         });
 
@@ -705,15 +800,35 @@ impl NonFinalizedState {
             block_commitment_result.expect("scope has finished");
         let (sprout_anchor_result, sprout_anchor_duration) =
             sprout_anchor_result.expect("scope has finished");
-        let (chain_push_result, chain_push_duration) =
+        let (chain_push_result, chain_clone_duration, chain_push_duration) =
             chain_push_result.expect("scope has finished");
 
-        metrics::histogram!("state.contextual.block_commitment.duration_seconds")
-            .record(block_commitment_duration.as_secs_f64());
-        metrics::histogram!("state.contextual.sprout_anchor_check.duration_seconds")
-            .record(sprout_anchor_duration.as_secs_f64());
-        metrics::histogram!("state.contextual.chain_push.duration_seconds")
-            .record(chain_push_duration.as_secs_f64());
+        // These task durations overlap. Only `parallel_update` measures their
+        // combined critical-path wall time.
+        record_contextual_duration!(
+            "state.contextual.parallel_task.block_commitment.duration_seconds",
+            "state.contextual.mined.parallel_task.block_commitment.duration_seconds",
+            block_commitment_duration,
+            is_mined,
+        );
+        record_contextual_duration!(
+            "state.contextual.parallel_task.sprout_anchor_check.duration_seconds",
+            "state.contextual.mined.parallel_task.sprout_anchor_check.duration_seconds",
+            sprout_anchor_duration,
+            is_mined,
+        );
+        record_contextual_duration!(
+            "state.contextual.parallel_task.chain_clone.duration_seconds",
+            "state.contextual.mined.parallel_task.chain_clone.duration_seconds",
+            chain_clone_duration,
+            is_mined,
+        );
+        record_contextual_duration!(
+            "state.contextual.parallel_task.chain_push.duration_seconds",
+            "state.contextual.mined.parallel_task.chain_push.duration_seconds",
+            chain_push_duration,
+            is_mined,
+        );
 
         block_commitment_result?;
         sprout_anchor_result?;

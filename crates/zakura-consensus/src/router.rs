@@ -149,6 +149,79 @@ where
     }
 }
 
+/// Measures the unloaded latency of a read through the old buffered route and
+/// the direct transaction-state route.
+///
+/// This helper is public only so the `state_read_routing` benchmark can use the
+/// production router without exposing its implementation type.
+#[cfg(feature = "internal-bench")]
+#[doc(hidden)]
+pub async fn benchmark_transaction_state_read_routing(
+    requests: usize,
+    buffered_first: bool,
+) -> (std::time::Duration, std::time::Duration) {
+    use zakura_chain::serialization::DateTime32;
+
+    assert!(requests > 0, "the benchmark needs at least one request");
+
+    let write_state = tower::service_fn(|request: zs::Request| async move {
+        Err::<zs::Response, BoxError>(
+            format!("unexpected write-state benchmark request: {request:?}").into(),
+        )
+    });
+    let read_state = tower::service_fn(|request: zs::ReadRequest| async move {
+        match request {
+            zs::ReadRequest::BestChainNextMedianTimePast => Ok::<_, BoxError>(
+                zs::ReadResponse::BestChainNextMedianTimePast(DateTime32::MIN),
+            ),
+            request => Err(format!("unexpected read-state benchmark request: {request:?}").into()),
+        }
+    });
+
+    let direct = TransactionStateRouter::new(write_state, read_state);
+    let buffered = Buffer::new(BoxService::new(direct.clone()), 1);
+
+    direct
+        .clone()
+        .oneshot(zs::Request::BestChainNextMedianTimePast)
+        .await
+        .expect("the direct benchmark warmup succeeds");
+    buffered
+        .clone()
+        .oneshot(zs::Request::BestChainNextMedianTimePast)
+        .await
+        .expect("the buffered benchmark warmup succeeds");
+
+    async fn measure<S>(mut service: S, requests: usize) -> std::time::Duration
+    where
+        S: Service<zs::Request, Response = zs::Response, Error = BoxError>,
+        S::Future: Send,
+    {
+        let start = std::time::Instant::now();
+        for _ in 0..requests {
+            let response = service
+                .ready()
+                .await
+                .expect("the benchmark route becomes ready")
+                .call(zs::Request::BestChainNextMedianTimePast)
+                .await
+                .expect("the benchmark route answers the read request");
+            std::hint::black_box(response);
+        }
+        start.elapsed()
+    }
+
+    if buffered_first {
+        let buffered_elapsed = measure(buffered, requests).await;
+        let direct_elapsed = measure(direct, requests).await;
+        (buffered_elapsed, direct_elapsed)
+    } else {
+        let direct_elapsed = measure(direct, requests).await;
+        let buffered_elapsed = measure(buffered, requests).await;
+        (buffered_elapsed, direct_elapsed)
+    }
+}
+
 /// An error while semantically verifying a block.
 //
 // One or both of these error variants are at least 140 bytes

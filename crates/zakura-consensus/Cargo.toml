@@ -30,6 +30,7 @@ progress-bar = [
 ]
 
 # Test-only features
+internal-bench = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl", "zakura-state/proptest-impl"]
 
 [dependencies]
@@ -113,6 +114,11 @@ harness = false
 [[bench]]
 name = "worst_case_tx_verification"
 harness = false
+
+[[bench]]
+name = "state_read_routing"
+harness = false
+required-features = ["internal-bench"]
 
 [lints]
 workspace = true

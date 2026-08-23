@@ -97,6 +97,9 @@ mod arbitrary;
 #[cfg(test)]
 mod tests;
 
+#[cfg(any(test, feature = "proptest-impl"))]
+pub mod vct_fast_sync_fixture;
+
 #[allow(unused_imports)]
 pub use column_family::{TypedColumnFamily, WriteTypedBatch};
 pub(crate) use commitment_aux::serve_block_roots;
@@ -117,7 +120,9 @@ pub use header_chain::{
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use header_chain::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
-pub(crate) use treestate_artifact::embedded_historical_subtrees;
+pub(crate) use treestate_artifact::{
+    embedded_historical_frontier_artifact, embedded_historical_subtrees,
+};
 pub use treestate_artifact::{
     verify_subtree_artifact, FrontierArtifact, FrontierEntry, SubtreeArtifact, SubtreeRecord,
     TreestateArtifactError, VerifiedSubtreeCounts,
@@ -878,7 +883,7 @@ impl FinalizedState {
                             auxiliary_window.delivery_roots(height, block.hash())
                         });
                     let vct_roots = exact_vct_roots;
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "proptest-impl"))]
                     let vct_roots = match vct_auxiliary_window.as_ref() {
                         Some(_) => vct_roots,
                         None => self.vct.source().and_then(|v| {
@@ -1489,7 +1494,7 @@ impl FinalizedState {
     /// round-trip can be exercised in-process. `requires_verified_successor` marks
     /// whether the installed source is untrusted and must defer tip roots until their
     /// successor is buffered.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub(in crate::service::finalized_state) fn enable_vct_fast_source(
         &mut self,
         source: Box<dyn commitment_aux::CommitmentRootSource>,

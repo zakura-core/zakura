@@ -10,7 +10,9 @@ on:
     paths:
       - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
       - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
+      # A frontier grid repin shows up as a lockfile change, not an artifact change.
+      - Cargo.lock
   workflow_call:
     inputs:
       target_ref:

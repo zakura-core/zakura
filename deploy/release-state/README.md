@@ -17,8 +17,17 @@ Production host wiring, operations, and rollback:
   then atomically replaces `release-state/latest.json`. Bundles are retained
   newest-4 by default (`RELEASE_STATE_KEEP`).
 - **GitHub (repository):** the workflow resolves `latest.json` over a pinned
-  HTTPS host, verifies every digest, and opens a draft PR. Humans review and
-  merge; releases build only committed source.
+  HTTPS host, verifies every digest, publishes the bundle's frontier grid to
+  crates.io, and opens a draft PR that imports the other three artifacts and
+  repins the grid. Humans review and merge; releases build only committed
+  source and the exact versions the lockfile pins.
+
+  The grid is published rather than committed because it is regenerated on
+  every refresh at ~2.1 MB, which the repository would carry in its history
+  forever. Cargo can only resolve a version that already exists, so the
+  publish necessarily precedes the PR that pins it; a candidate the reviewer
+  rejects is a yanked, unreferenced version. See
+  `docs/design/historical-treestate-serving.md` §5.
 
 ## Why an archive node, and why it need not be stopped
 
@@ -36,17 +45,22 @@ whole-band replay — hours on Mainnet.
 
 ## Cutover order
 
-This change makes the publisher emit `mainnet-frontier-grid.bin`. Import and provenance checks that
-_require_ the fourth file land in a follow-up, so today's importer still accepts a three-file
-bundle and a four-file one alike. Deploy when convenient after merge:
+The importer requires every bundle to carry all four files and fails closed on one that does not,
+so the publisher has to be updated around the same time as the repository. It cannot be updated
+_first_: `deploy-snapshot-host.sh` refuses to install an exporter whose revision is not already an
+ancestor of `origin/main`, which is a supply-chain control worth keeping.
 
-1. Merge this repository change.
+So the order is:
+
+1. Merge the repository change.
 2. Run `deploy-snapshot-host.sh`, now buildable from `main`.
 3. Set `RELEASE_STATE_ARCHIVE_CACHE` and enable the timer.
+4. Dispatch `update-release-state.yml` once the first new bundle exists.
 
-Until the import follow-up merges, scheduled imports ignore the new grid file. Once that follow-up
-lands, prefer deploying the publisher the same day so the first required four-file bundle already
-exists.
+Between 1 and 3 a scheduled import will fail with `meta.files is missing keys:
+mainnet-frontier-grid.bin`. Nothing is committed and nothing in production changes — it is a red
+scheduled job that clears as soon as the new publisher publishes — but prefer merging and
+deploying the same day over leaving it red for a week.
 
 ## One-time host setup
 

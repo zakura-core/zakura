@@ -31,11 +31,18 @@ archive node — one that never fast-synced — has per-height trees everywhere,
 read and no note commitment is ever re-appended. A fast-synced archive node has to replay its
 absent band instead, which is hours on Mainnet.
 
-Neither is quick. The default cost-weighted spacing decides where entries go by scanning every
-block body from genesis for its commitment counts, so both kinds of node read the whole chain
-once per run; the legacy node just skips the append work on top. `TimeoutStartSec=6h` on the unit
-covers the slower case. Measure one run before trusting the daily schedule, and consider
-`RELEASE_STATE_GRID_COST_MS` or a longer `OnCalendar` interval if it does not comfortably fit.
+The **first** run is the expensive one. With no previously published grid to resume from, the
+cost-weighted spacing decides where entries go by scanning every block body from genesis for its
+commitment counts, so both kinds of node read the whole chain once; the legacy node just skips
+the append work on top. `TimeoutStartSec=6h` on the unit covers the slower case.
+
+Routine runs are incremental. The publisher passes the previous bundle's grid as
+`--mainnet-frontier-grid-input`, so the walk restarts at the last carried entry plus one and
+scans only the blocks above it. Carried entries are re-checked against this database's own
+authenticated roots rather than recomputed from bodies, which is what keeps resuming trust-free
+without paying for the chain again. Measure the first run before trusting the schedule, and
+consider `RELEASE_STATE_GRID_COST_MS` or a longer `OnCalendar` interval only if that run does not
+comfortably fit.
 
 The existing automation remains in place and is untouched by this publisher:
 
@@ -138,9 +145,10 @@ In `zakura-core/zakura`:
   gate, frontier and Sprout tests, a strict diff allowlist, then mints a
   short-lived GitHub App token and opens a signed draft
   `adam/update-release-state` PR.
-- `.github/workflows/tests-unit.yml` includes the checkpoint, frontier, and
-  provenance paths, so generated update PRs run Unit Tests. A follow-up adds the
-  frontier-grid path once the binary is committed.
+- `.github/workflows/tests-unit.yml` includes the checkpoint, frontier, grid, and
+  provenance paths, so generated update PRs run Unit Tests.
+- `.github/workflows/history-growth.yml` raises its packed-growth allowance for a change
+  confined to the release-state files, because the committed frontier grid is a few megabytes.
 - `.github/workflows/create-release.yml` and `scripts/make/release.mk` validate only
   committed release state before creating a tag.
 - `scripts/check-release-state.sh` is the non-Cargo release gate and rejects

@@ -2510,13 +2510,18 @@ impl WriteBlockWorkerTask {
                 }
             };
 
-            let Some(((queued_child, rsp_tx, _admission), queued_at)) = queued_child_and_rsp_tx
+            let Some(((queued_child, rsp_tx, admission), queued_at)) = queued_child_and_rsp_tx
             else {
                 continue;
             };
 
+            let writer_queue_duration = queued_at.elapsed().as_secs_f64();
             metrics::histogram!("state.block_writer.queue.duration_seconds")
-                .record(queued_at.elapsed().as_secs_f64());
+                .record(writer_queue_duration);
+            if admission.is_some() {
+                metrics::histogram!("state.block_writer.queue.mined.duration_seconds")
+                    .record(writer_queue_duration);
+            }
             let child_hash = queued_child.hash;
             let parent_hash = queued_child.block.header.previous_block_hash;
             let child_height = queued_child.height;

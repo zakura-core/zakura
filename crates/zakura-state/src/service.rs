@@ -1582,7 +1582,7 @@ impl Service<Request> for StateService {
                         self.queue_and_commit_to_non_finalized_state(block, Some(admission))
                     })
                 });
-                metrics::histogram!("state.semantic_commit.queue_send.duration_seconds")
+                metrics::histogram!("state.semantic_commit.queue_and_commit.duration_seconds")
                     .record(queue_send_start.elapsed().as_secs_f64());
 
                 timer.finish_desc("CommitSemanticallyVerifiedBlockWithAdmission");

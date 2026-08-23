@@ -17,7 +17,7 @@ use std::{
     io,
 };
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz-impl"))]
 use bitvec::prelude::*;
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use hex::ToHex;
@@ -26,6 +26,8 @@ use incrementalmerkletree::{
     Hashable,
 };
 use lazy_static::lazy_static;
+#[cfg(any(test, feature = "fuzz-impl"))]
+use sinsemilla::HashDomain;
 use thiserror::Error;
 use zcash_primitives::merkle_tree::HashSer;
 
@@ -78,6 +80,48 @@ fn merkle_crh_orchard(layer: u8, left: pallas::Base, right: pallas::Base) -> pal
 
     Option::from(pallas::Base::from_repr(hash.to_bytes()))
         .expect("an Orchard Merkle hash contains a canonical Pallas field element")
+}
+
+#[cfg(any(test, feature = "fuzz-impl"))]
+lazy_static! {
+    static ref ORCHARD_MERKLE_CRH_REFERENCE_DOMAIN: HashDomain =
+        HashDomain::new("z.cash:Orchard-MerkleCRH");
+}
+
+#[cfg(any(test, feature = "fuzz-impl"))]
+fn merkle_crh_orchard_reference(
+    layer: u8,
+    left: pallas::Base,
+    right: pallas::Base,
+) -> pallas::Base {
+    let mut message = bitvec![u8, Lsb0;];
+
+    let level = MERKLE_DEPTH - 1 - layer;
+    message.extend_from_bitslice(&BitArray::<_, Lsb0>::from([level, 0])[0..10]);
+    message.extend_from_bitslice(&BitArray::<_, Lsb0>::from(left.to_repr())[0..255]);
+    message.extend_from_bitslice(&BitArray::<_, Lsb0>::from(right.to_repr())[0..255]);
+
+    let hash: Option<pallas::Base> = ORCHARD_MERKLE_CRH_REFERENCE_DOMAIN
+        .hash(message.iter().map(|bit| *bit.as_ref()))
+        .into();
+
+    hash.unwrap_or_else(pallas::Base::zero)
+}
+
+/// Compares the production and reference Orchard Merkle hashes for fuzzing.
+#[cfg(feature = "fuzz-impl")]
+#[doc(hidden)]
+pub fn fuzz_merkle_crh_orchard_equivalence(layer: u8, left_limbs: [u64; 4], right_limbs: [u64; 4]) {
+    assert!(layer < MERKLE_DEPTH, "the Orchard layer must be below 32");
+
+    let left = pallas::Base::from_raw(left_limbs);
+    let right = pallas::Base::from_raw(right_limbs);
+
+    assert_eq!(
+        merkle_crh_orchard(layer, left, right).to_repr(),
+        merkle_crh_orchard_reference(layer, left, right).to_repr(),
+        "weighted Orchard Merkle hash differs from the reference at layer {layer}",
+    );
 }
 
 lazy_static! {
@@ -852,26 +896,6 @@ mod tests {
         assert_eq!(rebuilt.root(), original.root());
     }
 
-    /// Reference implementation that builds the Sinsemilla message directly.
-    /// The library implementation must stay byte-identical to this function.
-    fn merkle_crh_orchard_uncached(
-        layer: u8,
-        left: pallas::Base,
-        right: pallas::Base,
-    ) -> pallas::Base {
-        let mut s = bitvec![u8, Lsb0;];
-
-        let l = MERKLE_DEPTH - 1 - layer;
-        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from([l, 0])[0..10]);
-        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(left.to_repr())[0..255]);
-        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(right.to_repr())[0..255]);
-
-        match crate::orchard::sinsemilla::sinsemilla_hash(b"z.cash:Orchard-MerkleCRH", &s) {
-            Some(h) => h,
-            None => pallas::Base::zero(),
-        }
-    }
-
     /// Field elements that exercise the full 255-bit width of `pallas::Base`,
     /// which the small-integer `node(..)` helper never reaches (it only sets the
     /// low 8 bytes). Real note-commitment x-coordinates are full-width, so the
@@ -912,7 +936,7 @@ mod tests {
                 for &right in &values {
                     assert_eq!(
                         merkle_crh_orchard(layer, left, right).to_repr(),
-                        merkle_crh_orchard_uncached(layer, left, right).to_repr(),
+                        merkle_crh_orchard_reference(layer, left, right).to_repr(),
                         "library hash must match the reference at layer {layer}",
                     );
                 }
@@ -936,7 +960,7 @@ mod tests {
 
             proptest::prop_assert_eq!(
                 merkle_crh_orchard(layer, left, right).to_repr(),
-                merkle_crh_orchard_uncached(layer, left, right).to_repr(),
+                merkle_crh_orchard_reference(layer, left, right).to_repr(),
                 "library hash must match the reference at layer {}", layer
             );
         }

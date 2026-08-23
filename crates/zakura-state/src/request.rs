@@ -717,6 +717,17 @@ mod tests {
 
         let semantic = SemanticallyVerifiedBlock::from(cloned);
         assert_eq!(&semantic.new_outputs, contextual.new_outputs.as_ref());
+
+        let unique = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            SemanticallyVerifiedBlock::from(contextual.block.clone()),
+            HashMap::new(),
+        )
+        .expect("the test block's value balance can be calculated");
+        assert_eq!(Arc::strong_count(&unique.new_outputs), 1);
+        let expected_outputs = unique.new_outputs.as_ref().clone();
+
+        let semantic = SemanticallyVerifiedBlock::from(unique);
+        assert_eq!(semantic.new_outputs, expected_outputs);
     }
 
     #[test]
@@ -744,8 +755,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             block: valid.block,
             hash: valid.hash,
             height: valid.height,
-            new_outputs: Arc::try_unwrap(valid.new_outputs)
-                .unwrap_or_else(|shared_outputs| (*shared_outputs).clone()),
+            new_outputs: Arc::unwrap_or_clone(valid.new_outputs),
             transaction_hashes: valid.transaction_hashes,
             deferred_pool_balance_change: Some(DeferredPoolBalanceChange::new(
                 valid.chain_value_pool_change.deferred_amount(),

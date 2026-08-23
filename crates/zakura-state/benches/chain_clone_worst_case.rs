@@ -39,8 +39,17 @@ fn main() {
     let contextual_outputs = contextual_outputs(blocks, transactions_per_block);
     let shared_contextual_outputs: Vec<_> =
         contextual_outputs.iter().cloned().map(Arc::new).collect();
+    let created_utxos: HashMap<_, _> = contextual_outputs
+        .iter()
+        .flat_map(|outputs| {
+            outputs
+                .iter()
+                .map(|(outpoint, utxo)| (*outpoint, utxo.clone()))
+        })
+        .collect();
 
     let mut dominant_index_timings = Vec::with_capacity(samples);
+    let mut created_utxo_timings = Vec::with_capacity(samples);
     let mut contextual_output_timings = Vec::with_capacity(samples);
     let mut shared_output_timings = Vec::with_capacity(samples);
     for _ in 0..samples {
@@ -49,6 +58,11 @@ fn main() {
         let cloned_nullifiers = black_box(&nullifiers).clone();
         dominant_index_timings.push(start.elapsed());
         black_box((cloned_transactions, cloned_nullifiers));
+
+        let start = Instant::now();
+        let cloned_created_utxos = black_box(&created_utxos).clone();
+        created_utxo_timings.push(start.elapsed());
+        black_box(cloned_created_utxos);
 
         let start = Instant::now();
         let cloned_outputs = black_box(&contextual_outputs).clone();
@@ -66,6 +80,13 @@ fn main() {
         transaction_count,
         nullifier_count,
         dominant_index_timings,
+    );
+    print_timings(
+        "created_utxo_index_clone",
+        blocks,
+        transaction_count,
+        nullifier_count,
+        created_utxo_timings,
     );
     print_timings(
         "contextual_output_map_clone",

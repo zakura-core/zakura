@@ -32,11 +32,299 @@ use crate::{
     },
     tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
     BoxError, CheckpointVerifiedBlock, Config, HistoricalTreeUnavailable, PruningConfig, Request,
-    Response, SemanticallyVerifiedBlock, StateInitError, StorageMode, CHAIN_TIP_UPDATE_WAIT_LIMIT,
-    MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    Response, SemanticallyVerifiedBlock, StateInitError, StorageMode, ValidateContextError,
+    CHAIN_TIP_UPDATE_WAIT_LIMIT, MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+fn prepared_relay_test_state() -> (
+    Network,
+    super::finalized_state::FinalizedState,
+    super::non_finalized_state::NonFinalizedState,
+    Arc<Block>,
+) {
+    use crate::tests::FakeChainHelper;
+
+    let network = Network::Mainnet;
+    let heartwood_height = NetworkUpgrade::Heartwood
+        .activation_height(&network)
+        .expect("Heartwood activates")
+        .0;
+    let root = Arc::new(
+        network.block_map()[&(heartwood_height - 1)]
+            .zcash_deserialize_into::<Block>()
+            .expect("pre-Heartwood test block is valid"),
+    );
+    let finalized = super::finalized_state::FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("ephemeral finalized state opens");
+    let mut non_finalized = super::non_finalized_state::NonFinalizedState::new(&network);
+    non_finalized
+        .commit_new_chain(root.clone().prepare(), &finalized)
+        .expect("root commits");
+    let activation = root.make_fake_child().set_block_commitment([0; 32]);
+    non_finalized
+        .commit_block(activation.clone().prepare(), &finalized)
+        .expect("Heartwood activation commits");
+    let sibling_commitment: [u8; 32] = non_finalized
+        .best_chain()
+        .expect("activation chain exists")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("activation creates a history root")
+        .into();
+    let best = activation
+        .make_fake_child()
+        .set_block_commitment(sibling_commitment)
+        .set_work(100);
+    let side = activation
+        .make_fake_child()
+        .set_block_commitment(sibling_commitment)
+        .set_work(50);
+    non_finalized
+        .commit_block(best.prepare(), &finalized)
+        .expect("best child commits");
+    non_finalized
+        .commit_block(side.clone().prepare(), &finalized)
+        .expect("side child commits");
+
+    (network, finalized, non_finalized, side)
+}
+
+fn prepared_relay_difficulty_context() -> (
+    Network,
+    super::finalized_state::FinalizedState,
+    super::non_finalized_state::NonFinalizedState,
+    Arc<Block>,
+) {
+    use crate::tests::FakeChainHelper;
+    use zakura_header_chain::POW_ADJUSTMENT_BLOCK_SPAN;
+
+    let network = Network::Mainnet;
+    let heartwood_height = NetworkUpgrade::Heartwood
+        .activation_height(&network)
+        .expect("Heartwood activates")
+        .0;
+    let root = Arc::new(
+        network.block_map()[&(heartwood_height - 1)]
+            .zcash_deserialize_into::<Block>()
+            .expect("pre-Heartwood test block is valid"),
+    );
+    let finalized = super::finalized_state::FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("ephemeral finalized state opens");
+    let mut non_finalized = super::non_finalized_state::NonFinalizedState::new(&network);
+    non_finalized
+        .commit_new_chain(root.clone().prepare(), &finalized)
+        .expect("root commits");
+    let mut tip = root;
+    for context_index in 0..POW_ADJUSTMENT_BLOCK_SPAN {
+        let commitment = if context_index == 0 {
+            [0; 32]
+        } else {
+            non_finalized
+                .best_chain()
+                .expect("the context chain exists")
+                .history_block_commitment_tree()
+                .hash()
+                .expect("the context chain has a history root")
+                .into()
+        };
+        let mut child = tip.make_fake_child().set_block_commitment(commitment);
+        let child_height = child.coinbase_height().expect("the child has a height");
+        Arc::make_mut(&mut Arc::make_mut(&mut child).header).time =
+            tip.header.time + NetworkUpgrade::target_spacing_for_height(&network, child_height);
+        non_finalized
+            .commit_block(child.clone().prepare(), &finalized)
+            .expect("difficulty context block commits");
+        tip = child;
+    }
+
+    (network, finalized, non_finalized, tip)
+}
+
+#[test]
+fn prepared_relay_preflight_authorizes_a_selected_tip_child() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, _) = prepared_relay_test_state();
+    let best = non_finalized
+        .best_tip_block()
+        .expect("the test state has a best tip")
+        .block
+        .clone();
+    let commitment: [u8; 32] = non_finalized
+        .best_chain()
+        .expect("the best chain exists")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the best chain has a history root")
+        .into();
+    let child = best.make_fake_child().set_block_commitment(commitment);
+
+    let eligibility = super::check_prepared_mined_relay_eligibility_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect("the selected tip child passes the relay preflight");
+
+    assert_eq!(
+        eligibility,
+        crate::PreparedMinedRelayEligibility::Authorized
+    );
+}
+
+#[test]
+fn prepared_relay_preflight_uses_commit_first_for_a_side_chain() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, side) = prepared_relay_test_state();
+    let parent_hash = side.hash();
+    let parent_chain = non_finalized
+        .find_chain(|chain| chain.contains_block_hash(parent_hash))
+        .expect("side parent chain exists");
+    let history_tree =
+        super::read::tree::history_tree(Some(parent_chain), &finalized.db, parent_hash.into())
+            .expect("side parent has a history tree");
+    let commitment: [u8; 32] = history_tree
+        .hash()
+        .expect("the side chain has a history root")
+        .into();
+    let child = side.make_fake_child().set_block_commitment(commitment);
+
+    let eligibility = super::check_prepared_mined_relay_eligibility_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect("the side-chain child proves its expected work");
+
+    assert_eq!(
+        eligibility,
+        crate::PreparedMinedRelayEligibility::CommitFirst
+    );
+}
+
+#[test]
+fn prepared_relay_preflight_rejects_an_easier_claimed_target() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, tip) = prepared_relay_difficulty_context();
+    let commitment: [u8; 32] = non_finalized
+        .best_chain()
+        .expect("the best chain exists")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the best chain has a history root")
+        .into();
+    let mut child = tip
+        .make_fake_child()
+        .set_block_commitment(commitment)
+        .set_work(1);
+    let child_height = child.coinbase_height().expect("the child has a height");
+    Arc::make_mut(&mut Arc::make_mut(&mut child).header).time =
+        tip.header.time + NetworkUpgrade::target_spacing_for_height(&network, child_height);
+
+    let error = super::check_prepared_mined_relay_eligibility_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect_err("an easier claimed target fails the relay preflight");
+
+    assert!(matches!(
+        error.downcast_ref::<ValidateContextError>(),
+        Some(ValidateContextError::InvalidDifficultyThreshold { .. })
+    ));
+}
+
+#[test]
+fn prepared_relay_preflight_rejects_time_at_or_below_median() {
+    use crate::tests::FakeChainHelper;
+    use zakura_header_chain::{AdjustedDifficulty, POW_ADJUSTMENT_BLOCK_SPAN};
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, tip) = prepared_relay_difficulty_context();
+    let commitment: [u8; 32] = non_finalized
+        .best_chain()
+        .expect("the best chain exists")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the best chain has a history root")
+        .into();
+    let parent_hash = tip.hash();
+    let mut child = tip.make_fake_child().set_block_commitment(commitment);
+    let too_early = super::any_ancestor_blocks(&non_finalized, &finalized.db, parent_hash)
+        .take(11)
+        .last()
+        .expect("the context has a median-time window")
+        .header
+        .time;
+    Arc::make_mut(&mut Arc::make_mut(&mut child).header).time = too_early;
+    let relevant_data = super::any_ancestor_blocks(&non_finalized, &finalized.db, parent_hash)
+        .take(POW_ADJUSTMENT_BLOCK_SPAN)
+        .map(|block| (block.header.difficulty_threshold, block.header.time));
+    let expected_target = AdjustedDifficulty::new_from_block(&child, &network, relevant_data)
+        .expect("the context derives an expected target")
+        .expected_difficulty_threshold();
+    Arc::make_mut(&mut Arc::make_mut(&mut child).header).difficulty_threshold = expected_target;
+
+    let error = super::check_prepared_mined_relay_eligibility_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect_err("a time at or below median-time-past fails the relay preflight");
+
+    assert!(matches!(
+        error.downcast_ref::<ValidateContextError>(),
+        Some(ValidateContextError::TimeTooEarly { .. })
+    ));
+}
+
+#[test]
+fn prepared_relay_preflight_rejects_a_forged_commitment() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, side) = prepared_relay_test_state();
+    let child = side.make_fake_child().set_block_commitment([0x42; 32]);
+
+    let error = super::check_prepared_mined_relay_eligibility_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect_err("a forged commitment fails the relay preflight");
+
+    assert!(matches!(
+        error.downcast_ref::<ValidateContextError>(),
+        Some(ValidateContextError::InvalidBlockCommitment(_))
+    ));
+}
 
 #[tokio::test]
 async fn historical_frontier_load_errors_are_returned_from_state_init() {

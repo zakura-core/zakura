@@ -63,9 +63,10 @@ use crate::{
         read::find,
         watch_receiver::WatchReceiver,
     },
-    BlockAdmission, BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config,
-    HashOrHeight, HistoricalTreeUnavailable, KnownBlock, ReadRequest, ReadResponse, Request,
-    Response, SemanticallyVerifiedBlock, StateInitError,
+    BlockAdmission, BlockCommitmentData, BoxError, CheckpointVerifiedBlock,
+    CommitSemanticallyVerifiedError, Config, HashOrHeight, HistoricalTreeUnavailable, KnownBlock,
+    PreparedMinedRelayEligibility, ReadRequest, ReadResponse, Request, Response,
+    SemanticallyVerifiedBlock, StateInitError,
 };
 
 pub mod block_iter;
@@ -1797,6 +1798,7 @@ impl Service<Request> for StateService {
             | Request::FindBlockHashes { .. }
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
+            | Request::CheckPreparedMinedRelayEligibility(_)
             | Request::CheckBlockProposalValidity(_) => {
                 // Redirect the request to the concurrent ReadStateService
                 let read_service = self.read_service.clone();
@@ -3009,6 +3011,18 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::ValidBestChainTipNullifiersAndAnchors)
             }
 
+            ReadRequest::CheckPreparedMinedRelayEligibility(commitment) => {
+                let latest_non_finalized_state = state.latest_non_finalized_state();
+                let eligibility = check_prepared_mined_relay_eligibility_for_state(
+                    &state.network,
+                    &latest_non_finalized_state,
+                    &state.db,
+                    commitment,
+                )?;
+
+                Ok(ReadResponse::PreparedMinedRelayEligibility(eligibility))
+            }
+
             // Used by the get_block and get_block_hash RPCs.
             ReadRequest::BestChainBlockHash(height) => Ok(ReadResponse::BlockHash(
                 read::hash_by_height(state.latest_best_chain(), &state.db, height),
@@ -3144,6 +3158,70 @@ impl Service<ReadRequest> for ReadStateService {
         };
 
         timed_span.spawn_blocking(request_handler)
+    }
+}
+
+fn check_prepared_mined_relay_eligibility_for_state(
+    network: &Network,
+    non_finalized_state: &NonFinalizedState,
+    db: &ZakuraDb,
+    commitment: BlockCommitmentData,
+) -> Result<PreparedMinedRelayEligibility, BoxError> {
+    let parent_hash = commitment.block.header.previous_block_hash;
+    let parent_chain =
+        non_finalized_state.find_chain(|chain| chain.contains_block_hash(parent_hash));
+    let history_tree = read::tree::history_tree(parent_chain, db, parent_hash.into());
+    let history_tree = match history_tree {
+        Some(history_tree) => history_tree,
+        None if matches!(
+            commitment.block.commitment(network)?,
+            block::Commitment::PreSaplingReserved(_)
+                | block::Commitment::FinalSaplingRoot(_)
+                | block::Commitment::ChainHistoryActivationReserved
+        ) =>
+        {
+            Arc::new(zakura_chain::history_tree::HistoryTree::default())
+        }
+        None => return Ok(PreparedMinedRelayEligibility::Unavailable),
+    };
+    check::block_commitment_is_valid_for_chain_history(
+        commitment.block.clone(),
+        network,
+        &history_tree,
+        commitment.auth_data_root,
+    )?;
+
+    let relevant_chain: Vec<_> =
+        any_ancestor_blocks(non_finalized_state, db, parent_hash).collect();
+    if relevant_chain.is_empty() {
+        return Ok(PreparedMinedRelayEligibility::Unavailable);
+    }
+    let candidate_height = commitment
+        .block
+        .coinbase_height()
+        .ok_or(crate::ValidateContextError::NotReadyToBeCommitted)?;
+    let finalized_tip_height = db.finalized_tip_height().or_else(|| {
+        relevant_chain
+            .last()
+            .and_then(|block| block.coinbase_height())
+    });
+    check::block_is_valid_for_recent_chain_data(
+        &commitment.block,
+        candidate_height,
+        network,
+        finalized_tip_height,
+        relevant_chain,
+    )?;
+
+    if network.disable_pow() {
+        return Ok(PreparedMinedRelayEligibility::Unavailable);
+    }
+    let extends_selected_tip = read::best_tip(non_finalized_state, db)
+        .is_some_and(|(_, selected_tip_hash)| selected_tip_hash == parent_hash);
+    if extends_selected_tip {
+        Ok(PreparedMinedRelayEligibility::Authorized)
+    } else {
+        Ok(PreparedMinedRelayEligibility::CommitFirst)
     }
 }
 

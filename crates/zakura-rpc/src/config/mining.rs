@@ -64,7 +64,8 @@ pub struct Config {
     #[serde(default)]
     pub internal_miner: bool,
 
-    /// Advertise mined block hashes after state admission and before contextual commit completes.
+    /// Advertise prepared mined block hashes after expected-work validation and state admission,
+    /// but before contextual commit completes.
     pub optimistic_block_inventory: bool,
 }
 

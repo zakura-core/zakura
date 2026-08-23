@@ -2833,7 +2833,11 @@ where
                 admitted = admission.wait() => {
                     metrics::histogram!("mining.state_admission.duration_seconds")
                         .record(admission_start.elapsed().as_secs_f64());
-                    if admitted && optimistic_block_inventory && pending_blocks.insert(block.clone()) {
+                    if admitted
+                        && admission.optimistic_relay_authorized()
+                        && optimistic_block_inventory
+                        && pending_blocks.insert(block.clone())
+                    {
                         let (advertised, receiver) = tokio::sync::oneshot::channel();
                         let event = MinedBlockEvent::Early {
                             hash: block_hash,

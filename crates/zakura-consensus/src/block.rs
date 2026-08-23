@@ -329,12 +329,19 @@ where
                     prepared_block.block = block;
                     prepared_block.hash = hash;
                     prepared_block.height = height;
-                    return commit_prepared_block(
-                        state_service,
-                        prepared_block,
-                        request.admission(),
-                    )
-                    .await;
+                    let admission = request.admission();
+                    if let Some(admission) = &admission {
+                        if check_prepared_mined_relay_eligibility(
+                            &mut state_service,
+                            (&prepared_block).into(),
+                        )
+                        .await?
+                            == zs::PreparedMinedRelayEligibility::Authorized
+                        {
+                            admission.authorize_optimistic_relay();
+                        }
+                    }
+                    return commit_prepared_block(state_service, prepared_block, admission).await;
                 }
                 metrics::histogram!("mining.solved_header_check.duration_seconds")
                     .record(solved_header_start.elapsed().as_secs_f64());
@@ -517,6 +524,35 @@ where
         }
         .instrument(span)
         .boxed()
+    }
+}
+
+async fn check_prepared_mined_relay_eligibility<S>(
+    state_service: &mut S,
+    block: zs::BlockCommitmentData,
+) -> Result<zs::PreparedMinedRelayEligibility, VerifyBlockError>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    let hash = block.block.hash();
+    let preflight_start = std::time::Instant::now();
+    let response = async {
+        state_service
+            .ready()
+            .await
+            .map_err(|source| VerifyBlockError::StateService { source, hash })?
+            .call(zs::Request::CheckPreparedMinedRelayEligibility(block))
+            .await
+            .map_err(|source| map_commit_error(source, hash))
+    }
+    .await;
+    metrics::histogram!("mining.prepared_relay_preflight.duration_seconds")
+        .record(preflight_start.elapsed().as_secs_f64());
+
+    match response? {
+        zs::Response::PreparedMinedRelayEligibility(eligibility) => Ok(eligibility),
+        _ => unreachable!("wrong response for prepared mined-block relay eligibility"),
     }
 }
 

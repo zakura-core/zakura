@@ -56,9 +56,10 @@ pub use error::{
 };
 pub use header_chain::*;
 pub use request::{
-    BlockAdmission, CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight,
-    HeaderChainBodyEvidenceAuthority, MappedRequest, PreparedHeaderChainBodyEvidence,
-    PreparedHeaderChainInsert, ReadRequest, Request, SemanticallyVerifiedBlock,
+    BlockAdmission, BlockCommitmentData, CheckpointVerifiedBlock,
+    CommitSemanticallyVerifiedBlockRequest, HashOrHeight, HeaderChainBodyEvidenceAuthority,
+    MappedRequest, PreparedHeaderChainBodyEvidence, PreparedHeaderChainInsert, ReadRequest,
+    Request, SemanticallyVerifiedBlock,
 };
 
 #[cfg(feature = "indexer")]
@@ -66,7 +67,7 @@ pub use request::Spend;
 
 pub use response::{
     AnyTx, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock, MinedTx,
-    NonFinalizedBlocksListener, ReadResponse, Response,
+    NonFinalizedBlocksListener, PreparedMinedRelayEligibility, ReadResponse, Response,
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use service::finalized_state::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};

@@ -53,7 +53,10 @@ pub(super) const MERKLE_DEPTH: u8 = 32;
 ///
 /// MerkleCRH^Orchard: {0..MerkleDepth^Orchard − 1} × P𝑥 × P𝑥 → P𝑥
 ///
-/// MerkleCRH^Orchard(layer, left, right) := 0 if hash == ⊥; hash otherwise
+/// The weighted evaluator assumes the Sinsemilla incomplete additions do not
+/// reach an exceptional case. This assumption follows from the discrete-log
+/// relationships between independently generated Sinsemilla points being
+/// unknown. It therefore omits the protocol's unreachable `hash == ⊥` mapping.
 ///
 /// where hash = SinsemillaHash("z.cash:Orchard-MerkleCRH", l || left || right),
 /// l = I2LEBSP_10(MerkleDepth^Orchard − 1 − layer),  and left, right, and

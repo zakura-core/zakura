@@ -639,6 +639,20 @@ mod tests {
             assert_eq!(error.mempool_misbehavior_score(), 0);
         }
     }
+
+    #[test]
+    fn local_transaction_failures_are_retryable_without_peer_penalty() {
+        use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
+
+        let error =
+            TransactionError::Other("transaction parser worker dropped its response".to_string());
+
+        assert_eq!(
+            error.body_verification_class(),
+            BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+        );
+        assert_eq!(error.mempool_misbehavior_score(), 0);
+    }
 }
 
 #[derive(Error, Clone, Debug, PartialEq, Eq)]

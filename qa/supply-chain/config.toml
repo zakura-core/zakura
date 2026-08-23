@@ -394,52 +394,52 @@ criteria = "safe-to-deploy"
 [[exemptions.zakura-bellman]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-bls12-381]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-halo2-gadgets]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-halo2-legacy-pdqsort]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-halo2-poseidon]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-halo2-proofs]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-jubjub]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-keys]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-orchard]]
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "Retain this exact-version exemption: rc3 adds batched key agreement whose variable-time behavior depends on the incoming viewing key. Functional behavior was reviewed, but a complete timing-safety argument is still pending. Zakurad does not perform trial decryption or hold incoming viewing keys."
 
 [[exemptions.zakura-pairing]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-pasta-curves]]
 version = "1.0.0-rc.3"
@@ -449,32 +449,32 @@ notes = "Retain this exact-version exemption: rc3 makes Field::invert variable-t
 [[exemptions.zakura-primitives]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-proofs]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-reddsa]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-redjubjub]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-sapling-crypto]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zakura-sinsemilla]]
 version = "1.0.0-rc.2"
 criteria = "safe-to-deploy"
-notes = "Accepted rc2 migration baseline for the reviewed rc2-to-rc3 delta audit."
+notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
 
 [[exemptions.zerovec]]
 version = "0.11.6"

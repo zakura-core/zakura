@@ -23,6 +23,11 @@ changes made that possible, and one made it necessary:
   only for convenience.
 - It therefore takes no snapshot lock and cannot delay a snapshot. Its own
   `/run/zakura-release-state-publish.lock` still rejects overlapping timer or manual runs.
+- It does skip a run while `zakura-snapshot.service` is active, because that job stops the
+  archive container to tar its state. Skipping costs a slightly older bundle; failing would cost
+  an alert. It reads that unit's state rather than taking the snapshot lock on purpose:
+  `check-and-publish.sh` also decides from the unit, so a held lock would not defer a snapshot —
+  it would start one that then died on the lock.
 - The frontier grid covers the heights below the checkpoint, which the pruned database no
   longer holds. That is why the source moved from `zakura-pruned` to `zakura`.
 

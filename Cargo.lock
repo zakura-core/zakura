@@ -6921,9 +6921,9 @@ dependencies = [
 
 [[package]]
 name = "valargroup-zakura-assets"
-version = "0.3453771.0"
+version = "0.3457371.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66315a106761e55eb1dcec995b0beb88865c578a45b67c633d09fe940da2d213"
+checksum = "42207ed9d1df776c64849d93644b7c5c4625c2b66304c2d05b71938b5d8ac90d"
 
 [[package]]
 name = "valuable"

@@ -213,7 +213,13 @@ so it never fast-synced and holds per-height commitment trees at every height.
 That is what makes it the supported generator for the release-state historical
 frontier grid, whose entries then come from reads rather than from replaying a
 fast-synced node's absent band. It is not a public bootstrap peer and is
-deliberately absent from the node ids in `zakura-network`. One-time runner bootstrap from an operator machine with SSH access
+deliberately absent from the node ids in `zakura-network`.
+
+A node only becomes deployable once the deployer runner can reach it. The fleet's
+deploy key is `zakura-mainnet-deployer@us-east-0`; it must be in the node's
+`~/.ssh/authorized_keys`, and the node's address must be in the workflow's
+host-key pin list. A host that is missing the key fails the deploy with
+`Permission denied (publickey)` at the scp step, after a successful build. One-time runner bootstrap from an operator machine with SSH access
 and CI credentials in `~/agents-env`:
 
 ```bash

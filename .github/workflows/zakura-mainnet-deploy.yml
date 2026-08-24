@@ -174,7 +174,8 @@ jobs:
             161.35.156.226 \
             139.59.64.115 \
             168.144.173.250 \
-            159.203.113.196; do
+            159.203.113.196 \
+            104.131.174.28; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts

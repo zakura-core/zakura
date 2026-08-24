@@ -22,14 +22,20 @@
 //! [1]: crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS
 //! [2]: crate::constants::MAX_INVALIDATED_BLOCKS
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use zakura_chain::block::{self, Height};
 
-use crate::service::{
-    finalized_state::ZakuraDb,
-    non_finalized_state::{Chain, NonFinalizedState},
-    read::find::tip,
+use crate::{
+    service::{
+        finalized_state::ZakuraDb,
+        non_finalized_state::{Chain, NonFinalizedState},
+        read::find::tip,
+    },
+    ContextuallyVerifiedBlock,
 };
 
 /// The status of a chain tip.
@@ -52,24 +58,6 @@ pub enum ChainTipStatus {
 
     /// This branch was invalidated, either by consensus or by `invalidateblock`.
     Invalid,
-}
-
-impl ChainTipStatus {
-    /// Returns the zcashd-compatible name of this status.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ChainTipStatus::Active => "active",
-            ChainTipStatus::ValidFork => "valid-fork",
-            ChainTipStatus::HeadersOnly => "headers-only",
-            ChainTipStatus::Invalid => "invalid",
-        }
-    }
-}
-
-impl std::fmt::Display for ChainTipStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// The tip of one chain that this node tracks.
@@ -128,6 +116,26 @@ pub fn chain_tips(
     // Track the hashes we have already reported, so a tip is never listed twice.
     let mut seen: HashSet<block::Hash> = HashSet::from([best_hash]);
 
+    // Index every block in every invalidated branch. `invalidated_parents` holds the
+    // parent hash of each of those blocks: a block in that set has a known successor,
+    // so it is not a tip, and zcashd would not report it. `invalidated_by_hash` walks
+    // a branch back to the block it forked from, which is not always the parent of
+    // its root: `invalidateblock` can be called more than once on the same branch, and
+    // then one branch's parent is the tip of another.
+    let invalidated_branches = non_finalized_state.invalidated_blocks();
+
+    let mut invalidated_parents: HashSet<block::Hash> = HashSet::new();
+    let mut invalidated_by_hash: HashMap<block::Hash, (Height, block::Hash)> = HashMap::new();
+
+    for blocks in invalidated_branches.values() {
+        for invalidated_block in blocks.iter() {
+            let parent = invalidated_block.block.header.previous_block_hash;
+
+            invalidated_parents.insert(parent);
+            invalidated_by_hash.insert(invalidated_block.hash, (invalidated_block.height, parent));
+        }
+    }
+
     // Non-finalized forks. `chain_iter()` yields chains in descending work order, so
     // the best chain comes first and is already covered above.
     let chains: Vec<&Arc<Chain>> = non_finalized_state.chain_iter().collect();
@@ -148,7 +156,10 @@ pub fn chain_tips(
                 && other.contains_block_hash(hash)
         });
 
-        if has_successor {
+        // A fork tip whose child was invalidated also has a known successor. The best
+        // chain tip is exempt, because zcashd always reports the active tip, and it
+        // is already in `tips` above.
+        if has_successor || invalidated_parents.contains(&hash) {
             continue;
         }
 
@@ -163,10 +174,9 @@ pub fn chain_tips(
         });
     }
 
-    // Invalidated branches. The map is keyed by the height of the branch's root, so
-    // the branch forked from its parent at `root_height - 1`.
-    for (root_height, blocks) in non_finalized_state.invalidated_blocks() {
-        let Some(tip_block) = blocks.last() else {
+    // Invalidated branches.
+    for blocks in invalidated_branches.values() {
+        let (Some(root_block), Some(tip_block)) = (blocks.first(), blocks.last()) else {
             continue;
         };
 
@@ -174,7 +184,12 @@ pub fn chain_tips(
             continue;
         }
 
-        let fork_height = root_height.0.saturating_sub(1);
+        // The tip of a branch that another branch was later split from is not a tip.
+        if invalidated_parents.contains(&tip_block.hash) {
+            continue;
+        }
+
+        let fork_height = invalidated_fork_height(root_block, &invalidated_by_hash);
 
         tips.push(ChainTipInfo {
             height: tip_block.height,
@@ -206,6 +221,34 @@ pub fn chain_tips(
     });
 
     tips
+}
+
+/// Returns the height of the block that an invalidated branch forked from.
+///
+/// zcashd measures `branchlen` from the fork with the active chain, not from the
+/// parent of the branch root. Those differ when `invalidateblock` was called more
+/// than once on the same branch, because the root's parent is then invalidated too.
+/// This walks back to the deepest invalidated ancestor, whose parent is on the best
+/// chain.
+fn invalidated_fork_height(
+    root_block: &ContextuallyVerifiedBlock,
+    invalidated_by_hash: &HashMap<block::Hash, (Height, block::Hash)>,
+) -> u32 {
+    let mut root_height = root_block.height;
+    let mut parent = root_block.block.header.previous_block_hash;
+
+    // Each step moves to a distinct invalidated block, so the walk cannot take more
+    // steps than there are invalidated blocks.
+    for _ in 0..invalidated_by_hash.len() {
+        let Some(&(height, next_parent)) = invalidated_by_hash.get(&parent) else {
+            break;
+        };
+
+        root_height = height;
+        parent = next_parent;
+    }
+
+    root_height.0.saturating_sub(1)
 }
 
 /// Returns the height of the highest block that `chain` shares with `best_chain`.

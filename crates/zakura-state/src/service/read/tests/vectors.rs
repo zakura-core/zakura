@@ -1703,6 +1703,63 @@ fn chain_tips_report_invalidated_branches() {
     );
 }
 
+/// Repeated `invalidateblock` calls on the same branch report one tip, not one per
+/// call, and the branch length is still measured from the best chain.
+#[test]
+fn chain_tips_report_repeated_invalidations_as_one_branch() {
+    let _init_guard = zakura_test::init();
+
+    let block1: Arc<Block> = Arc::new(Mainnet.test_block(653599, 583999).unwrap());
+    let block2 = block1.make_fake_child().set_work(10);
+    let block3 = block2.make_fake_child().set_work(20);
+    let block4 = block3.make_fake_child().set_work(30);
+
+    let (mut state, finalized_state) = new_chain_tips_test_state(&Mainnet);
+    state
+        .commit_new_chain(block1.clone().prepare(), &finalized_state)
+        .expect("fake root block should commit to an empty non-finalized state");
+    for block in [&block2, &block3, &block4] {
+        state
+            .commit_block(block.clone().prepare(), &finalized_state)
+            .expect("each child block should extend the chain");
+    }
+
+    // The first call did not roll back far enough, so a second call invalidates the
+    // parent of the first branch. That leaves two invalidated branches in the state.
+    state
+        .invalidate_block(block3.hash())
+        .expect("invalidating a non-root block should succeed");
+    state
+        .invalidate_block(block2.hash())
+        .expect("invalidating the parent of an invalidated branch should succeed");
+
+    let tips = chain_tips(&state, &finalized_state.db, None);
+
+    assert_eq!(
+        tips,
+        vec![
+            // block2 is not a tip: block3 is its successor, even though both are
+            // invalidated. zcashd measures the branch from the fork with the best
+            // chain, which is block1, three blocks below block4.
+            ChainTipInfo {
+                height: block4.coinbase_height().unwrap(),
+                hash: block4.hash(),
+                branch_len: 3,
+                status: ChainTipStatus::Invalid,
+            },
+            // block1 is the parent of an invalidated block, but it is also the best
+            // chain tip, and zcashd always reports the active tip.
+            ChainTipInfo {
+                height: block1.coinbase_height().unwrap(),
+                hash: block1.hash(),
+                branch_len: 0,
+                status: ChainTipStatus::Active,
+            },
+        ],
+        "two invalidations on one branch should report one invalid tip"
+    );
+}
+
 /// A header chain that is ahead of the block tip is reported as `headers-only`.
 #[test]
 fn chain_tips_report_a_header_tip_above_the_block_tip() {

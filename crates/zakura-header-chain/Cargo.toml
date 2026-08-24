@@ -1,6 +1,6 @@
 [package]
 name = "zakura-header-chain"
-version = "1.0.0-rc0"
+version = "1.0.0-rc2"
 authors.workspace = true
 description = "Fork-aware header-chain domain types and transition engine for Zakura"
 license.workspace = true

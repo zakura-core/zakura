@@ -142,3 +142,70 @@ impl UtxoProviders {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::{amount::Amount, transaction};
+
+    use super::*;
+
+    #[test]
+    fn three_providers_promote_and_collapse_provider_storage() {
+        let outpoint = transparent::OutPoint {
+            hash: transaction::Hash([0x49; 32]),
+            index: 0,
+        };
+        let output = transparent::Output {
+            value: Amount::zero(),
+            lock_script: transparent::Script::new(&[]),
+        };
+        let provider_hashes = [
+            block::Hash([1; 32]),
+            block::Hash([2; 32]),
+            block::Hash([3; 32]),
+        ];
+        let provider_utxos = [
+            transparent::Utxo::new(output.clone(), block::Height(1), false),
+            transparent::Utxo::new(output.clone(), block::Height(2), false),
+            transparent::Utxo::new(output, block::Height(3), false),
+        ];
+        let mut cache = UtxoProviderCache::default();
+
+        cache.insert(provider_hashes[0], outpoint, provider_utxos[0].clone());
+        assert!(matches!(
+            cache.providers_by_outpoint.get(&outpoint),
+            Some(UtxoProviders::Single { block_hash, utxo })
+                if *block_hash == provider_hashes[0] && *utxo == provider_utxos[0]
+        ));
+
+        cache.insert(provider_hashes[1], outpoint, provider_utxos[1].clone());
+        cache.insert(provider_hashes[2], outpoint, provider_utxos[2].clone());
+        let Some(UtxoProviders::Multiple(providers)) = cache.providers_by_outpoint.get(&outpoint)
+        else {
+            panic!("three UTXO providers use the multiple-provider representation");
+        };
+        assert_eq!(providers.len(), 3);
+        for (hash, utxo) in provider_hashes.iter().zip(provider_utxos.iter()) {
+            assert_eq!(providers.get(hash), Some(utxo));
+        }
+
+        cache.remove_provider(&provider_hashes[1], &outpoint);
+        let Some(UtxoProviders::Multiple(providers)) = cache.providers_by_outpoint.get(&outpoint)
+        else {
+            panic!("two UTXO providers keep the multiple-provider representation");
+        };
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers.get(&provider_hashes[0]), Some(&provider_utxos[0]));
+        assert_eq!(providers.get(&provider_hashes[2]), Some(&provider_utxos[2]));
+
+        cache.remove_provider(&provider_hashes[0], &outpoint);
+        assert!(matches!(
+            cache.providers_by_outpoint.get(&outpoint),
+            Some(UtxoProviders::Single { block_hash, utxo })
+                if *block_hash == provider_hashes[2] && *utxo == provider_utxos[2]
+        ));
+
+        cache.remove_provider(&provider_hashes[2], &outpoint);
+        assert!(!cache.providers_by_outpoint.contains_key(&outpoint));
+    }
+}

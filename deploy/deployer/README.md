@@ -215,6 +215,15 @@ frontier grid, whose entries then come from reads rather than from replaying a
 fast-synced node's absent band. It is not a public bootstrap peer and is
 deliberately absent from the node ids in `zakura-network`.
 
+One fleet entry buys three things, because the dashboard and the alerting both
+derive from the same config. `zakura-mainnet-deploy.yml` copies the generated
+`nodes.ci.toml` into `/opt/zakura-mainnet-dashboard/nodes.toml`, so a node added
+here appears on the status dashboard; `zakura-cluster-watchdog.py` then reads
+that dashboard's `/data` and alerts `#zakura-alerts` when a node stays unhealthy.
+Nothing separate has to be registered for monitoring. Note that the dashboard
+step runs `if: always()` and rewrites the whole node list, so it picks up a new
+node even on a deploy scoped to one host with `--node`.
+
 A node only becomes deployable once the deployer runner can reach it. The fleet's
 deploy key is `zakura-mainnet-deployer@us-east-0`; it must be in the node's
 `~/.ssh/authorized_keys`, and the node's address must be in the workflow's

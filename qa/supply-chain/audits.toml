@@ -4330,6 +4330,12 @@ end = "2025-07-29"
 
 [[trusted.zakura-assets]]
 criteria = "safe-to-deploy"
+user-id = 1244 # Sean Bowe (ebfull)
+start = "2026-08-11"
+end = "2027-08-24"
+
+[[trusted.zakura-assets]]
+criteria = "safe-to-deploy"
 trusted-publisher = "github:zakura-core/zakura"
 start = "2026-08-24"
 end = "2027-08-24"

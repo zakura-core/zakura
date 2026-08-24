@@ -76,6 +76,13 @@ version = "0.57.1"
 when = "2026-04-17"
 trusted-publisher = "github:bytecodealliance/wit-bindgen"
 
+[[publisher.zakura-assets]]
+version = "0.3457371.0"
+when = "2026-08-24"
+user-id = 1244
+user-login = "ebfull"
+user-name = "Sean Bowe"
+
 [[publisher.zcash_address]]
 version = "0.13.0"
 when = "2026-07-09"

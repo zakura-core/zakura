@@ -4236,8 +4236,10 @@ async fn rpc_getchaintips() {
     // One tip of every status the state can report.
     let state_tips = vec![
         ChainTipInfo {
+            // Every byte differs, so the `hash` assertion below detects a hash that
+            // is serialized in the wrong byte order.
             height: Height(1_000_412),
-            hash: Hash([0xd9; 32]),
+            hash: Hash(std::array::from_fn(|index| index as u8)),
             branch_len: 412,
             status: ChainTipStatus::HeadersOnly,
         },
@@ -4278,7 +4280,12 @@ async fn rpc_getchaintips() {
 
     // zcashd's field names and status spellings, in the order the state returned.
     assert_eq!(json[0]["height"], 1_000_412);
-    assert_eq!(json[0]["hash"], Hash([0xd9; 32]).to_string());
+    // zcashd prints block hashes in big-endian display order, which reverses the
+    // bytes of the internal representation.
+    assert_eq!(
+        json[0]["hash"],
+        "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
+    );
     assert_eq!(json[0]["branchlen"], 412);
     assert_eq!(json[0]["status"], "headers-only");
 

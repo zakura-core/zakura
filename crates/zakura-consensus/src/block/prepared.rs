@@ -156,6 +156,11 @@ impl PreparedCandidateCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.prune_expired();
 
+        if inner.entries.is_empty() {
+            metrics::counter!("mining.prepared_cache.misses").increment(1);
+            return None;
+        }
+
         if let Some(work_id) = work_id {
             if let Some(entry_id) = inner.work_ids.get(work_id).map(|alias| alias.entry_id) {
                 if let Some(entry) = inner.entries.iter().find(|entry| entry.id == entry_id) {

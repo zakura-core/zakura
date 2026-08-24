@@ -17,7 +17,7 @@ use std::{
 
 use futures::{
     future::{FutureExt, TryFutureExt},
-    stream::{FuturesUnordered, Stream, StreamExt},
+    Stream,
 };
 use tokio::sync::oneshot::{self, error::TryRecvError};
 use tower::{buffer::Buffer, timeout::Timeout, util::BoxService, Service, ServiceExt};
@@ -640,28 +640,30 @@ impl Service<zn::Request> for Inbound {
                 async move {
                     let mut blocks: Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
-                    let mut lookups = FuturesUnordered::new();
+                    let mut state_lookup_bytes = 0;
+                    let mut lookup_results = Vec::new();
 
                     for (index, &hash) in hashes.iter().take(GETDATA_MAX_BLOCK_COUNT).enumerate() {
-                        let state = state.clone();
-                        let pending_blocks = pending_blocks.clone();
-                        lookups.push(async move {
-                            let block =
-                                block_by_hash_or_pending(state, pending_blocks, hash).await?;
-                            Ok::<_, zn::BoxError>((index, hash, block))
-                        });
-                    }
+                        if state_lookup_bytes >= GETDATA_SENT_BYTES_LIMIT {
+                            break;
+                        }
 
-                    // Start every lookup before awaiting any result.
-                    let mut lookup_results = Vec::with_capacity(lookups.len());
-                    while let Some(result) = lookups.next().await {
-                        lookup_results.push(result?);
+                        let block = block_by_hash_or_pending(
+                            state.clone(),
+                            pending_blocks.clone(),
+                            hash,
+                        )
+                        .await?;
+                        if let Some(block) = &block {
+                            state_lookup_bytes = state_lookup_bytes
+                                .saturating_add(block.zcash_serialized_size());
+                        }
+                        lookup_results.push((index, hash, block));
                     }
-                    lookup_results.sort_unstable_by_key(|(index, _, _)| *index);
 
                     for (_, hash, block) in lookup_results {
                         if total_size >= GETDATA_SENT_BYTES_LIMIT {
-                            continue;
+                            break;
                         }
 
                         // Add the block responses to the list, while updating the size limit.

@@ -143,6 +143,9 @@ use types::{
     z_validate_address::ZValidateAddressResponse,
 };
 
+/// Bounds the final mined-block event send after the RPC lifecycle has detached.
+const MINED_BLOCK_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Calls a Tower service and maps readiness or call errors to
 /// [`server::error::LegacyCode::Misc`].
 async fn call_service<S, Request>(service: S, request: Request) -> Result<S::Response>
@@ -1101,35 +1104,29 @@ where
     }
 
     fn prepare_template_in_background(&self, template: &BlockTemplateResponse) {
-        #[cfg(test)]
-        {
-            let _ = (template, self.gbt.try_acquire_template_preparation());
-        }
-
-        #[cfg(not(test))]
-        {
-            let Some(preparation_permit) = self.gbt.try_acquire_template_preparation() else {
-                metrics::counter!("mining.template_preparation.saturated").increment(1);
-                return;
-            };
-            let Ok(block) = proposal_block_from_template(template, None, &self.network) else {
-                return;
-            };
-            let request = zakura_consensus::Request::Prepare {
-                block: Arc::new(block),
-                work_id: Some(template.work_id().clone()),
-            };
-            let verifier = self.gbt.block_verifier_router();
-            tokio::spawn(
-                async move {
-                    let _preparation_permit = preparation_permit;
-                    if let Err(error) = verifier.oneshot(request).await {
-                        tracing::debug!(?error, "background mining candidate preparation failed");
-                    }
+        let Some(preparation_permit) = self.gbt.try_acquire_template_preparation() else {
+            metrics::counter!("mining.template_preparation.saturated").increment(1);
+            return;
+        };
+        let template = template.clone();
+        let network = self.network.clone();
+        let verifier = self.gbt.block_verifier_router();
+        tokio::spawn(
+            async move {
+                let _preparation_permit = preparation_permit;
+                let Ok(block) = proposal_block_from_template(&template, None, &network) else {
+                    return;
+                };
+                let request = zakura_consensus::Request::Prepare {
+                    block: Arc::new(block),
+                    work_id: Some(template.work_id().clone()),
+                };
+                if let Err(error) = verifier.oneshot(request).await {
+                    tracing::debug!(?error, "background mining candidate preparation failed");
                 }
-                .in_current_span(),
-            );
-        }
+            }
+            .in_current_span(),
+        );
     }
 
     async fn run_mined_block_lifecycle(
@@ -1229,7 +1226,20 @@ where
                         early_advertised,
                     }
                 };
-                let _ = mined_block_sender.send(event).await;
+                let send_result = tokio::time::timeout(
+                    MINED_BLOCK_EVENT_SEND_TIMEOUT,
+                    mined_block_sender.send(event),
+                )
+                .await;
+                if !matches!(send_result, Ok(Ok(()))) {
+                    metrics::counter!("mining.optimistic_inventory.final_send_failures")
+                        .increment(1);
+                    tracing::warn!(
+                        ?block_hash,
+                        ?height,
+                        "could not send the final mined-block event"
+                    );
+                }
             });
             verification_result
         });

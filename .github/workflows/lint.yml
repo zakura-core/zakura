@@ -220,6 +220,15 @@ jobs:
           python3 deploy/runner/test_zakura_cluster_status.py
           python3 deploy/runner/test_zakura_cluster_watchdog.py
 
+      - name: Release-state coupling
+        if: ${{ !cancelled() }}
+        # Cargo-free check that the committed checkpoint list, frontier, subtree roots, and
+        # frontier grid all describe the same block as the provenance manifest. The other three
+        # are embedded in the binary and bound by `embedded_mainnet_final_frontiers_parse`; the
+        # grid deliberately is not, so this is what binds it on an ordinary PR. Bootstrap
+        # provenance is a release-time policy rather than a PR one, hence the override.
+        run: ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=1 ./scripts/check-release-state.sh
+
       - name: Ensure no arbitrary or proptest dependency on default build
         if: ${{ !cancelled() }}
         run: cargo +stable tree --package zakura -e=features,no-dev | grep -Eq "arbitrary|proptest" && exit 1 || exit 0

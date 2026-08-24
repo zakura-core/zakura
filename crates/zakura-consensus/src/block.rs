@@ -336,6 +336,11 @@ where
                         tx::check::lock_time_has_passed(transaction, height, block.header.time)
                             .map_err(VerifyBlockError::Transaction)?;
                     }
+                    check::merkle_root_validity(
+                        &network,
+                        &block,
+                        &prepared_block.transaction_hashes,
+                    )?;
                     metrics::histogram!("mining.solved_header_check.duration_seconds")
                         .record(solved_header_start.elapsed().as_secs_f64());
 
@@ -508,7 +513,7 @@ where
 
             // Return early for proposal requests.
             if request.is_proposal() {
-                let cache_copy = prepared_block.clone();
+                let cache_copy = request.should_cache().then(|| prepared_block.clone());
                 let response = match state_service
                     .ready()
                     .await
@@ -520,7 +525,7 @@ where
                     zs::Response::ValidBlockProposal => Ok(hash),
                     _ => unreachable!("wrong response for CheckBlockProposalValidity"),
                 };
-                if response.is_ok() && request.should_cache() {
+                if let (Ok(_), Some(cache_copy)) = (&response, cache_copy) {
                     let candidate = cache_copy.block.clone();
                     prepared_candidates.insert(&candidate, request.work_id(), cache_copy, &network);
                     metrics::histogram!("mining.preparation.duration_seconds").record(

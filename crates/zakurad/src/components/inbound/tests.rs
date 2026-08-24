@@ -17,7 +17,6 @@ async fn peer_block_lookup_queries_all_active_chains() {
     use tower::{buffer::Buffer, util::BoxService};
     use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
     use zakura_rpc::PendingBlockRegistry;
-
     let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .expect("the genesis block is valid");

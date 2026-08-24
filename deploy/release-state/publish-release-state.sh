@@ -24,6 +24,14 @@
 #                             (default: whatever the exporter defaults to). Only
 #                             affects entries added after the resumed prefix;
 #                             published entries are carried forward verbatim.
+#   RELEASE_STATE_PREVIOUS_GRID
+#                             resume the frontier grid from this local file rather
+#                             than from the previously published bundle. For
+#                             bootstrapping a generator whose pointer predates the
+#                             grid: seed it with the artifact the repository already
+#                             pins, so the first bundle extends that grid by
+#                             construction instead of relying on a fresh genesis
+#                             walk reproducing it byte for byte.
 #   RELEASE_STATE_KEEP        immutable bundles to retain (default 4)
 #   RELEASE_STATE_LOCK_FILE   host-local publisher lock
 #                             (default: /tmp/zakura-release-state-publish.lock)
@@ -99,6 +107,17 @@ list_remote_object() {
 # frontier grid, and resuming from that grid means this run scans only the blocks
 # above its last entry instead of the whole chain from genesis. The pointer height
 # is reused further down for the regression guard.
+# An explicit seed wins over the pointer: the operator is telling this run which
+# grid to extend, which is the whole point during a bootstrap.
+SEEDED_GRID=0
+if [ -n "${RELEASE_STATE_PREVIOUS_GRID:-}" ]; then
+    [ -r "$RELEASE_STATE_PREVIOUS_GRID" ] \
+        || { echo "RELEASE_STATE_PREVIOUS_GRID is not readable: ${RELEASE_STATE_PREVIOUS_GRID@Q}" >&2; exit 1; }
+    GRID_ARGS+=(--mainnet-frontier-grid-input "$RELEASE_STATE_PREVIOUS_GRID")
+    SEEDED_GRID=1
+    echo "resuming the frontier grid from seed ${RELEASE_STATE_PREVIOUS_GRID@Q}" >&2
+fi
+
 POINTER_LISTING=$(list_remote_object "$REMOTE_PREFIX/latest.json")
 POINTER_HEIGHT=
 if [ -n "$POINTER_LISTING" ]; then
@@ -110,7 +129,9 @@ if [ -n "$POINTER_LISTING" ]; then
     # resume from. That is not an error: the run falls back to a full walk, which
     # is what the first grid-bearing export has to do anyway.
     PREVIOUS_GRID="$REMOTE_PREFIX/v1/$POINTER_HEIGHT/mainnet-frontier-grid.bin"
-    if [ -n "$(list_remote_object "$PREVIOUS_GRID")" ]; then
+    if [ "$SEEDED_GRID" = 1 ]; then
+        : # already resuming from the seed
+    elif [ -n "$(list_remote_object "$PREVIOUS_GRID")" ]; then
         rclone copyto "$PREVIOUS_GRID" "$STAGE/previous-frontier-grid.bin"
         GRID_ARGS+=(--mainnet-frontier-grid-input "$STAGE/previous-frontier-grid.bin")
         echo "resuming the frontier grid from bundle v1/$POINTER_HEIGHT" >&2

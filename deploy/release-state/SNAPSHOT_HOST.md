@@ -36,9 +36,9 @@ construction rather than by coincidence:
 
 ```sh
 curl -sSL -o /tmp/pub.crate \
-  https://static.crates.io/crates/valargroup-zakura-assets/valargroup-zakura-assets-0.3453771.0.crate
+  https://static.crates.io/crates/zakura-assets/zakura-assets-0.3457371.0.crate
 tar xzOf /tmp/pub.crate \
-  valargroup-zakura-assets-0.3453771.0/src/mainnet-frontier-grid.bin \
+  zakura-assets-0.3457371.0/src/mainnet-frontier-grid.bin \
   > /opt/zakura-release-state/seed-frontier-grid.bin
 
 RELEASE_STATE_PREVIOUS_GRID=/opt/zakura-release-state/seed-frontier-grid.bin \

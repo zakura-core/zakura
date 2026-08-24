@@ -47,9 +47,11 @@ pub const MIN_PRUNING_RETENTION: u32 = 10_000;
 /// would leave the request path open when entries load but fail their root checks, and checking
 /// only the request path would let a node start on a grid it can never serve from.
 ///
-/// Sized to sit far above expected grid gaps and far below the absent band it must never replay.
-/// Generation is deliberately not bounded by it, and the grid-free `audit-historical-treestates`
-/// walk measures the whole band on purpose.
+/// Sized to sit far above a real grid's gaps and far below the absent band it must never replay.
+/// The published Mainnet grid's largest cold request is 1,333 blocks, so this leaves roughly 75x
+/// headroom, while the band itself is ~3.4M blocks. Generation is deliberately not bounded by it:
+/// `export-historical-treestates` replays between grid targets, and the grid-free
+/// `audit-historical-treestates` walk measures the whole band on purpose.
 ///
 /// Deliberately a constant rather than a setting. It bounds nothing an operator picks: the grid an
 /// operator does pick is what decides replay cost, and no value of this backstop makes a node with

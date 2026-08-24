@@ -148,11 +148,12 @@ pub struct Config {
 
     /// Optional path to a frontier artifact used to anchor historical tree derivation.
     ///
-    /// When unset, historical tree derivation remains idle and the absent band is reported as
-    /// unavailable. The artifact holds note commitment frontiers at a sparse height grid, so a
-    /// cold request replays from the nearest grid entry rather than from genesis. Every entry is
-    /// checked against the authenticated root this node already stores before it is used, so a
-    /// corrupt or hostile artifact is rejected rather than absorbed.
+    /// Mainnet's reviewed frontier grid is embedded in the binary, so the default `None` uses that
+    /// grid without deployment-time configuration. Setting a path overrides the embedded grid,
+    /// primarily for tests and custom networks. The artifact holds note commitment frontiers at a
+    /// sparse height grid, so a cold request replays from the nearest grid entry rather than from
+    /// genesis. Every entry is checked against the authenticated root this node already stores
+    /// before it is used, so a corrupt or hostile artifact is rejected rather than absorbed.
     ///
     /// Completed subtree roots need no equivalent setting: they ship embedded in the binary and
     /// are loaded without operator configuration.
@@ -320,7 +321,8 @@ impl Config {
     /// weigh: a derived frontier is served only when it reproduces the authenticated root this node
     /// already stores, so the answer is verified rather than trusted, and a node that can answer a
     /// treestate query correctly has no reason to refuse it. What an operator does choose is the
-    /// cost bound: derivation anchors on [`Self::historical_frontier_artifact`], and
+    /// cost bound: derivation anchors on the embedded Mainnet grid or the
+    /// [`Self::historical_frontier_artifact`] override, and
     /// [`crate::MAX_HISTORICAL_TREE_REPLAY_BLOCKS`] bounds it from both ends, refusing a grid whose
     /// gaps are too wide at startup and a request that would replay too far at serving time.
     pub fn derive_historical_trees(&self, database_was_vct_fast_synced: bool) -> bool {

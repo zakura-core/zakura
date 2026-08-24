@@ -17,6 +17,8 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
+import datetime
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,66 @@ class Fleet:
     name: str
     url: str
     dashboard_url: str
+
+
+@dataclass(frozen=True)
+class ReleaseState:
+    """One published release-state pointer to watch.
+
+    The generator is a single unmonitored host on a daily timer, and the artifact it
+    publishes is what every consumer actually reads. Watching the artifact rather than
+    the unit catches a timer that silently stopped firing, a host that vanished, and a
+    bundle that published successfully while missing a file — none of which a
+    systemd OnFailure would see.
+    """
+
+    name: str
+    url: str
+    stale_after: float
+    required_files: tuple[str, ...]
+
+
+def load_release_state(config_path: Path) -> list[ReleaseState]:
+    with config_path.open("rb") as config_file:
+        data = tomllib.load(config_file)
+
+    targets = []
+    seen = set()
+    for raw in data.get("release_state", []):
+        for required in ("name", "url"):
+            if required not in raw:
+                raise SystemExit(
+                    f"release_state missing required field '{required}': {raw}"
+                )
+
+        name = str(raw["name"])
+        if name in seen:
+            raise SystemExit(f"duplicate release_state name: {name}")
+        seen.add(name)
+
+        # Defaults match the importer: fetch-release-state.py rejects a bundle older
+        # than 48h, so alerting at the same threshold fires before the weekly import
+        # would refuse it rather than after.
+        targets.append(
+            ReleaseState(
+                name=name,
+                url=str(raw["url"]),
+                stale_after=float(raw.get("stale_after", 172800)),
+                required_files=tuple(
+                    raw.get(
+                        "required_files",
+                        [
+                            "main-checkpoints.txt",
+                            "mainnet-frontier.bin",
+                            "mainnet-treestate-subtrees.bin",
+                            "mainnet-frontier-grid.bin",
+                        ],
+                    )
+                ),
+            )
+        )
+
+    return targets
 
 
 def load_fleets(config_path: Path) -> list[Fleet]:
@@ -71,6 +133,7 @@ def load_state(state_path: Path) -> dict[str, Any]:
 
     state.setdefault("nodes", {})
     state.setdefault("fleets", {})
+    state.setdefault("release_state", {})
     return state
 
 
@@ -84,7 +147,17 @@ def save_state(state_path: Path, state: dict[str, Any]) -> None:
 
 
 def fetch_json(url: str, timeout: float) -> dict[str, Any]:
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    # A User-Agent is required, not cosmetic: the dashboard on loopback does not care,
+    # but the public release-state origin sits behind an edge that answers urllib's
+    # default agent with 403. Without this the release-state check reports
+    # "unreachable" forever instead of watching the artifact.
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "zakura-cluster-watchdog",
+        },
+    )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = response.read()
 
@@ -349,9 +422,78 @@ def fleet_recovery_text(fleet: Fleet, previous: dict[str, Any]) -> str:
     )
 
 
+def release_state_condition(
+    target: ReleaseState, pointer: dict[str, Any], meta: dict[str, Any], now: float
+) -> tuple[str, str]:
+    """Classify a published release state, returning (condition, detail).
+
+    Missing files are reported before staleness because a bundle can be perfectly
+    fresh and still useless: that is exactly what a generator exporting from the wrong
+    database produces, and no freshness check would notice.
+    """
+
+    # An unreadable file list is reported, never skipped. Treating it as a pass would
+    # make a pointer with no usable meta_url, or a meta fetch that half-failed, look
+    # exactly like a healthy bundle — the one outcome monitoring must never produce.
+    files = meta.get("files")
+    if not isinstance(files, dict):
+        return "unreadable", "meta.files is missing or not an object"
+
+    missing = [name for name in target.required_files if name not in files]
+    if missing:
+        return "incomplete", "missing " + ", ".join(sorted(missing))
+
+    generated_at = pointer.get("generated_at")
+    age = pointer_age_seconds(generated_at, now)
+    if age is None:
+        return "unreadable", f"unparsable generated_at: {generated_at!r}"
+    if age > target.stale_after:
+        return "stale", f"published {format_duration(age)} ago"
+
+    return "ok", ""
+
+
+def pointer_age_seconds(generated_at: Any, now: float) -> float | None:
+    if not isinstance(generated_at, str):
+        return None
+    try:
+        stamp = datetime.datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+    return now - stamp.timestamp()
+
+
+def release_state_alert_text(
+    target: ReleaseState, condition: str, detail: str, height: Any
+) -> str:
+    return (
+        f":rotating_light: *Zakura {target.name} release state* {condition}\n"
+        f"{detail}\n"
+        f"pointer: {target.url}\n"
+        f"height: {height}"
+    )
+
+
+def release_state_recovery_text(target: ReleaseState, previous: dict[str, Any]) -> str:
+    condition = previous.get("condition") or "unhealthy"
+    return (
+        f":white_check_mark: *Zakura {target.name} release state* recovered "
+        f"from {condition}\n"
+        f"pointer: {target.url}"
+    )
+
+
 class Watchdog:
-    def __init__(self, fleets: list[Fleet], args: argparse.Namespace):
+    def __init__(
+        self,
+        fleets: list[Fleet],
+        args: argparse.Namespace,
+        release_state: list[ReleaseState] | None = None,
+    ):
         self.fleets = fleets
+        self.release_state = release_state or []
         self.args = args
         self.started_at = time.time()
         self.fetch_recovered_at: dict[str, float] = {}
@@ -376,6 +518,55 @@ class Watchdog:
             for row in rows:
                 if isinstance(row, dict):
                     self.handle_node(state, fleet, row, now, suppressed)
+
+        for target in self.release_state:
+            self.handle_release_state(state, target, now, suppressed)
+
+    def handle_release_state(
+        self,
+        state: dict[str, Any],
+        target: ReleaseState,
+        now: float,
+        suppressed: bool,
+    ) -> None:
+        bucket = state.setdefault("release_state", {})
+        key = target.name
+        entry = bucket.get(key, {})
+        height: Any = entry.get("height")
+
+        try:
+            pointer = fetch_json(target.url, self.args.request_timeout)
+            meta_url = pointer.get("meta_url")
+            if not isinstance(meta_url, str):
+                raise ValueError(f"pointer has no meta_url: {target.url}")
+            meta = fetch_json(meta_url, self.args.request_timeout)
+            height = pointer.get("height", height)
+            condition, detail = release_state_condition(target, pointer, meta, now)
+        except Exception as error:
+            condition, detail = "unreachable", str(error)
+
+        bad_since = (
+            float(entry.get("bad_since", now))
+            if entry.get("condition") == condition and condition != "ok"
+            else now
+        )
+
+        # Threshold zero: a bundle that is already past its staleness window, or is
+        # missing a file, is not a transient blip to wait out. The window itself is
+        # the grace period.
+        update_alert_state(
+            bucket,
+            key,
+            condition,
+            bad_since,
+            0.0,
+            release_state_alert_text(target, condition, detail, height),
+            release_state_recovery_text(target, entry),
+            now,
+            suppressed,
+            self.args,
+        )
+        bucket.setdefault(key, {})["height"] = height
 
     def handle_fleet_error(
         self,
@@ -527,7 +718,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     fleets = load_fleets(args.config)
-    watchdog = Watchdog(fleets, args)
+    watchdog = Watchdog(fleets, args, load_release_state(args.config))
 
     while True:
         state = load_state(args.state_file)

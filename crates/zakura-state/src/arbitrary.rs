@@ -60,6 +60,7 @@ impl SemanticallyVerifiedBlock {
 impl ContextuallyVerifiedBlock {
     /// Create a block that's ready for non-finalized `Chain` contextual
     /// validation, using a [`SemanticallyVerifiedBlock`] and fake zero-valued spent UTXOs.
+    /// The helper assigns zero value to intra-block spends as well as chain spends.
     ///
     /// Only for use in tests.
     pub fn test_with_zero_spent_utxos(block: impl Into<SemanticallyVerifiedBlock>) -> Self {

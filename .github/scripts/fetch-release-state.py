@@ -37,10 +37,6 @@ FILE_LIMITS = {
     "main-checkpoints.txt": 4 * 1024 * 1024,
     "mainnet-frontier.bin": 1 * 1024 * 1024,
     "mainnet-treestate-subtrees.bin": 8 * 1024 * 1024,
-}
-# Produced by the archive publisher once generation lands; still optional here so existing
-# three-file bundles keep fetching until the import follow-up requires the grid.
-OPTIONAL_FILE_LIMITS = {
     # The cost-weighted grid measures ~3.3 MB on Mainnet. The cap leaves room for a
     # uniform-spacing run, which is larger, without accepting an unbounded download.
     "mainnet-frontier-grid.bin": 32 * 1024 * 1024,
@@ -217,6 +213,67 @@ def resolve_bundle(
     if meta_url != f"{prefix}v1/{height}/meta.json":
         raise BundleError("meta URL is not the expected immutable bundle path")
 
+    return _resolve_from_meta(
+        meta_url,
+        meta_sha256,
+        output_dir,
+        metadata_out,
+        fetch=fetch,
+        now=now,
+        max_age_hours=max_age_hours,
+        expected={
+            "height": height,
+            "block_hash": block_hash,
+            "generated_at": _string(latest["generated_at"], "latest.generated_at"),
+        },
+    )
+
+
+def resolve_pinned_bundle(
+    meta_url: str,
+    meta_sha256: str,
+    output_dir: Path,
+    metadata_out: Path,
+    *,
+    fetch: Callable[[str, int], bytes] = _download,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Resolve one specific immutable bundle by digest, ignoring the moving pointer.
+
+    The publish path needs the bundle a run already resolved rather than whatever `latest.json`
+    points at by the time it runs, so the bytes it uploads are derived independently from the same
+    immutable object. A third party reproducing a published artifact needs the same entry point,
+    starting from the `meta_sha256` the committed provenance manifest records.
+    """
+
+    _validate_url(meta_url, "meta URL")
+    if output_dir.exists():
+        raise BundleError(f"output directory already exists: {output_dir}")
+    return _resolve_from_meta(
+        meta_url,
+        _hex_digest(meta_sha256, "meta digest"),
+        output_dir,
+        metadata_out,
+        fetch=fetch,
+        now=now,
+        max_age_hours=None,
+        expected=None,
+    )
+
+
+def _resolve_from_meta(
+    meta_url: str,
+    meta_sha256: str,
+    output_dir: Path,
+    metadata_out: Path,
+    *,
+    fetch: Callable[[str, int], bytes],
+    now: datetime | None,
+    max_age_hours: int | None,
+    expected: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Download and verify one immutable bundle from its digest-pinned meta URL."""
+
     meta_bytes = fetch(meta_url, META_MAX_BYTES)
     if hashlib.sha256(meta_bytes).hexdigest() != meta_sha256:
         raise BundleError("meta digest does not match the latest pointer")
@@ -226,26 +283,33 @@ def resolve_bundle(
         raise BundleError("unsupported meta schema version")
     if meta["network"] != "Mainnet":
         raise BundleError("meta.network must be Mainnet")
-    if _integer(meta["height"], "meta.height") != height:
-        raise BundleError("latest pointer and meta identify different heights")
-    if _hex_digest(meta["block_hash"], "meta.block_hash") != block_hash:
-        raise BundleError("latest pointer and meta identify different blocks")
+    height = _integer(meta["height"], "meta.height")
+    block_hash = _hex_digest(meta["block_hash"], "meta.block_hash")
+    if expected is not None:
+        if height != expected["height"]:
+            raise BundleError("latest pointer and meta identify different heights")
+        if block_hash != expected["block_hash"]:
+            raise BundleError("latest pointer and meta identify different blocks")
+        if expected["generated_at"] != meta["generated_at"]:
+            raise BundleError("latest pointer and meta have different generation times")
+    # Checked against the meta's own height, so the immutable path shape holds whether the bundle
+    # was reached through the pointer or named directly by digest.
+    if not meta_url.endswith(f"/v1/{height}/meta.json"):
+        raise BundleError("meta URL is not the expected immutable bundle path")
 
     generated_at = _timestamp(meta["generated_at"], "meta.generated_at")
-    if _string(latest["generated_at"], "latest.generated_at") != meta["generated_at"]:
-        raise BundleError("latest pointer and meta have different generation times")
     now = now or datetime.now(timezone.utc)
     if generated_at > now + FUTURE_SKEW:
         raise BundleError("meta.generated_at is unexpectedly in the future")
-    if now - generated_at > timedelta(hours=max_age_hours):
+    # A caller that pinned a digest chose this bundle deliberately, and reproducing a published
+    # artifact means fetching an old one, so staleness is only an error on the pointer path.
+    if max_age_hours is not None and now - generated_at > timedelta(hours=max_age_hours):
         raise BundleError(f"release-state bundle is older than {max_age_hours} hours")
 
     files = _object(meta["files"], "meta.files")
-    _check_keys(files, set(FILE_LIMITS), set(OPTIONAL_FILE_LIMITS), "meta.files")
+    _check_keys(files, set(FILE_LIMITS), set(), "meta.files")
     validated: dict[str, dict[str, Any]] = {}
-    for name, max_size in {**FILE_LIMITS, **OPTIONAL_FILE_LIMITS}.items():
-        if name not in files:
-            continue
+    for name, max_size in FILE_LIMITS.items():
         entry = _object(files[name], f"meta.files.{name}")
         _check_keys(entry, {"size", "sha256"}, set(), f"meta.files.{name}")
         size = _integer(entry["size"], f"meta.files.{name}.size", maximum=max_size)
@@ -298,6 +362,7 @@ def _self_test() -> int:
     checkpoints = b"0 00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08\n"
     frontier = b"\x36\x3d\x33\x00frontier"
     subtrees = b"subtree roots"
+    frontier_grid = b"frontier grid"
     now = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
 
     def build(
@@ -305,16 +370,13 @@ def _self_test() -> int:
         meta_mutate: Callable[[dict[str, Any]], None] = lambda meta: None,
         latest_mutate: Callable[[dict[str, Any]], None] = lambda latest: None,
         file_overrides: dict[str, bytes] | None = None,
-        include_frontier_grid: bool = False,
     ) -> dict[str, bytes]:
-        frontier_grid = b"frontier grid"
         data_files = {
             "main-checkpoints.txt": checkpoints,
             "mainnet-frontier.bin": frontier,
             "mainnet-treestate-subtrees.bin": subtrees,
+            "mainnet-frontier-grid.bin": frontier_grid,
         }
-        if include_frontier_grid:
-            data_files["mainnet-frontier-grid.bin"] = frontier_grid
         meta = {
             "schema_version": 1,
             "network": "Mainnet",
@@ -348,9 +410,8 @@ def _self_test() -> int:
             f"{base}main-checkpoints.txt": checkpoints,
             f"{base}mainnet-frontier.bin": frontier,
             f"{base}mainnet-treestate-subtrees.bin": subtrees,
+            f"{base}mainnet-frontier-grid.bin": frontier_grid,
         }
-        if include_frontier_grid:
-            responses[f"{base}mainnet-frontier-grid.bin"] = frontier_grid
         responses.update(file_overrides or {})
         return responses
 
@@ -379,6 +440,79 @@ def _self_test() -> int:
             resolution = self.resolve(build())
             self.assertEqual(resolution["height"], 3415600)
 
+        def resolve_pinned(self, responses: dict[str, bytes], **kwargs: Any):
+            meta_url = kwargs.pop(
+                "meta_url", f"https://{host}/release-state/v1/3415600/meta.json"
+            )
+            digest = kwargs.pop(
+                "meta_sha256",
+                hashlib.sha256(responses[f"https://{host}/release-state/v1/3415600/meta.json"])
+                .hexdigest(),
+            )
+
+            def fake_fetch(fetch_url: str, max_bytes: int) -> bytes:
+                data = responses.get(fetch_url)
+                if data is None:
+                    raise BundleError(f"unexpected fetch of {fetch_url}")
+                if len(data) > max_bytes:
+                    raise BundleError(f"{fetch_url} exceeds its maximum allowed size")
+                return data
+
+            with tempfile.TemporaryDirectory() as scratch:
+                return resolve_pinned_bundle(
+                    meta_url,
+                    digest,
+                    Path(scratch) / "bundle",
+                    Path(scratch) / "resolution.json",
+                    fetch=fake_fetch,
+                    now=now,
+                    **kwargs,
+                )
+
+        def test_pinned_bundle_resolves_without_the_pointer(self):
+            responses = build()
+            # The pointer must not be consulted at all: fake_fetch raises on any URL it is not
+            # given, and latest.json is removed here to prove it is never requested.
+            del responses[latest_url]
+            resolution = self.resolve_pinned(responses)
+            self.assertEqual(resolution["height"], 3415600)
+            self.assertEqual(resolution["meta_sha256"], hashlib.sha256(
+                responses[f"https://{host}/release-state/v1/3415600/meta.json"]
+            ).hexdigest())
+
+        def test_pinned_bundle_rejects_a_wrong_meta_digest(self):
+            with self.assertRaisesRegex(BundleError, "meta digest does not match"):
+                self.resolve_pinned(build(), meta_sha256="cc" * 32)
+
+        def test_pinned_bundle_accepts_a_stale_bundle(self):
+            def age(meta: dict[str, Any]) -> None:
+                meta["generated_at"] = "2025-01-01T00:00:00Z"
+
+            # Reproducing a published artifact means fetching an old bundle on purpose, so the
+            # freshness rule that guards the pointer path must not apply here.
+            resolution = self.resolve_pinned(build(meta_mutate=age))
+            self.assertEqual(resolution["generated_at"], "2025-01-01T00:00:00Z")
+
+        def test_pinned_bundle_rejects_a_future_bundle(self):
+            def ahead(meta: dict[str, Any]) -> None:
+                meta["generated_at"] = "2027-01-01T00:00:00Z"
+
+            with self.assertRaisesRegex(BundleError, "unexpectedly in the future"):
+                self.resolve_pinned(build(meta_mutate=ahead))
+
+        def test_pinned_bundle_rejects_a_non_immutable_meta_path(self):
+            responses = build()
+            moved = f"https://{host}/release-state/meta.json"
+            responses[moved] = responses[f"https://{host}/release-state/v1/3415600/meta.json"]
+            with self.assertRaisesRegex(BundleError, "expected immutable bundle path"):
+                self.resolve_pinned(responses, meta_url=moved)
+
+        def test_pinned_bundle_rejects_a_disallowed_host(self):
+            with self.assertRaisesRegex(BundleError, "host"):
+                self.resolve_pinned(
+                    build(), meta_url="https://example.com/release-state/v1/3415600/meta.json"
+                )
+
         def test_subtree_artifact_is_downloaded(self):
             resolution = self.resolve(build())
             self.assertEqual(resolution["height"], 3415600)
@@ -390,44 +524,22 @@ def _self_test() -> int:
             with self.assertRaisesRegex(BundleError, "missing keys"):
                 self.resolve(build(meta_mutate=remove_subtrees))
 
-        def test_frontier_grid_is_optional(self):
-            resolution = self.resolve(build())
-            self.assertEqual(resolution["height"], 3415600)
+        def test_missing_frontier_grid_is_rejected(self):
+            def remove_grid(meta: dict[str, Any]) -> None:
+                del meta["files"]["mainnet-frontier-grid.bin"]
 
-        def test_frontier_grid_is_accepted_when_present(self):
-            with tempfile.TemporaryDirectory() as scratch:
-                responses = build(include_frontier_grid=True)
-
-                def fake_fetch(fetch_url: str, max_bytes: int) -> bytes:
-                    data = responses.get(fetch_url)
-                    if data is None:
-                        raise BundleError(f"unexpected fetch of {fetch_url}")
-                    if len(data) > max_bytes:
-                        raise BundleError(f"{fetch_url} exceeds its maximum allowed size")
-                    return data
-
-                resolution = resolve_bundle(
-                    latest_url,
-                    Path(scratch) / "bundle",
-                    Path(scratch) / "resolution.json",
-                    48,
-                    fetch=fake_fetch,
-                    now=now,
-                )
-                self.assertEqual(resolution["height"], 3415600)
-                self.assertEqual(
-                    (Path(scratch) / "bundle" / "mainnet-frontier-grid.bin").read_bytes(),
-                    b"frontier grid",
-                )
+            with self.assertRaisesRegex(BundleError, "missing keys"):
+                self.resolve(build(meta_mutate=remove_grid))
 
         def test_frontier_grid_digest_is_checked(self):
-            responses = build(include_frontier_grid=True)
-            tampered = b"frontier griD"
-            responses[
-                f"https://{host}/release-state/v1/3415600/mainnet-frontier-grid.bin"
-            ] = tampered
+            base = f"https://{host}/release-state/v1/3415600/"
+            # Same length as the fixture, so the digest check is what rejects it
+            # rather than the declared-size check running first.
+            tampered = bytes(frontier_grid[:-1]) + b"D"
             with self.assertRaisesRegex(BundleError, "digest does not match"):
-                self.resolve(responses)
+                self.resolve(
+                    build(file_overrides={f"{base}mainnet-frontier-grid.bin": tampered})
+                )
 
         def test_wrong_host_rejected(self):
             with self.assertRaisesRegex(BundleError, "host"):
@@ -520,7 +632,9 @@ def _self_test() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true", help="run the built-in tests")
-    parser.add_argument("--latest-url")
+    parser.add_argument("--latest-url", help="follow the moving pointer to the newest bundle")
+    parser.add_argument("--meta-url", help="resolve one immutable bundle, pinned by digest")
+    parser.add_argument("--meta-sha256", help="expected digest of --meta-url")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--metadata-out", type=Path)
     parser.add_argument("--max-age-hours", type=int, default=48)
@@ -528,16 +642,28 @@ def main() -> int:
 
     if args.self_test:
         return _self_test()
-    if not (args.latest_url and args.output_dir and args.metadata_out):
-        parser.error("--latest-url, --output-dir, and --metadata-out are required")
+    if not (args.output_dir and args.metadata_out):
+        parser.error("--output-dir and --metadata-out are required")
+    if bool(args.latest_url) == bool(args.meta_url):
+        parser.error("give exactly one of --latest-url or --meta-url")
+    if bool(args.meta_url) != bool(args.meta_sha256):
+        parser.error("--meta-url and --meta-sha256 must be given together")
 
     try:
-        resolution = resolve_bundle(
-            args.latest_url,
-            args.output_dir,
-            args.metadata_out,
-            args.max_age_hours,
-        )
+        if args.meta_url:
+            resolution = resolve_pinned_bundle(
+                args.meta_url,
+                args.meta_sha256,
+                args.output_dir,
+                args.metadata_out,
+            )
+        else:
+            resolution = resolve_bundle(
+                args.latest_url,
+                args.output_dir,
+                args.metadata_out,
+                args.max_age_hours,
+            )
     except BundleError as error:
         print(f"release-state fetch failed: {error}", file=sys.stderr)
         return 1

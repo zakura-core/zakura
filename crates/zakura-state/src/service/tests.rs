@@ -39,6 +39,31 @@ use crate::{
 const LAST_BLOCK_HEIGHT: u32 = 10;
 
 #[tokio::test]
+async fn state_init_loads_the_embedded_mainnet_frontier_grid() {
+    let network = Network::Mainnet;
+    let config = Config::ephemeral();
+    assert!(
+        config.derive_historical_trees(false),
+        "an ephemeral archive config derives, so this covers the deriving case"
+    );
+
+    assert!(
+        super::init(config.clone(), &network, Height::MAX, 0)
+            .await
+            .is_ok(),
+        "a deriving Mainnet node must start without a frontier grid path"
+    );
+
+    let loaded = super::load_historical_frontier_artifact(&network, &config, false)
+        .expect("the embedded Mainnet grid loads");
+    assert_eq!(
+        loaded.last_checkpoint,
+        Some(network.checkpoint_list().max_height()),
+        "the default grid covers the embedded checkpoint handoff"
+    );
+}
+
+#[tokio::test]
 async fn historical_frontier_load_errors_are_returned_from_state_init() {
     let network = Network::Mainnet;
     let temp_dir = tempfile::tempdir().expect("temporary directory is created");

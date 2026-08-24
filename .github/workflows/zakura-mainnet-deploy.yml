@@ -174,7 +174,8 @@ jobs:
             161.35.156.226 \
             139.59.64.115 \
             168.144.173.250 \
-            159.203.113.196; do
+            159.203.113.196 \
+            104.131.174.28; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -274,6 +275,26 @@ jobs:
           log_file   = ""
           rpc_listen_addr = "127.0.0.1:8232"
           state_cache_dir = "/mnt/data/import-zebra"
+
+          # Legacy archive node: `vct_fast_sync = false`, so it holds per-height
+          # commitment trees everywhere and never fast-synced. That is what makes it
+          # the supported generator for the release-state historical frontier grid —
+          # entries come from reads instead of replaying an absent band. Binary-only
+          # like the rest of the fleet, so its `vct_fast_sync = false` config is not
+          # rewritten by a deploy; that setting is the whole point of the node.
+          [[nodes]]
+          name       = "archive-vct-off"
+          ssh_string = "root@104.131.174.28"
+          commit     = "${REF}"
+          rpc_listen_addr = "127.0.0.1:8232"
+          log_file   = "/var/log/zakura/zakura.log"
+          # Metadata only under manage_config = false, but it records why this node
+          # differs. On `dual` its body tip wedged: the v2 coordinator logged
+          # `accepted block apply lost terminal observation; apply lifecycle is
+          # failed` and the header chain ran ~6,000 blocks ahead of the verified
+          # tip. Switching the node to `legacy` cleared it immediately. Do not flip
+          # this host to config-managed without carrying that setting across.
+          p2p_stack  = "legacy"
           EOF
 
       - name: Build deployer binary

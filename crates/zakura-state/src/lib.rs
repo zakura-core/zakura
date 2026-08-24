@@ -85,6 +85,10 @@ pub use service::{
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
 
+// Lets tests above this crate drive real RPC handlers over a fast-synced node's absent band.
+#[cfg(any(test, feature = "proptest-impl"))]
+pub use service::finalized_state::vct_fast_sync_fixture::{VctFastSyncedChain, VctFastSyncedNode};
+
 #[cfg(feature = "internal-bench")]
 pub use service::finalized_state::{
     benchmark_finality_witness, FinalityWitnessBenchmarkReport, FinalityWitnessBenchmarkSample,

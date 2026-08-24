@@ -3,10 +3,11 @@
 //! Two artifacts, with deliberately different trust stories (see
 //! `docs/design/verified-commitment-trees.md` §16):
 //!
-//! - The **frontier artifact** holds per-pool note commitment frontiers at a sparse height grid.
-//!   Every entry is checked against the authenticated root in `commitment_roots_by_height` before
-//!   use, so the artifact carries no trust weight: a corrupt or hostile one is rejected rather
-//!   than absorbed. That is what lets it be coarse, small, and distributed outside the binary.
+//! - The **frontier artifact** holds per-pool note commitment frontiers at a sparse height grid
+//!   from genesis through the last checkpoint. Every entry is checked against the authenticated
+//!   root in `commitment_roots_by_height` before use, so the artifact carries no trust weight: a
+//!   corrupt or hostile one is rejected rather than absorbed. The reviewed Mainnet artifact is
+//!   embedded in the binary.
 //! - The **subtree-root artifact** holds completed subtree roots. The final frontier pins all of
 //!   them through its ommers, so the embedded artifact is checked against the embedded frontier
 //!   before a read service can use it.
@@ -71,6 +72,14 @@ const FRONTIER_DIGEST_OFFSET: usize = 8 + 2 + 1 + 4 + 4 + 4;
 
 /// Reviewed completed-subtree roots shipped with the Mainnet last checkpoint.
 pub(super) const MAINNET_SUBTREES: &[u8] = include_bytes!("vct/mainnet-subtrees.bin");
+
+/// Reviewed historical frontier grid shipped with the Mainnet last checkpoint.
+///
+/// Published as a crates.io package rather than committed here: it is regenerated on every
+/// release-state refresh, and at ~2.1 MB per revision that is history the repository would carry
+/// forever. `Cargo.lock` pins the exact bytes, and `mainnet-vct-manifest.json` records the digest
+/// this checkpoint was reviewed with.
+const MAINNET_FRONTIER_GRID: &[u8] = zakura_assets::MAINNET_FRONTIER_GRID;
 
 /// The format version treestate artifacts are written at.
 const VERSION: u16 = 1;
@@ -1047,6 +1056,36 @@ impl SubtreeArtifact {
     }
 }
 
+/// Returns the historical frontier grid embedded for `network`, if supported.
+///
+/// Mainnet parses its embedded artifact once per process. Other networks have no published grid.
+pub(crate) fn embedded_historical_frontier_artifact(
+    network: &Network,
+) -> Option<Arc<FrontierArtifact>> {
+    match network {
+        Network::Mainnet => {
+            static MAINNET_ARTIFACT: OnceLock<Arc<FrontierArtifact>> = OnceLock::new();
+
+            Some(
+                MAINNET_ARTIFACT
+                    .get_or_init(|| {
+                        Arc::new(
+                            FrontierArtifact::decode(MAINNET_FRONTIER_GRID, network)
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "invalid embedded Mainnet historical frontier artifact: \
+                                         {error}"
+                                    )
+                                }),
+                        )
+                    })
+                    .clone(),
+            )
+        }
+        Network::Testnet(_) => None,
+    }
+}
+
 /// Returns subtree roots verified against `network`'s embedded final frontier.
 ///
 /// Mainnet verifies its embedded artifact once per process before any read service can use it.
@@ -1426,6 +1465,44 @@ mod tests {
         };
         assert_eq!(mid_chain.max_cold_replay_blocks_from(Height(2_000_000)), 99);
         assert_eq!(mid_chain.max_cold_replay_blocks(), 2_000_000);
+    }
+
+    /// Encoding a nested entry list is a byte prefix of encoding the longer list. The exporter
+    /// omits partial final cells so real successive exports produce nested lists; this test is
+    /// the encoder half of that append-only contract.
+    #[test]
+    fn frontier_encoding_is_prefix_compatible_across_tips() {
+        let later = sample_frontiers();
+        let earlier = FrontierArtifact {
+            spacing: later.spacing,
+            last_checkpoint: later.last_checkpoint,
+            entries: later.entries[..later.entries.len() - 1].to_vec(),
+        };
+
+        let earlier_bytes = earlier.encode(&Network::Mainnet);
+        let later_bytes = later.encode(&Network::Mainnet);
+
+        // The headers differ (the record count changed), so the append contract holds over the
+        // payload, which is where the entries live.
+        assert_eq!(
+            later_bytes[FRONTIER_HEADER_LEN..][..earlier_bytes.len() - FRONTIER_HEADER_LEN],
+            earlier_bytes[FRONTIER_HEADER_LEN..],
+            "a later export must extend the earlier payload, not rewrite it"
+        );
+    }
+
+    #[test]
+    fn embedded_mainnet_frontier_grid_respects_replay_limit() {
+        let artifact = embedded_historical_frontier_artifact(&Network::Mainnet)
+            .expect("Mainnet has an embedded historical frontier artifact");
+        let max_gap = artifact.max_cold_replay_blocks();
+        let limit = crate::MAX_HISTORICAL_TREE_REPLAY_BLOCKS;
+
+        assert!(
+            max_gap <= limit,
+            "embedded Mainnet historical frontier artifact requires replaying {max_gap} blocks, \
+             exceeding the {limit}-block limit"
+        );
     }
 
     fn sample_subtrees() -> SubtreeArtifact {

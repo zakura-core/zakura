@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tower::ServiceExt;
 use zakura_chain::{
+    amount::NonNegative,
     block::{Block, Height},
     ironwood, orchard,
     parameters::{Network, Network::*},
@@ -13,6 +14,7 @@ use zakura_chain::{
         TRACKED_SUBTREE_HEIGHT,
     },
     transaction,
+    value_balance::ValueBalance,
 };
 
 use zakura_test::{
@@ -21,24 +23,27 @@ use zakura_test::{
 };
 
 use crate::{
+    arbitrary::Prepare,
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     init_test_services, populated_state,
     response::MinedTx,
     service::{
         finalized_state::{
-            embedded_last_checkpoint_leaf_counts, DiskWriteBatch, SubtreeArtifact, SubtreeRecord,
-            ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE,
+            embedded_last_checkpoint_leaf_counts, DiskWriteBatch, FinalizedState, SubtreeArtifact,
+            SubtreeRecord, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE,
         },
-        non_finalized_state::Chain,
+        non_finalized_state::{Chain, NonFinalizedState},
         read::{
-            contiguous_subtrees_from, ironwood_subtrees, merge_published_subtrees,
+            chain_tips, contiguous_subtrees_from, ironwood_subtrees, merge_published_subtrees,
             orchard_subtrees, retain_subtrees_completed_at_or_below, sapling_subtrees,
             tree::{
                 first_missing_subtree_index, is_syncing_below_last_checkpoint,
                 sapling_subtrees_with_gaps, subtree_completed_by_last_checkpoint,
             },
+            ChainTipInfo, ChainTipStatus,
         },
     },
+    tests::FakeChainHelper,
     Config, HistoricalSubtreeUnavailable, HistoricalSubtreeUnavailableReason, ReadRequest,
     ReadResponse,
 };
@@ -1534,4 +1539,254 @@ async fn older_fast_sync_marker_uses_newer_artifact_only_for_skipped_history() {
         Err(_) => {}
         Ok(other) => panic!("unexpected response for a post-H1 hole: {other:?}"),
     }
+}
+
+/// Builds an empty non-finalized state and an ephemeral finalized state, ready to
+/// accept fake blocks.
+fn new_chain_tips_test_state(network: &Network) -> (NonFinalizedState, FinalizedState) {
+    let state = NonFinalizedState::new(network);
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), network)
+        .expect("opening an ephemeral finalized state succeeds");
+    finalized_state.set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
+
+    (state, finalized_state)
+}
+
+/// A node with no blocks at all has no tips to report.
+#[test]
+fn chain_tips_are_empty_without_blocks() {
+    let _init_guard = zakura_test::init();
+
+    let (state, finalized_state) = new_chain_tips_test_state(&Mainnet);
+
+    let tips = chain_tips(&state, &finalized_state.db, None);
+
+    assert!(
+        tips.is_empty(),
+        "a node with no blocks should report no chain tips, got {tips:?}"
+    );
+}
+
+/// A node with a single chain reports exactly one tip, and it is the active one.
+#[test]
+fn chain_tips_report_a_single_active_tip() {
+    let _init_guard = zakura_test::init();
+
+    let block1: Arc<Block> = Arc::new(Mainnet.test_block(653599, 583999).unwrap());
+    let block2 = block1.make_fake_child().set_work(10);
+
+    let (mut state, finalized_state) = new_chain_tips_test_state(&Mainnet);
+    state
+        .commit_new_chain(block1.prepare(), &finalized_state)
+        .expect("fake root block should commit to an empty non-finalized state");
+    state
+        .commit_block(block2.clone().prepare(), &finalized_state)
+        .expect("child block should extend the root chain");
+
+    let tips = chain_tips(&state, &finalized_state.db, None);
+
+    assert_eq!(
+        tips,
+        vec![ChainTipInfo {
+            height: block2.coinbase_height().unwrap(),
+            hash: block2.hash(),
+            branch_len: 0,
+            status: ChainTipStatus::Active,
+        }],
+        "a single chain should report only its own tip, as active"
+    );
+}
+
+/// A fork is reported alongside the active tip, with the branch length measured from
+/// the block it shares with the best chain.
+#[test]
+fn chain_tips_report_forks_with_branch_lengths() {
+    let _init_guard = zakura_test::init();
+
+    let block1: Arc<Block> = Arc::new(Mainnet.test_block(653599, 583999).unwrap());
+    // The best chain has more cumulative work, so it wins the fork.
+    let block2a = block1.make_fake_child().set_work(10);
+    let block3a = block2a.make_fake_child().set_work(20);
+    let block2b = block1.make_fake_child().set_work(11);
+
+    let (mut state, finalized_state) = new_chain_tips_test_state(&Mainnet);
+    state
+        .commit_new_chain(block1.clone().prepare(), &finalized_state)
+        .expect("fake root block should commit to an empty non-finalized state");
+    state
+        .commit_block(block2a.prepare(), &finalized_state)
+        .expect("best chain should extend the root chain");
+    state
+        .commit_block(block3a.clone().prepare(), &finalized_state)
+        .expect("best chain tip should extend the best chain");
+    state
+        .commit_block(block2b.clone().prepare(), &finalized_state)
+        .expect("fork tip should fork from the root chain");
+
+    let tips = chain_tips(&state, &finalized_state.db, None);
+
+    assert_eq!(
+        tips,
+        vec![
+            ChainTipInfo {
+                height: block3a.coinbase_height().unwrap(),
+                hash: block3a.hash(),
+                branch_len: 0,
+                status: ChainTipStatus::Active,
+            },
+            // block2b forks from block1, one block below its own tip.
+            ChainTipInfo {
+                height: block2b.coinbase_height().unwrap(),
+                hash: block2b.hash(),
+                branch_len: 1,
+                status: ChainTipStatus::ValidFork,
+            },
+        ],
+        "the fork should be reported below the active tip, with its branch length"
+    );
+}
+
+/// An invalidated branch is reported with its own tip and `invalid` status, and the
+/// shortened chain that invalidation leaves behind is not reported as a tip, because
+/// its tip block is still inside the best chain.
+#[test]
+fn chain_tips_report_invalidated_branches() {
+    let _init_guard = zakura_test::init();
+
+    let block1: Arc<Block> = Arc::new(Mainnet.test_block(653599, 583999).unwrap());
+    let block2a = block1.make_fake_child().set_work(10);
+    let block3a = block2a.make_fake_child().set_work(20);
+    let block2b = block1.make_fake_child().set_work(11);
+
+    let (mut state, finalized_state) = new_chain_tips_test_state(&Mainnet);
+    state
+        .commit_new_chain(block1.clone().prepare(), &finalized_state)
+        .expect("fake root block should commit to an empty non-finalized state");
+    state
+        .commit_block(block2a.clone().prepare(), &finalized_state)
+        .expect("best chain should extend the root chain");
+    state
+        .commit_block(block3a.clone().prepare(), &finalized_state)
+        .expect("best chain tip should extend the best chain");
+    state
+        .commit_block(block2b.clone().prepare(), &finalized_state)
+        .expect("fork tip should fork from the root chain");
+
+    state
+        .invalidate_block(block2a.hash())
+        .expect("invalidating a non-root block should succeed");
+
+    let tips = chain_tips(&state, &finalized_state.db, None);
+
+    assert_eq!(
+        tips,
+        vec![
+            // Tips are ordered by descending height, as in zcashd, so the invalidated
+            // branch comes before the lower active tip. The branch is block2a..block3a,
+            // forked from block1.
+            ChainTipInfo {
+                height: block3a.coinbase_height().unwrap(),
+                hash: block3a.hash(),
+                branch_len: 2,
+                status: ChainTipStatus::Invalid,
+            },
+            // block2b is the best chain now that block2a's branch is invalidated.
+            ChainTipInfo {
+                height: block2b.coinbase_height().unwrap(),
+                hash: block2b.hash(),
+                branch_len: 0,
+                status: ChainTipStatus::Active,
+            },
+        ],
+        "the invalidated branch should be reported, and the shortened chain left \
+         behind should not be, because block1 is still inside the best chain"
+    );
+}
+
+/// A header chain that is ahead of the block tip is reported as `headers-only`.
+#[test]
+fn chain_tips_report_a_header_tip_above_the_block_tip() {
+    let _init_guard = zakura_test::init();
+
+    let block1: Arc<Block> = Arc::new(Mainnet.test_block(653599, 583999).unwrap());
+    let block2 = block1.make_fake_child().set_work(10);
+    // A header the node has validated but whose block body it does not have yet.
+    let header3 = block2.make_fake_child().set_work(20);
+
+    let (mut state, finalized_state) = new_chain_tips_test_state(&Mainnet);
+    state
+        .commit_new_chain(block1.prepare(), &finalized_state)
+        .expect("fake root block should commit to an empty non-finalized state");
+    state
+        .commit_block(block2.clone().prepare(), &finalized_state)
+        .expect("child block should extend the root chain");
+
+    let header_tip = (header3.coinbase_height().unwrap(), header3.hash());
+    let tips = chain_tips(&state, &finalized_state.db, Some(header_tip));
+
+    assert_eq!(
+        tips,
+        vec![
+            ChainTipInfo {
+                height: header3.coinbase_height().unwrap(),
+                hash: header3.hash(),
+                branch_len: 1,
+                status: ChainTipStatus::HeadersOnly,
+            },
+            ChainTipInfo {
+                height: block2.coinbase_height().unwrap(),
+                hash: block2.hash(),
+                branch_len: 0,
+                status: ChainTipStatus::Active,
+            },
+        ],
+        "a header tip above the block tip should be reported as headers-only"
+    );
+}
+
+/// A header tip that is not above the block tip is not reported: those blocks are
+/// already available, so there is no headers-only tip.
+#[test]
+fn chain_tips_ignore_a_header_tip_at_or_below_the_block_tip() {
+    let _init_guard = zakura_test::init();
+
+    let block1: Arc<Block> = Arc::new(Mainnet.test_block(653599, 583999).unwrap());
+    let block2 = block1.make_fake_child().set_work(10);
+
+    let (mut state, finalized_state) = new_chain_tips_test_state(&Mainnet);
+    state
+        .commit_new_chain(block1.clone().prepare(), &finalized_state)
+        .expect("fake root block should commit to an empty non-finalized state");
+    state
+        .commit_block(block2.clone().prepare(), &finalized_state)
+        .expect("child block should extend the root chain");
+
+    // The header chain has selected the same tip as the block chain.
+    let at_tip = chain_tips(
+        &state,
+        &finalized_state.db,
+        Some((block2.coinbase_height().unwrap(), block2.hash())),
+    );
+    // The header chain is behind the block chain.
+    let below_tip = chain_tips(
+        &state,
+        &finalized_state.db,
+        Some((block1.coinbase_height().unwrap(), block1.hash())),
+    );
+
+    let expected = vec![ChainTipInfo {
+        height: block2.coinbase_height().unwrap(),
+        hash: block2.hash(),
+        branch_len: 0,
+        status: ChainTipStatus::Active,
+    }];
+
+    assert_eq!(
+        at_tip, expected,
+        "a header tip level with the block tip should not add a headers-only tip"
+    );
+    assert_eq!(
+        below_tip, expected,
+        "a header tip below the block tip should not add a headers-only tip"
+    );
 }

@@ -1861,6 +1861,18 @@ pub enum ReadRequest {
     /// with the current best chain tip block size in bytes.
     TipBlockSize,
 
+    /// Returns [`ReadResponse::ChainTips(Vec<ChainTipInfo>)`](ReadResponse::ChainTips)
+    /// with the tip of every chain this node currently tracks, in descending
+    /// height order.
+    ///
+    /// This covers the best chain, the non-finalized forks, recently invalidated
+    /// branches, and the header chain when headers-first sync is ahead of the block
+    /// tip. Its cost is bounded by the number of tracked forks, not by the height of
+    /// the chain.
+    ///
+    /// Used by the `getchaintips` RPC.
+    ChainTips,
+
     /// Returns [`ReadResponse::NonFinalizedBlocksListener`] with a channel receiver
     /// allowing the caller to listen for new blocks in the non-finalized state.
     NonFinalizedBlocksListener {
@@ -1935,6 +1947,7 @@ impl ReadRequest {
             ReadRequest::SolutionRate { .. } => "solution_rate",
             ReadRequest::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
             ReadRequest::TipBlockSize => "tip_block_size",
+            ReadRequest::ChainTips => "chain_tips",
             ReadRequest::NonFinalizedBlocksListener { .. } => "non_finalized_blocks_listener",
             ReadRequest::IsTransparentOutputSpent(_) => "is_transparent_output_spent",
         }

@@ -288,6 +288,13 @@ jobs:
           commit     = "${REF}"
           rpc_listen_addr = "127.0.0.1:8232"
           log_file   = "/var/log/zakura/zakura.log"
+          # Metadata only under manage_config = false, but it records why this node
+          # differs. On `dual` its body tip wedged: the v2 coordinator logged
+          # `accepted block apply lost terminal observation; apply lifecycle is
+          # failed` and the header chain ran ~6,000 blocks ahead of the verified
+          # tip. Switching the node to `legacy` cleared it immediately. Do not flip
+          # this host to config-managed without carrying that setting across.
+          p2p_stack  = "legacy"
           EOF
 
       - name: Build deployer binary

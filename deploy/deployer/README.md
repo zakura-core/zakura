@@ -213,7 +213,13 @@ so it never fast-synced and holds per-height commitment trees at every height.
 That is what makes it the supported generator for the release-state historical
 frontier grid, whose entries then come from reads rather than from replaying a
 fast-synced node's absent band. It is not a public bootstrap peer and is
-deliberately absent from the node ids in `zakura-network`.
+deliberately absent from the node ids in `zakura-network`, and it runs
+`p2p_stack = "legacy"` rather than the fleet's `dual`: on `dual` its verified body
+tip wedged roughly 6,000 blocks behind its own header chain while the v2
+coordinator logged `accepted block apply lost terminal observation; apply
+lifecycle is failed`. The fleet is binary-only, so that setting lives in the
+node's own config; flipping this host to config-managed without carrying it
+across would silently reintroduce the stall.
 
 One fleet entry buys three things, because the dashboard and the alerting both
 derive from the same config. `zakura-mainnet-deploy.yml` copies the generated

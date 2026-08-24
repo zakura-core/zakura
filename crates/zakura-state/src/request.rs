@@ -30,7 +30,7 @@ use zakura_chain::{
     sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
     transaction::{self, UnminedTx},
-    transparent::{self, utxos_from_ordered_utxos},
+    transparent,
     value_balance::{ValueBalance, ValueBalanceError},
 };
 
@@ -115,6 +115,13 @@ impl BlockAdmission {
     }
 
     /// Waits until state admits or rejects the block.
+    ///
+    /// # Correctness
+    ///
+    /// This future never resolves when neither `admit` nor `reject` runs. The state rejects
+    /// duplicates, queue replacements, and expired blocks, but a verifier error before the state
+    /// receives the block leaves the admission pending. Callers must await this future under a
+    /// cancellation path, such as a `select!` arm that also awaits verification.
     pub async fn wait(&self) -> bool {
         loop {
             let notified = self.0.changed.notified();
@@ -628,15 +635,19 @@ impl ContextuallyVerifiedBlock {
     /// Create a block that's ready for non-finalized `Chain` contextual validation,
     /// using a [`SemanticallyVerifiedBlock`] and the UTXOs it spends.
     ///
-    /// When combined, `semantically_verified.new_outputs` and `spent_utxos` must contain
-    /// the [`Utxo`](transparent::Utxo)s spent by every transparent input in this block,
-    /// including UTXOs created by earlier transactions in this block.
+    /// `spent_outputs` must contain the [`Utxo`](transparent::Utxo) spent by
+    /// every transparent input in this block. This includes UTXOs created by
+    /// earlier transactions in the same block.
     ///
     /// Note: a [`ContextuallyVerifiedBlock`] isn't actually contextually valid until
     /// [`Chain::push()`](crate::service::non_finalized_state::Chain::push) returns success.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if `spent_outputs` omits a transparent input's UTXO.
     pub fn with_block_and_spent_utxos(
         semantically_verified: SemanticallyVerifiedBlock,
-        mut spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+        spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     ) -> Result<Self, ValueBalanceError> {
         let SemanticallyVerifiedBlock {
             block,
@@ -648,23 +659,19 @@ impl ContextuallyVerifiedBlock {
             auth_data_root: _,
         } = semantically_verified;
 
-        // This is redundant for the non-finalized state,
-        // but useful to make some tests pass more easily.
-        //
-        // TODO: fix the tests, and stop adding unrelated outputs.
-        spent_outputs.extend(new_outputs.clone());
+        let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
+            &spent_outputs,
+            deferred_pool_balance_change,
+        )?;
 
         Ok(Self {
-            block: block.clone(),
+            block,
             hash,
             height,
             new_outputs,
-            spent_outputs: spent_outputs.clone(),
+            spent_outputs,
             transaction_hashes,
-            chain_value_pool_change: block.chain_value_pool_change(
-                &utxos_from_ordered_utxos(spent_outputs),
-                deferred_pool_balance_change,
-            )?,
+            chain_value_pool_change,
         })
     }
 }

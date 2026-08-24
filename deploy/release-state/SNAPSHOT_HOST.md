@@ -1,5 +1,64 @@
 # Production release-state publisher host
 
+## Host profiles
+
+The publisher runs on exactly one machine, but which machine is a deployment choice.
+`deploy-snapshot-host.sh` selects it with `RELEASE_STATE_HOST_PROFILE`:
+
+| Profile | Host | Node | Grid generation |
+| --- | --- | --- | --- |
+| `snapshot` (default) | `zakura-snapshot` | `zakura` container, docker | replays the absent band — hours |
+| `archive` | `roman-zakura-archive-vct-off` | `zakurad.service`, no docker | reads stored trees — ~81 min measured |
+
+The `archive` profile is the supported generator. That node runs
+`vct_fast_sync = false`, so it holds per-height commitment trees everywhere and the
+grid comes from reads rather than replay, and it shares its host with no snapshot
+job. The rest of this document describes the `snapshot` profile, which remains
+supported; the differences are that the archive host has no containers to check, no
+snapshot units to defer to, and supplies R2 credentials from its EnvironmentFile
+rather than through a secrets wrapper.
+
+The installer stamps the profile into `/opt/zakura-release-state/profile.env`, which
+the publisher reads, so the host identity and liveness checks describe the host they
+actually run on.
+
+### Seeding the first grid
+
+A generator whose pointer bundle predates the frontier grid has nothing to resume
+from, so its first export walks from genesis — the ~81 minute case. Worse, the
+importer requires each bundle's grid to be a byte prefix-extension of the one the
+repository currently pins, and a fresh walk only reproduces that if the cost model,
+the exporter, and the chain data all agree exactly.
+
+Seeding removes both problems. Carried entries are re-checked against this
+database's authenticated roots and then written verbatim, so the prefix matches by
+construction rather than by coincidence:
+
+```sh
+curl -sSL -o /tmp/pub.crate \
+  https://static.crates.io/crates/valargroup-zakura-assets/valargroup-zakura-assets-0.3453771.0.crate
+tar xzOf /tmp/pub.crate \
+  valargroup-zakura-assets-0.3453771.0/src/mainnet-frontier-grid.bin \
+  > /opt/zakura-release-state/seed-frontier-grid.bin
+
+RELEASE_STATE_PREVIOUS_GRID=/opt/zakura-release-state/seed-frontier-grid.bin \
+  systemctl start zakura-release-state.service
+```
+
+Use the version the workspace `Cargo.toml` pins, since that is the grid the importer
+will compare against. Only the first run needs it; afterwards the published bundle
+carries a grid and the pointer path resumes on its own.
+
+### R2 credentials
+
+The unit no longer bakes a secrets wrapper into `ExecStart`. Either mechanism works,
+chosen in `/etc/zakura-release-state.env`:
+
+- set `RELEASE_STATE_SECRETS_WRAPPER=/usr/local/bin/with-secrets.sh` and the
+  publisher re-execs through it, as the snapshot host does today; or
+- set `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` directly, for a host with no
+  secrets manager.
+
 ## Purpose and topology
 
 The production release-state publisher generates a trusted, coupled Mainnet checkpoint list, VCT
@@ -31,11 +90,18 @@ archive node — one that never fast-synced — has per-height trees everywhere,
 read and no note commitment is ever re-appended. A fast-synced archive node has to replay its
 absent band instead, which is hours on Mainnet.
 
-Neither is quick. The default cost-weighted spacing decides where entries go by scanning every
-block body from genesis for its commitment counts, so both kinds of node read the whole chain
-once per run; the legacy node just skips the append work on top. `TimeoutStartSec=6h` on the unit
-covers the slower case. Measure one run before trusting the daily schedule, and consider
-`RELEASE_STATE_GRID_COST_MS` or a longer `OnCalendar` interval if it does not comfortably fit.
+The **first** run is the expensive one. With no previously published grid to resume from, the
+cost-weighted spacing decides where entries go by scanning every block body from genesis for its
+commitment counts, so both kinds of node read the whole chain once; the legacy node just skips
+the append work on top. `TimeoutStartSec=6h` on the unit covers the slower case.
+
+Routine runs are incremental. The publisher passes the previous bundle's grid as
+`--mainnet-frontier-grid-input`, so the walk restarts at the last carried entry plus one and
+scans only the blocks above it. Carried entries are re-checked against this database's own
+authenticated roots rather than recomputed from bodies, which is what keeps resuming trust-free
+without paying for the chain again. Measure the first run before trusting the schedule, and
+consider `RELEASE_STATE_GRID_COST_MS` or a longer `OnCalendar` interval only if that run does not
+comfortably fit.
 
 The existing automation remains in place and is untouched by this publisher:
 
@@ -138,9 +204,10 @@ In `zakura-core/zakura`:
   gate, frontier and Sprout tests, a strict diff allowlist, then mints a
   short-lived GitHub App token and opens a signed draft
   `adam/update-release-state` PR.
-- `.github/workflows/tests-unit.yml` includes the checkpoint, frontier, and
-  provenance paths, so generated update PRs run Unit Tests. A follow-up adds the
-  frontier-grid path once the binary is committed.
+- `.github/workflows/tests-unit.yml` includes the checkpoint, frontier, grid, and
+  provenance paths, so generated update PRs run Unit Tests.
+- `.github/workflows/history-growth.yml` raises its packed-growth allowance for a change
+  confined to the release-state files, because the committed frontier grid is a few megabytes.
 - `.github/workflows/create-release.yml` and `scripts/make/release.mk` validate only
   committed release state before creating a tag.
 - `scripts/check-release-state.sh` is the non-Cargo release gate and rejects

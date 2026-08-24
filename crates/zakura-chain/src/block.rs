@@ -290,6 +290,39 @@ impl Block {
         utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
     ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
+        self.chain_value_pool_change_from_utxos(deferred_pool_balance_change, |transaction| {
+            transaction.value_balance(utxos)
+        })
+    }
+
+    /// Returns the overall chain value pool change using borrowed ordered UTXOs.
+    ///
+    /// The given `utxos` must contain the [`transparent::OrderedUtxo`]s of every
+    /// input in this block. This includes UTXOs created by earlier transactions
+    /// in the same block. The map can also contain unrelated UTXOs, which this
+    /// method ignores.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if `utxos` omits a transparent input's UTXO.
+    pub fn chain_value_pool_change_from_ordered_utxos(
+        &self,
+        utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
+        self.chain_value_pool_change_from_utxos(deferred_pool_balance_change, |transaction| {
+            transaction.value_balance_from_ordered_utxos(utxos)
+        })
+    }
+
+    fn chain_value_pool_change_from_utxos<F>(
+        &self,
+        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+        mut transaction_value_balance: F,
+    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError>
+    where
+        F: FnMut(&Transaction) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError>,
+    {
         // `Result<T, E>` implements `IntoIterator`, so a `flat_map(|t| t.value_balance(utxos))`
         // would silently drop transactions whose value balance returns `Err`. Use `try_fold`
         // to propagate the first error instead.
@@ -297,7 +330,7 @@ impl Block {
             .transactions
             .iter()
             .try_fold(ValueBalance::<NegativeAllowed>::zero(), |acc, tx| {
-                acc + tx.value_balance(utxos)?
+                acc + transaction_value_balance(tx)?
             })?;
 
         Ok(*tx_pool_sum.neg().set_deferred_amount(

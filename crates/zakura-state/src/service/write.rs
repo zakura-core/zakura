@@ -45,7 +45,7 @@ use crate::{
             DiskWriteBatch, FinalizedState, VctAuthenticationProof, VctAuxiliaryFailureAttribution,
             VctAuxiliaryWindow, VctSuccessorWitness, ZakuraDb,
         },
-        non_finalized_state::NonFinalizedState,
+        non_finalized_state::{ContextualMetrics, NonFinalizedState},
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
@@ -1260,16 +1260,6 @@ fn commit_operator_change(
 /// We allow enough space for multiple concurrent chain forks with errors.
 const REJECTED_ANCESTOR_MAP_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
 
-macro_rules! record_contextual_duration {
-    ($metric_name:literal, $mined_metric_name:literal, $duration:expr, $is_mined:expr $(,)?) => {{
-        let duration = $duration.as_secs_f64();
-        metrics::histogram!($metric_name).record(duration);
-        if $is_mined {
-            metrics::histogram!($mined_metric_name).record(duration);
-        }
-    }};
-}
-
 /// Run contextual validation on the prepared block and add it to the
 /// non-finalized state if it is contextually valid.
 pub(crate) fn validate_and_commit_non_finalized(
@@ -1281,7 +1271,7 @@ pub(crate) fn validate_and_commit_non_finalized(
         finalized_state,
         non_finalized_state,
         prepared,
-        false,
+        ContextualMetrics::Disabled,
     )
 }
 
@@ -1299,32 +1289,38 @@ fn validate_and_commit_non_finalized_with_metrics(
     finalized_state: &ZakuraDb,
     non_finalized_state: &mut NonFinalizedState,
     prepared: SemanticallyVerifiedBlock,
-    is_mined: bool,
+    contextual_metrics: ContextualMetrics,
 ) -> Result<(), ValidateContextError> {
     let total_start = Instant::now();
     let initial_checks_start = Instant::now();
     let initial_checks =
         check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared);
-    record_contextual_duration!(
+    contextual_metrics.record_duration(
         "state.contextual.initial_checks.duration_seconds",
         "state.contextual.mined.initial_checks.duration_seconds",
         initial_checks_start.elapsed(),
-        is_mined,
     );
     let result = initial_checks.and_then(|()| {
         let parent_hash = prepared.block.header.previous_block_hash;
 
         if finalized_state.finalized_tip_hash() == parent_hash {
-            non_finalized_state.commit_new_chain_with_metrics(prepared, finalized_state, is_mined)
+            non_finalized_state.commit_new_chain_with_metrics(
+                prepared,
+                finalized_state,
+                contextual_metrics,
+            )
         } else {
-            non_finalized_state.commit_block_with_metrics(prepared, finalized_state, is_mined)
+            non_finalized_state.commit_block_with_metrics(
+                prepared,
+                finalized_state,
+                contextual_metrics,
+            )
         }
     });
-    record_contextual_duration!(
+    contextual_metrics.record_duration(
         "state.contextual.total.duration_seconds",
         "state.contextual.mined.total.duration_seconds",
         total_start.elapsed(),
-        is_mined,
     );
 
     result
@@ -2561,6 +2557,7 @@ impl WriteBlockWorkerTask {
             metrics::histogram!("state.block_writer.queue.duration_seconds")
                 .record(writer_queue_duration);
             let is_mined = admission.is_some();
+            let contextual_metrics = ContextualMetrics::for_commit(is_mined);
             if is_mined {
                 metrics::histogram!("state.block_writer.queue.mined.duration_seconds")
                     .record(writer_queue_duration);
@@ -2583,17 +2580,16 @@ impl WriteBlockWorkerTask {
                     if let Some(writer) = header_chain.as_ref() {
                         let snapshot_clone_start = Instant::now();
                         let mut staged = non_finalized_state.clone();
-                        record_contextual_duration!(
+                        contextual_metrics.record_duration(
                             "state.contextual.snapshot_clone.duration_seconds",
                             "state.contextual.mined.snapshot_clone.duration_seconds",
                             snapshot_clone_start.elapsed(),
-                            is_mined,
                         );
                         validate_and_commit_non_finalized_with_metrics(
                             &finalized_state.db,
                             &mut staged,
                             queued_child,
-                            is_mined,
+                            contextual_metrics,
                         )
                         .map_err(|error| CommitBlockError::from(Box::new(error)))
                         .and_then(|()| {
@@ -2624,11 +2620,10 @@ impl WriteBlockWorkerTask {
                                             }
                                         })
                                     });
-                            record_contextual_duration!(
+                            contextual_metrics.record_duration(
                                 "state.contextual.header_transition_prepare.duration_seconds",
                                 "state.contextual.mined.header_transition_prepare.duration_seconds",
                                 transition_prepare_start.elapsed(),
-                                is_mined,
                             );
                             let transition = transition?;
 
@@ -2639,11 +2634,10 @@ impl WriteBlockWorkerTask {
                                 .map_err(|error| CommitBlockError::HeaderChainError {
                                     error: error.to_string(),
                                 });
-                            record_contextual_duration!(
+                            contextual_metrics.record_duration(
                                 "state.contextual.header_transition_commit.duration_seconds",
                                 "state.contextual.mined.header_transition_commit.duration_seconds",
                                 transition_commit_start.elapsed(),
-                                is_mined,
                             );
                             result
                         })
@@ -2652,7 +2646,7 @@ impl WriteBlockWorkerTask {
                             &finalized_state.db,
                             non_finalized_state,
                             queued_child,
-                            is_mined,
+                            contextual_metrics,
                         )
                         .map_err(|error| CommitBlockError::from(Box::new(error)))
                     }

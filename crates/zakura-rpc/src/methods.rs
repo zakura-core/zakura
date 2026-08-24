@@ -400,6 +400,11 @@ pub trait Rpc {
     /// Zakura never returns zcashd's `valid-headers` or `unknown` statuses. Every
     /// block in its non-finalized state is contextually verified, so a tip is either
     /// fully valid, invalidated, or known only by its header.
+    ///
+    /// `branchlen` can be short for an `invalid` tip. Zakura tracks a limited number
+    /// of forks, and it can drop the chain that an invalidated branch forked from.
+    /// The branch is still reported, but its length is then measured from the deepest
+    /// block the node still tracks.
     #[method(name = "getchaintips")]
     async fn get_chain_tips(&self) -> Result<GetChainTipsResponse>;
 

@@ -10,8 +10,10 @@
 //! [`MAX_NON_FINALIZED_CHAIN_FORKS`][1] and [`MAX_INVALIDATED_BLOCKS`][2]. This
 //! function walks that set, adds a few point lookups in the finalized state, and
 //! walks the selected header chain from the block tip down to its fork with the
-//! best chain. So its cost follows the number of tracked forks and the depth of a
-//! reorg, not the height of the chain. It never scans a block index.
+//! best chain. The caller bounds that last walk to the headers at or below the block
+//! tip, so headers-first sync does not widen it. The cost therefore follows the
+//! number of tracked forks and the depth of a reorg, not the height of the chain,
+//! and it never scans a block index.
 //!
 //! # Coverage
 //!
@@ -63,6 +65,22 @@ pub enum ChainTipStatus {
     Invalid,
 }
 
+/// The part of the selected header chain that [`chain_tips`] needs.
+#[derive(Copy, Clone, Debug)]
+pub struct SelectedHeaders<'a> {
+    /// The tip of the selected header chain.
+    pub tip: Frontier,
+
+    /// The selected headers at or below the best chain tip, in ascending height
+    /// order.
+    ///
+    /// The selected header chain and the best chain agree at and below the finalized
+    /// tip, so their fork is always in this range. Bounding the range keeps the fork
+    /// search off the headers-first sync gap, which holds every header the node has
+    /// validated but not yet filled in.
+    pub overlap: &'a [Frontier],
+}
+
 /// The tip of one chain that this node tracks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainTipInfo {
@@ -83,8 +101,8 @@ pub struct ChainTipInfo {
 /// Returns the tip of every chain this node currently tracks, in descending height
 /// order.
 ///
-/// `selected_headers` is the selected header chain, when headers-first sync is
-/// running. Pass `None` to omit header-only tips.
+/// `selected_headers` is the selected header tip and its overlap with the best
+/// chain, when headers-first sync is running. Pass `None` to omit header-only tips.
 ///
 /// The best chain tip is always reported, and is always the only [`Active`] entry.
 /// Returns an empty list if the node has no blocks at all.
@@ -93,7 +111,7 @@ pub struct ChainTipInfo {
 pub fn chain_tips(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
-    selected_headers: Option<&[Frontier]>,
+    selected_headers: Option<SelectedHeaders<'_>>,
 ) -> Vec<ChainTipInfo> {
     let best_chain = non_finalized_state.best_chain();
 
@@ -204,45 +222,40 @@ pub fn chain_tips(
 
     // The selected header chain can have more work at the same or a lower height.
     // Use its ancestry and block availability instead of comparing tip heights.
-    if let Some(selected_headers) = selected_headers {
-        if let Some(header_tip) = selected_headers.last().copied() {
-            let body_available = chains
-                .iter()
-                .any(|chain| chain.contains_block_hash(header_tip.hash))
-                || db.height(header_tip.hash).is_some()
-                || invalidated_branches
-                    .values()
-                    .any(|blocks| blocks.iter().any(|block| block.hash == header_tip.hash));
+    if let Some(SelectedHeaders {
+        tip: header_tip,
+        overlap,
+    }) = selected_headers
+    {
+        let body_available = chains
+            .iter()
+            .any(|chain| chain.contains_block_hash(header_tip.hash))
+            || db.height(header_tip.hash).is_some()
+            || invalidated_branches
+                .values()
+                .any(|blocks| blocks.iter().any(|block| block.hash == header_tip.hash));
 
-            // Look for the fork only when this tip is reported. When the body is
-            // available, which is the steady state, the search below never runs.
-            if !body_available {
-                // The best chain has no block above its own tip, so no header above
-                // it can be the fork. The projection is ordered by height, so this
-                // skips that whole range instead of reading the database once per
-                // header in it. Headers-first sync makes that range the sync gap,
-                // which the header chain bounds at `MAX_NON_FINALIZED_NODES_V1`.
-                let fork_height = selected_headers
-                    .iter()
-                    .rev()
-                    .skip_while(|header| header.height > best_height)
-                    .find_map(|header| {
-                        (best_chain_hash_at_height(best_chain, db, header.height)
-                            == Some(header.hash))
-                        .then_some(header.height)
+        // Look for the fork only when this tip is reported. When the body is
+        // available, which is the steady state, the search below never runs.
+        if !body_available {
+            // `overlap` already stops at the best chain tip, so this reads the
+            // database once per block between the fork and that tip, and never once
+            // per header in the sync gap above it.
+            let fork_height = overlap.iter().rev().find_map(|header| {
+                (best_chain_hash_at_height(best_chain, db, header.height) == Some(header.hash))
+                    .then_some(header.height)
+            });
+
+            // A header chain that shares no block with the best chain has no branch
+            // length to report, so it is left out.
+            if let Some(fork_height) = fork_height {
+                if seen.insert(header_tip.hash) {
+                    tips.push(ChainTipInfo {
+                        height: header_tip.height,
+                        hash: header_tip.hash,
+                        branch_len: header_tip.height.0.saturating_sub(fork_height.0),
+                        status: ChainTipStatus::HeadersOnly,
                     });
-
-                // A header chain that shares no block with the best chain has no
-                // branch length to report, so it is left out.
-                if let Some(fork_height) = fork_height {
-                    if seen.insert(header_tip.hash) {
-                        tips.push(ChainTipInfo {
-                            height: header_tip.height,
-                            hash: header_tip.hash,
-                            branch_len: header_tip.height.0.saturating_sub(fork_height.0),
-                            status: ChainTipStatus::HeadersOnly,
-                        });
-                    }
                 }
             }
         }
@@ -264,8 +277,16 @@ pub fn chain_tips(
 /// zcashd measures `branchlen` from the fork with the active chain, not from the
 /// parent of the branch root. Those differ when `invalidateblock` was called more
 /// than once on the same branch, because the root's parent is then invalidated too.
-/// This walks back to the deepest invalidated ancestor, whose parent is on the best
-/// chain.
+/// This walks back to the deepest invalidated ancestor, then on through the chain
+/// that holds its parent, which can itself be a fork rather than the best chain.
+///
+/// # Limitations
+///
+/// The fork limit can evict the chain that holds the parent. The node then has no
+/// record of the blocks between the branch and the best chain, so the fork is
+/// measured from the deepest ancestor it still tracks and `branchlen` is short by
+/// the length of the evicted part. zcashd never has to do this, because it never
+/// drops a block from its index.
 fn invalidated_fork_height(
     root_block: &ContextuallyVerifiedBlock,
     invalidated_by_hash: &HashMap<block::Hash, (Height, block::Hash)>,
@@ -297,6 +318,8 @@ fn invalidated_fork_height(
         .iter()
         .find(|chain| chain.contains_block_hash(parent))
         .map(|chain| fork_height(chain, best_chain))
+        // The parent is in no tracked chain, so the fork limit evicted it. Measure
+        // from the parent, the deepest ancestor this node can still name.
         .unwrap_or(parent_height)
 }
 

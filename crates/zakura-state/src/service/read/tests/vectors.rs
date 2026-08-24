@@ -25,7 +25,9 @@ use zakura_test::{
 
 use crate::{
     arbitrary::Prepare,
-    constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+    constants::{
+        state_database_format_version_in_code, MAX_NON_FINALIZED_CHAIN_FORKS, STATE_DATABASE_KIND,
+    },
     init_test_services, populated_state,
     response::MinedTx,
     service::{
@@ -41,7 +43,7 @@ use crate::{
                 first_missing_subtree_index, is_syncing_below_last_checkpoint,
                 sapling_subtrees_with_gaps, subtree_completed_by_last_checkpoint,
             },
-            ChainTipInfo, ChainTipStatus,
+            ChainTipInfo, ChainTipStatus, SelectedHeaders,
         },
     },
     tests::FakeChainHelper,
@@ -1808,6 +1810,77 @@ fn chain_tips_measure_invalid_branch_from_current_best_chain() {
     );
 }
 
+/// The fork limit can evict the chain that an invalid branch forked from. The
+/// branch is still reported, but its length is measured from the deepest ancestor
+/// that the node still tracks, so it is short.
+#[test]
+fn chain_tips_shorten_an_invalid_branch_when_its_parent_chain_is_evicted() {
+    let _init_guard = zakura_test::init();
+
+    let block1: Arc<Block> = Arc::new(Mainnet.test_block(653599, 583999).unwrap());
+    let block2 = block1.make_fake_child().set_work(1);
+    let block3 = block2.make_fake_child().set_work(1);
+
+    let (mut state, finalized_state) = new_chain_tips_test_state(&Mainnet);
+    state
+        .commit_new_chain(block1.clone().prepare(), &finalized_state)
+        .expect("fake root block should commit to an empty non-finalized state");
+    state
+        .commit_block(block2.clone().prepare(), &finalized_state)
+        .expect("the first child should extend the root chain");
+    state
+        .commit_block(block3.clone().prepare(), &finalized_state)
+        .expect("the branch tip should extend the block chain");
+
+    // Invalidation leaves a shortened chain, block1 to block2, with the least work
+    // of any chain. block3 stays in the invalidated record.
+    state
+        .invalidate_block(block3.hash())
+        .expect("invalidating a non-root block should succeed");
+
+    // Each fork carries more work than the shortened chain, so the shortened chain
+    // is the first one the fork limit drops.
+    for work in 0..11u128 {
+        let fork = block1.make_fake_child().set_work(100 + work);
+        state
+            .commit_block(fork.prepare(), &finalized_state)
+            .expect("each fork should fork from the root chain");
+    }
+
+    assert_eq!(
+        state.chain_count(),
+        MAX_NON_FINALIZED_CHAIN_FORKS,
+        "the fork limit should hold the number of chains down"
+    );
+    assert!(
+        !state
+            .chain_iter()
+            .any(|chain| chain.contains_block_hash(block2.hash())),
+        "the shortened chain should be evicted, which is what this test is about"
+    );
+
+    let tips = chain_tips(&state, &finalized_state.db, None);
+    let invalid_tip = tips
+        .iter()
+        .find(|tip| tip.hash == block3.hash())
+        .expect("the invalidated branch should still be reported");
+
+    assert_eq!(invalid_tip.status, ChainTipStatus::Invalid);
+    assert_eq!(
+        invalid_tip.branch_len, 1,
+        "block2 is gone, so the branch is measured from it, not from block1"
+    );
+
+    // zcashd reports 2 here, because it never drops a block from its index and can
+    // always walk back to block1. Zakura cannot once the chain is evicted: block2 is
+    // in no chain, no invalidated branch, and not in the finalized state.
+    assert_eq!(
+        block3.coinbase_height().unwrap().0 - block1.coinbase_height().unwrap().0,
+        2,
+        "the fork with the active chain is block1, two blocks below the branch tip"
+    );
+}
+
 /// A header chain that is ahead of the block tip is reported as `headers-only`.
 #[test]
 fn chain_tips_report_a_header_tip_above_the_block_tip() {
@@ -1826,12 +1899,16 @@ fn chain_tips_report_a_header_tip_above_the_block_tip() {
         .commit_block(block2.clone().prepare(), &finalized_state)
         .expect("child block should extend the root chain");
 
-    let selected_headers = [
+    // The overlap stops at the block tip; header3 is above it and is only the tip.
+    let overlap = [
         Frontier::new(block1.coinbase_height().unwrap(), block1.hash()),
         Frontier::new(block2.coinbase_height().unwrap(), block2.hash()),
-        Frontier::new(header3.coinbase_height().unwrap(), header3.hash()),
     ];
-    let tips = chain_tips(&state, &finalized_state.db, Some(&selected_headers));
+    let selected_headers = SelectedHeaders {
+        tip: Frontier::new(header3.coinbase_height().unwrap(), header3.hash()),
+        overlap: &overlap,
+    };
+    let tips = chain_tips(&state, &finalized_state.db, Some(selected_headers));
 
     assert_eq!(
         tips,
@@ -1870,22 +1947,26 @@ fn chain_tips_ignore_a_header_tip_with_an_available_body() {
         .expect("child block should extend the root chain");
 
     // The header chain has selected the same tip as the block chain.
+    let overlap = [
+        Frontier::new(block1.coinbase_height().unwrap(), block1.hash()),
+        Frontier::new(block2.coinbase_height().unwrap(), block2.hash()),
+    ];
     let at_tip = chain_tips(
         &state,
         &finalized_state.db,
-        Some(&[
-            Frontier::new(block1.coinbase_height().unwrap(), block1.hash()),
-            Frontier::new(block2.coinbase_height().unwrap(), block2.hash()),
-        ]),
+        Some(SelectedHeaders {
+            tip: Frontier::new(block2.coinbase_height().unwrap(), block2.hash()),
+            overlap: &overlap,
+        }),
     );
     // The selected header tip is an active-chain ancestor.
     let below_tip = chain_tips(
         &state,
         &finalized_state.db,
-        Some(&[Frontier::new(
-            block1.coinbase_height().unwrap(),
-            block1.hash(),
-        )]),
+        Some(SelectedHeaders {
+            tip: Frontier::new(block1.coinbase_height().unwrap(), block1.hash()),
+            overlap: &overlap[..1],
+        }),
     );
 
     let expected = vec![ChainTipInfo {
@@ -1926,11 +2007,15 @@ fn chain_tips_report_a_shorter_higher_work_header_fork() {
         .commit_block(block3a.clone().prepare(), &finalized_state)
         .expect("the active tip should extend the block chain");
 
-    let selected_headers = [
+    let overlap = [
         Frontier::new(block1.coinbase_height().unwrap(), block1.hash()),
         Frontier::new(header2b.coinbase_height().unwrap(), header2b.hash()),
     ];
-    let tips = chain_tips(&state, &finalized_state.db, Some(&selected_headers));
+    let selected_headers = SelectedHeaders {
+        tip: Frontier::new(header2b.coinbase_height().unwrap(), header2b.hash()),
+        overlap: &overlap,
+    };
+    let tips = chain_tips(&state, &finalized_state.db, Some(selected_headers));
     let header_tip = tips
         .iter()
         .find(|tip| tip.hash == header2b.hash())
@@ -1963,13 +2048,18 @@ fn chain_tips_measure_a_header_fork_from_the_active_chain() {
         .commit_block(block3a.prepare(), &finalized_state)
         .expect("the active tip should extend the block chain");
 
-    let selected_headers = [
+    // block3a is the block tip, so the overlap stops there and header4b is only the
+    // tip.
+    let overlap = [
         Frontier::new(block1.coinbase_height().unwrap(), block1.hash()),
         Frontier::new(header2b.coinbase_height().unwrap(), header2b.hash()),
         Frontier::new(header3b.coinbase_height().unwrap(), header3b.hash()),
-        Frontier::new(header4b.coinbase_height().unwrap(), header4b.hash()),
     ];
-    let tips = chain_tips(&state, &finalized_state.db, Some(&selected_headers));
+    let selected_headers = SelectedHeaders {
+        tip: Frontier::new(header4b.coinbase_height().unwrap(), header4b.hash()),
+        overlap: &overlap,
+    };
+    let tips = chain_tips(&state, &finalized_state.db, Some(selected_headers));
     let header_tip = tips
         .iter()
         .find(|tip| tip.hash == header4b.hash())

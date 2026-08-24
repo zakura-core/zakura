@@ -39,7 +39,7 @@ pub use block::{
 #[cfg(feature = "indexer")]
 pub use block::spending_transaction_hash;
 
-pub use chain_tips::{chain_tips, ChainTipInfo, ChainTipStatus};
+pub use chain_tips::{chain_tips, ChainTipInfo, ChainTipStatus, SelectedHeaders};
 
 pub use find::{
     best_tip, block_locator, depth, finalized_state_contains_block_hash, find_chain_hashes,

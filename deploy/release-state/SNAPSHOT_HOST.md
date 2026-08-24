@@ -1,5 +1,37 @@
 # Production release-state publisher host
 
+## Host profiles
+
+The publisher runs on exactly one machine, but which machine is a deployment choice.
+`deploy-snapshot-host.sh` selects it with `RELEASE_STATE_HOST_PROFILE`:
+
+| Profile | Host | Node | Grid generation |
+| --- | --- | --- | --- |
+| `snapshot` (default) | `zakura-snapshot` | `zakura` container, docker | replays the absent band — hours |
+| `archive` | `roman-zakura-archive-vct-off` | `zakurad.service`, no docker | reads stored trees — ~81 min measured |
+
+The `archive` profile is the supported generator. That node runs
+`vct_fast_sync = false`, so it holds per-height commitment trees everywhere and the
+grid comes from reads rather than replay, and it shares its host with no snapshot
+job. The rest of this document describes the `snapshot` profile, which remains
+supported; the differences are that the archive host has no containers to check, no
+snapshot units to defer to, and supplies R2 credentials from its EnvironmentFile
+rather than through a secrets wrapper.
+
+The installer stamps the profile into `/opt/zakura-release-state/profile.env`, which
+the publisher reads, so the host identity and liveness checks describe the host they
+actually run on.
+
+### R2 credentials
+
+The unit no longer bakes a secrets wrapper into `ExecStart`. Either mechanism works,
+chosen in `/etc/zakura-release-state.env`:
+
+- set `RELEASE_STATE_SECRETS_WRAPPER=/usr/local/bin/with-secrets.sh` and the
+  publisher re-execs through it, as the snapshot host does today; or
+- set `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` directly, for a host with no
+  secrets manager.
+
 ## Purpose and topology
 
 The production release-state publisher generates a trusted, coupled Mainnet checkpoint list, VCT

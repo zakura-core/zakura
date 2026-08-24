@@ -5,15 +5,23 @@
 # /run/zakura-release-state-publish.lock rejects overlapping runs.
 [Unit]
 Description=Publish Mainnet release-state bundle
+# Wants rather than Requires: the archive profile's node runs under systemd
+# directly and the host has no docker at all, where Requires would fail the unit.
 After=docker.service
-Requires=docker.service
+Wants=docker.service
 
 [Service]
 Type=oneshot
 # Supplies RELEASE_STATE_ARCHIVE_CACHE, and optionally RELEASE_STATE_KEEP or
 # RELEASE_STATE_GRID_COST_MS. The publisher refuses to run without the cache path.
+#
+# R2 credentials reach the publisher one of two ways, chosen by this same file.
+# A host with a secrets manager sets RELEASE_STATE_SECRETS_WRAPPER to a command
+# that injects them and execs its argument; the publisher re-execs through it. A
+# host without one puts R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY here directly.
+# The wrapper is therefore no longer baked into ExecStart.
 EnvironmentFile=/etc/zakura-release-state.env
-ExecStart=/usr/local/bin/with-secrets.sh /opt/zakura-release-state/bin/publish-from-archive-host.sh
+ExecStart=/opt/zakura-release-state/bin/publish-from-archive-host.sh
 # A whole-band frontier grid replay takes hours on a fast-synced archive
 # database. A legacy archive database reads the grid instead and finishes in
 # minutes, but the ceiling has to cover both.

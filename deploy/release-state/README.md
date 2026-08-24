@@ -8,6 +8,21 @@ Design: `docs/design/verified-commitment-trees.md`, section 16.
 Production host wiring, operations, and rollback:
 [`SNAPSHOT_HOST.md`](SNAPSHOT_HOST.md).
 
+## Where the publisher runs
+
+Selected by `RELEASE_STATE_HOST_PROFILE` when running `deploy-snapshot-host.sh`:
+`snapshot` (default, the containerised host) or `archive`
+(`roman-zakura-archive-vct-off`, the supported generator). The archive node runs
+`vct_fast_sync = false`, so the frontier grid comes from reads rather than replaying
+an absent band, and it shares its host with no snapshot job.
+
+Nothing in the publisher needs a container runtime. `publish-release-state.sh` has no
+docker in it at all: the exporter is a plain binary reading the cache as a read-only
+RocksDB secondary. Docker appears only as a liveness hint on the `snapshot` profile,
+because that host happens to run its node in a container; the `archive` profile checks
+`zakurad.service` instead, and the unit only `Wants=docker.service` so it starts on a
+host with none.
+
 ## What runs where
 
 - **This host (archive node):** `publish-release-state.sh <archive-cache-dir>`

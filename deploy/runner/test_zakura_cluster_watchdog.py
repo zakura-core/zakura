@@ -279,6 +279,23 @@ class ReleaseStateConditionTests(unittest.TestCase):
         self.assertEqual(cond, "unreadable")
 
 
+    def test_absent_file_list_is_reported_not_treated_as_healthy(self):
+        # A pointer with no usable meta_url, or a half-failed meta fetch, must not look
+        # identical to a healthy bundle.
+        cond, detail = watchdog.release_state_condition(
+            make_release_state(), self.pointer(age_seconds=60.0), {}, self.NOW
+        )
+        self.assertEqual(cond, "unreadable")
+        self.assertIn("meta.files", detail)
+
+    def test_non_object_file_list_is_reported(self):
+        cond, _ = watchdog.release_state_condition(
+            make_release_state(), self.pointer(age_seconds=60.0),
+            {"files": ["a", "b"]}, self.NOW,
+        )
+        self.assertEqual(cond, "unreadable")
+
+
 class ReleaseStateConfigTests(unittest.TestCase):
     def load(self, body):
         import tempfile

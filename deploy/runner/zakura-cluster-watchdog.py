@@ -432,11 +432,16 @@ def release_state_condition(
     database produces, and no freshness check would notice.
     """
 
+    # An unreadable file list is reported, never skipped. Treating it as a pass would
+    # make a pointer with no usable meta_url, or a meta fetch that half-failed, look
+    # exactly like a healthy bundle — the one outcome monitoring must never produce.
     files = meta.get("files")
-    if isinstance(files, dict):
-        missing = [name for name in target.required_files if name not in files]
-        if missing:
-            return "incomplete", "missing " + ", ".join(sorted(missing))
+    if not isinstance(files, dict):
+        return "unreadable", "meta.files is missing or not an object"
+
+    missing = [name for name in target.required_files if name not in files]
+    if missing:
+        return "incomplete", "missing " + ", ".join(sorted(missing))
 
     generated_at = pointer.get("generated_at")
     age = pointer_age_seconds(generated_at, now)
@@ -532,11 +537,9 @@ class Watchdog:
         try:
             pointer = fetch_json(target.url, self.args.request_timeout)
             meta_url = pointer.get("meta_url")
-            meta = (
-                fetch_json(str(meta_url), self.args.request_timeout)
-                if isinstance(meta_url, str)
-                else {}
-            )
+            if not isinstance(meta_url, str):
+                raise ValueError(f"pointer has no meta_url: {target.url}")
+            meta = fetch_json(meta_url, self.args.request_timeout)
             height = pointer.get("height", height)
             condition, detail = release_state_condition(target, pointer, meta, now)
         except Exception as error:

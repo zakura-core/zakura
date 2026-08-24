@@ -341,7 +341,7 @@ impl VctState {
 
     /// The supplied roots for `height`, when vct mode has a source entry for it
     /// (the signal that this block takes the VCT fast-sync).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub(super) fn vct_roots_at_height(
         &self,
         height: block::Height,
@@ -439,7 +439,7 @@ impl VctState {
     /// Test-only: build fast-mode state from an arbitrary commitment-root source
     /// (e.g. a payload produced from a database), so the producer→consumer round-trip
     /// can be exercised without networking.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub(super) fn test_with_source(
         source: Box<dyn CommitmentRootSource>,
         requires_verified_successor: bool,
@@ -582,7 +582,7 @@ impl VctCommitState {
     /// state, so the producer→consumer round-trip can be exercised in-process.
     /// `requires_verified_successor` marks an untrusted source that must defer
     /// tip roots until their successor is buffered.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub(super) fn install_test_source(
         &mut self,
         source: Box<dyn CommitmentRootSource>,
@@ -836,6 +836,17 @@ mod tests {
         frontier_size: u64,
         subtrees_sha256: String,
         subtrees_size: u64,
+        // The frontier grid joined the release state after the other artifacts, so a manifest
+        // without these is a valid older one. Unlike the others the grid reaches the binary
+        // through a pinned crates.io dependency rather than from the tree, so this test binds it
+        // by way of that dependency and `scripts/check-release-state.sh` binds the pinned version
+        // to the same height without cargo.
+        #[serde(default)]
+        frontier_grid_sha256: Option<String>,
+        #[serde(default)]
+        frontier_grid_size: Option<u64>,
+        #[serde(default)]
+        frontier_grid_entries: Option<u32>,
         #[serde(default)]
         meta_sha256: Option<String>,
     }
@@ -1004,6 +1015,57 @@ mod tests {
         );
         assert_eq!(provenance.schema_version, 1);
         assert_eq!(provenance.network, "Mainnet");
+        // All three grid fields or none: a half-written record would let the file and the
+        // manifest disagree about which artifact is committed.
+        let grid_fields = [
+            provenance.frontier_grid_sha256.is_some(),
+            provenance.frontier_grid_size.is_some(),
+            provenance.frontier_grid_entries.is_some(),
+        ];
+        assert!(
+            grid_fields.iter().all(|present| *present)
+                || grid_fields.iter().all(|present| !*present),
+            "the frontier grid provenance record must be complete or absent, found {grid_fields:?}"
+        );
+        if let Some(entries) = provenance.frontier_grid_entries {
+            assert!(entries > 0, "a recorded frontier grid must have entries");
+        }
+        // The grid is not in the tree, so this is what holds the bytes a build actually embeds
+        // against the checkpoint this manifest was reviewed for. The crate's own constants are
+        // checked too, so a crate that misdeclares its payload cannot pass by agreeing with
+        // itself.
+        if let (Some(digest), Some(size), Some(entries)) = (
+            provenance.frontier_grid_sha256.as_deref(),
+            provenance.frontier_grid_size,
+            provenance.frontier_grid_entries,
+        ) {
+            let grid = zakura_assets::MAINNET_FRONTIER_GRID;
+            assert_eq!(
+                size,
+                u64::try_from(grid.len()).expect("frontier grid length fits in u64"),
+                "manifest must describe the pinned frontier grid's length"
+            );
+            assert_eq!(
+                digest,
+                hex::encode(Sha256::digest(grid)),
+                "manifest must authenticate the pinned frontier grid bytes"
+            );
+            assert_eq!(
+                digest,
+                zakura_assets::MAINNET_FRONTIER_GRID_SHA256_HEX,
+                "the pinned crate must declare the digest the manifest reviewed"
+            );
+            assert_eq!(
+                entries,
+                zakura_assets::MAINNET_FRONTIER_GRID_ENTRIES,
+                "manifest must describe the pinned frontier grid's entry count"
+            );
+            assert_eq!(
+                zakura_assets::MAINNET_FRONTIER_GRID_CHECKPOINT,
+                frontiers.height.0,
+                "the pinned frontier grid must cover the embedded list's last checkpoint"
+            );
+        }
         assert!(
             matches!(
                 provenance.source.as_str(),

@@ -64,6 +64,11 @@ user-id = 4484
 user-login = "hsivonen"
 user-name = "Henri Sivonen"
 
+[[publisher.valargroup-zakura-assets]]
+version = "0.3457371.0"
+when = "2026-08-24"
+trusted-publisher = "github:zakura-core/zakura"
+
 [[publisher.wasip2]]
 version = "1.0.4+wasi-0.2.12"
 when = "2026-06-12"

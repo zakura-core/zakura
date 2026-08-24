@@ -919,7 +919,7 @@ impl StateService {
     fn queue_and_commit_to_non_finalized_state(
         &mut self,
         semantically_verified: SemanticallyVerifiedBlock,
-        admission: Option<BlockAdmission>,
+        mut admission: Option<BlockAdmission>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
         let parent_hash = semantically_verified.block.header.previous_block_hash;
@@ -966,16 +966,17 @@ impl StateService {
         // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
         // has been queued but not yet committed to the state fails the older request and replaces
         // it with the newer request.
-        let rsp_rx = if let Some((_, old_rsp_tx, _)) = self
+        let rsp_rx = if let Some((_, old_rsp_tx, old_admission)) = self
             .non_finalized_state_queued_blocks
             .get_mut(&semantically_verified.hash)
         {
-            if let Some(admission) = admission {
-                admission.reject();
-            }
             tracing::debug!("replacing older queued request with new request");
             let (mut rsp_tx, rsp_rx) = oneshot::channel();
             std::mem::swap(old_rsp_tx, &mut rsp_tx);
+            std::mem::swap(old_admission, &mut admission);
+            if let Some(admission) = admission {
+                admission.reject();
+            }
             let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
                 Some(semantically_verified.hash.into()),
                 KnownBlock::Queue,
@@ -2128,12 +2129,13 @@ fn frontier_grid_gap_exceeds_replay_limit(
     (blocks > limit).then_some(blocks)
 }
 
-/// Loads the configured frontier grid into a fresh cache.
+/// Loads the configured frontier grid override or the embedded Mainnet grid into a fresh cache.
 ///
-/// An unreadable or invalid configured artifact is fatal for a node that derives
-/// ([`Config::derive_historical_trees`]) and a warning for one that does not. Without a configured
-/// grid, the node keeps reporting the absent band as unavailable. A well-framed artifact is still
-/// refused unless its entries tile genesis through
+/// Mainnet needs no deployment-time file: its reviewed grid is part of the binary. An explicit
+/// path overrides that grid, and an unreadable or invalid override is fatal for a node that
+/// derives ([`Config::derive_historical_trees`]) and a warning for one that does not. Networks
+/// without an embedded or configured grid keep reporting the absent band as unavailable. A
+/// well-framed artifact is still refused unless its entries tile genesis through
 /// `last_checkpoint` at gaps of at most [`MAX_HISTORICAL_TREE_REPLAY_BLOCKS`].
 fn load_historical_frontier_artifact(
     network: &Network,
@@ -2163,12 +2165,25 @@ fn load_historical_frontier_artifact_if_enabled(
                 }),
             path.clone(),
         )
-    } else {
-        if derivation_enabled {
+    } else if derivation_enabled {
+        let Some(artifact) = finalized_state::embedded_historical_frontier_artifact(network) else {
             tracing::info!(
-                "historical tree derivation is idle: no historical frontier artifact is configured"
+                "historical tree derivation is idle: this network has no embedded historical \
+                 frontier artifact"
             );
-        }
+
+            return Ok(LoadedHistoricalFrontierArtifact {
+                cache: Arc::new(Mutex::new(read::HistoricalTreeCache::default())),
+                last_checkpoint: None,
+                source_path: None,
+            });
+        };
+
+        (
+            Ok(artifact),
+            PathBuf::from("embedded Mainnet historical frontier artifact"),
+        )
+    } else {
         return Ok(LoadedHistoricalFrontierArtifact {
             cache: Arc::new(Mutex::new(read::HistoricalTreeCache::default())),
             last_checkpoint: None,

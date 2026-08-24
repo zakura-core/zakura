@@ -274,6 +274,19 @@ jobs:
           log_file   = ""
           rpc_listen_addr = "127.0.0.1:8232"
           state_cache_dir = "/mnt/data/import-zebra"
+
+          # Legacy archive node: `vct_fast_sync = false`, so it holds per-height
+          # commitment trees everywhere and never fast-synced. That is what makes it
+          # the supported generator for the release-state historical frontier grid —
+          # entries come from reads instead of replaying an absent band. Binary-only
+          # like the rest of the fleet, so its `vct_fast_sync = false` config is not
+          # rewritten by a deploy; that setting is the whole point of the node.
+          [[nodes]]
+          name       = "archive-vct-off"
+          ssh_string = "root@104.131.174.28"
+          commit     = "${REF}"
+          rpc_listen_addr = "127.0.0.1:8232"
+          log_file   = "/var/log/zakura/zakura.log"
           EOF
 
       - name: Build deployer binary

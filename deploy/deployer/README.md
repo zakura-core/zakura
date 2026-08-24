@@ -204,10 +204,16 @@ and deploys it to:
 - `asia-south-0` — `root@139.59.64.115`
 - `asia-pacific-0` — `root@168.144.173.250`
 - `zakura-compat` — `root@159.203.113.196`
+- `archive-vct-off` — `root@104.131.174.28`
 
 The first nine run a hand-provisioned `zakurad` systemd service.
 `zakura-compat` runs `zakurad-compat` alongside a native `zcashd` sidecar on the
-same host. One-time runner bootstrap from an operator machine with SSH access
+same host. `archive-vct-off` is a legacy archive node — `vct_fast_sync = false`,
+so it never fast-synced and holds per-height commitment trees at every height.
+That is what makes it the supported generator for the release-state historical
+frontier grid, whose entries then come from reads rather than from replaying a
+fast-synced node's absent band. It is not a public bootstrap peer and is
+deliberately absent from the node ids in `zakura-network`. One-time runner bootstrap from an operator machine with SSH access
 and CI credentials in `~/agents-env`:
 
 ```bash

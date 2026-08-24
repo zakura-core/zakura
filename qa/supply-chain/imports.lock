@@ -64,11 +64,6 @@ user-id = 4484
 user-login = "hsivonen"
 user-name = "Henri Sivonen"
 
-[[publisher.valargroup-zakura-assets]]
-version = "0.3457371.0"
-when = "2026-08-24"
-trusted-publisher = "github:zakura-core/zakura"
-
 [[publisher.wasip2]]
 version = "1.0.4+wasi-0.2.12"
 when = "2026-06-12"
@@ -80,6 +75,13 @@ user-name = "Alex Crichton"
 version = "0.57.1"
 when = "2026-04-17"
 trusted-publisher = "github:bytecodealliance/wit-bindgen"
+
+[[publisher.zakura-assets]]
+version = "0.3457371.0"
+when = "2026-08-24"
+user-id = 1244
+user-login = "ebfull"
+user-name = "Sean Bowe"
 
 [[publisher.zcash_address]]
 version = "0.13.0"

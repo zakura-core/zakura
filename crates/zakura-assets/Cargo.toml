@@ -1,0 +1,40 @@
+# Packaging manifest for Zakura's published binary assets.
+#
+# This package is deliberately outside the workspace: its payload is generated
+# by `scripts/pack-assets-crate.py` from a verified release-state bundle and is
+# never committed, so a plain checkout cannot build it. Zakura consumes the
+# published crate from crates.io like any other dependency.
+#
+# The package name is the one place the published name is written down.
+# `scripts/pack-assets-crate.py` reads it from here rather than hardcoding it.
+[package]
+name = "valargroup-zakura-assets"
+# Stamped by `scripts/pack-assets-crate.py` as `0.<last_checkpoint>.<revision>`,
+# so the version a consumer pins states which checkpoint the payload covers.
+version = "0.3453771.0"
+authors = ["Zakura Contributors"]
+edition = "2021"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zakura-core/zakura"
+documentation = "https://docs.rs/zakura"
+description = "Reviewed Mainnet historical frontier grid for Zakura"
+readme = "README.md"
+keywords = ["zcash", "zakura", "blockchain"]
+categories = ["cryptography::cryptocurrencies", "data-structures"]
+# Cargo derives a package's file list from git. The payload and its generated
+# constants are gitignored, so without an explicit include they would be left
+# out of the .crate archive and the published crate would not compile.
+include = [
+    "Cargo.toml",
+    "README.md",
+    "src/lib.rs",
+    "src/generated.rs",
+    "src/mainnet-frontier-grid.bin",
+]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dev-dependencies]
+sha2 = "0.10"

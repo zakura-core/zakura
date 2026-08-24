@@ -371,8 +371,8 @@ impl DiskWriteBatch {
         );
     }
 
-    #[cfg(test)]
-    /// Deletes the half-open row range used by legacy serving tests.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    /// Deletes the half-open row range used by legacy serving test fixtures.
     pub fn delete_range_commitment_roots_by_height(
         &mut self,
         db: &ZakuraDb,

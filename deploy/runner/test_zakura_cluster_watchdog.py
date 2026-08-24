@@ -198,3 +198,130 @@ class StallRecoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def make_release_state(**overrides):
+    defaults = {
+        "name": "mainnet",
+        "url": "https://example.invalid/release-state/latest.json",
+        "stale_after": 172800.0,
+        "required_files": (
+            "main-checkpoints.txt",
+            "mainnet-frontier.bin",
+            "mainnet-treestate-subtrees.bin",
+            "mainnet-frontier-grid.bin",
+        ),
+    }
+    defaults.update(overrides)
+    return watchdog.ReleaseState(**defaults)
+
+
+ALL_FILES = {
+    "main-checkpoints.txt": {},
+    "mainnet-frontier.bin": {},
+    "mainnet-treestate-subtrees.bin": {},
+    "mainnet-frontier-grid.bin": {},
+}
+
+
+class ReleaseStateConditionTests(unittest.TestCase):
+    """The published artifact, not the unit, is what tells us the pipeline is alive."""
+
+    NOW = 1_800_000_000.0
+
+    def pointer(self, age_seconds=0.0, height=3457371):
+        stamp = watchdog.datetime.datetime.fromtimestamp(
+            self.NOW - age_seconds, watchdog.datetime.timezone.utc
+        )
+        return {
+            "height": height,
+            "generated_at": stamp.isoformat().replace("+00:00", "Z"),
+        }
+
+    def condition(self, pointer, files, target=None):
+        return watchdog.release_state_condition(
+            target or make_release_state(), pointer, {"files": files}, self.NOW
+        )
+
+    def test_fresh_complete_bundle_is_ok(self):
+        cond, _ = self.condition(self.pointer(age_seconds=3600.0), ALL_FILES)
+        self.assertEqual(cond, "ok")
+
+    def test_a_bundle_past_its_window_is_stale(self):
+        cond, detail = self.condition(self.pointer(age_seconds=200_000.0), ALL_FILES)
+        self.assertEqual(cond, "stale")
+        self.assertIn("ago", detail)
+
+    def test_one_missed_daily_export_does_not_alert(self):
+        # The generator runs daily; a 48h window has to tolerate a single miss.
+        cond, _ = self.condition(self.pointer(age_seconds=90_000.0), ALL_FILES)
+        self.assertEqual(cond, "ok")
+
+    def test_a_fresh_bundle_missing_the_grid_is_incomplete(self):
+        # The regression the retired snapshot-host publisher would have caused: a
+        # perfectly fresh three-file bundle that no freshness check would flag.
+        three_files = {k: v for k, v in ALL_FILES.items() if "grid" not in k}
+        cond, detail = self.condition(self.pointer(age_seconds=60.0), three_files)
+        self.assertEqual(cond, "incomplete")
+        self.assertIn("mainnet-frontier-grid.bin", detail)
+
+    def test_missing_file_outranks_staleness(self):
+        three_files = {k: v for k, v in ALL_FILES.items() if "grid" not in k}
+        cond, _ = self.condition(self.pointer(age_seconds=999_999.0), three_files)
+        self.assertEqual(cond, "incomplete")
+
+    def test_unparsable_timestamp_is_reported_not_silently_ok(self):
+        cond, _ = self.condition({"height": 1, "generated_at": "nonsense"}, ALL_FILES)
+        self.assertEqual(cond, "unreadable")
+
+    def test_absent_timestamp_is_reported(self):
+        cond, _ = self.condition({"height": 1}, ALL_FILES)
+        self.assertEqual(cond, "unreadable")
+
+
+    def test_absent_file_list_is_reported_not_treated_as_healthy(self):
+        # A pointer with no usable meta_url, or a half-failed meta fetch, must not look
+        # identical to a healthy bundle.
+        cond, detail = watchdog.release_state_condition(
+            make_release_state(), self.pointer(age_seconds=60.0), {}, self.NOW
+        )
+        self.assertEqual(cond, "unreadable")
+        self.assertIn("meta.files", detail)
+
+    def test_non_object_file_list_is_reported(self):
+        cond, _ = watchdog.release_state_condition(
+            make_release_state(), self.pointer(age_seconds=60.0),
+            {"files": ["a", "b"]}, self.NOW,
+        )
+        self.assertEqual(cond, "unreadable")
+
+
+class ReleaseStateConfigTests(unittest.TestCase):
+    def load(self, body):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as handle:
+            handle.write(body)
+            path = Path(handle.name)
+        return watchdog.load_release_state(path)
+
+    def test_absent_section_is_not_an_error(self):
+        # The fleet watchdog must keep working on a config that predates this check.
+        self.assertEqual(self.load('[[fleets]]\nname = "t"\nurl = "u"\n'), [])
+
+    def test_defaults_match_the_importer_window(self):
+        targets = self.load('[[release_state]]\nname = "mainnet"\nurl = "u"\n')
+        self.assertEqual(targets[0].stale_after, 172800)
+        self.assertIn("mainnet-frontier-grid.bin", targets[0].required_files)
+
+    def test_duplicate_names_are_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.load(
+                '[[release_state]]\nname = "m"\nurl = "u"\n'
+                '[[release_state]]\nname = "m"\nurl = "u"\n'
+            )
+
+    def test_missing_url_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.load('[[release_state]]\nname = "m"\n')
+

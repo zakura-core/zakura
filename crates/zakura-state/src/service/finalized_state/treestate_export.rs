@@ -573,16 +573,16 @@ mod tests {
 
 /// Estimated replay cost of one block, in microseconds, independent of its shielded activity.
 ///
-/// Covers reading the block and walking its transactions. Blocks with no shielded outputs cost
-/// about this much, which is what the constant is fitted to.
-const COST_PER_BLOCK_US: u64 = 1_500;
+/// Covers reading the block and walking its transactions. Fitted to quiet Mainnet windows (no
+/// note commitments) on `roman-zakura-archive-vct-off` (2026-08-21): median ≈ 249 µs/block.
+const COST_PER_BLOCK_US: u64 = 249;
 
 /// Estimated replay cost of appending one note commitment, in microseconds.
 ///
-/// Fitted so the model reproduces the measured whole-band replay time (6,879 s over 3,358,006
-/// blocks and ~124M Sapling and Orchard commitments) given [`COST_PER_BLOCK_US`]. Appending
-/// dominates wherever there is shielded activity.
-const COST_PER_COMMITMENT_US: u64 = 47;
+/// Fitted jointly with [`COST_PER_BLOCK_US`] against 347 cold 500-block windows across Mainnet on
+/// `roman-zakura-archive-vct-off` (2026-08-21). Appending dominates wherever there is shielded
+/// activity. The previous 1_500 / 47 pair overestimated cost and over-sized the published grid.
+const COST_PER_COMMITMENT_US: u64 = 30;
 
 /// How the frontier grid's height spacing is chosen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1016,8 +1016,8 @@ mod grid_target_tests {
 
     #[test]
     fn adaptive_grid_omits_a_partial_final_cell() {
-        // Three empty blocks cost 4_500 µs, so a 4_000 µs budget fires every third height.
-        let spacing = GridSpacing::Adaptive { budget_us: 4_000 };
+        // Three empty blocks cost 747 µs, so a 700 µs budget fires every third height.
+        let spacing = GridSpacing::Adaptive { budget_us: 700 };
 
         assert_eq!(
             published_grid_heights(spacing, Height(0), Height(10), |_| 0),
@@ -1033,7 +1033,7 @@ mod grid_target_tests {
 
     #[test]
     fn adaptive_grid_heights_are_prefix_compatible_across_tips() {
-        let spacing = GridSpacing::Adaptive { budget_us: 4_000 };
+        let spacing = GridSpacing::Adaptive { budget_us: 700 };
         let earlier = published_grid_heights(spacing, Height(0), Height(10), |_| 0);
         let later = published_grid_heights(spacing, Height(0), Height(11), |_| 0);
 

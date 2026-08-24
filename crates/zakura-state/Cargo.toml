@@ -37,6 +37,7 @@ commit-metrics = []
 # Test-only features
 header-fuzz = []
 proptest-impl = [
+    "dep:halo2",
     "proptest",
     "proptest-derive",
     "zakura-chain/proptest-impl"
@@ -46,6 +47,7 @@ proptest-impl = [
 bincode = { workspace = true }
 chrono = { workspace = true, features = ["clock", "std"] }
 futures = { workspace = true }
+halo2 = { workspace = true, optional = true }
 hex = { workspace = true }
 hex-literal = { workspace = true }
 humantime-serde = { workspace = true }
@@ -71,6 +73,7 @@ tracing = { workspace = true }
 
 sapling-crypto = { workspace = true }
 
+zakura-assets = { workspace = true }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.1-rc0" }
 zakura-chain = { path = "../zakura-chain", version = "6.0.0-rc0", features = ["async-error"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0-rc0" }

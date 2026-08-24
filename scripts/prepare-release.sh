@@ -151,6 +151,8 @@ if [ "$dry_run" = 0 ]; then
         [ -n "$dirty_line" ] || continue
         dirty_path="${dirty_line:3}"
         case "$dirty_path" in
+          Cargo.toml|\
+          Cargo.lock|\
           crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt|\
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin|\
           crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin|\

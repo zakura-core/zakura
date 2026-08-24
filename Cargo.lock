@@ -6920,12 +6920,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "valargroup-zakura-assets"
-version = "0.3457371.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42207ed9d1df776c64849d93644b7c5c4625c2b66304c2d05b71938b5d8ac90d"
-
-[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7732,6 +7726,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-assets"
+version = "0.3457371.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "380d37960ac8b518a75c17fcf8554a1b81e7387267d6b42a56fbed298255b723"
+
+[[package]]
 name = "zakura-bellman"
 version = "1.0.0-rc.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8390,7 +8390,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tower 0.4.13",
  "tracing",
- "valargroup-zakura-assets",
+ "zakura-assets",
  "zakura-chain",
  "zakura-halo2-proofs",
  "zakura-header-chain",

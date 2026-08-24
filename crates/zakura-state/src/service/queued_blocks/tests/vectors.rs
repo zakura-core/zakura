@@ -4,7 +4,11 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
-use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+use zakura_chain::{
+    block::{self, Block},
+    serialization::ZcashDeserializeInto,
+    transparent,
+};
 use zakura_test::prelude::*;
 
 use crate::{
@@ -14,6 +18,7 @@ use crate::{
     },
     tests::FakeChainHelper,
     CommitBlockError, CommitSemanticallyVerifiedError,
+    SemanticallyVerifiedBlock,
 };
 
 // Quick helper trait for making queued blocks with throw away channels
@@ -26,6 +31,315 @@ impl IntoQueued for Arc<Block> {
         let (rsp_tx, _) = oneshot::channel();
         (self.prepare(), rsp_tx, None)
     }
+}
+
+impl IntoQueued for SemanticallyVerifiedBlock {
+    fn into_queued(self) -> QueuedSemanticallyVerified {
+        let (rsp_tx, _) = oneshot::channel();
+        (self, rsp_tx, None)
+    }
+}
+
+#[derive(Clone)]
+struct SharedUtxoProviders {
+    lower: SemanticallyVerifiedBlock,
+    higher: SemanticallyVerifiedBlock,
+    outpoint: transparent::OutPoint,
+    lower_utxo: transparent::Utxo,
+    higher_utxo: transparent::Utxo,
+    lower_parent_hash: block::Hash,
+    higher_parent_hash: block::Hash,
+}
+
+/// Returns two blocks on competing branches that provide the same non-coinbase outpoint.
+///
+/// `SemanticallyVerifiedBlock::new_outputs` explicitly permits unrelated outputs, so the
+/// fixture can exercise cache ownership without constructing fully valid competing blocks.
+fn shared_utxo_providers() -> Result<SharedUtxoProviders> {
+    let root: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
+    let left_child: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.zcash_deserialize_into()?;
+
+    let lower_block = left_child.make_fake_child();
+    let right_child = root.make_fake_child();
+    let right_grandchild = right_child.make_fake_child();
+    let higher_block = right_grandchild.make_fake_child();
+
+    let source = left_child.prepare();
+    let (outpoint, source_output) = source
+        .new_outputs
+        .iter()
+        .find(|(_outpoint, ordered_utxo)| !ordered_utxo.utxo.from_coinbase)
+        .expect("mainnet block 419201 has non-coinbase transparent outputs");
+    let outpoint = *outpoint;
+    let output = source_output.utxo.output.clone();
+
+    let mut lower = lower_block.prepare();
+    let mut higher = higher_block.prepare();
+    assert!(lower.height < higher.height);
+    assert_ne!(lower.hash, higher.hash);
+
+    let lower_output = transparent::OrderedUtxo::new(output.clone(), lower.height, 1);
+    let higher_output = transparent::OrderedUtxo::new(output, higher.height, 1);
+    let lower_utxo = lower_output.utxo.clone();
+    let higher_utxo = higher_output.utxo.clone();
+
+    lower.new_outputs.insert(outpoint, lower_output);
+    higher.new_outputs.insert(outpoint, higher_output);
+
+    let lower_parent_hash = lower.block.header.previous_block_hash;
+    let higher_parent_hash = higher.block.header.previous_block_hash;
+    assert_ne!(lower_parent_hash, higher_parent_hash);
+
+    Ok(SharedUtxoProviders {
+        lower,
+        higher,
+        outpoint,
+        lower_utxo,
+        higher_utxo,
+        lower_parent_hash,
+        higher_parent_hash,
+    })
+}
+
+fn duplicate_only_output(
+    original: &SemanticallyVerifiedBlock,
+    other: &SemanticallyVerifiedBlock,
+) -> (transparent::OutPoint, transparent::OrderedUtxo) {
+    other
+        .new_outputs
+        .iter()
+        .find(|(outpoint, _output)| !original.new_outputs.contains_key(outpoint))
+        .map(|(outpoint, output)| (*outpoint, output.clone()))
+        .expect("competing blocks have at least one distinct output")
+}
+
+fn sent_buffers_contain(sent: &SentHashes, hash: block::Hash) -> bool {
+    sent.curr_buf
+        .iter()
+        .any(|(sent_hash, _height)| *sent_hash == hash)
+        || sent
+            .bufs
+            .iter()
+            .flatten()
+            .any(|(sent_hash, _height)| *sent_hash == hash)
+}
+
+#[test]
+fn dequeue_children_preserves_shared_utxo_until_last_provider() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    for remove_lower_first in [true, false] {
+        let providers = shared_utxo_providers()?;
+        let mut queue = QueuedBlocks::default();
+        queue.queue(providers.lower.clone().into_queued());
+        queue.queue(providers.higher.clone().into_queued());
+
+        let (first_parent, first_hash, remaining_utxo, last_parent, last_hash) =
+            if remove_lower_first {
+                (
+                    providers.lower_parent_hash,
+                    providers.lower.hash,
+                    providers.higher_utxo.clone(),
+                    providers.higher_parent_hash,
+                    providers.higher.hash,
+                )
+            } else {
+                (
+                    providers.higher_parent_hash,
+                    providers.higher.hash,
+                    providers.lower_utxo.clone(),
+                    providers.lower_parent_hash,
+                    providers.lower.hash,
+                )
+            };
+
+        let removed = queue.dequeue_children(first_parent);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0.hash, first_hash);
+        assert_eq!(queue.utxo(&providers.outpoint), Some(remaining_utxo));
+
+        let removed = queue.dequeue_children(last_parent);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0.hash, last_hash);
+        assert_eq!(queue.utxo(&providers.outpoint), None);
+        assert!(queue.blocks.is_empty());
+        assert!(queue.by_parent.is_empty());
+        assert!(queue.by_height.is_empty());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn queued_pruning_preserves_shared_utxo_until_last_provider() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let providers = shared_utxo_providers()?;
+
+    let mut queue = QueuedBlocks::default();
+    queue.queue(providers.lower.clone().into_queued());
+    queue.queue(providers.higher.clone().into_queued());
+
+    queue.prune_by_height(providers.lower.height);
+    assert!(!queue.blocks.contains_key(&providers.lower.hash));
+    assert!(queue.blocks.contains_key(&providers.higher.hash));
+    assert_eq!(
+        queue.utxo(&providers.outpoint),
+        Some(providers.higher_utxo.clone())
+    );
+
+    queue.prune_by_height(providers.higher.height);
+    assert_eq!(queue.utxo(&providers.outpoint), None);
+    assert!(queue.blocks.is_empty());
+    assert!(queue.by_parent.is_empty());
+    assert!(queue.by_height.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn sent_pruning_preserves_shared_utxo_until_last_provider() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let providers = shared_utxo_providers()?;
+
+    let mut sent = SentHashes::default();
+    sent.add(&providers.lower);
+    sent.add(&providers.higher);
+    sent.finish_batch();
+
+    sent.prune_by_height(providers.lower.height);
+    assert!(!sent.contains(&providers.lower.hash));
+    assert!(sent.contains(&providers.higher.hash));
+    assert_eq!(
+        sent.utxo(&providers.outpoint),
+        Some(providers.higher_utxo.clone())
+    );
+
+    sent.prune_by_height(providers.higher.height);
+    assert_eq!(sent.utxo(&providers.outpoint), None);
+    assert!(sent.sent.is_empty());
+    assert!(!sent_buffers_contain(&sent, providers.lower.hash));
+    assert!(!sent_buffers_contain(&sent, providers.higher.hash));
+
+    Ok(())
+}
+
+#[test]
+fn sent_rejection_preserves_shared_utxo_until_last_provider() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    for remove_lower_first in [true, false] {
+        let providers = shared_utxo_providers()?;
+        let mut sent = SentHashes::default();
+        sent.add(&providers.lower);
+        sent.add(&providers.higher);
+        sent.finish_batch();
+
+        let (first_hash, remaining_utxo, last_hash) = if remove_lower_first {
+            (
+                providers.lower.hash,
+                providers.higher_utxo.clone(),
+                providers.higher.hash,
+            )
+        } else {
+            (
+                providers.higher.hash,
+                providers.lower_utxo.clone(),
+                providers.lower.hash,
+            )
+        };
+
+        sent.remove(&first_hash);
+        assert!(!sent.contains(&first_hash));
+        assert!(!sent_buffers_contain(&sent, first_hash));
+        assert_eq!(sent.utxo(&providers.outpoint), Some(remaining_utxo));
+
+        sent.remove(&last_hash);
+        assert!(!sent.contains(&last_hash));
+        assert!(!sent_buffers_contain(&sent, last_hash));
+        assert_eq!(sent.utxo(&providers.outpoint), None);
+        assert!(sent.sent.is_empty());
+        assert!(sent.bufs.is_empty());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn duplicate_queued_block_is_idempotent() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let providers = shared_utxo_providers()?;
+    let (duplicate_outpoint, duplicate_output) =
+        duplicate_only_output(&providers.lower, &providers.higher);
+
+    let mut duplicate = providers.lower.clone();
+    duplicate.new_outputs.clear();
+    duplicate
+        .new_outputs
+        .insert(duplicate_outpoint, duplicate_output);
+
+    let mut queue = QueuedBlocks::default();
+    queue.queue(providers.lower.clone().into_queued());
+    queue.queue(duplicate.into_queued());
+
+    assert_eq!(queue.blocks.len(), 1);
+    assert_eq!(queue.by_parent.len(), 1);
+    assert_eq!(queue.by_height.len(), 1);
+    assert_eq!(
+        queue.utxo(&providers.outpoint),
+        Some(providers.lower_utxo.clone())
+    );
+    assert_eq!(queue.utxo(&duplicate_outpoint), None);
+
+    queue.dequeue_children(providers.lower_parent_hash);
+    assert_eq!(queue.utxo(&providers.outpoint), None);
+    assert_eq!(queue.utxo(&duplicate_outpoint), None);
+    assert!(queue.blocks.is_empty());
+    assert!(queue.by_parent.is_empty());
+    assert!(queue.by_height.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn duplicate_sent_block_is_idempotent() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let providers = shared_utxo_providers()?;
+    let (duplicate_outpoint, duplicate_output) =
+        duplicate_only_output(&providers.lower, &providers.higher);
+
+    let mut duplicate = providers.lower.clone();
+    duplicate.new_outputs.clear();
+    duplicate
+        .new_outputs
+        .insert(duplicate_outpoint, duplicate_output);
+
+    let mut sent = SentHashes::default();
+    sent.add(&providers.lower);
+    sent.add(&duplicate);
+
+    assert_eq!(sent.sent.len(), 1);
+    assert_eq!(
+        sent.curr_buf
+            .iter()
+            .filter(|(hash, _height)| *hash == providers.lower.hash)
+            .count(),
+        1
+    );
+    assert_eq!(
+        sent.utxo(&providers.outpoint),
+        Some(providers.lower_utxo.clone())
+    );
+    assert_eq!(sent.utxo(&duplicate_outpoint), None);
+
+    sent.remove(&providers.lower.hash);
+    assert_eq!(sent.utxo(&providers.outpoint), None);
+    assert_eq!(sent.utxo(&duplicate_outpoint), None);
+    assert!(sent.sent.is_empty());
+    assert!(!sent_buffers_contain(&sent, providers.lower.hash));
+
+    Ok(())
 }
 
 #[test]

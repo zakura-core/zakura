@@ -7,9 +7,11 @@
 //! zcashd answers `getchaintips` by scanning its entire block index twice under
 //! `cs_main`, which costs seconds once the index holds millions of entries. Zakura
 //! keeps only the non-finalized chains in memory, and that set is bounded by
-//! [`MAX_NON_FINALIZED_CHAIN_FORKS`][1] and [`MAX_INVALIDATED_BLOCKS`][2]. So this
-//! function is bounded by the number of forks, not by the height of the chain, and
-//! it never touches the finalized state's block index.
+//! [`MAX_NON_FINALIZED_CHAIN_FORKS`][1] and [`MAX_INVALIDATED_BLOCKS`][2]. This
+//! function walks that set, adds a few point lookups in the finalized state, and
+//! walks the selected header chain from the block tip down to its fork with the
+//! best chain. So its cost follows the number of tracked forks and the depth of a
+//! reorg, not the height of the chain. It never scans a block index.
 //!
 //! # Coverage
 //!
@@ -212,19 +214,35 @@ pub fn chain_tips(
                     .values()
                     .any(|blocks| blocks.iter().any(|block| block.hash == header_tip.hash));
 
-            let fork_height = selected_headers.iter().rev().find_map(|header| {
-                (best_chain_hash_at_height(best_chain, db, header.height) == Some(header.hash))
-                    .then_some(header.height)
-            });
-
-            if !body_available && seen.insert(header_tip.hash) {
-                if let Some(fork_height) = fork_height {
-                    tips.push(ChainTipInfo {
-                        height: header_tip.height,
-                        hash: header_tip.hash,
-                        branch_len: header_tip.height.0.saturating_sub(fork_height.0),
-                        status: ChainTipStatus::HeadersOnly,
+            // Look for the fork only when this tip is reported. When the body is
+            // available, which is the steady state, the search below never runs.
+            if !body_available {
+                // The best chain has no block above its own tip, so no header above
+                // it can be the fork. The projection is ordered by height, so this
+                // skips that whole range instead of reading the database once per
+                // header in it. Headers-first sync makes that range the sync gap,
+                // which the header chain bounds at `MAX_NON_FINALIZED_NODES_V1`.
+                let fork_height = selected_headers
+                    .iter()
+                    .rev()
+                    .skip_while(|header| header.height > best_height)
+                    .find_map(|header| {
+                        (best_chain_hash_at_height(best_chain, db, header.height)
+                            == Some(header.hash))
+                        .then_some(header.height)
                     });
+
+                // A header chain that shares no block with the best chain has no
+                // branch length to report, so it is left out.
+                if let Some(fork_height) = fork_height {
+                    if seen.insert(header_tip.hash) {
+                        tips.push(ChainTipInfo {
+                            height: header_tip.height,
+                            hash: header_tip.hash,
+                            branch_len: header_tip.height.0.saturating_sub(fork_height.0),
+                            status: ChainTipStatus::HeadersOnly,
+                        });
+                    }
                 }
             }
         }

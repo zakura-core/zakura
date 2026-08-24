@@ -1063,6 +1063,7 @@ where
                 let request = zakura_consensus::Request::Prepare {
                     block: Arc::new(block),
                     work_id: Some(template.work_id().clone()),
+                    source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
                 };
                 if let Err(error) = verifier.oneshot(request).await {
                     tracing::debug!(?error, "background mining candidate preparation failed");

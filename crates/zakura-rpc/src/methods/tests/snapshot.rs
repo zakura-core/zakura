@@ -1257,6 +1257,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .as_ref()
         .zcash_deserialize_into()
         .expect("coinbase bytes are valid");
+    let server_template = get_block_template.clone();
 
     snapshot_rpc_getblocktemplate(
         "basic",
@@ -1346,6 +1347,21 @@ pub async fn test_mining_rpcs<State, ReadState>(
         None,
     );
 
+    let mut server_preparation_verifier = mock_block_verifier_router.clone();
+    rpc_mock_state_verifier.prepare_template_in_background(&server_template);
+    server_preparation_verifier
+        .expect_request_that(|request| {
+            matches!(
+                request,
+                zakura_consensus::Request::Prepare {
+                    source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
+                    ..
+                }
+            )
+        })
+        .await
+        .respond(Hash::from([0; 32]));
+
     let get_block_template_fut =
         rpc_mock_state_verifier.get_block_template(Some(GetBlockTemplateParameters {
             mode: GetBlockTemplateRequestMode::Proposal,
@@ -1355,7 +1371,15 @@ pub async fn test_mining_rpcs<State, ReadState>(
 
     let mock_block_verifier_router_request_handler = async move {
         mock_block_verifier_router
-            .expect_request_that(|req| matches!(req, zakura_consensus::Request::Prepare { .. }))
+            .expect_request_that(|request| {
+                matches!(
+                    request,
+                    zakura_consensus::Request::Prepare {
+                        source: zakura_consensus::PreparedCandidateSource::ClientProposal,
+                        ..
+                    }
+                )
+            })
             .await
             .respond(Hash::from([0; 32]));
     };

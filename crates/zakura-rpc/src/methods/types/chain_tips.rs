@@ -17,8 +17,8 @@ pub enum ChainTipStatusResponse {
     /// A fully validated tip that is not part of the best chain.
     ValidFork,
 
-    /// The header chain is ahead of the best chain, and the blocks for this tip are
-    /// not available yet.
+    /// The node selected this header tip, but not all block bodies for its branch
+    /// are available.
     HeadersOnly,
 
     /// This branch contains at least one invalid block.

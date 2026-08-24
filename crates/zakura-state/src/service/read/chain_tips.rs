@@ -16,8 +16,8 @@
 //! zcashd remembers every stale tip it has ever seen, because its block index is
 //! never pruned. Zakura drops a fork once it is below the finalized tip, so this
 //! function reports the tips that are still live: the best chain, the non-finalized
-//! forks, recently invalidated branches, and the header chain when headers-first
-//! sync is ahead of the block tip.
+//! forks, recently invalidated branches, and the selected header chain when some
+//! block bodies are unavailable.
 //!
 //! [1]: crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS
 //! [2]: crate::constants::MAX_INVALIDATED_BLOCKS
@@ -28,6 +28,7 @@ use std::{
 };
 
 use zakura_chain::block::{self, Height};
+use zakura_header_chain::Frontier;
 
 use crate::{
     service::{
@@ -52,11 +53,11 @@ pub enum ChainTipStatus {
     /// A fully validated tip that is not part of the best chain.
     ValidFork,
 
-    /// The header chain is ahead of the best chain, and the blocks for this tip are
-    /// not available yet.
+    /// The node selected this header tip, but not all block bodies for its branch
+    /// are available.
     HeadersOnly,
 
-    /// This branch was invalidated, either by consensus or by `invalidateblock`.
+    /// This branch was invalidated by `invalidateblock`.
     Invalid,
 }
 
@@ -80,9 +81,8 @@ pub struct ChainTipInfo {
 /// Returns the tip of every chain this node currently tracks, in descending height
 /// order.
 ///
-/// `header_tip` is the tip of the header chain, when headers-first sync is running
-/// and has selected one. Pass `None` to omit header-only tips; a header tip at or
-/// below the best chain tip is ignored, because its blocks are already available.
+/// `selected_headers` is the selected header chain, when headers-first sync is
+/// running. Pass `None` to omit header-only tips.
 ///
 /// The best chain tip is always reported, and is always the only [`Active`] entry.
 /// Returns an empty list if the node has no blocks at all.
@@ -91,7 +91,7 @@ pub struct ChainTipInfo {
 pub fn chain_tips(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
-    header_tip: Option<(Height, block::Hash)>,
+    selected_headers: Option<&[Frontier]>,
 ) -> Vec<ChainTipInfo> {
     let best_chain = non_finalized_state.best_chain();
 
@@ -189,26 +189,44 @@ pub fn chain_tips(
             continue;
         }
 
-        let fork_height = invalidated_fork_height(root_block, &invalidated_by_hash);
+        let fork_height =
+            invalidated_fork_height(root_block, &invalidated_by_hash, &chains, best_chain, db);
 
         tips.push(ChainTipInfo {
             height: tip_block.height,
             hash: tip_block.hash,
-            branch_len: tip_block.height.0.saturating_sub(fork_height),
+            branch_len: tip_block.height.0.saturating_sub(fork_height.0),
             status: ChainTipStatus::Invalid,
         });
     }
 
-    // The header chain, when it is ahead of the blocks we have. Headers build on the
-    // best chain, so the fork point is the best chain tip.
-    if let Some((height, hash)) = header_tip {
-        if height > best_height && seen.insert(hash) {
-            tips.push(ChainTipInfo {
-                height,
-                hash,
-                branch_len: height.0.saturating_sub(best_height.0),
-                status: ChainTipStatus::HeadersOnly,
+    // The selected header chain can have more work at the same or a lower height.
+    // Use its ancestry and block availability instead of comparing tip heights.
+    if let Some(selected_headers) = selected_headers {
+        if let Some(header_tip) = selected_headers.last().copied() {
+            let body_available = chains
+                .iter()
+                .any(|chain| chain.contains_block_hash(header_tip.hash))
+                || db.height(header_tip.hash).is_some()
+                || invalidated_branches
+                    .values()
+                    .any(|blocks| blocks.iter().any(|block| block.hash == header_tip.hash));
+
+            let fork_height = selected_headers.iter().rev().find_map(|header| {
+                (best_chain_hash_at_height(best_chain, db, header.height) == Some(header.hash))
+                    .then_some(header.height)
             });
+
+            if !body_available && seen.insert(header_tip.hash) {
+                if let Some(fork_height) = fork_height {
+                    tips.push(ChainTipInfo {
+                        height: header_tip.height,
+                        hash: header_tip.hash,
+                        branch_len: header_tip.height.0.saturating_sub(fork_height.0),
+                        status: ChainTipStatus::HeadersOnly,
+                    });
+                }
+            }
         }
     }
 
@@ -233,7 +251,10 @@ pub fn chain_tips(
 fn invalidated_fork_height(
     root_block: &ContextuallyVerifiedBlock,
     invalidated_by_hash: &HashMap<block::Hash, (Height, block::Hash)>,
-) -> u32 {
+    chains: &[&Arc<Chain>],
+    best_chain: Option<&Arc<Chain>>,
+    db: &ZakuraDb,
+) -> Height {
     let mut root_height = root_block.height;
     let mut parent = root_block.block.header.previous_block_hash;
 
@@ -248,7 +269,28 @@ fn invalidated_fork_height(
         parent = next_parent;
     }
 
-    root_height.0.saturating_sub(1)
+    let parent_height = Height(root_height.0.saturating_sub(1));
+
+    if best_chain_hash_at_height(best_chain, db, parent_height) == Some(parent) {
+        return parent_height;
+    }
+
+    chains
+        .iter()
+        .find(|chain| chain.contains_block_hash(parent))
+        .map(|chain| fork_height(chain, best_chain))
+        .unwrap_or(parent_height)
+}
+
+/// Returns the active block hash at `height`.
+fn best_chain_hash_at_height(
+    best_chain: Option<&Arc<Chain>>,
+    db: &ZakuraDb,
+    height: Height,
+) -> Option<block::Hash> {
+    best_chain
+        .and_then(|chain| chain.hash_by_height(height))
+        .or_else(|| db.hash(height))
 }
 
 /// Returns the height of the highest block that `chain` shares with `best_chain`.

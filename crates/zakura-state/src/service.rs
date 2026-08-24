@@ -3100,25 +3100,20 @@ impl Service<ReadRequest> for ReadStateService {
 
             // Used by the getchaintips RPC.
             ReadRequest::ChainTips => {
-                // # Correctness
-                //
-                // The header chain and the non-finalized chains are read separately, so
-                // the header tip can advance between the two reads. That can only make a
-                // headers-only tip slightly stale, and `read::chain_tips` drops any header
-                // tip that is not above the best chain tip.
                 let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
-                let header_tip = match header_chain_reader {
+                let (non_finalized_state, selected_headers) = match header_chain_reader {
                     Some(reader) => {
-                        let tip = reader.selected_tip()?;
-                        Some((tip.height, tip.hash))
+                        let (non_finalized_state, selected_headers) = reader
+                            .with_selected_projection(|| state.latest_non_finalized_state())?;
+                        (non_finalized_state, Some(selected_headers))
                     }
-                    None => None,
+                    None => (state.latest_non_finalized_state(), None),
                 };
 
                 Ok(ReadResponse::ChainTips(read::chain_tips(
-                    &state.latest_non_finalized_state(),
+                    &non_finalized_state,
                     &state.db,
-                    header_tip,
+                    selected_headers.as_deref(),
                 )))
             }
 

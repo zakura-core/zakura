@@ -1866,9 +1866,9 @@ pub enum ReadRequest {
     /// height order.
     ///
     /// This covers the best chain, the non-finalized forks, recently invalidated
-    /// branches, and the header chain when headers-first sync is ahead of the block
-    /// tip. Its cost is bounded by the number of tracked forks, not by the height of
-    /// the chain.
+    /// branches, and the selected header chain when some block bodies are
+    /// unavailable. Its cost is bounded by the number of tracked forks, not by the
+    /// height of the chain.
     ///
     /// Used by the `getchaintips` RPC.
     ChainTips,

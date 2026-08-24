@@ -16,6 +16,7 @@ use zakura_chain::{
     transaction,
     value_balance::ValueBalance,
 };
+use zakura_header_chain::Frontier;
 
 use zakura_test::{
     prelude::Result,
@@ -1760,6 +1761,53 @@ fn chain_tips_report_repeated_invalidations_as_one_branch() {
     );
 }
 
+/// An invalid branch keeps its fork point when a different branch becomes active.
+#[test]
+fn chain_tips_measure_invalid_branch_from_current_best_chain() {
+    let _init_guard = zakura_test::init();
+
+    let block1: Arc<Block> = Arc::new(Mainnet.test_block(653599, 583999).unwrap());
+    let block2a = block1.make_fake_child().set_work(30);
+    let block3a = block2a.make_fake_child().set_work(30);
+    let block4a = block3a.make_fake_child().set_work(30);
+    let block2b = block1.make_fake_child().set_work(10);
+    let block3b = block2b.make_fake_child().set_work(10);
+    let block4b = block3b.make_fake_child().set_work(100);
+
+    let (mut state, finalized_state) = new_chain_tips_test_state(&Mainnet);
+    state
+        .commit_new_chain(block1.clone().prepare(), &finalized_state)
+        .expect("fake root block should commit to an empty non-finalized state");
+    for block in [&block2a, &block3a, &block4a, &block2b, &block3b] {
+        state
+            .commit_block(block.clone().prepare(), &finalized_state)
+            .expect("each block should commit to its parent chain");
+    }
+
+    state
+        .invalidate_block(block4a.hash())
+        .expect("the old best chain tip should be invalidated");
+    state
+        .commit_block(block4b.clone().prepare(), &finalized_state)
+        .expect("the higher-work fork should become active");
+
+    let tips = chain_tips(&state, &finalized_state.db, None);
+    let invalid_tip = tips
+        .iter()
+        .find(|tip| tip.hash == block4a.hash())
+        .expect("the invalidated tip should be reported");
+
+    assert_eq!(invalid_tip.status, ChainTipStatus::Invalid);
+    assert_eq!(
+        invalid_tip.branch_len, 3,
+        "the invalid branch should be measured from block1, its fork with the current best chain"
+    );
+    assert!(
+        tips.iter().all(|tip| tip.hash != block3a.hash()),
+        "the invalid tip's parent has a known successor, so it is not a tip"
+    );
+}
+
 /// A header chain that is ahead of the block tip is reported as `headers-only`.
 #[test]
 fn chain_tips_report_a_header_tip_above_the_block_tip() {
@@ -1772,14 +1820,18 @@ fn chain_tips_report_a_header_tip_above_the_block_tip() {
 
     let (mut state, finalized_state) = new_chain_tips_test_state(&Mainnet);
     state
-        .commit_new_chain(block1.prepare(), &finalized_state)
+        .commit_new_chain(block1.clone().prepare(), &finalized_state)
         .expect("fake root block should commit to an empty non-finalized state");
     state
         .commit_block(block2.clone().prepare(), &finalized_state)
         .expect("child block should extend the root chain");
 
-    let header_tip = (header3.coinbase_height().unwrap(), header3.hash());
-    let tips = chain_tips(&state, &finalized_state.db, Some(header_tip));
+    let selected_headers = [
+        Frontier::new(block1.coinbase_height().unwrap(), block1.hash()),
+        Frontier::new(block2.coinbase_height().unwrap(), block2.hash()),
+        Frontier::new(header3.coinbase_height().unwrap(), header3.hash()),
+    ];
+    let tips = chain_tips(&state, &finalized_state.db, Some(&selected_headers));
 
     assert_eq!(
         tips,
@@ -1801,10 +1853,9 @@ fn chain_tips_report_a_header_tip_above_the_block_tip() {
     );
 }
 
-/// A header tip that is not above the block tip is not reported: those blocks are
-/// already available, so there is no headers-only tip.
+/// A selected header tip with an available body is not reported again.
 #[test]
-fn chain_tips_ignore_a_header_tip_at_or_below_the_block_tip() {
+fn chain_tips_ignore_a_header_tip_with_an_available_body() {
     let _init_guard = zakura_test::init();
 
     let block1: Arc<Block> = Arc::new(Mainnet.test_block(653599, 583999).unwrap());
@@ -1822,13 +1873,19 @@ fn chain_tips_ignore_a_header_tip_at_or_below_the_block_tip() {
     let at_tip = chain_tips(
         &state,
         &finalized_state.db,
-        Some((block2.coinbase_height().unwrap(), block2.hash())),
+        Some(&[
+            Frontier::new(block1.coinbase_height().unwrap(), block1.hash()),
+            Frontier::new(block2.coinbase_height().unwrap(), block2.hash()),
+        ]),
     );
-    // The header chain is behind the block chain.
+    // The selected header tip is an active-chain ancestor.
     let below_tip = chain_tips(
         &state,
         &finalized_state.db,
-        Some((block1.coinbase_height().unwrap(), block1.hash())),
+        Some(&[Frontier::new(
+            block1.coinbase_height().unwrap(),
+            block1.hash(),
+        )]),
     );
 
     let expected = vec![ChainTipInfo {
@@ -1845,5 +1902,82 @@ fn chain_tips_ignore_a_header_tip_at_or_below_the_block_tip() {
     assert_eq!(
         below_tip, expected,
         "a header tip below the block tip should not add a headers-only tip"
+    );
+}
+
+/// A shorter selected header fork is reported when its block body is unavailable.
+#[test]
+fn chain_tips_report_a_shorter_higher_work_header_fork() {
+    let _init_guard = zakura_test::init();
+
+    let block1: Arc<Block> = Arc::new(Mainnet.test_block(653599, 583999).unwrap());
+    let block2a = block1.make_fake_child().set_work(10);
+    let block3a = block2a.make_fake_child().set_work(10);
+    let header2b = block1.make_fake_child().set_work(100);
+
+    let (mut state, finalized_state) = new_chain_tips_test_state(&Mainnet);
+    state
+        .commit_new_chain(block1.clone().prepare(), &finalized_state)
+        .expect("fake root block should commit to an empty non-finalized state");
+    state
+        .commit_block(block2a.prepare(), &finalized_state)
+        .expect("the first child should extend the root chain");
+    state
+        .commit_block(block3a.clone().prepare(), &finalized_state)
+        .expect("the active tip should extend the block chain");
+
+    let selected_headers = [
+        Frontier::new(block1.coinbase_height().unwrap(), block1.hash()),
+        Frontier::new(header2b.coinbase_height().unwrap(), header2b.hash()),
+    ];
+    let tips = chain_tips(&state, &finalized_state.db, Some(&selected_headers));
+    let header_tip = tips
+        .iter()
+        .find(|tip| tip.hash == header2b.hash())
+        .expect("the selected header fork should be reported");
+
+    assert_eq!(header_tip.status, ChainTipStatus::HeadersOnly);
+    assert_eq!(header_tip.branch_len, 1);
+}
+
+/// A taller selected header fork is measured from its fork with the active chain.
+#[test]
+fn chain_tips_measure_a_header_fork_from_the_active_chain() {
+    let _init_guard = zakura_test::init();
+
+    let block1: Arc<Block> = Arc::new(Mainnet.test_block(653599, 583999).unwrap());
+    let block2a = block1.make_fake_child().set_work(10);
+    let block3a = block2a.make_fake_child().set_work(10);
+    let header2b = block1.make_fake_child().set_work(20);
+    let header3b = header2b.make_fake_child().set_work(20);
+    let header4b = header3b.make_fake_child().set_work(20);
+
+    let (mut state, finalized_state) = new_chain_tips_test_state(&Mainnet);
+    state
+        .commit_new_chain(block1.clone().prepare(), &finalized_state)
+        .expect("fake root block should commit to an empty non-finalized state");
+    state
+        .commit_block(block2a.prepare(), &finalized_state)
+        .expect("the first child should extend the root chain");
+    state
+        .commit_block(block3a.prepare(), &finalized_state)
+        .expect("the active tip should extend the block chain");
+
+    let selected_headers = [
+        Frontier::new(block1.coinbase_height().unwrap(), block1.hash()),
+        Frontier::new(header2b.coinbase_height().unwrap(), header2b.hash()),
+        Frontier::new(header3b.coinbase_height().unwrap(), header3b.hash()),
+        Frontier::new(header4b.coinbase_height().unwrap(), header4b.hash()),
+    ];
+    let tips = chain_tips(&state, &finalized_state.db, Some(&selected_headers));
+    let header_tip = tips
+        .iter()
+        .find(|tip| tip.hash == header4b.hash())
+        .expect("the selected header fork should be reported");
+
+    assert_eq!(header_tip.status, ChainTipStatus::HeadersOnly);
+    assert_eq!(
+        header_tip.branch_len, 3,
+        "the header branch should be measured from block1, not the active tip"
     );
 }

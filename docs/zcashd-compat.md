@@ -308,7 +308,7 @@ height of the chain.
 The two nodes report different tips. zcashd never prunes its block index, so it
 lists every stale tip it has ever seen. Zakura lists the tips that are still
 live: the best chain, the non-finalized forks, recently invalidated branches,
-and the header chain when headers-first sync is ahead of the block tip. Zakura
+and the selected header chain when some block bodies are unavailable. Zakura
 does not return zcashd's `valid-headers` or `unknown` statuses. Call the sidecar
 only if you need the full history of stale tips.
 

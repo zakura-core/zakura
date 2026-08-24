@@ -114,6 +114,13 @@ impl BlockAdmission {
     }
 
     /// Waits until state admits or rejects the block.
+    ///
+    /// # Correctness
+    ///
+    /// This future never resolves when neither `admit` nor `reject` runs. The state rejects
+    /// duplicates, queue replacements, and expired blocks, but a verifier error before the state
+    /// receives the block leaves the admission pending. Callers must await this future under a
+    /// cancellation path, such as a `select!` arm that also awaits verification.
     pub async fn wait(&self) -> bool {
         loop {
             let notified = self.0.changed.notified();

@@ -56,6 +56,9 @@ use downloads::{Downloads as BlockDownloads, GossipedTipChildHeightMismatch};
 ///
 /// If the response takes longer than this time, it will be cancelled,
 /// and the peer might be disconnected.
+///
+/// This constant must exceed the 15-second `PENDING_BLOCK_WAIT` in `zakura-rpc`, so that a peer
+/// waiting for an early-advertised block reaches that wait's own timeout first.
 pub const MAX_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(18);
 
 /// The maximum response time for requests that do not wait for a mined-block commit.

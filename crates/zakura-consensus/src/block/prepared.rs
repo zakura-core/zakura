@@ -56,6 +56,20 @@ impl PreparedCandidateCache {
         work_id: Option<&str>,
         network: &Network,
     ) -> Option<SemanticallyVerifiedBlock> {
+        // Deriving the candidate bytes costs a full block serialization, so skip it when the
+        // cache holds no entry that could match.
+        {
+            let mut inner = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.prune_expired();
+            if inner.entries.is_empty() {
+                metrics::counter!("mining.prepared_cache.misses").increment(1);
+                return None;
+            }
+        }
+
         let immutable_bytes = immutable_candidate_bytes(block, network);
         let fingerprint = fingerprint(&immutable_bytes);
         let mut inner = self

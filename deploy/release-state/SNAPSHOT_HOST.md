@@ -22,6 +22,33 @@ The installer stamps the profile into `/opt/zakura-release-state/profile.env`, w
 the publisher reads, so the host identity and liveness checks describe the host they
 actually run on.
 
+### Seeding the first grid
+
+A generator whose pointer bundle predates the frontier grid has nothing to resume
+from, so its first export walks from genesis — the ~81 minute case. Worse, the
+importer requires each bundle's grid to be a byte prefix-extension of the one the
+repository currently pins, and a fresh walk only reproduces that if the cost model,
+the exporter, and the chain data all agree exactly.
+
+Seeding removes both problems. Carried entries are re-checked against this
+database's authenticated roots and then written verbatim, so the prefix matches by
+construction rather than by coincidence:
+
+```sh
+curl -sSL -o /tmp/pub.crate \
+  https://static.crates.io/crates/valargroup-zakura-assets/valargroup-zakura-assets-0.3453771.0.crate
+tar xzOf /tmp/pub.crate \
+  valargroup-zakura-assets-0.3453771.0/src/mainnet-frontier-grid.bin \
+  > /opt/zakura-release-state/seed-frontier-grid.bin
+
+RELEASE_STATE_PREVIOUS_GRID=/opt/zakura-release-state/seed-frontier-grid.bin \
+  systemctl start zakura-release-state.service
+```
+
+Use the version the workspace `Cargo.toml` pins, since that is the grid the importer
+will compare against. Only the first run needs it; afterwards the published bundle
+carries a grid and the pointer path resumes on its own.
+
 ### R2 credentials
 
 The unit no longer bakes a secrets wrapper into `ExecStart`. Either mechanism works,

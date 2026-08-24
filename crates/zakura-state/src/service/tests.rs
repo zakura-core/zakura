@@ -31,12 +31,51 @@ use crate::{
         StateService,
     },
     tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
-    BoxError, CheckpointVerifiedBlock, Config, HistoricalTreeUnavailable, PruningConfig, Request,
-    Response, SemanticallyVerifiedBlock, StateInitError, StorageMode, ValidateContextError,
-    CHAIN_TIP_UPDATE_WAIT_LIMIT, MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    BlockAdmission, BoxError, CheckpointVerifiedBlock, Config, HistoricalTreeUnavailable,
+    PruningConfig, Request, Response, SemanticallyVerifiedBlock, StateInitError, StorageMode,
+    ValidateContextError, CHAIN_TIP_UPDATE_WAIT_LIMIT, MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+#[test]
+fn queued_duplicate_replaces_the_old_admission() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let runtime = Runtime::new().expect("the Tokio runtime starts");
+    let (mut state_service, _, _, _) = runtime
+        .block_on(StateService::new(
+            Config::ephemeral(),
+            &network,
+            Height::MAX,
+            0,
+        ))
+        .expect("ephemeral state initialization succeeds");
+    let block = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("the mainnet height-one block is valid"),
+    )
+    .prepare();
+
+    let old_admission = BlockAdmission::pending();
+    let old_response = state_service
+        .queue_and_commit_to_non_finalized_state(block.clone(), Some(old_admission.clone()));
+    let new_admission = BlockAdmission::pending();
+    let _new_response = state_service
+        .queue_and_commit_to_non_finalized_state(block.clone(), Some(new_admission.clone()));
+
+    assert!(!runtime.block_on(old_admission.wait()));
+    assert!(old_response
+        .blocking_recv()
+        .expect("the replaced request receives a response")
+        .is_err());
+    let queued = state_service
+        .non_finalized_state_queued_blocks
+        .get_mut(&block.hash)
+        .expect("the newer request remains queued");
+    assert_eq!(queued.2.as_ref(), Some(&new_admission));
+}
 
 fn prepared_relay_test_state() -> (
     Network,

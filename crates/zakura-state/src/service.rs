@@ -919,7 +919,7 @@ impl StateService {
     fn queue_and_commit_to_non_finalized_state(
         &mut self,
         semantically_verified: SemanticallyVerifiedBlock,
-        admission: Option<BlockAdmission>,
+        mut admission: Option<BlockAdmission>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
         let parent_hash = semantically_verified.block.header.previous_block_hash;
@@ -966,16 +966,17 @@ impl StateService {
         // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
         // has been queued but not yet committed to the state fails the older request and replaces
         // it with the newer request.
-        let rsp_rx = if let Some((_, old_rsp_tx, _)) = self
+        let rsp_rx = if let Some((_, old_rsp_tx, old_admission)) = self
             .non_finalized_state_queued_blocks
             .get_mut(&semantically_verified.hash)
         {
-            if let Some(admission) = admission {
-                admission.reject();
-            }
             tracing::debug!("replacing older queued request with new request");
             let (mut rsp_tx, rsp_rx) = oneshot::channel();
             std::mem::swap(old_rsp_tx, &mut rsp_tx);
+            std::mem::swap(old_admission, &mut admission);
+            if let Some(admission) = admission {
+                admission.reject();
+            }
             let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
                 Some(semantically_verified.hash.into()),
                 KnownBlock::Queue,

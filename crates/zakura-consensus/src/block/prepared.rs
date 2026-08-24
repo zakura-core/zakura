@@ -106,6 +106,15 @@ impl PreparedCandidateCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.prune_expired();
+        if work_id.is_some_and(|work_id| {
+            inner.entries.iter().any(|entry| {
+                entry.work_id.as_deref() == Some(work_id)
+                    && entry.immutable_bytes != immutable_bytes
+            })
+        }) {
+            metrics::counter!("mining.prepared_cache.work_id_conflicts").increment(1);
+            return;
+        }
         let existing_work_id = if work_id.is_none() {
             inner
                 .entries
@@ -273,6 +282,12 @@ mod tests {
             .lookup(&changed_difficulty, Some("work"), &network)
             .is_none());
 
+        let mut changed_merkle_root = original.clone();
+        Arc::make_mut(&mut changed_merkle_root.header).merkle_root.0[0] ^= 1;
+        assert!(cache
+            .lookup(&changed_merkle_root, Some("work"), &network)
+            .is_none());
+
         let mut changed_transactions = original;
         changed_transactions
             .transactions
@@ -283,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn inserting_a_reused_work_id_replaces_the_old_candidate() {
+    fn inserting_a_reused_work_id_does_not_replace_the_old_candidate() {
         let network = Network::Mainnet;
         let original = test_block();
         let mut replacement = original.clone();
@@ -303,8 +318,8 @@ mod tests {
             &network,
         );
 
-        assert!(cache.lookup(&replacement, Some("work"), &network).is_some());
-        assert!(cache.lookup(&original, Some("work"), &network).is_none());
+        assert!(cache.lookup(&replacement, Some("work"), &network).is_none());
+        assert!(cache.lookup(&original, Some("work"), &network).is_some());
         assert_eq!(
             cache
                 .0

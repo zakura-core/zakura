@@ -2,7 +2,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -84,6 +87,7 @@ enum PendingStatus {
 
 #[derive(Debug)]
 struct PendingBlock {
+    owner_id: u64,
     status: watch::Sender<PendingStatus>,
 }
 
@@ -92,6 +96,7 @@ struct PendingBlock {
 struct PendingBlockRegistryInner {
     entries: Mutex<HashMap<block::Hash, PendingBlock>>,
     wait_permits: Arc<Semaphore>,
+    next_owner_id: AtomicU64,
 }
 
 /// Holds early-advertised block bodies until their contextual commits finish.
@@ -103,15 +108,41 @@ impl Default for PendingBlockRegistry {
         Self(Arc::new(PendingBlockRegistryInner {
             entries: Mutex::new(HashMap::new()),
             wait_permits: Arc::new(Semaphore::new(MAX_PENDING_BLOCK_WAITS)),
+            next_owner_id: AtomicU64::new(1),
         }))
+    }
+}
+
+/// Owns one pending-block registry entry.
+#[derive(Debug)]
+pub(crate) struct PendingBlockRegistration {
+    registry: PendingBlockRegistry,
+    hash: block::Hash,
+    owner_id: u64,
+    resolved: bool,
+}
+
+impl PendingBlockRegistration {
+    /// Resolves this registration and wakes its peer waiters.
+    pub(crate) fn resolve(mut self, result: Result<Arc<block::Block>, ()>) {
+        self.registry.resolve(self.hash, self.owner_id, result);
+        self.resolved = true;
+    }
+}
+
+impl Drop for PendingBlockRegistration {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.registry.resolve(self.hash, self.owner_id, Err(()));
+        }
     }
 }
 
 impl PendingBlockRegistry {
     /// Inserts a block before its early inventory is sent.
     ///
-    /// Returns false when the bounded registry is full.
-    pub fn insert(&self, block: Arc<block::Block>) -> bool {
+    /// Returns no registration when the hash already has an owner or the registry is full.
+    pub(crate) fn insert(&self, block: Arc<block::Block>) -> Option<PendingBlockRegistration> {
         let hash = block.hash();
         let mut entries = self
             .0
@@ -119,29 +150,41 @@ impl PendingBlockRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if entries.contains_key(&hash) {
-            return false;
+            return None;
         }
         if entries.len() >= MAX_PENDING_BLOCKS {
             metrics::counter!("mining.pending_registry.saturated").increment(1);
-            return false;
+            return None;
         }
 
+        let owner_id = self.0.next_owner_id.fetch_add(1, Ordering::Relaxed);
         let (status, _receiver) = watch::channel(PendingStatus::Waiting);
-        entries.insert(hash, PendingBlock { status });
-        true
+        entries.insert(hash, PendingBlock { owner_id, status });
+        Some(PendingBlockRegistration {
+            registry: self.clone(),
+            hash,
+            owner_id,
+            resolved: false,
+        })
     }
 
-    /// Resolves peer waiters and removes a terminal entry.
-    pub fn resolve(&self, hash: block::Hash, result: Result<Arc<block::Block>, ()>) {
-        let entry = self
+    fn resolve(&self, hash: block::Hash, owner_id: u64, result: Result<Arc<block::Block>, ()>) {
+        let mut entries = self
             .0
             .entries
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&hash);
-        let Some(entry) = entry else {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !entries
+            .get(&hash)
+            .is_some_and(|entry| entry.owner_id == owner_id)
+        {
             return;
-        };
+        }
+        let entry = entries
+            .remove(&hash)
+            .expect("entry exists because its owner matched under the same lock");
+        drop(entries);
+
         let status = match result {
             Ok(block) => PendingStatus::Committed(block),
             Err(()) => PendingStatus::Failed,
@@ -161,21 +204,17 @@ impl PendingBlockRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&hash)
             .map(|entry| entry.status.subscribe());
-        let wait_permit = status.as_ref().and_then(|_| {
-            self.0
-                .wait_permits
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| {
-                    metrics::counter!("mining.pending_peer_wait.saturated").increment(1);
-                })
-                .ok()
-        });
+        let wait_permits = status.as_ref().map(|_| self.0.wait_permits.clone());
         let deadline = tokio::time::Instant::now() + PENDING_BLOCK_WAIT;
 
         async move {
             let mut status = status?;
-            let _wait_permit: OwnedSemaphorePermit = wait_permit?;
+            let _wait_permit: OwnedSemaphorePermit = wait_permits?
+                .try_acquire_owned()
+                .map_err(|_| {
+                    metrics::counter!("mining.pending_peer_wait.saturated").increment(1);
+                })
+                .ok()?;
             let start = std::time::Instant::now();
             let result = tokio::time::timeout_at(deadline, async {
                 loop {
@@ -297,14 +336,17 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
+        let registration = registry
+            .insert(block.clone())
+            .expect("the registry accepts the block");
+        assert!(registry.insert(block.clone()).is_none());
 
         let wait = tokio::spawn({
             let registry = registry.clone();
             async move { registry.wait(hash).await }
         });
         tokio::task::yield_now().await;
-        registry.resolve(hash, Ok(block.clone()));
+        registration.resolve(Ok(block.clone()));
 
         assert_eq!(wait.await.expect("wait task succeeds"), Some(block));
     }
@@ -314,10 +356,12 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
+        let registration = registry
+            .insert(block.clone())
+            .expect("the registry accepts the block");
 
         let wait = registry.wait(hash);
-        registry.resolve(hash, Ok(block.clone()));
+        registration.resolve(Ok(block.clone()));
 
         assert_eq!(wait.await, Some(block));
     }
@@ -327,14 +371,16 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block));
+        let registration = registry
+            .insert(block)
+            .expect("the registry accepts the block");
 
         let wait = tokio::spawn({
             let registry = registry.clone();
             async move { registry.wait(hash).await }
         });
         tokio::task::yield_now().await;
-        registry.resolve(hash, Err(()));
+        registration.resolve(Err(()));
 
         assert_eq!(wait.await.expect("wait task succeeds"), None);
     }
@@ -344,16 +390,27 @@ mod tests {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
+        let registration = registry
+            .insert(block.clone())
+            .expect("the registry accepts the block");
 
         let waits: Vec<_> = (0..MAX_PENDING_BLOCK_WAITS)
-            .map(|_| registry.wait(hash))
+            .map(|_| {
+                let registry = registry.clone();
+                tokio::spawn(async move { registry.wait(hash).await })
+            })
             .collect();
+        while registry.0.wait_permits.available_permits() > 0 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(registry.wait(hash).await, None);
 
-        drop(waits);
+        for wait in waits {
+            wait.abort();
+            let _ = wait.await;
+        }
         let wait = registry.wait(hash);
-        registry.resolve(hash, Ok(block.clone()));
+        registration.resolve(Ok(block.clone()));
         assert_eq!(wait.await, Some(block));
     }
 
@@ -361,15 +418,21 @@ mod tests {
     fn pending_registry_is_bounded() {
         let registry = PendingBlockRegistry::default();
         let original = test_block();
+        let mut registrations = Vec::new();
         for nonce in 0..MAX_PENDING_BLOCKS {
             let mut block = (*original).clone();
             let nonce = u8::try_from(nonce).expect("the registry bound fits in u8");
             Arc::make_mut(&mut block.header).nonce = [nonce; 32].into();
-            assert!(registry.insert(Arc::new(block)));
+            registrations.push(
+                registry
+                    .insert(Arc::new(block))
+                    .expect("the registry has capacity"),
+            );
         }
 
         let mut overflow = (*original).clone();
         Arc::make_mut(&mut overflow.header).nonce = [u8::MAX; 32].into();
-        assert!(!registry.insert(Arc::new(overflow)));
+        assert!(registry.insert(Arc::new(overflow)).is_none());
+        drop(registrations);
     }
 }

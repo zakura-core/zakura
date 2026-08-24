@@ -52,11 +52,14 @@ mod tests;
 
 use downloads::{Downloads as BlockDownloads, GossipedTipChildHeightMismatch};
 
-/// The maximum amount of time an inbound service response can take.
+/// The maximum response time for block-body requests that can wait for a mined-block commit.
 ///
 /// If the response takes longer than this time, it will be cancelled,
 /// and the peer might be disconnected.
 pub const MAX_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(18);
+
+/// The maximum response time for requests that do not wait for a mined-block commit.
+const DEFAULT_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(5);
 
 /// The number of bytes the [`Inbound`] service will queue in response to a single block or
 /// transaction request, before ignoring any additional block or transaction IDs in that request.
@@ -197,15 +200,11 @@ async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<bl
     }
 }
 
-/// Returns a committed block from any active chain or waits for its pending commit.
-async fn block_by_hash_or_pending(
+/// Returns a committed block from any active chain.
+async fn block_by_hash(
     mut state: State,
-    pending_blocks: PendingBlockRegistry,
     hash: block::Hash,
 ) -> Result<Option<Arc<Block>>, zn::BoxError> {
-    // Subscribe before the state lookup. A commit can remove the registry entry while state
-    // answers this request.
-    let pending_wait = pending_blocks.wait(hash);
     let response = state
         .ready()
         .await?
@@ -214,7 +213,7 @@ async fn block_by_hash_or_pending(
 
     match response {
         zs::Response::Block(Some(block)) => Ok(Some(block)),
-        zs::Response::Block(None) => Ok(pending_wait.await),
+        zs::Response::Block(None) => Ok(None),
         _ => unreachable!("wrong response from state"),
     }
 }
@@ -597,7 +596,16 @@ impl Service<zn::Request> for Inbound {
             }
         };
 
-        match req {
+        let response_timeout = if matches!(
+            &req,
+            zn::Request::BlocksByHash(_) | zn::Request::BlocksByHashFrom { .. }
+        ) {
+            MAX_INBOUND_RESPONSE_TIME
+        } else {
+            DEFAULT_INBOUND_RESPONSE_TIME
+        };
+
+        let response = match req {
             zn::Request::Peers => {
                 // # Security
                 //
@@ -639,28 +647,38 @@ impl Service<zn::Request> for Inbound {
                 async move {
                     let mut blocks: Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
-                    let mut lookups = FuturesUnordered::new();
+                    let mut state_lookup_bytes = 0;
+                    let mut pending_lookups = FuturesUnordered::new();
+                    let mut lookup_results = Vec::new();
 
                     for (index, &hash) in hashes.iter().take(GETDATA_MAX_BLOCK_COUNT).enumerate() {
-                        let state = state.clone();
-                        let pending_blocks = pending_blocks.clone();
-                        lookups.push(async move {
-                            let block =
-                                block_by_hash_or_pending(state, pending_blocks, hash).await?;
-                            Ok::<_, zn::BoxError>((index, hash, block))
-                        });
+                        if state_lookup_bytes >= GETDATA_SENT_BYTES_LIMIT {
+                            break;
+                        }
+
+                        // Subscribe before the state lookup. A commit can remove the registry entry
+                        // while state answers this request.
+                        let pending_wait = pending_blocks.wait(hash);
+                        match block_by_hash(state.clone(), hash).await? {
+                            Some(block) => {
+                                state_lookup_bytes = state_lookup_bytes
+                                    .saturating_add(block.zcash_serialized_size());
+                                lookup_results.push((index, hash, Some(block)));
+                            }
+                            None => pending_lookups.push(async move {
+                                (index, hash, pending_wait.await)
+                            }),
+                        }
                     }
 
-                    // Start every state lookup and pending wait before awaiting any result.
-                    let mut lookup_results = Vec::with_capacity(lookups.len());
-                    while let Some(result) = lookups.next().await {
-                        lookup_results.push(result?);
+                    while let Some(result) = pending_lookups.next().await {
+                        lookup_results.push(result);
                     }
                     lookup_results.sort_unstable_by_key(|(index, _, _)| *index);
 
                     for (_, hash, block) in lookup_results {
                         if total_size >= GETDATA_SENT_BYTES_LIMIT {
-                            continue;
+                            break;
                         }
 
                         // Add the block responses to the list, while updating the size limit.
@@ -837,6 +855,14 @@ impl Service<zn::Request> for Inbound {
             }
 
             zn::Request::AdvertiseBlockToAll(_) => unreachable!("should always be decoded as `AdvertiseBlock` request")
+        };
+
+        async move {
+            match tokio::time::timeout(response_timeout, response).await {
+                Ok(response) => response,
+                Err(error) => Err(Box::new(error) as zn::BoxError),
+            }
         }
+        .boxed()
     }
 }

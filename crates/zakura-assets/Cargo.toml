@@ -6,12 +6,14 @@
 # published crate from crates.io like any other dependency.
 #
 # The package name is the one place the published name is written down.
-# `scripts/pack-assets-crate.py` reads it from here rather than hardcoding it.
+# `scripts/pack-assets-crate.py` reads it from here rather than hardcoding it, and
+# `scripts/check-release-state.sh` resolves it from the workspace pin, so renaming the
+# published crate is this line plus the pin.
 [package]
-name = "valargroup-zakura-assets"
+name = "zakura-assets"
 # Stamped by `scripts/pack-assets-crate.py` as `0.<last_checkpoint>.<revision>`,
 # so the version a consumer pins states which checkpoint the payload covers.
-version = "0.3453771.0"
+version = "0.3457371.0"
 authors = ["Zakura Contributors"]
 edition = "2021"
 rust-version = "1.91"

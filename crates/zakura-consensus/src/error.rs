@@ -290,6 +290,9 @@ pub enum TransactionError {
     #[error("Ironwood proof has a non-canonical size")]
     IronwoodProofSize,
 
+    #[error("transaction parser worker panicked")]
+    TransactionParserPanicked,
+
     #[error("unexpected error")]
     Other(String),
 }
@@ -492,6 +495,7 @@ impl TransactionError {
             Self::Balance(_) => consensus("transaction.balance"),
             Self::OrchardProofSize => consensus("transaction.orchard_proof_size"),
             Self::IronwoodProofSize => consensus("transaction.ironwood_proof_size"),
+            Self::TransactionParserPanicked => consensus("transaction.parser_panic"),
             Self::ImmatureTransparentCoinbaseSpend { .. } => {
                 consensus("transaction.immature_transparent_coinbase_spend")
             }
@@ -641,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn local_transaction_failures_are_retryable_without_peer_penalty() {
+    fn parser_shutdown_is_retryable_without_peer_penalty() {
         use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
 
         let error =
@@ -650,6 +654,19 @@ mod tests {
         assert_eq!(
             error.body_verification_class(),
             BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+        );
+        assert_eq!(error.mempool_misbehavior_score(), 0);
+    }
+
+    #[test]
+    fn parser_panic_is_non_retryable_without_peer_penalty() {
+        use zakura_header_chain::{BodyRuleId, BodyVerificationClass};
+
+        let error = TransactionError::TransactionParserPanicked;
+
+        assert_eq!(
+            error.body_verification_class(),
+            BodyVerificationClass::ConsensusInvalid(BodyRuleId::new("transaction.parser_panic"))
         );
         assert_eq!(error.mempool_misbehavior_score(), 0);
     }

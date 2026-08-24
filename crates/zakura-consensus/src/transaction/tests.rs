@@ -50,7 +50,7 @@ use zakura_test::mock_service::MockService;
 
 use crate::{error::TransactionError, primitives, transaction::POLL_MEMPOOL_DELAY, BoxError};
 
-use super::{check, Request, Verifier};
+use super::{check, spawn_transaction_parser, Request, Verifier};
 
 #[cfg(test)]
 mod prop;
@@ -65,6 +65,24 @@ fn test_timeout() -> std::time::Duration {
     } else {
         std::time::Duration::from_secs(30)
     }
+}
+
+#[tokio::test]
+async fn transaction_parser_runs_on_tokio_blocking_pool() {
+    let rayon_worker = spawn_transaction_parser(rayon::current_thread_index)
+        .await
+        .expect("the parser worker returns its result");
+
+    assert_eq!(rayon_worker, None);
+}
+
+#[tokio::test]
+async fn transaction_parser_panic_returns_explicit_error() {
+    let error = spawn_transaction_parser(|| -> () { panic!("deterministic parser panic") })
+        .await
+        .expect_err("the parser panic must return an error");
+
+    assert_eq!(error, TransactionError::TransactionParserPanicked);
 }
 
 #[test]

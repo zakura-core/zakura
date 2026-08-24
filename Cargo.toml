@@ -44,11 +44,10 @@ edition = "2021"
 # manifest without fetching anything. The requirement is exact because these are reviewed bytes,
 # not a compatible range; `Cargo.lock` carries the registry checksum that pins them.
 #
-# Renamed so that no Rust source or script mentions the published crate name. The package is
-# published from `crates/zakura-assets/` in this repository. TODO(#703 follow-up): retarget to
-# `zakura-assets` once its crates.io owner adds the Trusted Publisher entry, which is a one-line
-# change here.
-zakura-assets = { version = "=0.3457371.0", package = "valargroup-zakura-assets" }
+# Published from `crates/zakura-assets/` in this repository. The dependency name and the
+# published name now match, so no `package` rename is needed: every consumer, script, and
+# gate refers to `zakura-assets` and nothing else.
+zakura-assets = { version = "=0.3457371.0" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 orchard = { version = "1.0.0-rc.2", package = "zakura-orchard" }
 sapling-crypto = { version = "1.0.0-rc.2", package = "zakura-sapling-crypto" }

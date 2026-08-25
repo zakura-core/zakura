@@ -3446,14 +3446,16 @@ async fn rpc_submitblock_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn rpc_submitsolution_uses_prepared_candidate() {
+async fn rpc_client_proposal_can_submit_solution() {
     let _init_guard = zakura_test::init();
 
+    let network = testnet::Parameters::build()
+        .to_network()
+        .expect("the default testnet parameters are valid");
     let candidate: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .expect("the genesis test vector is valid");
     let prepared_candidates = PreparedCandidateResolver::default();
-    prepared_candidates.insert_for_test(candidate.clone(), "prepared-work", &Mainnet);
     let mut block_verifier_router: MockService<_, _, _, BoxError> =
         MockService::build().for_unit_tests();
     let submit_block_channel = types::submit_block::SubmitBlockChannel::new();
@@ -3463,7 +3465,7 @@ async fn rpc_submitsolution_uses_prepared_candidate() {
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _) = RpcImpl::new_with_prepared_candidates(
-        Mainnet,
+        network.clone(),
         Default::default(),
         Default::default(),
         "0.0.1",
@@ -3478,8 +3480,48 @@ async fn rpc_submitsolution_uses_prepared_candidate() {
         rx,
         Some(mined_block_sender),
         pending_blocks.clone(),
-        prepared_candidates,
+        prepared_candidates.clone(),
     );
+
+    let proposal = rpc.get_block_template(Some(GetBlockTemplateParameters {
+        mode: GetBlockTemplateRequestMode::Proposal,
+        data: Some(HexData(
+            candidate
+                .zcash_serialize_to_vec()
+                .expect("candidate serialization succeeds"),
+        )),
+        work_id: Some("proposal-work".to_owned()),
+        ..Default::default()
+    }));
+    let mut proposal_verifier = block_verifier_router.clone();
+    let proposal_candidate = candidate.clone();
+    let proposal_cache = prepared_candidates.clone();
+    let proposal_network = network.clone();
+    let prepare = async move {
+        let request = proposal_verifier
+            .expect_request_that(|request| {
+                matches!(
+                    request,
+                    zakura_consensus::Request::Prepare {
+                        work_id: Some(work_id),
+                        source: zakura_consensus::PreparedCandidateSource::ClientProposal,
+                        ..
+                    } if work_id == "proposal-work"
+                )
+            })
+            .await;
+        let (block, source) = match request.request() {
+            zakura_consensus::Request::Prepare { block, source, .. } => (block.clone(), *source),
+            _ => unreachable!("the request matcher requires Prepare"),
+        };
+        proposal_cache.insert_for_test(block, "proposal-work", source, &proposal_network);
+        request.respond(proposal_candidate.hash());
+    };
+    let (proposal, ()) = tokio::join!(proposal, prepare);
+    assert!(matches!(
+        proposal,
+        Ok(GetBlockTemplateResponse::ProposalMode(response)) if response.is_valid()
+    ));
 
     let stale = rpc
         .submit_solution(SubmitSolutionParameters {
@@ -3501,7 +3543,7 @@ async fn rpc_submitsolution_uses_prepared_candidate() {
     header_with_trailing_byte.push(0);
     let malformed = rpc
         .submit_solution(SubmitSolutionParameters {
-            work_id: "prepared-work".to_owned(),
+            work_id: "proposal-work".to_owned(),
             header: HexData(header_with_trailing_byte),
         })
         .await;
@@ -3511,7 +3553,7 @@ async fn rpc_submitsolution_uses_prepared_candidate() {
     changed_header.version ^= 1;
     let mismatch = rpc
         .submit_solution(SubmitSolutionParameters {
-            work_id: "prepared-work".to_owned(),
+            work_id: "proposal-work".to_owned(),
             header: HexData(
                 changed_header
                     .zcash_serialize_to_vec()
@@ -3527,7 +3569,7 @@ async fn rpc_submitsolution_uses_prepared_candidate() {
     let candidate_hash = candidate.hash();
     let submission = tokio::spawn(async move {
         rpc.submit_solution(SubmitSolutionParameters {
-            work_id: "prepared-work".to_owned(),
+            work_id: "proposal-work".to_owned(),
             header: HexData(
                 candidate
                     .header
@@ -3545,7 +3587,7 @@ async fn rpc_submitsolution_uses_prepared_candidate() {
                     block,
                     work_id: Some(work_id),
                     ..
-                } if block.hash() == candidate_hash && work_id == "prepared-work"
+                } if block.hash() == candidate_hash && work_id == "proposal-work"
             )
         })
         .await;

@@ -53,7 +53,7 @@ pub use block::check::difficulty_is_valid;
 pub use checkpoint::CheckpointVerifier;
 
 pub use block::{
-    subsidy::funding_stream_address, PreparedCandidateResolver, Request,
+    subsidy::funding_stream_address, PreparedCandidateResolver, PreparedCandidateSource, Request,
     ResolvePreparedCandidateError, VerifyBlockError, MAX_BLOCK_SIGOPS,
 };
 pub use checkpoint::{VerifyCheckpointError, MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};

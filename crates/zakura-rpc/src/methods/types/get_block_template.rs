@@ -794,6 +794,7 @@ where
         .call(zakura_consensus::Request::Prepare {
             block: Arc::new(block),
             work_id,
+            source: zakura_consensus::PreparedCandidateSource::ClientProposal,
         })
         .await;
 

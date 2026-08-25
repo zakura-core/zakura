@@ -15,10 +15,15 @@ use zakura_chain::{
 };
 use zakura_state::SemanticallyVerifiedBlock;
 
-const MAX_ENTRIES: usize = 32;
+use super::PreparedCandidateSource;
+
+const SERVER_MAX_ENTRIES: usize = 24;
 // One 219 ms preparation at a time can produce fewer than 2,800 aliases per TTL.
-const MAX_WORK_IDS: usize = 4_096;
-const MAX_BYTES: usize = 64 * 1024 * 1024;
+const SERVER_MAX_WORK_IDS: usize = 3_072;
+const SERVER_MAX_BYTES: usize = 48 * 1024 * 1024;
+const PROPOSAL_MAX_ENTRIES: usize = 8;
+const PROPOSAL_MAX_WORK_IDS: usize = 1_024;
+const PROPOSAL_MAX_BYTES: usize = 16 * 1024 * 1024;
 const ENTRY_TTL: Duration = Duration::from_secs(10 * 60);
 
 type EntryId = u64;
@@ -33,9 +38,12 @@ impl std::fmt::Debug for PreparedCandidateCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         f.debug_struct("PreparedCandidateCache")
-            .field("entries", &inner.entries.len())
-            .field("work_ids", &inner.work_ids.len())
-            .field("bytes", &inner.bytes)
+            .field("server_entries", &inner.server.entries.len())
+            .field("server_work_ids", &inner.server.work_ids.len())
+            .field("server_bytes", &inner.server.bytes)
+            .field("proposal_entries", &inner.proposals.entries.len())
+            .field("proposal_work_ids", &inner.proposals.work_ids.len())
+            .field("proposal_bytes", &inner.proposals.bytes)
             .finish()
     }
 }
@@ -51,8 +59,10 @@ impl std::fmt::Debug for PreparedCandidateResolver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         f.debug_struct("PreparedCandidateResolver")
-            .field("entries", &inner.entries.len())
-            .field("work_ids", &inner.work_ids.len())
+            .field("server_entries", &inner.server.entries.len())
+            .field("server_work_ids", &inner.server.work_ids.len())
+            .field("proposal_entries", &inner.proposals.entries.len())
+            .field("proposal_work_ids", &inner.proposals.work_ids.len())
             .finish()
     }
 }
@@ -71,6 +81,12 @@ pub enum ResolvePreparedCandidateError {
 
 #[derive(Default)]
 struct CacheInner {
+    server: Partition,
+    proposals: Partition,
+}
+
+#[derive(Default)]
+struct Partition {
     entries: VecDeque<Entry>,
     work_ids: HashMap<String, WorkIdAlias>,
     work_id_order: VecDeque<String>,
@@ -105,17 +121,9 @@ impl PreparedCandidateResolver {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.prune_expired();
 
-        let entry_id = inner
-            .work_ids
-            .get(work_id)
-            .map(|alias| alias.entry_id)
-            .ok_or(ResolvePreparedCandidateError::StaleWork)?;
         let entry = inner
-            .entries
-            .iter()
-            .find(|entry| entry.id == entry_id)
+            .find_work_id(work_id)
             .ok_or(ResolvePreparedCandidateError::StaleWork)?;
-
         if !preserved_header_fields_match(&entry.prepared.block.header, &solved_header) {
             return Err(ResolvePreparedCandidateError::CandidateMismatch);
         }
@@ -129,10 +137,17 @@ impl PreparedCandidateResolver {
     /// Inserts a candidate for cross-crate tests.
     #[cfg(any(test, feature = "proptest-impl"))]
     #[doc(hidden)]
-    pub fn insert_for_test(&self, block: Arc<Block>, work_id: &str, network: &Network) {
+    pub fn insert_for_test(
+        &self,
+        block: Arc<Block>,
+        work_id: &str,
+        source: PreparedCandidateSource,
+        network: &Network,
+    ) {
         PreparedCandidateCache(self.0.clone()).insert(
             &block,
             Some(work_id),
+            source,
             SemanticallyVerifiedBlock::from(block.clone()),
             network,
         );
@@ -156,29 +171,25 @@ impl PreparedCandidateCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.prune_expired();
 
-        if inner.entries.is_empty() {
+        if inner.is_empty() {
             metrics::counter!("mining.prepared_cache.misses").increment(1);
             return None;
         }
 
         if let Some(work_id) = work_id {
-            if let Some(entry_id) = inner.work_ids.get(work_id).map(|alias| alias.entry_id) {
-                if let Some(entry) = inner.entries.iter().find(|entry| entry.id == entry_id) {
-                    if candidates_match(&entry.prepared.block, block) {
-                        metrics::counter!("mining.prepared_cache.hits").increment(1);
-                        return Some(entry.prepared.clone());
-                    }
-
-                    metrics::counter!("mining.prepared_cache.mismatches").increment(1);
-                    return None;
+            if let Some(entry) = inner.find_work_id(work_id) {
+                if candidates_match(&entry.prepared.block, block) {
+                    metrics::counter!("mining.prepared_cache.hits").increment(1);
+                    return Some(entry.prepared.clone());
                 }
+
+                metrics::counter!("mining.prepared_cache.mismatches").increment(1);
+                return None;
             }
         }
 
         let fingerprint = candidate_fingerprint(block, network);
-        if let Some(entry) = inner.entries.iter().find(|entry| {
-            entry.fingerprint == fingerprint && candidates_match(&entry.prepared.block, block)
-        }) {
+        if let Some(entry) = inner.find_candidate(fingerprint, block) {
             metrics::counter!("mining.prepared_cache.hits").increment(1);
             return Some(entry.prepared.clone());
         }
@@ -191,9 +202,19 @@ impl PreparedCandidateCache {
         &self,
         block: &Block,
         work_id: Option<&str>,
+        source: PreparedCandidateSource,
         prepared: SemanticallyVerifiedBlock,
         network: &Network,
     ) {
+        let prepared_size = prepared_candidate_size(&prepared);
+        let alias_size = work_id.map(work_id_alias_size).unwrap_or(0);
+        let limits = source.limits();
+        if prepared_size > limits.max_bytes
+            || prepared_size.saturating_add(alias_size) > limits.max_bytes
+        {
+            return;
+        }
+
         let fingerprint = candidate_fingerprint(block, network);
         let mut inner = self
             .0
@@ -201,21 +222,29 @@ impl PreparedCandidateCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.prune_expired();
 
-        let conflicting_work_id = work_id.is_some_and(|work_id| {
-            inner.work_ids.get(work_id).is_some_and(|alias| {
-                inner
-                    .entries
-                    .iter()
-                    .find(|entry| entry.id == alias.entry_id)
-                    .is_some_and(|entry| !candidates_match(&entry.prepared.block, block))
-            })
-        });
-        if conflicting_work_id {
-            metrics::counter!("mining.prepared_cache.work_id_conflicts").increment(1);
-            return;
+        if let Some(work_id) = work_id {
+            if let Some((existing_source, entry)) = inner.find_work_id_with_source(work_id) {
+                if candidates_match(&entry.prepared.block, block) {
+                    return;
+                }
+
+                metrics::counter!(
+                    "mining.prepared_cache.work_id_conflicts",
+                    "source" => source.metric_label()
+                )
+                .increment(1);
+                let server_reclaims_proposal = source == PreparedCandidateSource::ServerTemplate
+                    && existing_source == PreparedCandidateSource::ClientProposal;
+                if !server_reclaims_proposal {
+                    return;
+                }
+
+                inner.partition(existing_source).remove_work_id(work_id);
+            }
         }
 
-        let existing_entry = inner
+        let partition = inner.partition(source);
+        let existing_entry = partition
             .entries
             .iter()
             .find(|entry| {
@@ -224,19 +253,71 @@ impl PreparedCandidateCache {
             .map(|entry| entry.id);
         let entry_id = match existing_entry {
             Some(entry_id) => {
-                inner.refresh_candidate(entry_id, prepared);
+                partition.refresh_candidate(entry_id, prepared, limits);
                 Some(entry_id)
             }
-            None => inner.insert_candidate(fingerprint, prepared),
+            None => partition.insert_candidate(fingerprint, prepared, source, limits),
         };
 
         if let (Some(entry_id), Some(work_id)) = (entry_id, work_id) {
-            inner.insert_work_id(work_id, entry_id);
+            partition.insert_work_id(work_id, entry_id, source, limits);
         }
     }
 }
 
 impl CacheInner {
+    fn prune_expired(&mut self) {
+        self.server.prune_expired();
+        self.proposals.prune_expired();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.server.entries.is_empty() && self.proposals.entries.is_empty()
+    }
+
+    fn partition(&mut self, source: PreparedCandidateSource) -> &mut Partition {
+        match source {
+            PreparedCandidateSource::ServerTemplate => &mut self.server,
+            PreparedCandidateSource::ClientProposal => &mut self.proposals,
+        }
+    }
+
+    fn find_work_id(&self, work_id: &str) -> Option<&Entry> {
+        self.server
+            .entry_for_work_id(work_id)
+            .or_else(|| self.proposals.entry_for_work_id(work_id))
+    }
+
+    fn find_work_id_with_source(&self, work_id: &str) -> Option<(PreparedCandidateSource, &Entry)> {
+        self.server
+            .entry_for_work_id(work_id)
+            .map(|entry| (PreparedCandidateSource::ServerTemplate, entry))
+            .or_else(|| {
+                self.proposals
+                    .entry_for_work_id(work_id)
+                    .map(|entry| (PreparedCandidateSource::ClientProposal, entry))
+            })
+    }
+
+    fn find_candidate(&self, fingerprint: [u8; 32], block: &Block) -> Option<&Entry> {
+        self.server
+            .find_candidate(fingerprint, block)
+            .or_else(|| self.proposals.find_candidate(fingerprint, block))
+    }
+}
+
+impl Partition {
+    fn entry_for_work_id(&self, work_id: &str) -> Option<&Entry> {
+        let entry_id = self.work_ids.get(work_id)?.entry_id;
+        self.entries.iter().find(|entry| entry.id == entry_id)
+    }
+
+    fn find_candidate(&self, fingerprint: [u8; 32], block: &Block) -> Option<&Entry> {
+        self.entries.iter().find(|entry| {
+            entry.fingerprint == fingerprint && candidates_match(&entry.prepared.block, block)
+        })
+    }
+
     fn prune_expired(&mut self) {
         let now = Instant::now();
         let expired_entries: Vec<_> = self
@@ -264,20 +345,18 @@ impl CacheInner {
         &mut self,
         fingerprint: [u8; 32],
         prepared: SemanticallyVerifiedBlock,
+        source: PreparedCandidateSource,
+        limits: PartitionLimits,
     ) -> Option<EntryId> {
         let size = prepared_candidate_size(&prepared);
-        if size > MAX_BYTES {
+        if size > limits.max_bytes {
             return None;
         }
 
-        while self.entries.len() >= MAX_ENTRIES {
-            if !self.evict_oldest_entry() {
-                return None;
-            }
-        }
-
-        while self.bytes.saturating_add(size) > MAX_BYTES {
-            if !self.evict_oldest_entry() {
+        while self.entries.len() >= limits.max_entries
+            || self.bytes.saturating_add(size) > limits.max_bytes
+        {
+            if !self.evict_oldest_entry(source) {
                 return None;
             }
         }
@@ -295,7 +374,12 @@ impl CacheInner {
         Some(id)
     }
 
-    fn refresh_candidate(&mut self, entry_id: EntryId, prepared: SemanticallyVerifiedBlock) {
+    fn refresh_candidate(
+        &mut self,
+        entry_id: EntryId,
+        prepared: SemanticallyVerifiedBlock,
+        limits: PartitionLimits,
+    ) {
         let Some(index) = self.entries.iter().position(|entry| entry.id == entry_id) else {
             return;
         };
@@ -305,7 +389,7 @@ impl CacheInner {
             .expect("entry exists because its index came from the same deque");
         let retained_bytes = self.bytes.saturating_sub(entry.size);
         let replacement_size = prepared_candidate_size(&prepared);
-        if retained_bytes.saturating_add(replacement_size) <= MAX_BYTES {
+        if retained_bytes.saturating_add(replacement_size) <= limits.max_bytes {
             self.bytes = retained_bytes.saturating_add(replacement_size);
             entry.size = replacement_size;
             entry.prepared = prepared;
@@ -314,14 +398,22 @@ impl CacheInner {
         self.entries.push_back(entry);
     }
 
-    fn insert_work_id(&mut self, work_id: &str, entry_id: EntryId) {
+    fn insert_work_id(
+        &mut self,
+        work_id: &str,
+        entry_id: EntryId,
+        source: PreparedCandidateSource,
+        limits: PartitionLimits,
+    ) {
         if self.work_ids.contains_key(work_id) {
             return;
         }
 
         let size = work_id_alias_size(work_id);
-        while self.work_ids.len() >= MAX_WORK_IDS || self.bytes.saturating_add(size) > MAX_BYTES {
-            if !self.evict_oldest_work_id() {
+        while self.work_ids.len() >= limits.max_work_ids
+            || self.bytes.saturating_add(size) > limits.max_bytes
+        {
+            if !self.evict_oldest_work_id(source) {
                 return;
             }
         }
@@ -379,26 +471,65 @@ impl CacheInner {
         true
     }
 
-    fn evict_oldest_entry(&mut self) -> bool {
+    fn evict_oldest_entry(&mut self, source: PreparedCandidateSource) -> bool {
         let Some(entry_id) = self.entries.front().map(|entry| entry.id) else {
             return false;
         };
         let removed = self.remove_entry(entry_id);
         if removed {
-            metrics::counter!("mining.prepared_cache.evictions").increment(1);
+            metrics::counter!(
+                "mining.prepared_cache.evictions",
+                "source" => source.metric_label()
+            )
+            .increment(1);
         }
         removed
     }
 
-    fn evict_oldest_work_id(&mut self) -> bool {
+    fn evict_oldest_work_id(&mut self, source: PreparedCandidateSource) -> bool {
         let Some(work_id) = self.work_id_order.front().cloned() else {
             return false;
         };
         let removed = self.remove_work_id(&work_id);
         if removed {
-            metrics::counter!("mining.prepared_cache.work_id_evictions").increment(1);
+            metrics::counter!(
+                "mining.prepared_cache.work_id_evictions",
+                "source" => source.metric_label()
+            )
+            .increment(1);
         }
         removed
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PartitionLimits {
+    max_entries: usize,
+    max_work_ids: usize,
+    max_bytes: usize,
+}
+
+impl PreparedCandidateSource {
+    fn limits(self) -> PartitionLimits {
+        match self {
+            Self::ServerTemplate => PartitionLimits {
+                max_entries: SERVER_MAX_ENTRIES,
+                max_work_ids: SERVER_MAX_WORK_IDS,
+                max_bytes: SERVER_MAX_BYTES,
+            },
+            Self::ClientProposal => PartitionLimits {
+                max_entries: PROPOSAL_MAX_ENTRIES,
+                max_work_ids: PROPOSAL_MAX_WORK_IDS,
+                max_bytes: PROPOSAL_MAX_BYTES,
+            },
+        }
+    }
+
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::ServerTemplate => "server_template",
+            Self::ClientProposal => "client_proposal",
+        }
     }
 }
 
@@ -477,10 +608,22 @@ mod tests {
             .expect("the genesis test vector is valid")
     }
 
-    fn insert(cache: &PreparedCandidateCache, block: &Block, work_id: &str) {
+    fn distinct_block(index: u8) -> Block {
+        let mut block = test_block();
+        Arc::make_mut(&mut block.header).previous_block_hash = Hash([index; 32]);
+        block
+    }
+
+    fn insert(
+        cache: &PreparedCandidateCache,
+        block: &Block,
+        work_id: &str,
+        source: PreparedCandidateSource,
+    ) {
         cache.insert(
             block,
             Some(work_id),
+            source,
             SemanticallyVerifiedBlock::from(Arc::new(block.clone())),
             &Network::Mainnet,
         );
@@ -491,7 +634,12 @@ mod tests {
         let network = Network::Mainnet;
         let original = test_block();
         let cache = PreparedCandidateCache::default();
-        insert(&cache, &original, "work");
+        insert(
+            &cache,
+            &original,
+            "work",
+            PreparedCandidateSource::ServerTemplate,
+        );
 
         let mut solved = original;
         let header = Arc::make_mut(&mut solved.header);
@@ -508,7 +656,12 @@ mod tests {
         let network = Network::Mainnet;
         let original = test_block();
         let cache = PreparedCandidateCache::default();
-        insert(&cache, &original, "work");
+        insert(
+            &cache,
+            &original,
+            "work",
+            PreparedCandidateSource::ServerTemplate,
+        );
 
         let mut changed_parent = original.clone();
         Arc::make_mut(&mut changed_parent.header).previous_block_hash = Hash([1; 32]);
@@ -545,11 +698,21 @@ mod tests {
     }
 
     #[test]
-    fn repeated_candidates_keep_every_work_id() {
+    fn repeated_candidates_keep_every_same_source_work_id() {
         let block = test_block();
         let cache = PreparedCandidateCache::default();
-        insert(&cache, &block, "first");
-        insert(&cache, &block, "second");
+        insert(
+            &cache,
+            &block,
+            "first",
+            PreparedCandidateSource::ServerTemplate,
+        );
+        insert(
+            &cache,
+            &block,
+            "second",
+            PreparedCandidateSource::ServerTemplate,
+        );
 
         assert!(cache.resolver().resolve("first", *block.header).is_ok());
         assert!(cache.resolver().resolve("second", *block.header).is_ok());
@@ -557,31 +720,20 @@ mod tests {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(inner.entries.len(), 1);
-        assert_eq!(inner.work_ids.len(), 2);
-    }
-
-    #[test]
-    fn reused_work_id_cannot_replace_its_candidate() {
-        let original = test_block();
-        let mut replacement = original.clone();
-        Arc::make_mut(&mut replacement.header).version ^= 1;
-        let cache = PreparedCandidateCache::default();
-        insert(&cache, &original, "work");
-        insert(&cache, &replacement, "work");
-
-        assert!(cache.resolver().resolve("work", *original.header).is_ok());
-        assert_eq!(
-            cache.resolver().resolve("work", *replacement.header),
-            Err(ResolvePreparedCandidateError::CandidateMismatch)
-        );
+        assert_eq!(inner.server.entries.len(), 1);
+        assert_eq!(inner.server.work_ids.len(), 2);
     }
 
     #[test]
     fn resolver_reconstructs_only_solved_header_fields() {
         let block = test_block();
         let cache = PreparedCandidateCache::default();
-        insert(&cache, &block, "work");
+        insert(
+            &cache,
+            &block,
+            "work",
+            PreparedCandidateSource::ServerTemplate,
+        );
 
         let mut solved_header = *block.header;
         solved_header.time += chrono::Duration::seconds(1);
@@ -607,56 +759,326 @@ mod tests {
     }
 
     #[test]
-    fn work_id_aliases_are_bounded() {
+    fn proposal_alias_eviction_does_not_evict_server_aliases() {
         let block = test_block();
         let cache = PreparedCandidateCache::default();
-        for index in 0..=MAX_WORK_IDS {
-            insert(&cache, &block, &format!("work-{index}"));
+        insert(
+            &cache,
+            &block,
+            "server",
+            PreparedCandidateSource::ServerTemplate,
+        );
+        for index in 0..=PROPOSAL_MAX_WORK_IDS {
+            insert(
+                &cache,
+                &block,
+                &format!("proposal-{index}"),
+                PreparedCandidateSource::ClientProposal,
+            );
         }
 
         let inner = cache
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(inner.work_ids.len(), MAX_WORK_IDS);
-        assert!(!inner.work_ids.contains_key("work-0"));
-        assert!(inner.work_ids.contains_key(&format!("work-{MAX_WORK_IDS}")));
-        assert!(inner.bytes <= MAX_BYTES);
+        assert_eq!(inner.proposals.work_ids.len(), PROPOSAL_MAX_WORK_IDS);
+        assert!(!inner.proposals.work_ids.contains_key("proposal-0"));
+        assert!(inner
+            .proposals
+            .work_ids
+            .contains_key(&format!("proposal-{PROPOSAL_MAX_WORK_IDS}")));
+        assert!(inner.server.work_ids.contains_key("server"));
+        assert!(inner.server.bytes <= SERVER_MAX_BYTES);
+        assert!(inner.proposals.bytes <= PROPOSAL_MAX_BYTES);
     }
 
     #[test]
-    fn candidate_eviction_removes_its_work_id() {
-        let original = test_block();
+    fn server_alias_eviction_does_not_evict_proposal_aliases() {
+        let block = test_block();
         let cache = PreparedCandidateCache::default();
-        for index in 0..=MAX_ENTRIES {
-            let mut block = original.clone();
-            Arc::make_mut(&mut block.header).version = u32::try_from(index)
-                .expect("the candidate bound fits in u32")
-                .saturating_add(4);
-            insert(&cache, &block, &format!("work-{index}"));
+        insert(
+            &cache,
+            &block,
+            "proposal",
+            PreparedCandidateSource::ClientProposal,
+        );
+        for index in 0..=SERVER_MAX_WORK_IDS {
+            insert(
+                &cache,
+                &block,
+                &format!("server-{index}"),
+                PreparedCandidateSource::ServerTemplate,
+            );
         }
 
         let inner = cache
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(inner.entries.len(), MAX_ENTRIES);
-        assert!(!inner.work_ids.contains_key("work-0"));
-        assert!(inner.work_ids.contains_key(&format!("work-{MAX_ENTRIES}")));
-        assert!(inner.bytes <= MAX_BYTES);
+        assert_eq!(inner.server.work_ids.len(), SERVER_MAX_WORK_IDS);
+        assert!(!inner.server.work_ids.contains_key("server-0"));
+        assert!(inner.proposals.work_ids.contains_key("proposal"));
+    }
+
+    #[test]
+    fn candidate_partitions_evict_only_their_oldest_candidate() {
+        let cache = PreparedCandidateCache::default();
+        let proposal = distinct_block(100);
+        insert(
+            &cache,
+            &proposal,
+            "proposal",
+            PreparedCandidateSource::ClientProposal,
+        );
+        let servers: Vec<_> = (0..=SERVER_MAX_ENTRIES)
+            .map(|index| distinct_block(index as u8))
+            .collect();
+        for (index, block) in servers.iter().enumerate() {
+            insert(
+                &cache,
+                block,
+                &format!("server-{index}"),
+                PreparedCandidateSource::ServerTemplate,
+            );
+        }
+        assert_eq!(
+            cache.resolver().resolve("server-0", *servers[0].header),
+            Err(ResolvePreparedCandidateError::StaleWork)
+        );
+        assert!(cache
+            .resolver()
+            .resolve("server-1", *servers[1].header)
+            .is_ok());
+        assert!(cache
+            .resolver()
+            .resolve("proposal", *proposal.header)
+            .is_ok());
+
+        let server = distinct_block(101);
+        insert(
+            &cache,
+            &server,
+            "server-stable",
+            PreparedCandidateSource::ServerTemplate,
+        );
+        let proposals: Vec<_> = (110..=110 + PROPOSAL_MAX_ENTRIES)
+            .map(|index| distinct_block(index as u8))
+            .collect();
+        for (index, block) in proposals.iter().enumerate() {
+            insert(
+                &cache,
+                block,
+                &format!("proposal-churn-{index}"),
+                PreparedCandidateSource::ClientProposal,
+            );
+        }
+        assert_eq!(
+            cache
+                .resolver()
+                .resolve("proposal-churn-0", *proposals[0].header),
+            Err(ResolvePreparedCandidateError::StaleWork)
+        );
+        assert!(cache
+            .resolver()
+            .resolve("proposal-churn-1", *proposals[1].header)
+            .is_ok());
+        assert!(cache
+            .resolver()
+            .resolve("server-stable", *server.header)
+            .is_ok());
+
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(inner.server.entries.len() <= SERVER_MAX_ENTRIES);
+        assert!(inner.proposals.entries.len() <= PROPOSAL_MAX_ENTRIES);
+        assert!(inner.server.work_ids.len() <= SERVER_MAX_WORK_IDS);
+        assert!(inner.proposals.work_ids.len() <= PROPOSAL_MAX_WORK_IDS);
+        assert!(inner.server.bytes <= SERVER_MAX_BYTES);
+        assert!(inner.proposals.bytes <= PROPOSAL_MAX_BYTES);
+    }
+
+    #[test]
+    fn proposal_cannot_replace_a_server_work_id() {
+        let cache = PreparedCandidateCache::default();
+        let server = distinct_block(1);
+        let proposal = distinct_block(2);
+        insert(
+            &cache,
+            &server,
+            "shared",
+            PreparedCandidateSource::ServerTemplate,
+        );
+        insert(
+            &cache,
+            &proposal,
+            "shared",
+            PreparedCandidateSource::ClientProposal,
+        );
+
+        assert!(cache.resolver().resolve("shared", *server.header).is_ok());
+        assert_eq!(
+            cache.resolver().resolve("shared", *proposal.header),
+            Err(ResolvePreparedCandidateError::CandidateMismatch)
+        );
+    }
+
+    #[test]
+    fn same_source_reused_work_id_cannot_replace_its_candidate() {
+        let cache = PreparedCandidateCache::default();
+        let original = distinct_block(1);
+        let replacement = distinct_block(2);
+        insert(
+            &cache,
+            &original,
+            "shared",
+            PreparedCandidateSource::ServerTemplate,
+        );
+        insert(
+            &cache,
+            &replacement,
+            "shared",
+            PreparedCandidateSource::ServerTemplate,
+        );
+
+        assert!(cache.resolver().resolve("shared", *original.header).is_ok());
+        assert_eq!(
+            cache.resolver().resolve("shared", *replacement.header),
+            Err(ResolvePreparedCandidateError::CandidateMismatch)
+        );
+    }
+
+    #[test]
+    fn server_reclaims_its_work_id_from_a_proposal() {
+        let cache = PreparedCandidateCache::default();
+        let proposal = distinct_block(1);
+        let server = distinct_block(2);
+        insert(
+            &cache,
+            &proposal,
+            "shared",
+            PreparedCandidateSource::ClientProposal,
+        );
+        insert(
+            &cache,
+            &server,
+            "shared",
+            PreparedCandidateSource::ServerTemplate,
+        );
+
+        assert!(cache.resolver().resolve("shared", *server.header).is_ok());
+        assert_eq!(
+            cache.resolver().resolve("shared", *proposal.header),
+            Err(ResolvePreparedCandidateError::CandidateMismatch)
+        );
+    }
+
+    #[test]
+    fn each_source_retains_the_same_candidate_under_its_own_work_id() {
+        let block = test_block();
+        let cache = PreparedCandidateCache::default();
+        insert(
+            &cache,
+            &block,
+            "server",
+            PreparedCandidateSource::ServerTemplate,
+        );
+        insert(
+            &cache,
+            &block,
+            "proposal",
+            PreparedCandidateSource::ClientProposal,
+        );
+
+        assert!(cache.resolver().resolve("server", *block.header).is_ok());
+        assert!(cache.resolver().resolve("proposal", *block.header).is_ok());
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(inner.server.entries.len(), 1);
+        assert_eq!(inner.proposals.entries.len(), 1);
+    }
+
+    #[test]
+    fn identical_work_id_and_candidate_leave_the_existing_mapping_unchanged() {
+        let block = test_block();
+        let cache = PreparedCandidateCache::default();
+        insert(
+            &cache,
+            &block,
+            "shared",
+            PreparedCandidateSource::ClientProposal,
+        );
+        let expiration = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .proposals
+            .work_ids["shared"]
+            .expires_at;
+        insert(
+            &cache,
+            &block,
+            "shared",
+            PreparedCandidateSource::ServerTemplate,
+        );
+
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(inner.server.entries.is_empty());
+        assert_eq!(inner.proposals.work_ids["shared"].expires_at, expiration);
+    }
+
+    #[test]
+    fn oversized_entries_do_not_exceed_partition_byte_limits() {
+        let block = test_block();
+        let cache = PreparedCandidateCache::default();
+        let proposal_work_id = "p".repeat(PROPOSAL_MAX_BYTES);
+        insert(
+            &cache,
+            &block,
+            &proposal_work_id,
+            PreparedCandidateSource::ClientProposal,
+        );
+        let server_work_id = "s".repeat(SERVER_MAX_BYTES);
+        insert(
+            &cache,
+            &block,
+            &server_work_id,
+            PreparedCandidateSource::ServerTemplate,
+        );
+
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(inner.server.entries.is_empty());
+        assert!(inner.proposals.entries.is_empty());
+        assert_eq!(inner.server.bytes, 0);
+        assert_eq!(inner.proposals.bytes, 0);
     }
 
     #[test]
     fn candidate_expiry_removes_its_work_ids() {
         let block = test_block();
         let cache = PreparedCandidateCache::default();
-        insert(&cache, &block, "work");
+        insert(
+            &cache,
+            &block,
+            "work",
+            PreparedCandidateSource::ServerTemplate,
+        );
         {
             let mut inner = cache
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             inner
+                .server
                 .entries
                 .front_mut()
                 .expect("the inserted candidate exists")
@@ -671,9 +1093,9 @@ mod tests {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(inner.entries.is_empty());
-        assert!(inner.work_ids.is_empty());
-        assert_eq!(inner.bytes, 0);
+        assert!(inner.server.entries.is_empty());
+        assert!(inner.server.work_ids.is_empty());
+        assert_eq!(inner.server.bytes, 0);
     }
 
     #[test]

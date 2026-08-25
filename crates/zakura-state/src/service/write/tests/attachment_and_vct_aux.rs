@@ -156,20 +156,21 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
         successor: None,
     };
     assert_eq!(
-        missing_vct_successor_retry(&window, block::Height(1)),
+        missing_vct_successor_retry(window.successor_height, block::Height(1)),
         (block::Height(2), VctWriteRetryCause::MissingSuccessor),
         "an absent successor header waits for header admission"
     );
     window.successor_height = Some(block::Height(2));
     assert_eq!(
-        missing_vct_successor_retry(&window, block::Height(1)),
+        missing_vct_successor_retry(window.successor_height, block::Height(1)),
         (
             block::Height(2),
             VctWriteRetryCause::MissingRoot {
-                replacement_required: true
+                replacement_required: false
             }
         ),
-        "a retained successor without usable auxiliary data requests replacement"
+        "a retained successor without usable auxiliary data polls the open repair episode; \
+         a new episode would retire the header-sync repair task twice a second"
     );
     window.successor_height = None;
     let expected_roots = authenticated

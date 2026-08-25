@@ -442,3 +442,185 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
         .await
         .expect("the late-response reactor stops cleanly");
 }
+
+/// A supplier that has moved past the repair height must still be eligible.
+///
+/// This is the shape the stalled mainnet nodes saw: every peer advertised a different selected
+/// tip and had finalized past the repair predecessor. Requiring the supplier to sit on our own
+/// stalled tip, and to retain history below it, left the repair with no supplier at all.
+#[tokio::test]
+async fn vct_repair_accepts_a_supplier_ahead_of_the_stalled_branch() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let mut repair_block_header = *regtest_genesis_block().header;
+    repair_block_header.previous_block_hash = anchor.hash;
+    repair_block_header.time += chrono::Duration::seconds(1);
+    let repair_block_header = Arc::new(repair_block_header);
+    let repair_header =
+        zakura_header_chain::Frontier::new(block::Height(1), repair_block_header.hash());
+    let selected_tip = zakura_header_chain::Frontier::new(block::Height(2), block::Hash([3; 32]));
+    let mut snapshot = committed_snapshot(anchor);
+    snapshot.frontiers.header_best = selected_tip;
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_repairs_tx, repairs_rx) = watch::channel(zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: repair_header.height,
+        },
+        generation: 7,
+    });
+    startup.vct_root_repairs = Some(repairs_rx);
+    let (handle, mut actions, reactor) =
+        spawn_header_sync_reactor(startup).expect("the repair fixture starts");
+    let HeaderPortOperation::QueryVctRepairContext { owner, .. } = next_action(&mut actions).await
+    else {
+        panic!("the exact repair context query precedes ordinary maintenance");
+    };
+
+    let (send, mut outbound) = framed_channel(8);
+    let peer = peer();
+    handle
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        )))
+        .await
+        .expect("the repair supplier connects");
+    let _status = outbound.recv().await.expect("the local status is sent");
+    handle
+        .send(Event::WireMessage {
+            peer: peer.clone(),
+            session_id: 0,
+            msg: HeaderSyncMessage::Status(Status {
+                work_anchor_height: anchor.height,
+                work_anchor_hash: anchor.hash,
+                // A tip we have never selected, well ahead of the stalled branch.
+                selected_tip_height: block::Height(9),
+                selected_tip_hash: block::Hash([9; 32]),
+                suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(9_u8),
+                // Finalized past the repair predecessor, so nothing below is retained.
+                oldest_retained_height: block::Height(5),
+                max_headers_per_response: 1,
+                max_inflight_requests: 1,
+                max_message_bytes: 2_000_000,
+                tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+            }),
+        })
+        .await
+        .expect("the repair supplier status reaches the reactor");
+    handle
+        .send(Event::VctRepairContextReady {
+            owner,
+            result: VctRepairContextResult::Resolved(zakura_header_chain::VctRepairContext {
+                target: repair_header,
+                locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
+            }),
+        })
+        .await
+        .expect("the exact repair context reaches the reactor");
+
+    let request = outbound.recv().await.expect("the repair request is sent");
+    let HeaderSyncMessage::GetHeaders(request) = handle
+        .codec()
+        .decode_frame(request, None)
+        .expect("the canonical repair request decodes")
+    else {
+        panic!("the repair uses the canonical GetHeaders message");
+    };
+    assert_eq!(request.target_tip_hash, repair_header.hash);
+    assert_eq!(request.locator_hashes, vec![anchor.hash]);
+    assert_eq!(request.max_header_count, 1);
+    assert_eq!(request.tree_aux_schema, AuxSchema::V1);
+
+    shutdown.cancel();
+    reactor.await.expect("the reactor task joins");
+}
+
+/// A peer that cannot reach the repair height never receives a request, and the repair defers.
+///
+/// The deferral path also builds the rejection tally the operator needs: without it the trace
+/// records only that the repair made no progress, not which requirement excluded the network.
+#[tokio::test]
+async fn vct_repair_defers_when_no_peer_reaches_the_repair_height() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let mut repair_block_header = *regtest_genesis_block().header;
+    repair_block_header.previous_block_hash = anchor.hash;
+    repair_block_header.time += chrono::Duration::seconds(1);
+    let repair_block_header = Arc::new(repair_block_header);
+    let repair_header =
+        zakura_header_chain::Frontier::new(block::Height(1), repair_block_header.hash());
+    let mut snapshot = committed_snapshot(anchor);
+    snapshot.frontiers.header_best =
+        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([3; 32]));
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_repairs_tx, repairs_rx) = watch::channel(zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: repair_header.height,
+        },
+        generation: 7,
+    });
+    startup.vct_root_repairs = Some(repairs_rx);
+    let (handle, mut actions, reactor) =
+        spawn_header_sync_reactor(startup).expect("the repair fixture starts");
+    let HeaderPortOperation::QueryVctRepairContext { owner, .. } = next_action(&mut actions).await
+    else {
+        panic!("the exact repair context query precedes ordinary maintenance");
+    };
+
+    let (send, mut outbound) = framed_channel(8);
+    let peer = peer();
+    handle
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        )))
+        .await
+        .expect("the peer connects");
+    let _status = outbound.recv().await.expect("the local status is sent");
+    handle
+        .send(Event::WireMessage {
+            peer: peer.clone(),
+            session_id: 0,
+            msg: HeaderSyncMessage::Status(Status {
+                work_anchor_height: anchor.height,
+                work_anchor_hash: anchor.hash,
+                // Below the repair target, so this peer cannot hold the header at all.
+                selected_tip_height: anchor.height,
+                selected_tip_hash: anchor.hash,
+                suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(1_u8),
+                oldest_retained_height: anchor.height,
+                max_headers_per_response: 1,
+                max_inflight_requests: 1,
+                max_message_bytes: 2_000_000,
+                tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+            }),
+        })
+        .await
+        .expect("the peer status reaches the reactor");
+    handle
+        .send(Event::VctRepairContextReady {
+            owner,
+            result: VctRepairContextResult::Resolved(zakura_header_chain::VctRepairContext {
+                target: repair_header,
+                locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
+            }),
+        })
+        .await
+        .expect("the exact repair context reaches the reactor");
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), outbound.recv())
+            .await
+            .is_err(),
+        "an unreachable repair height must not produce a wire request"
+    );
+
+    shutdown.cancel();
+    reactor.await.expect("the reactor task joins");
+}

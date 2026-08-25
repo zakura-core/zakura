@@ -38,6 +38,14 @@ use crate::zakura::{
 const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 const LEASE_RELEASE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const VCT_REPAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Minimum interval between repeated unassignable-repair trace rows for one repair generation.
+///
+/// The reactor emits the first row immediately, then samples while nothing changes. The bound
+/// keeps a long unassignable repair from dominating the header-sync JSONL trace.
+const VCT_REPAIR_NO_SUPPLIER_TRACE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(10);
+/// Time one repair generation may stay unassignable before the reactor reports it at error level.
+const VCT_REPAIR_NO_SUPPLIER_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 /// Minimum interval between unchanged header-snapshot refresh trace rows.
 ///
 /// The trace records every frontier advance and reanchor.
@@ -169,6 +177,7 @@ fn build_header_sync_reactor(
         request_deadlines: HashMap::new(),
         completed_targets: CompletedHeaderTargets::default(),
         vct_repair: RepairRequirementSlot::default(),
+        vct_repair_no_supplier: None,
         served_paths: HashMap::new(),
         served_path_deadlines: HashMap::new(),
         pending_lease_releases: VecDeque::new(),
@@ -265,6 +274,8 @@ struct HeaderSyncReactor {
     request_deadlines: HashMap<ZakuraPeerId, Instant>,
     completed_targets: CompletedHeaderTargets,
     vct_repair: RepairRequirementSlot,
+    /// Escalation state for a repair generation that no peer can supply.
+    vct_repair_no_supplier: Option<VctRepairNoSupplier>,
     served_paths: HashMap<ZakuraPeerId, ServedPathState>,
     served_path_deadlines: HashMap<ZakuraPeerId, Instant>,
     pending_lease_releases: VecDeque<PendingLeaseRelease>,
@@ -376,6 +387,39 @@ fn vct_repair_task(
     let scope = zakura_header_chain::BodyWorkAuthority::for_snapshot(snapshot);
     let owner = scope.bind(INTERNAL_VCT_REPAIR_SESSION_ID, request_id);
     Some(RepairRequirement::new(owner, height, status.generation))
+}
+
+/// Why each advertised peer failed to qualify as a VCT repair supplier.
+///
+/// The reactor reports the tally when no supplier qualifies. Without it the trace records only
+/// that the repair made no progress, not which requirement excluded the network.
+#[derive(Copy, Clone, Debug, Default)]
+struct VctSupplierRejections {
+    /// Peers that had advertised a status.
+    considered: u64,
+    /// Peers whose selected tip is below the repair target.
+    height: u64,
+    /// Peers that advertise no capacity for the one-header repair response.
+    capacity: u64,
+    /// Peers that do not support the V1 auxiliary schema.
+    schema: u64,
+    /// Peers already serving another header request.
+    busy: u64,
+    /// Peers already tried in the current supplier cycle.
+    tried: u64,
+}
+
+/// One repair generation that has found no eligible supplier.
+#[derive(Copy, Clone, Debug)]
+struct VctRepairNoSupplier {
+    /// Repair generation this record tracks.
+    generation: u64,
+    /// First observation of the unassignable generation.
+    since: Instant,
+    /// Last emitted trace row.
+    last_trace: Instant,
+    /// Whether the reactor already reported this generation at error level.
+    reported: bool,
 }
 
 #[cfg_attr(any(test, feature = "zakura-testkit"), allow(dead_code))]
@@ -1749,7 +1793,137 @@ impl HeaderSyncReactor {
         });
     }
 
+    /// Record a repair generation that no connected peer can supply.
+    ///
+    /// The reactor samples the trace row and escalates to error level once the generation has
+    /// stayed unassignable for [`VCT_REPAIR_NO_SUPPLIER_WARN_AFTER`]. Without the tally an
+    /// operator sees only that the repair made no progress.
+    fn note_vct_repair_without_supplier(
+        &mut self,
+        task: &RepairRequirement,
+        predecessor: zakura_header_chain::Frontier,
+        rejections: &VctSupplierRejections,
+        now: Instant,
+    ) {
+        metrics::counter!("sync.header.vct.repair.no_supplier.total").increment(1);
+        let best_peer_tip = self
+            .peer_state
+            .values()
+            .filter_map(|state| state.last_status.as_ref())
+            .map(|status| (status.selected_tip_height, status.selected_tip_hash))
+            .max_by_key(|(height, _)| *height);
+
+        let record = match self.vct_repair_no_supplier {
+            Some(record) if record.generation == task.repair_generation => record,
+            _ => VctRepairNoSupplier {
+                generation: task.repair_generation,
+                since: now,
+                last_trace: now,
+                reported: false,
+            },
+        };
+        let first_observation = self
+            .vct_repair_no_supplier
+            .is_none_or(|previous| previous.generation != task.repair_generation);
+        let trace_due = first_observation
+            || now.saturating_duration_since(record.last_trace)
+                >= VCT_REPAIR_NO_SUPPLIER_TRACE_INTERVAL;
+        let stalled_for = now.saturating_duration_since(record.since);
+        let report_due = !record.reported && stalled_for >= VCT_REPAIR_NO_SUPPLIER_WARN_AFTER;
+
+        if trace_due {
+            self.emit_vct_repair_no_supplier(task, predecessor, rejections, best_peer_tip);
+        }
+        if report_due {
+            tracing::error!(
+                height = ?task.height,
+                predecessor_height = ?predecessor.height,
+                repair_generation = task.repair_generation,
+                branch_target = ?task.owner.branch.target_tip_hash,
+                ?best_peer_tip,
+                peers_considered = rejections.considered,
+                rejected_height = rejections.height,
+                rejected_capacity = rejections.capacity,
+                rejected_schema = rejections.schema,
+                rejected_busy = rejections.busy,
+                rejected_tried = rejections.tried,
+                ?stalled_for,
+                "VCT: no connected peer can supply the repair root; the parked checkpoint commit \
+                 cannot advance until an eligible supplier appears"
+            );
+        }
+
+        self.vct_repair_no_supplier = Some(VctRepairNoSupplier {
+            generation: task.repair_generation,
+            since: record.since,
+            last_trace: if trace_due { now } else { record.last_trace },
+            reported: record.reported || report_due,
+        });
+    }
+
+    fn emit_vct_repair_no_supplier(
+        &self,
+        task: &RepairRequirement,
+        predecessor: zakura_header_chain::Frontier,
+        rejections: &VctSupplierRejections,
+        best_peer_tip: Option<(block::Height, block::Hash)>,
+    ) {
+        self.startup.trace.emit_with(HEADER_SYNC_TABLE, |row| {
+            row.insert(
+                hs_trace::EVENT.into(),
+                hs_trace::HEADER_VCT_REPAIR_STATE.into(),
+            );
+            insert_header_scope(row, task.owner.header);
+            row.insert(hs_trace::SESSION_ID.into(), task.owner.session_id.into());
+            row.insert(
+                hs_trace::REQUEST_ID.into(),
+                task.owner.request_id.get().into(),
+            );
+            row.insert(hs_trace::HEIGHT.into(), u64::from(task.height.0).into());
+            row.insert(
+                hs_trace::PREDECESSOR_HEIGHT.into(),
+                u64::from(predecessor.height.0).into(),
+            );
+            row.insert(
+                hs_trace::REPAIR_GENERATION.into(),
+                task.repair_generation.into(),
+            );
+            row.insert(hs_trace::PHASE.into(), "no_supplier".into());
+            row.insert(
+                hs_trace::SUPPLIER_COUNT.into(),
+                u64::try_from(task.tried_sources.len())
+                    .unwrap_or(u64::MAX)
+                    .into(),
+            );
+            row.insert(hs_trace::CANDIDATE_COUNT.into(), 0.into());
+            row.insert(
+                hs_trace::PEERS_CONSIDERED.into(),
+                rejections.considered.into(),
+            );
+            row.insert(hs_trace::REJECTED_HEIGHT.into(), rejections.height.into());
+            row.insert(
+                hs_trace::REJECTED_CAPACITY.into(),
+                rejections.capacity.into(),
+            );
+            row.insert(hs_trace::REJECTED_SCHEMA.into(), rejections.schema.into());
+            row.insert(hs_trace::REJECTED_BUSY.into(), rejections.busy.into());
+            row.insert(hs_trace::REJECTED_TRIED.into(), rejections.tried.into());
+            row.insert(
+                hs_trace::BEST_PEER_HEIGHT.into(),
+                best_peer_tip.map_or(serde_json::Value::Null, |(height, _)| {
+                    u64::from(height.0).into()
+                }),
+            );
+            row.insert(
+                hs_trace::BEST_PEER_HASH.into(),
+                best_peer_tip.map_or(serde_json::Value::Null, |(_, hash)| hash.to_string().into()),
+            );
+            row.insert(hs_trace::OUTCOME.into(), "no_eligible_supplier".into());
+        });
+    }
+
     fn retire_vct_repair(&mut self) {
+        self.vct_repair_no_supplier = None;
         if let Some(task) = self.vct_repair.take() {
             if let Some(peer) = self
                 .peer_work_queue
@@ -2543,36 +2717,49 @@ impl HeaderSyncReactor {
         };
         let response_bytes = headers_response_bytes(&self.startup.network, AuxSchema::V1, 1)
             .expect("one fixed-width response fits in usize");
+        // A peer can serve the exact repair target from its retained header graph or from its
+        // finalized state, and those two bands are exhaustive below its selected tip. The filter
+        // therefore checks only reachable height, response capacity, and schema support. The
+        // supplier proves branch membership by returning the exact target hash after the exact
+        // predecessor hash; the admission path rejects anything else.
+        let mut rejections = VctSupplierRejections::default();
         let mut candidates: Vec<_> = self
             .peer_state
             .iter()
             .filter_map(|(peer, state)| {
                 let status = state.last_status.as_ref()?;
-                (status.selected_tip_hash == task.owner.branch.target_tip_hash
-                    && status.selected_tip_height >= context.target.height
-                    && status.oldest_retained_height <= predecessor.height
-                    && status.max_headers_per_response != 0
-                    && status.max_inflight_requests != 0
-                    && usize::try_from(status.max_message_bytes).unwrap_or(usize::MAX)
-                        >= response_bytes
-                    && status.tree_aux_schema_mask & AuxSchema::V1.mask_bit() != 0
-                    && self.peer_work_queue.active(peer).is_none())
-                .then(|| {
-                    (
-                        peer.clone(),
-                        source_id_from_peer(peer),
-                        state.session.clone(),
-                        status.clone(),
-                    )
-                })
+                rejections.considered = rejections.considered.saturating_add(1);
+                if status.selected_tip_height < context.target.height {
+                    rejections.height = rejections.height.saturating_add(1);
+                    return None;
+                }
+                if status.max_headers_per_response == 0
+                    || status.max_inflight_requests == 0
+                    || usize::try_from(status.max_message_bytes).unwrap_or(usize::MAX)
+                        < response_bytes
+                {
+                    rejections.capacity = rejections.capacity.saturating_add(1);
+                    return None;
+                }
+                if status.tree_aux_schema_mask & AuxSchema::V1.mask_bit() == 0 {
+                    rejections.schema = rejections.schema.saturating_add(1);
+                    return None;
+                }
+                if self.peer_work_queue.active(peer).is_some() {
+                    rejections.busy = rejections.busy.saturating_add(1);
+                    return None;
+                }
+                let source = source_id_from_peer(peer);
+                if task.tried_sources.contains(&source) {
+                    rejections.tried = rejections.tried.saturating_add(1);
+                    return None;
+                }
+                Some((peer.clone(), source, state.session.clone(), status.clone()))
             })
             .collect();
         candidates.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
-        let candidates: Vec<_> = candidates
-            .into_iter()
-            .filter(|(_, source, _, _)| !task.tried_sources.contains(source))
-            .collect();
         if candidates.is_empty() {
+            self.note_vct_repair_without_supplier(&task, predecessor, &rejections, now);
             let _ = self
                 .vct_repair
                 .get_mut(task.owner)
@@ -2580,6 +2767,7 @@ impl HeaderSyncReactor {
                 .defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
             return;
         }
+        self.vct_repair_no_supplier = None;
         for (peer, source, session, mut status) in candidates {
             self.peer_work_queue.remove_unstarted(&peer);
             if self.peer_work_queue.reservable_header_count(1) != 1

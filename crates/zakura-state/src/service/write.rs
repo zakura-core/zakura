@@ -68,14 +68,18 @@ use vct_write_retry::{VctWriteRetryCause, VctWriteRetryManager};
 pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
 
 fn missing_vct_successor_retry(
-    auxiliary_window: &VctAuxiliaryWindow,
+    successor_height: Option<Height>,
     current_height: Height,
 ) -> (Height, VctWriteRetryCause) {
-    if let Some(successor_height) = auxiliary_window.successor_height {
+    if let Some(successor_height) = successor_height {
+        // The successor header exists but carries no auxiliary record. The committer disputed
+        // nothing, so this poll continues the open repair episode instead of starting a new one.
+        // A new episode would retire the header-sync repair task and discard its supplier
+        // backoff on every poll.
         return (
             successor_height,
             VctWriteRetryCause::MissingRoot {
-                replacement_required: true,
+                replacement_required: false,
             },
         );
     }
@@ -2111,8 +2115,10 @@ impl WriteBlockWorkerTask {
                 let auxiliary_window = vct_auxiliary_window
                     .as_ref()
                     .expect("exact VCT roots require an auxiliary window");
-                let (height, retry_cause) =
-                    missing_vct_successor_retry(auxiliary_window, ordered_block.0.height);
+                let (height, retry_cause) = missing_vct_successor_retry(
+                    auxiliary_window.successor_height,
+                    ordered_block.0.height,
+                );
                 let wait =
                     vct_write_retry_manager.on_retryable_error(height, retry_cause, ordered_block);
                 std::thread::park_timeout(wait);

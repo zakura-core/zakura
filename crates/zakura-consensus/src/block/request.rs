@@ -5,6 +5,15 @@ use std::sync::Arc;
 use zakura_chain::block::Block;
 use zakura_state::BlockAdmission;
 
+/// Identifies who supplied a prepared mining candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedCandidateSource {
+    /// The node's background `getblocktemplate` preparation.
+    ServerTemplate,
+    /// A client's proposal-mode `getblocktemplate` request.
+    ClientProposal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A request to the chain or block verifier
 pub enum Request {
@@ -29,6 +38,8 @@ pub enum Request {
         block: Arc<Block>,
         /// The template work ID, when one was assigned.
         work_id: Option<String>,
+        /// The source that supplied the candidate.
+        source: PreparedCandidateSource,
     },
 }
 
@@ -54,6 +65,14 @@ impl Request {
     /// Returns true when a successful proposal should populate the prepared-candidate cache.
     pub fn should_cache(&self) -> bool {
         matches!(self, Request::Prepare { .. })
+    }
+
+    /// Returns the prepared candidate source.
+    pub fn prepared_candidate_source(&self) -> Option<PreparedCandidateSource> {
+        match self {
+            Request::Prepare { source, .. } => Some(*source),
+            _ => None,
+        }
     }
 
     /// Returns the supplied mining work ID.

@@ -14,8 +14,12 @@ use zakura_chain::{
 };
 use zakura_state::SemanticallyVerifiedBlock;
 
-const MAX_ENTRIES: usize = 32;
-const MAX_BYTES: usize = 64 * 1024 * 1024;
+use super::PreparedCandidateSource;
+
+const SERVER_MAX_ENTRIES: usize = 24;
+const SERVER_MAX_BYTES: usize = 48 * 1024 * 1024;
+const PROPOSAL_MAX_ENTRIES: usize = 8;
+const PROPOSAL_MAX_BYTES: usize = 16 * 1024 * 1024;
 const ENTRY_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Default)]
@@ -28,14 +32,22 @@ impl std::fmt::Debug for PreparedCandidateCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         f.debug_struct("PreparedCandidateCache")
-            .field("entries", &inner.entries.len())
-            .field("bytes", &inner.bytes)
+            .field("server_entries", &inner.server.entries.len())
+            .field("server_bytes", &inner.server.bytes)
+            .field("proposal_entries", &inner.proposals.entries.len())
+            .field("proposal_bytes", &inner.proposals.bytes)
             .finish()
     }
 }
 
 #[derive(Default)]
 struct CacheInner {
+    server: Partition,
+    proposals: Partition,
+}
+
+#[derive(Default)]
+struct Partition {
     entries: VecDeque<Entry>,
     bytes: usize,
 }
@@ -64,7 +76,7 @@ impl PreparedCandidateCache {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             inner.prune_expired();
-            if inner.entries.is_empty() {
+            if inner.is_empty() {
                 metrics::counter!("mining.prepared_cache.misses").increment(1);
                 return None;
             }
@@ -79,11 +91,7 @@ impl PreparedCandidateCache {
         inner.prune_expired();
 
         if let Some(work_id) = work_id {
-            if let Some(entry) = inner
-                .entries
-                .iter()
-                .find(|entry| entry.work_id.as_deref() == Some(work_id))
-            {
+            if let Some(entry) = inner.find_work_id(work_id) {
                 if entry.immutable_bytes == immutable_bytes {
                     metrics::counter!("mining.prepared_cache.hits").increment(1);
                     return Some(entry.prepared.clone());
@@ -94,9 +102,7 @@ impl PreparedCandidateCache {
             }
         }
 
-        if let Some(entry) = inner.entries.iter().find(|entry| {
-            entry.fingerprint == fingerprint && entry.immutable_bytes == immutable_bytes
-        }) {
+        if let Some(entry) = inner.find_candidate(fingerprint, &immutable_bytes) {
             metrics::counter!("mining.prepared_cache.hits").increment(1);
             return Some(entry.prepared.clone());
         }
@@ -109,6 +115,7 @@ impl PreparedCandidateCache {
         &self,
         block: &Block,
         work_id: Option<&str>,
+        source: PreparedCandidateSource,
         prepared: SemanticallyVerifiedBlock,
         network: &Network,
     ) {
@@ -120,17 +127,29 @@ impl PreparedCandidateCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.prune_expired();
-        if work_id.is_some_and(|work_id| {
-            inner.entries.iter().any(|entry| {
-                entry.work_id.as_deref() == Some(work_id)
-                    && entry.immutable_bytes != immutable_bytes
-            })
-        }) {
-            metrics::counter!("mining.prepared_cache.work_id_conflicts").increment(1);
-            return;
+
+        if let Some(work_id) = work_id {
+            if let Some((existing_source, entry)) = inner.find_work_id_with_source(work_id) {
+                if entry.immutable_bytes == immutable_bytes {
+                    return;
+                }
+
+                metrics::counter!(
+                    "mining.prepared_cache.work_id_conflicts",
+                    "source" => source.metric_label()
+                )
+                .increment(1);
+                let server_reclaims_proposal = source == PreparedCandidateSource::ServerTemplate
+                    && existing_source == PreparedCandidateSource::ClientProposal;
+                if !server_reclaims_proposal {
+                    return;
+                }
+            }
         }
+
+        let partition = inner.partition(source);
         let existing_work_id = if work_id.is_none() {
-            inner
+            partition
                 .entries
                 .iter()
                 .find(|entry| {
@@ -147,20 +166,37 @@ impl PreparedCandidateCache {
                 .or_else(|| existing_work_id.as_ref().map(String::len))
                 .unwrap_or(0),
         );
-        if size > MAX_BYTES {
+        let (max_entries, max_bytes) = source.limits();
+        if size > max_bytes {
             return;
         }
         let work_id = work_id.map(ToOwned::to_owned).or(existing_work_id);
-        inner.remove_matching(work_id.as_deref(), fingerprint, &immutable_bytes);
 
-        while inner.entries.len() >= MAX_ENTRIES || inner.bytes.saturating_add(size) > MAX_BYTES {
-            if !inner.evict_oldest() {
+        if let Some(work_id) = work_id.as_deref() {
+            if source == PreparedCandidateSource::ServerTemplate
+                && inner
+                    .proposals
+                    .entries
+                    .iter()
+                    .any(|entry| entry.work_id.as_deref() == Some(work_id))
+            {
+                inner.proposals.remove_work_id(work_id);
+            }
+        }
+
+        let partition = inner.partition(source);
+        partition.remove_matching(work_id.as_deref(), fingerprint, &immutable_bytes);
+
+        while partition.entries.len() >= max_entries
+            || partition.bytes.saturating_add(size) > max_bytes
+        {
+            if !partition.evict_oldest(source) {
                 break;
             }
         }
 
-        inner.bytes = inner.bytes.saturating_add(size);
-        inner.entries.push_back(Entry {
+        partition.bytes = partition.bytes.saturating_add(size);
+        partition.entries.push_back(Entry {
             work_id,
             fingerprint,
             immutable_bytes,
@@ -173,13 +209,66 @@ impl PreparedCandidateCache {
 
 impl CacheInner {
     fn prune_expired(&mut self) {
+        self.server
+            .prune_expired(PreparedCandidateSource::ServerTemplate);
+        self.proposals
+            .prune_expired(PreparedCandidateSource::ClientProposal);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.server.entries.is_empty() && self.proposals.entries.is_empty()
+    }
+
+    fn partition(&mut self, source: PreparedCandidateSource) -> &mut Partition {
+        match source {
+            PreparedCandidateSource::ServerTemplate => &mut self.server,
+            PreparedCandidateSource::ClientProposal => &mut self.proposals,
+        }
+    }
+
+    fn find_work_id(&self, work_id: &str) -> Option<&Entry> {
+        self.server
+            .entries
+            .iter()
+            .chain(self.proposals.entries.iter())
+            .find(|entry| entry.work_id.as_deref() == Some(work_id))
+    }
+
+    fn find_work_id_with_source(&self, work_id: &str) -> Option<(PreparedCandidateSource, &Entry)> {
+        self.server
+            .entries
+            .iter()
+            .find(|entry| entry.work_id.as_deref() == Some(work_id))
+            .map(|entry| (PreparedCandidateSource::ServerTemplate, entry))
+            .or_else(|| {
+                self.proposals
+                    .entries
+                    .iter()
+                    .find(|entry| entry.work_id.as_deref() == Some(work_id))
+                    .map(|entry| (PreparedCandidateSource::ClientProposal, entry))
+            })
+    }
+
+    fn find_candidate(&self, fingerprint: [u8; 32], immutable_bytes: &[u8]) -> Option<&Entry> {
+        self.server
+            .entries
+            .iter()
+            .chain(self.proposals.entries.iter())
+            .find(|entry| {
+                entry.fingerprint == fingerprint && entry.immutable_bytes == immutable_bytes
+            })
+    }
+}
+
+impl Partition {
+    fn prune_expired(&mut self, source: PreparedCandidateSource) {
         let now = Instant::now();
         while self
             .entries
             .front()
             .is_some_and(|entry| entry.expires_at <= now)
         {
-            self.evict_oldest();
+            self.evict_oldest(source);
         }
     }
 
@@ -201,13 +290,48 @@ impl CacheInner {
         }
     }
 
-    fn evict_oldest(&mut self) -> bool {
+    fn remove_work_id(&mut self, work_id: &str) {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.work_id.as_deref() == Some(work_id))
+        else {
+            return;
+        };
+        let entry = self
+            .entries
+            .remove(index)
+            .expect("entry exists because its index came from the same deque");
+        self.bytes = self.bytes.saturating_sub(entry.size);
+    }
+
+    fn evict_oldest(&mut self, source: PreparedCandidateSource) -> bool {
         let Some(entry) = self.entries.pop_front() else {
             return false;
         };
         self.bytes = self.bytes.saturating_sub(entry.size);
-        metrics::counter!("mining.prepared_cache.evictions").increment(1);
+        metrics::counter!(
+            "mining.prepared_cache.evictions",
+            "source" => source.metric_label()
+        )
+        .increment(1);
         true
+    }
+}
+
+impl PreparedCandidateSource {
+    fn limits(self) -> (usize, usize) {
+        match self {
+            Self::ServerTemplate => (SERVER_MAX_ENTRIES, SERVER_MAX_BYTES),
+            Self::ClientProposal => (PROPOSAL_MAX_ENTRIES, PROPOSAL_MAX_BYTES),
+        }
+    }
+
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::ServerTemplate => "server_template",
+            Self::ClientProposal => "client_proposal",
+        }
     }
 }
 
@@ -245,13 +369,41 @@ mod tests {
             .expect("the genesis test vector is valid")
     }
 
+    fn distinct_block(index: u8) -> Block {
+        let mut block = test_block();
+        Arc::make_mut(&mut block.header).previous_block_hash = Hash([index; 32]);
+        block
+    }
+
+    fn insert(
+        cache: &PreparedCandidateCache,
+        block: &Block,
+        work_id: &str,
+        source: PreparedCandidateSource,
+        network: &Network,
+    ) {
+        cache.insert(
+            block,
+            Some(work_id),
+            source,
+            SemanticallyVerifiedBlock::from(Arc::new(block.clone())),
+            network,
+        );
+    }
+
     #[test]
     fn solved_header_fields_reuse_prepared_candidate() {
         let network = Network::Mainnet;
         let original = test_block();
         let prepared = SemanticallyVerifiedBlock::from(Arc::new(original.clone()));
         let cache = PreparedCandidateCache::default();
-        cache.insert(&original, Some("work"), prepared, &network);
+        cache.insert(
+            &original,
+            Some("work"),
+            PreparedCandidateSource::ServerTemplate,
+            prepared,
+            &network,
+        );
 
         let mut solved = original;
         let header = Arc::make_mut(&mut solved.header);
@@ -269,7 +421,13 @@ mod tests {
         let original = test_block();
         let prepared = SemanticallyVerifiedBlock::from(Arc::new(original.clone()));
         let cache = PreparedCandidateCache::default();
-        cache.insert(&original, Some("work"), prepared, &network);
+        cache.insert(
+            &original,
+            Some("work"),
+            PreparedCandidateSource::ServerTemplate,
+            prepared,
+            &network,
+        );
 
         let mut changed_parent = original.clone();
         Arc::make_mut(&mut changed_parent.header).previous_block_hash = Hash([1; 32]);
@@ -322,12 +480,14 @@ mod tests {
         cache.insert(
             &original,
             Some("work"),
+            PreparedCandidateSource::ServerTemplate,
             SemanticallyVerifiedBlock::from(Arc::new(original.clone())),
             &network,
         );
         cache.insert(
             &replacement,
             Some("work"),
+            PreparedCandidateSource::ClientProposal,
             SemanticallyVerifiedBlock::from(Arc::new(replacement.clone())),
             &network,
         );
@@ -339,9 +499,263 @@ mod tests {
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .server
                 .entries
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn proposal_eviction_does_not_evict_server_candidates() {
+        let network = Network::Mainnet;
+        let cache = PreparedCandidateCache::default();
+        let server = distinct_block(100);
+        insert(
+            &cache,
+            &server,
+            "server",
+            PreparedCandidateSource::ServerTemplate,
+            &network,
+        );
+
+        let proposals: Vec<_> = (0..=PROPOSAL_MAX_ENTRIES)
+            .map(|index| distinct_block(index as u8))
+            .collect();
+        for (index, proposal) in proposals.iter().enumerate() {
+            insert(
+                &cache,
+                proposal,
+                &format!("proposal-{index}"),
+                PreparedCandidateSource::ClientProposal,
+                &network,
+            );
+        }
+
+        assert!(cache
+            .lookup(&proposals[0], Some("proposal-0"), &network)
+            .is_none());
+        assert!(cache
+            .lookup(&proposals[1], Some("proposal-1"), &network)
+            .is_some());
+        assert!(cache.lookup(&server, Some("server"), &network).is_some());
+
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(inner.server.entries.len(), 1);
+        assert_eq!(inner.proposals.entries.len(), PROPOSAL_MAX_ENTRIES);
+        assert!(inner.server.bytes <= SERVER_MAX_BYTES);
+        assert!(inner.proposals.bytes <= PROPOSAL_MAX_BYTES);
+    }
+
+    #[test]
+    fn server_eviction_does_not_evict_proposals() {
+        let network = Network::Mainnet;
+        let cache = PreparedCandidateCache::default();
+        let proposal = distinct_block(100);
+        insert(
+            &cache,
+            &proposal,
+            "proposal",
+            PreparedCandidateSource::ClientProposal,
+            &network,
+        );
+
+        let servers: Vec<_> = (0..=SERVER_MAX_ENTRIES)
+            .map(|index| distinct_block(index as u8))
+            .collect();
+        for (index, server) in servers.iter().enumerate() {
+            insert(
+                &cache,
+                server,
+                &format!("server-{index}"),
+                PreparedCandidateSource::ServerTemplate,
+                &network,
+            );
+        }
+
+        assert!(cache
+            .lookup(&servers[0], Some("server-0"), &network)
+            .is_none());
+        assert!(cache
+            .lookup(&servers[1], Some("server-1"), &network)
+            .is_some());
+        assert!(cache
+            .lookup(&proposal, Some("proposal"), &network)
+            .is_some());
+
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(inner.server.entries.len(), SERVER_MAX_ENTRIES);
+        assert_eq!(inner.proposals.entries.len(), 1);
+        assert!(inner.server.bytes <= SERVER_MAX_BYTES);
+        assert!(inner.proposals.bytes <= PROPOSAL_MAX_BYTES);
+    }
+
+    #[test]
+    fn proposal_cannot_replace_a_server_work_id() {
+        let network = Network::Mainnet;
+        let cache = PreparedCandidateCache::default();
+        let server = distinct_block(1);
+        let proposal = distinct_block(2);
+        insert(
+            &cache,
+            &server,
+            "shared",
+            PreparedCandidateSource::ServerTemplate,
+            &network,
+        );
+        insert(
+            &cache,
+            &proposal,
+            "shared",
+            PreparedCandidateSource::ClientProposal,
+            &network,
+        );
+
+        assert!(cache.lookup(&server, Some("shared"), &network).is_some());
+        assert!(cache.lookup(&proposal, Some("shared"), &network).is_none());
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(inner.server.entries.len(), 1);
+        assert!(inner.proposals.entries.is_empty());
+    }
+
+    #[test]
+    fn server_reclaims_its_work_id_from_a_proposal() {
+        let network = Network::Mainnet;
+        let cache = PreparedCandidateCache::default();
+        let proposal = distinct_block(1);
+        let server = distinct_block(2);
+        insert(
+            &cache,
+            &proposal,
+            "shared",
+            PreparedCandidateSource::ClientProposal,
+            &network,
+        );
+        insert(
+            &cache,
+            &server,
+            "shared",
+            PreparedCandidateSource::ServerTemplate,
+            &network,
+        );
+
+        assert!(cache.lookup(&server, Some("shared"), &network).is_some());
+        assert!(cache.lookup(&proposal, Some("shared"), &network).is_none());
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(inner.server.entries.len(), 1);
+        assert!(inner.proposals.entries.is_empty());
+    }
+
+    #[test]
+    fn each_source_retains_the_same_candidate_under_its_own_work_id() {
+        let network = Network::Mainnet;
+        let cache = PreparedCandidateCache::default();
+        let candidate = test_block();
+        insert(
+            &cache,
+            &candidate,
+            "server",
+            PreparedCandidateSource::ServerTemplate,
+            &network,
+        );
+        insert(
+            &cache,
+            &candidate,
+            "proposal",
+            PreparedCandidateSource::ClientProposal,
+            &network,
+        );
+
+        assert!(cache.lookup(&candidate, Some("server"), &network).is_some());
+        assert!(cache
+            .lookup(&candidate, Some("proposal"), &network)
+            .is_some());
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(inner.server.entries.len(), 1);
+        assert_eq!(inner.proposals.entries.len(), 1);
+    }
+
+    #[test]
+    fn identical_work_id_and_candidate_leave_the_existing_mapping_unchanged() {
+        let network = Network::Mainnet;
+        let cache = PreparedCandidateCache::default();
+        let candidate = test_block();
+        insert(
+            &cache,
+            &candidate,
+            "shared",
+            PreparedCandidateSource::ClientProposal,
+            &network,
+        );
+        let original_expiration = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .proposals
+            .entries[0]
+            .expires_at;
+
+        insert(
+            &cache,
+            &candidate,
+            "shared",
+            PreparedCandidateSource::ServerTemplate,
+            &network,
+        );
+
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(inner.server.entries.is_empty());
+        assert_eq!(inner.proposals.entries.len(), 1);
+        assert_eq!(inner.proposals.entries[0].expires_at, original_expiration);
+    }
+
+    #[test]
+    fn oversized_entries_do_not_exceed_partition_byte_limits() {
+        let network = Network::Mainnet;
+        let cache = PreparedCandidateCache::default();
+        let candidate = test_block();
+        let oversized_proposal_id = "p".repeat(PROPOSAL_MAX_BYTES);
+        insert(
+            &cache,
+            &candidate,
+            &oversized_proposal_id,
+            PreparedCandidateSource::ClientProposal,
+            &network,
+        );
+        let oversized_server_id = "s".repeat(SERVER_MAX_BYTES);
+        insert(
+            &cache,
+            &candidate,
+            &oversized_server_id,
+            PreparedCandidateSource::ServerTemplate,
+            &network,
+        );
+
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(inner.server.entries.is_empty());
+        assert!(inner.proposals.entries.is_empty());
+        assert_eq!(inner.server.bytes, 0);
+        assert_eq!(inner.proposals.bytes, 0);
     }
 }

@@ -38,7 +38,7 @@ mod prepared;
 pub mod request;
 pub mod subsidy;
 
-pub use request::Request;
+pub use request::{PreparedCandidateSource, Request};
 
 #[cfg(test)]
 mod tests;
@@ -514,7 +514,15 @@ where
                 };
                 if let (Ok(_), Some(cache_copy)) = (&response, cache_copy) {
                     let candidate = cache_copy.block.clone();
-                    prepared_candidates.insert(&candidate, request.work_id(), cache_copy, &network);
+                    prepared_candidates.insert(
+                        &candidate,
+                        request.work_id(),
+                        request
+                            .prepared_candidate_source()
+                            .expect("cached preparation has a candidate source"),
+                        cache_copy,
+                        &network,
+                    );
                     metrics::histogram!("mining.preparation.duration_seconds").record(
                         preparation_start
                             .expect("cached preparation records its start time")

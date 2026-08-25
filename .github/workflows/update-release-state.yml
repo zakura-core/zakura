@@ -9,11 +9,30 @@
 # the grid is published before the pull request that pins it is opened, and a candidate the
 # reviewer rejects is a yanked, unreferenced version. Only the publish job holds an OIDC token,
 # and its environment carries no other secrets.
+#
+# The weekly schedule publishes. A manual dispatch defaults to `mode: verify`, which packs the
+# crate and proves the OIDC exchange without an upload path, and never opens a pull request. Run
+# it as the pre-flight after changing the crate name or its Trusted Publisher configuration.
+# `revision` sets the version's patch component, which is how one checkpoint is republished
+# through this workflow rather than by hand.
 name: Update Mainnet release state
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "verify: pack the grid and prove the OIDC exchange without uploading. publish: upload to crates.io (irreversible)"
+        required: false
+        default: verify
+        type: choice
+        options:
+          - verify
+          - publish
+      revision:
+        description: "Patch component of the crate version, for republishing one checkpoint through CI"
+        required: false
+        default: "0"
+        type: string
       max_age_hours:
         description: "Maximum bundle age in hours"
         required: false
@@ -37,11 +56,42 @@ jobs:
     permissions:
       contents: read
     outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      revision: ${{ steps.mode.outputs.revision }}
       has_changes: ${{ steps.advance.outputs.has_changes }}
       height: ${{ steps.advance.outputs.height }}
       meta_url: ${{ steps.advance.outputs.meta_url }}
       meta_sha256: ${{ steps.advance.outputs.meta_sha256 }}
     steps:
+      # The schedule carries no inputs, so an absent mode is the weekly refresh and publishes.
+      # A dispatch defaults to verify, so a stray manual run cannot reach the registry. Validated
+      # here rather than at the point of use so a bad value costs nothing.
+      - name: Resolve the run mode
+        id: mode
+        env:
+          MODE: ${{ inputs.mode || 'publish' }}
+          REVISION: ${{ inputs.revision || '0' }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            verify | publish) ;;
+            *)
+              echo "mode must be verify or publish, got ${MODE}." >&2
+              exit 1
+              ;;
+          esac
+          case "$REVISION" in
+            "" | *[!0-9]*)
+              echo "revision must be a non-negative integer, got ${REVISION}." >&2
+              exit 1
+              ;;
+          esac
+          # Normalised so the publish guard's `!= '0'` test cannot be fooled by "00".
+          REVISION=$((10#$REVISION))
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+          echo "revision=${REVISION}" >> "$GITHUB_OUTPUT"
+          echo "Running in ${MODE} mode at revision ${REVISION}."
+
       - name: Checkout main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
@@ -91,11 +141,19 @@ jobs:
           PY
 
   publish-assets:
-    name: Publish the frontier grid to crates.io
+    name: Pack and publish the frontier grid to crates.io
     needs: [resolve]
+    # A non-zero revision republishes the checkpoint the list already carries, which by
+    # definition does not advance it, so that case has to run with `has_changes` false. Verify
+    # runs always pack: re-deriving the grid and holding it against the published bytes is most
+    # of what the dry run is for, and this job has no upload path outside publish mode.
     # The repository guard matches publish-crates.yml: a staging fork must never reach the real
     # registry, and failing before the OIDC exchange keeps its logs honest.
-    if: needs.resolve.outputs.has_changes == 'true' && github.repository == 'zakura-core/zakura'
+    if: >-
+      (needs.resolve.outputs.has_changes == 'true'
+      || needs.resolve.outputs.revision != '0'
+      || needs.resolve.outputs.mode == 'verify')
+      && github.repository == 'zakura-core/zakura'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: crates-io-assets
@@ -135,10 +193,12 @@ jobs:
         id: pack
         env:
           BUNDLE: ${{ runner.temp }}/release-state-bundle
+          REVISION: ${{ needs.resolve.outputs.revision }}
         run: |
           set -euo pipefail
           python3 scripts/pack-assets-crate.py \
             --grid "$BUNDLE/mainnet-frontier-grid.bin" \
+            --revision "$REVISION" \
             --result-out "$RUNNER_TEMP/asset-crate.json"
           jq -r '"name=\(.name)", "version=\(.version)", "sha256=\(.sha256)"' \
             "$RUNNER_TEMP/asset-crate.json" >> "$GITHUB_OUTPUT"
@@ -179,14 +239,15 @@ jobs:
 
       - name: Authenticate with crates.io
         id: auth
-        if: steps.existing.outputs.published == 'false'
+        if: steps.existing.outputs.published == 'false' && needs.resolve.outputs.mode == 'publish'
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       # The token is scoped to this step alone and revoked when the job ends. The payload is
       # gitignored, so --allow-dirty is what lets cargo package the generated files that the
       # crate's explicit `include` list names.
       - name: Publish to crates.io
-        if: steps.existing.outputs.published == 'false'
+        id: publish
+        if: steps.existing.outputs.published == 'false' && needs.resolve.outputs.mode == 'publish'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
@@ -195,10 +256,60 @@ jobs:
             --allow-dirty \
             --no-verify
 
+      - name: Summarize the packed crate
+        if: ${{ !cancelled() }}
+        env:
+          MODE: ${{ needs.resolve.outputs.mode }}
+          NAME: ${{ steps.pack.outputs.name }}
+          VERSION: ${{ steps.pack.outputs.version }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+          PUBLISHED: ${{ steps.existing.outputs.published }}
+          UPLOAD: ${{ steps.publish.outcome }}
+        run: |
+          {
+            echo "## Frontier grid (mode: ${MODE})"
+            echo
+            if [ -z "$VERSION" ]; then
+              echo "- Packing did not complete; nothing was uploaded."
+            else
+              echo "- Crate: \`${NAME} ${VERSION}\`"
+              echo "- Grid SHA-256: \`${SHA256}\`"
+              if [ "$PUBLISHED" = "true" ]; then
+                echo "- Already published with these bytes; nothing to upload."
+              elif [ "$MODE" != "publish" ]; then
+                echo "- Not uploaded: verify mode has no publish path."
+              else
+                echo "- Upload to crates.io: ${UPLOAD:-did not run}."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Proves the Trusted Publisher configuration for the asset crate end to end without an upload.
+  # crates.io matches its configuration against the OIDC `workflow_ref` claim, which names the
+  # top-level workflow file, so this check is only meaningful from inside this workflow: a
+  # separate test workflow would present a different identity and prove nothing about this one.
+  # In publish mode the real upload exercises the same exchange, so this job would be redundant.
+  oidc-smoke:
+    name: Exchange and revoke crates.io OIDC token
+    needs: [resolve]
+    if: >-
+      needs.resolve.outputs.mode == 'verify'
+      && github.repository == 'zakura-core/zakura'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: crates-io-assets
+    permissions:
+      id-token: write
+    steps:
+      # Keep this as the only step: no repository code receives the real, short-lived
+      # production token returned by the action.
+      - name: Authenticate with crates.io
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
   open-pr:
     name: Import the release state and open the draft pull request
     needs: [resolve, publish-assets]
-    if: needs.resolve.outputs.has_changes == 'true'
+    if: needs.resolve.outputs.has_changes == 'true' && needs.resolve.outputs.mode == 'publish'
     runs-on: ubuntu-latest
     environment: release-automation
     permissions:

@@ -12,7 +12,7 @@ assignees: ""
 
 For performance and security, every release should carry a current Mainnet checkpoint list and its matching VCT frontier.
 
-- [ ] Run the [Update Mainnet release state workflow](https://github.com/zakura-core/zakura/actions/workflows/update-release-state.yml) from `main`. It imports the newest publisher bundle and opens or updates a draft PR (it exits green with no PR when the committed state is already current).
+- [ ] Run the [Update Mainnet release state workflow](https://github.com/zakura-core/zakura/actions/workflows/update-release-state.yml) from `main` with `mode: publish`. It imports the newest publisher bundle and opens or updates a draft PR (it exits green with no PR when the committed state is already current). The dispatch default is `mode: verify`, which packs the grid and proves the crates.io exchange without publishing or opening a PR.
 - [ ] Review and merge that draft PR: the diff is append-only over the committed checkpoint list; spot-check a few new heights and the terminal hash against an independent node or explorer.
 - [ ] `make pre-release` verifies the committed pairing and rejects pre-pipeline `legacy-bootstrap` state; for an emergency release with a broken publisher, export `ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=1` locally, check the `allow_bootstrap_release_state` input when dispatching the Create release workflow, and note it in the release PR.
 - [ ] Testnet checkpoints are still updated manually when needed, per [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/crates/zakura-utils/README.md#zakura-checkpoints).

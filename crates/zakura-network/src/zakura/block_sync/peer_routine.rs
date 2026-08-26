@@ -19,7 +19,7 @@
 //! routine receives inbound traffic from its own `FramedRecv`. Its fill loop,
 //! matched-body path, and unmatched-body paths run in the same task.
 
-use std::{collections::BTreeMap, num::NonZeroU64};
+use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
 
 use tokio::sync::{futures::Notified, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -70,6 +70,27 @@ const FILL_STOP_TRACE_INTERVAL: Duration = Duration::from_secs(10);
 
 fn fill_stop_trace_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= FILL_STOP_TRACE_INTERVAL)
+}
+
+/// Return the first contiguous run that the predicate accepts.
+///
+/// The function evaluates each visited item once. This property matters when
+/// the predicate reads shared retry state that the reactor or sequencer can update.
+fn first_allowed_run<T>(
+    items: &[T],
+    mut is_allowed: impl FnMut(&T) -> bool,
+) -> Option<Range<usize>> {
+    let mut start = None;
+
+    for (index, item) in items.iter().enumerate() {
+        if is_allowed(item) {
+            start.get_or_insert(index);
+        } else if let Some(start) = start {
+            return Some(start..index);
+        }
+    }
+
+    start.map(|start| start..items.len())
 }
 
 /// Why a fill pass stopped issuing requests. Typed so every admission refusal is
@@ -915,25 +936,18 @@ impl PeerRoutine {
                             .registry
                             .is_body_retry_avoided(&self.peer, item.scope, item.hash, now)
                 };
-                let keep_from = items
-                    .iter()
-                    .position(|(height, item)| is_allowed(height, item));
-                match keep_from {
-                    Some(0) => {}
-                    Some(index) => {
-                        let avoided: Vec<_> = items.drain(..index).map(|(h, _)| h).collect();
-                        self.work.return_items_quiet(avoided);
-                    }
-                    None => {
-                        let avoided: Vec<_> = items.iter().map(|(h, _)| *h).collect();
-                        self.work.return_items_quiet(avoided);
-                        break FillStop::RetryAvoid;
-                    }
+                let Some(keep) =
+                    first_allowed_run(&items, |(height, item)| is_allowed(height, item))
+                else {
+                    let avoided: Vec<_> = items.iter().map(|(h, _)| *h).collect();
+                    self.work.return_items_quiet(avoided);
+                    break FillStop::RetryAvoid;
+                };
+                let keep_len = keep.len();
+                if keep.start > 0 {
+                    let avoided: Vec<_> = items.drain(..keep.start).map(|(h, _)| h).collect();
+                    self.work.return_items_quiet(avoided);
                 }
-                let keep_len = items
-                    .iter()
-                    .take_while(|(height, item)| is_allowed(height, item))
-                    .count();
                 if keep_len < items.len() {
                     let avoided = items.split_off(keep_len);
                     self.work
@@ -941,7 +955,14 @@ impl PeerRoutine {
                 }
             }
             self.trace_work_taken(servable_low, servable_high, items.len());
-            let scope = items[0].1.scope;
+            debug_assert!(
+                !items.is_empty(),
+                "retry filtering must retain a nonempty allowed run"
+            );
+            let Some((first_height, first_item)) = items.first().copied() else {
+                break FillStop::Internal;
+            };
+            let scope = first_item.scope;
             debug_assert!(items.iter().all(|(_, item)| item.scope == scope));
 
             // Reserve the summed per-block size estimate for this request (not
@@ -955,7 +976,7 @@ impl PeerRoutine {
             // chunk we actually kept can begin above the floor-rescue window. Label the
             // request by its *actual* lowest height, so a purely speculative take is never
             // funded as a floor reservation or given the short floor-rescue leash.
-            let request_priority = classify_priority(view.download_floor, items[0].0);
+            let request_priority = classify_priority(view.download_floor, first_height);
 
             let reserved_bytes = items.iter().fold(0u64, |acc, (_, item)| {
                 acc.saturating_add(item.estimated_bytes)
@@ -1000,9 +1021,9 @@ impl PeerRoutine {
             };
             let request = BlockRangeRequest {
                 owner,
-                start_height: items[0].0,
+                start_height: first_height,
                 count,
-                anchor_hash: items[0].1.hash,
+                anchor_hash: first_item.hash,
                 // The summed size-estimate reservation for this request (released
                 // on a send failure below); equals the sum of the per-height
                 // `expected_blocks` estimates.
@@ -2212,6 +2233,79 @@ mod tests {
     use crate::zakura::framed_channel;
     use crate::zakura::trace::ZakuraTrace;
     use crate::zakura::ZakuraPeerId;
+
+    fn reference_first_allowed_run(allowed: &[bool]) -> Option<std::ops::Range<usize>> {
+        let start = allowed.iter().position(|allowed| *allowed)?;
+        let len = allowed[start..]
+            .iter()
+            .take_while(|allowed| **allowed)
+            .count();
+        Some(start..start + len)
+    }
+
+    #[test]
+    fn retry_filter_retains_each_small_allowed_run() {
+        for len in 0..=6 {
+            for mask in 0..(1usize << len) {
+                let allowed: Vec<_> = (0..len)
+                    .map(|index| mask & (1usize << index) != 0)
+                    .collect();
+                let expected = reference_first_allowed_run(&allowed);
+                let items: Vec<_> = (0..len).collect();
+                let mut calls = vec![0usize; len];
+
+                let keep = super::first_allowed_run(&items, |item| {
+                    calls[*item] += 1;
+                    allowed[*item]
+                });
+
+                assert_eq!(keep, expected, "len={len}, mask={mask:#08b}");
+
+                let visited_len = match &expected {
+                    Some(range) if range.end < len => range.end + 1,
+                    Some(range) => range.end,
+                    None => len,
+                };
+                for (index, calls) in calls.into_iter().enumerate() {
+                    assert_eq!(
+                        calls,
+                        usize::from(index < visited_len),
+                        "len={len}, mask={mask:#08b}, index={index}"
+                    );
+                }
+
+                let mut retained = items;
+                let mut returned = Vec::new();
+                match keep {
+                    Some(keep) => {
+                        let keep_len = keep.len();
+                        if keep.start > 0 {
+                            returned.extend(retained.drain(..keep.start));
+                        }
+                        if keep_len < retained.len() {
+                            returned.extend(retained.split_off(keep_len));
+                        }
+                    }
+                    None => {
+                        returned.extend(retained.iter().copied());
+                        retained.clear();
+                    }
+                }
+
+                let expected_retained: Vec<_> = expected.clone().into_iter().flatten().collect();
+                let expected_returned: Vec<_> = (0..len)
+                    .filter(|index| !expected.as_ref().is_some_and(|range| range.contains(index)))
+                    .collect();
+                assert_eq!(retained, expected_retained, "len={len}, mask={mask:#08b}");
+                assert_eq!(returned, expected_returned, "len={len}, mask={mask:#08b}");
+                assert_eq!(
+                    retained.is_empty(),
+                    expected.is_none(),
+                    "len={len}, mask={mask:#08b}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn repeated_fill_stop_traces_are_sampled() {

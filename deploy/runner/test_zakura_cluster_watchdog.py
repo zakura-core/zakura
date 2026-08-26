@@ -203,6 +203,95 @@ class StallRecoveryTests(unittest.TestCase):
         self.assertEqual(self.posted, [])
 
 
+class StallDiagnosticTests(unittest.TestCase):
+    def test_node_alert_formats_pipeline_and_repair_metrics(self):
+        fleet = watchdog.Fleet(
+            name="mainnet",
+            url="http://dashboard.invalid/data",
+            dashboard_url="http://dashboard.invalid/",
+        )
+        row = {
+            "name": "canada-0",
+            "health": "stale",
+            "height": 3_461_397,
+            "headers": 3_461_900,
+            "header_lag": 503,
+            "peer_count": 7,
+            "commit": "5c33befdfae0a9e047079c96b9254d9d894c3885",
+            "version": "1.3.0-rc2",
+            "detail": "height has not advanced within stale window",
+            "metrics": {
+                "checkpoint_verified_height": 3_461_397.0,
+                "sync_estimated_network_tip_height": 3_461_901.0,
+                "sync_estimated_distance_to_tip": 504.0,
+                "state_vct_root_stalled_height": 3_461_398.0,
+                "state_vct_root_repair_requested": 12.0,
+                "sync_header_vct_repair_requested_total": 12.0,
+                "sync_header_vct_repair_scheduled_total": 3.0,
+                "sync_header_vct_repair_admitted_total": 1.0,
+            },
+        }
+
+        text = watchdog.node_alert_text(fleet, row, "stalled", 617.0)
+
+        self.assertIn("headers 3461900 | header lag 503 | peers 7", text)
+        self.assertIn("checkpoint verified 3461397", text)
+        self.assertIn("network tip 3461901 | distance 504", text)
+        self.assertIn(
+            "repair: stalled height 3461398 | state requests 12 | requested 12 | "
+            "scheduled 3 | admitted 1",
+            text,
+        )
+        self.assertIn("commit 5c33befdfae0 | version 1.3.0-rc2", text)
+
+    def test_due_alert_fetches_the_node_detail_once(self):
+        posted = []
+        fleet = watchdog.Fleet(
+            name="mainnet",
+            url="http://dashboard.invalid/data",
+            dashboard_url="http://dashboard.invalid/",
+        )
+        args = make_args()
+        instance = watchdog.Watchdog([fleet], args)
+        state = {
+            "nodes": {
+                "mainnet/canada-0": {
+                    "condition": "stalled",
+                    "bad_since": 300.0,
+                    "alerting": False,
+                }
+            }
+        }
+        row = {
+            "name": "canada-0",
+            "health": "stale",
+            "height": 3_461_397,
+            "seconds_since_advanced": 700.0,
+        }
+        detail = {
+            "node": {
+                **row,
+                "metrics": {"checkpoint_verified_height": 3_461_397.0},
+            }
+        }
+
+        with (
+            patch.object(watchdog, "fetch_json", return_value=detail) as fetch,
+            patch.object(
+                watchdog,
+                "post_slack",
+                side_effect=lambda text, _args: (posted.append(text), True)[1],
+            ),
+        ):
+            instance.handle_node(state, fleet, row, 1_000.0, False)
+
+        fetch.assert_called_once_with(
+            "http://dashboard.invalid/data/node/canada-0",
+            args.request_timeout,
+        )
+        self.assertIn("checkpoint verified 3461397", posted[0])
+
+
 class SharedStallTests(unittest.TestCase):
     NOW = 2_000.0
 

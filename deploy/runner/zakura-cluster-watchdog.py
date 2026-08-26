@@ -16,6 +16,7 @@ import sys
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 import datetime
 
@@ -26,6 +27,32 @@ from typing import Any
 
 DOWN_HEALTH = {"down", "rpc_error"}
 STATE_VERSION = 1
+STALL_DIAGNOSTIC_METRICS = (
+    ("network tip", "sync_estimated_network_tip_height"),
+    ("distance", "sync_estimated_distance_to_tip"),
+    ("checkpoint next", "checkpoint_processing_next_height"),
+    ("checkpoint verified", "checkpoint_verified_height"),
+    ("state finalized", "state_finalized_block_height"),
+    ("header best", "sync_header_chain_frontier_header_best_height"),
+    ("header verified", "sync_header_chain_frontier_verified_best_height"),
+    ("header finalized", "sync_header_chain_frontier_finalized_height"),
+    ("header progress age", "sync_header_work_last_progress_age_seconds"),
+    ("oldest missing", "sync_header_work_oldest_missing_height"),
+    ("header in flight", "sync_header_work_in_flight_count"),
+    ("block outstanding", "sync_block_outstanding"),
+    ("missing bodies", "sync_block_missing_bodies"),
+)
+STALL_REPAIR_METRICS = (
+    ("stalled height", "state_vct_root_stalled_height"),
+    ("state requests", "state_vct_root_repair_requested"),
+    ("state retries", "state_vct_root_retry_count"),
+    ("sweep frontier", "state_vct_aux_sweep_frontier_height"),
+    ("requested", "sync_header_vct_repair_requested_total"),
+    ("scheduled", "sync_header_vct_repair_scheduled_total"),
+    ("admitted", "sync_header_vct_repair_admitted_total"),
+    ("no supplier", "sync_header_vct_repair_no_supplier_total"),
+    ("resource stalled", "sync_header_vct_repair_resource_stalled_total"),
+)
 
 
 @dataclass(frozen=True)
@@ -198,6 +225,63 @@ def format_duration(seconds: float) -> str:
 
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h" if minutes == 0 else f"{hours}h {minutes}m"
+
+
+def format_value(value: object) -> str:
+    number = coerce_float(value)
+    if number is None:
+        return str(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def named_values(source: dict[str, Any], fields: tuple[tuple[str, str], ...]) -> str:
+    values = [
+        f"{label} {format_value(source[key])}"
+        for label, key in fields
+        if source.get(key) is not None
+    ]
+    return " | ".join(values)
+
+
+def node_diagnostic_lines(row: dict[str, Any]) -> list[str]:
+    metrics = row.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    identity = named_values(
+        row,
+        (
+            ("headers", "headers"),
+            ("header lag", "header_lag"),
+            ("peers", "peer_count"),
+        ),
+    )
+    commit = str(row.get("commit") or "")
+    version = str(row.get("version") or "")
+    build = " | ".join(
+        value
+        for value in (
+            f"commit {commit[:12]}" if commit else "",
+            f"version {version}" if version else "",
+        )
+        if value
+    )
+    pipeline = named_values(metrics, STALL_DIAGNOSTIC_METRICS)
+    repair = named_values(metrics, STALL_REPAIR_METRICS)
+
+    lines = []
+    if identity or build:
+        lines.append("node: " + " | ".join(value for value in (identity, build) if value))
+    if pipeline:
+        lines.append(f"pipeline: {pipeline}")
+    if repair:
+        lines.append(f"repair: {repair}")
+    metrics_error = str(row.get("metrics_error") or "")
+    if metrics_error and not pipeline:
+        lines.append(f"metrics: unavailable ({metrics_error})")
+    return lines
 
 
 def suppression_until(path: Path) -> float | None:
@@ -429,12 +513,14 @@ def node_alert_text(fleet: Fleet, row: dict[str, Any], condition: str, age: floa
     detail = row.get("detail") or "no detail"
     height_text = str(height) if height is not None else "-"
 
-    return (
+    lines = [
         f":rotating_light: *Zakura {fleet.name}* - `{name}` {condition} "
-        f"for {format_duration(age)}\n"
-        f"health: {health} - height: {height_text} - detail: {detail}\n"
-        f"dashboard: {fleet.dashboard_url}"
-    )
+        f"for {format_duration(age)}",
+        f"health: {health} - height: {height_text} - detail: {detail}",
+        *node_diagnostic_lines(row),
+        f"dashboard: {fleet.dashboard_url}",
+    ]
+    return "\n".join(lines)
 
 
 def node_recovery_text(fleet: Fleet, row: dict[str, Any], previous: dict[str, Any]) -> str:
@@ -470,14 +556,44 @@ def fleet_recovery_text(fleet: Fleet, previous: dict[str, Any]) -> str:
 
 
 def shared_stall_alert_text(
-    fleet: Fleet, height: float, node_count: int, age: float
+    fleet: Fleet,
+    height: float,
+    node_count: int,
+    age: float,
+    rows: list[dict[str, Any]],
 ) -> str:
-    return (
+    lines = [
         f":rotating_light: *Zakura {fleet.name}* network height has not advanced "
-        f"for {format_duration(age)}\n"
-        f"{node_count} nodes agree at height {int(height)}\n"
-        f"dashboard: {fleet.dashboard_url}"
-    )
+        f"for {format_duration(age)}",
+        f"{node_count} nodes agree at height {int(height)}",
+    ]
+    for row in rows[:8]:
+        summary = named_values(
+            row,
+            (
+                ("height", "height"),
+                ("headers", "headers"),
+                ("header lag", "header_lag"),
+                ("peers", "peer_count"),
+            ),
+        )
+        metrics = row.get("metrics")
+        if isinstance(metrics, dict):
+            pipeline = named_values(
+                metrics,
+                (
+                    ("checkpoint", "checkpoint_verified_height"),
+                    ("network tip", "sync_estimated_network_tip_height"),
+                    ("distance", "sync_estimated_distance_to_tip"),
+                ),
+            )
+            summary = " | ".join(value for value in (summary, pipeline) if value)
+        commit = str(row.get("commit") or "")
+        if commit:
+            summary = " | ".join(value for value in (summary, f"commit {commit[:12]}") if value)
+        lines.append(f"- {row.get('name') or 'unknown'}: {summary or 'no diagnostics'}")
+    lines.append(f"dashboard: {fleet.dashboard_url}")
+    return "\n".join(lines)
 
 
 def shared_stall_recovery_text(fleet: Fleet, height: float | None) -> str:
@@ -564,6 +680,29 @@ class Watchdog:
         self.args = args
         self.started_at = time.time()
         self.fetch_recovered_at: dict[str, float] = {}
+
+    def node_detail(self, fleet: Fleet, row: dict[str, Any]) -> dict[str, Any]:
+        node_name = str(row.get("name") or "")
+        if not node_name:
+            return row
+        detail_url = (
+            fleet.dashboard_url.rstrip("/")
+            + "/data/node/"
+            + urllib.parse.quote(node_name, safe="")
+        )
+        try:
+            payload = fetch_json(detail_url, self.args.request_timeout)
+        except Exception as error:
+            print(
+                f"warning: could not fetch stall diagnostics for "
+                f"{fleet.name}/{node_name}: {error}",
+                file=sys.stderr,
+            )
+            return row
+        detail = payload.get("node")
+        if not isinstance(detail, dict):
+            return row
+        return {**row, **detail}
 
     def run_once(self, state: dict[str, Any]) -> None:
         now = time.time()
@@ -745,13 +884,20 @@ class Watchdog:
         if previous.get("condition") == "stalled":
             bad_since = min(float(previous.get("bad_since", bad_since)), bad_since)
         age = now - bad_since
+        alert_rows = rows
+        if (
+            not suppressed
+            and not previous.get("alerting")
+            and age >= self.args.shared_stalled_after
+        ):
+            alert_rows = [self.node_detail(fleet, row) for row in rows]
         update_alert_state(
             bucket,
             fleet.name,
             "stalled",
             bad_since,
             self.args.shared_stalled_after,
-            shared_stall_alert_text(fleet, height, node_count, age),
+            shared_stall_alert_text(fleet, height, node_count, age, alert_rows),
             shared_stall_recovery_text(fleet, height),
             now,
             suppressed,
@@ -776,6 +922,14 @@ class Watchdog:
         if condition != "ok" and previous.get("condition") == condition:
             bad_since = min(float(previous.get("bad_since", bad_since)), bad_since)
         age = now - bad_since
+        alert_row = row
+        if (
+            condition != "ok"
+            and not suppressed
+            and not previous.get("alerting")
+            and age >= threshold
+        ):
+            alert_row = self.node_detail(fleet, row)
 
         update_alert_state(
             bucket,
@@ -783,7 +937,7 @@ class Watchdog:
             condition,
             bad_since,
             threshold,
-            node_alert_text(fleet, row, condition, age),
+            node_alert_text(fleet, alert_row, condition, age),
             node_recovery_text(fleet, row, previous),
             now,
             suppressed,

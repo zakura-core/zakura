@@ -94,7 +94,8 @@ Alerts fire only after a sustained condition:
 - one node's height has not advanced for at least 10 minutes
 - every observable node shares one height and block hash for at least 30 minutes,
   with at least two observable nodes
-- a dashboard endpoint is unreachable for at least 10 minutes
+- a dashboard endpoint is unreachable, malformed, or serves a stale collector
+  snapshot for at least 10 minutes
 
 Stall alerts include a fixed set of sync-pipeline and VCT repair metrics. The
 fleet `/data` response copies only those numeric fields into each row. The

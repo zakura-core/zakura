@@ -95,6 +95,12 @@ Alerts fire only after a sustained condition:
 - at least two observable nodes share one height and block hash for at least 30 minutes
 - a dashboard endpoint is unreachable for at least 10 minutes
 
+Stall alerts include a fixed set of sync-pipeline and VCT repair metrics. The
+fleet `/data` response copies only those numeric fields into each row. The
+watchdog therefore uses the same collector snapshot for the stall condition and
+its diagnostics. The diagnostic object contains no per-node history, logs, or
+addresses.
+
 The watchdog coalesces a verifiable shared tip into one fleet alert. A missing
 or different block hash keeps the individual node alerts. Down alerts take
 precedence over stalled alerts, so each node has at most one active alert. The

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -26,6 +27,38 @@ from typing import Any
 
 DOWN_HEALTH = {"down", "rpc_error"}
 STATE_VERSION = 1
+MAX_SHARED_DIAGNOSTIC_ROWS = 8
+STALL_PIPELINE_METRICS = (
+    ("network tip", "sync_estimated_network_tip_height"),
+    ("distance", "sync_estimated_distance_to_tip"),
+    ("checkpoint next", "checkpoint_processing_next_height"),
+    ("checkpoint verified", "checkpoint_verified_height"),
+    ("state finalized", "state_finalized_block_height"),
+    ("header best", "sync_header_chain_frontier_header_best_height"),
+    ("header verified", "sync_header_chain_frontier_verified_best_height"),
+    ("header finalized", "sync_header_chain_frontier_finalized_height"),
+    ("header progress age", "sync_header_work_last_progress_age_seconds"),
+    ("oldest missing", "sync_header_work_oldest_missing_height"),
+    ("header in flight", "sync_header_work_in_flight_count"),
+    ("block applying", "sync_block_applying"),
+    ("block header tip", "sync_block_best_header_tip_height"),
+    ("block verified tip", "sync_block_verified_tip_height"),
+    ("block fill stop", "sync_block_fill_stop"),
+    ("block outstanding", "sync_block_outstanding"),
+    ("missing bodies", "sync_block_missing_bodies"),
+)
+STALL_REPAIR_METRICS = (
+    ("stalled height", "state_vct_root_stalled_height"),
+    ("state requests", "state_vct_root_repair_requested"),
+    ("state retries", "state_vct_root_retry_count"),
+    ("sweep frontier", "state_vct_aux_sweep_frontier_height"),
+    ("requested", "sync_header_vct_repair_requested_total"),
+    ("scheduled", "sync_header_vct_repair_scheduled_total"),
+    ("admitted", "sync_header_vct_repair_admitted_total"),
+    ("context unavailable", "sync_header_vct_repair_context_unavailable_total"),
+    ("timed out", "sync_header_vct_repair_timed_out_total"),
+    ("resource stalled", "sync_header_vct_repair_resource_stalled_total"),
+)
 
 
 @dataclass(frozen=True)
@@ -213,6 +246,81 @@ def format_duration(seconds: float) -> str:
 
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h" if minutes == 0 else f"{hours}h {minutes}m"
+
+
+def format_metric(value: object) -> str | None:
+    number = coerce_float(value)
+    if number is None or not math.isfinite(number):
+        return None
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def named_metrics(
+    source: dict[str, Any], fields: tuple[tuple[str, str], ...]
+) -> str:
+    values = []
+    for label, key in fields:
+        value = format_metric(source.get(key))
+        if value is not None:
+            values.append(f"{label} {value}")
+    return " | ".join(values)
+
+
+def bounded_text(value: object, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def alert_metrics(row: dict[str, Any]) -> tuple[dict[str, Any], bool | None]:
+    diagnostics = row.get("alert_diagnostics")
+    if not isinstance(diagnostics, dict):
+        return {}, None
+    metrics = diagnostics.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = {}
+    available = diagnostics.get("metrics_available")
+    return metrics, available if isinstance(available, bool) else None
+
+
+def node_diagnostic_lines(row: dict[str, Any]) -> list[str]:
+    identity = named_metrics(
+        row,
+        (
+            ("headers", "headers"),
+            ("header lag", "header_lag"),
+            ("peers", "peer_count"),
+        ),
+    )
+    commit = bounded_text(row.get("commit"), 12)
+    version = bounded_text(row.get("version"), 64)
+    build = " | ".join(
+        value
+        for value in (
+            f"commit {commit}" if commit else "",
+            f"version {version}" if version else "",
+        )
+        if value
+    )
+    metrics, available = alert_metrics(row)
+    pipeline = named_metrics(metrics, STALL_PIPELINE_METRICS)
+    repair = named_metrics(metrics, STALL_REPAIR_METRICS)
+
+    lines = []
+    if identity or build:
+        lines.append("node: " + " | ".join(value for value in (identity, build) if value))
+    if pipeline:
+        lines.append(f"pipeline: {pipeline}")
+    if repair:
+        lines.append(f"repair: {repair}")
+    if not pipeline and not repair:
+        if available is False:
+            lines.append("metrics: unavailable")
+        elif available is None:
+            lines.append("metrics: absent from fleet snapshot")
+        else:
+            lines.append("metrics: no alert diagnostics emitted")
+    return lines
 
 
 def suppression_until(path: Path) -> float | None:
@@ -451,12 +559,14 @@ def node_alert_text(fleet: Fleet, row: dict[str, Any], condition: str, age: floa
     detail = row.get("detail") or "no detail"
     height_text = str(height) if height is not None else "-"
 
-    return (
+    lines = [
         f":rotating_light: *Zakura {fleet.name}* - `{name}` {condition} "
-        f"for {format_duration(age)}\n"
-        f"health: {health} - height: {height_text} - detail: {detail}\n"
-        f"dashboard: {fleet.dashboard_url}"
-    )
+        f"for {format_duration(age)}",
+        f"health: {health} - height: {height_text} - detail: {detail}",
+        *node_diagnostic_lines(row),
+        f"dashboard: {fleet.dashboard_url}",
+    ]
+    return "\n".join(lines)
 
 
 def node_recovery_text(fleet: Fleet, row: dict[str, Any], previous: dict[str, Any]) -> str:
@@ -492,15 +602,58 @@ def fleet_recovery_text(fleet: Fleet, previous: dict[str, Any]) -> str:
 
 
 def shared_stall_alert_text(
-    fleet: Fleet, height: float, block_hash: str, node_count: int, age: float
+    fleet: Fleet,
+    height: float,
+    block_hash: str,
+    node_count: int,
+    age: float,
+    rows: list[dict[str, Any]],
 ) -> str:
-    return (
+    lines = [
         f":rotating_light: *Zakura {fleet.name}* network height has not advanced "
-        f"for {format_duration(age)}\n"
-        f"{node_count} nodes agree at height {int(height)}\n"
-        f"tip hash: {block_hash}\n"
-        f"dashboard: {fleet.dashboard_url}"
-    )
+        f"for {format_duration(age)}",
+        f"{node_count} nodes agree at height {int(height)}",
+        f"tip hash: {block_hash}",
+    ]
+    for row in rows[:MAX_SHARED_DIAGNOSTIC_ROWS]:
+        summary = named_metrics(
+            row,
+            (
+                ("height", "height"),
+                ("headers", "headers"),
+                ("header lag", "header_lag"),
+                ("peers", "peer_count"),
+            ),
+        )
+        metrics, _available = alert_metrics(row)
+        pipeline = named_metrics(
+            metrics,
+            (
+                ("checkpoint", "checkpoint_verified_height"),
+                ("network tip", "sync_estimated_network_tip_height"),
+                ("distance", "sync_estimated_distance_to_tip"),
+                ("applying", "sync_block_applying"),
+                ("outstanding", "sync_block_outstanding"),
+                ("missing", "sync_block_missing_bodies"),
+            ),
+        )
+        commit = bounded_text(row.get("commit"), 12)
+        summary = " | ".join(
+            value
+            for value in (
+                summary,
+                pipeline,
+                f"commit {commit}" if commit else "",
+            )
+            if value
+        )
+        name = bounded_text(row.get("name") or "unknown", 64)
+        lines.append(f"- {name}: {summary or 'no diagnostics'}")
+    hidden = max(0, node_count - MAX_SHARED_DIAGNOSTIC_ROWS)
+    if hidden:
+        lines.append(f"- {hidden} more participating nodes not shown")
+    lines.append(f"dashboard: {fleet.dashboard_url}")
+    return "\n".join(lines)
 
 
 def shared_stall_recovery_text(
@@ -825,19 +978,25 @@ class Watchdog:
                         f"{format_duration(age)}"
                     )
                 next_entry["suppression_logged"] = True
-            elif post_slack(
-                shared_stall_alert_text(
+            else:
+                participant_names = set(common_stall.node_names)
+                participant_rows = [
+                    row
+                    for row in rows
+                    if str(row.get("name") or "unknown") in participant_names
+                ]
+                alert_text = shared_stall_alert_text(
                     fleet,
                     common_stall.height,
                     common_stall.block_hash,
                     len(common_stall.node_names),
                     age,
-                ),
-                self.args,
-            ):
-                next_entry["alerting"] = True
-                next_entry["last_alert_at"] = now
-                next_entry["alert_height"] = common_stall.height
+                    participant_rows,
+                )
+                if post_slack(alert_text, self.args):
+                    next_entry["alerting"] = True
+                    next_entry["last_alert_at"] = now
+                    next_entry["alert_height"] = common_stall.height
 
         bucket[fleet.name] = next_entry
 

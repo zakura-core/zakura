@@ -202,6 +202,7 @@ jobs:
           # Read-only fields below: consumed by the status dashboard's SSH probe,
           # not written to any node (manage_config = false).
           rpc_listen_addr = "0.0.0.0:8232"
+          metrics_endpoint = "127.0.0.1:9999"
           log_file        = "/root/logs/zakura-tracing.log"
           # Verified on the fleet: the nine regional nodes keep state here, the
           # compat host does not. Used only for the dashboard's disk probe.
@@ -584,6 +585,7 @@ jobs:
           ssh_string = "root@159.203.113.196"
           probe_kind = "zcashd"
           service_name = ""
+          metrics_endpoint = ""
           # Managed/path install from zcashd-compat-manifest.json (v1.0.0-compat-rc0).
           bin_path = "/mnt/data/import-zebra/zcashd-compat/bin/v1.0.0-compat-rc0/x86_64-pc-linux-gnu/zcashd"
           log_file = ""

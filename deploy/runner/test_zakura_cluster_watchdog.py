@@ -203,6 +203,131 @@ class StallRecoveryTests(unittest.TestCase):
         self.assertEqual(self.posted, [])
 
 
+class StallDiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        self.fleet = watchdog.Fleet(
+            name="mainnet",
+            url="http://dashboard.invalid/data",
+            dashboard_url="http://dashboard.invalid/",
+        )
+
+    @staticmethod
+    def diagnostics(**metrics):
+        return {
+            "last_poll": 1_000.0,
+            "metrics_at": 999.0,
+            "metrics_available": True,
+            "metrics": metrics,
+        }
+
+    def test_node_alert_formats_atomic_pipeline_and_repair_metrics(self):
+        row = {
+            "name": "canada-0",
+            "health": "stale",
+            "height": 3_461_397,
+            "headers": 3_461_900,
+            "header_lag": 503,
+            "peer_count": 7,
+            "commit": "5c33befdfae0a9e047079c96b9254d9d894c3885",
+            "version": "1.3.0-rc2",
+            "detail": "height has not advanced within stale window",
+            "alert_diagnostics": self.diagnostics(
+                checkpoint_verified_height=3_461_397.0,
+                sync_estimated_network_tip_height=3_461_901.0,
+                sync_estimated_distance_to_tip=504.0,
+                sync_block_applying=0.0,
+                sync_block_best_header_tip_height=3_461_900.0,
+                sync_block_verified_tip_height=3_461_397.0,
+                sync_block_fill_stop=1.0,
+                sync_block_outstanding=0.0,
+                sync_block_missing_bodies=4_000.0,
+                state_vct_root_stalled_height=3_461_398.0,
+                sync_header_vct_repair_context_unavailable_total=5.0,
+                sync_header_vct_repair_timed_out_total=2.0,
+            ),
+        }
+        row["alert_diagnostics"].update({"health": "healthy", "height": 9_999_999})
+
+        text = watchdog.node_alert_text(self.fleet, row, "stalled", 617.0)
+
+        self.assertIn("health: stale - height: 3461397", text)
+        self.assertIn("headers 3461900 | header lag 503 | peers 7", text)
+        self.assertIn("checkpoint verified 3461397", text)
+        self.assertIn("block applying 0", text)
+        self.assertIn("block header tip 3461900", text)
+        self.assertIn("block verified tip 3461397", text)
+        self.assertIn("block fill stop 1", text)
+        self.assertIn("block outstanding 0 | missing bodies 4000", text)
+        self.assertIn("context unavailable 5 | timed out 2", text)
+        self.assertNotIn("no supplier", text)
+
+    def test_missing_diagnostics_do_not_hide_the_stall(self):
+        row = {
+            "name": "canada-0",
+            "health": "stale",
+            "height": 3_461_397,
+            "detail": "height has not advanced within stale window",
+        }
+
+        text = watchdog.node_alert_text(self.fleet, row, "stalled", 617.0)
+
+        self.assertIn("`canada-0` stalled", text)
+        self.assertIn("metrics: absent from fleet snapshot", text)
+
+    def test_due_alert_uses_one_fleet_request(self):
+        posted = []
+        instance = watchdog.Watchdog([self.fleet], make_args())
+        snapshot = {
+            "last_poll": 1_000.0,
+            "rows": [
+                {
+                    "name": "canada-0",
+                    "health": "stale",
+                    "height": 3_461_397,
+                    "block_hash": "aaaa",
+                    "seconds_since_advanced": 700.0,
+                    "alert_diagnostics": self.diagnostics(
+                        sync_block_missing_bodies=4_000.0
+                    ),
+                }
+            ],
+        }
+
+        with (
+            patch.object(watchdog, "fetch_json", return_value=snapshot) as fetch,
+            patch.object(watchdog.time, "time", return_value=1_000.0),
+            patch.object(
+                watchdog,
+                "post_slack",
+                side_effect=lambda text, _args: (posted.append(text), True)[1],
+            ),
+        ):
+            instance.run_once({"nodes": {}, "fleets": {}, "shared_stalls": {}})
+
+        fetch.assert_called_once_with(self.fleet.url, instance.args.request_timeout)
+        self.assertEqual(len(posted), 1)
+        self.assertIn("missing bodies 4000", posted[0])
+
+    def test_diagnostic_rendering_is_bounded(self):
+        fields = watchdog.STALL_PIPELINE_METRICS + watchdog.STALL_REPAIR_METRICS
+        metrics = {
+            name: float(index) for index, (_label, name) in enumerate(fields)
+        }
+        row = {
+            "name": "node-a",
+            "health": "stale",
+            "height": 1,
+            "detail": "stalled",
+            "version": "x" * 10_000,
+            "alert_diagnostics": self.diagnostics(**metrics),
+        }
+
+        text = watchdog.node_alert_text(self.fleet, row, "stalled", 700.0)
+
+        self.assertLess(len(text), 2_000)
+        self.assertNotIn("x" * 65, text)
+
+
 class SharedStallTests(unittest.TestCase):
     NOW = 2_000.0
 
@@ -267,6 +392,44 @@ class SharedStallTests(unittest.TestCase):
         self.assertTrue(
             all(not entry["alerting"] for entry in self.state["nodes"].values())
         )
+
+    def test_shared_alert_lists_only_participating_nodes(self):
+        node_a = self.row("node-a", 4_302_737, 1_817)
+        node_b = self.row("node-b", 4_302_737, 1_816)
+        for row in (node_a, node_b):
+            row["alert_diagnostics"] = StallDiagnosticTests.diagnostics(
+                checkpoint_verified_height=4_302_737.0
+            )
+        down = self.row("down-node", 7, 1_900, health="down", block_hash="bbbb")
+
+        self.run_snapshot([down, node_a, node_b])
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("- node-a:", self.posted[0])
+        self.assertIn("- node-b:", self.posted[0])
+        self.assertNotIn("- down-node:", self.posted[0])
+
+    def test_shared_alert_limits_rendered_participants(self):
+        rows = [
+            {
+                **self.row(f"node-{index:02}", 100, 1_900, block_hash="aaaa"),
+                "alert_diagnostics": StallDiagnosticTests.diagnostics(
+                    sync_block_missing_bodies=4_000.0
+                ),
+            }
+            for index in range(12)
+        ]
+
+        text = watchdog.shared_stall_alert_text(
+            self.fleet, 100, "aaaa", len(rows), 1_900.0, rows
+        )
+
+        self.assertEqual(
+            sum(line.startswith("- node-") for line in text.splitlines()),
+            watchdog.MAX_SHARED_DIAGNOSTIC_ROWS,
+        )
+        self.assertIn("- 4 more participating nodes not shown", text)
+        self.assertLess(len(text), 3_000)
 
     def test_short_common_idle_does_not_alert(self):
         self.run_snapshot(

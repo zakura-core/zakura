@@ -59,6 +59,98 @@ fn vct_repair_signal_schedules_one_exact_current_height() {
 }
 
 #[tokio::test]
+async fn committer_repair_replaces_and_then_restores_a_sweep_repair() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let mut snapshot = committed_snapshot(anchor);
+    snapshot.frontiers.header_best =
+        zakura_header_chain::Frontier::new(block::Height(20), block::Hash([2; 32]));
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot));
+    startup.committed_snapshots = Some(snapshots_rx);
+
+    let sweep_height = block::Height(11);
+    let committer_height = block::Height(12);
+    let (repairs_tx, repairs_rx) = watch::channel(zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: sweep_height,
+        },
+        generation: 7,
+    });
+    startup.vct_root_repairs = Some(repairs_rx);
+    let (handle, mut actions, reactor) =
+        spawn_header_sync_reactor(startup).expect("the repair replacement fixture starts");
+
+    let HeaderPortOperation::QueryVctRepairContext {
+        owner: sweep_owner,
+        height,
+    } = next_action(&mut actions).await
+    else {
+        panic!("the sweep repair requests its context");
+    };
+    assert_eq!(height, sweep_height);
+
+    repairs_tx
+        .send(zakura_header_chain::VctRootRepairStatus {
+            state: zakura_header_chain::VctRootRepairState::Unavailable {
+                height: committer_height,
+            },
+            generation: 8,
+        })
+        .expect("the committer repair replaces the sweep repair");
+    let HeaderPortOperation::QueryVctRepairContext {
+        owner: committer_owner,
+        height,
+    } = next_action(&mut actions).await
+    else {
+        panic!("the committer repair requests its context");
+    };
+    assert_eq!(height, committer_height);
+    assert_ne!(committer_owner, sweep_owner);
+
+    handle
+        .send(Event::VctRepairContextReady {
+            owner: sweep_owner,
+            result: VctRepairContextResult::Resolved(zakura_header_chain::VctRepairContext {
+                target: zakura_header_chain::Frontier::new(sweep_height, block::Hash([11; 32])),
+                locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
+            }),
+        })
+        .await
+        .expect("the late sweep completion reaches the reactor");
+    assert!(
+        time::timeout(std::time::Duration::from_millis(20), actions.recv())
+            .await
+            .is_err(),
+        "a completion from the retired sweep repair cannot schedule work"
+    );
+
+    repairs_tx
+        .send(zakura_header_chain::VctRootRepairStatus {
+            state: zakura_header_chain::VctRootRepairState::Unavailable {
+                height: sweep_height,
+            },
+            generation: 9,
+        })
+        .expect("clearing the committer repair restores the sweep repair");
+    let HeaderPortOperation::QueryVctRepairContext {
+        owner: restored_sweep_owner,
+        height,
+    } = next_action(&mut actions).await
+    else {
+        panic!("the restored sweep repair requests new context");
+    };
+    assert_eq!(height, sweep_height);
+    assert_ne!(restored_sweep_owner, sweep_owner);
+    assert_ne!(restored_sweep_owner, committer_owner);
+
+    shutdown.cancel();
+    reactor
+        .await
+        .expect("the repair replacement reactor stops cleanly");
+}
+
+#[tokio::test]
 async fn vct_repair_uses_one_exact_canonical_auxiliary_request() {
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown.clone());

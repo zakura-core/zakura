@@ -233,20 +233,17 @@ impl VctWriteRetryManager {
         self.publish_effective_repair_status(None);
     }
 
-    /// Publishes the lowest outstanding repair height.
+    /// Publishes the repair that can unblock the writer.
     ///
-    /// The repair channel stores one latest value. The manager publishes the lower height because
-    /// its replacement unblocks the higher repair.
+    /// The repair channel stores one latest value. A committer repair takes priority because the
+    /// authentication sweep runs only after the checkpoint queue becomes empty. The sweep cannot
+    /// clear its repair while a missing committer root keeps that queue nonempty.
     fn publish_effective_repair_status(
         &mut self,
         requester_with_new_episode: Option<VctRepairRequester>,
     ) {
         let effective_repair = match (self.committer_repair_height, self.sweep_repair_height) {
-            (Some(committer), Some(sweep)) if committer <= sweep => {
-                Some((committer, VctRepairRequester::Committer))
-            }
-            (Some(_), Some(sweep)) => Some((sweep, VctRepairRequester::Sweep)),
-            (Some(committer), None) => Some((committer, VctRepairRequester::Committer)),
+            (Some(committer), _) => Some((committer, VctRepairRequester::Committer)),
             (None, Some(sweep)) => Some((sweep, VctRepairRequester::Sweep)),
             (None, None) => None,
         };

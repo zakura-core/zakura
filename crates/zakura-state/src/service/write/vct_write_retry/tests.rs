@@ -241,6 +241,48 @@ fn a_hidden_higher_sweep_need_keeps_the_lower_committer_episode() {
 }
 
 #[test]
+fn a_missing_committer_root_preempts_a_lower_sweep_need() {
+    let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let mut manager = VctWriteRetryManager::new(tx);
+    let sweep_height = Height(42);
+    let committer_height = Height(84);
+
+    manager.request_sweep_repair(sweep_height);
+    let sweep_status = *rx.borrow_and_update();
+    assert_eq!(
+        sweep_status.state,
+        VctRootRepairState::Unavailable {
+            height: sweep_height
+        }
+    );
+
+    manager.on_retryable_error(committer_height, MISSING_ROOT, queued_block(1));
+    let committer_status = *rx.borrow_and_update();
+    assert_eq!(
+        committer_status.state,
+        VctRootRepairState::Unavailable {
+            height: committer_height
+        },
+        "the committer must advance before the checkpoint queue can empty and run the sweep"
+    );
+    assert_eq!(committer_status.generation, sweep_status.generation + 1);
+    assert!(
+        manager.take_retryable_block().is_some(),
+        "the production missing-root path parks the blocked checkpoint"
+    );
+
+    manager.on_commit_success();
+    let resumed_sweep = *rx.borrow_and_update();
+    assert_eq!(
+        resumed_sweep.state,
+        VctRootRepairState::Unavailable {
+            height: sweep_height
+        }
+    );
+    assert_eq!(resumed_sweep.generation, committer_status.generation + 1);
+}
+
+#[test]
 fn root_repair_signal_ignores_await_successor_and_clears_on_commit() {
     let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
     let mut manager = VctWriteRetryManager::new(tx);

@@ -982,7 +982,7 @@ fn a_committer_stall_below_the_sweep_takes_priority() {
     assert_eq!(
         fixture.repair_state(),
         VctRootRepairState::Unavailable { height: stalled },
-        "the lower need is the one whose replacement unblocks the other"
+        "the committer repair must unblock the checkpoint queue before the sweep can resume"
     );
 
     fixture.repair.on_commit_success();

@@ -22,6 +22,113 @@ from typing import Any, NamedTuple
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = SCRIPT_DIR / "templates"
 
+# This branch-only probe prints bounded, read-only evidence into the Actions log.
+# It preserves the stopped service and its run artifacts.
+STALL_DIAGNOSTIC_TARGETS = {
+    "us-west-0": "root@143.244.184.176",
+    "canada-0": "root@159.203.38.10",
+    "europe-west-0": "root@64.227.44.93",
+    "asia-south-0": "root@139.59.64.115",
+    "asia-pacific-0": "root@168.144.173.250",
+}
+
+STALL_DIAGNOSTIC_SCRIPT = r"""
+set -u
+
+section() {
+    printf '\n===== %s =====\n' "$1"
+}
+
+section identity
+date --iso-8601=seconds
+hostname
+uname -a
+uptime
+
+section resources
+df -h
+df -i
+free -h
+ps -eo pid,ppid,stat,etimes,%cpu,%mem,rss,cmd --sort=-rss | head -n 50
+
+section services
+for unit in zakura.service zakurad.service zakura-continuous-sync.service; do
+    printf '\n--- %s ---\n' "${unit}"
+    systemctl show "${unit}" \
+        --property=ActiveState,SubState,Result,ExecMainStatus,NRestarts,ActiveEnterTimestamp \
+        --no-pager 2>&1 || true
+done
+
+section controller-state
+for file in \
+    /var/lib/zakura-continuous-sync/state.json \
+    /var/lib/zakura-monitor/cluster-state.json; do
+    if [ -f "${file}" ]; then
+        printf '\n--- %s ---\n' "${file}"
+        cat "${file}"
+    fi
+done
+
+section artifact-inventory
+find /var/log/zakura /root/logs \
+    -maxdepth 5 -type f \
+    -printf '%TY-%Tm-%TdT%TH:%TM:%TS %s %p\n' 2>/dev/null | sort || true
+
+section run-metadata
+find /var/log/zakura/runs -maxdepth 2 \
+    -type f -name run.json -print0 2>/dev/null |
+    while IFS= read -r -d '' file; do
+        printf '\n--- %s ---\n' "${file}"
+        cat "${file}"
+    done
+
+section recent-samples
+find /var/log/zakura/runs -maxdepth 2 \
+    -type f -name samples.jsonl -print0 2>/dev/null |
+    while IFS= read -r -d '' file; do
+        printf '\n--- %s ---\n' "${file}"
+        tail -n 300 "${file}"
+    done
+
+section node-log-errors
+find /var/log/zakura/runs /var/log/zakura /root/logs \
+    -maxdepth 3 -type f \
+    \( -name zebrad.log -o -name zakura-tracing.log -o -name monitor.log \) \
+    -print0 2>/dev/null |
+    while IFS= read -r -d '' file; do
+        printf '\n--- %s errors ---\n' "${file}"
+        tail -n 100000 "${file}" |
+            grep -E -i 'warn|error|fail|stall|panic|MissingRoot|ConflictingReplay|repair' |
+            tail -n 5000 || true
+        printf '\n--- %s tail ---\n' "${file}"
+        tail -n 500 "${file}"
+    done
+
+section trace-excerpts
+find /var/log/zakura/runs /var/log/zakura/traces \
+    -maxdepth 4 -type f -name '*.jsonl' -print0 2>/dev/null |
+    while IFS= read -r -d '' file; do
+        printf '\n--- %s ---\n' "${file}"
+        tail -n 200000 "${file}" |
+            grep -E -i \
+                'MissingRoot|ConflictingReplay|repair|supplier|stall|error|fail|waiting|verifier|transition|replay|round_finish|pipeline_reset|block_finish|notfound' |
+            tail -n 5000 || true
+    done
+
+section journals
+for unit in zakura.service zakurad.service zakura-continuous-sync.service; do
+    printf '\n--- %s ---\n' "${unit}"
+    journalctl -u "${unit}" --since '7 days ago' --no-pager -n 5000 2>&1 |
+        grep -E -i 'warn|error|fail|stall|panic|MissingRoot|ConflictingReplay|repair' |
+        tail -n 3000 || true
+done
+
+section metrics
+curl -fsS --max-time 20 http://127.0.0.1:9999/metrics 2>/dev/null |
+    grep -E -i 'height|tip|sync|checkpoint|verif|queue|repair|replay|peer|error|fail' |
+    tail -n 10000 || true
+"""
+
 SSH_COMMON_OPTS = [
     "-o",
     "BatchMode=yes",
@@ -371,14 +478,45 @@ def cmd_deploy(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    nodes = load_nodes(args.config, args.node)
+    requested = set(args.node or [])
+    diagnostic_targets = requested.intersection(STALL_DIAGNOSTIC_TARGETS)
+    if diagnostic_targets:
+        unknown = requested - diagnostic_targets
+        if unknown:
+            raise DeployError(
+                "cannot mix diagnostic targets with continuous-sync nodes: "
+                + ", ".join(sorted(unknown))
+            )
+        nodes = [
+            Node({"name": name, "ssh_string": STALL_DIAGNOSTIC_TARGETS[name]})
+            for name in sorted(diagnostic_targets)
+        ]
+    else:
+        nodes = load_nodes(args.config, args.node)
 
     def work(node: Node) -> tuple[str, bool, str]:
-        ok, data = remote_json(node, "/usr/local/sbin/zakura-continuous-sync.py status")
-        if not ok:
-            return node.name, False, str(data)
-        print(json.dumps(data, indent=2, sort_keys=True))
-        return node.name, True, "status fetched"
+        if node.name not in STALL_DIAGNOSTIC_TARGETS:
+            ok, data = remote_json(node, "/usr/local/sbin/zakura-continuous-sync.py status")
+            if not ok:
+                return node.name, False, str(data)
+            print(json.dumps(data, indent=2, sort_keys=True))
+
+        cmd = node.ssh_cmd("bash", "-s")
+        actions_key = Path.home() / ".ssh" / "zakura-continuous-sync"
+        if actions_key.exists():
+            cmd[1:1] = ["-i", str(actions_key), "-o", "IdentitiesOnly=yes"]
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            input=STALL_DIAGNOSTIC_SCRIPT,
+            capture_output=True,
+            timeout=240,
+        )
+        print(f"\n######## diagnostics: {node.name} ########")
+        print(proc.stdout)
+        if proc.returncode != 0:
+            return node.name, False, (proc.stderr or f"diagnostic exit {proc.returncode}").strip()
+        return node.name, True, "status and diagnostics fetched"
 
     return summarize_parallel(nodes, work)
 

@@ -489,7 +489,9 @@ struct VctSupplierRejections {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum VctRepairStallOutcome {
+    LocalCapacityUnavailable,
     LocalFailure,
+    LocalOperationPending,
     LocalSendFailure,
     NoEligibleSupplier,
     SupplierCycleExhausted,
@@ -500,7 +502,9 @@ enum VctRepairStallOutcome {
 impl VctRepairStallOutcome {
     fn label(self) -> &'static str {
         match self {
+            Self::LocalCapacityUnavailable => "local_capacity_unavailable",
             Self::LocalFailure => "local_failure",
+            Self::LocalOperationPending => "local_operation_pending",
             Self::LocalSendFailure => "local_send_failed",
             Self::NoEligibleSupplier => "no_eligible_supplier",
             Self::SupplierCycleExhausted => "supplier_cycle_exhausted",
@@ -511,7 +515,10 @@ impl VctRepairStallOutcome {
 
     fn attribution(self) -> &'static str {
         match self {
-            Self::LocalFailure | Self::LocalSendFailure => "local",
+            Self::LocalCapacityUnavailable
+            | Self::LocalFailure
+            | Self::LocalOperationPending
+            | Self::LocalSendFailure => "local",
             Self::NoEligibleSupplier
             | Self::SupplierCycleExhausted
             | Self::SupplierFailure
@@ -830,7 +837,13 @@ impl HeaderSyncReactor {
                 active.purpose,
                 HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
             )
-            .then_some((active.owner, active.source))
+            .then_some((active.owner, active.source, active.phase))
+        });
+        let owns_local_repair_operation = replaced_repair.is_some_and(|(_, _, phase)| {
+            matches!(
+                phase,
+                HeaderTargetPhase::Preparing | HeaderTargetPhase::Applying
+            )
         });
         let at_capacity = !replaces_same_direction
             && self.admitted_count(direction)
@@ -856,7 +869,9 @@ impl HeaderSyncReactor {
         });
         let replaces_existing_peer = self.peer_state.contains_key(&peer);
         if replaces_existing_peer {
-            self.retire_peer_work(&peer, HeaderRequestTerminal::SessionReplaced);
+            if !owns_local_repair_operation {
+                self.retire_peer_work(&peer, HeaderRequestTerminal::SessionReplaced);
+            }
             self.release_served_path(&peer);
         }
         if let Some(previous) = self.peer_state.insert(
@@ -869,9 +884,13 @@ impl HeaderSyncReactor {
             },
         ) {
             previous.session.cancel_token().cancel();
-            if let Some((owner, source)) = replaced_repair
-                .and_then(|(owner, source)| owner.body_owner().map(|owner| (owner, source)))
-            {
+            if let Some((owner, source)) = replaced_repair.and_then(|(owner, source, phase)| {
+                if phase == HeaderTargetPhase::Receiving {
+                    owner.body_owner().map(|owner| (owner, source))
+                } else {
+                    None
+                }
+            }) {
                 self.retry_vct_repair(
                     owner,
                     VctRepairRetry::supplier(source, HeaderRequestTerminal::SessionReplaced),
@@ -919,13 +938,22 @@ impl HeaderSyncReactor {
                         .body_owner()
                         .expect("an auxiliary repair has body authority"),
                     active.source,
+                    active.phase,
                 )
             })
         });
-        self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
+        let owns_local_repair_operation = abandoned_repair.is_some_and(|(_, _, phase)| {
+            matches!(
+                phase,
+                HeaderTargetPhase::Preparing | HeaderTargetPhase::Applying
+            )
+        });
+        if !owns_local_repair_operation {
+            self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
+        }
         self.peer_state.remove(peer);
         self.vct_supplier_order.retain(|queued| queued != peer);
-        if let Some((owner, source)) = abandoned_repair {
+        if let Some((owner, source, HeaderTargetPhase::Receiving)) = abandoned_repair {
             self.retry_vct_repair(
                 owner,
                 VctRepairRetry::supplier(source, HeaderRequestTerminal::Disconnected),
@@ -2994,11 +3022,13 @@ impl HeaderSyncReactor {
                 .defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
             return;
         }
+        let mut local_capacity_unavailable = false;
         for (peer, source, session, mut status) in candidates {
             self.peer_work_queue.remove_unstarted(&peer);
             if self.peer_work_queue.reservable_header_count(1) != 1
                 || !self.peer_work_queue.reserve_request(&peer, 1)
             {
+                local_capacity_unavailable = true;
                 continue;
             }
             let request_id = match session.try_send_get_headers(
@@ -3123,14 +3153,16 @@ impl HeaderSyncReactor {
             return;
         }
         if let Some(current) = self.vct_repair.get(task.owner).cloned() {
-            if rejections.send_failed > 0 || current.supplier_cycle_exhausted() {
-                self.note_vct_repair_stall(
-                    &current,
-                    predecessor,
-                    rejections,
-                    VctRepairStallOutcome::SupplierSendFailure,
-                    now,
-                );
+            let stall_outcome = if rejections.send_failed > 0 || current.supplier_cycle_exhausted()
+            {
+                Some(VctRepairStallOutcome::SupplierSendFailure)
+            } else if local_capacity_unavailable {
+                Some(VctRepairStallOutcome::LocalCapacityUnavailable)
+            } else {
+                None
+            };
+            if let Some(stall_outcome) = stall_outcome {
+                self.note_vct_repair_stall(&current, predecessor, rejections, stall_outcome, now);
             }
         }
         let _ = self
@@ -3335,21 +3367,57 @@ impl HeaderSyncReactor {
                 })
             });
             if let Some((owner, source, phase)) = repair {
-                if let Some(task) = self.vct_repair.get(owner) {
-                    self.emit_vct_repair_state(task, "timeout", Some("timed_out"));
+                match phase {
+                    HeaderTargetPhase::Receiving => {
+                        if let Some(task) = self.vct_repair.get(owner) {
+                            self.emit_vct_repair_state(task, "timeout", Some("timed_out"));
+                        }
+                        self.retry_vct_repair(
+                            owner,
+                            VctRepairRetry::supplier(source, HeaderRequestTerminal::TimedOut),
+                        );
+                        metrics::counter!("sync.header.vct.repair.timed_out.total").increment(1);
+                    }
+                    HeaderTargetPhase::Preparing | HeaderTargetPhase::Applying => {
+                        let Some(task) = self.vct_repair.get(owner).cloned() else {
+                            self.retire_peer_work(&peer, HeaderRequestTerminal::RepairObsolete);
+                            continue;
+                        };
+                        self.emit_vct_repair_state(
+                            &task,
+                            "local_operation",
+                            Some(match phase {
+                                HeaderTargetPhase::Preparing => "preparing_pending",
+                                HeaderTargetPhase::Applying => "applying_pending",
+                                HeaderTargetPhase::Receiving => unreachable!(
+                                    "the receiving phase is handled before local operation polling"
+                                ),
+                            }),
+                        );
+                        if let Some(predecessor) = vct_repair_predecessor(&task) {
+                            self.note_vct_repair_stall(
+                                &task,
+                                predecessor,
+                                VctSupplierRejections::default(),
+                                VctRepairStallOutcome::LocalOperationPending,
+                                now,
+                            );
+                        }
+                        self.request_deadlines
+                            .insert(peer, now + self.startup.request_timeout);
+                        metrics::counter!(
+                            "sync.header.vct.repair.local_operation_pending.total",
+                            "phase" => match phase {
+                                HeaderTargetPhase::Preparing => "preparing",
+                                HeaderTargetPhase::Applying => "applying",
+                                HeaderTargetPhase::Receiving => unreachable!(
+                                    "the receiving phase is handled before local operation polling"
+                                ),
+                            }
+                        )
+                        .increment(1);
+                    }
                 }
-                self.retry_vct_repair(
-                    owner,
-                    match phase {
-                        HeaderTargetPhase::Receiving => {
-                            VctRepairRetry::supplier(source, HeaderRequestTerminal::TimedOut)
-                        }
-                        HeaderTargetPhase::Preparing | HeaderTargetPhase::Applying => {
-                            VctRepairRetry::local(source, HeaderRequestTerminal::TimedOut)
-                        }
-                    },
-                );
-                metrics::counter!("sync.header.vct.repair.timed_out.total").increment(1);
             } else {
                 let session_id = self
                     .peer_work_queue

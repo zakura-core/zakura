@@ -1,5 +1,110 @@
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
+use futures::{FutureExt, StreamExt};
+use tokio::sync::Notify;
+use zakura_node_services::header_chain as port;
+
 use super::*;
-use crate::zakura::header_sync::scheduler::repair::MAX_SUPPLIERS_PER_CYCLE;
+use crate::zakura::header_sync::scheduler::{
+    peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, repair::MAX_SUPPLIERS_PER_CYCLE,
+};
+
+#[derive(Debug)]
+struct PendingVctLocalPort {
+    prepare_calls: Arc<AtomicUsize>,
+    apply_calls: Arc<AtomicUsize>,
+    prepare_release: Arc<Notify>,
+    apply_release: Arc<Notify>,
+    apply_succeeds: bool,
+}
+
+impl port::Port for PendingVctLocalPort {
+    fn continuation_locator(
+        &self,
+    ) -> port::HeaderChainFuture<
+        '_,
+        Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn vct_repair_context(
+        &self,
+        _owner: zakura_header_chain::BodyWorkOwner,
+        _height: block::Height,
+    ) -> port::HeaderChainFuture<'_, Result<port::VctRepairContextReply, port::PortError>> {
+        Box::pin(async { Err(port::PortError::Unavailable { source: None }) })
+    }
+
+    fn acquire_header_path(
+        &self,
+        _request: port::AcquirePath,
+    ) -> port::HeaderChainFuture<'_, Result<port::AcquirePathReply, port::PortError>> {
+        Box::pin(async { Ok(port::AcquirePathReply::TargetNotRetained) })
+    }
+
+    fn read_header_path(
+        &self,
+        _path: port::RetainedHeaderPath,
+        _request: port::ReadPath,
+    ) -> port::HeaderChainFuture<'_, Result<port::ReadPathReply, port::PortError>> {
+        Box::pin(async { Ok(port::ReadPathReply::Unavailable) })
+    }
+
+    fn release_header_path(
+        &self,
+        _path: port::RetainedHeaderPath,
+    ) -> port::HeaderChainFuture<'_, Result<(), port::PortError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn prepare_header_target(
+        &self,
+        request: port::PrepareHeaderTarget,
+    ) -> port::HeaderChainFuture<'_, port::PrepareHeaderTargetReply> {
+        let calls = self.prepare_calls.clone();
+        let release = self.prepare_release.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            release.notified().await;
+            Err(Arc::new(
+                zakura_header_chain::HeaderChainError::local_resource(
+                    zakura_header_chain::ErrorSubject::Branch(
+                        request.owner.header_authority().branch,
+                    ),
+                    None,
+                ),
+            ))
+        })
+    }
+
+    fn apply_header_target(
+        &self,
+        target: port::PreparedHeaderTarget,
+    ) -> port::HeaderChainFuture<'_, port::ApplyHeaderTargetReply> {
+        let calls = self.apply_calls.clone();
+        let release = self.apply_release.clone();
+        let succeeds = self.apply_succeeds;
+        let owner = target.owner();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            release.notified().await;
+            if succeeds {
+                Ok(port::ApplyHeaderTargetOutcome::Applied)
+            } else {
+                Err(Arc::new(
+                    zakura_header_chain::HeaderChainError::local_resource(
+                        zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+                        None,
+                    ),
+                ))
+            }
+        })
+    }
+}
 
 fn seed_vct_active_request(
     reactor: &mut HeaderSyncReactor,
@@ -40,6 +145,97 @@ fn seed_vct_active_request(
     };
     reactor.vct_repair.insert(task);
     (source, owner.into(), context)
+}
+
+fn direct_vct_reactor(
+    port: Arc<dyn port::Port>,
+) -> (HeaderSyncReactor, zakura_header_chain::EngineSnapshot) {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.header_chain_port = port;
+    startup.use_direct_port();
+    let (_, _, reactor) =
+        build_header_sync_reactor(startup).expect("the direct VCT fixture builds");
+    (reactor, snapshot)
+}
+
+fn prepared_vct_target(
+    reactor: &HeaderSyncReactor,
+    snapshot: &zakura_header_chain::EngineSnapshot,
+    peer: &ZakuraPeerId,
+    source: zakura_header_chain::SourceId,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+    context: &zakura_header_chain::VctRepairContext,
+) -> port::PreparedHeaderTarget {
+    let active = reactor
+        .peer_work_queue
+        .active(peer)
+        .expect("the fixture has one active repair");
+    let header = active
+        .entries
+        .first()
+        .expect("the exact repair has one header")
+        .header
+        .clone();
+    let anchor = snapshot.frontiers.finalized;
+    let lease = zakura_header_chain::ValidationLease::new(
+        anchor,
+        vec![zakura_header_chain::HeaderContextFact {
+            frontier: anchor,
+            header: zakura_chain::block::genesis::regtest_genesis_block()
+                .header
+                .clone(),
+        }],
+        reactor.startup.network.clone(),
+        [9; 32],
+    );
+    let rules = zakura_header_chain::HeaderRules::for_validation_lease(&lease)
+        .expect("the fixture validation lease produces rules");
+    let batch = zakura_header_chain::prepare_headers(
+        zakura_header_chain::HeaderBatchInput::new(std::slice::from_ref(&header)),
+        anchor,
+        &rules,
+        &zakura_header_chain::SystemClock,
+    )
+    .expect("the fixture repair header prepares");
+    let delivery = zakura_header_chain::AuxDelivery::new(
+        zakura_header_chain::EvidenceId::from_digest([0x44; 32]),
+        header.hash(),
+        source,
+        owner,
+        zakura_header_chain::BodySizeHint::Unknown,
+        None,
+    );
+    let adapter_key = port::AdapterKey::new();
+    port::PreparedHeaderTarget::from_insert(
+        &adapter_key,
+        Box::new(zakura_header_chain::InsertHeaders {
+            owner,
+            source,
+            parent_hash: anchor.hash,
+            target_tip_hash: context.target.hash,
+            completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: anchor,
+                selected_target: context.target,
+            },
+            batch,
+            aux: vec![delivery],
+        }),
+    )
+}
+
+fn poll_pending_operation(reactor: &mut HeaderSyncReactor) {
+    assert!(
+        reactor
+            .pending_port_operations
+            .next()
+            .now_or_never()
+            .is_none(),
+        "the local operation remains pending"
+    );
 }
 
 #[test]
@@ -137,7 +333,7 @@ fn vct_request_timeout_keeps_required_work_and_rotates_the_supplier() {
 }
 
 #[test]
-fn vct_local_phase_timeouts_preserve_the_supplier_cycle() {
+fn vct_local_phase_deadlines_preserve_operation_ownership() {
     for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
         let mut startup = startup(CancellationToken::new());
         let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
@@ -157,32 +353,261 @@ fn vct_local_phase_timeouts_preserve_the_supplier_cycle() {
         task.tried_sources.insert(prior);
         task.attempts = 1;
         let deadline = Instant::now();
-        reactor.request_deadlines.insert(peer, deadline);
+        reactor.request_deadlines.insert(peer.clone(), deadline);
 
         reactor.retire_timed_out_requests(deadline);
 
         let task = reactor
             .vct_repair
             .current()
-            .expect("a local timeout keeps the current repair");
-        assert!(matches!(
-            &task.state,
-            RepairPolicyState::LocalBackoff {
-                context: retained,
-                retry_at,
-            } if retained == &context && *retry_at > deadline
-        ));
+            .expect("a local operation deadline keeps the current repair");
+        assert_eq!(
+            task.state,
+            RepairPolicyState::Assigned {
+                context: context.clone()
+            }
+        );
         assert_eq!(task.tried_sources, [prior].into_iter().collect());
         assert!(!task.tried_sources.contains(&source));
-        assert_eq!(task.attempts, 2);
+        assert_eq!(task.attempts, 1);
+        assert_eq!(
+            reactor
+                .peer_work_queue
+                .active(&peer)
+                .map(|active| active.phase),
+            Some(phase)
+        );
+        assert!(reactor.request_deadlines[&peer] > deadline);
         assert_eq!(
             reactor
                 .vct_repair_stall
-                .expect("the local timeout starts the generation stall clock")
+                .expect("the local operation starts the generation stall clock")
                 .outcome,
-            VctRepairStallOutcome::LocalFailure
+            VctRepairStallOutcome::LocalOperationPending
         );
     }
+}
+
+#[tokio::test]
+async fn pending_vct_prepare_remains_single_until_its_failure_completes() {
+    let prepare_calls = Arc::new(AtomicUsize::new(0));
+    let apply_calls = Arc::new(AtomicUsize::new(0));
+    let prepare_release = Arc::new(Notify::new());
+    let port = Arc::new(PendingVctLocalPort {
+        prepare_calls: prepare_calls.clone(),
+        apply_calls: apply_calls.clone(),
+        prepare_release: prepare_release.clone(),
+        apply_release: Arc::new(Notify::new()),
+        apply_succeeds: false,
+    });
+    let (mut reactor, snapshot) = direct_vct_reactor(port);
+    let peer = peer();
+    let (source, owner, context) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Preparing,
+    );
+    let active = reactor
+        .peer_work_queue
+        .active(&peer)
+        .expect("the fixture has one preparing repair");
+    let action = HeaderPortOperation::PrepareHeaderTarget {
+        purpose: active.purpose.clone(),
+        peer: peer.clone(),
+        source,
+        owner,
+        common_ancestor: snapshot.frontiers.finalized,
+        target: context.target,
+        completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
+            common_ancestor: snapshot.frontiers.finalized,
+            selected_target: context.target,
+        },
+        entries: active.entries.clone(),
+    };
+    assert!(reactor.dispatch_action(action));
+    poll_pending_operation(&mut reactor);
+    assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+
+    let mut deadline = Instant::now();
+    reactor.request_deadlines.insert(peer.clone(), deadline);
+    for _ in 0..3 {
+        reactor.retire_timed_out_requests(deadline);
+        poll_pending_operation(&mut reactor);
+        assert_eq!(reactor.pending_port_operations.len(), 1);
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            reactor
+                .peer_work_queue
+                .active(&peer)
+                .map(|active| active.phase),
+            Some(HeaderTargetPhase::Preparing)
+        );
+        deadline = reactor.request_deadlines[&peer];
+    }
+
+    prepare_release.notify_one();
+    let completion = reactor
+        .pending_port_operations
+        .next()
+        .await
+        .expect("the owned preparation completes");
+    reactor.handle_port_completion(completion);
+
+    assert!(reactor.pending_port_operations.is_empty());
+    assert!(reactor.peer_work_queue.active(&peer).is_none());
+    let task = reactor
+        .vct_repair
+        .current()
+        .expect("the attributed local failure keeps the repair");
+    assert!(matches!(
+        &task.state,
+        RepairPolicyState::LocalBackoff {
+            context: retained,
+            ..
+        } if retained == &context
+    ));
+    assert_eq!(task.attempts, 1);
+}
+
+#[tokio::test]
+async fn pending_vct_apply_remains_single_until_success() {
+    let prepare_calls = Arc::new(AtomicUsize::new(0));
+    let apply_calls = Arc::new(AtomicUsize::new(0));
+    let apply_release = Arc::new(Notify::new());
+    let port = Arc::new(PendingVctLocalPort {
+        prepare_calls: prepare_calls.clone(),
+        apply_calls: apply_calls.clone(),
+        prepare_release: Arc::new(Notify::new()),
+        apply_release: apply_release.clone(),
+        apply_succeeds: true,
+    });
+    let (mut reactor, snapshot) = direct_vct_reactor(port);
+    let peer = peer();
+    let (source, owner, context) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Applying,
+    );
+    let target = prepared_vct_target(&reactor, &snapshot, &peer, source, owner, &context);
+    let purpose = reactor
+        .peer_work_queue
+        .active(&peer)
+        .expect("the fixture has one applying repair")
+        .purpose
+        .clone();
+    assert!(
+        reactor.dispatch_action(HeaderPortOperation::ApplyHeaderTarget {
+            purpose,
+            peer: peer.clone(),
+            source,
+            owner,
+            target,
+        })
+    );
+    poll_pending_operation(&mut reactor);
+    assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
+
+    let mut deadline = Instant::now();
+    reactor.request_deadlines.insert(peer.clone(), deadline);
+    for _ in 0..3 {
+        reactor.retire_timed_out_requests(deadline);
+        poll_pending_operation(&mut reactor);
+        assert_eq!(reactor.pending_port_operations.len(), 1);
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            reactor
+                .peer_work_queue
+                .active(&peer)
+                .map(|active| active.phase),
+            Some(HeaderTargetPhase::Applying)
+        );
+        deadline = reactor.request_deadlines[&peer];
+    }
+
+    apply_release.notify_one();
+    let completion = reactor
+        .pending_port_operations
+        .next()
+        .await
+        .expect("the owned application completes");
+    reactor.handle_port_completion(completion);
+
+    assert!(reactor.pending_port_operations.is_empty());
+    assert!(reactor.peer_work_queue.active(&peer).is_none());
+    assert!(!reactor.request_deadlines.contains_key(&peer));
+    assert_eq!(
+        reactor.vct_repair.current().map(|task| &task.state),
+        Some(&RepairPolicyState::Completed)
+    );
+}
+
+#[tokio::test]
+async fn obsolete_vct_generation_retires_ownership_and_ignores_late_apply() {
+    let apply_calls = Arc::new(AtomicUsize::new(0));
+    let apply_release = Arc::new(Notify::new());
+    let port = Arc::new(PendingVctLocalPort {
+        prepare_calls: Arc::new(AtomicUsize::new(0)),
+        apply_calls: apply_calls.clone(),
+        prepare_release: Arc::new(Notify::new()),
+        apply_release: apply_release.clone(),
+        apply_succeeds: true,
+    });
+    let (mut reactor, snapshot) = direct_vct_reactor(port);
+    let peer = peer();
+    let (source, owner, context) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Applying,
+    );
+    let target = prepared_vct_target(&reactor, &snapshot, &peer, source, owner, &context);
+    let purpose = reactor
+        .peer_work_queue
+        .active(&peer)
+        .expect("the fixture has one applying repair")
+        .purpose
+        .clone();
+    assert!(
+        reactor.dispatch_action(HeaderPortOperation::ApplyHeaderTarget {
+            purpose,
+            peer: peer.clone(),
+            source,
+            owner,
+            target,
+        })
+    );
+    poll_pending_operation(&mut reactor);
+    assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
+
+    let mut changed = snapshot;
+    changed.header_generation = changed
+        .header_generation
+        .checked_next()
+        .expect("the fixture generation advances");
+    reactor.observe_latest_committed_snapshot(changed);
+    assert!(reactor.peer_work_queue.active(&peer).is_none());
+    assert!(reactor.vct_repair.current().is_none());
+    assert_eq!(reactor.pending_port_operations.len(), 1);
+
+    apply_release.notify_one();
+    let completion = reactor
+        .pending_port_operations
+        .next()
+        .await
+        .expect("the obsolete application eventually completes");
+    reactor.handle_port_completion(completion);
+
+    assert!(reactor.pending_port_operations.is_empty());
+    assert!(reactor.peer_work_queue.active(&peer).is_none());
+    assert!(reactor.vct_repair.current().is_none());
+    assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -408,6 +833,86 @@ fn initial_vct_wire_assignment_arms_the_request_deadline() {
         .copied()
         .expect("the exact repair wire request owns a deadline");
     assert!(deadline >= before + reactor.startup.request_timeout);
+}
+
+#[test]
+fn local_capacity_backoff_starts_the_generation_stall_clock() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let mut snapshot = committed_snapshot(anchor);
+    let repair_target =
+        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
+    snapshot.frontiers.header_best =
+        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32]));
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the capacity fixture builds");
+    let peer = peer();
+    let (send, _outbound) = framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+        peer.clone(),
+        7,
+        send,
+        CancellationToken::new(),
+    ));
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
+        INTERNAL_VCT_REPAIR_SESSION_ID,
+        std::num::NonZeroU64::new(1).expect("one is nonzero"),
+    );
+    let context = zakura_header_chain::VctRepairContext {
+        target: repair_target,
+        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
+    };
+    let mut repair = RepairRequirement::new(owner, repair_target.height, 11);
+    repair.state = RepairPolicyState::Ready {
+        context: context.clone(),
+    };
+    reactor.vct_repair.insert(repair);
+    let capacity_owner = ZakuraPeerId::new(vec![0x55; 32]).expect("the peer ID is bounded");
+    reactor.peer_work_queue.set_capacity_for_test(
+        &capacity_owner,
+        HEADER_CHUNK_BUDGET_CAPACITY_V1,
+        0,
+    );
+
+    reactor.handle_wire_message(
+        peer,
+        7,
+        HeaderSyncMessage::Status(Status {
+            work_anchor_height: anchor.height,
+            work_anchor_hash: anchor.hash,
+            selected_tip_height: snapshot.frontiers.header_best.height,
+            selected_tip_hash: snapshot.frontiers.header_best.hash,
+            suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+            oldest_retained_height: anchor.height,
+            max_headers_per_response: 1,
+            max_inflight_requests: 1,
+            max_message_bytes: 2_000_000,
+            tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+        }),
+    );
+
+    let task = reactor
+        .vct_repair
+        .current()
+        .expect("local capacity backoff keeps the repair");
+    assert!(matches!(
+        &task.state,
+        RepairPolicyState::SupplierBackoff {
+            context: retained,
+            ..
+        } if retained == &context
+    ));
+    assert_eq!(task.attempts, 0);
+    assert!(task.tried_sources.is_empty());
+    assert_eq!(
+        reactor
+            .vct_repair_stall
+            .expect("local capacity starts the generation stall clock")
+            .outcome,
+        VctRepairStallOutcome::LocalCapacityUnavailable
+    );
 }
 
 #[test]
@@ -759,6 +1264,75 @@ fn replacement_session_keeps_the_authenticated_supplier_identity() {
         task.state,
         RepairPolicyState::SupplierBackoff { .. }
     ));
+}
+
+#[test]
+fn replacement_and_disconnect_retain_owned_vct_local_operation() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the local lifecycle fixture builds");
+    let peer = peer();
+    let (first_send, _first_outbound) = framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+        peer.clone(),
+        7,
+        first_send,
+        CancellationToken::new(),
+    ));
+    let (_source, owner, context) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Applying,
+    );
+    let deadline = Instant::now() + reactor.startup.request_timeout;
+    reactor.request_deadlines.insert(peer.clone(), deadline);
+
+    let (replacement_send, _replacement_outbound) = framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+        peer.clone(),
+        8,
+        replacement_send,
+        CancellationToken::new(),
+    ));
+    reactor.handle_peer_disconnected(&peer, 7, "stale replaced session");
+
+    assert_eq!(
+        reactor
+            .peer_work_queue
+            .active(&peer)
+            .map(|active| (active.owner, active.phase)),
+        Some((owner, HeaderTargetPhase::Applying))
+    );
+    assert_eq!(reactor.request_deadlines.get(&peer), Some(&deadline));
+    assert_eq!(
+        reactor.vct_repair.current().map(|task| &task.state),
+        Some(&RepairPolicyState::Assigned {
+            context: context.clone()
+        })
+    );
+
+    reactor.handle_peer_disconnected(&peer, 8, "replacement disconnected");
+
+    assert!(!reactor.peer_state.contains_key(&peer));
+    assert!(reactor.vct_supplier_order.is_empty());
+    assert_eq!(
+        reactor
+            .peer_work_queue
+            .active(&peer)
+            .map(|active| (active.owner, active.phase)),
+        Some((owner, HeaderTargetPhase::Applying))
+    );
+    assert_eq!(reactor.request_deadlines.get(&peer), Some(&deadline));
+    assert_eq!(
+        reactor.vct_repair.current().map(|task| &task.state),
+        Some(&RepairPolicyState::Assigned { context })
+    );
 }
 
 #[test]

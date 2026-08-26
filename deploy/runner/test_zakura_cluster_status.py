@@ -925,6 +925,22 @@ class NodeDetailTests(unittest.TestCase):
         self.assertNotIn("root@node-a", json.dumps(diagnostics))
         self.assertLess(len(json.dumps(diagnostics)), 1_000)
 
+    def test_whole_probe_failure_marks_metrics_unavailable(self):
+        collected = collector()
+        error = "ssh exited 255: connection refused"
+
+        row = collected.row_for(node(), {"error": error}, now=1_000.0)
+        collected.rows = [row]
+        collected.last_poll = 1_001.0
+        diagnostics = collected.snapshot()["rows"][0]["alert_diagnostics"]
+
+        self.assertEqual(row["detail"], error)
+        self.assertEqual(row["metrics_error"], error)
+        self.assertIsNone(row["metrics_at"])
+        self.assertFalse(diagnostics["metrics_available"])
+        self.assertIsNone(diagnostics["metrics_at"])
+        self.assertEqual(diagnostics["metrics"], {})
+
     def test_node_payload_carries_the_deep_fields(self):
         collected = collector()
         collected.rows = [collected.row_for(node(), self.probe(), now=1_000.0)]

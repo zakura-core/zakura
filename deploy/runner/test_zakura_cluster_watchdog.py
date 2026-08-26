@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -327,6 +328,68 @@ class StallDiagnosticTests(unittest.TestCase):
         self.assertLess(len(text), 2_000)
         self.assertNotIn("x" * 65, text)
 
+    def test_node_detail_is_plain_text_and_bounded(self):
+        detail = (
+            "connection failed\n<!channel> *second_line* `command` "
+            + "x" * 10_000
+        )
+        row = {
+            "name": "node-a",
+            "health": "down",
+            "detail": detail,
+        }
+
+        text = watchdog.node_alert_text(self.fleet, row, "down", 700.0)
+        detail_line = next(
+            line for line in text.splitlines() if line.startswith("health:")
+        )
+
+        self.assertIn("connection failed", detail_line)
+        self.assertIn("second＿line", detail_line)
+        self.assertNotIn("<!channel>", detail_line)
+        self.assertNotIn("*second_line*", detail_line)
+        self.assertNotIn("`command`", detail_line)
+        self.assertLessEqual(
+            len(detail_line), watchdog.MAX_NODE_DETAIL_CHARS + 64
+        )
+
+
+class SlackPayloadTests(unittest.TestCase):
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def read():
+            return b"ok"
+
+    def test_webhook_payload_caps_the_final_message(self):
+        text = "useful prefix\n" + "x" * (watchdog.MAX_SLACK_MESSAGE_CHARS * 2)
+
+        with patch.object(
+            watchdog.urllib.request,
+            "urlopen",
+            return_value=self.Response(),
+        ) as urlopen:
+            posted = watchdog.post_slack_webhook(
+                "https://hooks.slack.invalid/test", text, make_args()
+            )
+
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertTrue(posted)
+        self.assertEqual(len(payload["text"]), watchdog.MAX_SLACK_MESSAGE_CHARS)
+        self.assertTrue(payload["text"].startswith("useful prefix\n"))
+        self.assertTrue(payload["text"].endswith(watchdog.SLACK_TRUNCATION_SUFFIX))
+        self.assertLess(
+            len(request.data), watchdog.MAX_SLACK_MESSAGE_CHARS + 64
+        )
+
 
 class SharedStallTests(unittest.TestCase):
     NOW = 2_000.0
@@ -414,7 +477,13 @@ class SharedStallTests(unittest.TestCase):
             {
                 **self.row(f"node-{index:02}", 100, 1_900, block_hash="aaaa"),
                 "alert_diagnostics": StallDiagnosticTests.diagnostics(
-                    sync_block_missing_bodies=4_000.0
+                    sync_block_missing_bodies=4_000.0,
+                    state_vct_root_stalled_height=101.0,
+                    state_vct_root_retry_count=3.0,
+                    state_vct_aux_sweep_frontier_height=99.0,
+                    sync_header_vct_repair_context_unavailable_total=2.0,
+                    sync_header_vct_repair_timed_out_total=1.0,
+                    sync_header_vct_repair_resource_stalled_total=0.0,
                 ),
             }
             for index in range(12)
@@ -429,7 +498,27 @@ class SharedStallTests(unittest.TestCase):
             watchdog.MAX_SHARED_DIAGNOSTIC_ROWS,
         )
         self.assertIn("- 4 more participating nodes not shown", text)
+        self.assertEqual(text.count("metrics ok"), watchdog.MAX_SHARED_DIAGNOSTIC_ROWS)
+        self.assertIn("vct stalled 101 | vct retries 3 | sweep 99", text)
+        self.assertIn("repair unavailable 2 | repair timed out 1", text)
         self.assertLess(len(text), 3_000)
+
+    def test_shared_alert_marks_unavailable_and_absent_metrics(self):
+        unavailable = self.row("node-a", 100, 1_900, block_hash="aaaa")
+        unavailable["alert_diagnostics"] = {
+            "last_poll": 1_000.0,
+            "metrics_at": None,
+            "metrics_available": False,
+            "metrics": {},
+        }
+        absent = self.row("node-b", 100, 1_900, block_hash="aaaa")
+
+        text = watchdog.shared_stall_alert_text(
+            self.fleet, 100, "aaaa", 2, 1_900.0, [unavailable, absent]
+        )
+
+        self.assertIn("- node-a: height 100 | metrics unavailable", text)
+        self.assertIn("- node-b: height 100 | metrics absent", text)
 
     def test_short_common_idle_does_not_alert(self):
         self.run_snapshot(

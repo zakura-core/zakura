@@ -28,6 +28,21 @@ from typing import Any
 DOWN_HEALTH = {"down", "rpc_error"}
 STATE_VERSION = 1
 MAX_SHARED_DIAGNOSTIC_ROWS = 8
+MAX_NODE_DETAIL_CHARS = 512
+MAX_SLACK_MESSAGE_CHARS = 35_000
+SLACK_TRUNCATION_SUFFIX = "\n[alert truncated]"
+SLACK_PLAIN_TEXT_TRANSLATION = str.maketrans(
+    {
+        "&": "＆",
+        "<": "‹",
+        ">": "›",
+        "*": "∗",
+        "_": "＿",
+        "~": "～",
+        "`": "ˋ",
+        "@": "＠",
+    }
+)
 STALL_PIPELINE_METRICS = (
     ("network tip", "sync_estimated_network_tip_height"),
     ("distance", "sync_estimated_distance_to_tip"),
@@ -58,6 +73,14 @@ STALL_REPAIR_METRICS = (
     ("context unavailable", "sync_header_vct_repair_context_unavailable_total"),
     ("timed out", "sync_header_vct_repair_timed_out_total"),
     ("resource stalled", "sync_header_vct_repair_resource_stalled_total"),
+)
+SHARED_REPAIR_METRICS = (
+    ("vct stalled", "state_vct_root_stalled_height"),
+    ("vct retries", "state_vct_root_retry_count"),
+    ("sweep", "state_vct_aux_sweep_frontier_height"),
+    ("repair unavailable", "sync_header_vct_repair_context_unavailable_total"),
+    ("repair timed out", "sync_header_vct_repair_timed_out_total"),
+    ("repair resource stalled", "sync_header_vct_repair_resource_stalled_total"),
 )
 
 
@@ -283,6 +306,17 @@ def bounded_text(value: object, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
 
 
+def slack_plain_text(value: object, limit: int) -> str:
+    return bounded_text(value, limit).translate(SLACK_PLAIN_TEXT_TRANSLATION)
+
+
+def bounded_slack_message(text: str) -> str:
+    if len(text) <= MAX_SLACK_MESSAGE_CHARS:
+        return text
+    keep = MAX_SLACK_MESSAGE_CHARS - len(SLACK_TRUNCATION_SUFFIX)
+    return text[:keep] + SLACK_TRUNCATION_SUFFIX
+
+
 def alert_metrics(row: dict[str, Any]) -> tuple[dict[str, Any], bool | None]:
     diagnostics = row.get("alert_diagnostics")
     if not isinstance(diagnostics, dict):
@@ -292,6 +326,18 @@ def alert_metrics(row: dict[str, Any]) -> tuple[dict[str, Any], bool | None]:
         metrics = {}
     available = diagnostics.get("metrics_available")
     return metrics, available if isinstance(available, bool) else None
+
+
+def metrics_availability_marker(
+    metrics: dict[str, Any], available: bool | None
+) -> str:
+    if available is False:
+        return "metrics unavailable"
+    if available is None:
+        return "metrics absent"
+    if not metrics:
+        return "metrics empty"
+    return "metrics ok"
 
 
 def node_diagnostic_lines(row: dict[str, Any]) -> list[str]:
@@ -365,6 +411,7 @@ def slack_webhook_url() -> str:
 
 
 def post_slack(text: str, args: argparse.Namespace) -> bool:
+    text = bounded_slack_message(text)
     webhook = slack_webhook_url()
     if args.dry_run:
         print(f"dry-run Slack message:\n{text}\n")
@@ -382,6 +429,7 @@ def post_slack(text: str, args: argparse.Namespace) -> bool:
 
 
 def post_slack_webhook(webhook: str, text: str, args: argparse.Namespace) -> bool:
+    text = bounded_slack_message(text)
     payload = json.dumps({"text": text}).encode("utf-8")
     request = urllib.request.Request(
         webhook,
@@ -598,7 +646,7 @@ def node_alert_text(fleet: Fleet, row: dict[str, Any], condition: str, age: floa
     name = row.get("name") or "unknown"
     health = row.get("health") or "unknown"
     height = row.get("height")
-    detail = row.get("detail") or "no detail"
+    detail = slack_plain_text(row.get("detail") or "no detail", MAX_NODE_DETAIL_CHARS)
     height_text = str(height) if height is not None else "-"
 
     lines = [
@@ -667,7 +715,7 @@ def shared_stall_alert_text(
                 ("peers", "peer_count"),
             ),
         )
-        metrics, _available = alert_metrics(row)
+        metrics, available = alert_metrics(row)
         pipeline = named_metrics(
             metrics,
             (
@@ -679,12 +727,15 @@ def shared_stall_alert_text(
                 ("missing", "sync_block_missing_bodies"),
             ),
         )
+        repair = named_metrics(metrics, SHARED_REPAIR_METRICS)
         commit = bounded_text(row.get("commit"), 12)
         summary = " | ".join(
             value
             for value in (
                 summary,
+                metrics_availability_marker(metrics, available),
                 pipeline,
+                repair,
                 f"commit {commit}" if commit else "",
             )
             if value

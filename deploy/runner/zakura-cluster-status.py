@@ -1315,15 +1315,16 @@ class ClusterCollector:
         if probe.get("metrics_skipped"):
             metrics_snapshot = self.last_metrics.get(node.name, {})
         else:
+            probe_error = probe.get("error")
             metrics_snapshot = {
                 "metrics": probe.get("metrics") or {},
-                "metrics_error": probe.get("metrics_error"),
+                "metrics_error": probe.get("metrics_error") or probe_error,
                 "metrics_version": probe.get("metrics_version") or "",
                 "metrics_bytes": coerce_int(probe.get("metrics_bytes")),
                 "metrics_series": coerce_int(probe.get("metrics_series")),
                 "metrics_scrape_seconds": probe.get("metrics_scrape_seconds"),
                 "peer_user_agents": probe.get("peer_user_agents") or [],
-                "metrics_at": now,
+                "metrics_at": None if probe_error else now,
             }
             self.last_metrics[node.name] = metrics_snapshot
 

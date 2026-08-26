@@ -7,6 +7,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT_PATH = Path(__file__).with_name("zakura-cluster-watchdog.py")
@@ -21,7 +22,12 @@ def make_args(**overrides):
     defaults = {
         "down_after": 600.0,
         "stalled_after": 600.0,
+        "shared_stalled_after": 1800.0,
         "starting_grace": 120.0,
+        "dashboard_down_after": 600.0,
+        "request_timeout": 20.0,
+        "slack_timeout": 20.0,
+        "suppression_file": Path("/nonexistent/zakura-watchdog-suppression"),
         "slack_webhook": None,
         "dry_run": True,
     }
@@ -69,6 +75,7 @@ class StallRecoveryTests(unittest.TestCase):
         self.assertEqual(self.posted, [], "posted a recovery at an unchanged height")
         self.assertTrue(bucket["fleet/node-a"]["alerting"], "alert should stay latched")
         self.assertEqual(bucket["fleet/node-a"]["alert_height"], 4129396)
+
 
     def test_repeated_timer_resets_never_clear_the_stall(self):
         bucket = {}
@@ -194,6 +201,113 @@ class StallRecoveryTests(unittest.TestCase):
             "STALLED", "RECOVERED", 2000.0, False, make_args(), 4129396,
         )
         self.assertEqual(self.posted, [])
+
+
+class SharedStallTests(unittest.TestCase):
+    NOW = 2_000.0
+
+    def setUp(self):
+        self.posted: list[str] = []
+        self._real_post = watchdog.post_slack
+        watchdog.post_slack = lambda text, args: (self.posted.append(text), True)[1]
+        self.fleet = watchdog.Fleet(
+            name="testnet",
+            url="http://dashboard.invalid/data",
+            dashboard_url="http://dashboard.invalid/",
+        )
+        self.args = make_args()
+        self.state = {
+            "version": watchdog.STATE_VERSION,
+            "nodes": {},
+            "fleets": {},
+            "shared_stalls": {},
+        }
+
+    def tearDown(self):
+        watchdog.post_slack = self._real_post
+
+    @staticmethod
+    def row(name, height, seconds_since_advanced, health="stale"):
+        return {
+            "name": name,
+            "height": height,
+            "health": health,
+            "detail": "height has not advanced within stale window",
+            "seconds_since_advanced": seconds_since_advanced,
+        }
+
+    def run_snapshot(self, rows, now=None):
+        instance = watchdog.Watchdog([self.fleet], self.args)
+        snapshot = {"rows": rows}
+        with (
+            patch.object(watchdog, "fetch_json", return_value=snapshot),
+            patch.object(watchdog.time, "time", return_value=now or self.NOW),
+        ):
+            instance.run_once(self.state)
+
+    def test_common_height_posts_one_fleet_alert(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 4_302_737, 1_817),
+                self.row("node-b", 4_302_737, 1_816),
+                self.row("node-c", 4_302_737, 1_803),
+            ]
+        )
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("3 nodes agree at height 4302737", self.posted[0])
+        self.assertTrue(self.state["shared_stalls"]["testnet"]["alerting"])
+        self.assertTrue(
+            all(not entry["alerting"] for entry in self.state["nodes"].values())
+        )
+
+    def test_short_common_idle_does_not_alert(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 4_302_737, 617),
+                self.row("node-b", 4_302_737, 616),
+                self.row("node-c", 4_302_737, 603),
+            ]
+        )
+
+        self.assertEqual(self.posted, [])
+        self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
+
+    def test_common_height_recovery_posts_once_after_progress(self):
+        stalled = [
+            self.row("node-a", 4_302_737, 1_817),
+            self.row("node-b", 4_302_737, 1_816),
+        ]
+        self.run_snapshot(stalled)
+        self.posted.clear()
+
+        advanced = [
+            self.row("node-a", 4_302_790, 5, "healthy"),
+            self.row("node-b", 4_302_790, 5, "healthy"),
+        ]
+        self.run_snapshot(advanced, now=self.NOW + 60)
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("network height advanced", self.posted[0])
+        self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
+
+    def test_divergence_recovers_fleet_and_alerts_lagging_node(self):
+        stalled = [
+            self.row("node-a", 4_302_737, 1_817),
+            self.row("node-b", 4_302_737, 1_816),
+        ]
+        self.run_snapshot(stalled)
+        self.posted.clear()
+
+        diverged = [
+            self.row("node-a", 4_302_800, 5, "healthy"),
+            self.row("node-b", 4_302_737, 1_876),
+        ]
+        self.run_snapshot(diverged, now=self.NOW + 60)
+
+        self.assertEqual(len(self.posted), 2)
+        self.assertIn("network height advanced", self.posted[0])
+        self.assertIn("`node-b` stalled", self.posted[1])
 
 
 if __name__ == "__main__":
@@ -324,4 +438,3 @@ class ReleaseStateConfigTests(unittest.TestCase):
     def test_missing_url_is_rejected(self):
         with self.assertRaises(SystemExit):
             self.load('[[release_state]]\nname = "m"\n')
-

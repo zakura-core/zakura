@@ -123,16 +123,27 @@ def load_fleets(config_path: Path) -> list[Fleet]:
 
 def load_state(state_path: Path) -> dict[str, Any]:
     if not state_path.exists():
-        return {"version": STATE_VERSION, "nodes": {}, "fleets": {}}
+        return {
+            "version": STATE_VERSION,
+            "nodes": {},
+            "fleets": {},
+            "shared_stalls": {},
+        }
 
     with state_path.open(encoding="utf-8") as state_file:
         state = json.load(state_file)
 
     if not isinstance(state, dict) or state.get("version") != STATE_VERSION:
-        return {"version": STATE_VERSION, "nodes": {}, "fleets": {}}
+        return {
+            "version": STATE_VERSION,
+            "nodes": {},
+            "fleets": {},
+            "shared_stalls": {},
+        }
 
     state.setdefault("nodes", {})
     state.setdefault("fleets", {})
+    state.setdefault("shared_stalls", {})
     state.setdefault("release_state", {})
     return state
 
@@ -286,6 +297,42 @@ def node_condition(
     return ("ok", now, 0)
 
 
+def shared_stall(
+    rows: list[dict[str, Any]],
+    now: float,
+    grace_since: float,
+    args: argparse.Namespace,
+) -> tuple[float, float, int] | None:
+    """Return a common stalled height when every observable node agrees on it."""
+    observed: list[tuple[float, float]] = []
+
+    for row in rows:
+        health = str(row.get("health") or "unknown")
+        if health in DOWN_HEALTH or health == "starting":
+            continue
+
+        height = coerce_float(row.get("height"))
+        if height is None:
+            return None
+
+        condition, bad_since, _threshold = node_condition(
+            row, now, grace_since, args
+        )
+        if condition != "stalled":
+            return None
+        observed.append((height, bad_since))
+
+    if len(observed) < 2:
+        return None
+
+    heights = {height for height, _bad_since in observed}
+    if len(heights) != 1:
+        return None
+
+    height = observed[0][0]
+    return height, min(bad_since for _height, bad_since in observed), len(observed)
+
+
 def stall_cleared(entry: dict[str, Any], height: float | None) -> bool:
     """True when a stalled alert may be retired.
 
@@ -422,6 +469,26 @@ def fleet_recovery_text(fleet: Fleet, previous: dict[str, Any]) -> str:
     )
 
 
+def shared_stall_alert_text(
+    fleet: Fleet, height: float, node_count: int, age: float
+) -> str:
+    return (
+        f":rotating_light: *Zakura {fleet.name}* network height has not advanced "
+        f"for {format_duration(age)}\n"
+        f"{node_count} nodes agree at height {int(height)}\n"
+        f"dashboard: {fleet.dashboard_url}"
+    )
+
+
+def shared_stall_recovery_text(fleet: Fleet, height: float | None) -> str:
+    height_text = str(int(height)) if height is not None else "-"
+    return (
+        f":white_check_mark: *Zakura {fleet.name}* network height advanced\n"
+        f"height: {height_text}\n"
+        f"dashboard: {fleet.dashboard_url}"
+    )
+
+
 def release_state_condition(
     target: ReleaseState, pointer: dict[str, Any], meta: dict[str, Any], now: float
 ) -> tuple[str, str]:
@@ -515,9 +582,26 @@ class Watchdog:
             if not isinstance(rows, list):
                 rows = []
 
-            for row in rows:
-                if isinstance(row, dict):
-                    self.handle_node(state, fleet, row, now, suppressed)
+            node_rows = [row for row in rows if isinstance(row, dict)]
+            grace_since = max(
+                self.started_at, self.fetch_recovered_at.get(fleet.name, 0)
+            )
+            common_stall = shared_stall(
+                node_rows, now, grace_since, self.args
+            )
+            self.handle_shared_stall(state, fleet, node_rows, common_stall, now, suppressed)
+
+            for row in node_rows:
+                condition, _bad_since, _threshold = node_condition(
+                    row, now, grace_since, self.args
+                )
+                self.handle_node(
+                    state,
+                    fleet,
+                    row,
+                    now,
+                    suppressed or (common_stall is not None and condition == "stalled"),
+                )
 
         for target in self.release_state:
             self.handle_release_state(state, target, now, suppressed)
@@ -623,6 +707,58 @@ class Watchdog:
             self.args,
         )
 
+    def handle_shared_stall(
+        self,
+        state: dict[str, Any],
+        fleet: Fleet,
+        rows: list[dict[str, Any]],
+        common_stall: tuple[float, float, int] | None,
+        now: float,
+        suppressed: bool,
+    ) -> None:
+        bucket = state.setdefault("shared_stalls", {})
+        previous = dict(bucket.get(fleet.name, {}))
+        heights = [
+            height
+            for row in rows
+            if (height := coerce_float(row.get("height"))) is not None
+        ]
+        current_height = max(heights, default=None)
+
+        if common_stall is None:
+            update_alert_state(
+                bucket,
+                fleet.name,
+                "ok",
+                now,
+                0,
+                "",
+                shared_stall_recovery_text(fleet, current_height),
+                now,
+                False,
+                self.args,
+                current_height,
+            )
+            return
+
+        height, bad_since, node_count = common_stall
+        if previous.get("condition") == "stalled":
+            bad_since = min(float(previous.get("bad_since", bad_since)), bad_since)
+        age = now - bad_since
+        update_alert_state(
+            bucket,
+            fleet.name,
+            "stalled",
+            bad_since,
+            self.args.shared_stalled_after,
+            shared_stall_alert_text(fleet, height, node_count, age),
+            shared_stall_recovery_text(fleet, height),
+            now,
+            suppressed,
+            self.args,
+            height,
+        )
+
     def handle_node(
         self,
         state: dict[str, Any],
@@ -679,6 +815,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=600.0,
         help="alert after no block progress for this many seconds",
+    )
+    parser.add_argument(
+        "--shared-stalled-after",
+        type=float,
+        default=1800.0,
+        help="alert after every observable node shares one stalled height this long",
     )
     parser.add_argument(
         "--dashboard-down-after",

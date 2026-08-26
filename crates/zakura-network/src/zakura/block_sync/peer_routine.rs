@@ -19,7 +19,7 @@
 //! routine receives inbound traffic from its own `FramedRecv`. Its fill loop,
 //! matched-body path, and unmatched-body paths run in the same task.
 
-use std::{collections::BTreeMap, num::NonZeroU64};
+use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
 
 use tokio::sync::{futures::Notified, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -70,6 +70,27 @@ const FILL_STOP_TRACE_INTERVAL: Duration = Duration::from_secs(10);
 
 fn fill_stop_trace_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= FILL_STOP_TRACE_INTERVAL)
+}
+
+/// Return the first contiguous run that the predicate accepts.
+///
+/// The function evaluates each visited item once. This property matters when
+/// the predicate reads shared retry state that the reactor or sequencer can update.
+fn first_allowed_run<T>(
+    items: &[T],
+    mut is_allowed: impl FnMut(&T) -> bool,
+) -> Option<Range<usize>> {
+    let mut start = None;
+
+    for (index, item) in items.iter().enumerate() {
+        if is_allowed(item) {
+            start.get_or_insert(index);
+        } else if let Some(start) = start {
+            return Some(start..index);
+        }
+    }
+
+    start.map(|start| start..items.len())
 }
 
 /// Why a fill pass stopped issuing requests. Typed so every admission refusal is
@@ -419,9 +440,11 @@ impl PeerRoutine {
             Notified::enable(capacity.as_mut());
             Notified::enable(available.as_mut());
 
-            if self.session.outbound_capacity() > 0 {
-                self.try_fill().await;
-            }
+            let retry_filter_deadline = if self.session.outbound_capacity() > 0 {
+                self.try_fill().await
+            } else {
+                None
+            };
             let outbound_queue_has_capacity = self.session.outbound_capacity() > 0;
             // Track the start of the current continuous outbound-full stretch so the
             // liveness check can bound the write-congestion grace: a peer that stopped
@@ -434,7 +457,7 @@ impl PeerRoutine {
             }
 
             // Sleep until the earliest outstanding deadline (own-timeout arm).
-            let timeout = self.earliest_deadline_sleep();
+            let timeout = self.earliest_deadline_sleep(retry_filter_deadline);
             tokio::pin!(timeout);
             let outbound_queue_poll = time::sleep(OUTBOUND_FULL_POLL_INTERVAL);
             tokio::pin!(outbound_queue_poll);
@@ -689,7 +712,7 @@ impl PeerRoutine {
     /// or registry-owned floor-watchdog hard exclude), so a routine that quiet-returned
     /// its only work re-runs want-work once the bias lifts even if no external event
     /// arrives. Defaults to a long idle sleep when none exists.
-    fn earliest_deadline_sleep(&self) -> time::Sleep {
+    fn earliest_deadline_sleep(&self, retry_filter_deadline: Option<Instant>) -> time::Sleep {
         let now = Instant::now();
         let earliest_deadline = self
             .window
@@ -707,6 +730,7 @@ impl PeerRoutine {
             local_retry_avoid,
             floor_watchdog_avoid,
             body_retry_avoid,
+            retry_filter_deadline,
         ]
         .into_iter()
         .flatten()
@@ -727,7 +751,7 @@ impl PeerRoutine {
     ///
     /// There is no floor gate: downloads are governed by the byte budget and
     /// per-peer slots, never floor-distance / near-tip lag.
-    async fn try_fill(&mut self) {
+    async fn try_fill(&mut self) -> Option<Instant> {
         // The BBR cwnd is clamped to the peer's advertised hard cap inside
         // `available_slots`, so there is no separate window to reconcile on a
         // `Status` change.
@@ -744,6 +768,7 @@ impl PeerRoutine {
         // routine again.
         let now = Instant::now();
         self.retry_avoid.retain(|_, until| *until > now);
+        let mut retry_filter_deadline = None;
         // Count requests issued this pass and capture *why* the fill loop stops, so a
         // trace can attribute carrier idle ("bubble") time to a cause. The loop yields a
         // `&'static str` reason via `break`; a pass that issues nothing (`fill_sent == 0`)
@@ -915,33 +940,44 @@ impl PeerRoutine {
                             .registry
                             .is_body_retry_avoided(&self.peer, item.scope, item.hash, now)
                 };
-                let keep_from = items
-                    .iter()
-                    .position(|(height, item)| is_allowed(height, item));
-                match keep_from {
-                    Some(0) => {}
-                    Some(index) => {
-                        let avoided: Vec<_> = items.drain(..index).map(|(h, _)| h).collect();
-                        self.work.return_items_quiet(avoided);
-                    }
-                    None => {
-                        let avoided: Vec<_> = items.iter().map(|(h, _)| *h).collect();
-                        self.work.return_items_quiet(avoided);
-                        break FillStop::RetryAvoid;
-                    }
+                let Some(keep) =
+                    first_allowed_run(&items, |(height, item)| is_allowed(height, item))
+                else {
+                    let avoided: Vec<_> = items.iter().map(|(h, _)| *h).collect();
+                    self.work.return_items_quiet(avoided);
+                    retry_filter_deadline = Some(self.retry_filter_wake_deadline(now));
+                    break FillStop::RetryAvoid;
+                };
+                let keep_len = keep.len();
+                let mut returned_avoided = false;
+                if keep.start > 0 {
+                    let avoided: Vec<_> = items.drain(..keep.start).map(|(h, _)| h).collect();
+                    self.work.return_items_quiet(avoided);
+                    returned_avoided = true;
                 }
-                let keep_len = items
-                    .iter()
-                    .take_while(|(height, item)| is_allowed(height, item))
-                    .count();
                 if keep_len < items.len() {
                     let avoided = items.split_off(keep_len);
                     self.work
                         .return_items_quiet(avoided.into_iter().map(|(height, _)| height));
+                    returned_avoided = true;
+                }
+                if returned_avoided {
+                    let deadline = self.retry_filter_wake_deadline(now);
+                    retry_filter_deadline = Some(
+                        retry_filter_deadline
+                            .map_or(deadline, |current: Instant| current.min(deadline)),
+                    );
                 }
             }
             self.trace_work_taken(servable_low, servable_high, items.len());
-            let scope = items[0].1.scope;
+            debug_assert!(
+                !items.is_empty(),
+                "retry filtering must retain a nonempty allowed run"
+            );
+            let Some((first_height, first_item)) = items.first().copied() else {
+                break FillStop::Internal;
+            };
+            let scope = first_item.scope;
             debug_assert!(items.iter().all(|(_, item)| item.scope == scope));
 
             // Reserve the summed per-block size estimate for this request (not
@@ -955,7 +991,7 @@ impl PeerRoutine {
             // chunk we actually kept can begin above the floor-rescue window. Label the
             // request by its *actual* lowest height, so a purely speculative take is never
             // funded as a floor reservation or given the short floor-rescue leash.
-            let request_priority = classify_priority(view.download_floor, items[0].0);
+            let request_priority = classify_priority(view.download_floor, first_height);
 
             let reserved_bytes = items.iter().fold(0u64, |acc, (_, item)| {
                 acc.saturating_add(item.estimated_bytes)
@@ -1000,9 +1036,9 @@ impl PeerRoutine {
             };
             let request = BlockRangeRequest {
                 owner,
-                start_height: items[0].0,
+                start_height: first_height,
                 count,
-                anchor_hash: items[0].1.hash,
+                anchor_hash: first_item.hash,
                 // The summed size-estimate reservation for this request (released
                 // on a send failure below); equals the sum of the per-height
                 // `expected_blocks` estimates.
@@ -1109,6 +1145,20 @@ impl PeerRoutine {
                 .routine_to_reactor
                 .try_send(RoutineToReactor::RequeryNeeded);
         }
+        retry_filter_deadline
+    }
+
+    /// Capture the retry deadline against the same time snapshot that rejected
+    /// the work. If shared state changed after filtering, retry immediately.
+    fn retry_filter_wake_deadline(&self, now: Instant) -> Instant {
+        let local = self.retry_avoid.values().min().copied();
+        let floor = self.registry.next_floor_avoid_deadline(&self.peer, now);
+        let body = self.registry.next_body_retry_deadline(&self.peer, now);
+        [local, floor, body]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(now)
     }
 
     fn admission_snapshot(&self, view: &SequencerView) -> AdmissionSnapshot {
@@ -1189,7 +1239,7 @@ impl PeerRoutine {
     async fn handle_deadlines(&mut self, now: Instant) -> Result<(), SinkReject> {
         let rescued_timed_out = self.expire_due_timeouts(now);
         if rescued_timed_out && self.session.outbound_capacity() > 0 {
-            self.try_fill().await;
+            let _ = self.try_fill().await;
         }
         self.check_block_liveness(now)
     }
@@ -2213,6 +2263,149 @@ mod tests {
     use crate::zakura::trace::ZakuraTrace;
     use crate::zakura::ZakuraPeerId;
 
+    fn reference_first_allowed_run(allowed: &[bool]) -> Option<std::ops::Range<usize>> {
+        let start = allowed.iter().position(|allowed| *allowed)?;
+        let len = allowed[start..]
+            .iter()
+            .take_while(|allowed| **allowed)
+            .count();
+        Some(start..start + len)
+    }
+
+    #[test]
+    fn retry_filter_retains_each_small_allowed_run() {
+        for len in 0..=6 {
+            for mask in 0..(1usize << len) {
+                let allowed: Vec<_> = (0..len)
+                    .map(|index| mask & (1usize << index) != 0)
+                    .collect();
+                let expected = reference_first_allowed_run(&allowed);
+                let items: Vec<_> = (0..len).collect();
+                let mut calls = vec![0usize; len];
+
+                let keep = super::first_allowed_run(&items, |item| {
+                    calls[*item] += 1;
+                    allowed[*item]
+                });
+
+                assert_eq!(keep, expected, "len={len}, mask={mask:#08b}");
+
+                let visited_len = match &expected {
+                    Some(range) if range.end < len => range.end + 1,
+                    Some(range) => range.end,
+                    None => len,
+                };
+                for (index, calls) in calls.into_iter().enumerate() {
+                    assert_eq!(
+                        calls,
+                        usize::from(index < visited_len),
+                        "len={len}, mask={mask:#08b}, index={index}"
+                    );
+                }
+
+                let mut retained = items;
+                let mut returned = Vec::new();
+                match keep {
+                    Some(keep) => {
+                        let keep_len = keep.len();
+                        if keep.start > 0 {
+                            returned.extend(retained.drain(..keep.start));
+                        }
+                        if keep_len < retained.len() {
+                            returned.extend(retained.split_off(keep_len));
+                        }
+                    }
+                    None => {
+                        returned.extend(retained.iter().copied());
+                        retained.clear();
+                    }
+                }
+
+                let expected_retained: Vec<_> = expected.clone().into_iter().flatten().collect();
+                let expected_returned: Vec<_> = (0..len)
+                    .filter(|index| !expected.as_ref().is_some_and(|range| range.contains(index)))
+                    .collect();
+                assert_eq!(retained, expected_retained, "len={len}, mask={mask:#08b}");
+                assert_eq!(returned, expected_returned, "len={len}, mask={mask:#08b}");
+                assert_eq!(
+                    retained.is_empty(),
+                    expected.is_none(),
+                    "len={len}, mask={mask:#08b}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_filter_carries_the_checked_deadline_to_the_waiter() {
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        let scope = super::super::test_work_scope();
+        let hash = block::Hash([1; 32]);
+        work.extend(
+            scope,
+            [(block::Height(1), hash, BlockSizeEstimate::Advertised(1_000))],
+        );
+
+        let cancel = CancellationToken::new();
+        let (out_send, mut out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let registry = Arc::new(PeerRegistry::new());
+        let until = Instant::now() + Duration::from_secs(60);
+        registry.defer_body_retry(
+            [zakura_header_chain::SourceId::from_digest(peer.digest())],
+            scope,
+            hash,
+            until,
+        );
+
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (actions_tx, _actions_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let mut routine = PeerRoutine::new(
+            peer,
+            0,
+            session,
+            in_recv,
+            config,
+            true,
+            0,
+            budget,
+            Arc::clone(&work),
+            registry,
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            actions_tx,
+            routine_to_reactor_tx,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+        routine.received_status = true;
+        routine.servable_low = block::Height(1);
+        routine.servable_high = block::Height(10);
+
+        assert_eq!(routine.try_fill().await, Some(until));
+        assert!(work.pending_contains(block::Height(1)));
+        assert!(!work.in_flight_contains(block::Height(1)));
+        assert!(
+            timeout(Duration::from_millis(1), out_recv.recv())
+                .await
+                .is_err(),
+            "filtered work must not be sent"
+        );
+    }
+
     #[test]
     fn repeated_fill_stop_traces_are_sampled() {
         let now = Instant::now();
@@ -2296,7 +2489,7 @@ mod tests {
         routine.servable_low = block::Height(1);
         routine.servable_high = block::Height(10);
 
-        routine.try_fill().await;
+        let _ = routine.try_fill().await;
 
         // The floor request went out synchronously (no funding round trip)…
         let frame = timeout(Duration::from_secs(5), out_recv.recv())
@@ -2392,7 +2585,7 @@ mod tests {
 
         // One fill pass: the routine reserves height 1's estimate and sends its
         // request, creating an outstanding claim for a still-reserved height.
-        timeout(Duration::from_secs(5), routine.try_fill())
+        let _ = timeout(Duration::from_secs(5), routine.try_fill())
             .await
             .expect("try_fill completes");
         assert!(

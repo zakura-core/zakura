@@ -114,7 +114,8 @@ DEFAULTS = {
     "container_name": "",
     "port": None,
     # Node-local observability endpoints, both loopback-bound and unauthenticated.
-    # The probe reads them from inside the node, so they never need exposing.
+    # The probe reads them from inside the node, so they never need exposing. A
+    # blank metrics endpoint selects Zakura's standard loopback endpoint.
     "metrics_endpoint": "",
     "health_listen_addr": "",
 }
@@ -185,7 +186,12 @@ def load_nodes(config_path: Path) -> list[Node]:
                 process_pattern=merged["process_pattern"],
                 container_name=merged["container_name"],
                 node_id=node_ids_by_host.get(ssh_host(merged["ssh_string"]), ""),
-                metrics_endpoint=merged["metrics_endpoint"],
+                metrics_endpoint=merged["metrics_endpoint"]
+                or (
+                    "127.0.0.1:9999"
+                    if merged["probe_kind"] == "zebra"
+                    else ""
+                ),
                 health_listen_addr=merged["health_listen_addr"],
                 state_cache_dir=merged["state_cache_dir"],
                 port=merged["port"],

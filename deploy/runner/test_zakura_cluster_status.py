@@ -83,6 +83,31 @@ def public_row(
     }
 
 
+class NodeConfigTests(unittest.TestCase):
+    def test_zakura_uses_the_standard_metrics_endpoint_by_default(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+            config.write(
+                '[[nodes]]\nname = "node-a"\nssh_string = "root@node-a"\n'
+            )
+            config.flush()
+
+            [configured] = status.load_nodes(Path(config.name))
+
+        self.assertEqual(configured.metrics_endpoint, "127.0.0.1:9999")
+
+    def test_non_zakura_probe_does_not_assume_a_metrics_endpoint(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+            config.write(
+                '[[nodes]]\nname = "node-a"\nssh_string = "root@node-a"\n'
+                'probe_kind = "zcashd"\n'
+            )
+            config.flush()
+
+            [configured] = status.load_nodes(Path(config.name))
+
+        self.assertEqual(configured.metrics_endpoint, "")
+
+
 class RemoteProbeTests(unittest.TestCase):
     """Run the probe the way a node does: as a standalone script over stdin.
 

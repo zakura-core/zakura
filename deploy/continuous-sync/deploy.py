@@ -35,6 +35,78 @@ STALL_DIAGNOSTIC_TARGETS = {
 
 STALL_DIAGNOSTIC_START_TARGETS = {"start-temp-zakura-sync-test-5"}
 
+PR800_VALIDATION_TARGET = "validate-pr800-failed-nodes"
+PR800_VALIDATION_SHA = "d3722adda63cdee8aac6b148788798f812a63285"
+PR800_VALIDATION_NODES = {
+    "temp-zakura-sync-test-1": "root@138.68.43.212",
+    "temp-zakura-sync-test-2": "root@138.197.218.91",
+}
+
+PR800_VALIDATION_SCRIPT = rf"""
+set -euo pipefail
+
+sha={PR800_VALIDATION_SHA}
+repo=/root/zakura
+config=/etc/zakura-continuous-sync/controller.toml
+binary=/var/lib/zakura-continuous-sync/build-cache/zakurad-${{sha}}
+unit=zakura-pr800-validation.service
+
+if systemctl is-active --quiet zakura-continuous-sync.service; then
+    printf 'refusing validation: controller is active\n' >&2
+    exit 1
+fi
+if systemctl is-active --quiet zakura.service; then
+    printf 'refusing validation: managed node service is active\n' >&2
+    exit 1
+fi
+
+git -C "${{repo}}" fetch origin fix/vct-root-repair-livelock
+resolved="$(git -C "${{repo}}" rev-parse origin/fix/vct-root-repair-livelock^{{commit}})"
+if [ "${{resolved}}" != "${{sha}}" ]; then
+    printf 'PR 800 moved: expected %s, resolved %s\n' "${{sha}}" "${{resolved}}" >&2
+    exit 1
+fi
+
+python3 - "${{config}}" "${{sha}}" <<'PY'
+import importlib.util
+import pathlib
+import sys
+
+controller_path = pathlib.Path("/usr/local/sbin/zakura-continuous-sync.py")
+spec = importlib.util.spec_from_file_location("continuous_sync", controller_path)
+controller = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+sys.modules[spec.name] = controller
+spec.loader.exec_module(controller)
+config = controller.load_config(pathlib.Path(sys.argv[1]))
+binary = controller.build_binary(config, sys.argv[2])
+print(f"built={{binary}}")
+PY
+
+if [ ! -x "${{binary}}" ]; then
+    printf 'validation binary missing: %s\n' "${{binary}}" >&2
+    exit 1
+fi
+
+systemctl stop "${{unit}}" 2>/dev/null || true
+systemctl reset-failed "${{unit}}" 2>/dev/null || true
+systemd-run \
+    --unit="${{unit%.service}}" \
+    --description='Zakura PR 800 preserved-state validation' \
+    --property=Type=simple \
+    --property=Restart=no \
+    --property=WorkingDirectory=/root/zakura \
+    "${{binary}}" --config /etc/zakura/zebrad.toml start
+
+sleep 15
+systemctl show "${{unit}}" \
+    --property=ActiveState,SubState,Result,ExecMainStatus,MainPID,ActiveEnterTimestamp \
+    --no-pager
+curl -fsS --max-time 20 http://127.0.0.1:9999/metrics 2>/dev/null |
+    grep -E 'checkpoint_(verified_height|processing_next_height)|state_finalized_block_height|sync_(header|block|estimated|downloads)|vct|repair' |
+    tail -n 500 || true
+"""
+
 STALL_DIAGNOSTIC_SCRIPT = r"""
 set -u
 
@@ -627,6 +699,32 @@ def cmd_deploy(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     requested = set(args.node or [])
+    if requested == {PR800_VALIDATION_TARGET}:
+        nodes = [
+            Node({"name": name, "ssh_string": ssh_string})
+            for name, ssh_string in PR800_VALIDATION_NODES.items()
+        ]
+
+        def validate(node: Node) -> tuple[str, bool, str]:
+            cmd = node.ssh_cmd("bash", "-s")
+            actions_key = Path.home() / ".ssh" / "zakura-continuous-sync"
+            if actions_key.exists():
+                cmd[1:1] = ["-i", str(actions_key), "-o", "IdentitiesOnly=yes"]
+            proc = subprocess.run(
+                cmd,
+                text=True,
+                input=PR800_VALIDATION_SCRIPT,
+                capture_output=True,
+                timeout=1500,
+            )
+            print(f"\n######## PR 800 validation: {node.name} ########")
+            print(proc.stdout)
+            if proc.returncode != 0:
+                return node.name, False, (proc.stderr or f"validation exit {proc.returncode}").strip()
+            return node.name, True, "PR 800 validation service started on preserved state"
+
+        return summarize_parallel(nodes, validate)
+
     diagnostic_targets = requested.intersection(STALL_DIAGNOSTIC_TARGETS)
     if diagnostic_targets:
         unknown = requested - diagnostic_targets

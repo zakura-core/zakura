@@ -460,6 +460,146 @@ class SlackPayloadTests(unittest.TestCase):
         self.assertIn(watchdog.SLACK_TRUNCATION_MARKER, posted_text)
         self.assertTrue(posted_text.endswith("dashboard: http://dashboard.invalid/"))
 
+    def test_duplicate_owner_recovery_bounds_and_sanitizes_identities(self):
+        fleet = watchdog.Fleet(
+            name="<!channel>" + "f" * 10_000,
+            url="http://source.invalid/data",
+            dashboard_url="http://dashboard.invalid/",
+        )
+
+        text = watchdog.duplicate_stall_recovery_text(
+            fleet,
+            "<duplicate>" + "d" * 10_000,
+            "`owner`" + "o" * 10_000,
+            "9" * 10_000,
+        )
+        posted_text = self.posted_text(text)
+
+        self.assertLessEqual(len(posted_text), watchdog.MAX_SLACK_MESSAGE_CHARS)
+        self.assertNotIn("<!channel>", posted_text)
+        self.assertNotIn("<duplicate>", posted_text)
+        self.assertNotIn("`owner`", posted_text)
+        self.assertNotIn("f" * (watchdog.MAX_ALERT_NAME_CHARS + 1), posted_text)
+        self.assertNotIn("d" * (watchdog.MAX_ALERT_NAME_CHARS + 1), posted_text)
+        self.assertNotIn("o" * (watchdog.MAX_ALERT_NAME_CHARS + 1), posted_text)
+        self.assertIn("height: -", posted_text)
+        self.assertTrue(posted_text.endswith("dashboard: http://dashboard.invalid/"))
+
+
+class FleetSnapshotTests(unittest.TestCase):
+    NOW = 2_000.0
+
+    def setUp(self):
+        self.posted: list[str] = []
+        self.fleet = watchdog.Fleet(
+            name="testnet",
+            url="http://dashboard.invalid/data",
+            dashboard_url="http://dashboard.invalid/",
+        )
+        self.instance = watchdog.Watchdog([self.fleet], make_args())
+
+    @staticmethod
+    def state():
+        return {
+            "version": watchdog.STATE_VERSION,
+            "nodes": {},
+            "fleets": {},
+            "shared_stalls": {},
+        }
+
+    @staticmethod
+    def healthy_row():
+        return {
+            "name": "node-a",
+            "health": "healthy",
+            "height": 100,
+            "block_hash": "aaaa",
+            "seconds_since_advanced": 1.0,
+        }
+
+    def run_snapshot(self, snapshot, state=None):
+        if state is None:
+            state = self.state()
+        with (
+            patch.object(watchdog, "fetch_json", return_value=snapshot),
+            patch.object(watchdog.time, "time", return_value=self.NOW),
+            patch.object(
+                watchdog,
+                "post_slack",
+                side_effect=lambda text, _args: (self.posted.append(text), True)[1],
+            ),
+        ):
+            self.instance.run_once(state)
+        return state
+
+    def test_stale_snapshot_alerts_from_the_last_successful_poll(self):
+        state = self.run_snapshot(
+            {
+                "last_poll": self.NOW - 600.0,
+                "rows": [self.healthy_row()],
+            }
+        )
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("dashboard unavailable for 10m", self.posted[0])
+        self.assertIn("snapshot is stale", self.posted[0])
+        self.assertTrue(state["fleets"]["testnet"]["alerting"])
+        self.assertEqual(state["nodes"], {})
+        self.assertEqual(state["shared_stalls"], {})
+
+    def test_stale_snapshot_keeps_the_earliest_fleet_failure_time(self):
+        state = self.state()
+        state["fleets"]["testnet"] = {
+            "condition": "unreachable",
+            "bad_since": self.NOW - 100.0,
+            "alerting": False,
+        }
+
+        self.run_snapshot(
+            {
+                "last_poll": self.NOW - 600.0,
+                "rows": [self.healthy_row()],
+            },
+            state,
+        )
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertEqual(state["fleets"]["testnet"]["bad_since"], self.NOW - 600.0)
+
+    def test_malformed_or_empty_rows_start_a_fleet_failure(self):
+        duplicate = self.healthy_row()
+        for rows in (
+            None,
+            [],
+            ["not an object"],
+            [{"health": "healthy"}],
+            [duplicate, dict(duplicate)],
+        ):
+            with self.subTest(rows=rows):
+                state = self.run_snapshot({"last_poll": self.NOW, "rows": rows})
+                self.assertEqual(
+                    state["fleets"]["testnet"]["condition"], "unreachable"
+                )
+                self.assertFalse(state["fleets"]["testnet"]["alerting"])
+                self.assertEqual(state["nodes"], {})
+
+    def test_invalid_last_poll_starts_a_fleet_failure(self):
+        for last_poll in (None, float("nan"), float("inf"), True):
+            with self.subTest(last_poll=last_poll):
+                state = self.run_snapshot(
+                    {"last_poll": last_poll, "rows": [self.healthy_row()]}
+                )
+                self.assertEqual(
+                    state["fleets"]["testnet"]["condition"], "unreachable"
+                )
+                self.assertEqual(state["nodes"], {})
+
+    def test_older_snapshot_without_last_poll_remains_compatible(self):
+        state = self.run_snapshot({"rows": [self.healthy_row()]})
+
+        self.assertEqual(state["fleets"]["testnet"]["condition"], "ok")
+        self.assertEqual(state["nodes"]["testnet/node-a"]["condition"], "ok")
+
 
 class SharedStallTests(unittest.TestCase):
     NOW = 2_000.0
@@ -897,6 +1037,35 @@ class SharedStallTests(unittest.TestCase):
         self.assertTrue(
             all(not entry["alerting"] for entry in self.state["nodes"].values())
         )
+
+    def test_non_finite_timers_are_not_stall_evidence(self):
+        for timer in (float("nan"), float("inf"), "-inf", True):
+            with self.subTest(timer=timer):
+                self.state = {
+                    "version": watchdog.STATE_VERSION,
+                    "nodes": {},
+                    "fleets": {},
+                    "shared_stalls": {},
+                }
+                self.posted.clear()
+                self.run_snapshot([self.row("node-a", 100, timer)])
+                self.assertEqual(self.posted, [])
+                self.assertEqual(
+                    self.state["nodes"]["testnet/node-a"]["condition"], "ok"
+                )
+
+    def test_non_finite_persisted_timer_does_not_crash_reconciliation(self):
+        self.state["nodes"]["testnet/node-a"] = {
+            "condition": "stalled",
+            "bad_since": float("inf"),
+            "alerting": False,
+            "event_height": 100,
+        }
+
+        self.run_snapshot([self.row("node-a", 100, 700.0)])
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertTrue(self.state["nodes"]["testnet/node-a"]["alerting"])
 
     def test_failed_shared_recovery_aborts_constituent_alerts(self):
         self.run_snapshot(

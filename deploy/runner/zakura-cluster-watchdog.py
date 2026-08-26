@@ -260,12 +260,13 @@ def fetch_json(url: str, timeout: float) -> dict[str, Any]:
 
 
 def coerce_float(value: object) -> float | None:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     try:
-        return float(value)
+        number = float(value)
     except (OverflowError, TypeError, ValueError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def coerce_height(value: object) -> int | None:
@@ -684,7 +685,9 @@ def update_alert_state(
         return
 
     if entry.get("condition") == condition:
-        bad_since = min(float(entry.get("bad_since", bad_since)), bad_since)
+        previous_bad_since = coerce_float(entry.get("bad_since"))
+        if previous_bad_since is not None:
+            bad_since = min(previous_bad_since, bad_since)
         alerting = was_alerting
     else:
         alerting = False
@@ -760,7 +763,7 @@ def node_recovery_text(fleet: Fleet, row: dict[str, Any], previous: dict[str, An
 def fleet_alert_text(fleet: Fleet, error: Exception, age: float) -> str:
     fleet_name = slack_identity(fleet.name, MAX_ALERT_NAME_CHARS, "unknown")
     return (
-        f":rotating_light: *Zakura {fleet_name}* dashboard unreachable "
+        f":rotating_light: *Zakura {fleet_name}* dashboard unavailable "
         f"for {format_duration(age)}\n"
         f"endpoint: {slack_dashboard_url(fleet.url)}\n"
         f"error: {slack_plain_text(error, MAX_ALERT_ERROR_CHARS)}"
@@ -849,6 +852,54 @@ def shared_stall_recovery_text(
         f"height: {height_text}\n"
         f"dashboard: {slack_dashboard_url(fleet.dashboard_url)}"
     )
+
+
+def duplicate_stall_recovery_text(
+    fleet: Fleet,
+    duplicate_name: object,
+    owner_name: object,
+    height: object,
+) -> str:
+    fleet_name = slack_identity(fleet.name, MAX_ALERT_NAME_CHARS, "unknown")
+    duplicate = slack_identity(duplicate_name, MAX_ALERT_NAME_CHARS, "unknown")
+    owner = slack_identity(owner_name, MAX_ALERT_NAME_CHARS, "unknown")
+    height_value = coerce_height(height)
+    height_text = str(height_value) if height_value is not None else "-"
+    return (
+        f":white_check_mark: *Zakura {fleet_name}* - `{duplicate}` "
+        "duplicate stall alert cleared\n"
+        f"detail: `{owner}` continues to represent the shared incident\n"
+        f"height: {height_text}\n"
+        f"dashboard: {slack_dashboard_url(fleet.dashboard_url)}"
+    )
+
+
+def validated_fleet_rows(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = snapshot.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("dashboard snapshot rows is not a list")
+    if not rows:
+        raise ValueError("dashboard snapshot has no node rows")
+    if any(not isinstance(row, dict) for row in rows):
+        raise ValueError("dashboard snapshot contains a non-object node row")
+
+    names = [row.get("name") for row in rows]
+    if any(not isinstance(name, str) or not name.strip() for name in names):
+        raise ValueError("dashboard snapshot contains a node row without a name")
+    if len(set(names)) != len(names):
+        raise ValueError("dashboard snapshot contains duplicate node names")
+    return rows
+
+
+def snapshot_last_poll(snapshot: dict[str, Any]) -> float | None:
+    if "last_poll" not in snapshot:
+        # Dashboards deployed before the atomic diagnostic payload omitted this
+        # field. Accept them during a rolling upgrade.
+        return None
+    last_poll = coerce_float(snapshot.get("last_poll"))
+    if last_poll is None:
+        raise ValueError("dashboard snapshot has no valid last_poll timestamp")
+    return last_poll
 
 
 def release_state_condition(
@@ -943,17 +994,33 @@ class Watchdog:
         for fleet in self.fleets:
             try:
                 snapshot = fetch_json(fleet.url, self.args.request_timeout)
+                node_rows = validated_fleet_rows(snapshot)
+                last_poll = snapshot_last_poll(snapshot)
             except Exception as error:
                 self.handle_fleet_error(state, fleet, error, now, suppressed)
                 continue
 
+            if (
+                last_poll is not None
+                and now - last_poll >= self.args.dashboard_down_after
+            ):
+                age = now - last_poll
+                error = ValueError(
+                    "dashboard snapshot is stale: last poll was "
+                    f"{format_duration(age)} ago"
+                )
+                self.handle_fleet_error(
+                    state,
+                    fleet,
+                    error,
+                    now,
+                    suppressed,
+                    bad_since=last_poll,
+                )
+                continue
+
             if not self.handle_fleet_recovered(state, fleet, now):
                 continue
-            rows = snapshot.get("rows", [])
-            if not isinstance(rows, list):
-                rows = []
-
-            node_rows = [row for row in rows if isinstance(row, dict)]
             grace_since = max(
                 self.started_at, self.fetch_recovered_at.get(fleet.name, 0)
             )
@@ -1018,9 +1085,12 @@ class Watchdog:
         except Exception as error:
             condition, detail = "unreachable", str(error)
 
+        previous_bad_since = coerce_float(entry.get("bad_since"))
         bad_since = (
-            float(entry.get("bad_since", now))
-            if entry.get("condition") == condition and condition != "ok"
+            previous_bad_since
+            if entry.get("condition") == condition
+            and condition != "ok"
+            and previous_bad_since is not None
             else now
         )
 
@@ -1048,15 +1118,17 @@ class Watchdog:
         error: Exception,
         now: float,
         suppressed: bool,
+        bad_since: float | None = None,
     ) -> None:
         key = fleet.name
         bucket = state.setdefault("fleets", {})
         entry = bucket.get(key, {})
-        bad_since = (
-            float(entry.get("bad_since", now))
-            if entry.get("condition") == "unreachable"
-            else now
-        )
+        previous_bad_since = coerce_float(entry.get("bad_since"))
+        detected_bad_since = now if bad_since is None else min(now, bad_since)
+        if entry.get("condition") == "unreachable" and previous_bad_since is not None:
+            bad_since = min(previous_bad_since, detected_bad_since)
+        else:
+            bad_since = detected_bad_since
         age = now - bad_since
         update_alert_state(
             bucket,
@@ -1250,12 +1322,11 @@ class Watchdog:
         owner = node_owners[0]
         bucket = state.setdefault("nodes", {})
         for duplicate in node_owners[1:]:
-            text = (
-                f":white_check_mark: *Zakura {fleet.name}* - `{duplicate.name}` "
-                "duplicate stall alert cleared\n"
-                f"detail: `{owner.name}` continues to represent the shared incident\n"
-                f"height: {common_stall.height}\n"
-                f"dashboard: {fleet.dashboard_url}"
+            text = duplicate_stall_recovery_text(
+                fleet,
+                duplicate.name,
+                owner.name,
+                common_stall.height,
             )
             if not post_slack(text, self.args):
                 return False
@@ -1316,13 +1387,15 @@ class Watchdog:
         bad_since = common_stall.bad_since
         timer_floor = bad_since
         if same_event:
-            previous_bad_since = float(previous.get("bad_since", bad_since))
+            previous_bad_since = coerce_float(previous.get("bad_since"))
+            if previous_bad_since is None:
+                previous_bad_since = bad_since
             previous_nodes = set(previous.get("node_names") or ())
             current_nodes = set(common_stall.node_names)
             if previous_nodes == current_nodes:
-                timer_floor = float(
-                    previous.get("timer_floor", previous_bad_since)
-                )
+                timer_floor = coerce_float(previous.get("timer_floor"))
+                if timer_floor is None:
+                    timer_floor = previous_bad_since
                 bad_since = max(
                     timer_floor,
                     min(previous_bad_since, bad_since),
@@ -1468,7 +1541,9 @@ class Watchdog:
             observation.condition != "ok"
             and previous.get("condition") == observation.condition
         ):
-            bad_since = min(float(previous.get("bad_since", bad_since)), bad_since)
+            previous_bad_since = coerce_float(previous.get("bad_since"))
+            if previous_bad_since is not None:
+                bad_since = min(previous_bad_since, bad_since)
         age = now - bad_since
 
         update_alert_state(

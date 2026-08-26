@@ -19,7 +19,7 @@
 //! routine receives inbound traffic from its own `FramedRecv`. Its fill loop,
 //! matched-body path, and unmatched-body paths run in the same task.
 
-use std::{collections::BTreeMap, num::NonZeroU64};
+use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
 
 use tokio::sync::{futures::Notified, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -70,6 +70,27 @@ const FILL_STOP_TRACE_INTERVAL: Duration = Duration::from_secs(10);
 
 fn fill_stop_trace_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= FILL_STOP_TRACE_INTERVAL)
+}
+
+/// Return the first contiguous run that the predicate accepts.
+///
+/// The function evaluates each visited item once. This property matters when
+/// the predicate reads shared retry state that another peer routine can update.
+fn first_allowed_run<T>(
+    items: &[T],
+    mut is_allowed: impl FnMut(&T) -> bool,
+) -> Option<Range<usize>> {
+    let mut start = None;
+
+    for (index, item) in items.iter().enumerate() {
+        if is_allowed(item) {
+            start.get_or_insert(index);
+        } else if let Some(start) = start {
+            return Some(start..index);
+        }
+    }
+
+    start.map(|start| start..items.len())
 }
 
 /// Why a fill pass stopped issuing requests. Typed so every admission refusal is
@@ -915,25 +936,18 @@ impl PeerRoutine {
                             .registry
                             .is_body_retry_avoided(&self.peer, item.scope, item.hash, now)
                 };
-                let keep_from = items
-                    .iter()
-                    .position(|(height, item)| is_allowed(height, item));
-                match keep_from {
-                    Some(0) => {}
-                    Some(index) => {
-                        let avoided: Vec<_> = items.drain(..index).map(|(h, _)| h).collect();
-                        self.work.return_items_quiet(avoided);
-                    }
-                    None => {
-                        let avoided: Vec<_> = items.iter().map(|(h, _)| *h).collect();
-                        self.work.return_items_quiet(avoided);
-                        break FillStop::RetryAvoid;
-                    }
+                let Some(keep) =
+                    first_allowed_run(&items, |(height, item)| is_allowed(height, item))
+                else {
+                    let avoided: Vec<_> = items.iter().map(|(h, _)| *h).collect();
+                    self.work.return_items_quiet(avoided);
+                    break FillStop::RetryAvoid;
+                };
+                let keep_len = keep.len();
+                if keep.start > 0 {
+                    let avoided: Vec<_> = items.drain(..keep.start).map(|(h, _)| h).collect();
+                    self.work.return_items_quiet(avoided);
                 }
-                let keep_len = items
-                    .iter()
-                    .take_while(|(height, item)| is_allowed(height, item))
-                    .count();
                 if keep_len < items.len() {
                     let avoided = items.split_off(keep_len);
                     self.work
@@ -2212,6 +2226,20 @@ mod tests {
     use crate::zakura::framed_channel;
     use crate::zakura::trace::ZakuraTrace;
     use crate::zakura::ZakuraPeerId;
+
+    #[test]
+    fn retry_filter_evaluates_each_item_once() {
+        let items = [0usize, 1, 2, 3];
+        let mut calls = [0usize; 4];
+
+        let keep = super::first_allowed_run(&items, |item| {
+            calls[*item] += 1;
+            matches!(*item, 1 | 2)
+        });
+
+        assert_eq!(keep, Some(1..3));
+        assert_eq!(calls, [1, 1, 1, 1]);
+    }
 
     #[test]
     fn repeated_fill_stop_traces_are_sampled() {

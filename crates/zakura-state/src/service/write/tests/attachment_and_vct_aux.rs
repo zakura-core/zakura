@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn only_new_vct_failure_evidence_starts_a_repair_episode() {
+    assert_eq!(
+        vct_failure_repair_trigger(&ApplyResult::Committed),
+        Some(VctRepairTrigger::RejectedDelivery)
+    );
+    assert_eq!(
+        vct_failure_repair_trigger(&ApplyResult::NoChange(
+            zakura_header_chain::NoChangeReceipt {
+                state_version: StateVersion::new(1),
+                idempotency_key: None,
+            }
+        )),
+        Some(VctRepairTrigger::MissingRootObserved),
+        "replayed evidence must not retire an in-flight replacement"
+    );
+}
+
+#[test]
 fn attachment_failure_exits_with_a_typed_error_before_publication() {
     let _init_guard = zakura_test::init();
     let network = Network::new_regtest(Default::default());

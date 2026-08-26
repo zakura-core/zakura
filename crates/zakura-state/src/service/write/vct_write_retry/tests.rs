@@ -228,6 +228,12 @@ fn sweep_rejection_restarts_the_same_height_after_missing_polls_deduplicate() {
     let replacement = *rx.borrow_and_update();
     assert_eq!(replacement.state, first.state);
     assert_eq!(replacement.generation, first.generation + 1);
+
+    manager.request_sweep_repair(height, VctRepairTrigger::MissingRootObserved);
+    assert!(
+        !rx.has_changed().expect("watch channel remains open"),
+        "an idempotent observation must not restart the replacement episode"
+    );
 }
 
 #[test]

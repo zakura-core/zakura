@@ -39,6 +39,7 @@ use crate::{
             VctAuxiliaryWindow, VctSuccessorWitness,
         },
         write::{
+            vct_failure_repair_trigger,
             vct_write_retry::{VctRepairTrigger, VctWriteRetryManager},
             HeaderChainWriter, VctAuxiliaryWindowRead,
         },
@@ -375,14 +376,15 @@ impl VctAuthenticationSweeper {
         );
 
         match writer.record_vct_auxiliary_failure(auxiliary_window, attribution, failure) {
-            Ok(Some(ApplyResult::Committed | ApplyResult::NoChange(_))) => {
+            Ok(Some(apply_result @ (ApplyResult::Committed | ApplyResult::NoChange(_)))) => {
                 let Some(repair_height) =
                     attribution.repair_height(delivery_height, Some(successor_witness.height))
                 else {
                     return;
                 };
-                repair_manager
-                    .request_sweep_repair(repair_height, VctRepairTrigger::RejectedDelivery);
+                let trigger = vct_failure_repair_trigger(&apply_result)
+                    .expect("committed or idempotent evidence has a trigger");
+                repair_manager.request_sweep_repair(repair_height, trigger);
             }
             Ok(Some(apply_result)) => {
                 tracing::debug!(

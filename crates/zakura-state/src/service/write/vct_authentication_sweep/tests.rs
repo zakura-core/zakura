@@ -848,6 +848,14 @@ fn an_ambiguous_boundary_disputes_both_deliveries_without_rejecting_them() {
         },
         "repair restarts at the lower disputed height"
     );
+
+    let generation = fixture.repair_receiver.borrow().generation;
+    fixture.sweep(&mut sweeper);
+    assert_eq!(
+        fixture.repair_receiver.borrow().generation,
+        generation,
+        "re-reading durable dispute evidence must not replace in-flight repair work"
+    );
 }
 
 #[test]

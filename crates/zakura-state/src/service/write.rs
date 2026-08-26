@@ -67,6 +67,15 @@ use vct_authentication_sweep::VctAuthenticationSweeper;
 use vct_write_retry::{VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager};
 pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
 
+/// Classifies durable failure evidence as a new repair episode or an idempotent observation.
+fn vct_failure_repair_trigger(apply_result: &ApplyResult) -> Option<VctRepairTrigger> {
+    match apply_result {
+        ApplyResult::Committed => Some(VctRepairTrigger::RejectedDelivery),
+        ApplyResult::NoChange(_) => Some(VctRepairTrigger::MissingRootObserved),
+        ApplyResult::Stale(_) | ApplyResult::ResourceStalled(_) => None,
+    }
+}
+
 fn missing_vct_successor_retry(
     successor_height: Option<Height>,
     current_height: Height,
@@ -2194,7 +2203,7 @@ impl WriteBlockWorkerTask {
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
                 Err((ordered_block, error)) => {
-                    let mut attributed_failure_repair_height = None;
+                    let mut attributed_failure_repair = None;
                     if let (Some(auxiliary_window), Some(failure)) = (
                         vct_auxiliary_window_for_outcome.as_ref(),
                         error.vct_failure(),
@@ -2218,15 +2227,21 @@ impl WriteBlockWorkerTask {
                                 failure_attribution,
                                 failure,
                             ) {
-                                Ok(Some(ApplyResult::Committed | ApplyResult::NoChange(_))) => {
-                                    attributed_failure_repair_height = failure_attribution
+                                Ok(Some(
+                                    apply_result @ (ApplyResult::Committed
+                                    | ApplyResult::NoChange(_)),
+                                )) => {
+                                    let trigger = vct_failure_repair_trigger(&apply_result)
+                                        .expect("committed or idempotent evidence has a trigger");
+                                    attributed_failure_repair = failure_attribution
                                         .repair_height(
                                             ordered_block.0.height,
                                             auxiliary_window
                                                 .successor
                                                 .as_ref()
                                                 .map(|successor| successor.height),
-                                        );
+                                        )
+                                        .map(|height| (height, trigger));
                                 }
                                 Ok(Some(ApplyResult::Stale(receipt))) => {
                                     tracing::debug!(
@@ -2260,16 +2275,13 @@ impl WriteBlockWorkerTask {
                     // The write loop polls await-successor stalls faster.
                     if let Some(height) = error.vct_retryable_height() {
                         let root_unavailable = error.vct_supplied_root_unavailable_height();
-                        let repair_height = attributed_failure_repair_height.unwrap_or(height);
+                        let (repair_height, repair_trigger) = attributed_failure_repair
+                            .unwrap_or((height, VctRepairTrigger::MissingRootObserved));
 
                         prev_finalized_note_commitment_trees = prev_note_commitment_trees_for_retry;
                         let retry_cause = if root_unavailable.is_some() {
                             VctWriteRetryCause::MissingRoot {
-                                trigger: if attributed_failure_repair_height.is_some() {
-                                    VctRepairTrigger::RejectedDelivery
-                                } else {
-                                    VctRepairTrigger::MissingRootObserved
-                                },
+                                trigger: repair_trigger,
                             }
                         } else {
                             VctWriteRetryCause::MissingSuccessor

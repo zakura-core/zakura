@@ -188,8 +188,17 @@ fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn retained_path_serves_a_locator_before_the_header_retention_window() {
+/// A reconciled store over a genesis and three descendant headers.
+///
+/// The genesis and the first two path headers are finalized and indexed in the canonical
+/// finalized columns; the third sits in the retained header graph above the finalized frontier.
+/// Returns the runtime, its open database, the genesis header, and the three-header path.
+fn reconciled_store_with_finalized_prefix() -> (
+    HeaderChainRuntime,
+    DiskDb,
+    VerifiedHeaderRef,
+    Vec<VerifiedHeaderRef>,
+) {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let db = open(&db_config, engine_config.network());
@@ -256,6 +265,15 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
             path[2..].to_vec(),
         )
         .expect("the finalized prefix and retained suffix reconcile");
+    (runtime, db, genesis, path)
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_path_serves_a_locator_before_the_header_retention_window() {
+    let (runtime, db, genesis, path) = reconciled_store_with_finalized_prefix();
+    let hash_by_height = db
+        .cf_handle("hash_by_height")
+        .expect("the finalized hash index exists");
     let reader = runtime.reader();
     let target = Frontier::new(path[2].height, path[2].hash);
     let scope = zakura_header_chain::HeaderWorkAuthority::for_target(
@@ -922,5 +940,73 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         Err(HeaderChainStoreError::Store(StoreError::Incoherent(
             "retained node and auxiliary delivery index disagree"
         )))
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_path_serves_an_exact_finalized_target_below_the_header_frontier() {
+    let (runtime, _db, genesis, path) = reconciled_store_with_finalized_prefix();
+    let finalized = Frontier::new(path[1].height, path[1].hash);
+    let reader = runtime.reader();
+
+    // A VCT repair asks for the exact header at one stalled height. The header graph holds only
+    // the retained suffix, so a supplier that has finalized past that height serves it from the
+    // finalized indexes.
+    let target = Frontier::new(path[0].height, path[0].hash);
+    assert!(target.height < finalized.height);
+    let scope = zakura_header_chain::HeaderWorkAuthority::for_target(
+        &runtime.publisher().snapshot(),
+        target.hash,
+    );
+    let owner = SourceId::from_digest([0x81; 32]);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(owner, 11, target.hash, &[genesis.hash], scope)
+        .expect("the finalized target resolves through the finalized indexes")
+    else {
+        panic!("the finalized target should acquire a lease");
+    };
+    assert_eq!(
+        lease.common_ancestor,
+        Frontier::new(genesis.height, genesis.hash)
+    );
+    assert_eq!(lease.target, target);
+
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(owner, 11, lease.lease_id, scope, genesis.hash, 4)
+        .expect("the finalized target page is coherent")
+    else {
+        panic!("the finalized target lease should remain available");
+    };
+    assert_eq!(
+        page.headers.as_slice(),
+        std::slice::from_ref(&path[0].header)
+    );
+    assert_eq!(page.target, target);
+    assert!(page.complete);
+    assert!(reader
+        .release_retained_path(owner, 11, lease.lease_id, scope)
+        .expect("the finalized target cursor releases"));
+
+    // A locator at or above the target leaves no ancestor to continue from.
+    let above_owner = SourceId::from_digest([0x82; 32]);
+    assert!(matches!(
+        reader
+            .acquire_retained_path(above_owner, 11, target.hash, &[path[1].hash], scope)
+            .expect("the locator lookup is coherent"),
+        RetainedPathLeaseOutcome::NoLocatorIntersection
+    ));
+
+    // An unknown target stays unservable.
+    let unknown_owner = SourceId::from_digest([0x83; 32]);
+    let unknown = zakura_chain::block::Hash([0x9c; 32]);
+    let unknown_scope = zakura_header_chain::HeaderWorkAuthority::for_target(
+        &runtime.publisher().snapshot(),
+        unknown,
+    );
+    assert!(matches!(
+        reader
+            .acquire_retained_path(unknown_owner, 11, unknown, &[genesis.hash], unknown_scope)
+            .expect("the unknown target lookup is coherent"),
+        RetainedPathLeaseOutcome::TargetNotRetained
     ));
 }

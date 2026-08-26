@@ -60,13 +60,29 @@ enum VctRepairRequester {
     Sweep,
 }
 
+/// Event that raises or renews an exact VCT metadata repair need.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum VctRepairTrigger {
+    /// The writer found no usable delivery for the height.
+    MissingRootObserved,
+    /// The writer rejected or disputed a selected delivery and needs another delivery.
+    RejectedDelivery,
+}
+
+impl VctRepairTrigger {
+    /// Whether this event starts a distinct repair episode.
+    fn starts_new_episode(self) -> bool {
+        self == Self::RejectedDelivery
+    }
+}
+
 /// VCT metadata condition that makes a checkpoint block retryable.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum VctWriteRetryCause {
     /// The committer cannot obtain a verifiable root.
     MissingRoot {
-        /// The writer rejected or disputed an existing delivery before requesting replacement.
-        replacement_required: bool,
+        /// Event that raised or renewed the repair need.
+        trigger: VctRepairTrigger,
     },
     /// The state has not stored the successor header that authenticates the root.
     MissingSuccessor,
@@ -94,9 +110,9 @@ impl VctWriteRetryManager {
         }
     }
 
-    /// Requests replacement metadata for the sweep at `height`.
-    pub(super) fn request_sweep_repair(&mut self, height: Height) {
-        let starts_new_episode = self.sweep_repair_height != Some(height);
+    /// Requests replacement metadata for the sweep at `height` after `trigger`.
+    pub(super) fn request_sweep_repair(&mut self, height: Height, trigger: VctRepairTrigger) {
+        let starts_new_episode = trigger.starts_new_episode();
         self.sweep_repair_height = Some(height);
         self.publish_effective_repair_status(
             starts_new_episode.then_some(VctRepairRequester::Sweep),
@@ -116,7 +132,7 @@ impl VctWriteRetryManager {
     /// Raises the committer repair height without parking a block.
     #[cfg(test)]
     pub(super) fn request_committer_repair_for_test(&mut self, height: Height) {
-        self.request_committer_repair(height, true);
+        self.request_committer_repair(height, VctRepairTrigger::RejectedDelivery);
     }
 
     /// Takes the checkpoint block that the writer parked for retry.
@@ -162,11 +178,8 @@ impl VctWriteRetryManager {
         block: QueuedCheckpointVerified,
     ) -> Duration {
         metrics::counter!("state.vct.root.retry.count").increment(1);
-        if let VctWriteRetryCause::MissingRoot {
-            replacement_required,
-        } = retry_cause
-        {
-            self.request_committer_repair(height, replacement_required);
+        if let VctWriteRetryCause::MissingRoot { trigger } = retry_cause {
+            self.request_committer_repair(height, trigger);
         }
 
         // The manager reports only stalls that exceed the warning threshold. Transient stalls stay
@@ -219,12 +232,11 @@ impl VctWriteRetryManager {
         }
     }
 
-    fn request_committer_repair(&mut self, height: Height, replacement_required: bool) {
+    fn request_committer_repair(&mut self, height: Height, trigger: VctRepairTrigger) {
+        let starts_new_episode = trigger.starts_new_episode();
         self.committer_repair_height = Some(height);
-        // Replacing a candidate starts a new repair episode even at the same height; a bare
-        // re-poll of the same stall must not.
         self.publish_effective_repair_status(
-            replacement_required.then_some(VctRepairRequester::Committer),
+            starts_new_episode.then_some(VctRepairRequester::Committer),
         );
     }
 
@@ -233,20 +245,17 @@ impl VctWriteRetryManager {
         self.publish_effective_repair_status(None);
     }
 
-    /// Publishes the lowest outstanding repair height.
+    /// Publishes the repair that can unblock the writer.
     ///
-    /// The repair channel stores one latest value. The manager publishes the lower height because
-    /// its replacement unblocks the higher repair.
+    /// The repair channel stores one latest value. A committer repair takes priority because the
+    /// authentication sweep runs only after the checkpoint queue becomes empty. The sweep cannot
+    /// clear its repair while a missing committer root keeps that queue nonempty.
     fn publish_effective_repair_status(
         &mut self,
         requester_with_new_episode: Option<VctRepairRequester>,
     ) {
         let effective_repair = match (self.committer_repair_height, self.sweep_repair_height) {
-            (Some(committer), Some(sweep)) if committer <= sweep => {
-                Some((committer, VctRepairRequester::Committer))
-            }
-            (Some(_), Some(sweep)) => Some((sweep, VctRepairRequester::Sweep)),
-            (Some(committer), None) => Some((committer, VctRepairRequester::Committer)),
+            (Some(committer), _) => Some((committer, VctRepairRequester::Committer)),
             (None, Some(sweep)) => Some((sweep, VctRepairRequester::Sweep)),
             (None, None) => None,
         };

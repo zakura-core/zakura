@@ -9,12 +9,13 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
 use color_eyre::Report;
 use futures::{Future, FutureExt, StreamExt};
-use tower::timeout::Timeout;
+use tower::{timeout::Timeout, Service};
 
 use zakura_chain::{
     block::{self, Block, Height},
@@ -53,6 +54,23 @@ type TestChainSync = ChainSync<
     MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
     MockChainTip,
 >;
+
+#[derive(Clone, Debug)]
+struct NeverReadyNetwork;
+
+impl Service<zn::Request> for NeverReadyNetwork {
+    type Response = zn::Response;
+    type Error = crate::BoxError;
+    type Future = futures::future::Pending<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Pending
+    }
+
+    fn call(&mut self, _request: zn::Request) -> Self::Future {
+        futures::future::pending()
+    }
+}
 
 /// Maximum time to wait for a request to any test service.
 ///
@@ -2144,10 +2162,11 @@ async fn not_found_download_restarts_sync() {
     );
 }
 
-/// A peer connection failure affects one block request, so the syncer requeues that hash without
-/// canceling the other checkpoint verification tasks.
+/// A peer connection failure affects one block request, so the syncer requeues that hash and clears
+/// the retry count after the replacement succeeds.
 #[tokio::test]
-async fn transient_download_failure_requeues_block() {
+async fn transient_download_failure_requeues_and_clears_on_success() -> Result<(), crate::BoxError>
+{
     let (
         mut chain_sync,
         _sync_status,
@@ -2157,35 +2176,54 @@ async fn transient_download_failure_requeues_block() {
         _mock_chain_tip_sender,
     ) = setup_chain_sync();
 
-    let block_hash = block::Hash::from([0xCE; 32]);
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let block_hash = block.hash();
     let error = BlockDownloadVerifyError::DownloadFailed {
         error: client_dropped_error(),
         hash: block_hash,
     };
 
-    let requeue = tokio::spawn(async move {
-        let result = chain_sync
-            .handle_block_response_with_missing_retry(Err(error))
-            .await;
-        (chain_sync, result)
-    });
-
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block_hash).collect()))
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
         .await
-        .respond(Err(client_dropped_error()));
-
-    let (chain_sync, result) = requeue
-        .await
-        .expect("transient block retry task should not panic");
-    result.expect("a transient block failure within budget should preserve the round");
+        .expect("a transient block failure within budget should preserve the round");
     assert_eq!(
         chain_sync.transient_block_retry_counts.get(&block_hash),
         Some(&1),
         "the transient block retry should consume one retry"
     );
 
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(block_hash).collect()))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+
+    block_verifier_router
+        .expect_request(zakura_consensus::Request::Commit(block))
+        .await
+        .respond(block_hash);
+
+    let response = chain_sync
+        .downloads
+        .next()
+        .await
+        .expect("the replacement download should complete");
+    chain_sync
+        .handle_block_response_with_missing_retry(response)
+        .await?;
+
+    assert!(
+        !chain_sync
+            .transient_block_retry_counts
+            .contains_key(&block_hash),
+        "a successful replacement should clear its transient retry count"
+    );
+    assert_eq!(chain_sync.downloads.in_flight(), 0);
+
+    peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
+
+    Ok(())
 }
 
 /// A persistently failing block still restarts the round after its queue-level retry budget.
@@ -3314,6 +3352,36 @@ async fn empty_block_response_is_retryable_download_failure() {
         matches!(result, Err(BlockDownloadVerifyError::DownloadFailed { .. })),
         "an empty block response must be a retryable DownloadFailed, got {result:?}",
     );
+}
+
+/// A replacement download must not wait forever when every peer is unready.
+#[tokio::test(start_paused = true)]
+async fn block_download_network_readiness_times_out() {
+    let _init_guard = zakura_test::init();
+
+    let verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let (chain_tip, _chain_tip_sender) = MockChainTip::new();
+    let (past_lookahead_limit_sender, _past_lookahead_limit_receiver) =
+        tokio::sync::watch::channel(false);
+    let mut downloads = Downloads::new(
+        NeverReadyNetwork,
+        verifier,
+        chain_tip,
+        past_lookahead_limit_sender,
+        sync::MIN_CONCURRENCY_LIMIT,
+        Height(0),
+        LegacySyncTrace::new(None, false),
+    );
+    let hash = block::Hash::from([0xCE; 32]);
+
+    let result = downloads.download_and_verify(hash).await;
+
+    assert!(
+        matches!(result, Err(BlockDownloadVerifyError::Timeout)),
+        "network readiness should time out, got {result:?}"
+    );
+    assert_eq!(downloads.in_flight(), 0);
 }
 
 /// Builds a [`Downloads`] wired to `peer_set`, `verifier`, and `chain_tip`.

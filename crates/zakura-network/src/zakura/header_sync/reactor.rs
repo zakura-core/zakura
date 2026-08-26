@@ -2679,14 +2679,6 @@ impl HeaderSyncReactor {
         let RepairPolicyState::Ready { context } = &task.state else {
             return;
         };
-        if task.supplier_cycle_exhausted() {
-            let _ = self
-                .vct_repair
-                .get_mut(task.owner)
-                .expect("the ready repair was cloned above")
-                .defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
-            return;
-        }
         let Some(predecessor) = context.locator.entries().first().copied() else {
             return;
         };
@@ -2761,10 +2753,6 @@ impl HeaderSyncReactor {
                     self.emit_queue_send_failed(&peer, &session, "GetHeaders", &error, None);
                     if let Some(current) = self.vct_repair.get_mut(task.owner) {
                         let _ = current.record_failed_source(source);
-                        if current.supplier_cycle_exhausted() {
-                            let _ = current.defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
-                            return;
-                        }
                     }
                     continue;
                 }

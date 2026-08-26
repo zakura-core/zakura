@@ -157,7 +157,7 @@ fn initial_vct_wire_assignment_arms_the_request_deadline() {
 }
 
 #[test]
-fn bounded_supplier_cycle_backs_off_while_fresh_peers_remain() {
+fn supplier_cycle_tries_a_fresh_peer_after_three_failures() {
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let mut snapshot = committed_snapshot(anchor);
@@ -168,7 +168,7 @@ fn bounded_supplier_cycle_backs_off_while_fresh_peers_remain() {
     let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
     startup.committed_snapshots = Some(snapshots_rx);
     let (_handle, _actions, mut reactor) =
-        build_header_sync_reactor(startup).expect("the bounded repair fixture builds");
+        build_header_sync_reactor(startup).expect("the repair fixture builds");
     let peer = peer();
     let (send, _outbound) = framed_channel(8);
     reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
@@ -194,7 +194,6 @@ fn bounded_supplier_cycle_backs_off_while_fresh_peers_remain() {
             .tried_sources
             .insert(zakura_header_chain::SourceId::from_digest([byte; 32]));
     }
-    assert!(repair.supplier_cycle_exhausted());
     reactor.vct_repair.insert(repair);
 
     reactor.handle_wire_message(
@@ -214,20 +213,23 @@ fn bounded_supplier_cycle_backs_off_while_fresh_peers_remain() {
         }),
     );
 
-    assert!(reactor.peer_work_queue.active(&peer).is_none());
+    let active = reactor
+        .peer_work_queue
+        .active(&peer)
+        .expect("the fresh fourth supplier receives the repair request");
+    assert!(matches!(
+        active.purpose,
+        HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+    ));
     let task = reactor
         .vct_repair
         .current()
-        .expect("the bounded cycle keeps the repair requirement");
+        .expect("the assigned cycle keeps the repair requirement");
     assert!(matches!(
         &task.state,
-        RepairPolicyState::SupplierBackoff {
-            context: retained,
-            ..
-        } if retained == &context
+        RepairPolicyState::Assigned { context: retained } if retained == &context
     ));
     assert_eq!(task.tried_sources.len(), 3);
-    assert!(task.supplier_cycle_exhausted());
 }
 
 #[test]

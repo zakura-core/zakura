@@ -70,12 +70,13 @@ for file in \
 done
 
 section artifact-inventory
-find /var/log/zakura /root/logs \
+ls -la /var/log/zakura /var/log/zakura/runs /var/log/zakura/traces /root/logs 2>&1 || true
+find -L /var/log/zakura /root/logs \
     -maxdepth 5 -type f \
     -printf '%TY-%Tm-%TdT%TH:%TM:%TS %s %p\n' 2>/dev/null | sort || true
 
 section run-metadata
-find /var/log/zakura/runs -maxdepth 2 \
+find -L /var/log/zakura/runs -maxdepth 2 \
     -type f -name run.json -print0 2>/dev/null |
     while IFS= read -r -d '' file; do
         printf '\n--- %s ---\n' "${file}"
@@ -83,7 +84,7 @@ find /var/log/zakura/runs -maxdepth 2 \
     done
 
 section recent-samples
-find /var/log/zakura/runs -maxdepth 2 \
+find -L /var/log/zakura/runs -maxdepth 2 \
     -type f -name samples.jsonl -print0 2>/dev/null |
     while IFS= read -r -d '' file; do
         printf '\n--- %s ---\n' "${file}"
@@ -91,9 +92,9 @@ find /var/log/zakura/runs -maxdepth 2 \
     done
 
 section node-log-errors
-find /var/log/zakura/runs /var/log/zakura /root/logs \
+find -L /var/log/zakura/runs /var/log/zakura /root/logs \
     -maxdepth 3 -type f \
-    \( -name zebrad.log -o -name zakura-tracing.log -o -name monitor.log \) \
+    \( -name zebrad.log -o -name zakura-tracing.log \) \
     -print0 2>/dev/null |
     while IFS= read -r -d '' file; do
         printf '\n--- %s errors ---\n' "${file}"
@@ -105,7 +106,7 @@ find /var/log/zakura/runs /var/log/zakura /root/logs \
     done
 
 section trace-excerpts
-find /var/log/zakura/runs /var/log/zakura/traces \
+find -L /var/log/zakura/runs /var/log/zakura/traces \
     -maxdepth 4 -type f -name '*.jsonl' -print0 2>/dev/null |
     while IFS= read -r -d '' file; do
         printf '\n--- %s ---\n' "${file}"

@@ -147,6 +147,21 @@ if not os.path.isfile(path):
 states = {}
 snapshots = collections.deque(maxlen=8)
 process_trace_id = None
+
+def missing_height_ranges(state_tip, heights):
+    if state_tip is None or not heights:
+        return []
+    height_set = set(heights)
+    ranges = []
+    for height in range(state_tip + 1, heights[-1] + 1):
+        if height in height_set:
+            continue
+        if ranges and height == ranges[-1][1] + 1:
+            ranges[-1][1] = height
+        else:
+            ranges.append([height, height])
+    return ranges
+
 size = os.path.getsize(path)
 with open(path, "rb") as trace:
     start = max(0, size - max_bytes)
@@ -179,6 +194,7 @@ with open(path, "rb") as trace:
             heights = sorted(
                 task["height"] for task in tasks if task.get("height") is not None
             )
+            ranges = missing_height_ranges(event.get("state_tip"), heights)
             snapshots.append({
                 "event": event_name,
                 "state_tip": event.get("state_tip"),
@@ -188,6 +204,9 @@ with open(path, "rb") as trace:
                 "known_height_min": heights[0] if heights else None,
                 "known_height_max": heights[-1] if heights else None,
                 "known_height_count": len(heights),
+                "missing_height_count": sum(end - start + 1 for start, end in ranges),
+                "missing_height_ranges": ranges[:50],
+                "missing_ranges_truncated": len(ranges) > 50,
             })
             if event_name == "pipeline_reset":
                 states.clear()
@@ -196,19 +215,11 @@ phase_counts = collections.Counter(state.get("phase") for state in states.values
 heights = sorted(
     state["height"] for state in states.values() if state.get("height") is not None
 )
-height_set = set(heights)
 state_tip = next(
     (snapshot["state_tip"] for snapshot in reversed(snapshots) if snapshot["state_tip"] is not None),
     None,
 )
-missing_ranges = []
-if state_tip is not None and heights:
-    missing = [height for height in range(state_tip + 1, heights[-1] + 1) if height not in height_set]
-    for height in missing:
-        if missing_ranges and height == missing_ranges[-1][1] + 1:
-            missing_ranges[-1][1] = height
-        else:
-            missing_ranges.append([height, height])
+missing_ranges = missing_height_ranges(state_tip, heights)
 
 print(json.dumps({
     "path": path,

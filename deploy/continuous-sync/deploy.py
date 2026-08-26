@@ -100,20 +100,20 @@ find -L /var/log/zakura/runs /var/log/zakura /root/logs \
         printf '\n--- %s errors ---\n' "${file}"
         tail -n 100000 "${file}" |
             grep -E -i 'warn|error|fail|stall|panic|MissingRoot|ConflictingReplay|repair' |
-            tail -n 5000 || true
+            tail -n 1000 || true
         printf '\n--- %s tail ---\n' "${file}"
-        tail -n 500 "${file}"
+        tail -n 200 "${file}"
     done
 
 section trace-excerpts
-find -L /var/log/zakura/runs /var/log/zakura/traces \
+find -L /var/log/zakura/runs /root/logs \
     -maxdepth 4 -type f -name '*.jsonl' -print0 2>/dev/null |
     while IFS= read -r -d '' file; do
         printf '\n--- %s ---\n' "${file}"
-        tail -n 200000 "${file}" |
+        tail -n 50000 "${file}" |
             grep -E -i \
                 'MissingRoot|ConflictingReplay|repair|supplier|stall|error|fail|waiting|verifier|transition|replay|round_finish|pipeline_reset|block_finish|notfound' |
-            tail -n 5000 || true
+            tail -n 500 || true
     done
 
 section journals
@@ -121,13 +121,13 @@ for unit in zakura.service zakurad.service zakura-continuous-sync.service; do
     printf '\n--- %s ---\n' "${unit}"
     journalctl -u "${unit}" --since '7 days ago' --no-pager -n 5000 2>&1 |
         grep -E -i 'warn|error|fail|stall|panic|MissingRoot|ConflictingReplay|repair' |
-        tail -n 3000 || true
+        tail -n 500 || true
 done
 
 section metrics
 curl -fsS --max-time 20 http://127.0.0.1:9999/metrics 2>/dev/null |
     grep -E -i 'height|tip|sync|checkpoint|verif|queue|repair|replay|peer|error|fail' |
-    tail -n 10000 || true
+    tail -n 3000 || true
 """
 
 SSH_COMMON_OPTS = [

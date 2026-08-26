@@ -146,6 +146,7 @@ if not os.path.isfile(path):
 
 states = {}
 snapshots = collections.deque(maxlen=8)
+round_events = collections.deque(maxlen=20)
 process_trace_id = None
 
 def missing_height_ranges(state_tip, heights):
@@ -178,7 +179,29 @@ with open(path, "rb") as trace:
             process_trace_id = event_process
             states.clear()
             snapshots.clear()
+            round_events.clear()
         event_name = event.get("event")
+        if event_name in {
+            "round_start",
+            "round_finish",
+            "round_error_snapshot",
+            "round_stalled",
+            "pipeline_reset",
+        }:
+            round_events.append({
+                key: event[key]
+                for key in (
+                    "ts",
+                    "event",
+                    "reason",
+                    "state_tip",
+                    "error",
+                    "in_flight",
+                    "reserve",
+                    "registry_retries",
+                )
+                if key in event
+            })
         if event_name == "block_phase":
             block_hash = event.get("hash")
             if block_hash:
@@ -235,6 +258,7 @@ print(json.dumps({
     "missing_height_count": sum(end - start + 1 for start, end in missing_ranges),
     "missing_height_ranges": missing_ranges[:200],
     "missing_ranges_truncated": len(missing_ranges) > 200,
+    "recent_round_events": list(round_events),
     "recent_snapshots": list(snapshots),
 }, indent=2, sort_keys=True))
 PY

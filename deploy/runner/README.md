@@ -91,12 +91,15 @@ The default config in `fleet-watchdog.toml` watches:
 Alerts fire only after a sustained condition:
 
 - `health` is `down` or `rpc_error` for at least 10 minutes
-- `seconds_since_advanced` is at least 600 seconds for at least 10 minutes
+- one node's height has not advanced for at least 10 minutes
+- at least two observable nodes share one height and block hash for at least 30 minutes
 - a dashboard endpoint is unreachable for at least 10 minutes
 
-Down alerts take precedence over stalled alerts, so each node has at most one
-active alert. The watchdog posts only on transitions: first failure after the
-threshold, then recovery. Persistent failures do not post every poll.
+The watchdog coalesces a verifiable shared tip into one fleet alert. A missing
+or different block hash keeps the individual node alerts. Down alerts take
+precedence over stalled alerts, so each node has at most one active alert. The
+watchdog posts only on transitions: first failure after the threshold, then
+recovery. Persistent failures do not post every poll.
 
 Slack delivery is **webhook-only**. Set:
 

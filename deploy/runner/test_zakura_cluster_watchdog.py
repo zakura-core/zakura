@@ -216,6 +216,7 @@ class SharedStallTests(unittest.TestCase):
             dashboard_url="http://dashboard.invalid/",
         )
         self.args = make_args()
+        self.instance = watchdog.Watchdog([self.fleet], self.args)
         self.state = {
             "version": watchdog.STATE_VERSION,
             "nodes": {},
@@ -227,25 +228,31 @@ class SharedStallTests(unittest.TestCase):
         watchdog.post_slack = self._real_post
 
     @staticmethod
-    def row(name, height, seconds_since_advanced, health="stale"):
+    def row(
+        name,
+        height,
+        seconds_since_advanced,
+        health="stale",
+        block_hash="00aa",
+    ):
         return {
             "name": name,
             "height": height,
+            "block_hash": block_hash,
             "health": health,
             "detail": "height has not advanced within stale window",
             "seconds_since_advanced": seconds_since_advanced,
         }
 
     def run_snapshot(self, rows, now=None):
-        instance = watchdog.Watchdog([self.fleet], self.args)
         snapshot = {"rows": rows}
         with (
             patch.object(watchdog, "fetch_json", return_value=snapshot),
             patch.object(watchdog.time, "time", return_value=now or self.NOW),
         ):
-            instance.run_once(self.state)
+            self.instance.run_once(self.state)
 
-    def test_common_height_posts_one_fleet_alert(self):
+    def test_matching_height_and_hash_posts_one_fleet_alert(self):
         self.run_snapshot(
             [
                 self.row("node-a", 4_302_737, 1_817),
@@ -308,6 +315,139 @@ class SharedStallTests(unittest.TestCase):
         self.assertEqual(len(self.posted), 2)
         self.assertIn("network height advanced", self.posted[0])
         self.assertIn("`node-b` stalled", self.posted[1])
+
+    def test_matching_height_with_different_hashes_keeps_node_alerts(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 4_302_737, 601, block_hash="aaaa"),
+                self.row("node-b", 4_302_737, 601, block_hash="bbbb"),
+            ]
+        )
+
+        self.assertEqual(len(self.posted), 2)
+        self.assertTrue(all("stalled" in post for post in self.posted))
+        self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
+
+    def test_missing_hash_keeps_node_alerts(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 4_302_737, 601),
+                self.row("node-b", 4_302_737, 601, block_hash=""),
+            ]
+        )
+
+        self.assertEqual(len(self.posted), 2)
+        self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
+
+    def test_fork_closes_shared_alert_before_posting_node_alerts(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 4_302_737, 1_801, block_hash="aaaa"),
+                self.row("node-b", 4_302_737, 1_801, block_hash="aaaa"),
+            ]
+        )
+        self.posted.clear()
+
+        self.run_snapshot(
+            [
+                self.row("node-a", 4_302_737, 1_861, block_hash="aaaa"),
+                self.row("node-b", 4_302_737, 1_861, block_hash="bbbb"),
+            ],
+            now=self.NOW + 60,
+        )
+
+        self.assertEqual(len(self.posted), 3)
+        self.assertIn("shared stall cleared", self.posted[0])
+        self.assertTrue(all("stalled" in post for post in self.posted[1:]))
+        self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
+
+    def test_threshold_skew_never_posts_a_constituent_node_alert(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 4_302_737, 601),
+                self.row("node-b", 4_302_737, 541),
+            ]
+        )
+        self.assertEqual(self.posted, [])
+
+        self.run_snapshot(
+            [
+                self.row("node-a", 4_302_737, 1_861),
+                self.row("node-b", 4_302_737, 1_801),
+            ],
+            now=self.NOW + 1_260,
+        )
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("network height has not advanced", self.posted[0])
+        self.assertTrue(
+            all(not entry["alerting"] for entry in self.state["nodes"].values())
+        )
+
+    def test_new_tip_after_polling_gap_gets_a_new_timer(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_200, block_hash="aaaa"),
+                self.row("node-b", 100, 1_200, block_hash="aaaa"),
+            ]
+        )
+        self.run_snapshot(
+            [
+                self.row("node-a", 101, 660, block_hash="bbbb"),
+                self.row("node-b", 101, 660, block_hash="bbbb"),
+            ],
+            now=self.NOW + 660,
+        )
+
+        self.assertEqual(self.posted, [])
+        entry = self.state["shared_stalls"]["testnet"]
+        self.assertEqual(entry["event_height"], 101)
+        self.assertEqual(entry["event_hash"], "bbbb")
+        self.assertEqual(entry["bad_since"], self.NOW)
+
+    def test_alerted_old_tip_recovers_before_new_tip_timer_starts(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_801, block_hash="aaaa"),
+                self.row("node-b", 100, 1_801, block_hash="aaaa"),
+            ]
+        )
+        self.posted.clear()
+
+        self.run_snapshot(
+            [
+                self.row("node-a", 101, 660, block_hash="bbbb"),
+                self.row("node-b", 101, 660, block_hash="bbbb"),
+            ],
+            now=self.NOW + 660,
+        )
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("network height advanced", self.posted[0])
+        self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
+        self.assertEqual(
+            self.state["shared_stalls"]["testnet"]["event_height"], 101
+        )
+
+    def test_preexisting_node_alert_represents_the_shared_incident(self):
+        self.state["nodes"]["testnet/node-a"] = {
+            "condition": "stalled",
+            "bad_since": self.NOW - 2_000,
+            "alerting": True,
+            "alert_height": 4_302_737,
+        }
+        self.run_snapshot(
+            [
+                self.row("node-a", 4_302_737, 1_900),
+                self.row("node-b", 4_302_737, 1_900),
+            ]
+        )
+
+        self.assertEqual(self.posted, [])
+        shared = self.state["shared_stalls"]["testnet"]
+        self.assertFalse(shared["alerting"])
+        self.assertEqual(shared["represented_by_nodes"], ["node-a"])
+        self.assertTrue(self.state["nodes"]["testnet/node-a"]["alerting"])
 
 
 if __name__ == "__main__":

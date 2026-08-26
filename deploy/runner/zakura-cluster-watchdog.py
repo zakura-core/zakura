@@ -36,6 +36,14 @@ class Fleet:
 
 
 @dataclass(frozen=True)
+class SharedTip:
+    height: int
+    block_hash: str
+    bad_since: float
+    node_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ReleaseState:
     """One published release-state pointer to watch.
 
@@ -187,6 +195,13 @@ def coerce_float(value: object) -> float | None:
         return None
 
 
+def coerce_height(value: object) -> int | None:
+    height = coerce_float(value)
+    if height is None or height < 0 or not height.is_integer():
+        return None
+    return int(height)
+
+
 def format_duration(seconds: float) -> str:
     seconds = max(0, int(seconds))
     if seconds < 60:
@@ -297,40 +312,45 @@ def node_condition(
     return ("ok", now, 0)
 
 
-def shared_stall(
+def tip_is_observable(row: dict[str, Any]) -> bool:
+    health = str(row.get("health") or "unknown")
+    return health not in DOWN_HEALTH and health != "starting"
+
+
+def shared_stall_candidate(
     rows: list[dict[str, Any]],
     now: float,
-    grace_since: float,
-    args: argparse.Namespace,
-) -> tuple[float, float, int] | None:
-    """Return a common stalled height when every observable node agrees on it."""
-    observed: list[tuple[float, float]] = []
+) -> SharedTip | None:
+    """Return a common verifiable tip before individual stall alerts become due."""
+    observed: list[tuple[int, str, float, str]] = []
 
     for row in rows:
-        health = str(row.get("health") or "unknown")
-        if health in DOWN_HEALTH or health == "starting":
+        if not tip_is_observable(row):
             continue
 
-        height = coerce_float(row.get("height"))
-        if height is None:
+        height = coerce_height(row.get("height"))
+        block_hash = str(row.get("block_hash") or "").strip().casefold()
+        seconds_since_advanced = coerce_float(row.get("seconds_since_advanced"))
+        node_name = str(row.get("name") or "unknown")
+        if height is None or not block_hash or seconds_since_advanced is None:
             return None
+        observed.append((height, block_hash, now - seconds_since_advanced, node_name))
 
-        condition, bad_since, _threshold = node_condition(
-            row, now, grace_since, args
-        )
-        if condition != "stalled":
-            return None
-        observed.append((height, bad_since))
-
-    if len(observed) < 2:
+    if len(observed) < 2 or len({item[3] for item in observed}) != len(observed):
         return None
 
-    heights = {height for height, _bad_since in observed}
-    if len(heights) != 1:
+    identities = {(height, block_hash) for height, block_hash, *_rest in observed}
+    if len(identities) != 1:
         return None
 
-    height = observed[0][0]
-    return height, min(bad_since for _height, bad_since in observed), len(observed)
+    height, block_hash = next(iter(identities))
+    return SharedTip(
+        height=height,
+        block_hash=block_hash,
+        # The shared interval starts when the last node reached this tip.
+        bad_since=max(bad_since for _height, _hash, bad_since, _name in observed),
+        node_names=tuple(name for _height, _hash, _bad_since, name in observed),
+    )
 
 
 def stall_cleared(entry: dict[str, Any], height: float | None) -> bool:
@@ -361,6 +381,7 @@ def update_alert_state(
     suppressed: bool,
     args: argparse.Namespace,
     height: float | None = None,
+    log_suppressed: bool = True,
 ) -> None:
     entry = state_bucket.get(key, {"condition": "ok", "alerting": False})
     was_alerting = bool(entry.get("alerting"))
@@ -411,7 +432,8 @@ def update_alert_state(
 
     if not alerting and age >= threshold:
         if suppressed:
-            print(f"suppressed alert for {key}: {condition} for {format_duration(age)}")
+            if log_suppressed:
+                print(f"suppressed alert for {key}: {condition} for {format_duration(age)}")
         elif post_slack(alert_text, args):
             next_entry["alerting"] = True
             next_entry["last_alert_at"] = now
@@ -470,20 +492,24 @@ def fleet_recovery_text(fleet: Fleet, previous: dict[str, Any]) -> str:
 
 
 def shared_stall_alert_text(
-    fleet: Fleet, height: float, node_count: int, age: float
+    fleet: Fleet, height: float, block_hash: str, node_count: int, age: float
 ) -> str:
     return (
         f":rotating_light: *Zakura {fleet.name}* network height has not advanced "
         f"for {format_duration(age)}\n"
         f"{node_count} nodes agree at height {int(height)}\n"
+        f"tip hash: {block_hash}\n"
         f"dashboard: {fleet.dashboard_url}"
     )
 
 
-def shared_stall_recovery_text(fleet: Fleet, height: float | None) -> str:
+def shared_stall_recovery_text(
+    fleet: Fleet, height: float | None, detail: str = "network height advanced"
+) -> str:
     height_text = str(int(height)) if height is not None else "-"
     return (
-        f":white_check_mark: *Zakura {fleet.name}* network height advanced\n"
+        f":white_check_mark: *Zakura {fleet.name}* shared stall cleared\n"
+        f"detail: {detail}\n"
         f"height: {height_text}\n"
         f"dashboard: {fleet.dashboard_url}"
     )
@@ -583,24 +609,27 @@ class Watchdog:
                 rows = []
 
             node_rows = [row for row in rows if isinstance(row, dict)]
-            grace_since = max(
-                self.started_at, self.fetch_recovered_at.get(fleet.name, 0)
+            common_stall = shared_stall_candidate(node_rows, now)
+            self.handle_shared_stall(
+                state, fleet, node_rows, common_stall, now, suppressed
             )
-            common_stall = shared_stall(
-                node_rows, now, grace_since, self.args
-            )
-            self.handle_shared_stall(state, fleet, node_rows, common_stall, now, suppressed)
+            shared_nodes = set(common_stall.node_names) if common_stall else set()
 
             for row in node_rows:
                 condition, _bad_since, _threshold = node_condition(
-                    row, now, grace_since, self.args
+                    row,
+                    now,
+                    max(self.started_at, self.fetch_recovered_at.get(fleet.name, 0)),
+                    self.args,
                 )
                 self.handle_node(
                     state,
                     fleet,
                     row,
                     now,
-                    suppressed or (common_stall is not None and condition == "stalled"),
+                    suppressed,
+                    condition == "stalled"
+                    and str(row.get("name") or "unknown") in shared_nodes,
                 )
 
         for target in self.release_state:
@@ -712,7 +741,7 @@ class Watchdog:
         state: dict[str, Any],
         fleet: Fleet,
         rows: list[dict[str, Any]],
-        common_stall: tuple[float, float, int] | None,
+        common_stall: SharedTip | None,
         now: float,
         suppressed: bool,
     ) -> None:
@@ -721,43 +750,143 @@ class Watchdog:
         heights = [
             height
             for row in rows
-            if (height := coerce_float(row.get("height"))) is not None
+            if tip_is_observable(row)
+            if (height := coerce_height(row.get("height"))) is not None
         ]
         current_height = max(heights, default=None)
 
         if common_stall is None:
-            update_alert_state(
-                bucket,
-                fleet.name,
-                "ok",
-                now,
-                0,
-                "",
-                shared_stall_recovery_text(fleet, current_height),
-                now,
-                False,
-                self.args,
-                current_height,
+            self.clear_or_hold_shared_stall(
+                bucket, fleet, rows, previous, current_height
             )
             return
 
-        height, bad_since, node_count = common_stall
-        if previous.get("condition") == "stalled":
-            bad_since = min(float(previous.get("bad_since", bad_since)), bad_since)
-        age = now - bad_since
-        update_alert_state(
-            bucket,
-            fleet.name,
-            "stalled",
-            bad_since,
-            self.args.shared_stalled_after,
-            shared_stall_alert_text(fleet, height, node_count, age),
-            shared_stall_recovery_text(fleet, height),
-            now,
-            suppressed,
-            self.args,
-            height,
+        previous_height = coerce_height(
+            previous.get("event_height", previous.get("alert_height"))
         )
+        previous_hash = str(previous.get("event_hash") or "").casefold()
+        same_event = (
+            previous.get("condition") == "stalled"
+            and previous_height == common_stall.height
+            and (not previous_hash or previous_hash == common_stall.block_hash)
+        )
+
+        if not same_event:
+            recovery_detail = (
+                "network height advanced"
+                if previous_height is not None
+                and common_stall.height > previous_height
+                else "shared tip changed"
+            )
+            if previous.get("alerting") and not post_slack(
+                shared_stall_recovery_text(
+                    fleet, common_stall.height, recovery_detail
+                ),
+                self.args,
+            ):
+                return
+            previous = {}
+
+        bad_since = common_stall.bad_since
+        if same_event:
+            previous_bad_since = float(previous.get("bad_since", bad_since))
+            previous_nodes = previous.get("node_names")
+            if previous_nodes is not None and set(previous_nodes) != set(
+                common_stall.node_names
+            ):
+                bad_since = max(previous_bad_since, bad_since)
+            else:
+                bad_since = min(previous_bad_since, bad_since)
+        age = now - bad_since
+        alerting = bool(previous.get("alerting"))
+        next_entry = {
+            "condition": "stalled",
+            "event_height": common_stall.height,
+            "event_hash": common_stall.block_hash,
+            "node_names": list(common_stall.node_names),
+            "bad_since": bad_since,
+            "alerting": alerting,
+            "last_seen": now,
+        }
+        if alerting:
+            next_entry["alert_height"] = common_stall.height
+            if "last_alert_at" in previous:
+                next_entry["last_alert_at"] = previous["last_alert_at"]
+
+        represented_by = self.alerting_nodes_for_shared_tip(state, fleet, common_stall)
+        if represented_by:
+            next_entry["represented_by_nodes"] = represented_by
+
+        if not alerting and not represented_by and age >= self.args.shared_stalled_after:
+            if suppressed:
+                if not previous.get("suppression_logged"):
+                    print(
+                        f"suppressed alert for {fleet.name}: shared stall for "
+                        f"{format_duration(age)}"
+                    )
+                next_entry["suppression_logged"] = True
+            elif post_slack(
+                shared_stall_alert_text(
+                    fleet,
+                    common_stall.height,
+                    common_stall.block_hash,
+                    len(common_stall.node_names),
+                    age,
+                ),
+                self.args,
+            ):
+                next_entry["alerting"] = True
+                next_entry["last_alert_at"] = now
+                next_entry["alert_height"] = common_stall.height
+
+        bucket[fleet.name] = next_entry
+
+    def clear_or_hold_shared_stall(
+        self,
+        bucket: dict[str, Any],
+        fleet: Fleet,
+        rows: list[dict[str, Any]],
+        previous: dict[str, Any],
+        current_height: int | None,
+    ) -> None:
+        if not previous.get("alerting"):
+            bucket[fleet.name] = {"condition": "ok", "alerting": False}
+            return
+
+        previous_height = coerce_height(
+            previous.get("event_height", previous.get("alert_height"))
+        )
+        eligible_count = sum(tip_is_observable(row) for row in rows)
+        if current_height is not None and (
+            previous_height is None or current_height > previous_height
+        ):
+            detail = "network height advanced"
+        elif eligible_count >= 2:
+            detail = "nodes no longer share one verifiable tip"
+        else:
+            bucket[fleet.name] = previous
+            return
+
+        if post_slack(
+            shared_stall_recovery_text(fleet, current_height, detail), self.args
+        ):
+            bucket[fleet.name] = {"condition": "ok", "alerting": False}
+
+    @staticmethod
+    def alerting_nodes_for_shared_tip(
+        state: dict[str, Any], fleet: Fleet, common_stall: SharedTip
+    ) -> list[str]:
+        represented_by = []
+        for node_name in common_stall.node_names:
+            entry = state.setdefault("nodes", {}).get(f"{fleet.name}/{node_name}", {})
+            alert_height = coerce_height(entry.get("alert_height"))
+            if (
+                entry.get("condition") == "stalled"
+                and entry.get("alerting")
+                and (alert_height is None or alert_height == common_stall.height)
+            ):
+                represented_by.append(node_name)
+        return represented_by
 
     def handle_node(
         self,
@@ -766,6 +895,7 @@ class Watchdog:
         row: dict[str, Any],
         now: float,
         suppressed: bool,
+        coalesced: bool = False,
     ) -> None:
         node_name = str(row.get("name") or "unknown")
         key = f"{fleet.name}/{node_name}"
@@ -786,9 +916,10 @@ class Watchdog:
             node_alert_text(fleet, row, condition, age),
             node_recovery_text(fleet, row, previous),
             now,
-            suppressed,
+            suppressed or coalesced,
             self.args,
             coerce_float(row.get("height")),
+            log_suppressed=not coalesced,
         )
 
 
@@ -820,7 +951,7 @@ def parse_args() -> argparse.Namespace:
         "--shared-stalled-after",
         type=float,
         default=1800.0,
-        help="alert after every observable node shares one stalled height this long",
+        help="alert after every observable node shares one stalled tip this long",
     )
     parser.add_argument(
         "--dashboard-down-after",

@@ -62,6 +62,19 @@ for unit in zakura.service zakurad.service zakura-continuous-sync.service; do
         --no-pager 2>&1 || true
 done
 
+section process-stacks
+node_pid="$(systemctl show zakura.service --property=MainPID --value 2>/dev/null || true)"
+if [ -n "${node_pid}" ] && [ "${node_pid}" != "0" ]; then
+    ps -L -p "${node_pid}" -o pid,tid,stat,etimes,pcpu,pmem,wchan:32,comm | head -n 200
+    if command -v gdb >/dev/null 2>&1; then
+        timeout 30 gdb --batch --quiet -p "${node_pid}" \
+            -ex 'set pagination off' \
+            -ex 'thread apply all bt 20' 2>&1 | tail -n 5000 || true
+    else
+        printf 'gdb is not installed\n'
+    fi
+fi
+
 section controller-state
 for file in \
     /var/lib/zakura-continuous-sync/state.json \

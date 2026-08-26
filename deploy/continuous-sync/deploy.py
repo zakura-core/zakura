@@ -36,6 +36,7 @@ STALL_DIAGNOSTIC_TARGETS = {
 STALL_DIAGNOSTIC_START_TARGETS = {"start-temp-zakura-sync-test-5"}
 
 PR800_VALIDATION_TARGET = "validate-pr800-failed-nodes"
+PR800_STATUS_TARGET = "status-pr800-failed-nodes"
 PR800_VALIDATION_SHA = "d3722adda63cdee8aac6b148788798f812a63285"
 PR800_VALIDATION_NODES = {
     "temp-zakura-sync-test-1": "root@138.68.43.212",
@@ -107,6 +108,36 @@ systemctl show "${{unit}}" \
 curl -fsS --max-time 20 http://127.0.0.1:9999/metrics 2>/dev/null |
     grep -E 'checkpoint_(verified_height|processing_next_height)|state_finalized_block_height|sync_(header|block|estimated|downloads)|vct|repair' |
     tail -n 500 || true
+"""
+
+PR800_STATUS_SCRIPT = r"""
+set -u
+
+printf '===== time =====\n'
+date --iso-8601=seconds
+
+printf '\n===== service =====\n'
+systemctl show zakura-pr800-validation.service \
+    --property=ActiveState,SubState,Result,ExecMainStatus,MainPID,ActiveEnterTimestamp \
+    --no-pager
+
+printf '\n===== metrics =====\n'
+curl -fsS --max-time 20 http://127.0.0.1:9999/metrics 2>/dev/null |
+    grep -E '^(zcash_chain_verified_block_height|state_finalized_block_height|checkpoint_(verified_height|processing_next_height)|sync_(estimated_network_tip_height|estimated_distance_to_tip)|sync_header_vct_repair[^ ]*|sync_header[^ ]*repair[^ ]*)' |
+    tail -n 1000 || true
+
+printf '\n===== repair-trace =====\n'
+find -L /var/log/zakura/traces -maxdepth 2 -type f -name '*.jsonl' -print0 2>/dev/null |
+    while IFS= read -r -d '' file; do
+        tail -n 100000 "${file}" |
+            grep -E -i 'vct.*repair|repair.*vct|no_supplier|replacement|required|missingroot' |
+            tail -n 300 || true
+    done
+
+printf '\n===== journal =====\n'
+journalctl -u zakura-pr800-validation.service --since '30 minutes ago' --no-pager -n 3000 2>&1 |
+    grep -E -i 'info|warn|error|fail|stall|repair|MissingRoot|height' |
+    tail -n 1000 || true
 """
 
 STALL_DIAGNOSTIC_SCRIPT = r"""
@@ -701,6 +732,32 @@ def cmd_deploy(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     requested = set(args.node or [])
+    if requested == {PR800_STATUS_TARGET}:
+        nodes = [
+            Node({"name": name, "ssh_string": ssh_string})
+            for name, ssh_string in PR800_VALIDATION_NODES.items()
+        ]
+
+        def validation_status(node: Node) -> tuple[str, bool, str]:
+            cmd = node.ssh_cmd("bash", "-s")
+            actions_key = Path.home() / ".ssh" / "zakura-continuous-sync"
+            if actions_key.exists():
+                cmd[1:1] = ["-i", str(actions_key), "-o", "IdentitiesOnly=yes"]
+            proc = subprocess.run(
+                cmd,
+                text=True,
+                input=PR800_STATUS_SCRIPT,
+                capture_output=True,
+                timeout=240,
+            )
+            print(f"\n######## PR 800 status: {node.name} ########")
+            print(proc.stdout)
+            if proc.returncode != 0:
+                return node.name, False, (proc.stderr or f"status exit {proc.returncode}").strip()
+            return node.name, True, "PR 800 validation status fetched"
+
+        return summarize_parallel(nodes, validation_status)
+
     if requested == {PR800_VALIDATION_TARGET}:
         nodes = [
             Node({"name": name, "ssh_string": ssh_string})

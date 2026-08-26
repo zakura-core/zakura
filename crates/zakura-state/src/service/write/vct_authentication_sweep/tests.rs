@@ -848,6 +848,14 @@ fn an_ambiguous_boundary_disputes_both_deliveries_without_rejecting_them() {
         },
         "repair restarts at the lower disputed height"
     );
+
+    let generation = fixture.repair_receiver.borrow().generation;
+    fixture.sweep(&mut sweeper);
+    assert_eq!(
+        fixture.repair_receiver.borrow().generation,
+        generation,
+        "re-reading durable dispute evidence must not replace in-flight repair work"
+    );
 }
 
 #[test]
@@ -927,7 +935,9 @@ fn a_transient_anchor_gate_preserves_an_existing_repair() {
     let repair_height = Height(BODY_TIP + 2);
     let mut fixture = Fixture::new();
     fixture.insert_headers(None, None);
-    fixture.repair.request_sweep_repair(repair_height);
+    fixture
+        .repair
+        .request_sweep_repair(repair_height, VctRepairTrigger::MissingRootObserved);
     fixture
         .finalized_state
         .enable_vct_exact_root_source_for_test(Height(BODY_TIP));
@@ -982,7 +992,7 @@ fn a_committer_stall_below_the_sweep_takes_priority() {
     assert_eq!(
         fixture.repair_state(),
         VctRootRepairState::Unavailable { height: stalled },
-        "the lower need is the one whose replacement unblocks the other"
+        "the committer repair must unblock the checkpoint queue before the sweep can resume"
     );
 
     fixture.repair.on_commit_success();

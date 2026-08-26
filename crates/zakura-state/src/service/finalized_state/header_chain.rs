@@ -1663,6 +1663,36 @@ impl HeaderChainReader {
         }))
     }
 
+    /// Commit a lease only if the branch has not moved since the caller read its snapshot.
+    ///
+    /// The caller derives the path from a snapshot it holds no lock over. Taking the writer lock
+    /// and re-reading the transition engine closes that window: an unchanged state version and an
+    /// unchanged work authority for the target together mean the derived path is still canonical.
+    /// A branch that moved yields `Busy`, and the dropped reservation frees the peer's slot.
+    fn commit_lease_if_branch_unchanged(
+        &self,
+        reservation: RetainedPathReservation,
+        base_state_version: zakura_header_chain::StateVersion,
+        spec: RetainedPathLeaseSpec,
+    ) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let current_snapshot = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .snapshot();
+        if current_snapshot.state_version != base_state_version
+            || spec.scope != HeaderWorkAuthority::for_target(&current_snapshot, spec.target.hash)
+        {
+            return Ok(RetainedPathLeaseOutcome::Busy);
+        }
+        reservation.commit(spec, Instant::now())
+    }
+
     /// Lease a canonical path that ends at a finalized target below the header frontier.
     ///
     /// Refusing a finalized target would strand any node whose VCT repair height every peer has
@@ -1702,23 +1732,9 @@ impl HeaderChainReader {
         let next = common_ancestor.height.next().map_err(|_| {
             StoreError::Incoherent("canonical header cursor start height overflowed")
         })?;
-        let retained_path: Arc<[block::Hash]> = Arc::from(Vec::new());
-        let _writer = self
-            .store
-            .writer
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let current_snapshot = self
-            .transition_engine
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .snapshot();
-        if current_snapshot.state_version != snapshot.state_version
-            || scope != HeaderWorkAuthority::for_target(&current_snapshot, target_tip_hash)
-        {
-            return Ok(RetainedPathLeaseOutcome::Busy);
-        }
-        reservation.commit(
+        self.commit_lease_if_branch_unchanged(
+            reservation,
+            snapshot.state_version,
             RetainedPathLeaseSpec {
                 peer,
                 session_id,
@@ -1730,12 +1746,23 @@ impl HeaderChainReader {
                     end: target.height,
                 },
                 retained_ancestor: None,
-                retained_path,
+                retained_path: Arc::from(Vec::new()),
             },
-            Instant::now(),
         )
     }
 
+    /// Lease a canonical header path from a locator intersection up to an exact target.
+    ///
+    /// The target resolves from the retained header graph, or, when it sits below the finalized
+    /// frontier, from the canonical finalized indexes. A VCT repair asks for one stalled height
+    /// that every peer past it has already finalized, so refusing the second band would strand
+    /// the requester.
+    ///
+    /// Returns `TargetNotRetained` when neither band holds the target, `NoLocatorIntersection`
+    /// when no locator hash is a canonical ancestor of it, `HistoryPruned` when the retained
+    /// path no longer reaches the finalized frontier, and `Busy` when the peer already holds a
+    /// lease or the branch moved under the request. On success the peer owns one lease until it
+    /// releases the lease or the idle deadline expires.
     pub(crate) fn acquire_retained_path(
         &self,
         peer: SourceId,
@@ -1858,22 +1885,9 @@ impl HeaderChainReader {
         {
             position = CanonicalHeaderPathPosition::Complete;
         }
-        let _writer = self
-            .store
-            .writer
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let current_snapshot = self
-            .transition_engine
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .snapshot();
-        if current_snapshot.state_version != snapshot.state_version
-            || scope != HeaderWorkAuthority::for_target(&current_snapshot, target_tip_hash)
-        {
-            return Ok(RetainedPathLeaseOutcome::Busy);
-        }
-        reservation.commit(
+        self.commit_lease_if_branch_unchanged(
+            reservation,
+            snapshot.state_version,
             RetainedPathLeaseSpec {
                 peer,
                 session_id,
@@ -1884,7 +1898,6 @@ impl HeaderChainReader {
                 retained_ancestor,
                 retained_path,
             },
-            Instant::now(),
         )
     }
 

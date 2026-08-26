@@ -188,8 +188,17 @@ fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn retained_path_serves_a_locator_before_the_header_retention_window() {
+/// A reconciled store over a genesis and three descendant headers.
+///
+/// The genesis and the first two path headers are finalized and indexed in the canonical
+/// finalized columns; the third sits in the retained header graph above the finalized frontier.
+/// Returns the runtime, its open database, the genesis header, and the three-header path.
+fn reconciled_store_with_finalized_prefix() -> (
+    HeaderChainRuntime,
+    DiskDb,
+    VerifiedHeaderRef,
+    Vec<VerifiedHeaderRef>,
+) {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let db = open(&db_config, engine_config.network());
@@ -256,6 +265,15 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
             path[2..].to_vec(),
         )
         .expect("the finalized prefix and retained suffix reconcile");
+    (runtime, db, genesis, path)
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_path_serves_a_locator_before_the_header_retention_window() {
+    let (runtime, db, genesis, path) = reconciled_store_with_finalized_prefix();
+    let hash_by_height = db
+        .cf_handle("hash_by_height")
+        .expect("the finalized hash index exists");
     let reader = runtime.reader();
     let target = Frontier::new(path[2].height, path[2].hash);
     let scope = zakura_header_chain::HeaderWorkAuthority::for_target(
@@ -927,72 +945,8 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
 
 #[tokio::test(start_paused = true)]
 async fn retained_path_serves_an_exact_finalized_target_below_the_header_frontier() {
-    let db_config = Config::ephemeral();
-    let (engine_config, anchor, metadata) = fixture();
-    let db = open(&db_config, engine_config.network());
-    let store = HeaderChainStore::new(db.clone());
-    store
-        .initialize(metadata, anchor.clone())
-        .expect("the empty schema initializes");
-
-    let genesis = VerifiedHeaderRef {
-        height: anchor.height,
-        hash: anchor.hash,
-        header: anchor.header.clone(),
-    };
-    let mut path = Vec::new();
-    let mut parent = genesis.clone();
-    for marker in 1..=3 {
-        let mut header = *parent.header;
-        header.previous_block_hash = parent.hash;
-        header.time += chrono::Duration::seconds(1);
-        header.nonce.0[0] = marker;
-        let header = Arc::new(header);
-        let height = parent
-            .height
-            .next()
-            .expect("the three-header fixture stays in range");
-        let hash = header.hash();
-        let child = VerifiedHeaderRef {
-            height,
-            hash,
-            header,
-        };
-        path.push(child.clone());
-        parent = child;
-    }
-
-    let hash_by_height = db
-        .cf_handle("hash_by_height")
-        .expect("the finalized hash index exists");
-    let height_by_hash = db
-        .cf_handle("height_by_hash")
-        .expect("the finalized height index exists");
-    let block_header_by_height = db
-        .cf_handle("block_header_by_height")
-        .expect("the finalized header column exists");
-    let mut batch = DiskWriteBatch::new();
-    for header in std::iter::once(&genesis).chain(path[..2].iter()) {
-        batch.zs_insert(&hash_by_height, header.height, header.hash);
-        batch.zs_insert(&height_by_hash, header.hash, header.height);
-        batch.zs_insert(
-            &block_header_by_height,
-            header.height,
-            header.header.as_ref(),
-        );
-    }
-    db.write(batch)
-        .expect("the canonical finalized header fixture commits");
-
+    let (runtime, _db, genesis, path) = reconciled_store_with_finalized_prefix();
     let finalized = Frontier::new(path[1].height, path[1].hash);
-    let (runtime, _) = store
-        .startup_reconciled(
-            &engine_config,
-            finalized,
-            path[..2].to_vec(),
-            path[2..].to_vec(),
-        )
-        .expect("the finalized prefix and retained suffix reconcile");
     let reader = runtime.reader();
 
     // A VCT repair asks for the exact header at one stalled height. The header graph holds only

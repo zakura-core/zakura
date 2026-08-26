@@ -88,7 +88,6 @@ pub(crate) mod header_sync_trace {
     pub(crate) const PHASE: &str = "phase";
     pub(crate) const SUPPLIER_COUNT: &str = "supplier_count";
     pub(crate) const PREDECESSOR_HEIGHT: &str = "predecessor_height";
-    pub(crate) const CANDIDATE_COUNT: &str = "candidate_count";
     pub(crate) const PEERS_CONSIDERED: &str = "peers_considered";
     pub(crate) const REJECTED_HEIGHT: &str = "rejected_height";
     pub(crate) const REJECTED_CAPACITY: &str = "rejected_capacity";

@@ -92,7 +92,8 @@ Alerts fire only after a sustained condition:
 
 - `health` is `down` or `rpc_error` for at least 10 minutes
 - one node's height has not advanced for at least 10 minutes
-- at least two observable nodes share one height and block hash for at least 30 minutes
+- every observable node shares one height and block hash for at least 30 minutes,
+  with at least two observable nodes
 - a dashboard endpoint is unreachable for at least 10 minutes
 
 Stall alerts include a fixed set of sync-pipeline and VCT repair metrics. The

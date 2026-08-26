@@ -609,12 +609,316 @@ class SharedStallTests(unittest.TestCase):
         self.assertEqual(self.posted, [])
         shared = self.state["shared_stalls"]["testnet"]
         self.assertFalse(shared["alerting"])
-        self.assertEqual(shared["represented_by_nodes"], ["node-a"])
+        self.assertEqual(shared["owner"], "node:node-a")
         self.assertTrue(self.state["nodes"]["testnet/node-a"]["alerting"])
 
+    def test_timer_reset_does_not_replace_a_latched_node_owner(self):
+        self.state["nodes"]["testnet/node-a"] = {
+            "condition": "stalled",
+            "bad_since": 0,
+            "alerting": True,
+            "alert_height": 100,
+        }
+        self.state["shared_stalls"]["testnet"] = {
+            "condition": "stalled",
+            "event_height": 100,
+            "event_hash": "aaaa",
+            "node_names": ["node-a", "node-b"],
+            "bad_since": 0,
+            "alerting": False,
+        }
 
-if __name__ == "__main__":
-    unittest.main()
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 5, "healthy", block_hash="aaaa"),
+                self.row("node-b", 100, 5, "healthy", block_hash="aaaa"),
+            ]
+        )
+
+        self.assertEqual(self.posted, [])
+        self.assertTrue(self.state["nodes"]["testnet/node-a"]["alerting"])
+        self.assertEqual(
+            self.state["shared_stalls"]["testnet"]["owner"],
+            "node:node-a",
+        )
+
+    def test_missed_progress_closes_old_node_event_before_new_shared_event(self):
+        self.run_snapshot([self.row("node-a", 100, 601, block_hash="aaaa")])
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("`node-a` stalled", self.posted[0])
+
+        self.run_snapshot(
+            [
+                self.row("node-a", 101, 660, block_hash="bbbb"),
+                self.row("node-b", 101, 660, block_hash="bbbb"),
+            ],
+            now=self.NOW + 60,
+        )
+
+        self.assertEqual(len(self.posted), 2)
+        self.assertIn("`node-a` recovered from stalled", self.posted[1])
+        self.assertFalse(self.state["nodes"]["testnet/node-a"]["alerting"])
+        self.assertEqual(
+            self.state["nodes"]["testnet/node-a"]["event_height"], 101
+        )
+
+        self.posted.clear()
+        self.run_snapshot(
+            [
+                self.row("node-a", 101, 1_801, block_hash="bbbb"),
+                self.row("node-b", 101, 1_801, block_hash="bbbb"),
+            ],
+            now=self.NOW + 1_201,
+        )
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("network height has not advanced", self.posted[0])
+        self.assertTrue(self.state["shared_stalls"]["testnet"]["alerting"])
+        self.assertFalse(self.state["nodes"]["testnet/node-a"]["alerting"])
+
+    def test_resync_to_lower_height_keeps_one_latched_node_event(self):
+        self.run_snapshot([self.row("node-a", 100, 601, block_hash="aaaa")])
+        self.posted.clear()
+
+        self.run_snapshot(
+            [self.row("node-a", 50, 5, "healthy", block_hash="bbbb")],
+            now=self.NOW + 60,
+        )
+        entry = self.state["nodes"]["testnet/node-a"]
+        self.assertEqual(self.posted, [])
+        self.assertTrue(entry["alerting"])
+        self.assertEqual(entry["alert_height"], 50)
+        self.assertEqual(entry["event_height"], 50)
+
+        self.run_snapshot(
+            [self.row("node-a", 50, 601, block_hash="bbbb")],
+            now=self.NOW + 660,
+        )
+        self.assertEqual(self.posted, [])
+        self.assertTrue(self.state["nodes"]["testnet/node-a"]["alerting"])
+
+    def test_retained_shared_owner_suppresses_the_remaining_node(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_801, block_hash="aaaa"),
+                self.row("node-b", 100, 1_801, block_hash="aaaa"),
+            ]
+        )
+        self.posted.clear()
+
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_861, block_hash="aaaa"),
+                self.row("node-b", 100, 1_861, "down", block_hash="aaaa"),
+            ],
+            now=self.NOW + 60,
+        )
+
+        self.assertEqual(self.posted, [])
+        self.assertTrue(self.state["shared_stalls"]["testnet"]["alerting"])
+        self.assertFalse(self.state["nodes"]["testnet/node-a"]["alerting"])
+
+    def test_failed_shared_recovery_aborts_constituent_alerts(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_801, block_hash="aaaa"),
+                self.row("node-b", 100, 1_801, block_hash="aaaa"),
+            ]
+        )
+        self.posted.clear()
+
+        def fail_recovery(text, _args):
+            self.posted.append(text)
+            return "shared stall cleared" not in text
+
+        watchdog.post_slack = fail_recovery
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_861, block_hash="aaaa"),
+                self.row("node-b", 100, 1_861, block_hash="bbbb"),
+            ],
+            now=self.NOW + 60,
+        )
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("shared stall cleared", self.posted[0])
+        self.assertTrue(self.state["shared_stalls"]["testnet"]["alerting"])
+        self.assertTrue(
+            all(not entry["alerting"] for entry in self.state["nodes"].values())
+        )
+
+    def test_failed_node_recovery_aborts_new_shared_event(self):
+        self.run_snapshot([self.row("node-a", 100, 601, block_hash="aaaa")])
+        old_node = dict(self.state["nodes"]["testnet/node-a"])
+        self.posted.clear()
+        watchdog.post_slack = lambda text, _args: (self.posted.append(text), False)[1]
+
+        self.run_snapshot(
+            [
+                self.row("node-a", 101, 660, block_hash="bbbb"),
+                self.row("node-b", 101, 660, block_hash="bbbb"),
+            ],
+            now=self.NOW + 60,
+        )
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("`node-a` recovered from stalled", self.posted[0])
+        self.assertEqual(self.state["nodes"]["testnet/node-a"], old_node)
+        self.assertEqual(self.state["shared_stalls"]["testnet"]["condition"], "ok")
+
+    def test_failed_dashboard_recovery_aborts_stall_processing(self):
+        self.state["fleets"]["testnet"] = {
+            "condition": "unreachable",
+            "bad_since": self.NOW - 1_000,
+            "alerting": True,
+        }
+        watchdog.post_slack = lambda text, _args: (self.posted.append(text), False)[1]
+
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_900, block_hash="aaaa"),
+                self.row("node-b", 100, 1_900, block_hash="aaaa"),
+            ]
+        )
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("dashboard recovered", self.posted[0])
+        self.assertTrue(self.state["fleets"]["testnet"]["alerting"])
+        self.assertEqual(self.state["nodes"], {})
+        self.assertEqual(self.state["shared_stalls"], {})
+
+    def test_pr802_duplicate_owners_migrate_to_one_node_owner(self):
+        self.state["nodes"]["testnet/node-a"] = {
+            "condition": "stalled",
+            "bad_since": self.NOW - 2_000,
+            "alerting": True,
+            "alert_height": 100,
+        }
+        self.state["shared_stalls"]["testnet"] = {
+            "condition": "stalled",
+            "bad_since": self.NOW - 2_000,
+            "alerting": True,
+            "alert_height": 100,
+        }
+
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_900, block_hash="aaaa"),
+                self.row("node-b", 100, 1_900, block_hash="aaaa"),
+            ]
+        )
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("constituent node alert continues", self.posted[0])
+        shared = self.state["shared_stalls"]["testnet"]
+        self.assertFalse(shared["alerting"])
+        self.assertEqual(shared["owner"], "node:node-a")
+        self.assertTrue(self.state["nodes"]["testnet/node-a"]["alerting"])
+
+    def test_multiple_constituent_owners_reconcile_to_one_node(self):
+        for node_name in ("node-a", "node-b"):
+            self.state["nodes"][f"testnet/{node_name}"] = {
+                "condition": "stalled",
+                "bad_since": self.NOW - 2_000,
+                "alerting": True,
+                "alert_height": 100,
+            }
+
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_900, block_hash="aaaa"),
+                self.row("node-b", 100, 1_900, block_hash="aaaa"),
+            ]
+        )
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("`node-b` duplicate stall alert cleared", self.posted[0])
+        self.assertTrue(self.state["nodes"]["testnet/node-a"]["alerting"])
+        self.assertFalse(self.state["nodes"]["testnet/node-b"]["alerting"])
+        self.assertEqual(
+            self.state["shared_stalls"]["testnet"]["owner"],
+            "node:node-a",
+        )
+
+    def test_failed_pr802_migration_recovery_preserves_both_states(self):
+        old_node = {
+            "condition": "stalled",
+            "bad_since": self.NOW - 2_000,
+            "alerting": True,
+            "alert_height": 100,
+        }
+        old_shared = {
+            "condition": "stalled",
+            "bad_since": self.NOW - 2_000,
+            "alerting": True,
+            "alert_height": 100,
+        }
+        self.state["nodes"]["testnet/node-a"] = dict(old_node)
+        self.state["shared_stalls"]["testnet"] = dict(old_shared)
+        watchdog.post_slack = lambda text, _args: (self.posted.append(text), False)[1]
+
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_900, block_hash="aaaa"),
+                self.row("node-b", 100, 1_900, block_hash="aaaa"),
+            ]
+        )
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertEqual(self.state["nodes"]["testnet/node-a"], old_node)
+        self.assertEqual(self.state["shared_stalls"]["testnet"], old_shared)
+
+    def test_membership_timer_boundary_persists_after_removal(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_000, block_hash="aaaa"),
+                self.row("node-b", 100, 1_000, block_hash="aaaa"),
+                self.row("node-c", 100, 2_000, block_hash="aaaa"),
+            ]
+        )
+
+        for now in (self.NOW + 60, self.NOW + 120):
+            self.run_snapshot(
+                [
+                    self.row("node-a", 100, now, block_hash="aaaa"),
+                    self.row("node-b", 100, now, block_hash="aaaa"),
+                ],
+                now=now,
+            )
+
+        shared = self.state["shared_stalls"]["testnet"]
+        self.assertEqual(self.posted, [])
+        self.assertEqual(shared["bad_since"], self.NOW - 1_000)
+        self.assertEqual(shared["timer_floor"], self.NOW - 1_000)
+
+    def test_membership_timer_boundary_persists_after_addition(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_200, block_hash="aaaa"),
+                self.row("node-b", 100, 1_200, block_hash="aaaa"),
+            ]
+        )
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_260, block_hash="aaaa"),
+                self.row("node-b", 100, 1_260, block_hash="aaaa"),
+                self.row("node-c", 100, 60, block_hash="aaaa"),
+            ],
+            now=self.NOW + 60,
+        )
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_320, block_hash="aaaa"),
+                self.row("node-b", 100, 1_320, block_hash="aaaa"),
+                self.row("node-c", 100, 120, block_hash="aaaa"),
+            ],
+            now=self.NOW + 120,
+        )
+
+        shared = self.state["shared_stalls"]["testnet"]
+        self.assertEqual(self.posted, [])
+        self.assertEqual(shared["bad_since"], self.NOW)
+        self.assertEqual(shared["timer_floor"], self.NOW)
 
 
 def make_release_state(**overrides):
@@ -741,3 +1045,7 @@ class ReleaseStateConfigTests(unittest.TestCase):
     def test_missing_url_is_rejected(self):
         with self.assertRaises(SystemExit):
             self.load('[[release_state]]\nname = "m"\n')
+
+
+if __name__ == "__main__":
+    unittest.main()

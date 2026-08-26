@@ -77,6 +77,17 @@ class SharedTip:
 
 
 @dataclass(frozen=True)
+class NodeObservation:
+    name: str
+    row: dict[str, Any]
+    condition: str
+    bad_since: float
+    threshold: float
+    height: int | None
+    block_hash: str
+
+
+@dataclass(frozen=True)
 class ReleaseState:
     """One published release-state pointer to watch.
 
@@ -425,6 +436,10 @@ def tip_is_observable(row: dict[str, Any]) -> bool:
     return health not in DOWN_HEALTH and health != "starting"
 
 
+def normalized_block_hash(value: object) -> str:
+    return str(value or "").strip().casefold()
+
+
 def shared_stall_candidate(
     rows: list[dict[str, Any]],
     now: float,
@@ -437,7 +452,7 @@ def shared_stall_candidate(
             continue
 
         height = coerce_height(row.get("height"))
-        block_hash = str(row.get("block_hash") or "").strip().casefold()
+        block_hash = normalized_block_hash(row.get("block_hash"))
         seconds_since_advanced = coerce_float(row.get("seconds_since_advanced"))
         node_name = str(row.get("name") or "unknown")
         if height is None or not block_hash or seconds_since_advanced is None:
@@ -459,6 +474,31 @@ def shared_stall_candidate(
         bad_since=max(bad_since for _height, _hash, bad_since, _name in observed),
         node_names=tuple(name for _height, _hash, _bad_since, name in observed),
     )
+
+
+def classify_node_observations(
+    rows: list[dict[str, Any]],
+    now: float,
+    grace_since: float,
+    args: argparse.Namespace,
+) -> tuple[NodeObservation, ...]:
+    observations = []
+    for row in rows:
+        condition, bad_since, threshold = node_condition(
+            row, now, grace_since, args
+        )
+        observations.append(
+            NodeObservation(
+                name=str(row.get("name") or "unknown"),
+                row=row,
+                condition=condition,
+                bad_since=bad_since,
+                threshold=threshold,
+                height=coerce_height(row.get("height")),
+                block_hash=normalized_block_hash(row.get("block_hash")),
+            )
+        )
+    return tuple(observations)
 
 
 def stall_cleared(entry: dict[str, Any], height: float | None) -> bool:
@@ -505,6 +545,8 @@ def update_alert_state(
                     # only clear once it re-synced past it, so a node that was fixed
                     # by a resync would never post a recovery.
                     entry = {**entry, "alert_height": height}
+                    if "event_height" in entry:
+                        entry["event_height"] = height
                 state_bucket[key] = entry
                 return
             if post_slack(recovery_text, args):
@@ -756,33 +798,49 @@ class Watchdog:
                 self.handle_fleet_error(state, fleet, error, now, suppressed)
                 continue
 
-            self.handle_fleet_recovered(state, fleet, now)
+            if not self.handle_fleet_recovered(state, fleet, now):
+                continue
             rows = snapshot.get("rows", [])
             if not isinstance(rows, list):
                 rows = []
 
             node_rows = [row for row in rows if isinstance(row, dict)]
-            common_stall = shared_stall_candidate(node_rows, now)
-            self.handle_shared_stall(
-                state, fleet, node_rows, common_stall, now, suppressed
+            grace_since = max(
+                self.started_at, self.fetch_recovered_at.get(fleet.name, 0)
             )
-            shared_nodes = set(common_stall.node_names) if common_stall else set()
+            observations = classify_node_observations(
+                node_rows, now, grace_since, self.args
+            )
+            common_stall = shared_stall_candidate(node_rows, now)
+            if not self.reconcile_obsolete_node_alerts(
+                state, fleet, observations
+            ):
+                continue
+            if not self.reconcile_duplicate_owners(
+                state, fleet, observations, common_stall
+            ):
+                continue
+            reconciled, shared_nodes = self.reconcile_shared_stall(
+                state,
+                fleet,
+                node_rows,
+                observations,
+                common_stall,
+                now,
+                suppressed,
+            )
+            if not reconciled:
+                continue
 
-            for row in node_rows:
-                condition, _bad_since, _threshold = node_condition(
-                    row,
-                    now,
-                    max(self.started_at, self.fetch_recovered_at.get(fleet.name, 0)),
-                    self.args,
-                )
-                self.handle_node(
+            for observation in observations:
+                self.handle_node_observation(
                     state,
                     fleet,
-                    row,
+                    observation,
                     now,
                     suppressed,
-                    condition == "stalled"
-                    and str(row.get("name") or "unknown") in shared_nodes,
+                    observation.condition == "stalled"
+                    and observation.name in shared_nodes,
                 )
 
         for target in self.release_state:
@@ -869,7 +927,7 @@ class Watchdog:
         state: dict[str, Any],
         fleet: Fleet,
         now: float,
-    ) -> None:
+    ) -> bool:
         key = fleet.name
         bucket = state.setdefault("fleets", {})
         previous = dict(bucket.get(key, {}))
@@ -888,16 +946,186 @@ class Watchdog:
             False,
             self.args,
         )
+        return not (
+            previous.get("alerting")
+            and bucket.get(key, {}).get("alerting")
+        )
 
-    def handle_shared_stall(
+    @staticmethod
+    def node_event_height(entry: dict[str, Any]) -> int | None:
+        return coerce_height(entry.get("event_height", entry.get("alert_height")))
+
+    @classmethod
+    def node_alert_matches_observation(
+        cls, entry: dict[str, Any], observation: NodeObservation
+    ) -> bool:
+        previous_condition = entry.get("condition")
+        if previous_condition == observation.condition:
+            if observation.condition != "stalled":
+                return True
+            previous_height = cls.node_event_height(entry)
+            return (
+                previous_height is None
+                or observation.height is None
+                or previous_height == observation.height
+            )
+
+        if previous_condition == "stalled" and observation.condition == "ok":
+            return not stall_cleared(entry, observation.height)
+        return False
+
+    def reconcile_obsolete_node_alerts(
+        self,
+        state: dict[str, Any],
+        fleet: Fleet,
+        observations: tuple[NodeObservation, ...],
+    ) -> bool:
+        bucket = state.setdefault("nodes", {})
+        for observation in observations:
+            key = f"{fleet.name}/{observation.name}"
+            previous = dict(bucket.get(key, {}))
+            if not previous.get("alerting"):
+                continue
+            if self.node_alert_matches_observation(previous, observation):
+                continue
+            if not post_slack(
+                node_recovery_text(fleet, observation.row, previous), self.args
+            ):
+                return False
+            bucket[key] = {"condition": "ok", "alerting": False}
+        return True
+
+    @staticmethod
+    def shared_event_identity(entry: dict[str, Any]) -> tuple[int | None, str]:
+        height = coerce_height(entry.get("event_height", entry.get("alert_height")))
+        return height, normalized_block_hash(entry.get("event_hash"))
+
+    @classmethod
+    def shared_event_matches_tip(
+        cls, entry: dict[str, Any], common_stall: SharedTip
+    ) -> bool:
+        height, block_hash = cls.shared_event_identity(entry)
+        return (
+            entry.get("condition") == "stalled"
+            and height == common_stall.height
+            and (not block_hash or block_hash == common_stall.block_hash)
+        )
+
+    @staticmethod
+    def observation_matches_shared_event(
+        observation: NodeObservation,
+        height: int | None,
+        block_hash: str,
+    ) -> bool:
+        return (
+            observation.condition == "stalled"
+            and height is not None
+            and observation.height == height
+            and (not block_hash or observation.block_hash == block_hash)
+        )
+
+    @classmethod
+    def active_node_owners(
+        cls,
+        state: dict[str, Any],
+        fleet: Fleet,
+        observations: tuple[NodeObservation, ...],
+        height: int | None,
+        block_hash: str,
+    ) -> list[NodeObservation]:
+        bucket = state.setdefault("nodes", {})
+        owners = []
+        for observation in observations:
+            entry = bucket.get(f"{fleet.name}/{observation.name}", {})
+            alert_height = cls.node_event_height(entry)
+            if (
+                entry.get("condition") == "stalled"
+                and entry.get("alerting")
+                and (alert_height is None or alert_height == height)
+                and observation.height == height
+                and (not block_hash or observation.block_hash == block_hash)
+                and cls.node_alert_matches_observation(
+                    entry, observation
+                )
+            ):
+                owners.append(observation)
+        return sorted(owners, key=lambda observation: observation.name)
+
+    def reconcile_duplicate_owners(
+        self,
+        state: dict[str, Any],
+        fleet: Fleet,
+        observations: tuple[NodeObservation, ...],
+        common_stall: SharedTip | None,
+    ) -> bool:
+        shared_bucket = state.setdefault("shared_stalls", {})
+        shared_entry = dict(shared_bucket.get(fleet.name, {}))
+        shared_height, shared_hash = self.shared_event_identity(shared_entry)
+
+        if shared_entry.get("alerting"):
+            node_owners = self.active_node_owners(
+                state,
+                fleet,
+                observations,
+                shared_height,
+                shared_hash,
+            )
+            if node_owners:
+                if not post_slack(
+                    shared_stall_recovery_text(
+                        fleet,
+                        shared_height,
+                        "constituent node alert continues to represent this incident",
+                    ),
+                    self.args,
+                ):
+                    return False
+                shared_bucket[fleet.name] = {
+                    "condition": "ok",
+                    "alerting": False,
+                }
+
+        if common_stall is None:
+            return True
+
+        node_owners = self.active_node_owners(
+            state,
+            fleet,
+            observations,
+            common_stall.height,
+            common_stall.block_hash,
+        )
+        if len(node_owners) < 2:
+            return True
+
+        owner = node_owners[0]
+        bucket = state.setdefault("nodes", {})
+        for duplicate in node_owners[1:]:
+            text = (
+                f":white_check_mark: *Zakura {fleet.name}* - `{duplicate.name}` "
+                "duplicate stall alert cleared\n"
+                f"detail: `{owner.name}` continues to represent the shared incident\n"
+                f"height: {common_stall.height}\n"
+                f"dashboard: {fleet.dashboard_url}"
+            )
+            if not post_slack(text, self.args):
+                return False
+            bucket[f"{fleet.name}/{duplicate.name}"] = {
+                "condition": "ok",
+                "alerting": False,
+            }
+        return True
+
+    def reconcile_shared_stall(
         self,
         state: dict[str, Any],
         fleet: Fleet,
         rows: list[dict[str, Any]],
+        observations: tuple[NodeObservation, ...],
         common_stall: SharedTip | None,
         now: float,
         suppressed: bool,
-    ) -> None:
+    ) -> tuple[bool, set[str]]:
         bucket = state.setdefault("shared_stalls", {})
         previous = dict(bucket.get(fleet.name, {}))
         heights = [
@@ -909,20 +1137,16 @@ class Watchdog:
         current_height = max(heights, default=None)
 
         if common_stall is None:
-            self.clear_or_hold_shared_stall(
-                bucket, fleet, rows, previous, current_height
+            return self.clear_or_hold_shared_stall(
+                bucket,
+                fleet,
+                observations,
+                previous,
+                current_height,
             )
-            return
 
-        previous_height = coerce_height(
-            previous.get("event_height", previous.get("alert_height"))
-        )
-        previous_hash = str(previous.get("event_hash") or "").casefold()
-        same_event = (
-            previous.get("condition") == "stalled"
-            and previous_height == common_stall.height
-            and (not previous_hash or previous_hash == common_stall.block_hash)
-        )
+        previous_height, _previous_hash = self.shared_event_identity(previous)
+        same_event = self.shared_event_matches_tip(previous, common_stall)
 
         if not same_event:
             recovery_detail = (
@@ -937,28 +1161,47 @@ class Watchdog:
                 ),
                 self.args,
             ):
-                return
+                return False, set()
             previous = {}
 
         bad_since = common_stall.bad_since
+        timer_floor = bad_since
         if same_event:
             previous_bad_since = float(previous.get("bad_since", bad_since))
-            previous_nodes = previous.get("node_names")
-            if previous_nodes is not None and set(previous_nodes) != set(
-                common_stall.node_names
-            ):
-                bad_since = max(previous_bad_since, bad_since)
+            previous_nodes = set(previous.get("node_names") or ())
+            current_nodes = set(common_stall.node_names)
+            if previous_nodes == current_nodes:
+                timer_floor = float(
+                    previous.get("timer_floor", previous_bad_since)
+                )
+                bad_since = max(
+                    timer_floor,
+                    min(previous_bad_since, bad_since),
+                )
             else:
-                bad_since = min(previous_bad_since, bad_since)
+                # A changed constituent set starts a conservative timer boundary.
+                # Persist the boundary so the next poll cannot backdate it.
+                bad_since = max(previous_bad_since, bad_since)
+                timer_floor = bad_since
         age = now - bad_since
         alerting = bool(previous.get("alerting"))
+        node_owners = self.active_node_owners(
+            state,
+            fleet,
+            observations,
+            common_stall.height,
+            common_stall.block_hash,
+        )
+        node_owner = node_owners[0].name if node_owners else None
         next_entry = {
             "condition": "stalled",
             "event_height": common_stall.height,
             "event_hash": common_stall.block_hash,
             "node_names": list(common_stall.node_names),
             "bad_since": bad_since,
+            "timer_floor": timer_floor,
             "alerting": alerting,
+            "owner": f"node:{node_owner}" if node_owner else "shared",
             "last_seen": now,
         }
         if alerting:
@@ -966,11 +1209,7 @@ class Watchdog:
             if "last_alert_at" in previous:
                 next_entry["last_alert_at"] = previous["last_alert_at"]
 
-        represented_by = self.alerting_nodes_for_shared_tip(state, fleet, common_stall)
-        if represented_by:
-            next_entry["represented_by_nodes"] = represented_by
-
-        if not alerting and not represented_by and age >= self.args.shared_stalled_after:
+        if not alerting and node_owner is None and age >= self.args.shared_stalled_after:
             if suppressed:
                 if not previous.get("suppression_logged"):
                     print(
@@ -999,23 +1238,26 @@ class Watchdog:
                     next_entry["alert_height"] = common_stall.height
 
         bucket[fleet.name] = next_entry
+        return True, set(common_stall.node_names)
 
     def clear_or_hold_shared_stall(
         self,
         bucket: dict[str, Any],
         fleet: Fleet,
-        rows: list[dict[str, Any]],
+        observations: tuple[NodeObservation, ...],
         previous: dict[str, Any],
         current_height: int | None,
-    ) -> None:
+    ) -> tuple[bool, set[str]]:
         if not previous.get("alerting"):
             bucket[fleet.name] = {"condition": "ok", "alerting": False}
-            return
+            return True, set()
 
         previous_height = coerce_height(
             previous.get("event_height", previous.get("alert_height"))
         )
-        eligible_count = sum(tip_is_observable(row) for row in rows)
+        eligible_count = sum(
+            tip_is_observable(observation.row) for observation in observations
+        )
         if current_height is not None and (
             previous_height is None or current_height > previous_height
         ):
@@ -1023,63 +1265,81 @@ class Watchdog:
         elif eligible_count >= 2:
             detail = "nodes no longer share one verifiable tip"
         else:
+            previous["owner"] = "shared"
             bucket[fleet.name] = previous
-            return
+            previous_hash = normalized_block_hash(previous.get("event_hash"))
+            owned_nodes = {
+                observation.name
+                for observation in observations
+                if self.observation_matches_shared_event(
+                    observation, previous_height, previous_hash
+                )
+            }
+            return True, owned_nodes
 
-        if post_slack(
+        if not post_slack(
             shared_stall_recovery_text(fleet, current_height, detail), self.args
         ):
-            bucket[fleet.name] = {"condition": "ok", "alerting": False}
+            return False, set()
+        bucket[fleet.name] = {"condition": "ok", "alerting": False}
+        return True, set()
 
-    @staticmethod
-    def alerting_nodes_for_shared_tip(
-        state: dict[str, Any], fleet: Fleet, common_stall: SharedTip
-    ) -> list[str]:
-        represented_by = []
-        for node_name in common_stall.node_names:
-            entry = state.setdefault("nodes", {}).get(f"{fleet.name}/{node_name}", {})
-            alert_height = coerce_height(entry.get("alert_height"))
-            if (
-                entry.get("condition") == "stalled"
-                and entry.get("alerting")
-                and (alert_height is None or alert_height == common_stall.height)
-            ):
-                represented_by.append(node_name)
-        return represented_by
-
-    def handle_node(
+    def handle_node_observation(
         self,
         state: dict[str, Any],
         fleet: Fleet,
-        row: dict[str, Any],
+        observation: NodeObservation,
         now: float,
         suppressed: bool,
         coalesced: bool = False,
     ) -> None:
-        node_name = str(row.get("name") or "unknown")
-        key = f"{fleet.name}/{node_name}"
+        key = f"{fleet.name}/{observation.name}"
         bucket = state.setdefault("nodes", {})
         previous = dict(bucket.get(key, {}))
-        grace_since = max(self.started_at, self.fetch_recovered_at.get(fleet.name, 0))
-        condition, bad_since, threshold = node_condition(row, now, grace_since, self.args)
-        if condition != "ok" and previous.get("condition") == condition:
+        previous_height = self.node_event_height(previous)
+        same_stall_event = (
+            observation.condition == "stalled"
+            and previous.get("condition") == "stalled"
+            and (
+                previous_height is None
+                or observation.height is None
+                or previous_height == observation.height
+            )
+        )
+        if (
+            observation.condition == "stalled"
+            and previous.get("condition") == "stalled"
+            and not same_stall_event
+        ):
+            previous = {}
+            bucket[key] = {"condition": "ok", "alerting": False}
+
+        bad_since = observation.bad_since
+        if (
+            observation.condition != "ok"
+            and previous.get("condition") == observation.condition
+        ):
             bad_since = min(float(previous.get("bad_since", bad_since)), bad_since)
         age = now - bad_since
 
         update_alert_state(
             bucket,
             key,
-            condition,
+            observation.condition,
             bad_since,
-            threshold,
-            node_alert_text(fleet, row, condition, age),
-            node_recovery_text(fleet, row, previous),
+            observation.threshold,
+            node_alert_text(fleet, observation.row, observation.condition, age),
+            node_recovery_text(fleet, observation.row, previous),
             now,
             suppressed or coalesced,
             self.args,
-            coerce_float(row.get("height")),
+            observation.height,
             log_suppressed=not coalesced,
         )
+        if observation.condition == "stalled":
+            entry = bucket.get(key, {})
+            if entry.get("condition") == "stalled" and observation.height is not None:
+                entry["event_height"] = observation.height
 
 
 def parse_args() -> argparse.Namespace:

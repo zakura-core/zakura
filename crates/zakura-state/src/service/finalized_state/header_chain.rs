@@ -880,14 +880,6 @@ struct CanonicalHeaderPathAdvance {
 }
 
 #[derive(Debug)]
-/// Identity a canonical header path lease is issued under.
-#[derive(Copy, Clone)]
-struct RetainedPathRequester {
-    peer: SourceId,
-    session_id: u64,
-    scope: HeaderWorkAuthority,
-}
-
 struct RetainedPathReservation {
     leases: Arc<Mutex<RetainedPathLeaseRegistry>>,
     peer: SourceId,
@@ -1680,16 +1672,13 @@ impl HeaderChainReader {
     fn acquire_finalized_target_path(
         &self,
         reservation: RetainedPathReservation,
-        requester: RetainedPathRequester,
+        session_id: u64,
+        scope: HeaderWorkAuthority,
         target_tip_hash: block::Hash,
         locator_hashes: &[block::Hash],
         snapshot: &EngineSnapshot,
     ) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
-        let RetainedPathRequester {
-            peer,
-            session_id,
-            scope,
-        } = requester;
+        let peer = reservation.peer;
         let Some(target) = self.finalized_frontier(target_tip_hash)? else {
             return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
         };
@@ -1813,11 +1802,8 @@ impl HeaderChainReader {
             // so the target is absent here but present and immutable in the finalized indexes.
             return self.acquire_finalized_target_path(
                 reservation,
-                RetainedPathRequester {
-                    peer,
-                    session_id,
-                    scope,
-                },
+                session_id,
+                scope,
                 target_tip_hash,
                 locator_hashes,
                 &snapshot,

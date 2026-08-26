@@ -398,15 +398,15 @@ struct VctSupplierRejections {
     /// Peers that had advertised a status.
     considered: u64,
     /// Peers whose selected tip is below the repair target.
-    height: u64,
+    below_target_height: u64,
     /// Peers that advertise no capacity for the one-header repair response.
-    capacity: u64,
+    insufficient_capacity: u64,
     /// Peers that do not support the V1 auxiliary schema.
-    schema: u64,
+    unsupported_schema: u64,
     /// Peers already serving another header request.
-    busy: u64,
+    already_serving: u64,
     /// Peers already tried in the current supplier cycle.
-    tried: u64,
+    already_tried: u64,
 }
 
 /// One repair generation that has found no eligible supplier.
@@ -1813,26 +1813,24 @@ impl HeaderSyncReactor {
             .map(|status| (status.selected_tip_height, status.selected_tip_hash))
             .max_by_key(|(height, _)| *height);
 
-        let record = match self.vct_repair_no_supplier {
-            Some(record) if record.generation == task.repair_generation => record,
-            _ => VctRepairNoSupplier {
-                generation: task.repair_generation,
-                since: now,
-                last_trace: now,
-                reported: false,
-            },
-        };
-        let first_observation = self
+        let open_record = self
             .vct_repair_no_supplier
-            .is_none_or(|previous| previous.generation != task.repair_generation);
-        let trace_due = first_observation
+            .filter(|record| record.generation == task.repair_generation);
+        let mut record = open_record.unwrap_or(VctRepairNoSupplier {
+            generation: task.repair_generation,
+            since: now,
+            last_trace: now,
+            reported: false,
+        });
+        let stalled_for = now.saturating_duration_since(record.since);
+        let trace_due = open_record.is_none()
             || now.saturating_duration_since(record.last_trace)
                 >= VCT_REPAIR_NO_SUPPLIER_TRACE_INTERVAL;
-        let stalled_for = now.saturating_duration_since(record.since);
         let report_due = !record.reported && stalled_for >= VCT_REPAIR_NO_SUPPLIER_WARN_AFTER;
 
         if trace_due {
             self.emit_vct_repair_no_supplier(task, predecessor, rejections, best_peer_tip);
+            record.last_trace = now;
         }
         if report_due {
             tracing::error!(
@@ -1842,23 +1840,19 @@ impl HeaderSyncReactor {
                 branch_target = ?task.owner.branch.target_tip_hash,
                 ?best_peer_tip,
                 peers_considered = rejections.considered,
-                rejected_height = rejections.height,
-                rejected_capacity = rejections.capacity,
-                rejected_schema = rejections.schema,
-                rejected_busy = rejections.busy,
-                rejected_tried = rejections.tried,
+                rejected_height = rejections.below_target_height,
+                rejected_capacity = rejections.insufficient_capacity,
+                rejected_schema = rejections.unsupported_schema,
+                rejected_busy = rejections.already_serving,
+                rejected_tried = rejections.already_tried,
                 ?stalled_for,
                 "VCT: no connected peer can supply the repair root; the parked checkpoint commit \
                  cannot advance until an eligible supplier appears"
             );
+            record.reported = true;
         }
 
-        self.vct_repair_no_supplier = Some(VctRepairNoSupplier {
-            generation: task.repair_generation,
-            since: record.since,
-            last_trace: if trace_due { now } else { record.last_trace },
-            reported: record.reported || report_due,
-        });
+        self.vct_repair_no_supplier = Some(record);
     }
 
     fn emit_vct_repair_no_supplier(
@@ -1900,14 +1894,14 @@ impl HeaderSyncReactor {
                 hs_trace::PEERS_CONSIDERED.into(),
                 rejections.considered.into(),
             );
-            row.insert(hs_trace::REJECTED_HEIGHT.into(), rejections.height.into());
+            row.insert(hs_trace::REJECTED_HEIGHT.into(), rejections.below_target_height.into());
             row.insert(
                 hs_trace::REJECTED_CAPACITY.into(),
-                rejections.capacity.into(),
+                rejections.insufficient_capacity.into(),
             );
-            row.insert(hs_trace::REJECTED_SCHEMA.into(), rejections.schema.into());
-            row.insert(hs_trace::REJECTED_BUSY.into(), rejections.busy.into());
-            row.insert(hs_trace::REJECTED_TRIED.into(), rejections.tried.into());
+            row.insert(hs_trace::REJECTED_SCHEMA.into(), rejections.unsupported_schema.into());
+            row.insert(hs_trace::REJECTED_BUSY.into(), rejections.already_serving.into());
+            row.insert(hs_trace::REJECTED_TRIED.into(), rejections.already_tried.into());
             row.insert(
                 hs_trace::BEST_PEER_HEIGHT.into(),
                 best_peer_tip.map_or(serde_json::Value::Null, |(height, _)| {
@@ -2730,7 +2724,7 @@ impl HeaderSyncReactor {
                 let status = state.last_status.as_ref()?;
                 rejections.considered = rejections.considered.saturating_add(1);
                 if status.selected_tip_height < context.target.height {
-                    rejections.height = rejections.height.saturating_add(1);
+                    rejections.below_target_height = rejections.below_target_height.saturating_add(1);
                     return None;
                 }
                 if status.max_headers_per_response == 0
@@ -2738,20 +2732,20 @@ impl HeaderSyncReactor {
                     || usize::try_from(status.max_message_bytes).unwrap_or(usize::MAX)
                         < response_bytes
                 {
-                    rejections.capacity = rejections.capacity.saturating_add(1);
+                    rejections.insufficient_capacity = rejections.insufficient_capacity.saturating_add(1);
                     return None;
                 }
                 if status.tree_aux_schema_mask & AuxSchema::V1.mask_bit() == 0 {
-                    rejections.schema = rejections.schema.saturating_add(1);
+                    rejections.unsupported_schema = rejections.unsupported_schema.saturating_add(1);
                     return None;
                 }
                 if self.peer_work_queue.active(peer).is_some() {
-                    rejections.busy = rejections.busy.saturating_add(1);
+                    rejections.already_serving = rejections.already_serving.saturating_add(1);
                     return None;
                 }
                 let source = source_id_from_peer(peer);
                 if task.tried_sources.contains(&source) {
-                    rejections.tried = rejections.tried.saturating_add(1);
+                    rejections.already_tried = rejections.already_tried.saturating_add(1);
                     return None;
                 }
                 Some((peer.clone(), source, state.session.clone(), status.clone()))

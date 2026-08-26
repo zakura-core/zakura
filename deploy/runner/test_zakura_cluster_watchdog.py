@@ -747,6 +747,36 @@ class SharedStallTests(unittest.TestCase):
             all(not entry["alerting"] for entry in self.state["nodes"].values())
         )
 
+    def test_failed_shared_alert_retries_without_constituent_alerts(self):
+        watchdog.post_slack = lambda text, _args: (self.posted.append(text), False)[1]
+        rows = [
+            self.row("node-a", 100, 1_801, block_hash="aaaa"),
+            self.row("node-b", 100, 1_801, block_hash="aaaa"),
+        ]
+
+        self.run_snapshot(rows)
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
+        self.assertTrue(
+            all(not entry["alerting"] for entry in self.state["nodes"].values())
+        )
+
+        watchdog.post_slack = lambda text, _args: (self.posted.append(text), True)[1]
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 1_861, block_hash="aaaa"),
+                self.row("node-b", 100, 1_861, block_hash="aaaa"),
+            ],
+            now=self.NOW + 60,
+        )
+
+        self.assertEqual(len(self.posted), 2)
+        self.assertTrue(self.state["shared_stalls"]["testnet"]["alerting"])
+        self.assertTrue(
+            all(not entry["alerting"] for entry in self.state["nodes"].values())
+        )
+
     def test_failed_node_recovery_aborts_new_shared_event(self):
         self.run_snapshot([self.row("node-a", 100, 601, block_hash="aaaa")])
         old_node = dict(self.state["nodes"]["testnet/node-a"])

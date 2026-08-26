@@ -30,7 +30,10 @@ STALL_DIAGNOSTIC_TARGETS = {
     "europe-west-0": "root@64.227.44.93",
     "asia-south-0": "root@139.59.64.115",
     "asia-pacific-0": "root@168.144.173.250",
+    "start-temp-zakura-sync-test-5": "root@142.93.27.189",
 }
+
+STALL_DIAGNOSTIC_START_TARGETS = {"start-temp-zakura-sync-test-5"}
 
 STALL_DIAGNOSTIC_SCRIPT = r"""
 set -u
@@ -501,6 +504,15 @@ def cmd_status(args: argparse.Namespace) -> int:
             if not ok:
                 return node.name, False, str(data)
             print(json.dumps(data, indent=2, sort_keys=True))
+
+        if node.name in STALL_DIAGNOSTIC_START_TARGETS:
+            start = subprocess.run(
+                node.ssh_cmd("systemctl", "start", "zakura.service"),
+                text=True,
+                capture_output=True,
+            )
+            if start.returncode != 0:
+                return node.name, False, (start.stderr or start.stdout).strip()
 
         cmd = node.ssh_cmd("bash", "-s")
         actions_key = Path.home() / ".ssh" / "zakura-continuous-sync"

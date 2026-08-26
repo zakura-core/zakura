@@ -132,6 +132,102 @@ find -L /var/log/zakura/runs /root/logs \
             tail -n 500 || true
     done
 
+section legacy-sync-frontier
+python3 - <<'PY'
+import collections
+import json
+import os
+
+path = "/var/log/zakura/traces/legacy_sync.jsonl"
+max_bytes = 1024 * 1024 * 1024
+if not os.path.isfile(path):
+    print(f"missing trace: {path}")
+    raise SystemExit
+
+states = {}
+snapshots = collections.deque(maxlen=8)
+process_trace_id = None
+size = os.path.getsize(path)
+with open(path, "rb") as trace:
+    start = max(0, size - max_bytes)
+    trace.seek(start)
+    if start:
+        trace.readline()
+    for raw_line in trace:
+        try:
+            event = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        event_process = event.get("process_trace_id")
+        if event_process != process_trace_id:
+            process_trace_id = event_process
+            states.clear()
+            snapshots.clear()
+        event_name = event.get("event")
+        if event_name == "block_phase":
+            block_hash = event.get("hash")
+            if block_hash:
+                previous = states.get(block_hash, {})
+                states[block_hash] = {
+                    "height": event.get("height", previous.get("height")),
+                    "phase": event.get("phase"),
+                }
+        elif event_name == "block_finish":
+            states.pop(event.get("hash"), None)
+        elif event_name in {"pipeline_reset", "round_error_snapshot", "round_stalled"}:
+            tasks = event.get("tasks", [])
+            heights = sorted(
+                task["height"] for task in tasks if task.get("height") is not None
+            )
+            snapshots.append({
+                "event": event_name,
+                "state_tip": event.get("state_tip"),
+                "in_flight": event.get("in_flight"),
+                "reserve": event.get("reserve"),
+                "registry_retries": event.get("registry_retries"),
+                "known_height_min": heights[0] if heights else None,
+                "known_height_max": heights[-1] if heights else None,
+                "known_height_count": len(heights),
+            })
+            if event_name == "pipeline_reset":
+                states.clear()
+
+phase_counts = collections.Counter(state.get("phase") for state in states.values())
+heights = sorted(
+    state["height"] for state in states.values() if state.get("height") is not None
+)
+height_set = set(heights)
+state_tip = next(
+    (snapshot["state_tip"] for snapshot in reversed(snapshots) if snapshot["state_tip"] is not None),
+    None,
+)
+missing_ranges = []
+if state_tip is not None and heights:
+    missing = [height for height in range(state_tip + 1, heights[-1] + 1) if height not in height_set]
+    for height in missing:
+        if missing_ranges and height == missing_ranges[-1][1] + 1:
+            missing_ranges[-1][1] = height
+        else:
+            missing_ranges.append([height, height])
+
+print(json.dumps({
+    "path": path,
+    "file_bytes": size,
+    "scanned_bytes": min(size, max_bytes),
+    "process_trace_id": process_trace_id,
+    "active_task_count": len(states),
+    "phase_counts": dict(sorted(phase_counts.items())),
+    "known_height_count": len(heights),
+    "known_height_min": heights[0] if heights else None,
+    "known_height_max": heights[-1] if heights else None,
+    "state_tip": state_tip,
+    "missing_height_count": sum(end - start + 1 for start, end in missing_ranges),
+    "missing_height_ranges": missing_ranges[:200],
+    "missing_ranges_truncated": len(missing_ranges) > 200,
+    "recent_snapshots": list(snapshots),
+}, indent=2, sort_keys=True))
+PY
+
 section journals
 for unit in zakura.service zakurad.service zakura-continuous-sync.service; do
     printf '\n--- %s ---\n' "${unit}"

@@ -16,6 +16,7 @@ use crate::{
 };
 
 mod block_sync;
+mod control_handshake;
 mod discovery;
 mod handler;
 mod handshake;
@@ -28,6 +29,7 @@ mod trace;
 pub mod transport;
 
 pub use block_sync::*;
+pub(crate) use control_handshake::*;
 pub use discovery::*;
 pub use handler::*;
 pub use handshake::*;

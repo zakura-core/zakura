@@ -2226,6 +2226,107 @@ async fn transient_download_failure_restarts_after_retry_limit() {
     peer_set.expect_no_requests().await;
 }
 
+/// A transient failure for one hash preserves other work in the sync round and retries only the
+/// failed hash.
+#[tokio::test]
+async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::BoxError> {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        mut state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let retried_block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let retried_hash = retried_block.hash();
+    let unrelated_block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    let unrelated_hash = unrelated_block.hash();
+    let reserve = [retried_hash, unrelated_hash].into_iter().collect();
+
+    let sync_round = chain_sync.sync_round(reserve, None);
+    let drive_services = async {
+        // Exhaust the retry layer inside one download service call. The unrelated request can
+        // arrive between these attempts because the sync round dispatches both hashes concurrently.
+        let service_attempts = sync::BLOCK_DOWNLOAD_RETRY_LIMIT + 1;
+        let mut failed_attempts = 0;
+        let mut unrelated_response_sent = false;
+        while failed_attempts < service_attempts || !unrelated_response_sent {
+            let response = peer_set
+                .expect_request_that(|request| match request {
+                    zn::Request::BlocksByHash(hashes) => {
+                        hashes == &HashSet::from([retried_hash])
+                            || hashes == &HashSet::from([unrelated_hash])
+                    }
+                    _ => false,
+                })
+                .await;
+
+            let requested_hash = match response.request() {
+                zn::Request::BlocksByHash(hashes) => *hashes
+                    .iter()
+                    .next()
+                    .expect("single-hash block request is nonempty"),
+                _ => unreachable!("request matcher accepts only block requests"),
+            };
+
+            if requested_hash == retried_hash {
+                failed_attempts += 1;
+                response.respond(Err(client_dropped_error()));
+            } else {
+                assert!(
+                    !unrelated_response_sent,
+                    "the unrelated block should be requested once"
+                );
+                unrelated_response_sent = true;
+                response.respond(zn::Response::Blocks(vec![Available((
+                    unrelated_block.clone(),
+                    None,
+                ))]));
+            }
+        }
+        assert_eq!(failed_attempts, service_attempts);
+
+        // Commit the unrelated block before answering the queue-level retry. This proves that the
+        // transient error did not cancel other work in the round.
+        block_verifier_router
+            .expect_request_that(|request| request.block().hash() == unrelated_hash)
+            .await
+            .respond(unrelated_hash);
+
+        peer_set
+            .expect_request(zn::Request::BlocksByHash(
+                iter::once(retried_hash).collect(),
+            ))
+            .await
+            .respond(zn::Response::Blocks(vec![Available((
+                retried_block.clone(),
+                None,
+            ))]));
+        block_verifier_router
+            .expect_request_that(|request| request.block().hash() == retried_hash)
+            .await
+            .respond(retried_hash);
+    };
+
+    let (result, ()) = tokio::join!(sync_round, drive_services);
+    result.expect("replacement download should complete the original sync round");
+    assert!(
+        chain_sync.transient_block_retry_counts.is_empty(),
+        "a successful replacement should clear its transient retry state"
+    );
+    assert_eq!(chain_sync.downloads.in_flight(), 0);
+
+    peer_set.expect_no_requests().await;
+    block_verifier_router.expect_no_requests().await;
+    state_service.expect_no_requests().await;
+
+    Ok(())
+}
+
 /// Unit test for the refactored [`ChainSync::build_extend`]: it must *discover* the next batch of
 /// download hashes from a prospective tip, performing the FindBlocks fan-out and parsing the
 /// response, **without** dispatching any block downloads or otherwise touching syncer state.

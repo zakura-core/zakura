@@ -2144,6 +2144,88 @@ async fn not_found_download_restarts_sync() {
     );
 }
 
+/// A peer connection failure affects one block request, so the syncer requeues that hash without
+/// canceling the other checkpoint verification tasks.
+#[tokio::test]
+async fn transient_download_failure_requeues_block() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xCE; 32]);
+    let error = BlockDownloadVerifyError::DownloadFailed {
+        error: client_dropped_error(),
+        hash: block_hash,
+    };
+
+    let requeue = tokio::spawn(async move {
+        let result = chain_sync
+            .handle_block_response_with_missing_retry(Err(error))
+            .await;
+        (chain_sync, result)
+    });
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(block_hash).collect()))
+        .await
+        .respond(Err(client_dropped_error()));
+
+    let (chain_sync, result) = requeue
+        .await
+        .expect("transient block retry task should not panic");
+    result.expect("a transient block failure within budget should preserve the round");
+    assert_eq!(
+        chain_sync.transient_block_retry_counts.get(&block_hash),
+        Some(&1),
+        "the transient block retry should consume one retry"
+    );
+
+    block_verifier_router.expect_no_requests().await;
+}
+
+/// A persistently failing block still restarts the round after its queue-level retry budget.
+#[tokio::test]
+async fn transient_download_failure_restarts_after_retry_limit() {
+    let (
+        mut chain_sync,
+        _sync_status,
+        _block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let block_hash = block::Hash::from([0xCF; 32]);
+    chain_sync
+        .transient_block_retry_counts
+        .insert(block_hash, sync::TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT);
+    let error = BlockDownloadVerifyError::DownloadFailed {
+        error: client_dropped_error(),
+        hash: block_hash,
+    };
+
+    let result = chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a transient block failure should restart sync after its retry budget"
+    );
+    assert!(
+        !chain_sync
+            .transient_block_retry_counts
+            .contains_key(&block_hash),
+        "an exhausted transient retry budget should be cleared"
+    );
+    peer_set.expect_no_requests().await;
+}
+
 /// Unit test for the refactored [`ChainSync::build_extend`]: it must *discover* the next batch of
 /// download hashes from a prospective tip, performing the FindBlocks fan-out and parsing the
 /// response, **without** dispatching any block downloads or otherwise touching syncer state.
@@ -3038,6 +3120,10 @@ fn not_found_block_error(_hash: block::Hash) -> crate::BoxError {
 /// `NotFoundRegistry`), as opposed to a single peer's `notfound`.
 fn not_found_registry_error(_hash: block::Hash) -> crate::BoxError {
     zn::SharedPeerError::from(zn::PeerError::NotFoundRegistry(Vec::new())).into()
+}
+
+fn client_dropped_error() -> crate::BoxError {
+    zn::SharedPeerError::from(zn::PeerError::ClientDropped).into()
 }
 
 #[test]

@@ -7,58 +7,76 @@
 
 ## Problem
 
-Zakura must be able to fully utilize each p2p connection without letting a peer overwhelm the node.
-A byte limit cannot achieve both goals because equal-sized messages can cause very different CPU,
-memory, disk, lock, and response costs. Zakura therefore bounds work instead.
+Zakura must fully utilize each p2p connection without letting a peer overwhelm the node. Denial of
+service exhausts finite resources, so Zakura prices messages by the work they can cause across multiple dimensions. Each message role has a bound for its CPU, memory, disk, lock, and response costs.
 
 Before Zakura handles an inbound message, it applies every filter required by that message's role:
 
-1. **Safe** — Frame checks and bounded decoding run before allocation or expensive verification.
-2. **Authorized** — A response must match a live reservation created by a request we sent.
-3. **Useful** — The message must be relevant and not repeat work we already handled.
-4. **Budgeted** — The message must stay within the bound selected for its role.
+1. **Safe** — Frame checks and bounded decoding precede allocation and expensive verification.
+2. **Authorized** — Each response matches a live reservation created by a request Zakura sent.
+3. **Useful** — The message is relevant and does not repeat completed work.
+4. **Budgeted** — The message fits the work bound for its role.
 
-The message role selects the work bound. Announcements use a declared cadence. Requests pay
-according to the work needed to answer them. Responses consume the reservation created by our
-request. A subscription is a reservation that allows several responses within subscriber-issued
-header and byte credit. Legal but useless messages are dropped after they consume a cadence token,
-reservation, or separate drop budget.
+Only bounded announcement metadata may arrive without a reservation, and a strict cadence limits
+it. Requests pay for the work needed to answer them. Responses consume one-shot, range, or
+subscription reservations. A subscription allows several responses within header and byte credit
+issued by the subscriber. Legal but useless messages consume their cadence token, reservation, or
+drop budget before Zakura drops them.
 
-Only bounded announcement metadata may arrive without a reservation. A strict cadence bounds that
-metadata. Headers, blocks, and other application objects require a one-shot reservation, range
-reservation, or subscription.
-
-A gate may disconnect a peer only for behavior that a conformant sender cannot produce. Every
-inbound rule therefore has a matching outbound obligation with a safety margin. Local scheduling
-decisions never create peer violations. A reservation remains live until its response arrives or
-the connection ends.
+A gate disconnects a peer only for behavior that a conformant sender cannot produce. Each inbound
+rule therefore has a matching outbound obligation with a safety margin. Local scheduling decisions
+do not create peer violations.
 
 These message rules do not address a peer that follows the protocol but wastes a connection slot.
 Peer-set policy handles that case separately.
 
 ## Design
 
-Each message type declares its byte cap, applicable filters, and filter bounds. The peer routine
-calls `admit` once before dispatching the message to its handler. `admit` returns `Continue`, `Drop`,
-`Delay`, `Disconnect`, or `LocalFault`.
+The implementation has two layers: message declarations and peer routines.
 
-Only applicable filters run. The implementation orders them by one rule: a filter runs before the
-work that it bounds.
+Each message declaration builds an admission path from reusable filters and message-specific
+configuration. The declaration selects the message role, the applicable filters, and their bounds
+and keys. The filters implement the shared admission behavior. The declaration contains the policy
+that differs between messages.
+
+Each peer routine creates the configured admission paths and owns their filter state for one
+connection. It passes each inbound message to its admission path before it calls the message
+handler. `admit` applies the configured filters and returns `Continue`, `Drop`, `Delay`,
+`Disconnect`, or `LocalFault`. The peer routine dispatches only `Continue` messages and handles
+every other result at the connection boundary.
 
 ```text
-frame check
-  → cadence check
-  → reservation lookup
-  → bounded decode and verification
-  → uniqueness and relevance
-  → work charge
-  → handler
+message declaration
+  → filters and message-specific configuration
+  → peer routine with per-connection filter state
+  → admit inbound message
+  → handler or connection action
 ```
 
-This order varies by message role. Announcements pay their cadence before verification. Responses
-find a reservation before decode because the reservation supplies their decode bounds. Requests pay
-their estimated response cost before the handler serves them. The work budget charges the upper
-bound at admission and refunds unused work after the response completes.
+An illustrative API could keep both layers small:
+
+```rust
+let headers = MessageDeclaration::response::<Headers>()
+    .with(Frame::max_bytes(MAX_HEADERS_BYTES))
+    .with(Decode::bounded())
+    .with(Verify::using(prepare_headers))
+    .with(Reservation::subscription());
+
+let mut admission = Admission::new(Declarations::new().with(headers));
+
+while let Some(frame) = peer.recv().await? {
+    match admission.admit(frame).await {
+        Continue(message) => handlers.dispatch(message).await?,
+        result => handle_result(peer, result).await?,
+    }
+}
+```
+
+This sketch shows the division of responsibility, not a proposed API.
+
+The admission path applies each filter before the work that it bounds. The exact filters and their
+order depend on the message role. The specification defines that order and each filter's
+configuration.
 
 Header sync demonstrates every message role:
 
@@ -69,50 +87,26 @@ Header sync demonstrates every message role:
 | `Headers` | Response | Frame, Decode, Verify, Reservation | Disconnect a page outside its subscription |
 | `HeadersOutcome` | Response | Frame, Decode, Reservation | Disconnect an unsolicited or invalid outcome |
 
-A header subscription turns push into an authorized response stream. The subscriber opens a
-subscription from an accepted base to one advertised target. It supplies a locator, an auxiliary
-schema, and header and byte credit. The publisher first pushes the path to that target. The same
-subscription then authorizes direct descendants as the publisher's selected chain grows. Each page
-must extend the subscription cursor and consume both credits.
+Header sync uses a credit-based subscription to make pushed headers authorized and bounded. The
+subscriber selects an advertised target, supplies a locator, and grants header and byte credit. The
+subscription first authorizes the path to that target. It then authorizes direct descendants as the
+publisher's selected chain grows. Only the subscriber can add credit.
 
-The subscriber renews the subscription by acknowledging an accepted cursor and adding credit. The
-publisher keeps a bounded ring of sent cursors until the subscriber acknowledges them. A close
-update stops new pages. The publisher then sends a terminal `HeadersOutcome` after every page
-already queued unless it already queued a terminal response.
+The peer routine creates or updates the subscription reservation before it sends an open or grant
+message. The reservation supplies the response identity, decode bounds, accepted cursor, and
+remaining credit. A bounded cursor history lets the publisher validate later acknowledgements
+without retaining unbounded state.
 
-The initial locator states which bases the subscriber has. An acknowledgement states which later
-cursor the subscriber accepted. A conformant publisher may rely on those statements. The publisher
-may also send a child after it queues the parent earlier on the same ordered stream. Existing credit
-must cover both headers. Merely sending a header does not create more credit.
+Outstanding credit remains valid until the publisher consumes it or the subscription ends.
+Scheduler reassignment, another peer's response, finality, or a reorganization does not revoke that
+credit. The subscriber admits a matching in-flight page and stops granting credit when it no longer
+wants more work.
 
-The protocol treats a locator or acknowledgement as authorization, not proof of application state.
-A subscriber can lie about what it accepted. That lie can spend only the Work budget assigned to
-that peer. Peer-set policy handles a peer that consumes a connection without advancing sync.
-
-The subscription records the initial target, response identity, decode bounds, receive cursor, and
-remaining credit. It remains live until a terminal outcome or the connection ends. The subscriber
-updates the subscription before it sends an open or credit-grant message, so a fast response always
-finds its bounds.
-
-The publisher may push a new header immediately when its selected chain extends the subscription
-cursor and credit remains. It does not need to send another `Status`. If its selected chain no
-longer extends that cursor, it must stop pushing and send a terminal `SubscriptionSuperseded`
-outcome. It announces the new target under the strict `Status` cadence. The subscriber opens
-another subscription if it selects that target.
-
-The publisher also owes progress. While credit remains and its own `Status` advertises a tip
-beyond the subscription cursor, it must push within a declared deadline. A quiet subscription is
-therefore either honestly idle or a violation. Without this rule a peer could advertise work,
-never serve it, and hold the subscription slot forever.
-
-The scheduler may retire or reassign the underlying work without changing the reservation. A later
-response still consumes the reservation, passes bounded verification, and reaches its handler. We
-asked for it, so we take it. A response without a reservation disconnects the peer.
-
-The subscriber authorizes only work it wants when it grants credit. Another peer, a reorganization,
-or finality may arrive before an in-flight page does. The subscriber keeps the subscription long
-enough to admit that page and admits it. Outstanding credit bounds this race. The subscriber
-withholds the next grant instead of discarding a page it already paid for.
+The publisher must advance an eligible subscription within the protocol deadline. It sends a
+terminal outcome when the subscription closes or its selected chain stops extending the accepted
+cursor. Locators and acknowledgements authorize work; they do not prove application state. Per-peer
+work budgets bound dishonest claims, while peer-set policy handles peers that make no useful
+progress.
 
 ```mermaid
 sequenceDiagram

@@ -8,7 +8,7 @@ use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, SourceId, VctRepairContext};
 
 /// Maximum distinct suppliers retained and tried before one repair backoff cycle.
-const MAX_SUPPLIERS_PER_CYCLE: usize = 3;
+pub(in crate::zakura::header_sync) const MAX_SUPPLIERS_PER_CYCLE: usize = 3;
 
 /// Structurally complete state of one auxiliary repair task.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +37,13 @@ pub(in crate::zakura::header_sync) enum RepairPolicyState {
         /// Exact selected request context.
         context: VctRepairContext,
         /// Earliest time another full supplier cycle may begin.
+        retry_at: Instant,
+    },
+    /// A local failure paused the repair without completing its supplier cycle.
+    LocalBackoff {
+        /// Exact selected request context.
+        context: VctRepairContext,
+        /// Earliest time local scheduling may resume.
         retry_at: Instant,
     },
     /// A shared active target owns supplier, wire, preparation, and admission progress.
@@ -77,6 +84,8 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
     pub attempts: u64,
     /// Suppliers already tried in the current cycle.
     pub tried_sources: HashSet<SourceId>,
+    /// Last supplier tried across every cycle for deterministic round-robin rotation.
+    pub supplier_cursor: Option<SourceId>,
 }
 
 impl RepairRequirement {
@@ -89,6 +98,7 @@ impl RepairRequirement {
             state: RepairPolicyState::NeedsContext,
             attempts: 0,
             tried_sources: HashSet::new(),
+            supplier_cursor: None,
         }
     }
 
@@ -159,6 +169,7 @@ impl RepairRequirement {
         self.attempts = self.attempts.saturating_add(1);
         if self.tried_sources.len() < MAX_SUPPLIERS_PER_CYCLE {
             self.tried_sources.insert(source);
+            self.supplier_cursor = Some(source);
         }
         self.state = RepairPolicyState::Ready { context };
         Ok(())
@@ -172,7 +183,21 @@ impl RepairRequirement {
         self.attempts = self.attempts.saturating_add(1);
         if self.tried_sources.len() < MAX_SUPPLIERS_PER_CYCLE {
             self.tried_sources.insert(source);
+            self.supplier_cursor = Some(source);
         }
+        Ok(())
+    }
+
+    /// Back off an assigned repair after a local failure without rejecting its supplier.
+    pub fn defer_local_retry_until(&mut self, retry_at: Instant) -> Result<(), RepairPolicyError> {
+        let RepairPolicyState::Assigned { context } = &self.state else {
+            return Err(RepairPolicyError::IllegalState);
+        };
+        self.attempts = self.attempts.saturating_add(1);
+        self.state = RepairPolicyState::LocalBackoff {
+            context: context.clone(),
+            retry_at,
+        };
         Ok(())
     }
 
@@ -210,6 +235,11 @@ impl RepairRequirement {
                 };
                 self.tried_sources.clear();
             }
+            RepairPolicyState::LocalBackoff { context, retry_at } if *retry_at <= now => {
+                self.state = RepairPolicyState::Ready {
+                    context: context.clone(),
+                };
+            }
             _ => {}
         }
     }
@@ -219,7 +249,8 @@ impl RepairRequirement {
         match self.state {
             RepairPolicyState::QueryingContext { deadline, .. } => Some(deadline),
             RepairPolicyState::ContextBackoff { retry_at }
-            | RepairPolicyState::SupplierBackoff { retry_at, .. } => Some(retry_at),
+            | RepairPolicyState::SupplierBackoff { retry_at, .. }
+            | RepairPolicyState::LocalBackoff { retry_at, .. } => Some(retry_at),
             _ => None,
         }
     }
@@ -432,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn supplier_cycle_retains_at_most_three_distinct_sources() {
+    fn supplier_cycle_bounds_identity_churn_and_preserves_cursor() {
         let mut task = task(&snapshot());
         let context = context();
         mark_context_requested(&mut task);
@@ -447,13 +478,17 @@ mod tests {
         assert!(task.supplier_cycle_exhausted());
         assert_eq!(task.tried_sources.len(), 3);
         assert_eq!(task.attempts, 3);
+        assert_eq!(task.supplier_cursor, Some(SourceId::from_digest([3; 32])));
 
-        task.record_failed_source(SourceId::from_digest([4; 32]))
-            .expect("ready work can record another failed supplier");
+        for byte in 4_u8..=64 {
+            task.record_failed_source(SourceId::from_digest([byte; 32]))
+                .expect("late churn cannot enlarge an exhausted cycle");
+        }
         assert!(task.supplier_cycle_exhausted());
         assert_eq!(task.tried_sources.len(), 3);
         assert!(!task.tried_sources.contains(&SourceId::from_digest([4; 32])));
-        assert_eq!(task.attempts, 4);
+        assert_eq!(task.attempts, 64);
+        assert_eq!(task.supplier_cursor, Some(SourceId::from_digest([3; 32])));
 
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
         task.defer_retry_until(deadline)
@@ -461,6 +496,41 @@ mod tests {
         task.resume_retry_cycle(deadline);
         assert!(!task.supplier_cycle_exhausted());
         assert!(task.tried_sources.is_empty());
+        assert_eq!(task.supplier_cursor, Some(SourceId::from_digest([3; 32])));
+        assert_eq!(task.state, RepairPolicyState::Ready { context });
+    }
+
+    #[test]
+    fn local_retry_preserves_supplier_eligibility_and_cursor() {
+        let mut task = task(&snapshot());
+        let context = context();
+        mark_context_requested(&mut task);
+        task.resolve(context.clone())
+            .expect("the exact context resolves");
+        task.assign(task.owner).expect("ready work can go on wire");
+        let failed_source = SourceId::from_digest([1; 32]);
+        task.retry(failed_source)
+            .expect("one supplier failure starts the current cycle");
+        task.assign(task.owner)
+            .expect("another supplier can own the current cycle");
+        let retry_at = Instant::now() + std::time::Duration::from_secs(1);
+
+        task.defer_local_retry_until(retry_at)
+            .expect("a local failure backs off assigned work");
+
+        assert_eq!(task.tried_sources, [failed_source].into_iter().collect());
+        assert_eq!(task.supplier_cursor, Some(failed_source));
+        assert_eq!(task.attempts, 2);
+        assert_eq!(
+            task.state,
+            RepairPolicyState::LocalBackoff {
+                context: context.clone(),
+                retry_at,
+            }
+        );
+        task.resume_retry_cycle(retry_at);
+        assert_eq!(task.tried_sources, [failed_source].into_iter().collect());
+        assert_eq!(task.supplier_cursor, Some(failed_source));
         assert_eq!(task.state, RepairPolicyState::Ready { context });
     }
 
@@ -513,6 +583,10 @@ mod tests {
                 context: context.clone(),
             },
             RepairPolicyState::SupplierBackoff {
+                context: context.clone(),
+                retry_at: deadline,
+            },
+            RepairPolicyState::LocalBackoff {
                 context: context.clone(),
                 retry_at: deadline,
             },

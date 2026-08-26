@@ -1,4 +1,5 @@
 use super::*;
+use crate::zakura::header_sync::scheduler::repair::MAX_SUPPLIERS_PER_CYCLE;
 
 #[test]
 fn request_timeout_retires_owned_work_and_wakes_maintenance() {
@@ -157,7 +158,7 @@ fn initial_vct_wire_assignment_arms_the_request_deadline() {
 }
 
 #[test]
-fn bounded_supplier_cycle_backs_off_while_fresh_peers_remain() {
+fn bounded_supplier_cycles_rotate_to_the_fourth_supplier() {
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let mut snapshot = committed_snapshot(anchor);
@@ -168,15 +169,22 @@ fn bounded_supplier_cycle_backs_off_while_fresh_peers_remain() {
     let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
     startup.committed_snapshots = Some(snapshots_rx);
     let (_handle, _actions, mut reactor) =
-        build_header_sync_reactor(startup).expect("the bounded repair fixture builds");
-    let peer = peer();
-    let (send, _outbound) = framed_channel(8);
-    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
-        peer.clone(),
-        7,
-        send,
-        CancellationToken::new(),
-    ));
+        build_header_sync_reactor(startup).expect("the bounded round-robin repair fixture builds");
+    let peers: Vec<_> = [1_u8, 2, 3, 4]
+        .into_iter()
+        .map(|byte| ZakuraPeerId::new(vec![byte; 32]).expect("the peer ID has the required length"))
+        .collect();
+    let mut _outbounds = Vec::new();
+    for (index, peer) in peers.iter().enumerate() {
+        let (send, outbound) = framed_channel(8);
+        reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+            peer.clone(),
+            7 + u64::try_from(index).expect("four peer indexes fit in u64"),
+            send,
+            CancellationToken::new(),
+        ));
+        _outbounds.push(outbound);
+    }
     let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
         INTERNAL_VCT_REPAIR_SESSION_ID,
         std::num::NonZeroU64::new(1).expect("one is nonzero"),
@@ -185,18 +193,138 @@ fn bounded_supplier_cycle_backs_off_while_fresh_peers_remain() {
         target: repair_target,
         locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
     };
-    let mut repair = RepairRequirement::new(owner, repair_target.height, 11);
-    repair.state = RepairPolicyState::Ready {
+    let mut task = RepairRequirement::new(owner, repair_target.height, 11);
+    task.state = RepairPolicyState::Ready {
         context: context.clone(),
     };
-    for byte in [0x11_u8, 0x22, 0x33] {
-        repair
-            .tried_sources
-            .insert(zakura_header_chain::SourceId::from_digest([byte; 32]));
+    reactor.vct_repair.insert(task);
+    let status = Status {
+        work_anchor_height: anchor.height,
+        work_anchor_hash: anchor.hash,
+        selected_tip_height: snapshot.frontiers.header_best.height,
+        selected_tip_hash: snapshot.frontiers.header_best.hash,
+        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+        oldest_retained_height: anchor.height,
+        max_headers_per_response: 1,
+        max_inflight_requests: 1,
+        max_message_bytes: 2_000_000,
+        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+    };
+    for (index, peer) in peers.iter().enumerate() {
+        reactor.handle_wire_message(
+            peer.clone(),
+            7 + u64::try_from(index).expect("four peer indexes fit in u64"),
+            HeaderSyncMessage::Status(status.clone()),
+        );
     }
-    assert!(repair.supplier_cycle_exhausted());
-    reactor.vct_repair.insert(repair);
 
+    for peer in &peers[..3] {
+        let active = reactor
+            .peer_work_queue
+            .active(peer)
+            .expect("the next round-robin supplier owns the repair")
+            .clone();
+        assert!(matches!(
+            active.purpose,
+            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+        ));
+        reactor.handle_headers_outcome(
+            peer.clone(),
+            active.owner.session_id(),
+            active.owner.header_authority(),
+            HeadersOutcome {
+                request_id: active.request_id.get(),
+                target_tip_hash: repair_target.hash,
+                outcome: HeadersOutcomeCode::TargetNotRetained,
+            },
+        );
+    }
+
+    assert!(peers
+        .iter()
+        .all(|peer| reactor.peer_work_queue.active(peer).is_none()));
+    let task = reactor
+        .vct_repair
+        .current()
+        .expect("the bounded cycle keeps the repair requirement");
+    let retry_at = match &task.state {
+        RepairPolicyState::SupplierBackoff {
+            context: retained,
+            retry_at,
+        } if retained == &context => *retry_at,
+        other => panic!("three supplier failures must back off, got {other:?}"),
+    };
+    assert_eq!(task.tried_sources.len(), 3);
+    assert!(task.supplier_cycle_exhausted());
+    assert_eq!(task.supplier_cursor, Some(source_id_from_peer(&peers[2])));
+    let stall = reactor
+        .vct_repair_stall
+        .expect("a complete failed cycle starts the generation stall clock");
+
+    reactor
+        .vct_repair
+        .current_mut()
+        .expect("the repair remains scheduled")
+        .resume_retry_cycle(retry_at);
+    reactor.try_assign_vct_repair();
+
+    let active = reactor
+        .peer_work_queue
+        .active(&peers[3])
+        .expect("the next cycle starts after the persistent supplier cursor");
+    assert!(matches!(
+        active.purpose,
+        HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+    ));
+    let task = reactor
+        .vct_repair
+        .current()
+        .expect("the fourth supplier owns the current repair");
+    assert!(task.tried_sources.is_empty());
+    assert_eq!(task.supplier_cursor, Some(source_id_from_peer(&peers[2])));
+    assert_eq!(
+        reactor
+            .vct_repair_stall
+            .expect("assignment preserves the generation stall clock")
+            .since,
+        stall.since
+    );
+}
+
+#[test]
+fn replacement_session_keeps_the_authenticated_supplier_identity() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let mut snapshot = committed_snapshot(anchor);
+    let repair_target =
+        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
+    snapshot.frontiers.header_best =
+        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32]));
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the replacement fixture builds");
+    let peer = peer();
+    let source = source_id_from_peer(&peer);
+    let (first_send, _first_outbound) = framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+        peer.clone(),
+        7,
+        first_send,
+        CancellationToken::new(),
+    ));
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
+        INTERNAL_VCT_REPAIR_SESSION_ID,
+        std::num::NonZeroU64::new(1).expect("one is nonzero"),
+    );
+    let mut task = RepairRequirement::new(owner, repair_target.height, 11);
+    task.state = RepairPolicyState::Ready {
+        context: zakura_header_chain::VctRepairContext {
+            target: repair_target,
+            locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        },
+    };
+    reactor.vct_repair.insert(task);
     reactor.handle_wire_message(
         peer.clone(),
         7,
@@ -213,21 +341,128 @@ fn bounded_supplier_cycle_backs_off_while_fresh_peers_remain() {
             tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
         }),
     );
+    assert!(reactor.peer_work_queue.active(&peer).is_some());
 
+    let (replacement_send, _replacement_outbound) = framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+        peer.clone(),
+        8,
+        replacement_send,
+        CancellationToken::new(),
+    ));
+
+    assert_eq!(reactor.peer_state.len(), 1);
     assert!(reactor.peer_work_queue.active(&peer).is_none());
     let task = reactor
         .vct_repair
         .current()
-        .expect("the bounded cycle keeps the repair requirement");
+        .expect("the replacement keeps the repair scheduled");
+    assert_eq!(task.tried_sources, [source].into_iter().collect());
+    assert_eq!(task.supplier_cursor, Some(source));
     assert!(matches!(
-        &task.state,
-        RepairPolicyState::SupplierBackoff {
-            context: retained,
-            ..
-        } if retained == &context
+        task.state,
+        RepairPolicyState::SupplierBackoff { .. }
     ));
-    assert_eq!(task.tried_sources.len(), 3);
-    assert!(task.supplier_cycle_exhausted());
+}
+
+#[test]
+fn send_failures_preserve_the_stall_clock_across_bounded_cycles() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let mut snapshot = committed_snapshot(anchor);
+    let repair_target =
+        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
+    snapshot.frontiers.header_best =
+        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32]));
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the send-failure fixture builds");
+    let peers: Vec<_> = [1_u8, 2, 3, 4]
+        .into_iter()
+        .map(|byte| ZakuraPeerId::new(vec![byte; 32]).expect("the peer ID is bounded"))
+        .collect();
+    let status = Status {
+        work_anchor_height: anchor.height,
+        work_anchor_hash: anchor.hash,
+        selected_tip_height: snapshot.frontiers.header_best.height,
+        selected_tip_hash: snapshot.frontiers.header_best.hash,
+        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+        oldest_retained_height: anchor.height,
+        max_headers_per_response: 1,
+        max_inflight_requests: 1,
+        max_message_bytes: 2_000_000,
+        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+    };
+    for (index, peer) in peers.iter().enumerate() {
+        let session_id = 7 + u64::try_from(index).expect("four peer indexes fit in u64");
+        let (send, outbound) = framed_channel(8);
+        reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+            peer.clone(),
+            session_id,
+            send,
+            CancellationToken::new(),
+        ));
+        reactor.handle_wire_message(
+            peer.clone(),
+            session_id,
+            HeaderSyncMessage::Status(status.clone()),
+        );
+        drop(outbound);
+    }
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
+        INTERNAL_VCT_REPAIR_SESSION_ID,
+        std::num::NonZeroU64::new(1).expect("one is nonzero"),
+    );
+    let context = zakura_header_chain::VctRepairContext {
+        target: repair_target,
+        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
+    };
+    let mut task = RepairRequirement::new(owner, repair_target.height, 11);
+    task.state = RepairPolicyState::Ready {
+        context: context.clone(),
+    };
+    reactor.vct_repair.insert(task);
+
+    reactor.try_assign_vct_repair();
+
+    let first_retry_at = match &reactor
+        .vct_repair
+        .current()
+        .expect("send failures keep the repair")
+        .state
+    {
+        RepairPolicyState::SupplierBackoff { retry_at, .. } => *retry_at,
+        other => panic!("three send failures must back off, got {other:?}"),
+    };
+    let task = reactor.vct_repair.current().expect("the repair remains");
+    assert_eq!(task.tried_sources.len(), MAX_SUPPLIERS_PER_CYCLE);
+    assert_eq!(task.supplier_cursor, Some(source_id_from_peer(&peers[2])));
+    let stall = reactor
+        .vct_repair_stall
+        .expect("send failures start the stall clock");
+
+    reactor
+        .vct_repair
+        .current_mut()
+        .expect("the repair remains")
+        .resume_retry_cycle(first_retry_at);
+    reactor.try_assign_vct_repair();
+
+    let task = reactor.vct_repair.current().expect("the repair remains");
+    assert!(matches!(
+        task.state,
+        RepairPolicyState::SupplierBackoff { .. }
+    ));
+    assert_eq!(task.tried_sources.len(), MAX_SUPPLIERS_PER_CYCLE);
+    assert_eq!(task.supplier_cursor, Some(source_id_from_peer(&peers[1])));
+    assert_eq!(
+        reactor
+            .vct_repair_stall
+            .expect("the next send cycle preserves the stall clock")
+            .since,
+        stall.since
+    );
 }
 
 #[test]

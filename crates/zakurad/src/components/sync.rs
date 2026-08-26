@@ -94,6 +94,14 @@ fn block_error_peer_label(error: &BlockDownloadVerifyError, expose_peer_addresse
 /// accountability in `zakura-network` disconnects such peers so this bound is rarely reached.
 const MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 8;
 
+/// Controls how many times the syncer requeues a required block hash after a transient peer or
+/// transport failure exhausts the block download service's internal retries.
+///
+/// A connection closing does not invalidate the selected chain or any other block already in the
+/// checkpoint verifier. Requeueing only the affected hash preserves that work. The bound still
+/// lets a persistently failing block restart the round and obtain fresh tips and peers.
+const TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 3;
+
 /// Controls how many times the syncer immediately requeues a required block after a peer supplies
 /// a body whose coinbase height contradicts our own tip
 /// ([`BlockDownloadVerifyError::TipChildHeightMismatch`]).
@@ -878,6 +886,9 @@ where
     /// `notfound` ([`NotFoundKind::Response`]). Bounded by [`MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT`].
     missing_block_retry_counts: HashMap<block::Hash, usize>,
 
+    /// Per-hash retry counts for transient peer and transport download failures.
+    transient_block_retry_counts: HashMap<block::Hash, usize>,
+
     /// Queue-level retry counts for required blocks whose body claimed a coinbase height that
     /// contradicts our own tip. Bounded by [`POISONED_BLOCK_RETRY_LIMIT`].
     poisoned_block_retry_counts: HashMap<block::Hash, usize>,
@@ -1049,6 +1060,7 @@ where
             prospective_tips: HashSet::new(),
             recent_syncs,
             missing_block_retry_counts: HashMap::new(),
+            transient_block_retry_counts: HashMap::new(),
             poisoned_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
@@ -1409,6 +1421,7 @@ where
     ) -> Result<(), Report> {
         self.prospective_tips = HashSet::new();
         self.missing_block_retry_counts.clear();
+        self.transient_block_retry_counts.clear();
         self.poisoned_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
@@ -2472,7 +2485,8 @@ where
         Self::handle_response(response, self.expose_peer_addresses)
     }
 
-    /// Handles a downloaded block response, requeueing required missing or poisoned block hashes.
+    /// Handles a downloaded block response and requeues a required hash when retrying one block can
+    /// preserve the rest of the round.
     ///
     /// A [`BlockDownloadVerifyError::TipChildHeightMismatch`] means a peer returned a body under
     /// the correct block hash but with a rewritten coinbase height. That satisfies the network
@@ -2488,6 +2502,10 @@ where
     /// rather than discarding the whole round. The requeues are bounded by
     /// [`MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT`].
     ///
+    /// A transient peer or transport error also affects only one requested hash. The syncer
+    /// requeues that hash after the download service exhausts its internal retries. The requeues
+    /// are bounded by [`TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT`].
+    ///
     /// A [`NotFoundKind::Registry`] miss means the peer set found that *every* ready peer is marked
     /// missing the block, so it can't be served right now. Rather than blocking the loop on an inline
     /// `sleep`, the hash is recorded in [`Self::registry_miss_retry`] with a backoff deadline; while
@@ -2502,6 +2520,7 @@ where
     ) -> Result<(), Report> {
         if let Ok((_height, hash)) = response.as_ref() {
             self.missing_block_retry_counts.remove(hash);
+            self.transient_block_retry_counts.remove(hash);
             self.poisoned_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
             self.registry_miss_retry.remove(hash);
@@ -2652,6 +2671,48 @@ where
                     );
                 }
             }
+        }
+
+        if let Some(hash) = response.as_ref().err().and_then(|error| match error {
+            BlockDownloadVerifyError::DownloadFailed { hash, .. }
+                if error.not_found_download().is_none() =>
+            {
+                Some(*hash)
+            }
+            _ => None,
+        }) {
+            let retry_count = self.transient_block_retry_counts.entry(hash).or_default();
+
+            if *retry_count < TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT {
+                *retry_count += 1;
+
+                info!(
+                    ?hash,
+                    retry_attempt = *retry_count,
+                    retry_limit = TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT,
+                    "transient sync block download failed, retrying required block"
+                );
+                metrics::counter!("sync.transient.block.requeued.count").increment(1);
+
+                match self.downloads.download_and_verify(hash).await {
+                    Ok(())
+                    | Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {
+                        return Ok(())
+                    }
+                    Err(error) => self.handle_block_response(Err(error))?,
+                }
+
+                return Ok(());
+            }
+
+            self.transient_block_retry_counts.remove(&hash);
+
+            warn!(
+                ?hash,
+                retry_limit = TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT,
+                "transient sync block download retry budget exhausted, restarting sync"
+            );
+            metrics::counter!("sync.transient.block.retry.limit.count").increment(1);
         }
 
         self.handle_block_response(response)?;

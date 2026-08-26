@@ -69,6 +69,7 @@ fi
 
 python3 - "${{config}}" "${{sha}}" <<'PY'
 import importlib.util
+import os
 import pathlib
 import sys
 
@@ -78,6 +79,7 @@ controller = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 sys.modules[spec.name] = controller
 spec.loader.exec_module(controller)
+os.environ["PATH"] = "/root/.cargo/bin:" + os.environ.get("PATH", "")
 config = controller.load_config(pathlib.Path(sys.argv[1]))
 binary = controller.build_binary(config, sys.argv[2])
 print(f"built={{binary}}")

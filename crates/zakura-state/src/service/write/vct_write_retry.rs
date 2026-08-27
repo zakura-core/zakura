@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::info;
 use zakura_chain::block::Height;
+use zakura_header_chain::EvidenceId;
 
 use crate::service::{
     finalized_state::FinalizedState,
@@ -46,6 +47,11 @@ pub(super) struct VctWriteRetryManager {
     root_repair_status: VctRootRepairStatus,
     /// Lowest metadata height that blocks the committer.
     committer_repair_height: Option<Height>,
+    /// Last rejected delivery that lacked durable boundary evidence.
+    ///
+    /// The writer must refetch this delivery once. Repeated commit polls must not restart the
+    /// same repair episode.
+    unrecorded_committer_rejection: Option<(Height, EvidenceId)>,
     /// Lowest metadata height that blocks the authentication sweep.
     ///
     /// The sweep runs far above the committer, so this height usually exceeds the committer repair
@@ -67,12 +73,14 @@ pub(super) enum VctRepairTrigger {
     MissingRootObserved,
     /// The writer rejected or disputed a selected delivery and needs another delivery.
     RejectedDelivery,
+    /// The writer rejected a delivery without enough boundary evidence to persist the rejection.
+    UnrecordedRejectedDelivery(EvidenceId),
 }
 
 impl VctRepairTrigger {
     /// Whether this event starts a distinct repair episode.
     fn starts_new_episode(self) -> bool {
-        self == Self::RejectedDelivery
+        self != Self::MissingRootObserved
     }
 }
 
@@ -106,6 +114,7 @@ impl VctWriteRetryManager {
             root_repair_sender,
             root_repair_status: VctRootRepairStatus::default(),
             committer_repair_height: None,
+            unrecorded_committer_rejection: None,
             sweep_repair_height: None,
         }
     }
@@ -233,7 +242,16 @@ impl VctWriteRetryManager {
     }
 
     fn request_committer_repair(&mut self, height: Height, trigger: VctRepairTrigger) {
-        let starts_new_episode = trigger.starts_new_episode();
+        let starts_new_episode = match trigger {
+            VctRepairTrigger::MissingRootObserved => false,
+            VctRepairTrigger::RejectedDelivery => true,
+            VctRepairTrigger::UnrecordedRejectedDelivery(delivery_id) => {
+                let rejection = (height, delivery_id);
+                let changed = self.unrecorded_committer_rejection != Some(rejection);
+                self.unrecorded_committer_rejection = Some(rejection);
+                changed
+            }
+        };
         self.committer_repair_height = Some(height);
         self.publish_effective_repair_status(
             starts_new_episode.then_some(VctRepairRequester::Committer),
@@ -242,6 +260,7 @@ impl VctWriteRetryManager {
 
     fn clear_committer_repair(&mut self) {
         self.committer_repair_height = None;
+        self.unrecorded_committer_rejection = None;
         self.publish_effective_repair_status(None);
     }
 

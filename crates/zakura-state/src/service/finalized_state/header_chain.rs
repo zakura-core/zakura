@@ -819,6 +819,21 @@ struct RetainedPathLeaseRegistry {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum RetainedPathCapacity {
+    General,
+    FinalizedFallback,
+}
+
+impl RetainedPathCapacity {
+    fn limit(self) -> usize {
+        match self {
+            Self::General => MAX_RETAINED_PATH_LEASES.saturating_sub(1),
+            Self::FinalizedFallback => MAX_RETAINED_PATH_LEASES,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum CanonicalHeaderPathPosition {
     Finalized {
         next: block::Height,
@@ -954,12 +969,16 @@ impl RetainedPathLeaseRegistry {
         Some(cursor)
     }
 
-    fn reserve(&mut self, peer: SourceId, now: Instant) -> Option<u64> {
+    fn reserve(
+        &mut self,
+        peer: SourceId,
+        now: Instant,
+        capacity: RetainedPathCapacity,
+    ) -> Option<u64> {
         self.expire(now);
         if self.by_peer.contains_key(&peer)
             || self.reservations.contains_key(&peer)
-            || self.by_peer.len().saturating_add(self.reservations.len())
-                >= MAX_RETAINED_PATH_LEASES
+            || self.by_peer.len().saturating_add(self.reservations.len()) >= capacity.limit()
         {
             return None;
         }
@@ -1748,12 +1767,12 @@ impl HeaderChainReader {
         reservation.commit(spec, Instant::now())
     }
 
-    /// Lease a canonical path that ends at a finalized target below the header frontier.
+    /// Lease one canonical header that ends at a finalized target below the header frontier.
     ///
     /// Refusing a finalized target would strand any node whose VCT repair height every peer has
     /// already finalized: the requester has no other way to obtain that exact header and its
-    /// authenticated roots. Finalized rows are immutable, so the path is a plain contiguous run
-    /// from the locator's canonical ancestor up to the target.
+    /// authenticated roots. The fallback requires the target's canonical predecessor as a
+    /// locator. This bound makes every finalized fallback lease complete in one page.
     fn acquire_finalized_target_path(
         &self,
         reservation: RetainedPathReservation,
@@ -1772,10 +1791,13 @@ impl HeaderChainReader {
             // means the branch moved under the request, so the requester must re-derive it.
             return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
         }
+        let Ok(predecessor_height) = target.height.previous() else {
+            return Ok(RetainedPathLeaseOutcome::NoLocatorIntersection);
+        };
         let mut common_ancestor = None;
         for locator_hash in locator_hashes {
             if let Some(frontier) = self.finalized_frontier(*locator_hash)? {
-                if frontier.height < target.height {
+                if frontier.height == predecessor_height {
                     common_ancestor = Some(frontier);
                     break;
                 }
@@ -1817,7 +1839,8 @@ impl HeaderChainReader {
     /// when no locator hash is a canonical ancestor of it, `HistoryPruned` when the retained
     /// path no longer reaches the finalized frontier, and `Busy` when the peer already holds a
     /// lease or the branch moved under the request. On success the peer owns one lease until it
-    /// releases the lease or the idle deadline expires.
+    /// releases the lease or the idle deadline expires. A finalized fallback requires the exact
+    /// canonical predecessor, so it cannot retain a multi-page historical path.
     pub(crate) fn acquire_retained_path(
         &self,
         peer: SourceId,
@@ -1833,11 +1856,25 @@ impl HeaderChainReader {
                 "retained path locator count is outside protocol bounds",
             )));
         }
+        // General paths may occupy all but one registry slot. A target outside the retained graph
+        // may use the final slot only when it resolves to the bounded finalized fallback below.
+        let capacity = if self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .graph()
+            .header_node(target_tip_hash)
+            .is_some()
+        {
+            RetainedPathCapacity::General
+        } else {
+            RetainedPathCapacity::FinalizedFallback
+        };
         let reservation_id = self
             .leases
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .reserve(peer, Instant::now());
+            .reserve(peer, Instant::now(), capacity);
         let Some(reservation_id) = reservation_id else {
             return Ok(RetainedPathLeaseOutcome::Busy);
         };

@@ -209,6 +209,27 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
         None,
         "hash-mismatched provenance fails closed"
     );
+    let mut rejected_at_handoff = window.clone();
+    rejected_at_handoff.delivery = unauthenticated;
+    assert_eq!(
+        unrecorded_vct_failure_repair(
+            &rejected_at_handoff,
+            VctAuxiliaryFailureAttribution::CurrentDelivery,
+        ),
+        Some((
+            block::Height(1),
+            VctRepairTrigger::UnrecordedRejectedDelivery(unauthenticated.delivery_id),
+        )),
+        "a handoff rejection without a successor boundary starts a replacement episode"
+    );
+    assert_eq!(
+        unrecorded_vct_failure_repair(
+            &rejected_at_handoff,
+            VctAuxiliaryFailureAttribution::NoDelivery,
+        ),
+        None,
+        "failure without an attributable delivery cannot request a replacement"
+    );
     assert!(
         HeaderChainWriter::vct_authentication_request(
             &window,

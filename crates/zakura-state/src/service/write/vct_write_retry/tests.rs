@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration, time::Instant};
 
 use tokio::sync::{mpsc, oneshot};
 use zakura_chain::{block::Height, serialization::ZcashDeserializeInto};
+use zakura_header_chain::EvidenceId;
 
 use super::{
     VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager, VCT_AWAIT_SUCCESSOR_WAIT,
@@ -206,6 +207,45 @@ fn root_repair_signal_advances_generation_after_rejected_replacement() {
     let second = *rx.borrow_and_update();
     assert_eq!(second.generation, 2);
     assert_eq!(second.state, first.state);
+}
+
+#[test]
+fn unrecorded_rejection_refetches_each_delivery_once() {
+    let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let mut manager = VctWriteRetryManager::new(tx);
+    let height = Height(42);
+    let first_delivery = EvidenceId::from_digest([1; 32]);
+
+    manager.on_retryable_error(
+        height,
+        VctWriteRetryCause::MissingRoot {
+            trigger: VctRepairTrigger::UnrecordedRejectedDelivery(first_delivery),
+        },
+        queued_block(1),
+    );
+    let first = *rx.borrow_and_update();
+    assert_eq!(first.generation, 1);
+
+    manager.on_retryable_error(
+        height,
+        VctWriteRetryCause::MissingRoot {
+            trigger: VctRepairTrigger::UnrecordedRejectedDelivery(first_delivery),
+        },
+        queued_block(2),
+    );
+    assert!(
+        !rx.has_changed().expect("watch channel remains open"),
+        "polling the same unrecorded rejection must keep its replacement in flight"
+    );
+
+    manager.on_retryable_error(
+        height,
+        VctWriteRetryCause::MissingRoot {
+            trigger: VctRepairTrigger::UnrecordedRejectedDelivery(EvidenceId::from_digest([2; 32])),
+        },
+        queued_block(3),
+    );
+    assert_eq!(rx.borrow_and_update().generation, first.generation + 1);
 }
 
 #[test]

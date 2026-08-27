@@ -76,6 +76,27 @@ fn vct_failure_repair_trigger(apply_result: &ApplyResult) -> Option<VctRepairTri
     }
 }
 
+/// Starts one replacement episode when current-root rejection lacks a successor boundary.
+fn unrecorded_vct_failure_repair(
+    auxiliary_window: &VctAuxiliaryWindow,
+    attribution: VctAuxiliaryFailureAttribution,
+) -> Option<(Height, VctRepairTrigger)> {
+    if attribution != VctAuxiliaryFailureAttribution::CurrentDelivery
+        || auxiliary_window
+            .successor
+            .as_ref()
+            .and_then(|successor| successor.auth_data_root)
+            .is_some()
+    {
+        return None;
+    }
+
+    Some((
+        auxiliary_window.delivery.tree_aux?.height,
+        VctRepairTrigger::UnrecordedRejectedDelivery(auxiliary_window.delivery.delivery_id),
+    ))
+}
+
 fn missing_vct_successor_retry(
     successor_height: Option<Height>,
     current_height: Height,
@@ -2221,6 +2242,9 @@ impl WriteBlockWorkerTask {
                             "VCT: attributed exact auxiliary verification failure"
                         );
 
+                        attributed_failure_repair =
+                            unrecorded_vct_failure_repair(auxiliary_window, failure_attribution);
+
                         if let Some(writer) = header_chain.as_ref() {
                             match writer.record_vct_auxiliary_failure(
                                 auxiliary_window,
@@ -2244,12 +2268,14 @@ impl WriteBlockWorkerTask {
                                         .map(|height| (height, trigger));
                                 }
                                 Ok(Some(ApplyResult::Stale(receipt))) => {
+                                    attributed_failure_repair = None;
                                     tracing::debug!(
                                         ?receipt,
                                         "VCT: ignored stale auxiliary failure evidence"
                                     );
                                 }
                                 Ok(Some(ApplyResult::ResourceStalled(receipt))) => {
+                                    attributed_failure_repair = None;
                                     tracing::warn!(
                                         ?receipt,
                                         "VCT: auxiliary failure evidence stopped by a committed resource alarm"
@@ -2257,6 +2283,7 @@ impl WriteBlockWorkerTask {
                                 }
                                 Ok(None) => {}
                                 Err(record_error) => {
+                                    attributed_failure_repair = None;
                                     tracing::error!(
                                         ?record_error,
                                         "VCT: could not persist auxiliary failure evidence"

@@ -1836,7 +1836,6 @@ mod tests {
     use tower::{service_fn, Service};
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_network::zakura::{
-        commit_state_trace as cs_trace,
         testkit::{TraceCapture, TraceValue},
         BlockSyncFrontiers, COMMIT_STATE_TABLE,
     };
@@ -2082,10 +2081,10 @@ mod tests {
         capture.flush().await;
         let reader = capture.reader().expect("test trace is readable");
         reader.table(COMMIT_STATE_TABLE.table()).assert_row(
-            cs_trace::REACTOR_EVENT_SENT,
+            "reactor_event_sent",
             &[
-                (cs_trace::APPLY_TOKEN, TraceValue::U64(2)),
-                (cs_trace::RESULT, TraceValue::Str("committed")),
+                ("apply_token", TraceValue::U64(2)),
+                ("result", TraceValue::Str("committed")),
             ],
         );
 

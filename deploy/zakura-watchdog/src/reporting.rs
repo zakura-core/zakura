@@ -60,6 +60,11 @@ impl Reporter {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_status_for_test(&self, check_name: &'static str) -> Option<CheckStatus> {
+        self.last_status.get(check_name).copied()
+    }
+
     /// Logs the outcome of one check cycle and captures a Sentry event when
     /// the check transitioned between passing and failing.
     ///

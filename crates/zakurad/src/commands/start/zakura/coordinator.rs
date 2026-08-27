@@ -361,6 +361,11 @@ impl SyncCoordinator {
         } else {
             diagnostic_interval
         };
+        if self.in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && self.operation_count() == 0
+        {
+            return Ok(());
+        }
         let started = tokio::time::Instant::now();
         let deadline = tokio::time::sleep(LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE);
         tokio::pin!(deadline);

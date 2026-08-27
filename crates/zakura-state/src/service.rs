@@ -798,11 +798,10 @@ impl StateService {
     }
 
     fn poll_non_finalized_write_failures(&mut self, cx: &mut Context<'_>) {
-        loop {
-            match Pin::new(&mut self.non_finalized_rejected_receiver).poll_recv(cx) {
-                Poll::Ready(Some(failure)) => self.handle_non_finalized_write_failure(failure),
-                Poll::Ready(None) | Poll::Pending => break,
-            }
+        while let Poll::Ready(Some(failure)) =
+            Pin::new(&mut self.non_finalized_rejected_receiver).poll_recv(cx)
+        {
+            self.handle_non_finalized_write_failure(failure);
         }
     }
 

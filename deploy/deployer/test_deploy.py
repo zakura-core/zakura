@@ -251,7 +251,7 @@ printf() {
                 self.assertLess(suppression, restart_guard_end)
                 self.assertLess(restart_guard_end, artifact_install)
 
-    def test_mainnet_workflow_bounds_suppression_ssh_sessions(self):
+    def test_mainnet_workflow_bounds_and_tolerates_suppression_ssh_failures(self):
         workflow = (
             SCRIPT_DIR.parent.parent
             / ".github/workflows/zakura-mainnet-deploy.yml"
@@ -261,10 +261,11 @@ printf() {
         )[1].split("      - name: Deploy fleet\n", 1)[0]
 
         self.assertIn(
-            "timeout --signal=TERM --kill-after=5s 60s \\", suppression_step
+            "if ! timeout --signal=TERM --kill-after=5s 60s \\", suppression_step
         )
         self.assertIn("-o ServerAliveInterval=10 \\", suppression_step)
         self.assertIn("-o ServerAliveCountMax=3 \\", suppression_step)
+        self.assertIn("continuing deploy", suppression_step)
 
 
 class NodeBuilder:

@@ -38,6 +38,9 @@ use crate::zakura::{
 const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 const LEASE_RELEASE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const VCT_REPAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Hard deadline for one VCT repair prepare or apply operation.
+const VCT_LOCAL_OPERATION_FATAL_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
 /// Minimum interval between repeated stalled-repair trace rows for one repair generation.
 ///
 /// The reactor emits the first row immediately, then samples while nothing changes. The bound
@@ -177,6 +180,7 @@ fn build_header_sync_reactor(
         completed_targets: CompletedHeaderTargets::default(),
         vct_repair: RepairRequirementSlot::default(),
         vct_repair_stall: None,
+        vct_local_operation: None,
         vct_supplier_order: VecDeque::new(),
         served_paths: HashMap::new(),
         served_path_deadlines: HashMap::new(),
@@ -276,6 +280,8 @@ struct HeaderSyncReactor {
     vct_repair: RepairRequirementSlot,
     /// Escalation state for a repair generation that has not completed.
     vct_repair_stall: Option<VctRepairStall>,
+    /// Hard deadline for the one locally executing VCT repair mutation.
+    vct_local_operation: Option<VctLocalOperation>,
     /// Admitted authenticated peers in stable supplier selection order.
     ///
     /// The admitted peer limits bound this queue. New identities enter behind established peers.
@@ -546,6 +552,57 @@ struct VctRepairStall {
     outcome: VctRepairStallOutcome,
 }
 
+#[derive(Clone, Debug)]
+struct VctLocalOperation {
+    phase: HeaderTargetPhase,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+    repair_generation: u64,
+    target: zakura_header_chain::Frontier,
+    started_at: Instant,
+    deadline: Instant,
+    fatal_sent: bool,
+}
+
+impl VctLocalOperation {
+    fn from_action(action: &HeaderPortOperation, now: Instant) -> Option<Self> {
+        let (phase, purpose, owner) = match action {
+            HeaderPortOperation::PrepareHeaderTarget { purpose, owner, .. } => {
+                (HeaderTargetPhase::Preparing, purpose, *owner)
+            }
+            HeaderPortOperation::ApplyHeaderTarget { purpose, owner, .. } => {
+                (HeaderTargetPhase::Applying, purpose, *owner)
+            }
+            _ => return None,
+        };
+        let HeaderTargetPurpose::SelectedAuxiliaryRepair {
+            selected_target,
+            repair_generation,
+        } = purpose
+        else {
+            return None;
+        };
+        Some(Self {
+            phase,
+            owner,
+            repair_generation: *repair_generation,
+            target: *selected_target,
+            started_at: now,
+            deadline: now + VCT_LOCAL_OPERATION_FATAL_AFTER,
+            fatal_sent: false,
+        })
+    }
+
+    fn phase_label(&self) -> &'static str {
+        match self.phase {
+            HeaderTargetPhase::Preparing => "prepare",
+            HeaderTargetPhase::Applying => "apply",
+            HeaderTargetPhase::Receiving => {
+                unreachable!("only local VCT operation phases have hard deadlines")
+            }
+        }
+    }
+}
+
 impl VctRepairStall {
     fn next_deadline(self) -> Instant {
         let trace_at = self
@@ -654,22 +711,19 @@ impl HeaderSyncReactor {
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
         let terminal_outcome = loop {
-            let maintenance = self.next_maintenance_deadline();
-            if maintenance <= Instant::now() {
-                self.refresh_statuses();
-                continue;
+            if self
+                .vct_local_operation
+                .as_ref()
+                .is_some_and(|operation| operation.fatal_sent)
+            {
+                self.startup.shutdown.cancelled().await;
+                break HeaderRequestTerminal::Shutdown;
             }
+            let maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             tokio::select! {
+                biased;
                 _ = self.startup.shutdown.cancelled() => break HeaderRequestTerminal::Shutdown,
-                event = self.lifecycle.recv() => match event {
-                    Some(event) => self.handle_event(event),
-                    None => break HeaderRequestTerminal::Shutdown,
-                },
-                event = self.events.recv() => match event {
-                    Some(event) => self.handle_event(event),
-                    None => break HeaderRequestTerminal::Shutdown,
-                },
                 completion = async {
                     if self.pending_port_operations.is_empty() {
                         std::future::pending().await
@@ -681,6 +735,15 @@ impl HeaderSyncReactor {
                         self.handle_port_completion(completion);
                     }
                 }
+                _ = time::sleep_until(maintenance) => self.refresh_statuses(),
+                event = self.lifecycle.recv() => match event {
+                    Some(event) => self.handle_event(event),
+                    None => break HeaderRequestTerminal::Shutdown,
+                },
+                event = self.events.recv() => match event {
+                    Some(event) => self.handle_event(event),
+                    None => break HeaderRequestTerminal::Shutdown,
+                },
                 changed = async {
                     match committed_snapshots.as_mut() {
                         Some(snapshots) => snapshots.changed().await,
@@ -714,7 +777,6 @@ impl HeaderSyncReactor {
                         vct_root_repairs = None;
                     }
                 }
-                _ = time::sleep_until(maintenance) => self.refresh_statuses(),
             }
         };
         self.retire_all_peer_work(terminal_outcome);
@@ -1614,6 +1676,7 @@ impl HeaderSyncReactor {
         owner: zakura_header_chain::HeaderSyncWorkOwner,
         result: HeaderTargetAdmissionResult,
     ) {
+        self.finish_vct_local_operation(owner, HeaderTargetPhase::Applying);
         let Some(active) = self.peer_work_queue.active(&peer).cloned() else {
             return;
         };
@@ -1761,6 +1824,7 @@ impl HeaderSyncReactor {
         owner: zakura_header_chain::HeaderSyncWorkOwner,
         result: HeaderTargetPreparationResult,
     ) {
+        self.finish_vct_local_operation(owner, HeaderTargetPhase::Preparing);
         let Some(active) = self.peer_work_queue.active(&peer).cloned() else {
             return;
         };
@@ -3291,6 +3355,9 @@ impl HeaderSyncReactor {
 
     fn refresh_statuses(&mut self) {
         let now = Instant::now();
+        if self.report_fatal_vct_local_operation(now) {
+            return;
+        }
         self.refresh_vct_repair_stall(now);
         self.retry_pending_lease_releases(now);
         self.retire_timed_out_requests(now);
@@ -3336,10 +3403,72 @@ impl HeaderSyncReactor {
                     .and_then(RepairRequirement::next_deadline),
             )
             .chain(self.vct_repair_stall.map(VctRepairStall::next_deadline))
+            .chain(
+                self.vct_local_operation
+                    .as_ref()
+                    .filter(|operation| !operation.fatal_sent)
+                    .map(|operation| operation.deadline),
+            )
             .chain(self.served_path_deadlines.values().copied())
             .chain(self.lease_release_retry_at)
             .min()
             .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(60))
+    }
+
+    fn finish_vct_local_operation(
+        &mut self,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
+        phase: HeaderTargetPhase,
+    ) {
+        if self.vct_local_operation.as_ref().is_some_and(|operation| {
+            operation.owner == owner && operation.phase == phase && !operation.fatal_sent
+        }) {
+            self.vct_local_operation = None;
+        }
+    }
+
+    /// Report one fatal event while retaining the original operation future until shutdown.
+    fn report_fatal_vct_local_operation(&mut self, now: Instant) -> bool {
+        let Some(operation) = self.vct_local_operation.as_ref() else {
+            return false;
+        };
+        if operation.fatal_sent {
+            return true;
+        }
+        if operation.deadline > now {
+            return false;
+        }
+
+        let elapsed = now.saturating_duration_since(operation.started_at);
+        let event = HeaderSyncFatalEvent {
+            phase: operation.phase_label(),
+            owner: operation.owner,
+            repair_generation: operation.repair_generation,
+            target: operation.target,
+            elapsed,
+        };
+        tracing::error!(
+            phase = event.phase,
+            owner = ?event.owner,
+            repair_generation = event.repair_generation,
+            branch = ?event.owner.header_authority().branch,
+            target = ?event.target,
+            elapsed = ?event.elapsed,
+            "VCT: local repair operation exceeded its hard deadline; terminating the node"
+        );
+        metrics::counter!(
+            "sync.header.vct.repair.local_operation_fatal.total",
+            "phase" => event.phase,
+        )
+        .increment(1);
+        self.vct_local_operation
+            .as_mut()
+            .expect("the reported local operation remains installed")
+            .fatal_sent = true;
+        if let Some(events) = self.startup.fatal_events.as_ref() {
+            let _ = events.send(event);
+        }
+        true
     }
 
     fn retire_timed_out_requests(&mut self, now: Instant) {
@@ -3854,6 +3983,15 @@ impl HeaderSyncReactor {
     fn dispatch_direct_port_operation(&mut self, action: HeaderPortOperation) -> bool {
         use zakura_node_services::header_chain as port;
 
+        let vct_local_operation = VctLocalOperation::from_action(&action, Instant::now());
+        if vct_local_operation.is_some() && self.vct_local_operation.is_some() {
+            tracing::error!(
+                current = ?self.vct_local_operation,
+                attempted = ?vct_local_operation,
+                "refused to replace an owned VCT local operation"
+            );
+            return false;
+        }
         if let HeaderPortOperation::QueryHeaderLocator { peer, .. } = &action {
             if !self.pending_locator_queries.insert(peer.clone()) {
                 return true;
@@ -4179,6 +4317,9 @@ impl HeaderSyncReactor {
                     Ok(completion) => PortOperationResult::Completed(completion),
                     Err(_) => PortOperationResult::Panicked(Box::new(panic_context)),
                 });
+        if let Some(operation) = vct_local_operation {
+            self.vct_local_operation = Some(operation);
+        }
         self.pending_port_operations.push(Box::pin(operation));
         true
     }
@@ -4325,6 +4466,16 @@ impl HeaderSyncReactor {
     }
 
     fn handle_port_panic(&mut self, context: PortPanicContext) {
+        if let Some(owner) = context.owner {
+            if let Some(phase) = self
+                .vct_local_operation
+                .as_ref()
+                .filter(|operation| operation.owner == owner)
+                .map(|operation| operation.phase)
+            {
+                self.finish_vct_local_operation(owner, phase);
+            }
+        }
         metrics::counter!(
             "sync.header.port.panicked",
             "operation" => context.operation

@@ -18,6 +18,8 @@ struct PendingVctLocalPort {
     apply_calls: Arc<AtomicUsize>,
     prepare_release: Arc<Notify>,
     apply_release: Arc<Notify>,
+    prepare_delay: Option<std::time::Duration>,
+    apply_delay: Option<std::time::Duration>,
     apply_succeeds: bool,
 }
 
@@ -67,9 +69,13 @@ impl port::Port for PendingVctLocalPort {
     ) -> port::HeaderChainFuture<'_, port::PrepareHeaderTargetReply> {
         let calls = self.prepare_calls.clone();
         let release = self.prepare_release.clone();
+        let delay = self.prepare_delay;
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
-            release.notified().await;
+            match delay {
+                Some(delay) => time::sleep(delay).await,
+                None => release.notified().await,
+            }
             Err(Arc::new(
                 zakura_header_chain::HeaderChainError::local_resource(
                     zakura_header_chain::ErrorSubject::Branch(
@@ -87,11 +93,15 @@ impl port::Port for PendingVctLocalPort {
     ) -> port::HeaderChainFuture<'_, port::ApplyHeaderTargetReply> {
         let calls = self.apply_calls.clone();
         let release = self.apply_release.clone();
+        let delay = self.apply_delay;
         let succeeds = self.apply_succeeds;
         let owner = target.owner();
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
-            release.notified().await;
+            match delay {
+                Some(delay) => time::sleep(delay).await,
+                None => release.notified().await,
+            }
             if succeeds {
                 Ok(port::ApplyHeaderTargetOutcome::Applied)
             } else {
@@ -150,6 +160,18 @@ fn seed_vct_active_request(
 fn direct_vct_reactor(
     port: Arc<dyn port::Port>,
 ) -> (HeaderSyncReactor, zakura_header_chain::EngineSnapshot) {
+    let (_handle, reactor, snapshot, _fatal_events) = direct_vct_reactor_with_fatal_events(port);
+    (reactor, snapshot)
+}
+
+fn direct_vct_reactor_with_fatal_events(
+    port: Arc<dyn port::Port>,
+) -> (
+    HeaderSyncHandle,
+    HeaderSyncReactor,
+    zakura_header_chain::EngineSnapshot,
+    mpsc::UnboundedReceiver<HeaderSyncFatalEvent>,
+) {
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let snapshot = committed_snapshot(anchor);
@@ -157,9 +179,11 @@ fn direct_vct_reactor(
     startup.committed_snapshots = Some(snapshots_rx);
     startup.header_chain_port = port;
     startup.use_direct_port();
-    let (_, _, reactor) =
+    let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
+    startup.fatal_events = Some(fatal_tx);
+    let (handle, _, reactor) =
         build_header_sync_reactor(startup).expect("the direct VCT fixture builds");
-    (reactor, snapshot)
+    (handle, reactor, snapshot, fatal_rx)
 }
 
 fn prepared_vct_target(
@@ -236,6 +260,302 @@ fn poll_pending_operation(reactor: &mut HeaderSyncReactor) {
             .is_none(),
         "the local operation remains pending"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_vct_prepare_and_apply_emit_one_fatal_event_at_thirty_minutes() {
+    for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let apply_calls = Arc::new(AtomicUsize::new(0));
+        let port = Arc::new(PendingVctLocalPort {
+            prepare_calls: prepare_calls.clone(),
+            apply_calls: apply_calls.clone(),
+            prepare_release: Arc::new(Notify::new()),
+            apply_release: Arc::new(Notify::new()),
+            prepare_delay: None,
+            apply_delay: None,
+            apply_succeeds: true,
+        });
+        let (_handle, mut reactor, snapshot, mut fatal_events) =
+            direct_vct_reactor_with_fatal_events(port);
+        let peer = peer();
+        let (source, owner, context) =
+            seed_vct_active_request(&mut reactor, &snapshot, peer.clone(), 7, phase);
+        let active = reactor
+            .peer_work_queue
+            .active(&peer)
+            .expect("the fixture has one active repair");
+        let action = match phase {
+            HeaderTargetPhase::Preparing => HeaderPortOperation::PrepareHeaderTarget {
+                purpose: active.purpose.clone(),
+                peer: peer.clone(),
+                source,
+                owner,
+                common_ancestor: snapshot.frontiers.finalized,
+                target: context.target,
+                completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
+                    common_ancestor: snapshot.frontiers.finalized,
+                    selected_target: context.target,
+                },
+                entries: active.entries.clone(),
+            },
+            HeaderTargetPhase::Applying => HeaderPortOperation::ApplyHeaderTarget {
+                purpose: active.purpose.clone(),
+                peer: peer.clone(),
+                source,
+                owner,
+                target: prepared_vct_target(&reactor, &snapshot, &peer, source, owner, &context),
+            },
+            HeaderTargetPhase::Receiving => {
+                unreachable!("the test covers local operation phases")
+            }
+        };
+        assert!(reactor.dispatch_action(action));
+        poll_pending_operation(&mut reactor);
+        reactor.request_deadlines.insert(
+            peer.clone(),
+            Instant::now() + reactor.startup.request_timeout,
+        );
+
+        for diagnostic in 1..60 {
+            time::advance(reactor.startup.request_timeout).await;
+            let now = Instant::now();
+            reactor.retire_timed_out_requests(now);
+            assert!(!reactor.report_fatal_vct_local_operation(now));
+            assert!(matches!(
+                fatal_events.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert_eq!(reactor.pending_port_operations.len(), 1);
+            assert_eq!(
+                prepare_calls.load(Ordering::SeqCst) + apply_calls.load(Ordering::SeqCst),
+                1,
+                "diagnostic {diagnostic} must not duplicate the state operation",
+            );
+        }
+
+        time::advance(reactor.startup.request_timeout).await;
+        let now = Instant::now();
+        reactor.retire_timed_out_requests(now);
+        assert!(reactor.report_fatal_vct_local_operation(now));
+        let fatal = fatal_events
+            .try_recv()
+            .expect("the hard deadline emits one fatal event");
+        assert_eq!(
+            fatal.phase,
+            match phase {
+                HeaderTargetPhase::Preparing => "prepare",
+                HeaderTargetPhase::Applying => "apply",
+                HeaderTargetPhase::Receiving => unreachable!(),
+            }
+        );
+        assert_eq!(fatal.owner, owner);
+        assert_eq!(fatal.repair_generation, 11);
+        assert_eq!(fatal.target, context.target);
+        assert_eq!(fatal.elapsed, VCT_LOCAL_OPERATION_FATAL_AFTER);
+        assert_eq!(reactor.pending_port_operations.len(), 1);
+        assert!(reactor.report_fatal_vct_local_operation(now));
+        assert!(matches!(
+            fatal_events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reactor_run_wakes_for_each_vct_local_operation_hard_deadline() {
+    for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let apply_calls = Arc::new(AtomicUsize::new(0));
+        let port = Arc::new(PendingVctLocalPort {
+            prepare_calls: prepare_calls.clone(),
+            apply_calls: apply_calls.clone(),
+            prepare_release: Arc::new(Notify::new()),
+            apply_release: Arc::new(Notify::new()),
+            prepare_delay: None,
+            apply_delay: None,
+            apply_succeeds: true,
+        });
+        let (_handle, mut reactor, snapshot, mut fatal_events) =
+            direct_vct_reactor_with_fatal_events(port);
+        let shutdown = reactor.startup.shutdown.clone();
+        let peer = peer();
+        let (source, owner, context) =
+            seed_vct_active_request(&mut reactor, &snapshot, peer.clone(), 7, phase);
+        let active = reactor
+            .peer_work_queue
+            .active(&peer)
+            .expect("the fixture has one active repair");
+        let purpose = active.purpose.clone();
+        let entries = active.entries.clone();
+        let action = match phase {
+            HeaderTargetPhase::Preparing => HeaderPortOperation::PrepareHeaderTarget {
+                purpose,
+                peer: peer.clone(),
+                source,
+                owner,
+                common_ancestor: snapshot.frontiers.finalized,
+                target: context.target,
+                completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
+                    common_ancestor: snapshot.frontiers.finalized,
+                    selected_target: context.target,
+                },
+                entries,
+            },
+            HeaderTargetPhase::Applying => HeaderPortOperation::ApplyHeaderTarget {
+                purpose,
+                peer: peer.clone(),
+                source,
+                owner,
+                target: prepared_vct_target(&reactor, &snapshot, &peer, source, owner, &context),
+            },
+            HeaderTargetPhase::Receiving => {
+                unreachable!("the test covers local operation phases")
+            }
+        };
+        assert!(reactor.dispatch_action(action));
+        let task = tokio::spawn(reactor.run());
+        tokio::task::yield_now().await;
+        assert_eq!(
+            prepare_calls.load(Ordering::SeqCst) + apply_calls.load(Ordering::SeqCst),
+            1
+        );
+
+        time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER - std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            fatal_events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!task.is_finished());
+
+        time::advance(std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        let fatal = fatal_events
+            .try_recv()
+            .expect("the running reactor emits the deadline event");
+        assert_eq!(fatal.owner, owner);
+        assert_eq!(
+            fatal.phase,
+            match phase {
+                HeaderTargetPhase::Preparing => "prepare",
+                HeaderTargetPhase::Applying => "apply",
+                HeaderTargetPhase::Receiving => unreachable!(),
+            }
+        );
+        assert_eq!(
+            prepare_calls.load(Ordering::SeqCst) + apply_calls.load(Ordering::SeqCst),
+            1
+        );
+        assert!(!task.is_finished(), "the pending operation remains owned");
+
+        shutdown.cancel();
+        task.await
+            .expect("the fatal reactor stops through normal shutdown");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn vct_apply_completion_wins_at_the_hard_deadline() {
+    let apply_calls = Arc::new(AtomicUsize::new(0));
+    let port = Arc::new(PendingVctLocalPort {
+        prepare_calls: Arc::new(AtomicUsize::new(0)),
+        apply_calls: apply_calls.clone(),
+        prepare_release: Arc::new(Notify::new()),
+        apply_release: Arc::new(Notify::new()),
+        prepare_delay: None,
+        apply_delay: Some(VCT_LOCAL_OPERATION_FATAL_AFTER),
+        apply_succeeds: true,
+    });
+    let (_handle, mut reactor, snapshot, mut fatal_events) =
+        direct_vct_reactor_with_fatal_events(port);
+    let shutdown = reactor.startup.shutdown.clone();
+    let peer = peer();
+    let (source, owner, context) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Applying,
+    );
+    let purpose = reactor
+        .peer_work_queue
+        .active(&peer)
+        .expect("the fixture has one applying repair")
+        .purpose
+        .clone();
+    let target = prepared_vct_target(&reactor, &snapshot, &peer, source, owner, &context);
+    assert!(
+        reactor.dispatch_action(HeaderPortOperation::ApplyHeaderTarget {
+            purpose,
+            peer,
+            source,
+            owner,
+            target,
+        })
+    );
+    let task = tokio::spawn(reactor.run());
+    tokio::task::yield_now().await;
+    assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
+
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
+    tokio::task::yield_now().await;
+
+    let fatal_result = fatal_events.try_recv();
+    assert!(
+        matches!(fatal_result, Err(mpsc::error::TryRecvError::Empty)),
+        "completion at the deadline emitted an unexpected event: {fatal_result:?}",
+    );
+    assert!(
+        !task.is_finished(),
+        "completion must not terminate the reactor"
+    );
+    assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
+    shutdown.cancel();
+    task.await
+        .expect("the reactor stops through normal shutdown");
+}
+
+#[test]
+fn normal_header_operations_have_no_vct_fatal_deadline() {
+    let port = Arc::new(PendingVctLocalPort {
+        prepare_calls: Arc::new(AtomicUsize::new(0)),
+        apply_calls: Arc::new(AtomicUsize::new(0)),
+        prepare_release: Arc::new(Notify::new()),
+        apply_release: Arc::new(Notify::new()),
+        prepare_delay: None,
+        apply_delay: None,
+        apply_succeeds: true,
+    });
+    let (mut reactor, snapshot) = direct_vct_reactor(port);
+    let peer = peer();
+    let (source, owner, context) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Preparing,
+    );
+    let active = reactor
+        .peer_work_queue
+        .active_mut(&peer)
+        .expect("the fixture has one preparing target");
+    active.purpose = HeaderTargetPurpose::Normal;
+    let action = HeaderPortOperation::PrepareHeaderTarget {
+        purpose: HeaderTargetPurpose::Normal,
+        peer,
+        source,
+        owner,
+        common_ancestor: snapshot.frontiers.finalized,
+        target: context.target,
+        completion: zakura_header_chain::TargetCompletion::TargetComplete {
+            common_ancestor: snapshot.frontiers.finalized,
+        },
+        entries: active.entries.clone(),
+    };
+
+    assert!(reactor.dispatch_action(action));
+    assert!(reactor.vct_local_operation.is_none());
 }
 
 #[test]
@@ -398,6 +718,8 @@ async fn pending_vct_prepare_remains_single_until_its_failure_completes() {
         apply_calls: apply_calls.clone(),
         prepare_release: prepare_release.clone(),
         apply_release: Arc::new(Notify::new()),
+        prepare_delay: None,
+        apply_delay: None,
         apply_succeeds: false,
     });
     let (mut reactor, snapshot) = direct_vct_reactor(port);
@@ -482,6 +804,8 @@ async fn pending_vct_apply_remains_single_until_success() {
         apply_calls: apply_calls.clone(),
         prepare_release: Arc::new(Notify::new()),
         apply_release: apply_release.clone(),
+        prepare_delay: None,
+        apply_delay: None,
         apply_succeeds: true,
     });
     let (mut reactor, snapshot) = direct_vct_reactor(port);
@@ -556,6 +880,8 @@ async fn obsolete_vct_generation_retires_ownership_and_ignores_late_apply() {
         apply_calls: apply_calls.clone(),
         prepare_release: Arc::new(Notify::new()),
         apply_release: apply_release.clone(),
+        prepare_delay: None,
+        apply_delay: None,
         apply_succeeds: true,
     });
     let (mut reactor, snapshot) = direct_vct_reactor(port);

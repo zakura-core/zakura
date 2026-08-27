@@ -523,6 +523,11 @@ impl StartCmd {
             .await
             .map_err(|error| eyre!(error))?;
 
+        let mut header_sync_fatal_events = match zakura_endpoint.as_ref() {
+            Some(endpoint) => endpoint.take_header_sync_fatal_events().await,
+            None => None,
+        };
+
         // Not added to node_tasks, because it must outlive start() being dropped to shutdown the
         // endpoint
         let zakura_endpoint_shutdown_task = if let Some(endpoint) = zakura_endpoint.clone() {
@@ -933,6 +938,20 @@ impl StartCmd {
                 let result = select! {
                 _ = shutdown.cancelled() => Ok(()),
 
+                header_sync_fatal_event = async {
+                    match header_sync_fatal_events.as_mut() {
+                        Some(events) => events.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match header_sync_fatal_event {
+                    Some(event) => Self::handle_header_sync_fatal_event(event, &shutdown),
+                    None => {
+                        header_sync_fatal_events = None;
+                        exit_when_task_finishes = false;
+                        Ok(())
+                    }
+                },
+
                 rpc_join_result = &mut rpc_task_handle => {
                     let rpc_server_result = rpc_join_result
                         .expect("unexpected panic in the rpc task");
@@ -1139,6 +1158,14 @@ impl StartCmd {
         false
     }
 
+    fn handle_header_sync_fatal_event(
+        event: zakura_network::zakura::HeaderSyncFatalEvent,
+        shutdown: &CancellationToken,
+    ) -> Result<(), Report> {
+        shutdown.cancel();
+        Err(eyre!(event))
+    }
+
     /// Returns the bound for the state service buffer,
     /// based on the configurations of the services that use the state concurrently.
     fn state_buffer_bound(config: &ZakuradConfig) -> usize {
@@ -1254,6 +1281,8 @@ impl config::Override<ZakuradConfig> for StartCmd {
 mod tests {
     use abscissa_core::config::Override;
     use color_eyre::eyre::eyre;
+    use tokio_util::sync::CancellationToken;
+    use zakura_chain::block;
 
     use super::StartCmd;
     use crate::components::zcashd_compat;
@@ -1581,6 +1610,41 @@ mod tests {
         assert!(!StartCmd::zcashd_compat_supervisor_should_exit(Err(
             join_err
         )));
+    }
+
+    #[test]
+    fn header_sync_fatal_event_returns_an_error_and_starts_shutdown() {
+        let authority = zakura_header_chain::BodyWorkAuthority {
+            header: zakura_header_chain::HeaderWorkAuthority {
+                header_generation: zakura_header_chain::HeaderGeneration::new(3),
+                branch: zakura_header_chain::BranchId::new(
+                    block::Hash([1; 32]),
+                    block::Hash([2; 32]),
+                ),
+            },
+            verified_generation: zakura_header_chain::VerifiedGeneration::new(4),
+            body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
+        };
+        let owner = authority
+            .bind(
+                5,
+                std::num::NonZeroU64::new(6).expect("the test request ID is nonzero"),
+            )
+            .into();
+        let event = zakura_network::zakura::HeaderSyncFatalEvent {
+            phase: "apply",
+            owner,
+            repair_generation: 7,
+            target: zakura_header_chain::Frontier::new(block::Height(8), block::Hash([2; 32])),
+            elapsed: std::time::Duration::from_secs(30 * 60),
+        };
+        let shutdown = CancellationToken::new();
+
+        let error = StartCmd::handle_header_sync_fatal_event(event, &shutdown)
+            .expect_err("a fatal VCT operation must stop the node");
+
+        assert!(shutdown.is_cancelled(), "the node starts normal shutdown");
+        assert!(error.to_string().contains("VCT local apply operation"));
     }
 }
 

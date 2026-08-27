@@ -31,11 +31,6 @@ BUILD_CACHE_DIR_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_DIR"
 BUILD_CACHE_RETAIN_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_RETAIN"
 DEFAULT_BUILD_CACHE_RETAIN = 12
 DATA_MOUNT = Path("/mnt/data")
-WATCHDOG_DEPLOYMENT_SUPPRESSION_FILE = Path(
-    "/run/zakura-watchdog/deployment-suppressed-until"
-)
-WATCHDOG_MAX_DEPLOYMENT_SUPPRESSION = 1200
-SHELL_SIGNED_INTEGER_MAX = (1 << 63) - 1
 
 # ssh/scp options shared by every remote call. BatchMode avoids interactive
 # password prompts hanging a parallel deploy; accept-new pins unknown host keys
@@ -88,9 +83,6 @@ DEFAULTS = {
     # Docker deploys replace the binary in an existing container without
     # recreating it, preserving its mounts, networking, and image configuration.
     "container_name": "",
-    # These must match any overrides in the node's zakura-watchdog service.
-    "watchdog_deployment_suppression_file": str(WATCHDOG_DEPLOYMENT_SUPPRESSION_FILE),
-    "watchdog_max_deployment_suppression": WATCHDOG_MAX_DEPLOYMENT_SUPPRESSION,
 }
 
 
@@ -128,8 +120,6 @@ class Node:
     start_command: str
     process_pattern: str
     container_name: str
-    watchdog_deployment_suppression_file: str
-    watchdog_max_deployment_suppression: int
     port: object = None
     # resolved at runtime
     sha: str = ""
@@ -179,33 +169,6 @@ def normalize_p2p_stack(value: object, *, where: str) -> str:
             f"expected one of: default, legacy, zakura, dual"
         )
     return stack
-
-
-def normalize_watchdog_suppression_file(value: object, *, where: str) -> str:
-    """Validate the marker path that must match the watchdog configuration."""
-    if not isinstance(value, str) or not value.strip():
-        raise DeployError(
-            f"{where}: watchdog_deployment_suppression_file must be a non-empty string"
-        )
-    if not Path(value).is_absolute():
-        raise DeployError(
-            f"{where}: watchdog_deployment_suppression_file must be an absolute path"
-        )
-    return value
-
-
-def normalize_watchdog_max_suppression(value: object, *, where: str) -> int:
-    """Validate the watchdog's non-negative maximum suppression window."""
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or not 0 <= value <= SHELL_SIGNED_INTEGER_MAX
-    ):
-        raise DeployError(
-            f"{where}: watchdog_max_deployment_suppression must be an integer "
-            f"between 0 and {SHELL_SIGNED_INTEGER_MAX}"
-        )
-    return value
 
 
 def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
@@ -284,14 +247,6 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             start_command=merged["start_command"],
             process_pattern=merged["process_pattern"],
             container_name=merged["container_name"],
-            watchdog_deployment_suppression_file=normalize_watchdog_suppression_file(
-                merged["watchdog_deployment_suppression_file"],
-                where=f"[[nodes]] {name}",
-            ),
-            watchdog_max_deployment_suppression=normalize_watchdog_max_suppression(
-                merged["watchdog_max_deployment_suppression"],
-                where=f"[[nodes]] {name}",
-            ),
             port=merged["port"],
         ))
 
@@ -328,35 +283,6 @@ def run(cmd: list[str], *, cwd: Path | None = None, capture: bool = False,
 def repo_root() -> Path:
     result = run(["git", "rev-parse", "--show-toplevel"], cwd=SCRIPT_DIR, capture=True)
     return Path(result.stdout.strip())
-
-
-def watchdog_deployment_suppression_script(node: Node) -> str:
-    """Render the node-local alert suppression marker for a planned restart."""
-    marker_arg = shlex.quote(node.watchdog_deployment_suppression_file)
-    return f"""
-WATCHDOG_DEPLOYMENT_SUPPRESSION_FILE={marker_arg}
-WATCHDOG_DEPLOYMENT_SUPPRESSION_SECONDS={node.watchdog_max_deployment_suppression}
-WATCHDOG_DEPLOYMENT_SUPPRESSION_NOW=$(date +%s)
-WATCHDOG_DEPLOYMENT_SUPPRESSION_MAX_EPOCH={SHELL_SIGNED_INTEGER_MAX}
-if (( WATCHDOG_DEPLOYMENT_SUPPRESSION_SECONDS >
-      WATCHDOG_DEPLOYMENT_SUPPRESSION_MAX_EPOCH -
-      WATCHDOG_DEPLOYMENT_SUPPRESSION_NOW )); then
-    echo "watchdog suppression window exceeds shell arithmetic range" >&2
-    exit 1
-fi
-mkdir -p -m 755 "$(dirname "$WATCHDOG_DEPLOYMENT_SUPPRESSION_FILE")"
-WATCHDOG_DEPLOYMENT_SUPPRESSION_UNTIL=$((
-    WATCHDOG_DEPLOYMENT_SUPPRESSION_NOW +
-    WATCHDOG_DEPLOYMENT_SUPPRESSION_SECONDS
-))
-WATCHDOG_DEPLOYMENT_SUPPRESSION_TMP=$(mktemp \
-    "${{WATCHDOG_DEPLOYMENT_SUPPRESSION_FILE}}.tmp.XXXXXX")
-printf '%s\n' "$WATCHDOG_DEPLOYMENT_SUPPRESSION_UNTIL" \\
-    > "$WATCHDOG_DEPLOYMENT_SUPPRESSION_TMP"
-chmod 644 "$WATCHDOG_DEPLOYMENT_SUPPRESSION_TMP"
-mv -f "$WATCHDOG_DEPLOYMENT_SUPPRESSION_TMP" \\
-    "$WATCHDOG_DEPLOYMENT_SUPPRESSION_FILE"
-"""
 
 
 # --------------------------------------------------------------------------- #
@@ -617,10 +543,6 @@ require_data_mount_for() {{
 require_data_mount_for "$STATE_DIR"
 require_data_mount_for "$(dirname "$LOG_FILE")"
 
-if [ "$NO_RESTART" != "1" ]; then
-{watchdog_suppression}
-fi
-
 mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")" "$(dirname "$LOG_FILE")"
 
 # Stage uploaded artifacts (uploaded to /tmp by the deploy step).
@@ -787,10 +709,6 @@ BIN_PATH={bin_path}
 SERVICE={service}
 NO_RESTART={no_restart}
 
-if [ "$NO_RESTART" != "1" ]; then
-{watchdog_suppression}
-fi
-
 mkdir -p "$(dirname "$BIN_PATH")"
 
 if [ -x "$BIN_PATH" ]; then
@@ -938,7 +856,6 @@ def cmd_deploy(args) -> int:
                         bin_path=shlex.quote(node.bin_path),
                         service=shlex.quote(node.service_name),
                         no_restart="1" if args.no_restart else "0",
-                        watchdog_suppression=watchdog_deployment_suppression_script(node),
                     )
                 proc = ssh_with_stdin(node, script)
                 if proc.returncode != 0:
@@ -970,7 +887,6 @@ def cmd_deploy(args) -> int:
                     log_file=shlex.quote(node.log_file),
                     state_dir=shlex.quote(node.state_cache_dir),
                     no_restart="1" if args.no_restart else "0",
-                    watchdog_suppression=watchdog_deployment_suppression_script(node),
                 )
             else:
                 script = PROCESS_INSTALL_SCRIPT.format(

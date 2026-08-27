@@ -321,22 +321,10 @@ The mainnet workflow writes it locally on `us-east-0`; the testnet workflow
 refreshes it on `us-east-0` over SSH on a best-effort basis. While the marker is
 in the future, new failure alerts are logged but not posted to Slack.
 
-Before restarting a systemd node, the deployer also writes the configured
-node-local watchdog marker. The defaults match
-`/run/zakura-watchdog/deployment-suppressed-until` and the watchdog's 20-minute
-maximum. If `/etc/zakura-watchdog/env` overrides
-`WATCHDOG_DEPLOYMENT_SUPPRESSION_FILE` or
-`WATCHDOG_MAX_DEPLOYMENT_SUPPRESSION`, set the matching
-`watchdog_deployment_suppression_file` and
-`watchdog_max_deployment_suppression` values in the deployer's `[defaults]` or
-`[[nodes]]` table. This keeps the local watchdog checks running while
-suppressing expected Sentry failure and recovery transitions during the
-restart. A `--no-restart` deploy does not write either suppression marker, and
-failures that outlast the configured window alert normally.
-
-The mainnet workflow also writes the default node-local marker before invoking
-the deployer from the requested ref. This keeps rollback deployments suppressed
-when the requested older ref predates deployer-managed node-local markers.
+Restart deploys that include `zakura-compat` also refresh that host's node-local
+watchdog marker and restart the active watchdog before `zakurad-compat`. This
+suppresses expected Sentry transitions and stays in the workflow so rollback
+refs whose deployer predates the marker remain covered.
 
 Manual dry run from `us-east-0`:
 

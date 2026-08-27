@@ -22,10 +22,6 @@ p2p_stack       = "dual"                     # legacy | zakura | dual | default
 # zakurad panics if either address is already bound, so check the port first.
 # metrics_endpoint   = "127.0.0.1:9999"     # Prometheus /metrics
 # health_listen_addr = "127.0.0.1:8080"     # /healthy and /ready
-# Match any overrides in /etc/zakura-watchdog/env so planned systemd restarts
-# write the marker where the watchdog reads it and within its accepted window.
-# watchdog_deployment_suppression_file = "/run/zakura-watchdog/deployment-suppressed-until"
-# watchdog_max_deployment_suppression = 1200
 # port          = 22                        # optional non-default ssh port
 
 # Optional fleet-wide Zakura settings, rendered into [network.zakura] on every

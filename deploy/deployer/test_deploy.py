@@ -1,9 +1,7 @@
 import importlib.util
 import os
-import subprocess
 import sys
 import tempfile
-import time
 import tomllib
 import unittest
 from pathlib import Path
@@ -120,152 +118,34 @@ class BuildCacheTests(unittest.TestCase):
             })
 
 
-class DeploymentSuppressionTests(unittest.TestCase):
-    def test_suppression_script_uses_node_watchdog_configuration(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            marker = Path(tmp) / "watchdog" / "deployment-suppressed-until"
-            duration = 30
-            node = mock.Mock(
-                watchdog_deployment_suppression_file=str(marker),
-                watchdog_max_deployment_suppression=duration,
-            )
-            before = int(time.time())
-
-            subprocess.run(
-                ["bash", "-c", deploy.watchdog_deployment_suppression_script(node)],
-                check=True,
-            )
-
-            after = int(time.time())
-            suppression_until = int(marker.read_text().strip())
-            self.assertGreaterEqual(
-                suppression_until,
-                before + duration,
-            )
-            self.assertLessEqual(
-                suppression_until,
-                after + duration,
-            )
-            self.assertEqual(marker.stat().st_mode & 0o777, 0o644)
-
-    def test_suppression_script_preserves_existing_directory_permissions(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            marker_dir = Path(tmp) / "private-watchdog"
-            marker_dir.mkdir(mode=0o700)
-            marker = marker_dir / "deployment-suppressed-until"
-            node = mock.Mock(
-                watchdog_deployment_suppression_file=str(marker),
-                watchdog_max_deployment_suppression=30,
-            )
-
-            subprocess.run(
-                ["bash", "-c", deploy.watchdog_deployment_suppression_script(node)],
-                check=True,
-            )
-
-            self.assertEqual(marker_dir.stat().st_mode & 0o777, 0o700)
-
-    def test_suppression_script_rejects_timestamp_overflow(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            marker = Path(tmp) / "watchdog" / "deployment-suppressed-until"
-            node = mock.Mock(
-                watchdog_deployment_suppression_file=str(marker),
-                watchdog_max_deployment_suppression=deploy.SHELL_SIGNED_INTEGER_MAX,
-            )
-
-            result = subprocess.run(
-                ["bash", "-c", deploy.watchdog_deployment_suppression_script(node)],
-                text=True,
-                capture_output=True,
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("exceeds shell arithmetic range", result.stderr)
-            self.assertFalse(marker.exists())
-
-    def test_suppression_script_publishes_marker_atomically(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            marker = Path(tmp) / "watchdog" / "deployment-suppressed-until"
-            marker.parent.mkdir()
-            marker.write_text("old\n")
-            node = mock.Mock(
-                watchdog_deployment_suppression_file=str(marker),
-                watchdog_max_deployment_suppression=30,
-            )
-            assert_old_marker_during_write = """
-set -e
-printf() {
-    [ "$(<\"$WATCHDOG_TEST_MARKER\")" = "old" ] || return 90
-    command printf "$@"
-}
-"""
-
-            subprocess.run(
-                [
-                    "bash",
-                    "-c",
-                    assert_old_marker_during_write
-                    + deploy.watchdog_deployment_suppression_script(node),
-                ],
-                check=True,
-                env={**os.environ, "WATCHDOG_TEST_MARKER": str(marker)},
-            )
-
-            self.assertGreater(int(marker.read_text().strip()), int(time.time()))
-            self.assertEqual(list(marker.parent.glob(f"{marker.name}.tmp.*")), [])
-
-    def test_systemd_restarts_activate_suppression_before_replacing_artifacts(self):
-        marker_command = "ACTIVATE_WATCHDOG_SUPPRESSION"
-        scripts = {
-            "managed": (
-                deploy.INSTALL_SCRIPT.format(
-                    bin_path="/usr/local/bin/zakurad",
-                    config_path="/etc/zakura/zakura.toml",
-                    service="zakurad",
-                    log_file="/var/log/zakura/zakura.log",
-                    state_dir="/var/lib/zakura",
-                    no_restart="0",
-                    watchdog_suppression=marker_command,
-                ),
-                "install -m 644 /tmp/zakurad-deploy.service",
-            ),
-            "binary-only": (
-                deploy.BINARY_ONLY_INSTALL_SCRIPT.format(
-                    bin_path="/usr/local/bin/zakurad",
-                    service="zakurad",
-                    no_restart="0",
-                    watchdog_suppression=marker_command,
-                ),
-                "install -m 755 /tmp/zakurad-deploy.new",
-            ),
-        }
-
-        for name, (script, first_artifact_install) in scripts.items():
-            with self.subTest(name=name):
-                subprocess.run(["bash", "-n"], input=script, text=True, check=True)
-                restart_guard = script.index('if [ "$NO_RESTART" != "1" ]')
-                suppression = script.index(marker_command)
-                restart_guard_end = script.index("\nfi", suppression)
-                artifact_install = script.index(first_artifact_install)
-                self.assertLess(restart_guard, suppression)
-                self.assertLess(suppression, restart_guard_end)
-                self.assertLess(restart_guard_end, artifact_install)
-
-    def test_mainnet_workflow_bounds_and_tolerates_suppression_ssh_failures(self):
+class MainnetWorkflowSuppressionTests(unittest.TestCase):
+    def test_suppression_is_scoped_to_compatibility_restarts(self):
         workflow = (
             SCRIPT_DIR.parent.parent
             / ".github/workflows/zakura-mainnet-deploy.yml"
         ).read_text()
         suppression_step = workflow.split(
-            "      - name: Suppress node watchdog alerts during deploy\n", 1
+            "      - name: Suppress compatibility watchdog alerts during deploy\n",
+            1,
         )[1].split("      - name: Deploy fleet\n", 1)[0]
 
         self.assertIn(
-            "if ! timeout --signal=TERM --kill-after=5s 60s \\", suppression_step
+            "inputs.node == '' || inputs.node == 'zakura-compat'",
+            suppression_step,
         )
-        self.assertIn("-o ServerAliveInterval=10 \\", suppression_step)
-        self.assertIn("-o ServerAliveCountMax=3 \\", suppression_step)
+        self.assertIn("!inputs.no_restart", suppression_step)
+        self.assertIn("root@159.203.113.196", suppression_step)
+        self.assertIn(
+            "/run/zakura-watchdog/deployment-suppressed-until",
+            suppression_step,
+        )
+        self.assertIn(
+            "if ! timeout --signal=TERM --kill-after=5s 60s \\",
+            suppression_step,
+        )
+        self.assertIn("systemctl restart zakura-watchdog", suppression_step)
         self.assertIn("continuing deploy", suppression_step)
+        self.assertNotIn("tomllib", suppression_step)
 
 
 class NodeBuilder:
@@ -301,12 +181,6 @@ class NodeBuilder:
             "start_command": "",
             "process_pattern": "",
             "container_name": "",
-            "watchdog_deployment_suppression_file": str(
-                deploy.WATCHDOG_DEPLOYMENT_SUPPRESSION_FILE
-            ),
-            "watchdog_max_deployment_suppression": (
-                deploy.WATCHDOG_MAX_DEPLOYMENT_SUPPRESSION
-            ),
         }
         data.update(overrides)
         return deploy.Node(**data)
@@ -377,44 +251,6 @@ class ConfigKeyTests(unittest.TestCase):
             nodes = deploy.load_nodes(path, None)
 
             self.assertEqual(nodes[0].health_listen_addr, "127.0.0.1:8080")
-
-    def test_watchdog_suppression_settings_are_per_node(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self.write_config(tmp, """
-                [defaults]
-                watchdog_deployment_suppression_file = "/run/custom-watchdog/default"
-                watchdog_max_deployment_suppression = 45
-
-                [[nodes]]
-                name = "node-a"
-                ssh_string = "root@example"
-                commit = "main"
-                watchdog_deployment_suppression_file = "/run/custom-watchdog/node-a"
-                watchdog_max_deployment_suppression = 30
-            """.replace("                ", ""))
-
-            node = deploy.load_nodes(path, None)[0]
-
-            self.assertEqual(
-                node.watchdog_deployment_suppression_file,
-                "/run/custom-watchdog/node-a",
-            )
-            self.assertEqual(node.watchdog_max_deployment_suppression, 30)
-
-    def test_watchdog_suppression_file_must_be_absolute(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self.write_config(tmp, """
-                [defaults]
-                watchdog_deployment_suppression_file = "relative/marker"
-
-                [[nodes]]
-                name = "node-a"
-                ssh_string = "root@example"
-                commit = "main"
-            """.replace("                ", ""))
-
-            with self.assertRaisesRegex(deploy.DeployError, "must be an absolute path"):
-                deploy.load_nodes(path, None)
 
     def test_unknown_key_still_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -17,16 +17,13 @@ use crate::{
 fn run_cycle(
     checks: &[Box<dyn Check>],
     reporter: &mut Reporter,
-    suppression_config: Option<&Config>,
+    suppression: Option<&AlertSuppression>,
 ) -> bool {
     let mut all_passed = true;
 
     for check in checks {
         let outcome = check.run_once();
-        // Re-read after the check so a marker written while an RPC was in
-        // flight still suppresses the resulting deployment failure.
-        let suppression = suppression_config.and_then(deployment_alert_suppression);
-        reporter.report(check.name(), &outcome, suppression.as_ref());
+        reporter.report(check.name(), &outcome, suppression);
 
         if outcome.status == CheckStatus::Fail {
             all_passed = false;
@@ -83,7 +80,8 @@ pub fn run_forever(config: &Config, checks: &[Box<dyn Check>], reporter: &mut Re
     );
 
     loop {
-        run_cycle(checks, reporter, Some(config));
+        let suppression = deployment_alert_suppression(config);
+        run_cycle(checks, reporter, suppression.as_ref());
         thread::sleep(Duration::from_secs(config.watchdog_interval));
     }
 }
@@ -149,22 +147,6 @@ mod tests {
             } else {
                 CheckOutcome::pass("scripted pass", BTreeMap::new())
             }
-        }
-    }
-
-    struct MarkerWritingCheck {
-        marker: PathBuf,
-    }
-
-    impl Check for MarkerWritingCheck {
-        fn name(&self) -> &'static str {
-            "marker_writing"
-        }
-
-        fn run_once(&self) -> CheckOutcome {
-            fs::write(&self.marker, (now_epoch_seconds() + 60).to_string())
-                .expect("test can write suppression marker");
-            CheckOutcome::fail("deployment restart", BTreeMap::new())
         }
     }
 
@@ -237,22 +219,6 @@ mod tests {
         let _ = fs::remove_file(&config.deployment_suppression_file);
 
         assert_eq!(deployment_alert_suppression(&config), None);
-    }
-
-    #[test]
-    fn marker_written_during_check_suppresses_its_failure() {
-        let mut config = test_config(5, 1);
-        config.deployment_suppression_file = test_suppression_path("in-flight");
-        let _ = fs::remove_file(&config.deployment_suppression_file);
-        let checks: Vec<Box<dyn Check>> = vec![Box::new(MarkerWritingCheck {
-            marker: config.deployment_suppression_file.clone(),
-        })];
-        let mut reporter = Reporter::new(false);
-
-        assert!(!run_cycle(&checks, &mut reporter, Some(&config)));
-        assert_eq!(reporter.last_status_for_test("marker_writing"), None);
-
-        let _ = fs::remove_file(&config.deployment_suppression_file);
     }
 
     #[test]

@@ -325,52 +325,21 @@ jobs:
           printf '%s\n' "$(( $(date +%s) + 1200 ))" \
             | sudo tee /run/zakura-fleet-watchdog/deploy-suppressed-until >/dev/null
 
-      - name: Suppress node watchdog alerts during deploy
-        # Keep this in workflow-owned code because the requested rollback ref
-        # can contain a deploy.py that predates node-local suppression.
-        if: ${{ !inputs.no_restart }}
-        working-directory: deploy/deployer
-        env:
-          NODE: ${{ inputs.node }}
+      - name: Suppress compatibility watchdog alerts during deploy
+        # This stays in workflow-owned code so rollback refs whose deployer
+        # predates suppression are still covered.
+        if: ${{ !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
         run: |
           set -euo pipefail
 
-          ssh_targets="$(
-            python3 - <<'PY'
-          import os
-          import sys
-          import tomllib
-
-          with open("nodes.ci.toml", "rb") as config_file:
-              config = tomllib.load(config_file)
-
-          selected = os.environ.get("NODE", "")
-          targets = [
-              node["ssh_string"]
-              for node in config["nodes"]
-              if not selected or node["name"] == selected
-          ]
-          if selected and not targets:
-              print(f"unknown deployer node: {selected}", file=sys.stderr)
-              raise SystemExit(1)
-          print("\n".join(targets))
-          PY
-          )"
-
-          if [ -z "$ssh_targets" ]; then
-            echo "deployer config contains no node SSH targets" >&2
-            exit 1
-          fi
-
-          while IFS= read -r ssh_target; do
-            if ! timeout --signal=TERM --kill-after=5s 60s \
-              ssh \
-                -o BatchMode=yes \
-                -o ConnectTimeout=20 \
-                -o ServerAliveInterval=10 \
-                -o ServerAliveCountMax=3 \
-                -o StrictHostKeyChecking=yes \
-                -- "$ssh_target" bash -s <<'REMOTE'; then
+          if ! timeout --signal=TERM --kill-after=5s 60s \
+            ssh \
+              -o BatchMode=yes \
+              -o ConnectTimeout=20 \
+              -o ServerAliveInterval=10 \
+              -o ServerAliveCountMax=3 \
+              -o StrictHostKeyChecking=yes \
+              -- root@159.203.113.196 bash -s <<'REMOTE'; then
           set -euo pipefail
 
           marker=/run/zakura-watchdog/deployment-suppressed-until
@@ -384,10 +353,12 @@ jobs:
           chmod 644 "$marker_tmp"
           mv -f "$marker_tmp" "$marker"
           trap - EXIT
+          if systemctl is-active --quiet zakura-watchdog; then
+            systemctl restart zakura-watchdog
+          fi
           REMOTE
-              echo "::warning::failed to publish node watchdog suppression marker on ${ssh_target}; continuing deploy" >&2
-            fi
-          done <<< "$ssh_targets"
+            echo "::warning::failed to suppress compatibility watchdog alerts; continuing deploy" >&2
+          fi
 
       - name: Deploy fleet
         working-directory: deploy/deployer

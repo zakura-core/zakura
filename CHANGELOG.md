@@ -11,6 +11,13 @@ independently.
 
 ## [Unreleased]
 
+## [1.3.0-rc4] - 2026-08-27
+
+### Fixed
+
+- Allowed Windows tools to check out and package `zakura-header-chain`
+  ([#829](https://github.com/zakura-core/zakura/pull/829)).
+
 ## [1.3.0-rc3] - 2026-08-27
 
 ### Added

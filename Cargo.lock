@@ -7607,7 +7607,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
 name = "zakura"
-version = "1.3.0-rc3"
+version = "1.3.0-rc4"
 dependencies = [
  "abscissa_core",
  "bytes",
@@ -7795,7 +7795,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "7.0.0-rc3"
+version = "7.0.0-rc4"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -7895,7 +7895,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "1.0.0-rc3"
+version = "1.0.0-rc4"
 dependencies = [
  "chrono",
  "criterion",
@@ -7961,7 +7961,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "7.0.0-rc3"
+version = "7.0.0-rc4"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -8007,7 +8007,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "3.2.1-rc2"
+version = "3.2.1-rc4"
 dependencies = [
  "jsonrpsee-types",
  "reqwest 0.12.28",
@@ -8165,7 +8165,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "8.0.0-rc3"
+version = "8.0.0-rc4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8297,7 +8297,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "7.0.0-rc3"
+version = "7.0.0-rc4"
 dependencies = [
  "bincode",
  "chrono",
@@ -8408,7 +8408,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.1-rc2"
+version = "2.2.1-rc4"
 dependencies = [
  "clap",
  "color-eyre",

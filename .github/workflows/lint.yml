@@ -14,6 +14,7 @@ on:
       - deny.toml
       - rust-toolchain.toml
       - .github/workflows/lint.yml
+      - .github/workflows/cross-platform.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
@@ -37,6 +38,7 @@ on:
       - deny.toml
       - rust-toolchain.toml
       - .github/workflows/lint.yml
+      - .github/workflows/cross-platform.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"

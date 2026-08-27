@@ -662,7 +662,7 @@ fn abandon_block_apply(
     token: BlockApplyToken,
     block: &block::Block,
     trace: &ZakuraTrace,
-) {
+) -> BlockApplyResult {
     let Some((height, expected_hash, result, event)) =
         abandoned_block_apply_finished_event(owner, source, token, block)
     else {
@@ -670,11 +670,12 @@ fn abandon_block_apply(
             expected_hash = ?block.hash(),
             "dropping abandoned Zakura block-sync body without coinbase height"
         );
-        return;
+        return BlockApplyResult::Rejected;
     };
 
     let _ = block_sync.send_control(event);
     trace.trace_block_apply_finished(token, height, expected_hash, result, false);
+    result
 }
 
 pub(crate) fn abandoned_block_apply_finished_event(
@@ -1101,6 +1102,13 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
             continue;
         };
         debug!(operation_id = ?accepted.id(), token = pending.token, "accepted native block apply operation");
+        let transfer_handoff = handoff.clone();
+        let transfer_block = pending.block.clone();
+        let transfer_owner = pending.owner;
+        let transfer_source = pending.source;
+        let transfer_token = pending.token;
+        let transfer_block_sync = block_sync.clone();
+        let transfer_trace = trace.clone();
         let apply = apply_block_sync_body(
             block_verifier.clone(),
             latest_chain_tip.clone(),
@@ -1117,17 +1125,52 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
         );
         in_flight_applies.push(
             async move {
-                let completed = apply.await;
-                let terminal = match completed.result {
-                    BlockApplyResult::Committed | BlockApplyResult::Duplicate => {
-                        super::BlockApplyTerminal::Committed
+                tokio::pin!(apply);
+                let mut accepted = Some(accepted);
+                tokio::select! {
+                    biased;
+                    completed = &mut apply => {
+                        let terminal = match completed.result {
+                            BlockApplyResult::Committed | BlockApplyResult::Duplicate => {
+                                super::BlockApplyTerminal::Committed
+                            }
+                            BlockApplyResult::Rejected
+                            | BlockApplyResult::Unavailable
+                            | BlockApplyResult::TimedOut => super::BlockApplyTerminal::Rejected,
+                        };
+                        accepted
+                            .take()
+                            .expect("accepted operation has one terminal result")
+                            .complete(terminal);
+                        completed
                     }
-                    BlockApplyResult::Rejected
-                    | BlockApplyResult::Unavailable
-                    | BlockApplyResult::TimedOut => super::BlockApplyTerminal::Rejected,
-                };
-                accepted.complete(terminal);
-                completed
+                    _ = transfer_handoff.wait_for_legacy_yield(),
+                        if class == BlockApplyClass::Checkpoint =>
+                    {
+                        // The checkpoint verifier owns transactional range commits after it
+                        // accepts a request. A partial range cannot commit until another request
+                        // supplies every missing body. Legacy fallback uses the same verifier, so
+                        // it can complete the range after this driver transfers completion
+                        // responsibility.
+                        let result = abandon_block_apply(
+                            &transfer_block_sync,
+                            transfer_owner,
+                            transfer_source,
+                            transfer_token,
+                            transfer_block.as_ref(),
+                            &transfer_trace,
+                        );
+                        accepted
+                            .take()
+                            .expect("accepted operation has one terminal result")
+                            .complete(super::BlockApplyTerminal::TransferredToLegacy);
+                        metrics::counter!(
+                            "sync.zakura.apply.checkpoint_transferred_to_legacy"
+                        )
+                        .increment(1);
+                        BlockApplyCompletion { class, result }
+                    }
+                }
             }
             .boxed(),
         );

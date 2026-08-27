@@ -4943,18 +4943,17 @@ mod zakura_header_sync_driver_tests {
         reactor_task.abort();
     }
 
-    /// Drives the block-sync apply loop against the *real* checkpoint verifier and a *real*
-    /// ephemeral state, reproducing the checkpoint-range batch-commit that Regtest (genesis
-    /// checkpoint only) cannot exercise.
+    /// Drives the block-sync apply loop against the real checkpoint verifier and an ephemeral
+    /// state. This test reproduces the checkpoint-range batch commit that Regtest cannot exercise.
     ///
     /// A checkpoint is placed at height 10 so an 11-block range covers a full checkpoint gap
     /// without 400 real blocks. The whole range is submitted except one mid-range body, which
     /// the verifier holds the entire range for (it commits nothing until the range is
-    /// contiguous to the next checkpoint). Delivering the withheld body must let the whole
-    /// range commit — i.e. a transiently-missing body recovers instead of wedging the floor,
-    /// which is the production "drop-through" failure mode.
+    /// contiguous to the next checkpoint). The fallback handoff must transfer the held requests
+    /// to the shared verifier. The legacy driver can then deliver the withheld body and commit the
+    /// range.
     #[tokio::test]
-    async fn block_sync_driver_recovers_checkpoint_range_after_withheld_body() {
+    async fn legacy_fallback_completes_transferred_checkpoint_range() {
         const CHECKPOINT_HEIGHT: u32 = 10;
         const WITHHELD: u32 = 5;
 
@@ -4998,6 +4997,7 @@ mod zakura_header_sync_driver_tests {
         // `Service<zakura_consensus::Request, Response = block::Hash>` bound.
         let checkpoint_verifier =
             tower::buffer::Buffer::new(BoxService::new(checkpoint_verifier), 16);
+        let legacy_verifier = checkpoint_verifier.clone();
         let verifier = service_fn(move |request: zakura_consensus::Request| {
             let checkpoint_verifier = checkpoint_verifier.clone();
             async move {
@@ -5014,10 +5014,12 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
+        let handoff = super::zakura::SyncCoordinator::new();
         let (driver, shutdown_tx) = DriverParams {
             // Every block 0..=10 is at or below the checkpoint, so all are Checkpoint-class
             // (indefinite-wait) commits — the path that wedges in production.
             max_checkpoint_height: block::Height(CHECKPOINT_HEIGHT),
+            handoff: handoff.clone(),
             ..DriverParams::default()
         }
         .spawn(
@@ -5070,20 +5072,27 @@ mod zakura_header_sync_driver_tests {
             "checkpoint range must not commit while a mid-range body is missing",
         );
 
-        // Deliver the withheld body; the verifier can now commit the whole range.
-        let (withheld_height, withheld_block) = chain
+        let fallback = tokio::spawn(async move {
+            handoff
+                .acquire_legacy_fallback(Duration::from_secs(1))
+                .await
+        });
+        let _fallback_lease = tokio::time::timeout(Duration::from_secs(1), fallback)
+            .await
+            .expect("fallback must not wait for an incomplete checkpoint range")
+            .expect("fallback acquisition task must finish")
+            .expect("fallback must acquire the transferred checkpoint range");
+
+        // The legacy driver uses the same verifier. Its missing body completes the transferred
+        // checkpoint range.
+        let (_withheld_height, withheld_block) = chain
             .iter()
             .find(|(height, _)| height.0 == WITHHELD)
             .expect("withheld block is part of the test chain");
-        action_tx
-            .send(BlockSyncAction::SubmitBlock {
-                owner: test_block_work_owner(),
-                source: test_block_source(),
-                token: u64::from(withheld_height.0),
-                block: withheld_block.clone(),
-            })
+        legacy_verifier
+            .oneshot(withheld_block.clone())
             .await
-            .expect("driver action channel stays open");
+            .expect("legacy verifier submission completes the checkpoint range");
 
         // Recovery: the entire range commits, so the finalized tip reaches the checkpoint.
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -5095,7 +5104,7 @@ mod zakura_header_sync_driver_tests {
             }
         })
         .await
-        .expect("delivering the withheld body must let the checkpoint range commit to the tip");
+        .expect("legacy fallback must let the checkpoint range commit to the tip");
 
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");

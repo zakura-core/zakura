@@ -1463,6 +1463,25 @@ pub(in crate::service) enum NonFinalizedWriteFailureKind {
     Retryable,
 }
 
+impl NonFinalizedWriteFailureKind {
+    fn from_error(error: &CommitBlockError) -> Self {
+        use zakura_header_chain::BodyVerificationClass;
+
+        if matches!(
+            error,
+            CommitBlockError::ValidateContextError(error)
+                if matches!(**error, ValidateContextError::InvalidAncestorBlock(_))
+        ) || matches!(
+            error.body_verification_class(),
+            BodyVerificationClass::ConsensusInvalid(_)
+        ) {
+            Self::Invalid
+        } else {
+            Self::Retryable
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::service) struct HeaderChainObservers {
     snapshot_sender: watch::Sender<Option<EngineSnapshot>>,
@@ -2656,9 +2675,11 @@ impl WriteBlockWorkerTask {
             //       after `update_latest_chain_channels()`,
             //       and send the result on rsp_tx here
 
-            if result.is_err() {
+            if let Err(error) = &result {
+                let failure_kind = NonFinalizedWriteFailureKind::from_error(error);
+
                 // If the block is invalid, mark any descendant blocks as rejected.
-                if matches!(result, Err(CommitBlockError::ValidateContextError(_))) {
+                if failure_kind == NonFinalizedWriteFailureKind::Invalid {
                     rejected_ancestor_map
                         .insert(child_hash, rejected_ancestor_hash.unwrap_or(child_hash));
                 }
@@ -2680,11 +2701,7 @@ impl WriteBlockWorkerTask {
                 // service exits.
                 let _ = non_finalized_rejected_sender.send(NonFinalizedWriteFailure {
                     hash: child_hash,
-                    kind: if matches!(result, Err(CommitBlockError::ValidateContextError(_))) {
-                        NonFinalizedWriteFailureKind::Invalid
-                    } else {
-                        NonFinalizedWriteFailureKind::Retryable
-                    },
+                    kind: failure_kind,
                 });
 
                 // Update the caller with the error.

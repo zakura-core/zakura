@@ -808,7 +808,6 @@ impl StateService {
     fn handle_non_finalized_write_failure(&mut self, failure: write::NonFinalizedWriteFailure) {
         self.non_finalized_block_write_sent_hashes
             .remove(&failure.hash);
-        self.remember_failed_ancestor(failure.hash, failure.hash, failure.kind);
         let error = Self::failed_ancestor_error(failure.hash, failure.kind);
         let descendants = self
             .non_finalized_state_queued_blocks
@@ -816,6 +815,7 @@ impl StateService {
         for descendant in descendants {
             self.remember_failed_ancestor(descendant, failure.hash, failure.kind);
         }
+        self.remember_failed_ancestor(failure.hash, failure.hash, failure.kind);
     }
 
     fn failed_ancestor_error(
@@ -840,6 +840,7 @@ impl StateService {
         ancestor: block::Hash,
         kind: write::NonFinalizedWriteFailureKind,
     ) {
+        self.non_finalized_failed_ancestors.shift_remove(&hash);
         self.non_finalized_failed_ancestors
             .insert(hash, (ancestor, kind));
         while self.non_finalized_failed_ancestors.len() > Self::FAILED_ANCESTOR_LIMIT {

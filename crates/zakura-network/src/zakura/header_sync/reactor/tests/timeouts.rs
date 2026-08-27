@@ -23,6 +23,34 @@ struct PendingVctLocalPort {
     apply_succeeds: bool,
 }
 
+impl PendingVctLocalPort {
+    fn new(apply_succeeds: bool) -> Self {
+        Self {
+            prepare_calls: Arc::new(AtomicUsize::new(0)),
+            apply_calls: Arc::new(AtomicUsize::new(0)),
+            prepare_release: Arc::new(Notify::new()),
+            apply_release: Arc::new(Notify::new()),
+            prepare_delay: None,
+            apply_delay: None,
+            apply_succeeds,
+        }
+    }
+
+    fn pending(apply_succeeds: bool) -> Arc<Self> {
+        Arc::new(Self::new(apply_succeeds))
+    }
+
+    fn with_apply_delay(delay: std::time::Duration) -> Arc<Self> {
+        let mut port = Self::new(true);
+        port.apply_delay = Some(delay);
+        Arc::new(port)
+    }
+
+    fn total_calls(&self) -> usize {
+        self.prepare_calls.load(Ordering::SeqCst) + self.apply_calls.load(Ordering::SeqCst)
+    }
+}
+
 impl port::Port for PendingVctLocalPort {
     fn continuation_locator(
         &self,
@@ -251,6 +279,244 @@ fn prepared_vct_target(
     )
 }
 
+struct VctLocalFixture {
+    _handle: HeaderSyncHandle,
+    port: Arc<PendingVctLocalPort>,
+    reactor: HeaderSyncReactor,
+    snapshot: zakura_header_chain::EngineSnapshot,
+    fatal_events: mpsc::UnboundedReceiver<HeaderSyncFatalEvent>,
+    peer: ZakuraPeerId,
+    source: zakura_header_chain::SourceId,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+    context: zakura_header_chain::VctRepairContext,
+    phase: HeaderTargetPhase,
+}
+
+impl VctLocalFixture {
+    fn new(port: Arc<PendingVctLocalPort>, phase: HeaderTargetPhase) -> Self {
+        let (handle, mut reactor, snapshot, fatal_events) =
+            direct_vct_reactor_with_fatal_events(port.clone());
+        let peer = peer();
+        let (source, owner, context) =
+            seed_vct_active_request(&mut reactor, &snapshot, peer.clone(), 7, phase);
+        Self {
+            _handle: handle,
+            port,
+            reactor,
+            snapshot,
+            fatal_events,
+            peer,
+            source,
+            owner,
+            context,
+            phase,
+        }
+    }
+
+    fn operation(&self) -> HeaderPortOperation {
+        let active = self
+            .reactor
+            .peer_work_queue
+            .active(&self.peer)
+            .expect("the fixture has one active repair");
+        match self.phase {
+            HeaderTargetPhase::Preparing => HeaderPortOperation::PrepareHeaderTarget {
+                purpose: active.purpose.clone(),
+                peer: self.peer.clone(),
+                source: self.source,
+                owner: self.owner,
+                common_ancestor: self.snapshot.frontiers.finalized,
+                target: self.context.target,
+                completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
+                    common_ancestor: self.snapshot.frontiers.finalized,
+                    selected_target: self.context.target,
+                },
+                entries: active.entries.clone(),
+            },
+            HeaderTargetPhase::Applying => HeaderPortOperation::ApplyHeaderTarget {
+                purpose: active.purpose.clone(),
+                peer: self.peer.clone(),
+                source: self.source,
+                owner: self.owner,
+                target: prepared_vct_target(
+                    &self.reactor,
+                    &self.snapshot,
+                    &self.peer,
+                    self.source,
+                    self.owner,
+                    &self.context,
+                ),
+            },
+            HeaderTargetPhase::Receiving => {
+                unreachable!("the fixture covers local operation phases")
+            }
+        }
+    }
+
+    fn dispatch(&mut self) {
+        let operation = self.operation();
+        assert!(self.reactor.dispatch_action(operation));
+    }
+
+    fn assert_single_operation_through_timeouts(&mut self) {
+        let mut deadline = Instant::now();
+        self.reactor
+            .request_deadlines
+            .insert(self.peer.clone(), deadline);
+        for _ in 0..3 {
+            self.reactor.retire_timed_out_requests(deadline);
+            poll_pending_operation(&mut self.reactor);
+            assert_eq!(self.reactor.pending_port_operations.len(), 1);
+            assert_eq!(
+                self.port.prepare_calls.load(Ordering::SeqCst),
+                usize::from(self.phase == HeaderTargetPhase::Preparing)
+            );
+            assert_eq!(
+                self.port.apply_calls.load(Ordering::SeqCst),
+                usize::from(self.phase == HeaderTargetPhase::Applying)
+            );
+            assert_eq!(
+                self.reactor
+                    .peer_work_queue
+                    .active(&self.peer)
+                    .map(|active| active.phase),
+                Some(self.phase)
+            );
+            deadline = self.reactor.request_deadlines[&self.peer];
+        }
+    }
+
+    async fn release_and_complete(&mut self) {
+        match self.phase {
+            HeaderTargetPhase::Preparing => self.port.prepare_release.notify_one(),
+            HeaderTargetPhase::Applying => self.port.apply_release.notify_one(),
+            HeaderTargetPhase::Receiving => unreachable!("receiving is not a local operation"),
+        }
+        let completion = self
+            .reactor
+            .pending_port_operations
+            .next()
+            .await
+            .expect("the owned local operation completes");
+        self.reactor.handle_port_completion(completion);
+    }
+}
+
+fn phase_label(phase: HeaderTargetPhase) -> &'static str {
+    match phase {
+        HeaderTargetPhase::Preparing => "prepare",
+        HeaderTargetPhase::Applying => "apply",
+        HeaderTargetPhase::Receiving => unreachable!("receiving is not a local operation"),
+    }
+}
+
+struct ReadyVctRepairFixture {
+    _handle: HeaderSyncHandle,
+    reactor: HeaderSyncReactor,
+    snapshot: zakura_header_chain::EngineSnapshot,
+    anchor: zakura_header_chain::Frontier,
+    target: zakura_header_chain::Frontier,
+    owner: zakura_header_chain::BodyWorkOwner,
+    context: zakura_header_chain::VctRepairContext,
+}
+
+impl ReadyVctRepairFixture {
+    fn new() -> Self {
+        let mut startup = startup(CancellationToken::new());
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let mut snapshot = committed_snapshot(anchor);
+        let target = zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
+        snapshot.frontiers.header_best =
+            zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32]));
+        let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (handle, _actions, reactor) =
+            build_header_sync_reactor(startup).expect("the VCT repair fixture builds");
+        let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
+            INTERNAL_VCT_REPAIR_SESSION_ID,
+            std::num::NonZeroU64::new(1).expect("one is nonzero"),
+        );
+        let context = zakura_header_chain::VctRepairContext {
+            target,
+            locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        };
+        Self {
+            _handle: handle,
+            reactor,
+            snapshot,
+            anchor,
+            target,
+            owner,
+            context,
+        }
+    }
+
+    fn schedule(&mut self) {
+        let mut repair = RepairRequirement::new(self.owner, self.target.height, 11);
+        repair.state = RepairPolicyState::Ready {
+            context: self.context.clone(),
+        };
+        self.reactor.vct_repair.insert(repair);
+    }
+
+    fn status(&self) -> Status {
+        Status {
+            work_anchor_height: self.anchor.height,
+            work_anchor_hash: self.anchor.hash,
+            selected_tip_height: self.snapshot.frontiers.header_best.height,
+            selected_tip_hash: self.snapshot.frontiers.header_best.hash,
+            suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+            oldest_retained_height: self.anchor.height,
+            max_headers_per_response: 1,
+            max_inflight_requests: 1,
+            max_message_bytes: 2_000_000,
+            tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+        }
+    }
+
+    fn connect(
+        &mut self,
+        markers: &[u8],
+        first_session_id: u64,
+    ) -> (Vec<ZakuraPeerId>, Vec<crate::zakura::FramedRecv>) {
+        let peers: Vec<_> = markers
+            .iter()
+            .map(|marker| {
+                ZakuraPeerId::new(vec![*marker; 32]).expect("the peer ID has the required length")
+            })
+            .collect();
+        let outbounds = peers
+            .iter()
+            .enumerate()
+            .map(|(index, peer)| {
+                let session_id =
+                    first_session_id + u64::try_from(index).expect("the peer index fits in u64");
+                let (send, outbound) = framed_channel(8);
+                self.reactor
+                    .handle_peer_connected(PeerSession::from_parts_with_session_id(
+                        peer.clone(),
+                        session_id,
+                        send,
+                        CancellationToken::new(),
+                    ));
+                outbound
+            })
+            .collect();
+        (peers, outbounds)
+    }
+
+    fn advertise(&mut self, peers: &[ZakuraPeerId], first_session_id: u64) {
+        let status = self.status();
+        for (index, peer) in peers.iter().enumerate() {
+            self.reactor.handle_wire_message(
+                peer.clone(),
+                first_session_id + u64::try_from(index).expect("the peer index fits in u64"),
+                HeaderSyncMessage::Status(status.clone()),
+            );
+        }
+    }
+}
+
 fn poll_pending_operation(reactor: &mut HeaderSyncReactor) {
     assert!(
         reactor
@@ -265,98 +531,48 @@ fn poll_pending_operation(reactor: &mut HeaderSyncReactor) {
 #[tokio::test(start_paused = true)]
 async fn pending_vct_prepare_and_apply_emit_one_fatal_event_at_thirty_minutes() {
     for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
-        let prepare_calls = Arc::new(AtomicUsize::new(0));
-        let apply_calls = Arc::new(AtomicUsize::new(0));
-        let port = Arc::new(PendingVctLocalPort {
-            prepare_calls: prepare_calls.clone(),
-            apply_calls: apply_calls.clone(),
-            prepare_release: Arc::new(Notify::new()),
-            apply_release: Arc::new(Notify::new()),
-            prepare_delay: None,
-            apply_delay: None,
-            apply_succeeds: true,
-        });
-        let (_handle, mut reactor, snapshot, mut fatal_events) =
-            direct_vct_reactor_with_fatal_events(port);
-        let peer = peer();
-        let (source, owner, context) =
-            seed_vct_active_request(&mut reactor, &snapshot, peer.clone(), 7, phase);
-        let active = reactor
-            .peer_work_queue
-            .active(&peer)
-            .expect("the fixture has one active repair");
-        let action = match phase {
-            HeaderTargetPhase::Preparing => HeaderPortOperation::PrepareHeaderTarget {
-                purpose: active.purpose.clone(),
-                peer: peer.clone(),
-                source,
-                owner,
-                common_ancestor: snapshot.frontiers.finalized,
-                target: context.target,
-                completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
-                    common_ancestor: snapshot.frontiers.finalized,
-                    selected_target: context.target,
-                },
-                entries: active.entries.clone(),
-            },
-            HeaderTargetPhase::Applying => HeaderPortOperation::ApplyHeaderTarget {
-                purpose: active.purpose.clone(),
-                peer: peer.clone(),
-                source,
-                owner,
-                target: prepared_vct_target(&reactor, &snapshot, &peer, source, owner, &context),
-            },
-            HeaderTargetPhase::Receiving => {
-                unreachable!("the test covers local operation phases")
-            }
-        };
-        assert!(reactor.dispatch_action(action));
-        poll_pending_operation(&mut reactor);
-        reactor.request_deadlines.insert(
-            peer.clone(),
-            Instant::now() + reactor.startup.request_timeout,
+        let mut fixture = VctLocalFixture::new(PendingVctLocalPort::pending(true), phase);
+        fixture.dispatch();
+        poll_pending_operation(&mut fixture.reactor);
+        fixture.reactor.request_deadlines.insert(
+            fixture.peer.clone(),
+            Instant::now() + fixture.reactor.startup.request_timeout,
         );
 
         for diagnostic in 1..60 {
-            time::advance(reactor.startup.request_timeout).await;
+            time::advance(fixture.reactor.startup.request_timeout).await;
             let now = Instant::now();
-            reactor.retire_timed_out_requests(now);
-            assert!(!reactor.report_fatal_vct_local_operation(now));
+            fixture.reactor.retire_timed_out_requests(now);
+            assert!(!fixture.reactor.report_fatal_vct_local_operation(now));
             assert!(matches!(
-                fatal_events.try_recv(),
+                fixture.fatal_events.try_recv(),
                 Err(mpsc::error::TryRecvError::Empty)
             ));
-            assert_eq!(reactor.pending_port_operations.len(), 1);
+            assert_eq!(fixture.reactor.pending_port_operations.len(), 1);
             assert_eq!(
-                prepare_calls.load(Ordering::SeqCst) + apply_calls.load(Ordering::SeqCst),
+                fixture.port.total_calls(),
                 1,
                 "diagnostic {diagnostic} must not duplicate the state operation",
             );
         }
 
-        time::advance(reactor.startup.request_timeout).await;
+        time::advance(fixture.reactor.startup.request_timeout).await;
         let now = Instant::now();
-        reactor.retire_timed_out_requests(now);
-        assert!(reactor.report_fatal_vct_local_operation(now));
-        let fatal = fatal_events
+        fixture.reactor.retire_timed_out_requests(now);
+        assert!(fixture.reactor.report_fatal_vct_local_operation(now));
+        let fatal = fixture
+            .fatal_events
             .try_recv()
             .expect("the hard deadline emits one fatal event");
-        assert_eq!(
-            fatal.phase,
-            match phase {
-                HeaderTargetPhase::Preparing => "prepare",
-                HeaderTargetPhase::Applying => "apply",
-                HeaderTargetPhase::Receiving => unreachable!(),
-            }
-        );
-        assert_eq!(fatal.owner, owner);
+        assert_eq!(fatal.phase, phase_label(phase));
+        assert_eq!(fatal.owner, fixture.owner);
         assert_eq!(fatal.repair_generation, 11);
-        assert_eq!(fatal.target, context.target);
+        assert_eq!(fatal.target, fixture.context.target);
         assert_eq!(fatal.elapsed, VCT_LOCAL_OPERATION_FATAL_AFTER);
-        assert_eq!(reactor.pending_port_operations.len(), 1);
-        assert!(reactor.report_fatal_vct_local_operation(now));
+        assert_eq!(fixture.reactor.pending_port_operations.len(), 1);
+        assert!(fixture.reactor.report_fatal_vct_local_operation(now));
         assert!(matches!(
-            fatal_events.try_recv(),
+            fixture.fatal_events.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
     }
@@ -365,61 +581,15 @@ async fn pending_vct_prepare_and_apply_emit_one_fatal_event_at_thirty_minutes() 
 #[tokio::test(start_paused = true)]
 async fn reactor_run_wakes_for_each_vct_local_operation_hard_deadline() {
     for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
-        let prepare_calls = Arc::new(AtomicUsize::new(0));
-        let apply_calls = Arc::new(AtomicUsize::new(0));
-        let port = Arc::new(PendingVctLocalPort {
-            prepare_calls: prepare_calls.clone(),
-            apply_calls: apply_calls.clone(),
-            prepare_release: Arc::new(Notify::new()),
-            apply_release: Arc::new(Notify::new()),
-            prepare_delay: None,
-            apply_delay: None,
-            apply_succeeds: true,
-        });
-        let (_handle, mut reactor, snapshot, mut fatal_events) =
-            direct_vct_reactor_with_fatal_events(port);
-        let shutdown = reactor.startup.shutdown.clone();
-        let peer = peer();
-        let (source, owner, context) =
-            seed_vct_active_request(&mut reactor, &snapshot, peer.clone(), 7, phase);
-        let active = reactor
-            .peer_work_queue
-            .active(&peer)
-            .expect("the fixture has one active repair");
-        let purpose = active.purpose.clone();
-        let entries = active.entries.clone();
-        let action = match phase {
-            HeaderTargetPhase::Preparing => HeaderPortOperation::PrepareHeaderTarget {
-                purpose,
-                peer: peer.clone(),
-                source,
-                owner,
-                common_ancestor: snapshot.frontiers.finalized,
-                target: context.target,
-                completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
-                    common_ancestor: snapshot.frontiers.finalized,
-                    selected_target: context.target,
-                },
-                entries,
-            },
-            HeaderTargetPhase::Applying => HeaderPortOperation::ApplyHeaderTarget {
-                purpose,
-                peer: peer.clone(),
-                source,
-                owner,
-                target: prepared_vct_target(&reactor, &snapshot, &peer, source, owner, &context),
-            },
-            HeaderTargetPhase::Receiving => {
-                unreachable!("the test covers local operation phases")
-            }
-        };
-        assert!(reactor.dispatch_action(action));
-        let task = tokio::spawn(reactor.run());
+        let mut fixture = VctLocalFixture::new(PendingVctLocalPort::pending(true), phase);
+        fixture.dispatch();
+        let shutdown = fixture.reactor.startup.shutdown.clone();
+        let owner = fixture.owner;
+        let port = fixture.port.clone();
+        let mut fatal_events = fixture.fatal_events;
+        let task = tokio::spawn(fixture.reactor.run());
         tokio::task::yield_now().await;
-        assert_eq!(
-            prepare_calls.load(Ordering::SeqCst) + apply_calls.load(Ordering::SeqCst),
-            1
-        );
+        assert_eq!(port.total_calls(), 1);
 
         time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER - std::time::Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
@@ -435,18 +605,8 @@ async fn reactor_run_wakes_for_each_vct_local_operation_hard_deadline() {
             .try_recv()
             .expect("the running reactor emits the deadline event");
         assert_eq!(fatal.owner, owner);
-        assert_eq!(
-            fatal.phase,
-            match phase {
-                HeaderTargetPhase::Preparing => "prepare",
-                HeaderTargetPhase::Applying => "apply",
-                HeaderTargetPhase::Receiving => unreachable!(),
-            }
-        );
-        assert_eq!(
-            prepare_calls.load(Ordering::SeqCst) + apply_calls.load(Ordering::SeqCst),
-            1
-        );
+        assert_eq!(fatal.phase, phase_label(phase));
+        assert_eq!(port.total_calls(), 1);
         assert!(!task.is_finished(), "the pending operation remains owned");
 
         shutdown.cancel();
@@ -457,46 +617,14 @@ async fn reactor_run_wakes_for_each_vct_local_operation_hard_deadline() {
 
 #[tokio::test(start_paused = true)]
 async fn vct_apply_completion_wins_at_the_hard_deadline() {
-    let apply_calls = Arc::new(AtomicUsize::new(0));
-    let port = Arc::new(PendingVctLocalPort {
-        prepare_calls: Arc::new(AtomicUsize::new(0)),
-        apply_calls: apply_calls.clone(),
-        prepare_release: Arc::new(Notify::new()),
-        apply_release: Arc::new(Notify::new()),
-        prepare_delay: None,
-        apply_delay: Some(VCT_LOCAL_OPERATION_FATAL_AFTER),
-        apply_succeeds: true,
-    });
-    let (_handle, mut reactor, snapshot, mut fatal_events) =
-        direct_vct_reactor_with_fatal_events(port);
-    let shutdown = reactor.startup.shutdown.clone();
-    let peer = peer();
-    let (source, owner, context) = seed_vct_active_request(
-        &mut reactor,
-        &snapshot,
-        peer.clone(),
-        7,
-        HeaderTargetPhase::Applying,
-    );
-    let purpose = reactor
-        .peer_work_queue
-        .active(&peer)
-        .expect("the fixture has one applying repair")
-        .purpose
-        .clone();
-    let target = prepared_vct_target(&reactor, &snapshot, &peer, source, owner, &context);
-    assert!(
-        reactor.dispatch_action(HeaderPortOperation::ApplyHeaderTarget {
-            purpose,
-            peer,
-            source,
-            owner,
-            target,
-        })
-    );
-    let task = tokio::spawn(reactor.run());
+    let port = PendingVctLocalPort::with_apply_delay(VCT_LOCAL_OPERATION_FATAL_AFTER);
+    let mut fixture = VctLocalFixture::new(port.clone(), HeaderTargetPhase::Applying);
+    fixture.dispatch();
+    let shutdown = fixture.reactor.startup.shutdown.clone();
+    let mut fatal_events = fixture.fatal_events;
+    let task = tokio::spawn(fixture.reactor.run());
     tokio::task::yield_now().await;
-    assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(port.apply_calls.load(Ordering::SeqCst), 1);
 
     time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
     tokio::task::yield_now().await;
@@ -510,7 +638,7 @@ async fn vct_apply_completion_wins_at_the_hard_deadline() {
         !task.is_finished(),
         "completion must not terminate the reactor"
     );
-    assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(port.apply_calls.load(Ordering::SeqCst), 1);
     shutdown.cancel();
     task.await
         .expect("the reactor stops through normal shutdown");
@@ -518,15 +646,7 @@ async fn vct_apply_completion_wins_at_the_hard_deadline() {
 
 #[test]
 fn normal_header_operations_have_no_vct_fatal_deadline() {
-    let port = Arc::new(PendingVctLocalPort {
-        prepare_calls: Arc::new(AtomicUsize::new(0)),
-        apply_calls: Arc::new(AtomicUsize::new(0)),
-        prepare_release: Arc::new(Notify::new()),
-        apply_release: Arc::new(Notify::new()),
-        prepare_delay: None,
-        apply_delay: None,
-        apply_succeeds: true,
-    });
+    let port = PendingVctLocalPort::pending(true);
     let (mut reactor, snapshot) = direct_vct_reactor(port);
     let peer = peer();
     let (source, owner, context) = seed_vct_active_request(
@@ -710,77 +830,22 @@ fn vct_local_phase_deadlines_preserve_operation_ownership() {
 
 #[tokio::test]
 async fn pending_vct_prepare_remains_single_until_its_failure_completes() {
-    let prepare_calls = Arc::new(AtomicUsize::new(0));
-    let apply_calls = Arc::new(AtomicUsize::new(0));
-    let prepare_release = Arc::new(Notify::new());
-    let port = Arc::new(PendingVctLocalPort {
-        prepare_calls: prepare_calls.clone(),
-        apply_calls: apply_calls.clone(),
-        prepare_release: prepare_release.clone(),
-        apply_release: Arc::new(Notify::new()),
-        prepare_delay: None,
-        apply_delay: None,
-        apply_succeeds: false,
-    });
-    let (mut reactor, snapshot) = direct_vct_reactor(port);
-    let peer = peer();
-    let (source, owner, context) = seed_vct_active_request(
-        &mut reactor,
-        &snapshot,
-        peer.clone(),
-        7,
-        HeaderTargetPhase::Preparing,
-    );
-    let active = reactor
+    let port = PendingVctLocalPort::pending(false);
+    let mut fixture = VctLocalFixture::new(port.clone(), HeaderTargetPhase::Preparing);
+    fixture.dispatch();
+    poll_pending_operation(&mut fixture.reactor);
+    assert_eq!(port.prepare_calls.load(Ordering::SeqCst), 1);
+    fixture.assert_single_operation_through_timeouts();
+    fixture.release_and_complete().await;
+
+    assert!(fixture.reactor.pending_port_operations.is_empty());
+    assert!(fixture
+        .reactor
         .peer_work_queue
-        .active(&peer)
-        .expect("the fixture has one preparing repair");
-    let action = HeaderPortOperation::PrepareHeaderTarget {
-        purpose: active.purpose.clone(),
-        peer: peer.clone(),
-        source,
-        owner,
-        common_ancestor: snapshot.frontiers.finalized,
-        target: context.target,
-        completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
-            common_ancestor: snapshot.frontiers.finalized,
-            selected_target: context.target,
-        },
-        entries: active.entries.clone(),
-    };
-    assert!(reactor.dispatch_action(action));
-    poll_pending_operation(&mut reactor);
-    assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
-
-    let mut deadline = Instant::now();
-    reactor.request_deadlines.insert(peer.clone(), deadline);
-    for _ in 0..3 {
-        reactor.retire_timed_out_requests(deadline);
-        poll_pending_operation(&mut reactor);
-        assert_eq!(reactor.pending_port_operations.len(), 1);
-        assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            reactor
-                .peer_work_queue
-                .active(&peer)
-                .map(|active| active.phase),
-            Some(HeaderTargetPhase::Preparing)
-        );
-        deadline = reactor.request_deadlines[&peer];
-    }
-
-    prepare_release.notify_one();
-    let completion = reactor
-        .pending_port_operations
-        .next()
-        .await
-        .expect("the owned preparation completes");
-    reactor.handle_port_completion(completion);
-
-    assert!(reactor.pending_port_operations.is_empty());
-    assert!(reactor.peer_work_queue.active(&peer).is_none());
-    let task = reactor
+        .active(&fixture.peer)
+        .is_none());
+    let task = fixture
+        .reactor
         .vct_repair
         .current()
         .expect("the attributed local failure keeps the repair");
@@ -789,151 +854,76 @@ async fn pending_vct_prepare_remains_single_until_its_failure_completes() {
         RepairPolicyState::LocalBackoff {
             context: retained,
             ..
-        } if retained == &context
+        } if retained == &fixture.context
     ));
     assert_eq!(task.attempts, 1);
 }
 
 #[tokio::test]
 async fn pending_vct_apply_remains_single_until_success() {
-    let prepare_calls = Arc::new(AtomicUsize::new(0));
-    let apply_calls = Arc::new(AtomicUsize::new(0));
-    let apply_release = Arc::new(Notify::new());
-    let port = Arc::new(PendingVctLocalPort {
-        prepare_calls: prepare_calls.clone(),
-        apply_calls: apply_calls.clone(),
-        prepare_release: Arc::new(Notify::new()),
-        apply_release: apply_release.clone(),
-        prepare_delay: None,
-        apply_delay: None,
-        apply_succeeds: true,
-    });
-    let (mut reactor, snapshot) = direct_vct_reactor(port);
-    let peer = peer();
-    let (source, owner, context) = seed_vct_active_request(
-        &mut reactor,
-        &snapshot,
-        peer.clone(),
-        7,
-        HeaderTargetPhase::Applying,
-    );
-    let target = prepared_vct_target(&reactor, &snapshot, &peer, source, owner, &context);
-    let purpose = reactor
+    let port = PendingVctLocalPort::pending(true);
+    let mut fixture = VctLocalFixture::new(port.clone(), HeaderTargetPhase::Applying);
+    fixture.dispatch();
+    poll_pending_operation(&mut fixture.reactor);
+    assert_eq!(port.apply_calls.load(Ordering::SeqCst), 1);
+    fixture.assert_single_operation_through_timeouts();
+    fixture.release_and_complete().await;
+
+    assert!(fixture.reactor.pending_port_operations.is_empty());
+    assert!(fixture
+        .reactor
         .peer_work_queue
-        .active(&peer)
-        .expect("the fixture has one applying repair")
-        .purpose
-        .clone();
-    assert!(
-        reactor.dispatch_action(HeaderPortOperation::ApplyHeaderTarget {
-            purpose,
-            peer: peer.clone(),
-            source,
-            owner,
-            target,
-        })
-    );
-    poll_pending_operation(&mut reactor);
-    assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
-
-    let mut deadline = Instant::now();
-    reactor.request_deadlines.insert(peer.clone(), deadline);
-    for _ in 0..3 {
-        reactor.retire_timed_out_requests(deadline);
-        poll_pending_operation(&mut reactor);
-        assert_eq!(reactor.pending_port_operations.len(), 1);
-        assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            reactor
-                .peer_work_queue
-                .active(&peer)
-                .map(|active| active.phase),
-            Some(HeaderTargetPhase::Applying)
-        );
-        deadline = reactor.request_deadlines[&peer];
-    }
-
-    apply_release.notify_one();
-    let completion = reactor
-        .pending_port_operations
-        .next()
-        .await
-        .expect("the owned application completes");
-    reactor.handle_port_completion(completion);
-
-    assert!(reactor.pending_port_operations.is_empty());
-    assert!(reactor.peer_work_queue.active(&peer).is_none());
-    assert!(!reactor.request_deadlines.contains_key(&peer));
+        .active(&fixture.peer)
+        .is_none());
+    assert!(!fixture
+        .reactor
+        .request_deadlines
+        .contains_key(&fixture.peer));
     assert_eq!(
-        reactor.vct_repair.current().map(|task| &task.state),
+        fixture.reactor.vct_repair.current().map(|task| &task.state),
         Some(&RepairPolicyState::Completed)
     );
 }
 
 #[tokio::test]
 async fn obsolete_vct_generation_retires_ownership_and_ignores_late_apply() {
-    let apply_calls = Arc::new(AtomicUsize::new(0));
-    let apply_release = Arc::new(Notify::new());
-    let port = Arc::new(PendingVctLocalPort {
-        prepare_calls: Arc::new(AtomicUsize::new(0)),
-        apply_calls: apply_calls.clone(),
-        prepare_release: Arc::new(Notify::new()),
-        apply_release: apply_release.clone(),
-        prepare_delay: None,
-        apply_delay: None,
-        apply_succeeds: true,
-    });
-    let (mut reactor, snapshot) = direct_vct_reactor(port);
-    let peer = peer();
-    let (source, owner, context) = seed_vct_active_request(
-        &mut reactor,
-        &snapshot,
-        peer.clone(),
-        7,
-        HeaderTargetPhase::Applying,
-    );
-    let target = prepared_vct_target(&reactor, &snapshot, &peer, source, owner, &context);
-    let purpose = reactor
-        .peer_work_queue
-        .active(&peer)
-        .expect("the fixture has one applying repair")
-        .purpose
-        .clone();
-    assert!(
-        reactor.dispatch_action(HeaderPortOperation::ApplyHeaderTarget {
-            purpose,
-            peer: peer.clone(),
-            source,
-            owner,
-            target,
-        })
-    );
-    poll_pending_operation(&mut reactor);
-    assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
+    let port = PendingVctLocalPort::pending(true);
+    let mut fixture = VctLocalFixture::new(port.clone(), HeaderTargetPhase::Applying);
+    fixture.dispatch();
+    poll_pending_operation(&mut fixture.reactor);
+    assert_eq!(port.apply_calls.load(Ordering::SeqCst), 1);
 
-    let mut changed = snapshot;
+    let mut changed = fixture.snapshot.clone();
     changed.header_generation = changed
         .header_generation
         .checked_next()
         .expect("the fixture generation advances");
-    reactor.observe_latest_committed_snapshot(changed);
-    assert!(reactor.peer_work_queue.active(&peer).is_none());
-    assert!(reactor.vct_repair.current().is_none());
-    assert_eq!(reactor.pending_port_operations.len(), 1);
+    fixture.reactor.observe_latest_committed_snapshot(changed);
+    assert!(fixture
+        .reactor
+        .peer_work_queue
+        .active(&fixture.peer)
+        .is_none());
+    assert!(fixture.reactor.vct_repair.current().is_none());
+    assert_eq!(fixture.reactor.pending_port_operations.len(), 1);
 
-    apply_release.notify_one();
-    let completion = reactor
+    port.apply_release.notify_one();
+    let completion = fixture
+        .reactor
         .pending_port_operations
         .next()
         .await
         .expect("the obsolete application eventually completes");
-    reactor.handle_port_completion(completion);
+    fixture.reactor.handle_port_completion(completion);
 
-    assert!(reactor.pending_port_operations.is_empty());
-    assert!(reactor.peer_work_queue.active(&peer).is_none());
-    assert!(reactor.vct_repair.current().is_none());
-    assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
+    assert!(fixture.reactor.pending_port_operations.is_empty());
+    assert!(fixture
+        .reactor
+        .peer_work_queue
+        .active(&fixture.peer)
+        .is_none());
+    assert!(fixture.reactor.vct_repair.current().is_none());
+    assert_eq!(port.apply_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -1096,130 +1086,45 @@ fn generation_stall_escalation_owns_a_maintenance_deadline() {
 
 #[test]
 fn initial_vct_wire_assignment_arms_the_request_deadline() {
-    let mut startup = startup(CancellationToken::new());
-    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
-    let mut snapshot = committed_snapshot(anchor);
-    let repair_target =
-        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
-    snapshot.frontiers.header_best =
-        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32]));
-    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
-    startup.committed_snapshots = Some(snapshots_rx);
-    let (_handle, _actions, mut reactor) =
-        build_header_sync_reactor(startup).expect("the repair timeout fixture builds");
-    let peer = peer();
-    let (send, _outbound) = framed_channel(8);
-    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
-        peer.clone(),
-        7,
-        send,
-        CancellationToken::new(),
-    ));
-    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
-        INTERNAL_VCT_REPAIR_SESSION_ID,
-        std::num::NonZeroU64::new(1).expect("one is nonzero"),
-    );
-    let mut repair = RepairRequirement::new(owner, repair_target.height, 11);
-    repair.state = RepairPolicyState::Ready {
-        context: zakura_header_chain::VctRepairContext {
-            target: repair_target,
-            locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-        },
-    };
-    reactor.vct_repair.insert(repair);
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    fixture.schedule();
     let before = Instant::now();
-
-    reactor.handle_wire_message(
-        peer.clone(),
-        7,
-        HeaderSyncMessage::Status(Status {
-            work_anchor_height: anchor.height,
-            work_anchor_hash: anchor.hash,
-            selected_tip_height: snapshot.frontiers.header_best.height,
-            selected_tip_hash: snapshot.frontiers.header_best.hash,
-            suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
-            oldest_retained_height: anchor.height,
-            max_headers_per_response: 1,
-            max_inflight_requests: 1,
-            max_message_bytes: 2_000_000,
-            tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-        }),
-    );
+    fixture.advertise(&peers, 7);
 
     assert!(matches!(
-        reactor
+        fixture
+            .reactor
             .peer_work_queue
-            .active(&peer)
+            .active(peer)
             .map(|active| &active.purpose),
         Some(HeaderTargetPurpose::SelectedAuxiliaryRepair { .. })
     ));
-    let deadline = reactor
+    let deadline = fixture
+        .reactor
         .request_deadlines
-        .get(&peer)
+        .get(peer)
         .copied()
         .expect("the exact repair wire request owns a deadline");
-    assert!(deadline >= before + reactor.startup.request_timeout);
+    assert!(deadline >= before + fixture.reactor.startup.request_timeout);
 }
 
 #[test]
 fn local_capacity_backoff_starts_the_generation_stall_clock() {
-    let mut startup = startup(CancellationToken::new());
-    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
-    let mut snapshot = committed_snapshot(anchor);
-    let repair_target =
-        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
-    snapshot.frontiers.header_best =
-        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32]));
-    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
-    startup.committed_snapshots = Some(snapshots_rx);
-    let (_handle, _actions, mut reactor) =
-        build_header_sync_reactor(startup).expect("the capacity fixture builds");
-    let peer = peer();
-    let (send, _outbound) = framed_channel(8);
-    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
-        peer.clone(),
-        7,
-        send,
-        CancellationToken::new(),
-    ));
-    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
-        INTERNAL_VCT_REPAIR_SESSION_ID,
-        std::num::NonZeroU64::new(1).expect("one is nonzero"),
-    );
-    let context = zakura_header_chain::VctRepairContext {
-        target: repair_target,
-        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-    };
-    let mut repair = RepairRequirement::new(owner, repair_target.height, 11);
-    repair.state = RepairPolicyState::Ready {
-        context: context.clone(),
-    };
-    reactor.vct_repair.insert(repair);
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    fixture.schedule();
     let capacity_owner = ZakuraPeerId::new(vec![0x55; 32]).expect("the peer ID is bounded");
-    reactor.peer_work_queue.set_capacity_for_test(
+    fixture.reactor.peer_work_queue.set_capacity_for_test(
         &capacity_owner,
         HEADER_CHUNK_BUDGET_CAPACITY_V1,
         0,
     );
+    fixture.advertise(&peers, 7);
 
-    reactor.handle_wire_message(
-        peer,
-        7,
-        HeaderSyncMessage::Status(Status {
-            work_anchor_height: anchor.height,
-            work_anchor_hash: anchor.hash,
-            selected_tip_height: snapshot.frontiers.header_best.height,
-            selected_tip_hash: snapshot.frontiers.header_best.hash,
-            suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
-            oldest_retained_height: anchor.height,
-            max_headers_per_response: 1,
-            max_inflight_requests: 1,
-            max_message_bytes: 2_000_000,
-            tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-        }),
-    );
-
-    let task = reactor
+    let task = fixture
+        .reactor
         .vct_repair
         .current()
         .expect("local capacity backoff keeps the repair");
@@ -1228,12 +1133,13 @@ fn local_capacity_backoff_starts_the_generation_stall_clock() {
         RepairPolicyState::SupplierBackoff {
             context: retained,
             ..
-        } if retained == &context
+        } if retained == &fixture.context
     ));
     assert_eq!(task.attempts, 0);
     assert!(task.tried_sources.is_empty());
     assert_eq!(
-        reactor
+        fixture
+            .reactor
             .vct_repair_stall
             .expect("local capacity starts the generation stall clock")
             .outcome,
@@ -1243,67 +1149,14 @@ fn local_capacity_backoff_starts_the_generation_stall_clock() {
 
 #[test]
 fn bounded_supplier_cycles_rotate_to_the_fourth_supplier() {
-    let mut startup = startup(CancellationToken::new());
-    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
-    let mut snapshot = committed_snapshot(anchor);
-    let repair_target =
-        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
-    snapshot.frontiers.header_best =
-        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32]));
-    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
-    startup.committed_snapshots = Some(snapshots_rx);
-    let (_handle, _actions, mut reactor) =
-        build_header_sync_reactor(startup).expect("the bounded round-robin repair fixture builds");
-    let peers: Vec<_> = [1_u8, 2, 3, 4]
-        .into_iter()
-        .map(|byte| ZakuraPeerId::new(vec![byte; 32]).expect("the peer ID has the required length"))
-        .collect();
-    let mut _outbounds = Vec::new();
-    for (index, peer) in peers.iter().enumerate() {
-        let (send, outbound) = framed_channel(8);
-        reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
-            peer.clone(),
-            7 + u64::try_from(index).expect("four peer indexes fit in u64"),
-            send,
-            CancellationToken::new(),
-        ));
-        _outbounds.push(outbound);
-    }
-    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
-        INTERNAL_VCT_REPAIR_SESSION_ID,
-        std::num::NonZeroU64::new(1).expect("one is nonzero"),
-    );
-    let context = zakura_header_chain::VctRepairContext {
-        target: repair_target,
-        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-    };
-    let mut task = RepairRequirement::new(owner, repair_target.height, 11);
-    task.state = RepairPolicyState::Ready {
-        context: context.clone(),
-    };
-    reactor.vct_repair.insert(task);
-    let status = Status {
-        work_anchor_height: anchor.height,
-        work_anchor_hash: anchor.hash,
-        selected_tip_height: snapshot.frontiers.header_best.height,
-        selected_tip_hash: snapshot.frontiers.header_best.hash,
-        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
-        oldest_retained_height: anchor.height,
-        max_headers_per_response: 1,
-        max_inflight_requests: 1,
-        max_message_bytes: 2_000_000,
-        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-    };
-    for (index, peer) in peers.iter().enumerate() {
-        reactor.handle_wire_message(
-            peer.clone(),
-            7 + u64::try_from(index).expect("four peer indexes fit in u64"),
-            HeaderSyncMessage::Status(status.clone()),
-        );
-    }
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[1, 2, 3, 4], 7);
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
 
     for peer in &peers[..3] {
-        let active = reactor
+        let active = fixture
+            .reactor
             .peer_work_queue
             .active(peer)
             .expect("the next round-robin supplier owns the repair")
@@ -1312,13 +1165,13 @@ fn bounded_supplier_cycles_rotate_to_the_fourth_supplier() {
             active.purpose,
             HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
         ));
-        reactor.handle_headers_outcome(
+        fixture.reactor.handle_headers_outcome(
             peer.clone(),
             active.owner.session_id(),
             active.owner.header_authority(),
             HeadersOutcome {
                 request_id: active.request_id.get(),
-                target_tip_hash: repair_target.hash,
+                target_tip_hash: fixture.target.hash,
                 outcome: HeadersOutcomeCode::TargetNotRetained,
             },
         );
@@ -1326,8 +1179,9 @@ fn bounded_supplier_cycles_rotate_to_the_fourth_supplier() {
 
     assert!(peers
         .iter()
-        .all(|peer| reactor.peer_work_queue.active(peer).is_none()));
-    let task = reactor
+        .all(|peer| fixture.reactor.peer_work_queue.active(peer).is_none()));
+    let task = fixture
+        .reactor
         .vct_repair
         .current()
         .expect("the bounded cycle keeps the repair requirement");
@@ -1335,13 +1189,13 @@ fn bounded_supplier_cycles_rotate_to_the_fourth_supplier() {
         RepairPolicyState::SupplierBackoff {
             context: retained,
             retry_at,
-        } if retained == &context => *retry_at,
+        } if retained == &fixture.context => *retry_at,
         other => panic!("three supplier failures must back off, got {other:?}"),
     };
     assert_eq!(task.tried_sources.len(), 3);
     assert!(task.supplier_cycle_exhausted());
     assert_eq!(
-        reactor.vct_supplier_order,
+        fixture.reactor.vct_supplier_order,
         [
             peers[3].clone(),
             peers[0].clone(),
@@ -1351,18 +1205,21 @@ fn bounded_supplier_cycles_rotate_to_the_fourth_supplier() {
         .into_iter()
         .collect::<VecDeque<_>>()
     );
-    let stall = reactor
+    let stall = fixture
+        .reactor
         .vct_repair_stall
         .expect("a complete failed cycle starts the generation stall clock");
 
-    reactor
+    fixture
+        .reactor
         .vct_repair
         .current_mut()
         .expect("the repair remains scheduled")
         .resume_retry_cycle(retry_at);
-    reactor.try_assign_vct_repair();
+    fixture.reactor.try_assign_vct_repair();
 
-    let active = reactor
+    let active = fixture
+        .reactor
         .peer_work_queue
         .active(&peers[3])
         .expect("the next cycle starts after the persistent supplier cursor");
@@ -1370,14 +1227,16 @@ fn bounded_supplier_cycles_rotate_to_the_fourth_supplier() {
         active.purpose,
         HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
     ));
-    let task = reactor
+    let task = fixture
+        .reactor
         .vct_repair
         .current()
         .expect("the fourth supplier owns the current repair");
     assert!(task.tried_sources.is_empty());
-    assert_eq!(reactor.vct_supplier_order.front(), Some(&peers[3]));
+    assert_eq!(fixture.reactor.vct_supplier_order.front(), Some(&peers[3]));
     assert_eq!(
-        reactor
+        fixture
+            .reactor
             .vct_repair_stall
             .expect("assignment preserves the generation stall clock")
             .since,
@@ -1387,82 +1246,30 @@ fn bounded_supplier_cycles_rotate_to_the_fourth_supplier() {
 
 #[test]
 fn established_supplier_precedes_new_identities_after_adversarial_churn() {
-    let mut startup = startup(CancellationToken::new());
-    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
-    let mut snapshot = committed_snapshot(anchor);
-    let repair_target =
-        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
-    snapshot.frontiers.header_best =
-        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32]));
-    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
-    startup.committed_snapshots = Some(snapshots_rx);
-    let (_handle, _actions, mut reactor) =
-        build_header_sync_reactor(startup).expect("the churn fixture builds");
-    let established: Vec<_> = [1_u8, 2, 3, 200]
-        .into_iter()
-        .map(|byte| ZakuraPeerId::new(vec![byte; 32]).expect("the peer ID is bounded"))
-        .collect();
-    let mut _outbounds = Vec::new();
-    for (index, peer) in established.iter().enumerate() {
-        let (send, outbound) = framed_channel(8);
-        reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
-            peer.clone(),
-            10 + u64::try_from(index).expect("the peer index fits in u64"),
-            send,
-            CancellationToken::new(),
-        ));
-        _outbounds.push(outbound);
-    }
-    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
-        INTERNAL_VCT_REPAIR_SESSION_ID,
-        std::num::NonZeroU64::new(1).expect("one is nonzero"),
-    );
-    let context = zakura_header_chain::VctRepairContext {
-        target: repair_target,
-        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-    };
-    let mut task = RepairRequirement::new(owner, repair_target.height, 11);
-    task.state = RepairPolicyState::Ready {
-        context: context.clone(),
-    };
-    reactor.vct_repair.insert(task);
-    let status = Status {
-        work_anchor_height: anchor.height,
-        work_anchor_hash: anchor.hash,
-        selected_tip_height: snapshot.frontiers.header_best.height,
-        selected_tip_hash: snapshot.frontiers.header_best.hash,
-        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
-        oldest_retained_height: anchor.height,
-        max_headers_per_response: 1,
-        max_inflight_requests: 1,
-        max_message_bytes: 2_000_000,
-        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-    };
-    for (index, peer) in established.iter().enumerate() {
-        reactor.handle_wire_message(
-            peer.clone(),
-            10 + u64::try_from(index).expect("the peer index fits in u64"),
-            HeaderSyncMessage::Status(status.clone()),
-        );
-    }
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (established, mut _outbounds) = fixture.connect(&[1, 2, 3, 200], 10);
+    fixture.schedule();
+    fixture.advertise(&established, 10);
     for peer in &established[..3] {
-        let active = reactor
+        let active = fixture
+            .reactor
             .peer_work_queue
             .active(peer)
             .expect("the next established supplier owns the repair")
             .clone();
-        reactor.handle_headers_outcome(
+        fixture.reactor.handle_headers_outcome(
             peer.clone(),
             active.owner.session_id(),
             active.owner.header_authority(),
             HeadersOutcome {
                 request_id: active.request_id.get(),
-                target_tip_hash: repair_target.hash,
+                target_tip_hash: fixture.target.hash,
                 outcome: HeadersOutcomeCode::TargetNotRetained,
             },
         );
     }
-    let retry_at = match reactor
+    let retry_at = match fixture
+        .reactor
         .vct_repair
         .current()
         .expect("the failed cycle keeps the repair")
@@ -1472,119 +1279,74 @@ fn established_supplier_precedes_new_identities_after_adversarial_churn() {
         ref other => panic!("the bounded cycle must back off, got {other:?}"),
     };
     for (index, peer) in established[..3].iter().enumerate() {
-        reactor.handle_peer_disconnected(
+        fixture.reactor.handle_peer_disconnected(
             peer,
             10 + u64::try_from(index).expect("the peer index fits in u64"),
             "test churn",
         );
     }
 
-    let churn: Vec<_> = [4_u8, 5, 6]
-        .into_iter()
-        .map(|byte| ZakuraPeerId::new(vec![byte; 32]).expect("the churn identity is bounded"))
-        .collect();
-    for (index, peer) in churn.iter().enumerate() {
-        let (send, outbound) = framed_channel(8);
-        let session_id = 20 + u64::try_from(index).expect("the churn index fits in u64");
-        reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
-            peer.clone(),
-            session_id,
-            send,
-            CancellationToken::new(),
-        ));
-        reactor.handle_wire_message(
-            peer.clone(),
-            session_id,
-            HeaderSyncMessage::Status(status.clone()),
-        );
-        _outbounds.push(outbound);
-    }
+    let (churn, churn_outbounds) = fixture.connect(&[4, 5, 6], 20);
+    fixture.advertise(&churn, 20);
+    _outbounds.extend(churn_outbounds);
 
-    assert_eq!(reactor.vct_supplier_order.front(), Some(&established[3]));
-    assert_eq!(reactor.vct_supplier_order.len(), reactor.peer_state.len());
-    reactor
+    assert_eq!(
+        fixture.reactor.vct_supplier_order.front(),
+        Some(&established[3])
+    );
+    assert_eq!(
+        fixture.reactor.vct_supplier_order.len(),
+        fixture.reactor.peer_state.len()
+    );
+    fixture
+        .reactor
         .vct_repair
         .current_mut()
         .expect("the repair remains scheduled")
         .resume_retry_cycle(retry_at);
-    reactor.try_assign_vct_repair();
+    fixture.reactor.try_assign_vct_repair();
 
-    assert!(reactor.peer_work_queue.active(&established[3]).is_some());
+    assert!(fixture
+        .reactor
+        .peer_work_queue
+        .active(&established[3])
+        .is_some());
     assert!(churn
         .iter()
-        .all(|peer| reactor.peer_work_queue.active(peer).is_none()));
+        .all(|peer| fixture.reactor.peer_work_queue.active(peer).is_none()));
 }
 
 #[test]
 fn replacement_session_keeps_the_authenticated_supplier_identity() {
-    let mut startup = startup(CancellationToken::new());
-    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
-    let mut snapshot = committed_snapshot(anchor);
-    let repair_target =
-        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
-    snapshot.frontiers.header_best =
-        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32]));
-    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
-    startup.committed_snapshots = Some(snapshots_rx);
-    let (_handle, _actions, mut reactor) =
-        build_header_sync_reactor(startup).expect("the replacement fixture builds");
-    let peer = peer();
-    let source = source_id_from_peer(&peer);
-    let (first_send, _first_outbound) = framed_channel(8);
-    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
-        peer.clone(),
-        7,
-        first_send,
-        CancellationToken::new(),
-    ));
-    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
-        INTERNAL_VCT_REPAIR_SESSION_ID,
-        std::num::NonZeroU64::new(1).expect("one is nonzero"),
-    );
-    let mut task = RepairRequirement::new(owner, repair_target.height, 11);
-    task.state = RepairPolicyState::Ready {
-        context: zakura_header_chain::VctRepairContext {
-            target: repair_target,
-            locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-        },
-    };
-    reactor.vct_repair.insert(task);
-    reactor.handle_wire_message(
-        peer.clone(),
-        7,
-        HeaderSyncMessage::Status(Status {
-            work_anchor_height: anchor.height,
-            work_anchor_hash: anchor.hash,
-            selected_tip_height: snapshot.frontiers.header_best.height,
-            selected_tip_hash: snapshot.frontiers.header_best.hash,
-            suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
-            oldest_retained_height: anchor.height,
-            max_headers_per_response: 1,
-            max_inflight_requests: 1,
-            max_message_bytes: 2_000_000,
-            tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-        }),
-    );
-    assert!(reactor.peer_work_queue.active(&peer).is_some());
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _first_outbound) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    let source = source_id_from_peer(peer);
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_some());
 
     let (replacement_send, _replacement_outbound) = framed_channel(8);
-    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
-        peer.clone(),
-        8,
-        replacement_send,
-        CancellationToken::new(),
-    ));
+    fixture
+        .reactor
+        .handle_peer_connected(PeerSession::from_parts_with_session_id(
+            peer.clone(),
+            8,
+            replacement_send,
+            CancellationToken::new(),
+        ));
 
-    assert_eq!(reactor.peer_state.len(), 1);
-    assert!(reactor.peer_work_queue.active(&peer).is_none());
-    let task = reactor
+    assert_eq!(fixture.reactor.peer_state.len(), 1);
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
+    let task = fixture
+        .reactor
         .vct_repair
         .current()
         .expect("the replacement keeps the repair scheduled");
     assert_eq!(task.tried_sources, [source].into_iter().collect());
     assert_eq!(
-        reactor.vct_supplier_order,
-        [peer].into_iter().collect::<VecDeque<_>>()
+        fixture.reactor.vct_supplier_order,
+        [peer.clone()].into_iter().collect::<VecDeque<_>>()
     );
     assert!(matches!(
         task.state,
@@ -1663,66 +1425,16 @@ fn replacement_and_disconnect_retain_owned_vct_local_operation() {
 
 #[test]
 fn send_failures_preserve_the_stall_clock_across_bounded_cycles() {
-    let mut startup = startup(CancellationToken::new());
-    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
-    let mut snapshot = committed_snapshot(anchor);
-    let repair_target =
-        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
-    snapshot.frontiers.header_best =
-        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32]));
-    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
-    startup.committed_snapshots = Some(snapshots_rx);
-    let (_handle, _actions, mut reactor) =
-        build_header_sync_reactor(startup).expect("the send-failure fixture builds");
-    let peers: Vec<_> = [1_u8, 2, 3, 4]
-        .into_iter()
-        .map(|byte| ZakuraPeerId::new(vec![byte; 32]).expect("the peer ID is bounded"))
-        .collect();
-    let status = Status {
-        work_anchor_height: anchor.height,
-        work_anchor_hash: anchor.hash,
-        selected_tip_height: snapshot.frontiers.header_best.height,
-        selected_tip_hash: snapshot.frontiers.header_best.hash,
-        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
-        oldest_retained_height: anchor.height,
-        max_headers_per_response: 1,
-        max_inflight_requests: 1,
-        max_message_bytes: 2_000_000,
-        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-    };
-    for (index, peer) in peers.iter().enumerate() {
-        let session_id = 7 + u64::try_from(index).expect("four peer indexes fit in u64");
-        let (send, outbound) = framed_channel(8);
-        reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
-            peer.clone(),
-            session_id,
-            send,
-            CancellationToken::new(),
-        ));
-        reactor.handle_wire_message(
-            peer.clone(),
-            session_id,
-            HeaderSyncMessage::Status(status.clone()),
-        );
-        drop(outbound);
-    }
-    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
-        INTERNAL_VCT_REPAIR_SESSION_ID,
-        std::num::NonZeroU64::new(1).expect("one is nonzero"),
-    );
-    let context = zakura_header_chain::VctRepairContext {
-        target: repair_target,
-        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-    };
-    let mut task = RepairRequirement::new(owner, repair_target.height, 11);
-    task.state = RepairPolicyState::Ready {
-        context: context.clone(),
-    };
-    reactor.vct_repair.insert(task);
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, outbounds) = fixture.connect(&[1, 2, 3, 4], 7);
+    fixture.advertise(&peers, 7);
+    drop(outbounds);
+    fixture.schedule();
 
-    reactor.try_assign_vct_repair();
+    fixture.reactor.try_assign_vct_repair();
 
-    let first_retry_at = match &reactor
+    let first_retry_at = match &fixture
+        .reactor
         .vct_repair
         .current()
         .expect("send failures keep the repair")
@@ -1731,10 +1443,14 @@ fn send_failures_preserve_the_stall_clock_across_bounded_cycles() {
         RepairPolicyState::SupplierBackoff { retry_at, .. } => *retry_at,
         other => panic!("three send failures must back off, got {other:?}"),
     };
-    let task = reactor.vct_repair.current().expect("the repair remains");
+    let task = fixture
+        .reactor
+        .vct_repair
+        .current()
+        .expect("the repair remains");
     assert_eq!(task.tried_sources.len(), MAX_SUPPLIERS_PER_CYCLE);
     assert_eq!(
-        reactor.vct_supplier_order,
+        fixture.reactor.vct_supplier_order,
         [
             peers[3].clone(),
             peers[0].clone(),
@@ -1744,25 +1460,31 @@ fn send_failures_preserve_the_stall_clock_across_bounded_cycles() {
         .into_iter()
         .collect::<VecDeque<_>>()
     );
-    let stall = reactor
+    let stall = fixture
+        .reactor
         .vct_repair_stall
         .expect("send failures start the stall clock");
 
-    reactor
+    fixture
+        .reactor
         .vct_repair
         .current_mut()
         .expect("the repair remains")
         .resume_retry_cycle(first_retry_at);
-    reactor.try_assign_vct_repair();
+    fixture.reactor.try_assign_vct_repair();
 
-    let task = reactor.vct_repair.current().expect("the repair remains");
+    let task = fixture
+        .reactor
+        .vct_repair
+        .current()
+        .expect("the repair remains");
     assert!(matches!(
         task.state,
         RepairPolicyState::SupplierBackoff { .. }
     ));
     assert_eq!(task.tried_sources.len(), MAX_SUPPLIERS_PER_CYCLE);
     assert_eq!(
-        reactor.vct_supplier_order,
+        fixture.reactor.vct_supplier_order,
         [
             peers[2].clone(),
             peers[3].clone(),
@@ -1773,7 +1495,8 @@ fn send_failures_preserve_the_stall_clock_across_bounded_cycles() {
         .collect::<VecDeque<_>>()
     );
     assert_eq!(
-        reactor
+        fixture
+            .reactor
             .vct_repair_stall
             .expect("the next send cycle preserves the stall clock")
             .since,

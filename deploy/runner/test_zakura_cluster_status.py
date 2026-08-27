@@ -83,6 +83,33 @@ def public_row(
     }
 
 
+class NodeConfigTests(unittest.TestCase):
+    def test_blank_metrics_endpoint_stays_disabled(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+            config.write(
+                '[defaults]\nmetrics_endpoint = "127.0.0.1:9999"\n'
+                '[[nodes]]\nname = "node-a"\nssh_string = "root@node-a"\n'
+                'metrics_endpoint = ""\n'
+            )
+            config.flush()
+
+            [configured] = status.load_nodes(Path(config.name))
+
+        self.assertEqual(configured.metrics_endpoint, "")
+
+    def test_explicit_metrics_endpoint_is_preserved(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+            config.write(
+                '[[nodes]]\nname = "node-a"\nssh_string = "root@node-a"\n'
+                'metrics_endpoint = "127.0.0.1:9999"\n'
+            )
+            config.flush()
+
+            [configured] = status.load_nodes(Path(config.name))
+
+        self.assertEqual(configured.metrics_endpoint, "127.0.0.1:9999")
+
+
 class RemoteProbeTests(unittest.TestCase):
     """Run the probe the way a node does: as a standalone script over stdin.
 
@@ -218,6 +245,58 @@ zcash_net_peers_connected{user_agent="/Gone:1.0/",remote_version="170160"} 0
                 "sync_header_verification_lag": 3.0,
                 "zcash_net_in_bytes_total": 12345.0,
             },
+        )
+
+    def test_metrics_scrape_keeps_stall_alert_series(self):
+        self.exposition += b"""checkpoint_processing_next_height 101
+checkpoint_verified_height 99
+state_finalized_block_height 98
+state_vct_root_stalled_height 100
+state_vct_root_repair_requested 4
+state_vct_root_retry_count 3
+state_vct_aux_sweep_frontier_height 97
+sync_header_vct_repair_requested_total 8
+sync_header_vct_repair_scheduled_total 7
+sync_header_vct_repair_admitted_total 6
+sync_header_vct_repair_context_unavailable_total 5
+sync_header_vct_repair_timed_out_total 4
+sync_header_vct_repair_resource_stalled_total 3
+sync_header_vct_repair_no_supplier_total 999
+sync_block_applying 0
+sync_block_best_header_tip_height 102
+sync_block_verified_tip_height 98
+sync_block_fill_stop 1
+sync_block_outstanding 0
+sync_block_missing_bodies 4000
+"""
+
+        probe = self.run_probe(metrics_endpoint=self.endpoint)
+
+        expected = {
+            "checkpoint_processing_next_height": 101.0,
+            "checkpoint_verified_height": 99.0,
+            "state_finalized_block_height": 98.0,
+            "state_vct_root_stalled_height": 100.0,
+            "state_vct_root_repair_requested": 4.0,
+            "state_vct_root_retry_count": 3.0,
+            "state_vct_aux_sweep_frontier_height": 97.0,
+            "sync_header_vct_repair_requested_total": 8.0,
+            "sync_header_vct_repair_scheduled_total": 7.0,
+            "sync_header_vct_repair_admitted_total": 6.0,
+            "sync_header_vct_repair_context_unavailable_total": 5.0,
+            "sync_header_vct_repair_timed_out_total": 4.0,
+            "sync_header_vct_repair_resource_stalled_total": 3.0,
+            "sync_block_applying": 0.0,
+            "sync_block_best_header_tip_height": 102.0,
+            "sync_block_verified_tip_height": 98.0,
+            "sync_block_fill_stop": 1.0,
+            "sync_block_outstanding": 0.0,
+            "sync_block_missing_bodies": 4_000.0,
+        }
+        for name, value in expected.items():
+            self.assertEqual(probe["metrics"].get(name), value)
+        self.assertNotIn(
+            "sync_header_vct_repair_no_supplier_total", probe["metrics"]
         )
 
     def test_peer_versions_come_from_the_user_agent_label(self):
@@ -808,6 +887,75 @@ class NodeDetailTests(unittest.TestCase):
         self.assertEqual(row["vitals"]["disk_free_pct"], 25.0)
         self.assertEqual(row["vitals"]["restart_count"], 2)
         self.assertEqual(row["peer_count"], 74)
+
+    def test_fleet_payload_carries_atomic_bounded_alert_diagnostics(self):
+        collected = collector()
+        metrics = {
+            "checkpoint_verified_height": 4_199_999.0,
+            "sync_block_applying": 0.0,
+            "sync_block_outstanding": 0.0,
+            "sync_block_missing_bodies": 4_000.0,
+            "sync_block_fill_stop": float("nan"),
+            "sync_block_verified_tip_height": float("inf"),
+            "not_an_alert_metric": 123.0,
+        }
+        collected.rows = [
+            collected.row_for(node(), self.probe(metrics=metrics), now=1_000.0)
+        ]
+        collected.last_poll = 1_001.0
+
+        snapshot = collected.snapshot()
+        diagnostics = snapshot["rows"][0]["alert_diagnostics"]
+
+        self.assertEqual(snapshot["last_poll"], 1_001.0)
+        self.assertEqual(diagnostics["last_poll"], snapshot["last_poll"])
+        self.assertEqual(diagnostics["metrics_at"], 1_000.0)
+        self.assertTrue(diagnostics["metrics_available"])
+        self.assertEqual(
+            diagnostics["metrics"],
+            {
+                "checkpoint_verified_height": 4_199_999.0,
+                "sync_block_applying": 0.0,
+                "sync_block_outstanding": 0.0,
+                "sync_block_missing_bodies": 4_000.0,
+            },
+        )
+        self.assertNotIn("not_an_alert_metric", json.dumps(diagnostics))
+        self.assertNotIn("log_errors", json.dumps(diagnostics))
+        self.assertNotIn("root@node-a", json.dumps(diagnostics))
+        self.assertLess(len(json.dumps(diagnostics)), 1_000)
+
+    def test_whole_probe_failure_marks_metrics_unavailable(self):
+        collected = collector()
+        error = "ssh exited 255: connection refused"
+
+        row = collected.row_for(node(), {"error": error}, now=1_000.0)
+        collected.rows = [row]
+        collected.last_poll = 1_001.0
+        diagnostics = collected.snapshot()["rows"][0]["alert_diagnostics"]
+
+        self.assertEqual(row["detail"], error)
+        self.assertEqual(row["metrics_error"], error)
+        self.assertIsNone(row["metrics_at"])
+        self.assertFalse(diagnostics["metrics_available"])
+        self.assertIsNone(diagnostics["metrics_at"])
+        self.assertEqual(diagnostics["metrics"], {})
+
+    def test_missing_metrics_timestamp_marks_metrics_unavailable(self):
+        diagnostics = status.alert_diagnostics(
+            {
+                "metrics": {"sync_block_missing_bodies": 4_000.0},
+                "metrics_at": None,
+            },
+            last_poll=1_001.0,
+        )
+
+        self.assertFalse(diagnostics["metrics_available"])
+        self.assertIsNone(diagnostics["metrics_at"])
+        self.assertEqual(
+            diagnostics["metrics"],
+            {"sync_block_missing_bodies": 4_000.0},
+        )
 
     def test_node_payload_carries_the_deep_fields(self):
         collected = collector()

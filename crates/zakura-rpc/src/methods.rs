@@ -114,6 +114,7 @@ pub(crate) mod types;
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
 use types::{
+    chain_tips::{self, GetChainTipsResponse},
     get_block_template::{
         constants::{
             DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MEMPOOL_LONG_POLL_INTERVAL,
@@ -374,6 +375,38 @@ pub trait Rpc {
     /// tags: blockchain
     #[method(name = "getbestblockheightandhash")]
     fn get_best_block_height_and_hash(&self) -> Result<GetBlockHeightAndHashResponse>;
+
+    /// Returns information about every tip in the block tree that this node still
+    /// tracks, including the best chain and orphaned branches.
+    ///
+    /// zcashd reference: [`getchaintips`](https://zcash.github.io/rpc/getchaintips.html)
+    /// method: post
+    /// tags: blockchain
+    ///
+    /// # Notes
+    ///
+    /// zcashd answers this call by scanning its entire block index under `cs_main`,
+    /// which costs seconds once the index holds millions of entries and blocks every
+    /// other RPC for that whole time. Zakura reads only the chains it holds in
+    /// memory, so the cost is bounded by the number of tracked forks rather than by
+    /// the height of the chain.
+    ///
+    /// The two nodes therefore report different tips. zcashd's block index is never
+    /// pruned, so it lists every stale tip it has ever seen. Zakura drops a fork once
+    /// it falls below the finalized tip, so it lists the tips that are still live:
+    /// the best chain, the non-finalized forks, recently invalidated branches, and
+    /// the selected header chain when some block bodies are unavailable.
+    ///
+    /// Zakura never returns zcashd's `valid-headers` or `unknown` statuses. Every
+    /// block in its non-finalized state is contextually verified, so a tip is either
+    /// fully valid, invalidated, or known only by its header.
+    ///
+    /// `branchlen` can be short for an `invalid` tip. Zakura tracks a limited number
+    /// of forks, and it can drop the chain that an invalidated branch forked from.
+    /// The branch is still reported, but its length is then measured from the deepest
+    /// block the node still tracks.
+    #[method(name = "getchaintips")]
+    async fn get_chain_tips(&self) -> Result<GetChainTipsResponse>;
 
     /// Returns details on the active state of the TX memory pool.
     ///
@@ -1741,6 +1774,20 @@ where
             .best_tip_height_and_hash()
             .map(|(height, hash)| GetBlockHeightAndHashResponse { height, hash })
             .ok_or_misc_error("No blocks in state")
+    }
+
+    async fn get_chain_tips(&self) -> Result<GetChainTipsResponse> {
+        let response: zakura_state::ReadResponse = call_service(
+            self.read_state.clone(),
+            zakura_state::ReadRequest::ChainTips,
+        )
+        .await?;
+
+        let zakura_state::ReadResponse::ChainTips(tips) = response else {
+            unreachable!("unmatched response to a ChainTips request")
+        };
+
+        Ok(tips.into_iter().map(chain_tips::ChainTip::from).collect())
     }
 
     async fn get_mempool_info(&self) -> Result<GetMempoolInfoResponse> {

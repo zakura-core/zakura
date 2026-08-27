@@ -296,6 +296,22 @@ special build is needed. The sidecar zcashd returns `Method not found` for all
 template and submission RPCs, so a
 misconfigured miner fails loudly instead of building on a lagging view.
 
+## Chain tips: call Zakura, not the sidecar
+
+Both nodes register `getchaintips`. Send the call to Zakura. zcashd answers it
+by scanning its whole block index under `cs_main`. On Mainnet that scan costs
+seconds, and it blocks every other zcashd RPC for the same time, including the
+wallet calls your integration depends on. Zakura reads only the chains it holds
+in memory, so the cost is bounded by the number of tracked forks, not by the
+height of the chain.
+
+The two nodes report different tips. zcashd never prunes its block index, so it
+lists every stale tip it has ever seen. Zakura lists the tips that are still
+live: the best chain, the non-finalized forks, recently invalidated branches,
+and the selected header chain when some block bodies are unavailable. Zakura
+does not return zcashd's `valid-headers` or `unknown` statuses. Call the sidecar
+only if you need the full history of stale tips.
+
 ## Wallet shielded-pool support (Orchard & Ironwood)
 
 Orchard and Ironwood are shielded pools, exercised through the unified `z_*` wallet RPCs

@@ -27,8 +27,9 @@ use zakura_chain::work::difficulty::{CompactDifficulty, U256};
 use crate::{ReadRequest, Request};
 
 use crate::{
-    service::read::AddressUtxos, ContextuallyVerifiedBlock, NonFinalizedState, TransactionLocation,
-    WatchReceiver, MAX_BLOCK_REORG_HEIGHT,
+    service::read::{AddressUtxos, ChainTipInfo},
+    ContextuallyVerifiedBlock, NonFinalizedState, TransactionLocation, WatchReceiver,
+    MAX_BLOCK_REORG_HEIGHT,
 };
 
 #[cfg(test)]
@@ -599,6 +600,10 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::TipBlockSize`]
     TipBlockSize(Option<usize>),
 
+    /// Response to [`ReadRequest::ChainTips`] with the tip of every chain this node
+    /// currently tracks, in descending height order.
+    ChainTips(Vec<ChainTipInfo>),
+
     /// Response to [`ReadRequest::NonFinalizedBlocksListener`]
     NonFinalizedBlocksListener(NonFinalizedBlocksListener),
 
@@ -731,7 +736,9 @@ impl TryFrom<ReadResponse> for Response {
 
             ReadResponse::ValidBlockProposal => Ok(Response::ValidBlockProposal),
 
-            ReadResponse::SolutionRate(_) | ReadResponse::TipBlockSize(_) => {
+            ReadResponse::SolutionRate(_)
+            | ReadResponse::TipBlockSize(_)
+            | ReadResponse::ChainTips(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
         }

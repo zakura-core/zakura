@@ -1443,6 +1443,61 @@ impl HeaderChainReader {
         Ok((full_state, projection))
     }
 
+    /// Capture full-state data, the selected header tip, and the selected headers
+    /// that can overlap the block chain, from one transition generation.
+    ///
+    /// `overlap_tip` reads the block chain tip height from the same generation. Only
+    /// the selected headers at or below that height are copied. The selected header
+    /// chain and the block chain agree at and below the finalized frontier, so their
+    /// fork is always in that range, and the range is bounded by the depth of the
+    /// non-finalized state.
+    ///
+    /// Prefer this to [`Self::with_selected_projection`] when only the fork is
+    /// needed. Headers-first sync puts the selected tip far above the block tip, and
+    /// the projection then holds up to [`MAX_NON_FINALIZED_NODES_V1`] headers, nearly
+    /// all of them above the block tip.
+    ///
+    /// [`MAX_NON_FINALIZED_NODES_V1`]: zakura_header_chain::MAX_NON_FINALIZED_NODES_V1
+    pub(crate) fn with_selected_overlap<T>(
+        &self,
+        read_full_state: impl FnOnce() -> T,
+        overlap_tip: impl FnOnce(&T) -> Option<block::Height>,
+    ) -> Result<(T, Frontier, Vec<Frontier>), HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let full_state = read_full_state();
+        let snapshot = engine.snapshot();
+        let projection = engine.selected_projection();
+        if projection.first().copied() != Some(snapshot.frontiers.finalized)
+            || projection.last().copied() != Some(snapshot.frontiers.header_best)
+        {
+            return Err(StoreError::Incoherent(
+                "selected projection disagrees with its published bounds",
+            )
+            .into());
+        }
+
+        let overlap = match overlap_tip(&full_state) {
+            // The projection is ordered by height, so this stops at the block tip
+            // instead of copying the sync gap above it.
+            Some(height) => projection
+                .iter()
+                .take_while(|frontier| frontier.height <= height)
+                .copied()
+                .collect(),
+            None => Vec::new(),
+        };
+
+        Ok((full_state, snapshot.frontiers.header_best, overlap))
+    }
+
     pub(crate) fn selected_hash(
         &self,
         height: block::Height,

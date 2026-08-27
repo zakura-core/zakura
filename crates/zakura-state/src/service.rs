@@ -3098,6 +3098,38 @@ impl Service<ReadRequest> for ReadStateService {
                 ))
             }
 
+            // Used by the getchaintips RPC.
+            ReadRequest::ChainTips => {
+                // Capture the header tip and its overlap with the block chain from
+                // one transition generation, so the two agree. The overlap stops at
+                // the block tip: the fork is never above it, and headers-first sync
+                // leaves tens of thousands of headers above it that would be copied
+                // and searched for nothing.
+                let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
+                let (non_finalized_state, header_tip, overlap) = match header_chain_reader {
+                    Some(reader) => {
+                        let (non_finalized_state, header_tip, overlap) = reader
+                            .with_selected_overlap(
+                                || state.latest_non_finalized_state(),
+                                |non_finalized_state| {
+                                    read::tip_height(non_finalized_state.best_chain(), &state.db)
+                                },
+                            )?;
+                        (non_finalized_state, Some(header_tip), overlap)
+                    }
+                    None => (state.latest_non_finalized_state(), None, Vec::new()),
+                };
+
+                Ok(ReadResponse::ChainTips(read::chain_tips(
+                    &non_finalized_state,
+                    &state.db,
+                    header_tip.map(|tip| read::SelectedHeaders {
+                        tip,
+                        overlap: &overlap,
+                    }),
+                )))
+            }
+
             ReadRequest::NonFinalizedBlocksListener { .. } => {
                 unreachable!("should return early");
             }

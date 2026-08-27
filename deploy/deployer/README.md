@@ -307,10 +307,14 @@ when either of these conditions stays true for at least 10 minutes:
 - `health` is `down` or `rpc_error`
 - `seconds_since_advanced` is at least 600 seconds
 
-Down alerts take precedence over stalled alerts, so a node only produces one
-active alert at a time. The watchdog also alerts if a dashboard endpoint is
-unreachable for at least 10 minutes, and posts one recovery message when a node
-or dashboard recovers. Persistent failures do not post on every poll cycle.
+The watchdog waits 30 minutes and posts one fleet alert when every observable
+node shares the same height and block hash. The fleet must have at least two
+observable nodes. A missing or different block hash keeps the 10-minute node
+alerts. Down alerts take precedence over stalled alerts, so a node only produces
+one active alert at a time. The watchdog also alerts if a dashboard endpoint is
+unreachable, malformed, or serves a stale collector snapshot for at least 10
+minutes. It posts one recovery message when a node or dashboard recovers.
+Persistent failures do not post on every poll cycle.
 
 Restart deploys write a 20-minute suppression marker before touching the fleet.
 The mainnet workflow writes it locally on `us-east-0`; the testnet workflow

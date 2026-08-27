@@ -118,7 +118,8 @@ pub use service::finalized_state::{
     validate_final_frontiers_bytes, FinalFrontiersGenerationError, FinalFrontiersValidationError,
 };
 pub use service::read::{
-    derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_CACHED_FRONTIERS,
+    derive_historical_frontiers, ChainTipInfo, ChainTipStatus, DerivedFrontiers,
+    HistoricalTreeCache, MAX_CACHED_FRONTIERS,
 };
 pub use service::{
     finalized_state::{DiskWriteBatch, FallibleDiskValue, FromDisk, IntoDisk, WriteDisk, ZakuraDb},

@@ -25,8 +25,8 @@ use tokio::{
     time::{sleep, sleep_until, timeout},
 };
 use tower::{
-    builder::ServiceBuilder, hedge::Hedge, limit::ConcurrencyLimit, retry::Retry, timeout::Timeout,
-    Service, ServiceExt,
+    builder::ServiceBuilder, hedge::Hedge, limit::ConcurrencyLimit, timeout::Timeout, Service,
+    ServiceExt,
 };
 
 use zakura_chain::{
@@ -63,15 +63,15 @@ pub use status::SyncStatus;
 /// Controls the number of peers used for each ObtainTips and ExtendTips request.
 const FANOUT: usize = 3;
 
-/// Controls how many times we will retry each block download.
+/// Maximum peer requests issued by one block download queue attempt.
 ///
-/// Failing block downloads is important because it defends against peers who
-/// feed us bad hashes. But spurious failures of valid blocks cause the syncer to
-/// restart from the previous checkpoint, potentially re-downloading blocks.
-///
-/// We also hedge requests, so we may retry up to twice this many times. Hedged
-/// retries may be concurrent, inner retries are sequential.
-const BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 3;
+/// The hedge service issues the original request and at most one concurrent hedge. Failure-specific
+/// retries belong to the sync queue, which prevents a generic service retry from multiplying this
+/// bound.
+const MAX_BLOCK_PEER_REQUESTS_PER_QUEUE_ATTEMPT: usize = 2;
+
+/// Successful requests required before the block download service starts hedging.
+const BLOCK_DOWNLOAD_HEDGE_MIN_DATA_POINTS: u64 = 20;
 
 fn block_error_peer_label(error: &BlockDownloadVerifyError, expose_peer_addresses: bool) -> String {
     error
@@ -93,6 +93,19 @@ fn block_error_peer_label(error: &BlockDownloadVerifyError, expose_peer_addresse
 /// repeatedly advertises a hash via `FindBlocks` and then `notfound`s the download; peer
 /// accountability in `zakura-network` disconnects such peers so this bound is rarely reached.
 const MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 8;
+
+/// Controls how many times the syncer requeues a required block hash after a transient peer or
+/// transport failure.
+///
+/// A connection closing does not invalidate the selected chain or any other block already in the
+/// checkpoint verifier. Requeueing only the affected hash preserves that work. The bound still
+/// lets a persistently failing block restart the round and obtain fresh tips and peers. One initial
+/// attempt plus these three retries, with at most two peer requests per attempt, creates a hard
+/// ceiling of eight peer requests for each transient hash in one sync round.
+const TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 3;
+
+const MAX_TRANSIENT_BLOCK_PEER_REQUESTS_PER_SYNC_ROUND: usize =
+    (TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT + 1) * MAX_BLOCK_PEER_REQUESTS_PER_QUEUE_ATTEMPT;
 
 /// Controls how many times the syncer immediately requeues a required block after a peer supplies
 /// a body whose coinbase height contradicts our own tip
@@ -850,15 +863,8 @@ where
 
     /// A service which downloads and verifies blocks, using the provided
     /// network and verifier services.
-    downloads: Pin<
-        Box<
-            Downloads<
-                Hedge<ConcurrencyLimit<Retry<zn::RetryLimit, Timeout<ZN>>>, AlwaysHedge>,
-                Timeout<ZV>,
-                ZSTip,
-            >,
-        >,
-    >,
+    downloads:
+        Pin<Box<Downloads<Hedge<ConcurrencyLimit<Timeout<ZN>>, AlwaysHedge>, Timeout<ZV>, ZSTip>>>,
 
     /// The cached block chain state.
     state: ZS,
@@ -877,6 +883,9 @@ where
     /// Queue-level retry counts for block hashes whose download failed with a single-peer
     /// `notfound` ([`NotFoundKind::Response`]). Bounded by [`MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT`].
     missing_block_retry_counts: HashMap<block::Hash, usize>,
+
+    /// Per-hash retry counts for transient peer and transport download failures.
+    transient_block_retry_counts: HashMap<block::Hash, usize>,
 
     /// Queue-level retry counts for required blocks whose body claimed a coinbase height that
     /// contradicts our own tip. Bounded by [`POISONED_BLOCK_RETRY_LIMIT`].
@@ -988,23 +997,15 @@ where
 
         let tip_network = Timeout::new(peers.clone(), TIPS_RESPONSE_TIMEOUT);
 
-        // The Hedge middleware is the outermost layer, hedging requests
-        // between two retry-wrapped networks.  The innermost timeout
-        // layer is relatively unimportant, because slow requests will
-        // probably be preemptively hedged.
-        //
-        // The Hedge goes outside the Retry, because the Retry layer
-        // abstracts away spurious failures from individual peers
-        // making a less-fallible network service, and the Hedge layer
-        // tries to reduce latency of that less-fallible service.
+        // The hedge middleware issues at most two peer requests for each queue attempt: the
+        // original request and one hedge. The sync queue owns failure-specific retry policy.
         let block_network = Hedge::new(
             ServiceBuilder::new()
                 .concurrency_limit(download_concurrency_limit)
-                .retry(zn::RetryLimit::new(BLOCK_DOWNLOAD_RETRY_LIMIT))
                 .timeout(BLOCK_DOWNLOAD_TIMEOUT)
                 .service(peers),
             AlwaysHedge,
-            20,
+            BLOCK_DOWNLOAD_HEDGE_MIN_DATA_POINTS,
             0.95,
             2 * SYNC_RESTART_DELAY,
         );
@@ -1049,6 +1050,7 @@ where
             prospective_tips: HashSet::new(),
             recent_syncs,
             missing_block_retry_counts: HashMap::new(),
+            transient_block_retry_counts: HashMap::new(),
             poisoned_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
@@ -1409,6 +1411,7 @@ where
     ) -> Result<(), Report> {
         self.prospective_tips = HashSet::new();
         self.missing_block_retry_counts.clear();
+        self.transient_block_retry_counts.clear();
         self.poisoned_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
@@ -2472,7 +2475,8 @@ where
         Self::handle_response(response, self.expose_peer_addresses)
     }
 
-    /// Handles a downloaded block response, requeueing required missing or poisoned block hashes.
+    /// Handles a downloaded block response and requeues a required hash when retrying one block can
+    /// preserve the rest of the round.
     ///
     /// A [`BlockDownloadVerifyError::TipChildHeightMismatch`] means a peer returned a body under
     /// the correct block hash but with a rewritten coinbase height. That satisfies the network
@@ -2481,12 +2485,15 @@ where
     /// newest block would wait for the next discovery round, which is exactly the delay the attack
     /// is trying to cause.
     ///
-    /// The block download service already retries each `BlocksByHash` request and may hedge it to
-    /// another peer. If a peer still responds `notfound` ([`NotFoundKind::Response`]), the syncer
+    /// The block download service may hedge each `BlocksByHash` request to another peer. If a peer
+    /// still responds `notfound` ([`NotFoundKind::Response`]), the syncer
     /// requeues the required hash — which routes to a different peer, since the peer set now marks
     /// the responding peer as missing it — and keeps the in-flight download/verify pipeline alive,
     /// rather than discarding the whole round. The requeues are bounded by
     /// [`MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT`].
+    ///
+    /// A transient peer or transport error also affects only one requested hash. The syncer
+    /// requeues that hash. The requeues are bounded by [`TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT`].
     ///
     /// A [`NotFoundKind::Registry`] miss means the peer set found that *every* ready peer is marked
     /// missing the block, so it can't be served right now. Rather than blocking the loop on an inline
@@ -2502,6 +2509,7 @@ where
     ) -> Result<(), Report> {
         if let Ok((_height, hash)) = response.as_ref() {
             self.missing_block_retry_counts.remove(hash);
+            self.transient_block_retry_counts.remove(hash);
             self.poisoned_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
             self.registry_miss_retry.remove(hash);
@@ -2652,6 +2660,49 @@ where
                     );
                 }
             }
+        }
+
+        if let Some(hash) = response.as_ref().err().and_then(|error| match error {
+            BlockDownloadVerifyError::DownloadFailed { hash, .. }
+                if error.not_found_download().is_none() =>
+            {
+                Some(*hash)
+            }
+            _ => None,
+        }) {
+            let retry_count = self.transient_block_retry_counts.entry(hash).or_default();
+
+            if *retry_count < TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT {
+                *retry_count += 1;
+
+                info!(
+                    ?hash,
+                    retry_attempt = *retry_count,
+                    retry_limit = TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT,
+                    "transient sync block download failed, retrying required block"
+                );
+                metrics::counter!("sync.transient.block.requeued.count").increment(1);
+
+                match self.downloads.download_and_verify(hash).await {
+                    Ok(())
+                    | Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {
+                        return Ok(())
+                    }
+                    Err(error) => self.handle_block_response(Err(error))?,
+                }
+
+                return Ok(());
+            }
+
+            self.transient_block_retry_counts.remove(&hash);
+
+            warn!(
+                ?hash,
+                retry_limit = TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT,
+                peer_request_ceiling = MAX_TRANSIENT_BLOCK_PEER_REQUESTS_PER_SYNC_ROUND,
+                "transient sync block download retry budget exhausted, restarting sync"
+            );
+            metrics::counter!("sync.transient.block.retry.limit.count").increment(1);
         }
 
         self.handle_block_response(response)?;

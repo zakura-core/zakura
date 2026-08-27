@@ -275,6 +275,13 @@ pub enum CommitBlockError {
         error: String,
     },
 
+    /// A local write failure prevented this block's ancestor from committing.
+    #[error("ancestor {ancestor} did not commit because of a local state write failure")]
+    AncestorWriteFailed {
+        /// Nearest failed ancestor reported by the state writer.
+        ancestor: block::Hash,
+    },
+
     /// The write task exited (likely during shutdown).
     #[error("block commit task exited. Is Zakura shutting down?")]
     #[non_exhaustive]
@@ -337,6 +344,9 @@ impl CommitBlockError {
             Self::Duplicate { .. } => BodyVerificationClass::Duplicate,
             Self::ValidateContextError(error) => error.body_verification_class(),
             Self::HeaderChainError { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
+            }
+            Self::AncestorWriteFailed { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
             }
             Self::WriteTaskExited => {

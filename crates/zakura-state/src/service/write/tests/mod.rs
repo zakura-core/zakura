@@ -61,7 +61,7 @@ use zakura_header_chain::{
     StateVersion, SuffixWork, SystemClock, TargetCompletion, TransientBodyFailure,
     TransientBodyFailureKind, TransitionContext, TransitionEvent, TransitionFailure,
     TransitionRequest, TrustedAnchor, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef,
-    WorkCoordinate, POW_ADJUSTMENT_BLOCK_SPAN,
+    WorkCoordinate, MAX_CANDIDATE_TIPS_V1, POW_ADJUSTMENT_BLOCK_SPAN,
 };
 
 fn header_owner(

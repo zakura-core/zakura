@@ -17,7 +17,8 @@ pub(crate) use block_sync_driver::{
     ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
 };
 pub(crate) use coordinator::{
-    BlockApplyOperation, BlockApplyTerminal, LegacyFallbackLease, SyncCoordinator,
+    BlockApplyOperation, BlockApplyTerminal, LegacyFallbackError, LegacyFallbackLease,
+    SyncCoordinator,
 };
 pub(crate) use frontier::{query_block_sync_frontiers, verified_block_tip_from_state};
 pub(crate) use header_sync_driver::zakura_header_sync_driver_startup;

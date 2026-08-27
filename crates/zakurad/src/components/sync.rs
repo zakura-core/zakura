@@ -580,7 +580,7 @@ async fn engage_legacy_fallback_alongside_zakura(
     block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::SyncCoordinator>,
 ) -> Result<
     crate::commands::start::zakura::LegacyFallbackLease,
-    zakura_node_services::sync_lifecycle::LifecycleTransitionError,
+    crate::commands::start::zakura::LegacyFallbackError,
 > {
     let lease = block_sync_handoff
         .acquire_legacy_fallback(std::time::Duration::from_secs(60))

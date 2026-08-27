@@ -662,6 +662,7 @@ pub struct HeaderChainRuntime {
     store: HeaderChainStore,
     config: EngineConfig,
     publisher: Publisher,
+    full_state_retention_references: Arc<Mutex<Arc<[block::Hash]>>>,
     leases: Arc<Mutex<RetainedPathLeaseRegistry>>,
     transition_engine: Arc<Mutex<HeaderChainEngine>>,
 }
@@ -2185,6 +2186,46 @@ impl HeaderChainReader {
 }
 
 impl HeaderChainRuntime {
+    /// Replace the complete process-local full-state fork-tip retention set.
+    pub(in crate::service) fn replace_full_state_retention_references(
+        &self,
+        mut references: Vec<block::Hash>,
+    ) {
+        references.sort_unstable_by_key(|hash| hash.0);
+        references.dedup();
+        *self
+            .full_state_retention_references
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = references.into();
+    }
+
+    /// Verify that every authenticated full-state header remains coherent in the retained DAG.
+    pub(in crate::service) fn verify_full_state_headers(
+        &self,
+        headers: &[VerifiedHeaderRef],
+    ) -> Result<(), HeaderChainStoreError> {
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        for expected in headers {
+            let matches = engine
+                .graph()
+                .header_node(expected.hash)
+                .is_some_and(|node| {
+                    node.height == expected.height
+                        && node.hash == expected.hash
+                        && node.parent_hash == expected.header.previous_block_hash
+                });
+            if !matches {
+                return Err(HeaderChainStoreError::StagedPathMismatch {
+                    hash: expected.hash,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Captures the complete selected projection and the engine snapshot that produced it.
     ///
     /// The method rejects an engine whose projection bounds disagree with its snapshot.
@@ -2849,23 +2890,37 @@ impl HeaderChainRuntime {
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
         let authoritative_full_state_fork_set = matches!(
             &request.event,
-            TransitionEvent::VerifiedChainChanged(_) | TransitionEvent::VerifiedBlockAccepted(_)
+            TransitionEvent::VerifiedChainChanged(_)
+                | TransitionEvent::VerifiedBlockAccepted(_)
+                | TransitionEvent::FullStateFinalized(_)
+                | TransitionEvent::OperatorInvalidate(_)
+                | TransitionEvent::OperatorReconsider(_)
         ) && context
             .full_state_authority
             .is_some_and(|authority| authority.authorizes_full_state(&request.event));
-        let lease_references = if authoritative_full_state_fork_set {
-            None
+        let active_retention_references = if authoritative_full_state_fork_set {
+            Vec::new()
         } else {
-            Some(
+            let mut references = self
+                .full_state_retention_references
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+                .to_vec();
+            references.extend(
                 self.leases
                     .lock()
                     .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-                    .active_references(Instant::now()),
-            )
+                    .active_references(Instant::now())
+                    .iter()
+                    .copied(),
+            );
+            references.sort_unstable_by_key(|hash| hash.0);
+            references.dedup();
+            references
         };
         let retention_references = combined_retention_references(
             context.retention_references,
-            lease_references.as_deref(),
+            Some(&active_retention_references),
         );
         #[cfg(test)]
         let test_header_authority = TestHeaderCompletionAuthority(context.full_state_authority);
@@ -2901,7 +2956,7 @@ impl HeaderChainRuntime {
         let state_authority = StateIssuedAuthority {
             inner: base_context.full_state_authority,
             validation_leases: &validation_leases,
-            active_retention_references: lease_references.as_deref().unwrap_or_default(),
+            active_retention_references: &active_retention_references,
             full_state_authorization_version: Some(before.state_version),
         };
         let transition_context = TransitionContext {
@@ -3569,6 +3624,7 @@ impl HeaderChainStore {
                 store: self,
                 config: config.clone(),
                 publisher,
+                full_state_retention_references: Arc::new(Mutex::new(Arc::from([]))),
                 leases: Arc::new(Mutex::new(RetainedPathLeaseRegistry::default())),
                 transition_engine,
             },
@@ -3652,6 +3708,7 @@ impl HeaderChainStore {
                 store: self,
                 config: integrated_config.clone(),
                 publisher,
+                full_state_retention_references: Arc::new(Mutex::new(Arc::from([]))),
                 leases: Arc::new(Mutex::new(RetainedPathLeaseRegistry::default())),
                 transition_engine,
             },
@@ -3730,6 +3787,7 @@ impl HeaderChainStore {
                 store: self,
                 config: config.clone(),
                 publisher,
+                full_state_retention_references: Arc::new(Mutex::new(Arc::from([]))),
                 leases: Arc::new(Mutex::new(RetainedPathLeaseRegistry::default())),
                 transition_engine,
             },
@@ -3946,6 +4004,7 @@ impl HeaderChainStore {
                 store: self,
                 config: config.clone(),
                 publisher,
+                full_state_retention_references: Arc::new(Mutex::new(Arc::from([]))),
                 leases: Arc::new(Mutex::new(RetainedPathLeaseRegistry::default())),
                 transition_engine,
             },

@@ -40,8 +40,16 @@ fn startup_restores_a_missing_full_state_side_path_idempotently() {
         header: side_header,
     }];
 
-    restore_verified_side_paths(&writer.runtime, &writer.config, vec![path.clone()])
-        .expect("startup restores the authenticated full-state side path");
+    restore_verified_side_paths(
+        &writer.runtime,
+        &writer.config,
+        vec![path.clone()],
+        &[side.hash],
+    )
+    .expect("startup restores the authenticated full-state side path");
+    writer
+        .runtime
+        .replace_full_state_retention_references(vec![side.hash]);
     let restored = writer.runtime.publisher().snapshot();
     assert!(writer
         .runtime
@@ -50,9 +58,111 @@ fn startup_restores_a_missing_full_state_side_path_idempotently() {
         .expect("the restored side context reads")
         .is_some());
 
-    restore_verified_side_paths(&writer.runtime, &writer.config, vec![path])
+    restore_verified_side_paths(&writer.runtime, &writer.config, vec![path], &[side.hash])
         .expect("replaying the same startup repair is idempotent");
     assert_eq!(writer.runtime.publisher().snapshot(), restored);
+}
+
+#[test]
+fn header_candidate_pressure_preserves_every_full_state_tip() {
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("the fixture finalized state opens");
+    let anchor = regtest_genesis_block();
+    let anchor_height = anchor
+        .coinbase_height()
+        .expect("the anchor has a coinbase height");
+    let writer = header_writer(&finalized_state, &network, anchor_height, &anchor);
+    let lease = writer
+        .runtime
+        .reader()
+        .validation_context(anchor.hash())
+        .expect("the anchor context read succeeds")
+        .expect("the anchor context exists");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the regtest validation policy is coherent");
+    let child = |marker: u8| {
+        let mut header = *anchor.header;
+        header.previous_block_hash = anchor.hash();
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[0] = marker;
+        let header = Arc::new(header);
+        let prepared = zakura_header_chain::prepare_headers(
+            HeaderBatchInput::new(std::slice::from_ref(&header)),
+            lease.parent(),
+            &rules,
+            &SystemClock,
+        )
+        .expect("the sibling header passes shared validation");
+        let prepared_header = prepared
+            .headers()
+            .first()
+            .expect("the prepared path contains its header");
+        (
+            header.clone(),
+            VerifiedHeaderRef {
+                height: prepared_header.height,
+                hash: prepared_header.hash,
+                header,
+            },
+        )
+    };
+    let (_, first) = child(1);
+    let (_, second) = child(2);
+    let full_state_tips = vec![first.hash, second.hash];
+    restore_verified_side_paths(
+        &writer.runtime,
+        &writer.config,
+        vec![vec![first.clone()], vec![second.clone()]],
+        &full_state_tips,
+    )
+    .expect("startup restores both full-state branches");
+    writer
+        .runtime
+        .replace_full_state_retention_references(full_state_tips);
+
+    for marker in 10..10
+        + u8::try_from(MAX_CANDIDATE_TIPS_V1)
+            .expect("the production candidate bound fits in one byte")
+    {
+        let (header, candidate) = child(marker);
+        let snapshot = writer.runtime.publisher().snapshot();
+        let owner = header_owner(&snapshot, candidate.hash, u64::from(marker), 1);
+        let batch = zakura_header_chain::prepare_headers(
+            HeaderBatchInput::new(std::slice::from_ref(&header)),
+            lease.parent(),
+            &rules,
+            &SystemClock,
+        )
+        .expect("the candidate header passes shared validation");
+        let result = writer
+            .runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: snapshot.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner,
+                        source: SourceId::from_digest([marker; 32]),
+                        parent_hash: anchor.hash(),
+                        target_tip_hash: candidate.hash,
+                        completion: TargetCompletion::TargetComplete {
+                            common_ancestor: Frontier::new(anchor_height, anchor.hash()),
+                        },
+                        batch,
+                        aux: Vec::new(),
+                    })),
+                },
+                &writer.context(),
+            )
+            .expect("header-only candidate pressure remains bounded");
+        assert!(!matches!(result, ApplyResult::ResourceStalled(_)));
+    }
+
+    writer
+        .runtime
+        .verify_full_state_headers(&[first, second])
+        .expect("candidate pressure preserves every full-state branch");
 }
 
 #[test]

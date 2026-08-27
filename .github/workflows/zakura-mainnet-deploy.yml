@@ -325,6 +325,68 @@ jobs:
           printf '%s\n' "$(( $(date +%s) + 1200 ))" \
             | sudo tee /run/zakura-fleet-watchdog/deploy-suppressed-until >/dev/null
 
+      - name: Suppress node watchdog alerts during deploy
+        # Keep this in workflow-owned code because the requested rollback ref
+        # can contain a deploy.py that predates node-local suppression.
+        if: ${{ !inputs.no_restart }}
+        working-directory: deploy/deployer
+        env:
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+
+          ssh_targets="$(
+            python3 - <<'PY'
+          import os
+          import sys
+          import tomllib
+
+          with open("nodes.ci.toml", "rb") as config_file:
+              config = tomllib.load(config_file)
+
+          selected = os.environ.get("NODE", "")
+          targets = [
+              node["ssh_string"]
+              for node in config["nodes"]
+              if not selected or node["name"] == selected
+          ]
+          if selected and not targets:
+              print(f"unknown deployer node: {selected}", file=sys.stderr)
+              raise SystemExit(1)
+          print("\n".join(targets))
+          PY
+          )"
+
+          if [ -z "$ssh_targets" ]; then
+            echo "deployer config contains no node SSH targets" >&2
+            exit 1
+          fi
+
+          while IFS= read -r ssh_target; do
+            timeout --signal=TERM --kill-after=5s 60s \
+              ssh \
+                -o BatchMode=yes \
+                -o ConnectTimeout=20 \
+                -o ServerAliveInterval=10 \
+                -o ServerAliveCountMax=3 \
+                -o StrictHostKeyChecking=yes \
+                -- "$ssh_target" bash -s <<'REMOTE'
+          set -euo pipefail
+
+          marker=/run/zakura-watchdog/deployment-suppressed-until
+          mkdir -p -m 755 "$(dirname "$marker")"
+          marker_tmp="$(mktemp "${marker}.tmp.XXXXXX")"
+          cleanup() {
+            rm -f "$marker_tmp"
+          }
+          trap cleanup EXIT
+          printf '%s\n' "$(( $(date +%s) + 1200 ))" > "$marker_tmp"
+          chmod 644 "$marker_tmp"
+          mv -f "$marker_tmp" "$marker"
+          trap - EXIT
+          REMOTE
+          done <<< "$ssh_targets"
+
       - name: Deploy fleet
         working-directory: deploy/deployer
         env:

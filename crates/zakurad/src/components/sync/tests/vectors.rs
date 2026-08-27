@@ -2264,6 +2264,85 @@ async fn transient_download_failure_restarts_after_retry_limit() {
     peer_set.expect_no_requests().await;
 }
 
+/// One initial transient attempt and three queue retries issue eight requests when every hedge runs.
+#[tokio::test(start_paused = true)]
+async fn transient_download_failure_has_eight_peer_request_ceiling() -> Result<(), crate::BoxError>
+{
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        mut state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    // Fill the latency histogram so every failing queue attempt issues its one allowed hedge.
+    let prime_block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let prime_hash = prime_block.hash();
+    for _ in 0..sync::BLOCK_DOWNLOAD_HEDGE_MIN_DATA_POINTS {
+        chain_sync.downloads.download_and_verify(prime_hash).await?;
+        peer_set
+            .expect_request(zn::Request::BlocksByHash(iter::once(prime_hash).collect()))
+            .await
+            .respond(zn::Response::Blocks(vec![Available((
+                prime_block.clone(),
+                None,
+            ))]));
+        block_verifier_router
+            .expect_request_that(|request| request.block().hash() == prime_hash)
+            .await
+            .respond(prime_hash);
+        assert!(
+            chain_sync
+                .downloads
+                .next()
+                .await
+                .expect("priming download should complete")
+                .is_ok(),
+            "priming download should succeed"
+        );
+    }
+    tokio::time::advance(2 * sync::SYNC_RESTART_DELAY).await;
+
+    let failed_hash = block::Hash::from([0xCF; 32]);
+    let sync_round = chain_sync.sync_round(iter::once(failed_hash).collect(), None);
+    let fail_peer_requests = async {
+        let request = zn::Request::BlocksByHash(iter::once(failed_hash).collect());
+        let queue_attempts = sync::TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT + 1;
+        let mut peer_request_count = 0;
+
+        for _ in 0..queue_attempts {
+            let original = peer_set.expect_request(request.clone()).await;
+            let hedge = peer_set.expect_request(request.clone()).await;
+            peer_request_count += 2;
+
+            original.respond(Err(client_dropped_error()));
+            hedge.respond(Err(client_dropped_error()));
+        }
+
+        peer_request_count
+    };
+
+    let (result, peer_request_count) = tokio::join!(sync_round, fail_peer_requests);
+    assert!(
+        result.is_err(),
+        "the exhausted transient retry budget should restart the sync round"
+    );
+    assert_eq!(
+        peer_request_count,
+        sync::MAX_TRANSIENT_BLOCK_PEER_REQUESTS_PER_SYNC_ROUND
+    );
+    assert!(chain_sync.transient_block_retry_counts.is_empty());
+
+    peer_set.expect_no_requests().await;
+    block_verifier_router.expect_no_requests().await;
+    state_service.expect_no_requests().await;
+
+    Ok(())
+}
+
 /// A transient failure for one hash preserves other work in the sync round and retries only the
 /// failed hash.
 #[tokio::test]
@@ -2287,12 +2366,11 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
 
     let sync_round = chain_sync.sync_round(reserve, None);
     let drive_services = async {
-        // Exhaust the retry layer inside one download service call. The unrelated request can
-        // arrive between these attempts because the sync round dispatches both hashes concurrently.
-        let service_attempts = sync::BLOCK_DOWNLOAD_RETRY_LIMIT + 1;
-        let mut failed_attempts = 0;
+        // Fail one download queue attempt. The unrelated request can arrive first because the sync
+        // round dispatches both hashes concurrently.
+        let mut failed_attempt_sent = false;
         let mut unrelated_response_sent = false;
-        while failed_attempts < service_attempts || !unrelated_response_sent {
+        while !failed_attempt_sent || !unrelated_response_sent {
             let response = peer_set
                 .expect_request_that(|request| match request {
                     zn::Request::BlocksByHash(hashes) => {
@@ -2312,7 +2390,11 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
             };
 
             if requested_hash == retried_hash {
-                failed_attempts += 1;
+                assert!(
+                    !failed_attempt_sent,
+                    "the failed block should use one request"
+                );
+                failed_attempt_sent = true;
                 response.respond(Err(client_dropped_error()));
             } else {
                 assert!(
@@ -2326,7 +2408,6 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
                 ))]));
             }
         }
-        assert_eq!(failed_attempts, service_attempts);
 
         // Commit the unrelated block before answering the queue-level retry. This proves that the
         // transient error did not cancel other work in the round.

@@ -64,18 +64,52 @@ mod vct_authentication_sweep;
 mod vct_write_retry;
 
 use vct_authentication_sweep::VctAuthenticationSweeper;
-use vct_write_retry::{VctWriteRetryCause, VctWriteRetryManager};
+use vct_write_retry::{VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager};
 pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
 
-fn missing_vct_successor_retry(
+/// Classifies durable failure evidence as a new repair episode or an idempotent observation.
+fn vct_failure_repair_trigger(apply_result: &ApplyResult) -> Option<VctRepairTrigger> {
+    match apply_result {
+        ApplyResult::Committed => Some(VctRepairTrigger::RejectedDelivery),
+        ApplyResult::NoChange(_) => Some(VctRepairTrigger::MissingRootObserved),
+        ApplyResult::Stale(_) | ApplyResult::ResourceStalled(_) => None,
+    }
+}
+
+/// Starts one replacement episode when current-root rejection lacks a successor boundary.
+fn unrecorded_vct_failure_repair(
     auxiliary_window: &VctAuxiliaryWindow,
+    attribution: VctAuxiliaryFailureAttribution,
+) -> Option<(Height, VctRepairTrigger)> {
+    if attribution != VctAuxiliaryFailureAttribution::CurrentDelivery
+        || auxiliary_window
+            .successor
+            .as_ref()
+            .and_then(|successor| successor.auth_data_root)
+            .is_some()
+    {
+        return None;
+    }
+
+    Some((
+        auxiliary_window.delivery.tree_aux?.height,
+        VctRepairTrigger::UnrecordedRejectedDelivery(auxiliary_window.delivery.delivery_id),
+    ))
+}
+
+fn missing_vct_successor_retry(
+    successor_height: Option<Height>,
     current_height: Height,
 ) -> (Height, VctWriteRetryCause) {
-    if let Some(successor_height) = auxiliary_window.successor_height {
+    if let Some(successor_height) = successor_height {
+        // The successor header exists but carries no auxiliary record. The committer disputed
+        // nothing, so this poll continues the open repair episode instead of starting a new one.
+        // A new episode would retire the header-sync repair task and discard its supplier
+        // backoff on every poll.
         return (
             successor_height,
             VctWriteRetryCause::MissingRoot {
-                replacement_required: true,
+                trigger: VctRepairTrigger::MissingRootObserved,
             },
         );
     }
@@ -2048,7 +2082,7 @@ impl WriteBlockWorkerTask {
                         let wait = vct_write_retry_manager.on_retryable_error(
                             height,
                             VctWriteRetryCause::MissingRoot {
-                                replacement_required: false,
+                                trigger: VctRepairTrigger::MissingRootObserved,
                             },
                             ordered_block,
                         );
@@ -2111,8 +2145,10 @@ impl WriteBlockWorkerTask {
                 let auxiliary_window = vct_auxiliary_window
                     .as_ref()
                     .expect("exact VCT roots require an auxiliary window");
-                let (height, retry_cause) =
-                    missing_vct_successor_retry(auxiliary_window, ordered_block.0.height);
+                let (height, retry_cause) = missing_vct_successor_retry(
+                    auxiliary_window.successor_height,
+                    ordered_block.0.height,
+                );
                 let wait =
                     vct_write_retry_manager.on_retryable_error(height, retry_cause, ordered_block);
                 std::thread::park_timeout(wait);
@@ -2188,7 +2224,7 @@ impl WriteBlockWorkerTask {
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
                 Err((ordered_block, error)) => {
-                    let mut attributed_failure_repair_height = None;
+                    let mut attributed_failure_repair = None;
                     if let (Some(auxiliary_window), Some(failure)) = (
                         vct_auxiliary_window_for_outcome.as_ref(),
                         error.vct_failure(),
@@ -2206,29 +2242,40 @@ impl WriteBlockWorkerTask {
                             "VCT: attributed exact auxiliary verification failure"
                         );
 
+                        attributed_failure_repair =
+                            unrecorded_vct_failure_repair(auxiliary_window, failure_attribution);
+
                         if let Some(writer) = header_chain.as_ref() {
                             match writer.record_vct_auxiliary_failure(
                                 auxiliary_window,
                                 failure_attribution,
                                 failure,
                             ) {
-                                Ok(Some(ApplyResult::Committed | ApplyResult::NoChange(_))) => {
-                                    attributed_failure_repair_height = failure_attribution
+                                Ok(Some(
+                                    apply_result @ (ApplyResult::Committed
+                                    | ApplyResult::NoChange(_)),
+                                )) => {
+                                    let trigger = vct_failure_repair_trigger(&apply_result)
+                                        .expect("committed or idempotent evidence has a trigger");
+                                    attributed_failure_repair = failure_attribution
                                         .repair_height(
                                             ordered_block.0.height,
                                             auxiliary_window
                                                 .successor
                                                 .as_ref()
                                                 .map(|successor| successor.height),
-                                        );
+                                        )
+                                        .map(|height| (height, trigger));
                                 }
                                 Ok(Some(ApplyResult::Stale(receipt))) => {
+                                    attributed_failure_repair = None;
                                     tracing::debug!(
                                         ?receipt,
                                         "VCT: ignored stale auxiliary failure evidence"
                                     );
                                 }
                                 Ok(Some(ApplyResult::ResourceStalled(receipt))) => {
+                                    attributed_failure_repair = None;
                                     tracing::warn!(
                                         ?receipt,
                                         "VCT: auxiliary failure evidence stopped by a committed resource alarm"
@@ -2236,6 +2283,7 @@ impl WriteBlockWorkerTask {
                                 }
                                 Ok(None) => {}
                                 Err(record_error) => {
+                                    attributed_failure_repair = None;
                                     tracing::error!(
                                         ?record_error,
                                         "VCT: could not persist auxiliary failure evidence"
@@ -2254,12 +2302,13 @@ impl WriteBlockWorkerTask {
                     // The write loop polls await-successor stalls faster.
                     if let Some(height) = error.vct_retryable_height() {
                         let root_unavailable = error.vct_supplied_root_unavailable_height();
-                        let repair_height = attributed_failure_repair_height.unwrap_or(height);
+                        let (repair_height, repair_trigger) = attributed_failure_repair
+                            .unwrap_or((height, VctRepairTrigger::MissingRootObserved));
 
                         prev_finalized_note_commitment_trees = prev_note_commitment_trees_for_retry;
                         let retry_cause = if root_unavailable.is_some() {
                             VctWriteRetryCause::MissingRoot {
-                                replacement_required: attributed_failure_repair_height.is_some(),
+                                trigger: repair_trigger,
                             }
                         } else {
                             VctWriteRetryCause::MissingSuccessor

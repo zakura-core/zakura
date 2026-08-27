@@ -11,6 +11,85 @@ independently.
 
 ## [Unreleased]
 
+## [1.3.0-rc3] - 2026-08-27
+
+### Added
+
+- Added the `getchaintips` RPC method to `zakurad`
+  ([#796](https://github.com/zakura-core/zakura/pull/796)). Operators no longer
+  have to send the call to the zcashd-compat sidecar, where it scans the whole
+  block index under `cs_main` and stalls every other RPC for seconds. Zakura
+  reads only the chains it holds in memory, so the cost is bounded by the number
+  of tracked forks rather than by the height of the chain.
+
+  The two nodes report different tips. zcashd never prunes its block index, so it
+  lists every stale tip it has ever seen. Zakura lists the tips that are still
+  live: the best chain, the non-finalized forks, recently invalidated branches,
+  and the selected header chain when some block bodies are unavailable. Zakura
+  does not return zcashd's `valid-headers` or `unknown` statuses. `branchlen` for
+  an `invalid` tip can be short, because Zakura tracks a limited number of forks
+  and can drop the chain that the branch forked from.
+
+### Changed
+
+- Reduced non-finalized chain snapshot latency by sharing immutable contextual
+  UTXO maps ([#780](https://github.com/zakura-core/zakura/pull/780)).
+- A commitment-root repair that no connected peer can supply now reports why each peer was
+  excluded and escalates after 60 seconds
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Updated the `zakura-core/libraries` crates to `1.0.0-rc.4`
+  ([#824](https://github.com/zakura-core/zakura/pull/824)).
+- Sped up Orchard note commitment tree updates during sync by about 2x by
+  evaluating `MerkleCRH^Orchard` with the libraries' new weighted fixed-length
+  Sinsemilla evaluator, for a one-time 3.75 MiB in-memory table
+  ([#824](https://github.com/zakura-core/zakura/pull/824)).
+- Shortened this release's end-of-support window from 40 to 33 days, so
+  Mainnet `zakurad` nodes running it halt at block 3,500,552, estimated
+  2026-09-30 — the day before October 1st. End-of-support warnings begin
+  3 days earlier ([#825](https://github.com/zakura-core/zakura/pull/825)).
+
+### Fixed
+
+- Fixed block sync peer routines panicking when concurrent retry state changes
+  emptied a selected work range. The routine now evaluates retry state once per
+  item, keeps a nonempty contiguous range, and carries the checked retry
+  deadline into its next wait
+  ([#818](https://github.com/zakura-core/zakura/pull/818)).
+- Fixed the legacy block syncer restarting an entire sync round after one transient peer or
+  transport failure. The syncer now retries the affected block hash with a bounded budget and
+  preserves the other download and checkpoint verification tasks. The syncer limits each transient
+  hash to eight peer requests per sync round. A replacement download also stops waiting and
+  restarts the round if the network stays unready past the download timeout
+  ([#819](https://github.com/zakura-core/zakura/pull/819)).
+- Fixed a sync halt when a checkpoint commit needed verified commitment-tree metadata from peers
+  that had advanced past the stalled node. Repair now accepts any peer that can reach the exact
+  height. Serving resolves finalized targets through a reserved one-header path in finalized
+  indexes
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Fixed commitment-root repair retries that could restart on every missing-root poll, discard
+  scheduler state, penalize the wrong supplier, duplicate local work, or miss connected suppliers.
+  Repair now preserves exact ownership and attribution while it rotates through bounded supplier
+  cycles
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Fixed authentication-sweep repair masking a blocked checkpoint committer repair. The committer
+  now takes priority until its checkpoint commits, then the sweep resumes
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Fixed authentication-sweep repair stopping after it rejected a replacement at the same height.
+  Rejection now starts a new repair generation, while repeated missing-root observations remain in
+  the current generation
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Fixed checkpoint-handoff repair stopping after it rejected roots without a successor witness.
+  Each rejected delivery now starts one deduplicated replacement generation
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Fixed an indefinite node stall when local preparation or application of commitment-root repair
+  remained pending. The node now exits with an error after 30 minutes so its supervisor can restart
+  it
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Fixed dual-stack nodes waiting forever to start legacy fallback when native block sync holds an
+  incomplete checkpoint range. Legacy fallback can now supply the missing bodies and resume block
+  verification
+  ([#823](https://github.com/zakura-core/zakura/pull/823)).
+
 ## [1.3.0-rc2] - 2026-08-24
 
 ### Added

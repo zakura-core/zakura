@@ -2,9 +2,11 @@ use std::{sync::Arc, time::Duration, time::Instant};
 
 use tokio::sync::{mpsc, oneshot};
 use zakura_chain::{block::Height, serialization::ZcashDeserializeInto};
+use zakura_header_chain::EvidenceId;
 
 use super::{
-    VctWriteRetryCause, VctWriteRetryManager, VCT_AWAIT_SUCCESSOR_WAIT, VCT_ROOT_RETRY_WAIT,
+    VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager, VCT_AWAIT_SUCCESSOR_WAIT,
+    VCT_ROOT_RETRY_WAIT,
 };
 use crate::{
     request::CheckpointVerifiedBlock,
@@ -16,10 +18,10 @@ use crate::{
 };
 
 const MISSING_ROOT: VctWriteRetryCause = VctWriteRetryCause::MissingRoot {
-    replacement_required: false,
+    trigger: VctRepairTrigger::MissingRootObserved,
 };
 const REJECTED_ROOT: VctWriteRetryCause = VctWriteRetryCause::MissingRoot {
-    replacement_required: true,
+    trigger: VctRepairTrigger::RejectedDelivery,
 };
 
 /// Builds a distinct [`QueuedCheckpointVerified`] with a discarded response channel, so
@@ -208,6 +210,100 @@ fn root_repair_signal_advances_generation_after_rejected_replacement() {
 }
 
 #[test]
+fn unrecorded_rejection_refetches_each_delivery_once() {
+    let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let mut manager = VctWriteRetryManager::new(tx);
+    let height = Height(42);
+    let first_delivery = EvidenceId::from_digest([1; 32]);
+
+    manager.on_retryable_error(
+        height,
+        VctWriteRetryCause::MissingRoot {
+            trigger: VctRepairTrigger::UnrecordedRejectedDelivery(first_delivery),
+        },
+        queued_block(1),
+    );
+    let first = *rx.borrow_and_update();
+    assert_eq!(first.generation, 1);
+
+    manager.on_retryable_error(
+        height,
+        VctWriteRetryCause::MissingRoot {
+            trigger: VctRepairTrigger::UnrecordedRejectedDelivery(first_delivery),
+        },
+        queued_block(2),
+    );
+    assert!(
+        !rx.has_changed().expect("watch channel remains open"),
+        "polling the same unrecorded rejection must keep its replacement in flight"
+    );
+
+    manager.on_retryable_error(
+        height,
+        VctWriteRetryCause::MissingRoot {
+            trigger: VctRepairTrigger::UnrecordedRejectedDelivery(EvidenceId::from_digest([2; 32])),
+        },
+        queued_block(3),
+    );
+    assert_eq!(rx.borrow_and_update().generation, first.generation + 1);
+}
+
+#[test]
+fn sweep_rejection_restarts_the_same_height_after_missing_polls_deduplicate() {
+    let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let mut manager = VctWriteRetryManager::new(tx);
+    let height = Height(42);
+
+    manager.request_sweep_repair(height, VctRepairTrigger::MissingRootObserved);
+    let first = *rx.borrow_and_update();
+    assert_eq!(first.generation, 1);
+
+    manager.request_sweep_repair(height, VctRepairTrigger::MissingRootObserved);
+    assert!(
+        !rx.has_changed().expect("watch channel remains open"),
+        "repeated missing-root observations keep the current sweep episode"
+    );
+
+    manager.request_sweep_repair(height, VctRepairTrigger::RejectedDelivery);
+    let replacement = *rx.borrow_and_update();
+    assert_eq!(replacement.state, first.state);
+    assert_eq!(replacement.generation, first.generation + 1);
+
+    manager.request_sweep_repair(height, VctRepairTrigger::MissingRootObserved);
+    assert!(
+        !rx.has_changed().expect("watch channel remains open"),
+        "an idempotent observation must not restart the replacement episode"
+    );
+}
+
+#[test]
+fn equal_height_committer_and_sweep_share_missing_work_but_rejection_restarts_it() {
+    let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let mut manager = VctWriteRetryManager::new(tx);
+    let height = Height(42);
+
+    manager.request_sweep_repair(height, VctRepairTrigger::MissingRootObserved);
+    let sweep = *rx.borrow_and_update();
+
+    manager.on_retryable_error(height, MISSING_ROOT, queued_block(1));
+    assert!(
+        !rx.has_changed().expect("watch channel remains open"),
+        "equal missing-root needs share one exact repair episode"
+    );
+
+    manager.on_retryable_error(height, REJECTED_ROOT, queued_block(2));
+    let rejected = *rx.borrow_and_update();
+    assert_eq!(rejected.state, sweep.state);
+    assert_eq!(rejected.generation, sweep.generation + 1);
+
+    manager.on_commit_success();
+    assert!(
+        !rx.has_changed().expect("watch channel remains open"),
+        "the current replacement also serves the restored equal-height sweep need"
+    );
+}
+
+#[test]
 fn a_hidden_higher_sweep_need_keeps_the_lower_committer_episode() {
     let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
     let mut manager = VctWriteRetryManager::new(tx);
@@ -223,7 +319,7 @@ fn a_hidden_higher_sweep_need_keeps_the_lower_committer_episode() {
         }
     );
 
-    manager.request_sweep_repair(sweep_height);
+    manager.request_sweep_repair(sweep_height, VctRepairTrigger::MissingRootObserved);
     assert!(
         !rx.has_changed().expect("watch channel remains open"),
         "a hidden higher need must not restart the committer repair episode"
@@ -238,6 +334,48 @@ fn a_hidden_higher_sweep_need_keeps_the_lower_committer_episode() {
         }
     );
     assert_eq!(sweep.generation, committer_status.generation + 1);
+}
+
+#[test]
+fn a_missing_committer_root_preempts_a_lower_sweep_need() {
+    let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let mut manager = VctWriteRetryManager::new(tx);
+    let sweep_height = Height(42);
+    let committer_height = Height(84);
+
+    manager.request_sweep_repair(sweep_height, VctRepairTrigger::MissingRootObserved);
+    let sweep_status = *rx.borrow_and_update();
+    assert_eq!(
+        sweep_status.state,
+        VctRootRepairState::Unavailable {
+            height: sweep_height
+        }
+    );
+
+    manager.on_retryable_error(committer_height, MISSING_ROOT, queued_block(1));
+    let committer_status = *rx.borrow_and_update();
+    assert_eq!(
+        committer_status.state,
+        VctRootRepairState::Unavailable {
+            height: committer_height
+        },
+        "the committer must advance before the checkpoint queue can empty and run the sweep"
+    );
+    assert_eq!(committer_status.generation, sweep_status.generation + 1);
+    assert!(
+        manager.take_retryable_block().is_some(),
+        "the production missing-root path parks the blocked checkpoint"
+    );
+
+    manager.on_commit_success();
+    let resumed_sweep = *rx.borrow_and_update();
+    assert_eq!(
+        resumed_sweep.state,
+        VctRootRepairState::Unavailable {
+            height: sweep_height
+        }
+    );
+    assert_eq!(resumed_sweep.generation, committer_status.generation + 1);
 }
 
 #[test]

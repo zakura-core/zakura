@@ -40,6 +40,7 @@ pub(crate) enum BlockApplyOperationState {
     Accepted,
     TooLate,
     Cancelled,
+    TransferredToLegacy,
     Committed,
     Rejected,
     Failed,
@@ -73,9 +74,13 @@ pub(crate) struct AcceptedBlockApplyOperation {
 pub(crate) enum BlockApplyTerminal {
     Committed,
     Rejected,
+    TransferredToLegacy,
 }
 
-/// Exclusive authorization for one fully drained legacy fallback round.
+/// Authorization for one legacy fallback round after native admission stops.
+///
+/// Full semantic commits drain before this lease activates. The block driver transfers incomplete
+/// checkpoint ranges to the shared checkpoint verifier so fallback can supply their missing bodies.
 #[derive(Debug)]
 pub(crate) struct LegacyFallbackLease {
     coordinator: Arc<SyncCoordinator>,
@@ -192,6 +197,19 @@ impl SyncCoordinator {
         }
     }
 
+    /// Wait until fallback starts draining native applies.
+    pub(crate) async fn wait_for_legacy_yield(&self) {
+        loop {
+            let changed = self.phase_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.is_yielded_to_legacy() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// Reserve one apply in the exact current native epoch.
     #[cfg(test)]
     pub(crate) fn begin_apply(self: &Arc<Self>) -> Option<BlockApplyPermit> {
@@ -264,7 +282,7 @@ impl SyncCoordinator {
         }
     }
 
-    /// Stop native admission, drain the exact epoch, then authorize one legacy round.
+    /// Stop native admission, quiesce the exact epoch, then authorize one legacy round.
     pub(crate) async fn acquire_legacy_fallback(
         self: &Arc<Self>,
         diagnostic_interval: Duration,
@@ -417,6 +435,9 @@ impl SyncCoordinator {
             let state = match terminal {
                 BlockApplyTerminal::Committed => BlockApplyOperationState::Committed,
                 BlockApplyTerminal::Rejected => BlockApplyOperationState::Rejected,
+                BlockApplyTerminal::TransferredToLegacy => {
+                    BlockApplyOperationState::TransferredToLegacy
+                }
             };
             record.state = state;
             record.state_tx.send_replace(state);

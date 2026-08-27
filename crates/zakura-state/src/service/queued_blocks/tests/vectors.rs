@@ -264,8 +264,8 @@ fn dequeue_descendants_removes_the_complete_failed_subtree() -> Result<()> {
         queue.queue((block.prepare(), response));
         responses.push(receiver);
     }
-    let error = CommitSemanticallyVerifiedError::from(CommitBlockError::AncestorWriteFailed {
-        ancestor: root.hash(),
+    let error = CommitSemanticallyVerifiedError::from(CommitBlockError::HeaderChainError {
+        error: format!("ancestor {} failed", root.hash()),
     });
 
     assert_eq!(queue.fail_descendants(root.hash(), error.clone()).len(), 3);

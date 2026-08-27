@@ -60,7 +60,8 @@ async fn descendant_arriving_after_a_local_parent_failure_completes_immediately(
 
     assert!(matches!(
         response.inner(),
-        CommitBlockError::AncestorWriteFailed { ancestor: failed } if *failed == ancestor
+        CommitBlockError::HeaderChainError { error }
+            if error.contains(&ancestor.to_string())
     ));
     assert_eq!(
         state.non_finalized_failed_ancestors.get(&block.hash),

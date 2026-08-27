@@ -826,9 +826,11 @@ impl StateService {
             write::NonFinalizedWriteFailureKind::Invalid => CommitBlockError::ValidateContextError(
                 Box::new(ValidateContextError::InvalidAncestorBlock(ancestor)),
             ),
-            write::NonFinalizedWriteFailureKind::Retryable => {
-                CommitBlockError::AncestorWriteFailed { ancestor }
-            }
+            write::NonFinalizedWriteFailureKind::Retryable => CommitBlockError::HeaderChainError {
+                error: format!(
+                    "ancestor {ancestor} did not commit because of a local state write failure"
+                ),
+            },
         }
     }
 

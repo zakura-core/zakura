@@ -493,61 +493,55 @@ mod tests {
     }
 
     #[test]
-    fn local_retry_preserves_supplier_eligibility() {
-        let mut task = task(&snapshot());
-        let context = context();
-        mark_context_requested(&mut task);
-        task.resolve(context.clone())
-            .expect("the exact context resolves");
-        task.assign(task.owner).expect("ready work can go on wire");
-        let failed_source = SourceId::from_digest([1; 32]);
-        task.retry(failed_source)
-            .expect("one supplier failure starts the current cycle");
-        task.assign(task.owner)
-            .expect("another supplier can own the current cycle");
-        let retry_at = Instant::now() + std::time::Duration::from_secs(1);
-
-        task.defer_local_retry_until(retry_at)
-            .expect("a local failure backs off assigned work");
-
-        assert_eq!(task.tried_sources, [failed_source].into_iter().collect());
-        assert_eq!(task.attempts, 2);
-        assert_eq!(
-            task.state,
-            RepairPolicyState::LocalBackoff {
-                context: context.clone(),
-                retry_at,
+    fn local_retry_preserves_supplier_eligibility_from_ready_and_assigned() {
+        for assigned in [false, true] {
+            let mut task = task(&snapshot());
+            let context = context();
+            mark_context_requested(&mut task);
+            task.resolve(context.clone())
+                .expect("the exact context resolves");
+            let failed_source = SourceId::from_digest([1; 32]);
+            if assigned {
+                task.assign(task.owner).expect("ready work can go on wire");
+                task.retry(failed_source)
+                    .expect("one supplier failure starts the current cycle");
+                task.assign(task.owner)
+                    .expect("another supplier can own the current cycle");
+            } else {
+                task.tried_sources.insert(failed_source);
             }
-        );
-        task.resume_retry_cycle(retry_at);
-        assert_eq!(task.tried_sources, [failed_source].into_iter().collect());
-        assert_eq!(task.state, RepairPolicyState::Ready { context });
-    }
+            let attempts = task.attempts;
+            let retry_at = Instant::now() + std::time::Duration::from_secs(1);
 
-    #[test]
-    fn ready_local_retry_preserves_supplier_eligibility() {
-        let mut task = task(&snapshot());
-        let context = context();
-        mark_context_requested(&mut task);
-        task.resolve(context.clone())
-            .expect("the exact context resolves");
-        let failed_source = SourceId::from_digest([1; 32]);
-        task.tried_sources.insert(failed_source);
-        let retry_at = Instant::now() + std::time::Duration::from_secs(1);
+            task.defer_local_retry_until(retry_at)
+                .expect("ready or assigned work can back off after a local failure");
 
-        task.defer_local_retry_until(retry_at)
-            .expect("ready work can back off after a local send failure");
-
-        assert_eq!(task.tried_sources, [failed_source].into_iter().collect());
-        assert_eq!(
-            task.state,
-            RepairPolicyState::LocalBackoff {
-                context: context.clone(),
-                retry_at,
-            }
-        );
-        task.resume_retry_cycle(retry_at);
-        assert_eq!(task.state, RepairPolicyState::Ready { context });
+            assert_eq!(
+                task.tried_sources,
+                [failed_source].into_iter().collect(),
+                "assigned={assigned}"
+            );
+            assert_eq!(task.attempts, attempts + 1, "assigned={assigned}");
+            assert_eq!(
+                task.state,
+                RepairPolicyState::LocalBackoff {
+                    context: context.clone(),
+                    retry_at,
+                },
+                "assigned={assigned}"
+            );
+            task.resume_retry_cycle(retry_at);
+            assert_eq!(
+                task.tried_sources,
+                [failed_source].into_iter().collect(),
+                "assigned={assigned}"
+            );
+            assert_eq!(
+                task.state,
+                RepairPolicyState::Ready { context },
+                "assigned={assigned}"
+            );
+        }
     }
 
     #[test]

@@ -3824,14 +3824,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
     let submit_block_channel_data = submit_block_receiver.recv().await.expect("channel is open");
     let (submitted_hash, submitted_height) = match submit_block_channel_data {
         MinedBlockEvent::Early { hash, height, .. }
-        | MinedBlockEvent::Committed {
-            hash,
-            height,
-            early_advertised: false,
-        } => (hash, height),
-        event => panic!(
-            "submitblock should send an authorized early event or the safe committed fallback: {event:?}"
-        ),
+        | MinedBlockEvent::Committed { hash, height } => (hash, height),
     };
     assert_eq!(submitted_hash, proposal_block.hash());
     assert_eq!(submitted_height, proposal_block.coinbase_height().unwrap());

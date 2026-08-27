@@ -9,7 +9,9 @@ use zakura_test::prelude::*;
 
 use crate::{
     arbitrary::Prepare,
-    service::queued_blocks::{QueuedBlocks, QueuedSemanticallyVerified, SentHashes},
+    service::queued_blocks::{
+        QueuedBlocks, QueuedSemanticallyVerified, SentHashes, MAX_QUEUED_BLOCKS,
+    },
     tests::FakeChainHelper,
 };
 
@@ -93,6 +95,44 @@ fn dequeue_gives_right_children() -> Result<()> {
     assert_eq!(0, queue.by_height.len());
     assert_eq!(0, queue.known_utxos.len());
 
+    Ok(())
+}
+
+#[test]
+fn same_hash_replacement_keeps_the_new_body() -> Result<()> {
+    let block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
+    let replacement_block = Arc::new((*block).clone());
+    let mut queue = QueuedBlocks::default();
+    queue.queue(block.clone().into_queued());
+
+    let old = queue.replace(block.hash(), replacement_block.clone().into_queued());
+    assert!(Arc::ptr_eq(&old.0.block, &block));
+    assert!(Arc::ptr_eq(
+        &queue
+            .get_mut(&block.hash())
+            .expect("replacement remains queued")
+            .0
+            .block,
+        &replacement_block
+    ));
+    Ok(())
+}
+
+#[test]
+fn orphan_queue_has_a_fixed_entry_bound() -> Result<()> {
+    let block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
+    let mut queue = QueuedBlocks::default();
+    assert!(!queue.is_full());
+
+    for index in 0..MAX_QUEUED_BLOCKS {
+        let mut queued = block.clone().into_queued();
+        let index = u64::try_from(index).expect("the queue bound fits in u64");
+        queued.0.hash.0[..8].copy_from_slice(&index.to_le_bytes());
+        queue.blocks.insert(queued.0.hash, queued);
+    }
+    assert!(queue.is_full());
     Ok(())
 }
 

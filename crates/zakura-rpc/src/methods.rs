@@ -141,9 +141,6 @@ use types::{
     z_validate_address::ZValidateAddressResponse,
 };
 
-/// Bounds the final mined-block event send after the RPC lifecycle has detached.
-const MINED_BLOCK_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Calls a Tower service and maps readiness or call errors to
 /// [`server::error::LegacyCode::Misc`].
 async fn call_service<S, Request>(service: S, request: Request) -> Result<S::Response>
@@ -948,7 +945,7 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::Sender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
     ) -> (Self, JoinHandle<()>)
     where
         VersionString: ToString + Clone + Send + 'static,
@@ -989,7 +986,7 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::Sender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
         pending_blocks: PendingBlockRegistry,
     ) -> (Self, JoinHandle<()>)
     where
@@ -1047,26 +1044,35 @@ where
     }
 
     fn prepare_template_in_background(&self, template: &BlockTemplateResponse) {
-        let Some(preparation_permit) = self.gbt.try_acquire_template_preparation() else {
-            metrics::counter!("mining.template_preparation.saturated").increment(1);
+        let Some(template) = self.gbt.queue_template_preparation(template.clone()) else {
+            metrics::counter!("mining.template_preparation.coalesced").increment(1);
             return;
         };
-        let template = template.clone();
         let network = self.network.clone();
         let verifier = self.gbt.block_verifier_router();
+        let gbt = self.gbt.clone();
         tokio::spawn(
             async move {
-                let _preparation_permit = preparation_permit;
-                let Ok(block) = proposal_block_from_template(&template, None, &network) else {
-                    return;
-                };
-                let request = zakura_consensus::Request::Prepare {
-                    block: Arc::new(block),
-                    work_id: Some(template.work_id().clone()),
-                    source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
-                };
-                if let Err(error) = verifier.oneshot(request).await {
-                    tracing::debug!(?error, "background mining candidate preparation failed");
+                let mut template = template;
+                loop {
+                    if let Ok(block) = proposal_block_from_template(&template, None, &network) {
+                        let request = zakura_consensus::Request::Prepare {
+                            block: Arc::new(block),
+                            work_id: Some(template.work_id().clone()),
+                            source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
+                        };
+                        if let Err(error) = verifier.clone().oneshot(request).await {
+                            tracing::debug!(
+                                ?error,
+                                "background mining candidate preparation failed"
+                            );
+                        }
+                    }
+
+                    let Some(next) = gbt.next_template_preparation() else {
+                        break;
+                    };
+                    template = next;
                 }
             }
             .in_current_span(),
@@ -2824,8 +2830,8 @@ where
             tokio::pin!(verification);
 
             let admission_start = std::time::Instant::now();
-            let mut early_result = None;
             let mut pending_registration = None;
+            let mut early_sent = false;
             let verification_result = tokio::select! {
                 biased;
 
@@ -2837,15 +2843,14 @@ where
                         && optimistic_block_inventory
                     {
                         if let Some(registration) = pending_blocks.insert(block.clone()) {
-                            let (advertised, receiver) = tokio::sync::oneshot::channel();
                             let event = MinedBlockEvent::Early {
                                 hash: block_hash,
                                 height,
                                 submitted_at,
-                                advertised,
+                                pending: registration.signal(),
                             };
-                            if mined_block_sender.try_send(event).is_ok() {
-                                early_result = Some(receiver);
+                            if mined_block_sender.send(event).is_ok() {
+                                early_sent = true;
                                 pending_registration = Some(registration);
                             }
                         }
@@ -2864,47 +2869,14 @@ where
                 );
             }
 
-            let committed = verification_result.is_ok();
-            tokio::spawn(async move {
-                let early_advertised = match early_result {
-                    Some(receiver) => tokio::time::timeout(Duration::from_secs(20), receiver)
-                        .await
-                        .ok()
-                        .and_then(|result| result.ok())
-                        .unwrap_or(false),
-                    None => false,
-                };
-                let event = if committed {
-                    if optimistic_block_inventory && !early_advertised {
-                        metrics::counter!("mining.optimistic_inventory.fallbacks").increment(1);
-                    }
-                    MinedBlockEvent::Committed {
+            if verification_result.is_ok() {
+                if mined_block_sender
+                    .send(MinedBlockEvent::Committed {
                         hash: block_hash,
                         height,
-                        early_advertised,
-                    }
-                } else {
-                    if early_advertised {
-                        metrics::counter!("mining.optimistic_inventory.post_commit_failures")
-                            .increment(1);
-                        tracing::warn!(
-                            ?block_hash,
-                            ?height,
-                            "mined block failed contextual commit after early inventory"
-                        );
-                    }
-                    MinedBlockEvent::Failed {
-                        hash: block_hash,
-                        height,
-                        early_advertised,
-                    }
-                };
-                let send_result = tokio::time::timeout(
-                    MINED_BLOCK_EVENT_SEND_TIMEOUT,
-                    mined_block_sender.send(event),
-                )
-                .await;
-                if !matches!(send_result, Ok(Ok(()))) {
+                    })
+                    .is_err()
+                {
                     metrics::counter!("mining.optimistic_inventory.final_send_failures")
                         .increment(1);
                     tracing::warn!(
@@ -2913,7 +2885,15 @@ where
                         "could not send the final mined-block event"
                     );
                 }
-            });
+            } else if early_sent {
+                metrics::counter!("mining.optimistic_inventory.post_admission_failures")
+                    .increment(1);
+                tracing::warn!(
+                    ?block_hash,
+                    ?height,
+                    "mined block failed contextual commit after state admission"
+                );
+            }
             verification_result
         });
 

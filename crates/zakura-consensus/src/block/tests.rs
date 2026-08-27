@@ -425,7 +425,7 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
         })
         .await;
     assert!(commit_result.is_ok());
-    assert_eq!(transaction_calls.load(Ordering::Relaxed), 3);
+    assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
 }
 
 // TODO: enable this test after implementing contextual verification

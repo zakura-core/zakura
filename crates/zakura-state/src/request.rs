@@ -80,7 +80,12 @@ impl BlockAdmission {
     }
 
     /// Marks the block as admitted to the active non-finalized write queue.
-    pub(crate) fn admit(&self) {
+    pub(crate) fn admit(&self, optimistic_relay_still_authorized: bool) {
+        if !optimistic_relay_still_authorized {
+            self.0
+                .optimistic_relay_authorized
+                .store(false, Ordering::Release);
+        }
         if self
             .0
             .state
@@ -124,10 +129,12 @@ impl BlockAdmission {
     pub async fn wait(&self) -> bool {
         loop {
             let notified = self.0.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             match self.0.state.load(Ordering::Acquire) {
                 Self::ADMITTED => return true,
                 Self::REJECTED => return false,
-                Self::PENDING => notified.await,
+                Self::PENDING => notified.as_mut().await,
                 _ => unreachable!("block admission state only uses declared constants"),
             }
         }
@@ -847,13 +854,19 @@ mod tests {
         rejected.authorize_optimistic_relay();
         assert!(rejected.optimistic_relay_authorized());
         rejected.reject();
-        rejected.admit();
+        rejected.admit(true);
         assert!(!rejected.wait().await);
 
         let admitted = BlockAdmission::pending();
-        admitted.admit();
+        admitted.admit(true);
         admitted.reject();
         assert!(admitted.wait().await);
+
+        let stale = BlockAdmission::pending();
+        stale.authorize_optimistic_relay();
+        stale.admit(false);
+        assert!(stale.wait().await);
+        assert!(!stale.optimistic_relay_authorized());
     }
 }
 

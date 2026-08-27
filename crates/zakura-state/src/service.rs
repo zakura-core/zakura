@@ -15,7 +15,7 @@
 //!   chain tip changes.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     ops::Bound,
     path::PathBuf,
@@ -178,6 +178,9 @@ pub(crate) struct StateService {
     /// A set of block hashes that have been sent to the block write task.
     /// Hashes of blocks below the finalized tip height are periodically pruned.
     non_finalized_block_write_sent_hashes: SentHashes,
+
+    /// Parents targeted by operator invalidation cannot authorize optimistic relay.
+    optimistic_relay_blocked_parents: HashSet<block::Hash>,
 
     /// If an invalid block is sent on `finalized_block_write_sender`
     /// or `non_finalized_block_write_sender`,
@@ -562,6 +565,7 @@ impl StateService {
             block_write_sender,
             finalized_block_write_last_sent_hash,
             non_finalized_block_write_sent_hashes,
+            optimistic_relay_blocked_parents: HashSet::new(),
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
             pending_utxos,
@@ -919,10 +923,11 @@ impl StateService {
     fn queue_and_commit_to_non_finalized_state(
         &mut self,
         semantically_verified: SemanticallyVerifiedBlock,
-        mut admission: Option<BlockAdmission>,
+        admission: Option<BlockAdmission>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
         let parent_hash = semantically_verified.block.header.previous_block_hash;
+        let hash = semantically_verified.hash;
 
         // Drop hashes of any blocks the write task has rejected before checking
         // the SentHashes membership below. Without this, a rejected same-hash
@@ -966,22 +971,32 @@ impl StateService {
         // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
         // has been queued but not yet committed to the state fails the older request and replaces
         // it with the newer request.
-        let rsp_rx = if let Some((_, old_rsp_tx, old_admission)) = self
+        let rsp_rx = if self
             .non_finalized_state_queued_blocks
             .get_mut(&semantically_verified.hash)
+            .is_some()
         {
             tracing::debug!("replacing older queued request with new request");
-            let (mut rsp_tx, rsp_rx) = oneshot::channel();
-            std::mem::swap(old_rsp_tx, &mut rsp_tx);
-            std::mem::swap(old_admission, &mut admission);
-            if let Some(admission) = admission {
-                admission.reject();
+            let (rsp_tx, rsp_rx) = oneshot::channel();
+            let (_, old_rsp_tx, old_admission) = self.non_finalized_state_queued_blocks.replace(
+                semantically_verified.hash,
+                (semantically_verified, rsp_tx, admission),
+            );
+            if let Some(old_admission) = old_admission {
+                old_admission.reject();
             }
-            let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
-                Some(semantically_verified.hash.into()),
+            let _ = old_rsp_tx.send(Err(CommitBlockError::new_duplicate(
+                Some(hash.into()),
                 KnownBlock::Queue,
             )
             .into()));
+            rsp_rx
+        } else if self.non_finalized_state_queued_blocks.is_full() {
+            if let Some(admission) = admission {
+                admission.reject();
+            }
+            let (rsp_tx, rsp_rx) = oneshot::channel();
+            let _ = rsp_tx.send(Err(CommitBlockError::QueueFull.into()));
             rsp_rx
         } else {
             let (rsp_tx, rsp_rx) = oneshot::channel();
@@ -1058,6 +1073,26 @@ impl StateService {
                     self.non_finalized_block_write_sent_hashes
                         .add(&queued_child.0);
                     let admission = queued_child.2.clone();
+                    let candidate_parent = queued_child.0.block.header.previous_block_hash;
+                    let optimistic_relay_still_authorized = admission
+                        .as_ref()
+                        .is_some_and(BlockAdmission::optimistic_relay_authorized)
+                        && self
+                            .best_tip()
+                            .is_some_and(|(_, tip_hash)| tip_hash == candidate_parent)
+                        && (self
+                            .non_finalized_block_write_sent_hashes
+                            .contains(&candidate_parent)
+                            || self.read_service.db.finalized_tip_hash() == candidate_parent)
+                        && !self
+                            .optimistic_relay_blocked_parents
+                            .contains(&candidate_parent);
+                    if optimistic_relay_still_authorized {
+                        // Only the first server candidate can reserve early relay for this parent.
+                        // Siblings receive the normal committed relay after contextual validation.
+                        self.optimistic_relay_blocked_parents
+                            .insert(candidate_parent);
+                    }
                     let send_result = non_finalized_block_write_sender.send(queued_child.into());
 
                     if let Err(SendError(NonFinalizedWriteMessage::Commit(queued))) = send_result {
@@ -1073,7 +1108,7 @@ impl StateService {
                     };
 
                     if let Some(admission) = admission {
-                        admission.admit();
+                        admission.admit(optimistic_relay_still_authorized);
                     }
 
                     new_parents.push(hash);
@@ -1090,7 +1125,7 @@ impl StateService {
     }
 
     fn send_invalidate_block(
-        &self,
+        &mut self,
         hash: block::Hash,
     ) -> oneshot::Receiver<Result<block::Hash, InvalidateError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
@@ -1099,6 +1134,10 @@ impl StateService {
             let _ = rsp_tx.send(Err(InvalidateError::ProcessingCheckpointedBlocks));
             return rsp_rx;
         };
+
+        // Block optimistic relay before the writer processes the invalidation. The write channel
+        // preserves request order, so a later candidate cannot advertise using this stale parent.
+        self.optimistic_relay_blocked_parents.insert(hash);
 
         if let Err(tokio::sync::mpsc::error::SendError(error)) =
             sender.send(NonFinalizedWriteMessage::Invalidate { hash, rsp_tx })

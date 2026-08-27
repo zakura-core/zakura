@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, watch};
 
 use zakura_chain::block;
 
@@ -42,7 +42,6 @@ pub struct SubmitBlockParameters {
 pub const PENDING_BLOCK_WAIT: Duration = Duration::from_secs(15);
 
 const MAX_PENDING_BLOCKS: usize = 16;
-const MAX_PENDING_BLOCK_WAITS: usize = 32;
 
 /// A mined-block lifecycle event consumed by the block gossip task.
 #[derive(Debug)]
@@ -55,8 +54,8 @@ pub enum MinedBlockEvent {
         height: block::Height,
         /// When the RPC accepted the submitted bytes.
         submitted_at: std::time::Instant,
-        /// Reports whether the early network advertisement completed.
-        advertised: oneshot::Sender<bool>,
+        /// Cancels the advertisement if contextual verification rejects the block.
+        pending: PendingBlockSignal,
     },
     /// The contextual commit completed.
     Committed {
@@ -64,17 +63,6 @@ pub enum MinedBlockEvent {
         hash: block::Hash,
         /// The block height.
         height: block::Height,
-        /// Whether the early advertisement completed successfully.
-        early_advertised: bool,
-    },
-    /// The contextual commit failed after state admission.
-    Failed {
-        /// The block hash.
-        hash: block::Hash,
-        /// The block height.
-        height: block::Height,
-        /// Whether peers received an early inventory.
-        early_advertised: bool,
     },
 }
 
@@ -91,11 +79,10 @@ struct PendingBlock {
     status: watch::Sender<PendingStatus>,
 }
 
-/// Stores pending blocks and bounds peer waits.
+/// Stores pending blocks and coalesces peer waits by block hash.
 #[derive(Debug)]
 struct PendingBlockRegistryInner {
     entries: Mutex<HashMap<block::Hash, PendingBlock>>,
-    wait_permits: Arc<Semaphore>,
     next_owner_id: AtomicU64,
 }
 
@@ -107,9 +94,35 @@ impl Default for PendingBlockRegistry {
     fn default() -> Self {
         Self(Arc::new(PendingBlockRegistryInner {
             entries: Mutex::new(HashMap::new()),
-            wait_permits: Arc::new(Semaphore::new(MAX_PENDING_BLOCK_WAITS)),
             next_owner_id: AtomicU64::new(1),
         }))
+    }
+}
+
+/// Reports whether an early-advertised block remains valid.
+#[derive(Debug)]
+pub struct PendingBlockSignal(watch::Receiver<PendingStatus>);
+
+impl PendingBlockSignal {
+    /// Returns true unless contextual verification has rejected the block.
+    pub fn is_valid(&self) -> bool {
+        !matches!(*self.0.borrow(), PendingStatus::Failed)
+    }
+
+    /// Resolves when contextual verification rejects the block.
+    pub async fn wait_for_failure(&mut self) {
+        loop {
+            let status = self.0.borrow_and_update().clone();
+            match status {
+                PendingStatus::Failed => return,
+                PendingStatus::Committed(_) => std::future::pending::<()>().await,
+                PendingStatus::Waiting => {}
+            }
+
+            if self.0.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
     }
 }
 
@@ -123,6 +136,23 @@ pub(crate) struct PendingBlockRegistration {
 }
 
 impl PendingBlockRegistration {
+    /// Returns a signal that cancels stale early inventory after commit failure.
+    pub(crate) fn signal(&self) -> PendingBlockSignal {
+        let entries = self
+            .registry
+            .0
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let status = entries
+            .get(&self.hash)
+            .filter(|entry| entry.owner_id == self.owner_id)
+            .expect("registration owns its entry until it resolves")
+            .status
+            .subscribe();
+        PendingBlockSignal(status)
+    }
+
     /// Resolves this registration and wakes its peer waiters.
     pub(crate) fn resolve(mut self, result: Result<Arc<block::Block>, ()>) {
         self.registry.resolve(self.hash, self.owner_id, result);
@@ -174,9 +204,9 @@ impl PendingBlockRegistry {
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !entries
+        if entries
             .get(&hash)
-            .is_some_and(|entry| entry.owner_id == owner_id)
+            .is_none_or(|entry| entry.owner_id != owner_id)
         {
             return;
         }
@@ -204,17 +234,10 @@ impl PendingBlockRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&hash)
             .map(|entry| entry.status.subscribe());
-        let wait_permits = status.as_ref().map(|_| self.0.wait_permits.clone());
         let deadline = tokio::time::Instant::now() + PENDING_BLOCK_WAIT;
 
         async move {
             let mut status = status?;
-            let _wait_permit: OwnedSemaphorePermit = wait_permits?
-                .try_acquire_owned()
-                .map_err(|_| {
-                    metrics::counter!("mining.pending_peer_wait.saturated").increment(1);
-                })
-                .ok()?;
             let start = std::time::Instant::now();
             let result = tokio::time::timeout_at(deadline, async {
                 loop {
@@ -283,33 +306,28 @@ impl From<SubmitBlockErrorResponse> for SubmitBlockResponse {
 /// A submit block channel, used to inform the gossip task about mined blocks.
 pub struct SubmitBlockChannel {
     /// The channel sender
-    sender: mpsc::Sender<MinedBlockEvent>,
+    sender: mpsc::UnboundedSender<MinedBlockEvent>,
     /// The channel receiver
-    receiver: mpsc::Receiver<MinedBlockEvent>,
+    receiver: mpsc::UnboundedReceiver<MinedBlockEvent>,
 }
 
 impl SubmitBlockChannel {
     /// Creates a new submit block channel
     pub fn new() -> Self {
-        /// How many unread messages the submit block channel should buffer before rejecting sends.
-        ///
-        /// This should be large enough to usually avoid rejecting sends. This channel is used by
-        /// the block hash gossip task, which waits for a ready peer in the peer set while
-        /// processing messages from this channel and could be much slower to gossip block hashes
-        /// than it is to commit blocks and produce new block templates.
-        const SUBMIT_BLOCK_CHANNEL_CAPACITY: usize = 10_000;
-
-        let (sender, receiver) = mpsc::channel(SUBMIT_BLOCK_CHANNEL_CAPACITY);
+        // Only admitted early events and successful commit events enter this channel. Invalid and
+        // duplicate submissions cannot fill it, and the gossip task does not wait for peer
+        // readiness while consuming it.
+        let (sender, receiver) = mpsc::unbounded_channel();
         Self { sender, receiver }
     }
 
     /// Get the channel sender
-    pub fn sender(&self) -> mpsc::Sender<MinedBlockEvent> {
+    pub fn sender(&self) -> mpsc::UnboundedSender<MinedBlockEvent> {
         self.sender.clone()
     }
 
     /// Get the channel receiver
-    pub fn receiver(self) -> mpsc::Receiver<MinedBlockEvent> {
+    pub fn receiver(self) -> mpsc::UnboundedReceiver<MinedBlockEvent> {
         self.receiver
     }
 }
@@ -386,7 +404,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_block_waits_are_bounded() {
+    async fn pending_block_failure_cancels_stale_inventory() {
+        let registry = PendingBlockRegistry::default();
+        let block = test_block();
+        let registration = registry
+            .insert(block)
+            .expect("the registry accepts the block");
+        let mut signal = registration.signal();
+
+        assert!(signal.is_valid());
+        registration.resolve(Err(()));
+        signal.wait_for_failure().await;
+        assert!(!signal.is_valid());
+    }
+
+    #[tokio::test]
+    async fn pending_block_waits_for_one_hash_are_coalesced() {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
@@ -394,24 +427,11 @@ mod tests {
             .insert(block.clone())
             .expect("the registry accepts the block");
 
-        let waits: Vec<_> = (0..MAX_PENDING_BLOCK_WAITS)
-            .map(|_| {
-                let registry = registry.clone();
-                tokio::spawn(async move { registry.wait(hash).await })
-            })
-            .collect();
-        while registry.0.wait_permits.available_permits() > 0 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(registry.wait(hash).await, None);
-
-        for wait in waits {
-            wait.abort();
-            let _ = wait.await;
-        }
-        let wait = registry.wait(hash);
+        let waits: Vec<_> = (0..64).map(|_| registry.wait(hash)).collect();
         registration.resolve(Ok(block.clone()));
-        assert_eq!(wait.await, Some(block));
+        for result in futures::future::join_all(waits).await {
+            assert_eq!(result, Some(block.clone()));
+        }
     }
 
     #[test]

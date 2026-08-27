@@ -4982,7 +4982,7 @@ mod zakura_header_sync_driver_tests {
             zakura_state::init_test_services(&network).await;
 
         // A low checkpoint at height 10 turns the 11-block range into one checkpoint batch.
-        let checkpoint_verifier = zakura_consensus::CheckpointVerifier::from_list(
+        let mut checkpoint_verifier = zakura_consensus::CheckpointVerifier::from_list(
             [
                 (block::Height(0), genesis_hash),
                 (block::Height(CHECKPOINT_HEIGHT), checkpoint_hash),
@@ -4992,6 +4992,13 @@ mod zakura_header_sync_driver_tests {
             write_state,
         )
         .expect("a checkpoint list with genesis and one mid-chain checkpoint is valid");
+
+        let submitted_count = Arc::new(AtomicUsize::new(0));
+        let verifier_submitted_count = submitted_count.clone();
+        let checkpoint_verifier = service_fn(move |block| {
+            verifier_submitted_count.fetch_add(1, Ordering::SeqCst);
+            checkpoint_verifier.call(block)
+        });
 
         // Adapt the checkpoint verifier (`Service<Arc<Block>>`) to the driver's
         // `Service<zakura_consensus::Request, Response = block::Hash>` bound.
@@ -5062,10 +5069,17 @@ mod zakura_header_sync_driver_tests {
                 .expect("driver action channel stays open");
         }
 
-        // While the body is missing the range cannot commit, and the driver must keep the
-        // checkpoint-class commits pending (not time them out): the tip never reaches the
-        // checkpoint.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let expected_submissions = chain.len().saturating_sub(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while submitted_count.load(Ordering::SeqCst) != expected_submissions {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the driver must submit every available checkpoint body before fallback starts");
+
+        // While the body is missing, the range cannot commit. The driver must keep the
+        // checkpoint-class commits pending instead of timing them out.
         assert_ne!(
             finalized_tip().await,
             Some(block::Height(CHECKPOINT_HEIGHT)),

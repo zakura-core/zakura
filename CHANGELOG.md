@@ -11,6 +11,22 @@ independently.
 
 ## [Unreleased]
 
+## [1.3.0-rc4] - 2026-08-27
+
+### Changed
+
+- Zakura now routes transaction-verifier and mempool state reads around the
+  serialized read-write state buffer
+  ([#784](https://github.com/zakura-core/zakura/pull/784)).
+
+### Fixed
+
+- Allowed Windows tools to check out and package `zakura-header-chain`
+  ([#829](https://github.com/zakura-core/zakura/pull/829)).
+- Fixed native sync stalls caused by header retention evicting a full-state fork. The node now
+  completes affected descendant operations and exits if legacy fallback waits 30 minutes for
+  native applies to drain ([#831](https://github.com/zakura-core/zakura/pull/831)).
+
 ## [1.3.0-rc3] - 2026-08-27
 
 ### Added

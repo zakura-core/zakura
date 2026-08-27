@@ -589,6 +589,26 @@ async fn engage_legacy_fallback_alongside_zakura(
     Ok(lease)
 }
 
+fn handle_legacy_fallback_acquisition(
+    acquisition: Result<
+        crate::commands::start::zakura::LegacyFallbackLease,
+        crate::commands::start::zakura::LegacyFallbackError,
+    >,
+) -> Result<Option<crate::commands::start::zakura::LegacyFallbackLease>, Report> {
+    match acquisition {
+        Ok(lease) => Ok(Some(lease)),
+        Err(
+            error @ crate::commands::start::zakura::LegacyFallbackError::ApplyDrainTimedOut {
+                ..
+            },
+        ) => Err(eyre!(error)),
+        Err(error) => {
+            warn!(?error, "could not acquire the legacy fallback apply lease");
+            Ok(None)
+        }
+    }
+}
+
 /// Sync configuration section.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
@@ -1237,7 +1257,7 @@ where
                          legacy ChainSync as the body-sync driver while Zakura keeps serving \
                          peers and following local commits"
                     );
-                    self.run_legacy_fallback_round(&block_sync_handoff).await;
+                    self.run_legacy_fallback_round(&block_sync_handoff).await?;
                     let resumed_tip = self.latest_chain_tip.best_tip_height();
                     tracker = ZakuraStallTracker::new(resumed_tip);
                     legacy_probe = ZakuraLegacyProbe::new(resumed_tip);
@@ -1258,7 +1278,7 @@ where
                              higher tip; resuming legacy ChainSync as the body-sync driver \
                              while Zakura keeps serving peers and following local commits"
                         );
-                        self.run_legacy_fallback_round(&block_sync_handoff).await;
+                        self.run_legacy_fallback_round(&block_sync_handoff).await?;
                         let resumed_tip = self.latest_chain_tip.best_tip_height();
                         tracker = ZakuraStallTracker::new(resumed_tip);
                         legacy_probe = ZakuraLegacyProbe::new(resumed_tip);
@@ -1272,13 +1292,12 @@ where
     async fn run_legacy_fallback_round(
         &mut self,
         block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::SyncCoordinator>,
-    ) {
-        let lease = match engage_legacy_fallback_alongside_zakura(block_sync_handoff).await {
-            Ok(lease) => lease,
-            Err(error) => {
-                warn!(?error, "could not acquire the legacy fallback apply lease");
-                return;
-            }
+    ) -> Result<(), Report> {
+        let Some(lease) = handle_legacy_fallback_acquisition(
+            engage_legacy_fallback_alongside_zakura(block_sync_handoff).await,
+        )?
+        else {
+            return Ok(());
         };
         if self.try_to_sync(None).await.is_err() {
             self.downloads.cancel_all();
@@ -1289,6 +1308,7 @@ where
             verified_tip = ?self.latest_chain_tip.best_tip_height(),
             "legacy fallback recovery round finished; returned body-sync ownership to Zakura"
         );
+        Ok(())
     }
 
     /// Probes the legacy peer set for how far ahead the network is on **our**

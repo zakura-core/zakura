@@ -78,6 +78,12 @@ The admission path applies each filter before the work that it bounds. The exact
 order depend on the message role. The specification defines that order and each filter's
 configuration.
 
+`Delay` does not require another request scheduler. The peer routine keeps the current request at
+the admission boundary and stops reading further frames from that peer's ordered stream until Work
+becomes available. The existing bounded application and QUIC queues then apply flow control to the
+peer. This may delay later messages on the same ordered stream, but it does not block another peer
+or service stream.
+
 Header sync demonstrates every message role:
 
 | Message | Role | Filters | Result when a filter stops it |

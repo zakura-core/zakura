@@ -29,7 +29,7 @@ The admission path returns one of five results:
 | --- | --- |
 | `Continue` | The handler may process the message. |
 | `Drop` | The message is legal but cannot help now. |
-| `Delay` | The request is legal, but its work budget is empty. |
+| `Delay` | The request waits at the admission boundary for Work. |
 | `Disconnect` | A conformant sender cannot produce the message. |
 | `LocalFault` | The receiver accepted work and then failed to complete it. |
 
@@ -220,29 +220,28 @@ refund = charge - actual_response_bytes
 ```
 
 - `REQUEST_OVERHEAD` MUST equal 64 KiB.
-- Work MUST charge the upper bound before the handler starts.
 - Work SHOULD refund unused response bytes after the terminal response is queued. It MUST refund
   unused charge after `LocalFault`.
 - The bucket capacity MUST be at least the largest request that the receiver accepts.
 - The refill MUST state the per-peer response bandwidth that the receiver grants.
-- Each `(peer, request_type)` MUST have a bounded FIFO request lane. Its capacity MUST equal the
-  advertised concurrency bound and MUST NOT exceed the advertised inflight limit.
-- An admitted request MUST hold one concurrency slot until its terminal response is queued,
-  `LocalFault` occurs, or the connection ends. A subscription update releases its slot when the
-  handler atomically commits the update.
-- Work MUST return `Disconnect` when no slot remains for a charged request. When a charged request
-  cannot dispatch immediately, Work MUST queue it and return `Delay(deficit / refill)`. `deficit`
-  equals its charge plus earlier queued charges minus available tokens, clamped to zero.
-- Work MUST resume requests in FIFO order without rerunning preceding filters or subtracting a
-  charge more than once.
-- A delayed request MUST block only its request lane. It MUST hold no shared lock, stream writer, or
-  handler permit. The transport reader MUST continue dispatching responses and other message
-  classes.
-- A zero-charge operation declared unable to `Delay` MUST bypass the request lane without consuming
-  a concurrency slot.
-- The sender MUST size protocol deadlines from the advertised refill, concurrency, and inflight
-  limits. Its outstanding requests SHOULD fit the work that the refill sustains within those
-  deadlines.
+- After every preceding filter passes, Work MUST acquire one concurrency slot and charge the upper
+  bound immediately before the handler starts. The request MUST hold that slot until its terminal
+  response is queued, `LocalFault` occurs, or the connection ends. A subscription update releases
+  its slot when the handler atomically commits the update.
+- Work MUST return `Disconnect` when a request exceeds the declared concurrency bound.
+- When Work is unavailable, the peer routine MUST retain the current request at the admission
+  boundary without dispatching its handler. It MUST return `Delay` for tracing and stop reading
+  further frames from that peer's ordered stream until the Work budget allows dispatch.
+- `Delay` MUST use the existing bounded application and QUIC queues for backpressure. It MUST NOT
+  create a separate delayed-request queue or scheduler. Every application and transport buffer
+  MUST fit within the declared per-peer resource bound.
+- A delayed request MUST hold no shared lock, stream writer, or handler permit. Backpressure on one
+  peer's stream MUST NOT block another peer or service stream. Later messages on the same ordered
+  stream MAY wait behind the delayed request.
+- A Work refund or refill MUST wake the peer routine when the request can proceed. The peer routine
+  MUST NOT rerun preceding filters or charge the request more than once.
+- The sender MUST respect the advertised concurrency and inflight limits. The protocol-specific
+  outbound obligation MUST keep its request rate within the service capacity.
 
 ## Message declarations
 
@@ -626,18 +625,19 @@ BLOCK_WORK_CAPACITY      >= 8 bytes + min(local_max_blocks_per_response * MAX_BL
 BLOCK_WORK_REFILL        = local per-peer serving rate, bytes/second
 ```
 
-The receiver MUST advertise its actual block count, response byte, inflight, and work-refill
-limits. It MUST NOT inherit the header-sync work budget.
+The receiver MUST advertise its actual block count, response byte, and inflight limits. It MUST NOT
+inherit the header-sync work budget. `BLOCK_WORK_REFILL` is local policy and is not advertised.
 
 Block sync already regulates its rate on the requesting side. Each sender sizes its outstanding
 `GetBlocks` work with a per-peer BBR window ([`DownloadWindow`][bs-window]), clamped by the inflight
 limit the receiver advertises and operating at the measured bandwidth-delay product, which is
 normally far below that clamp. That window is the outbound obligation matching this inbound rule.
 
-The two sides meet through `Delay`. A receiver whose Work bucket is empty delays the request instead
-of answering it. The delay lengthens the sender's round-trip samples, the sender's delay gradient
-shrinks its window, and the sender settles below the rate the receiver serves. Neither side needs to
-advertise a rate.
+The two sides meet through `Delay`. A receiver whose Work bucket is empty stops reading further
+frames from that peer's ordered stream until Work becomes available. Its bounded queues apply QUIC
+flow control instead of adding another request scheduler. The delay lengthens the sender's
+round-trip samples, the sender's delay gradient shrinks its window, and the sender settles below the
+rate the receiver serves.
 
 `BLOCK_WORK_REFILL` therefore binds only a sender that ignores its own controller. The receiver MUST
 set the rate from local policy. It MUST NOT derive the rate from a peer-supplied or peer-influenced
@@ -798,10 +798,10 @@ The implementation MUST provide these checks:
    operation. Each test MUST show that the process survives, that other peers' processing paths
    continue, that the affected work returns to the scheduler, and that the result reaches neither
    peer-set ban policy nor the peer-violation count.
-9. Delay-isolation tests MUST exhaust one request type's Work bucket and place a request in its
-   request lane. A later response and a message of another class on the same ordered stream MUST
-   reach their handlers before the delayed request becomes eligible. The tests MUST also prove FIFO
-   dispatch, prompt wake-up after a refund, and `Disconnect` at the concurrency bound.
+9. Backpressure tests MUST exhaust one request type's Work bucket and show that its handler does not
+   start. They MUST show that application and QUIC buffering stays within the declared bounds, that
+   the peer routine resumes after a refund or refill, and that another peer and service stream keep
+   making progress.
 
 Peer-slot selection, message priority, and stream layout are outside this specification. Peer-slot
 selection must remain separate because a conformant peer can waste a slot without violating a

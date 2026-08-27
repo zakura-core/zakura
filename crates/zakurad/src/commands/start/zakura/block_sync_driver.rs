@@ -1821,10 +1821,153 @@ pub(crate) fn block_sync_needed_blocks_from_state(
 
 #[cfg(test)]
 mod tests {
+    use super::super::SyncCoordinator;
     use super::*;
 
+    use std::{
+        future::{ready, Ready},
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use futures::FutureExt;
+    use tokio::sync::{mpsc, oneshot, watch};
+    use tower::{service_fn, Service};
     use zakura_chain::serialization::ZcashDeserializeInto;
+    use zakura_network::zakura::{
+        commit_state_trace as cs_trace,
+        testkit::{TraceCapture, TraceValue},
+        BlockSyncFrontiers, COMMIT_STATE_TABLE,
+    };
     use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
+
+    #[derive(Clone, Debug)]
+    struct BackpressuredVerifier {
+        ready_polls: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<zakura_consensus::Request> for BackpressuredVerifier {
+        type Response = block::Hash;
+        type Error = zakura_consensus::BoxError;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.ready_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Pending
+        }
+
+        fn call(&mut self, request: zakura_consensus::Request) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let zakura_consensus::Request::Commit(block) = request else {
+                panic!("unexpected consensus request: {request:?}");
+            };
+            ready(Ok(block.hash()))
+        }
+    }
+
+    struct TestDriver {
+        actions: mpsc::Sender<BlockSyncAction>,
+        shutdown: oneshot::Sender<()>,
+        driver_task: tokio::task::JoinHandle<()>,
+        reactor_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestDriver {
+        async fn shutdown(self) {
+            let _ = self.shutdown.send(());
+            self.driver_task
+                .await
+                .expect("block-sync driver exits cleanly");
+            self.reactor_task.abort();
+        }
+    }
+
+    fn spawn_checkpoint_driver<BlockVerifier>(
+        block_verifier: BlockVerifier,
+        handoff: Arc<SyncCoordinator>,
+        trace: ZakuraTrace,
+    ) -> TestDriver
+    where
+        BlockVerifier:
+            Service<zakura_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
+        BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
+        BlockVerifier::Future: Send + 'static,
+    {
+        let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+        drop(tip_tx);
+        let startup = zakura_network::zakura::BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            (block::Height(0), block::Hash([0; 32])),
+            tip_rx,
+            zakura_network::zakura::ZakuraBlockSyncConfig::default(),
+        );
+        let (block_sync, _reactor_actions, reactor_task) =
+            zakura_network::zakura::spawn_block_sync_reactor(startup);
+        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
+            panic!("unexpected read request: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Tip(None))
+        });
+        let (actions, action_rx) = mpsc::channel(8);
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let driver_task = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zakura_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zakura_chain::chain_tip::NoChainTip,
+            read_state,
+            None,
+            None,
+            block_verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            trace,
+            None,
+            handoff,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        TestDriver {
+            actions,
+            shutdown,
+            driver_task,
+            reactor_task,
+        }
+    }
+
+    async fn submit_checkpoint(driver: &TestDriver, token: BlockApplyToken) {
+        driver
+            .actions
+            .send(BlockSyncAction::SubmitBlock {
+                owner: test_owner(),
+                source: test_source(),
+                token,
+                block: mainnet_block(&BLOCK_MAINNET_1_BYTES),
+            })
+            .await
+            .expect("block-sync driver action channel stays open");
+    }
+
+    async fn wait_for_count(counter: &AtomicUsize, expected: usize, context: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while counter.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {context}"));
+    }
 
     fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
         Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
@@ -1850,6 +1993,104 @@ mod tests {
 
     fn test_source() -> zakura_header_chain::SourceId {
         zakura_header_chain::SourceId::from_digest([2; 32])
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fallback_transfers_checkpoint_apply_before_verifier_admission() {
+        let ready_polls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let verifier = BackpressuredVerifier {
+            ready_polls: ready_polls.clone(),
+            calls: calls.clone(),
+        };
+        let handoff = SyncCoordinator::new();
+        let driver = spawn_checkpoint_driver(verifier, handoff.clone(), ZakuraTrace::noop());
+
+        submit_checkpoint(&driver, 1).await;
+        wait_for_count(
+            ready_polls.as_ref(),
+            1,
+            "the checkpoint verifier readiness poll",
+        )
+        .await;
+
+        let lease = tokio::time::timeout(
+            Duration::from_secs(1),
+            handoff.acquire_legacy_fallback(Duration::from_secs(1)),
+        )
+        .await
+        .expect("backpressured checkpoint apply transfers without blocking fallback")
+        .expect("fallback acquires the apply lease after transfer");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "transfer must not wait for the verifier to admit the request"
+        );
+
+        drop(lease);
+        driver.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_checkpoint_apply_wins_over_ready_fallback_transfer() {
+        let (release_tx, release_rx) = watch::channel(false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let verifier_calls = calls.clone();
+        let verifier = service_fn(move |request: zakura_consensus::Request| {
+            let mut release_rx = release_rx.clone();
+            let verifier_calls = verifier_calls.clone();
+            async move {
+                let zakura_consensus::Request::Commit(block) = request else {
+                    panic!("unexpected consensus request: {request:?}");
+                };
+                verifier_calls.fetch_add(1, Ordering::SeqCst);
+                while !*release_rx.borrow() {
+                    release_rx
+                        .changed()
+                        .await
+                        .expect("commit release sender stays open");
+                }
+                Ok::<_, zakura_consensus::BoxError>(block.hash())
+            }
+        });
+        let mut capture =
+            TraceCapture::for_test("completed_checkpoint_apply_wins_over_ready_fallback_transfer")
+                .expect("test trace capture initializes");
+        let trace = ZakuraTrace::new(capture.tracer(), "01");
+        let handoff = SyncCoordinator::new();
+        let driver = spawn_checkpoint_driver(verifier, handoff.clone(), trace);
+
+        submit_checkpoint(&driver, 2).await;
+        wait_for_count(calls.as_ref(), 1, "the checkpoint verifier call").await;
+
+        let fallback = handoff.acquire_legacy_fallback(Duration::from_secs(1));
+        tokio::pin!(fallback);
+        assert!(
+            fallback.as_mut().now_or_never().is_none(),
+            "fallback starts draining while the checkpoint apply is pending"
+        );
+        assert!(handoff.is_yielded_to_legacy());
+
+        release_tx
+            .send(true)
+            .expect("commit release receiver stays open");
+        let lease = tokio::time::timeout(Duration::from_secs(1), &mut fallback)
+            .await
+            .expect("completed checkpoint apply releases the fallback drain")
+            .expect("fallback acquires the lease after native completion");
+
+        capture.flush().await;
+        let reader = capture.reader().expect("test trace is readable");
+        reader.table(COMMIT_STATE_TABLE.table()).assert_row(
+            cs_trace::REACTOR_EVENT_SENT,
+            &[
+                (cs_trace::APPLY_TOKEN, TraceValue::U64(2)),
+                (cs_trace::RESULT, TraceValue::Str("committed")),
+            ],
+        );
+
+        drop(lease);
+        driver.shutdown().await;
     }
 
     #[test]

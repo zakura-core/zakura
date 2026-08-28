@@ -26,6 +26,8 @@ independently.
 - Fixed native sync stalls caused by header retention evicting a full-state fork. The node now
   completes affected descendant operations and exits if legacy fallback waits 30 minutes for
   native applies to drain ([#831](https://github.com/zakura-core/zakura/pull/831)).
+- Suppressed node-local watchdog alerts during planned `zakura-compat` restarts
+  ([#835](https://github.com/zakura-core/zakura/pull/835)).
 
 ## [1.3.0-rc3] - 2026-08-27
 

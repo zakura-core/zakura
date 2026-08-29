@@ -392,87 +392,87 @@ version = "0.52.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.zakura-bellman]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-bls12-381]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-halo2-gadgets]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-halo2-legacy-pdqsort]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-halo2-poseidon]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-halo2-proofs]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-jubjub]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-keys]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-orchard]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-pairing]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-pasta-curves]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-primitives]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-proofs]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-reddsa]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-redjubjub]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-sapling-crypto]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-sinsemilla]]
-version = "1.0.0-rc.5"
+version = "1.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 

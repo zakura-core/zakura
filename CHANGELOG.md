@@ -164,25 +164,23 @@ independently.
 - A commitment-root repair that no connected peer can supply now reports why each peer was
   excluded and escalates after 60 seconds
   ([#821](https://github.com/zakura-core/zakura/pull/821)).
-- Updated the `zakura-core/libraries` crates to `1.0.0-rc.4`
-  ([#824](https://github.com/zakura-core/zakura/pull/824)).
+- Updated the `zakura-core/libraries` crates to their final `1.0.0` release,
+  picking up Orchard/halo2 proving and verification performance improvements
+  ([#824](https://github.com/zakura-core/zakura/pull/824),
+  [#839](https://github.com/zakura-core/zakura/pull/839),
+  [#842](https://github.com/zakura-core/zakura/pull/842)).
 - Sped up Orchard note commitment tree updates during sync by about 2x by
   evaluating `MerkleCRH^Orchard` with the libraries' new weighted fixed-length
   Sinsemilla evaluator, for a one-time 3.75 MiB in-memory table
   ([#824](https://github.com/zakura-core/zakura/pull/824)).
-- Shortened this release's end-of-support window from 40 to 33 days, so
-  Mainnet `zakurad` nodes running it halt at block 3,500,552, estimated
+- Shortened this release's end-of-support window from 40 to 31 days, so
+  Mainnet `zakurad` nodes running it halt at block 3,501,339, estimated
   2026-09-30 — the day before October 1st. End-of-support warnings begin
-  3 days earlier ([#825](https://github.com/zakura-core/zakura/pull/825)).
+  3 days earlier ([#825](https://github.com/zakura-core/zakura/pull/825),
+  [#843](https://github.com/zakura-core/zakura/pull/843)).
 - Zakura now routes transaction-verifier and mempool state reads around the
   serialized read-write state buffer
   ([#784](https://github.com/zakura-core/zakura/pull/784)).
-- Updated the `zakura-core/libraries` crates to `1.0.0-rc.5`, picking up
-  Orchard/halo2 proving and verification performance improvements
-  ([#839](https://github.com/zakura-core/zakura/pull/839)).
-- Updated the `zakura-core/libraries` crates from `1.0.0-rc.5` to the final
-  `1.0.0` release
-  ([#842](https://github.com/zakura-core/zakura/pull/842)).
 
 ### Removed
 

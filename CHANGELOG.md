@@ -11,6 +11,14 @@ independently.
 
 ## [Unreleased]
 
+## [1.3.0-rc5] - 2026-08-28
+
+### Changed
+
+- Updated the `zakura-core/libraries` crates to `1.0.0-rc.5`, picking up
+  Orchard/halo2 proving and verification performance improvements
+  ([#839](https://github.com/zakura-core/zakura/pull/839)).
+
 ## [1.3.0-rc4] - 2026-08-27
 
 ### Changed

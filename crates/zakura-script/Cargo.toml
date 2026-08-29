@@ -1,6 +1,6 @@
 [package]
 name = "zakura-script"
-version = "3.2.1-rc2"
+version = "3.2.1-rc5"
 authors.workspace = true
 description = "Zakura script verification wrapping zcashd's zcash_script library. Internal crate, published to support cargo install zakura"
 license.workspace = true

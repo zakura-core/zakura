@@ -11,192 +11,7 @@ independently.
 
 ## [Unreleased]
 
-## [1.3.0-rc5] - 2026-08-28
-
-### Changed
-
-- Updated the `zakura-core/libraries` crates to `1.0.0-rc.5`, picking up
-  Orchard/halo2 proving and verification performance improvements
-  ([#839](https://github.com/zakura-core/zakura/pull/839)).
-
-## [1.3.0-rc4] - 2026-08-27
-
-### Changed
-
-- Zakura now routes transaction-verifier and mempool state reads around the
-  serialized read-write state buffer
-  ([#784](https://github.com/zakura-core/zakura/pull/784)).
-
-### Fixed
-
-- Allowed Windows tools to check out and package `zakura-header-chain`
-  ([#829](https://github.com/zakura-core/zakura/pull/829)).
-- Fixed native sync stalls caused by header retention evicting a full-state fork. The node now
-  completes affected descendant operations and exits if legacy fallback waits 30 minutes for
-  native applies to drain ([#831](https://github.com/zakura-core/zakura/pull/831)).
-- Suppressed node-local watchdog alerts during planned `zakura-compat` restarts
-  ([#835](https://github.com/zakura-core/zakura/pull/835)).
-
-## [1.3.0-rc3] - 2026-08-27
-
-### Added
-
-- Added the `getchaintips` RPC method to `zakurad`
-  ([#796](https://github.com/zakura-core/zakura/pull/796)). Operators no longer
-  have to send the call to the zcashd-compat sidecar, where it scans the whole
-  block index under `cs_main` and stalls every other RPC for seconds. Zakura
-  reads only the chains it holds in memory, so the cost is bounded by the number
-  of tracked forks rather than by the height of the chain.
-
-  The two nodes report different tips. zcashd never prunes its block index, so it
-  lists every stale tip it has ever seen. Zakura lists the tips that are still
-  live: the best chain, the non-finalized forks, recently invalidated branches,
-  and the selected header chain when some block bodies are unavailable. Zakura
-  does not return zcashd's `valid-headers` or `unknown` statuses. `branchlen` for
-  an `invalid` tip can be short, because Zakura tracks a limited number of forks
-  and can drop the chain that the branch forked from.
-
-### Changed
-
-- Reduced non-finalized chain snapshot latency by sharing immutable contextual
-  UTXO maps ([#780](https://github.com/zakura-core/zakura/pull/780)).
-- A commitment-root repair that no connected peer can supply now reports why each peer was
-  excluded and escalates after 60 seconds
-  ([#821](https://github.com/zakura-core/zakura/pull/821)).
-- Updated the `zakura-core/libraries` crates to `1.0.0-rc.4`
-  ([#824](https://github.com/zakura-core/zakura/pull/824)).
-- Sped up Orchard note commitment tree updates during sync by about 2x by
-  evaluating `MerkleCRH^Orchard` with the libraries' new weighted fixed-length
-  Sinsemilla evaluator, for a one-time 3.75 MiB in-memory table
-  ([#824](https://github.com/zakura-core/zakura/pull/824)).
-- Shortened this release's end-of-support window from 40 to 33 days, so
-  Mainnet `zakurad` nodes running it halt at block 3,500,552, estimated
-  2026-09-30 — the day before October 1st. End-of-support warnings begin
-  3 days earlier ([#825](https://github.com/zakura-core/zakura/pull/825)).
-
-### Fixed
-
-- Fixed block sync peer routines panicking when concurrent retry state changes
-  emptied a selected work range. The routine now evaluates retry state once per
-  item, keeps a nonempty contiguous range, and carries the checked retry
-  deadline into its next wait
-  ([#818](https://github.com/zakura-core/zakura/pull/818)).
-- Fixed the legacy block syncer restarting an entire sync round after one transient peer or
-  transport failure. The syncer now retries the affected block hash with a bounded budget and
-  preserves the other download and checkpoint verification tasks. The syncer limits each transient
-  hash to eight peer requests per sync round. A replacement download also stops waiting and
-  restarts the round if the network stays unready past the download timeout
-  ([#819](https://github.com/zakura-core/zakura/pull/819)).
-- Fixed a sync halt when a checkpoint commit needed verified commitment-tree metadata from peers
-  that had advanced past the stalled node. Repair now accepts any peer that can reach the exact
-  height. Serving resolves finalized targets through a reserved one-header path in finalized
-  indexes
-  ([#821](https://github.com/zakura-core/zakura/pull/821)).
-- Fixed commitment-root repair retries that could restart on every missing-root poll, discard
-  scheduler state, penalize the wrong supplier, duplicate local work, or miss connected suppliers.
-  Repair now preserves exact ownership and attribution while it rotates through bounded supplier
-  cycles
-  ([#821](https://github.com/zakura-core/zakura/pull/821)).
-- Fixed authentication-sweep repair masking a blocked checkpoint committer repair. The committer
-  now takes priority until its checkpoint commits, then the sweep resumes
-  ([#821](https://github.com/zakura-core/zakura/pull/821)).
-- Fixed authentication-sweep repair stopping after it rejected a replacement at the same height.
-  Rejection now starts a new repair generation, while repeated missing-root observations remain in
-  the current generation
-  ([#821](https://github.com/zakura-core/zakura/pull/821)).
-- Fixed checkpoint-handoff repair stopping after it rejected roots without a successor witness.
-  Each rejected delivery now starts one deduplicated replacement generation
-  ([#821](https://github.com/zakura-core/zakura/pull/821)).
-- Fixed an indefinite node stall when local preparation or application of commitment-root repair
-  remained pending. The node now exits with an error after 30 minutes so its supervisor can restart
-  it
-  ([#821](https://github.com/zakura-core/zakura/pull/821)).
-- Fixed dual-stack nodes waiting forever to start legacy fallback when native block sync holds an
-  incomplete checkpoint range. Legacy fallback can now supply the missing bodies and resume block
-  verification
-  ([#823](https://github.com/zakura-core/zakura/pull/823)).
-
-## [1.3.0-rc2] - 2026-08-24
-
-### Added
-
-- Mainnet now ships a reviewed historical frontier grid, so a verified-commitment-trees
-  fast-synced archive node serves `z_gettreestate` and the `getblock`/`getblockheader` tree
-  sizes across its absent band with no deployment-time configuration. Serving previously
-  required pointing `state.historical_frontier_artifact` at a grid; that setting remains, now
-  as an override for tests and custom networks. The grid carries no trust weight — every entry
-  is still checked against the authenticated root this node already stores before it anchors
-  anything — but the bytes a build embeds are bound to the committed provenance manifest, so a
-  grid that has fallen out of step with the embedded checkpoint list fails CI rather than
-  leaving the band silently unavailable
-  ([#703](https://github.com/zakura-core/zakura/pull/703),
-  [#739](https://github.com/zakura-core/zakura/pull/739)).
-- Added opt-in historical treestate serving for verified-commitment-tree fast-synced archive nodes.
-  When `state.historical_frontier_artifact` names a sparse frontier grid, the node replays retained
-  block bodies from the nearest root-verified anchor and serves the result only after reproducing
-  its authenticated root. Missing or unusable grids and pruned nodes continue to report the typed
-  historical-tree-unavailable error
-  ([#775](https://github.com/zakura-core/zakura/pull/775)).
-
-### Changed
-
-- The Mainnet release-state bundle now carries the historical frontier grid alongside the
-  checkpoint list, VCT frontier, and completed-subtree roots, and the four are one required
-  set, so a replacement checkpoint list can never ship without its coupled release state.
-  Bundle fetching requires the grid and verifies its digest, the importer requires each update
-  to extend the previously published grid rather than rewrite it, and the provenance manifest
-  records its digest, size, and entry count
-  ([#703](https://github.com/zakura-core/zakura/pull/703),
-  [#735](https://github.com/zakura-core/zakura/pull/735)).
-
-- The grid is distributed as an exact-pinned crates.io package built from
-  `crates/zakura-assets/` rather than committed to this repository. At ~2.1 MB regenerated on
-  every weekly refresh, committing it would add that much to git history each time; the payload
-  is generated at publish time and never enters git. The version is
-  `0.<last_checkpoint>.<revision>`, so the pin states which checkpoint the payload covers, and
-  the release-state workflow publishes the grid before opening the pull request that pins it,
-  because cargo can only resolve a version that already exists.
-  `scripts/check-release-state.sh` holds the pin against the provenance manifest without cargo
-  and now runs on every pull request, while `embedded_mainnet_final_frontiers_parse` hashes the
-  bytes the dependency supplies and holds them against the manifest's recorded digest
-  ([#703](https://github.com/zakura-core/zakura/pull/703),
-  [#763](https://github.com/zakura-core/zakura/pull/763)).
-- Reduced contextual block verification latency by removing redundant UTXO
-  copies ([#779](https://github.com/zakura-core/zakura/pull/779)).
-- The Mainnet release-state asset package is now published as `zakura-assets` rather than
-  `valargroup-zakura-assets`. The prefixed name was a stand-in taken while `zakura-assets` was
-  reserved but unpublishable, and the workspace pin carried a `package` alias to translate
-  between the dependency name and the published one. Both now agree, so the pin, the packer, and
-  the release-state coupling gate all refer to `zakura-assets` and nothing else. Consumers that
-  build `zakura-state` from crates.io resolve the renamed package; the payload, the
-  `0.<last_checkpoint>.<revision>` version scheme, and the digest the provenance manifest binds it
-  to are unchanged
-  ([#793](https://github.com/zakura-core/zakura/pull/793)).
-
-## [1.3.0-rc1] - 2026-08-21
-
-### Fixed
-
-- Fixed a sync halt on nodes running the Zakura header chain. Checkpoint finality
-  evidence is bound to the state version the state writer read, but the combined
-  auxiliary-then-checkpoint path installed the auxiliary transition before it
-  planned finality. The auxiliary transition advanced the version and caused the
-  planner to persist mismatched checkpoint provenance. The combined path now
-  validates and records provenance against the pre-auxiliary snapshot. The
-  combined path returns `Stale` before staging the auxiliary transition when the
-  checkpoint request names an old state version
-  ([#746](https://github.com/zakura-core/zakura/pull/746)).
-- Fixed checkpoint recovery after a hard state commit error. Sibling checkpoint
-  commits could queue late reset requests that rewound the recovered verifier and
-  reopened a permanent block gap. The verifier now coalesces resets by commit
-  generation and ignores late resets from an earlier generation
-  ([#746](https://github.com/zakura-core/zakura/pull/746)).
-- Fixed header-chain startup when a release migrates an older disk format and
-  extends the checkpoint list in the same binary, so nodes can upgrade without
-  a resync
-  ([#765](https://github.com/zakura-core/zakura/pull/765)).
-
-## [1.3.0-rc0] - 2026-08-20
+## [1.3.0] - 2026-08-29
 
 ### Added
 
@@ -231,6 +46,37 @@ independently.
   re-verification ([#600](https://github.com/zakura-core/zakura/pull/600)).
 - Added peer software identifiers (`subver`) and advertised protocol versions
   to the `getpeerinfo` RPC response ([#730](https://github.com/zakura-core/zakura/pull/730)).
+- Mainnet now ships a reviewed historical frontier grid, so a verified-commitment-trees
+  fast-synced archive node serves `z_gettreestate` and the `getblock`/`getblockheader` tree
+  sizes across its absent band with no deployment-time configuration. Serving previously
+  required pointing `state.historical_frontier_artifact` at a grid; that setting remains, now
+  as an override for tests and custom networks. The grid carries no trust weight — every entry
+  is still checked against the authenticated root this node already stores before it anchors
+  anything — but the bytes a build embeds are bound to the committed provenance manifest, so a
+  grid that has fallen out of step with the embedded checkpoint list fails CI rather than
+  leaving the band silently unavailable
+  ([#703](https://github.com/zakura-core/zakura/pull/703),
+  [#739](https://github.com/zakura-core/zakura/pull/739)).
+- Added opt-in historical treestate serving for verified-commitment-tree fast-synced archive nodes.
+  When `state.historical_frontier_artifact` names a sparse frontier grid, the node replays retained
+  block bodies from the nearest root-verified anchor and serves the result only after reproducing
+  its authenticated root. Missing or unusable grids and pruned nodes continue to report the typed
+  historical-tree-unavailable error
+  ([#775](https://github.com/zakura-core/zakura/pull/775)).
+- Added the `getchaintips` RPC method to `zakurad`
+  ([#796](https://github.com/zakura-core/zakura/pull/796)). Operators no longer
+  have to send the call to the zcashd-compat sidecar, where it scans the whole
+  block index under `cs_main` and stalls every other RPC for seconds. Zakura
+  reads only the chains it holds in memory, so the cost is bounded by the number
+  of tracked forks rather than by the height of the chain.
+
+  The two nodes report different tips. zcashd never prunes its block index, so it
+  lists every stale tip it has ever seen. Zakura lists the tips that are still
+  live: the best chain, the non-finalized forks, recently invalidated branches,
+  and the selected header chain when some block bodies are unavailable. Zakura
+  does not return zcashd's `valid-headers` or `unknown` statuses. `branchlen` for
+  an `invalid` tip can be short, because Zakura tracks a limited number of forks
+  and can drop the chain that the branch forked from.
 
 ### Changed
 
@@ -281,6 +127,62 @@ independently.
   cryptography forks, so crate consumers resolve the Zakura implementations
   instead of their upstream equivalents
   ([#749](https://github.com/zakura-core/zakura/pull/749)).
+- The Mainnet release-state bundle now carries the historical frontier grid alongside the
+  checkpoint list, VCT frontier, and completed-subtree roots, and the four are one required
+  set, so a replacement checkpoint list can never ship without its coupled release state.
+  Bundle fetching requires the grid and verifies its digest, the importer requires each update
+  to extend the previously published grid rather than rewrite it, and the provenance manifest
+  records its digest, size, and entry count
+  ([#703](https://github.com/zakura-core/zakura/pull/703),
+  [#735](https://github.com/zakura-core/zakura/pull/735)).
+
+- The grid is distributed as an exact-pinned crates.io package built from
+  `crates/zakura-assets/` rather than committed to this repository. At ~2.1 MB regenerated on
+  every weekly refresh, committing it would add that much to git history each time; the payload
+  is generated at publish time and never enters git. The version is
+  `0.<last_checkpoint>.<revision>`, so the pin states which checkpoint the payload covers, and
+  the release-state workflow publishes the grid before opening the pull request that pins it,
+  because cargo can only resolve a version that already exists.
+  `scripts/check-release-state.sh` holds the pin against the provenance manifest without cargo
+  and now runs on every pull request, while `embedded_mainnet_final_frontiers_parse` hashes the
+  bytes the dependency supplies and holds them against the manifest's recorded digest
+  ([#703](https://github.com/zakura-core/zakura/pull/703),
+  [#763](https://github.com/zakura-core/zakura/pull/763)).
+- Reduced contextual block verification latency by removing redundant UTXO
+  copies ([#779](https://github.com/zakura-core/zakura/pull/779)).
+- The Mainnet release-state asset package is now published as `zakura-assets` rather than
+  `valargroup-zakura-assets`. The prefixed name was a stand-in taken while `zakura-assets` was
+  reserved but unpublishable, and the workspace pin carried a `package` alias to translate
+  between the dependency name and the published one. Both now agree, so the pin, the packer, and
+  the release-state coupling gate all refer to `zakura-assets` and nothing else. Consumers that
+  build `zakura-state` from crates.io resolve the renamed package; the payload, the
+  `0.<last_checkpoint>.<revision>` version scheme, and the digest the provenance manifest binds it
+  to are unchanged
+  ([#793](https://github.com/zakura-core/zakura/pull/793)).
+- Reduced non-finalized chain snapshot latency by sharing immutable contextual
+  UTXO maps ([#780](https://github.com/zakura-core/zakura/pull/780)).
+- A commitment-root repair that no connected peer can supply now reports why each peer was
+  excluded and escalates after 60 seconds
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Updated the `zakura-core/libraries` crates to `1.0.0-rc.4`
+  ([#824](https://github.com/zakura-core/zakura/pull/824)).
+- Sped up Orchard note commitment tree updates during sync by about 2x by
+  evaluating `MerkleCRH^Orchard` with the libraries' new weighted fixed-length
+  Sinsemilla evaluator, for a one-time 3.75 MiB in-memory table
+  ([#824](https://github.com/zakura-core/zakura/pull/824)).
+- Shortened this release's end-of-support window from 40 to 33 days, so
+  Mainnet `zakurad` nodes running it halt at block 3,500,552, estimated
+  2026-09-30 — the day before October 1st. End-of-support warnings begin
+  3 days earlier ([#825](https://github.com/zakura-core/zakura/pull/825)).
+- Zakura now routes transaction-verifier and mempool state reads around the
+  serialized read-write state buffer
+  ([#784](https://github.com/zakura-core/zakura/pull/784)).
+- Updated the `zakura-core/libraries` crates to `1.0.0-rc.5`, picking up
+  Orchard/halo2 proving and verification performance improvements
+  ([#839](https://github.com/zakura-core/zakura/pull/839)).
+- Updated the `zakura-core/libraries` crates from `1.0.0-rc.5` to the final
+  `1.0.0` release
+  ([#842](https://github.com/zakura-core/zakura/pull/842)).
 
 ### Removed
 
@@ -409,6 +311,70 @@ independently.
   ([#736](https://github.com/zakura-core/zakura/pull/736)).
 - Backed off repeated bootstrap dials when a peer closes short-lived Zakura
   connections ([#741](https://github.com/zakura-core/zakura/pull/741)).
+- Fixed a sync halt on nodes running the Zakura header chain. Checkpoint finality
+  evidence is bound to the state version the state writer read, but the combined
+  auxiliary-then-checkpoint path installed the auxiliary transition before it
+  planned finality. The auxiliary transition advanced the version and caused the
+  planner to persist mismatched checkpoint provenance. The combined path now
+  validates and records provenance against the pre-auxiliary snapshot. The
+  combined path returns `Stale` before staging the auxiliary transition when the
+  checkpoint request names an old state version
+  ([#746](https://github.com/zakura-core/zakura/pull/746)).
+- Fixed checkpoint recovery after a hard state commit error. Sibling checkpoint
+  commits could queue late reset requests that rewound the recovered verifier and
+  reopened a permanent block gap. The verifier now coalesces resets by commit
+  generation and ignores late resets from an earlier generation
+  ([#746](https://github.com/zakura-core/zakura/pull/746)).
+- Fixed header-chain startup when a release migrates an older disk format and
+  extends the checkpoint list in the same binary, so nodes can upgrade without
+  a resync
+  ([#765](https://github.com/zakura-core/zakura/pull/765)).
+- Fixed block sync peer routines panicking when concurrent retry state changes
+  emptied a selected work range. The routine now evaluates retry state once per
+  item, keeps a nonempty contiguous range, and carries the checked retry
+  deadline into its next wait
+  ([#818](https://github.com/zakura-core/zakura/pull/818)).
+- Fixed the legacy block syncer restarting an entire sync round after one transient peer or
+  transport failure. The syncer now retries the affected block hash with a bounded budget and
+  preserves the other download and checkpoint verification tasks. The syncer limits each transient
+  hash to eight peer requests per sync round. A replacement download also stops waiting and
+  restarts the round if the network stays unready past the download timeout
+  ([#819](https://github.com/zakura-core/zakura/pull/819)).
+- Fixed a sync halt when a checkpoint commit needed verified commitment-tree metadata from peers
+  that had advanced past the stalled node. Repair now accepts any peer that can reach the exact
+  height. Serving resolves finalized targets through a reserved one-header path in finalized
+  indexes
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Fixed commitment-root repair retries that could restart on every missing-root poll, discard
+  scheduler state, penalize the wrong supplier, duplicate local work, or miss connected suppliers.
+  Repair now preserves exact ownership and attribution while it rotates through bounded supplier
+  cycles
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Fixed authentication-sweep repair masking a blocked checkpoint committer repair. The committer
+  now takes priority until its checkpoint commits, then the sweep resumes
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Fixed authentication-sweep repair stopping after it rejected a replacement at the same height.
+  Rejection now starts a new repair generation, while repeated missing-root observations remain in
+  the current generation
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Fixed checkpoint-handoff repair stopping after it rejected roots without a successor witness.
+  Each rejected delivery now starts one deduplicated replacement generation
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Fixed an indefinite node stall when local preparation or application of commitment-root repair
+  remained pending. The node now exits with an error after 30 minutes so its supervisor can restart
+  it
+  ([#821](https://github.com/zakura-core/zakura/pull/821)).
+- Fixed dual-stack nodes waiting forever to start legacy fallback when native block sync holds an
+  incomplete checkpoint range. Legacy fallback can now supply the missing bodies and resume block
+  verification
+  ([#823](https://github.com/zakura-core/zakura/pull/823)).
+- Allowed Windows tools to check out and package `zakura-header-chain`
+  ([#829](https://github.com/zakura-core/zakura/pull/829)).
+- Fixed native sync stalls caused by header retention evicting a full-state fork. The node now
+  completes affected descendant operations and exits if legacy fallback waits 30 minutes for
+  native applies to drain ([#831](https://github.com/zakura-core/zakura/pull/831)).
+- Suppressed node-local watchdog alerts during planned `zakura-compat` restarts
+  ([#835](https://github.com/zakura-core/zakura/pull/835)).
 
 ### Security
 

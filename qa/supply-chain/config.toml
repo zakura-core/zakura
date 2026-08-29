@@ -73,7 +73,7 @@ audit-as-crates-io = false
 [[exemptions.addchain]]
 version = "0.3.0"
 criteria = "safe-to-deploy"
-notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+notes = "Introduced by the Zakura Common fork migration; retain this exact-version exemption pending dedicated review."
 
 [[exemptions.addr2line]]
 version = "0.21.0"
@@ -130,12 +130,12 @@ notes = "Audit deferred: the safe single-sink wrappers preserve the documented e
 [[exemptions.ff]]
 version = "0.14.0"
 criteria = "safe-to-deploy"
-notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+notes = "Introduced by the Zakura Common fork migration; retain this exact-version exemption pending dedicated review."
 
 [[exemptions.ff_derive]]
 version = "0.14.0"
 criteria = "safe-to-deploy"
-notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+notes = "Introduced by the Zakura Common fork migration; retain this exact-version exemption pending dedicated review."
 
 [[exemptions.fixedbitset]]
 version = "0.5.7"
@@ -151,7 +151,7 @@ notes = "Audit hold: recursive directory enumeration follows directory symlinks,
 [[exemptions.group]]
 version = "0.14.0"
 criteria = "safe-to-deploy"
-notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+notes = "Introduced by the Zakura Common fork migration; retain this exact-version exemption pending dedicated review."
 
 [[exemptions.h2]]
 version = "0.4.16"
@@ -269,7 +269,7 @@ notes = "Audit hold: the UEFI protocol tables expose firmware operations that ac
 [[exemptions.rand_chacha]]
 version = "0.10.0"
 criteria = "safe-to-deploy"
-notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+notes = "Introduced by the Zakura Common fork migration; retain this exact-version exemption pending dedicated review."
 
 [[exemptions.redox_users]]
 version = "0.4.5"

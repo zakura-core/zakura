@@ -124,7 +124,7 @@ independently.
   protocol or user configuration
   ([#707](https://github.com/zakura-core/zakura/pull/707)).
 - Changed the published dependency graph to use the coordinated Zakura
-  cryptography forks, so crate consumers resolve the Zakura implementations
+  Common forks, so crate consumers resolve the Zakura implementations
   instead of their upstream equivalents
   ([#749](https://github.com/zakura-core/zakura/pull/749)).
 - The Mainnet release-state bundle now carries the historical frontier grid alongside the
@@ -164,14 +164,15 @@ independently.
 - A commitment-root repair that no connected peer can supply now reports why each peer was
   excluded and escalates after 60 seconds
   ([#821](https://github.com/zakura-core/zakura/pull/821)).
-- Updated the `zakura-core/libraries` crates to their final `1.0.0` release,
+- Updated the `zakura-core/common` crates to their final `1.0.0` release,
   picking up Orchard/halo2 proving and verification performance improvements
   ([#824](https://github.com/zakura-core/zakura/pull/824),
   [#839](https://github.com/zakura-core/zakura/pull/839),
   [#842](https://github.com/zakura-core/zakura/pull/842)).
 - Sped up Orchard note commitment tree updates during sync by about 2x by
-  evaluating `MerkleCRH^Orchard` with the libraries' new weighted fixed-length
-  Sinsemilla evaluator, for a one-time 3.75 MiB in-memory table
+  evaluating `MerkleCRH^Orchard` with the Zakura Common libraries' new
+  weighted fixed-length Sinsemilla evaluator, for a one-time 3.75 MiB
+  in-memory table
   ([#824](https://github.com/zakura-core/zakura/pull/824)).
 - Shortened this release's end-of-support window from 40 to 31 days, so
   Mainnet `zakurad` nodes running it halt at block 3,501,339, estimated

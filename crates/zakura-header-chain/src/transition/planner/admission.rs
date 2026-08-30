@@ -1,6 +1,6 @@
 //! Bounded admission, authentication, and header-insertion rebasing.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use zakura_chain::block;
 
@@ -155,6 +155,16 @@ fn validate_event_resource_bounds(
     }
     if insert.aux.len() > limits.max_aux_deliveries_total.get() {
         return Err(TransitionFailure::AuxiliaryLimitExceeded);
+    }
+    let mut deliveries_by_header = HashMap::<block::Hash, HashSet<crate::EvidenceId>>::new();
+    for delivery in &insert.aux {
+        let delivery_ids = deliveries_by_header
+            .entry(delivery.header_hash)
+            .or_default();
+        delivery_ids.insert(delivery.delivery_id);
+        if delivery_ids.len() > limits.max_aux_deliveries_per_header.get() {
+            return Err(TransitionFailure::AuxiliaryLimitExceeded);
+        }
     }
     Ok(())
 }

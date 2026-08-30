@@ -60,9 +60,6 @@ alias = "temp-zakura-sync-test-1"
 public_ip = "138.68.43.212"
 mode_label = "dual-stack"
 p2p_stack = "dual"
-# Give the node time to complete its 600-second legacy-fallback handoff after
-# the controller observes an unresolved local header backlog.
-stall_seconds = 1800
 
 [[nodes]]
 name = "temp-zakura-sync-test-2"

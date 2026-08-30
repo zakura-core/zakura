@@ -167,14 +167,21 @@ class SyncProgress:
             self.status_unavailable_since = None
             return progressed, None
 
-        if evidence in ("legacy_height_only", "legacy_fallback"):
+        if evidence == "legacy_fallback":
+            self.backlog_since = None
+            self.status_unavailable_since = None
+            return progressed, (
+                f"Zakura block sync handed off to legacy fallback at committed height "
+                f"{self.last_height}; {detail}"
+            )
+
+        if evidence == "legacy_height_only":
             self.backlog_since = None
             self.status_unavailable_since = None
             stalled_for = observed_at - self.last_progress_at
             if self.last_height is not None and stalled_for >= policy.stall_seconds:
-                mode = "legacy fallback" if evidence == "legacy_fallback" else "legacy"
                 return progressed, (
-                    f"{mode} committed height {self.last_height} has not progressed for "
+                    f"legacy committed height {self.last_height} has not progressed for "
                     f"{stalled_for}s (threshold {policy.stall_seconds}s)"
                 )
             return progressed, None

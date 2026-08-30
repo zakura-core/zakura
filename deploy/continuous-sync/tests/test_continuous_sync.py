@@ -158,8 +158,20 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertEqual(sample["stall_evidence"], "no_local_header_backlog")
         self.assertIsNone(progress.status_unavailable_since)
 
-    def test_active_legacy_fallback_uses_committed_progress(self):
-        policy = sync.Policy(p2p_stack="dual", stall_seconds=1800)
+    def test_active_legacy_fallback_stops_the_run_immediately(self):
+        policy = sync.Policy(p2p_stack="dual", stall_seconds=600)
+        progress = sync.SyncProgress(started_at=100)
+        sample = exact_sync_sample(42, 45)
+        sample[sync.LEGACY_FALLBACK_ACTIVE_METRIC] = 1
+
+        progressed, failure = progress.observe(sample, policy, 100)
+
+        self.assertTrue(progressed)
+        self.assertEqual(sample["stall_evidence"], "legacy_fallback")
+        self.assertIn("handed off to legacy fallback at committed height 42", failure)
+
+    def test_legacy_fallback_stops_the_run_even_while_committed_height_advances(self):
+        policy = sync.Policy(p2p_stack="dual", stall_seconds=600)
         progress = sync.SyncProgress(started_at=100)
 
         def fallback_sample(committed_height: int) -> dict[str, object]:
@@ -167,13 +179,9 @@ class ContinuousSyncTests(unittest.TestCase):
             sample[sync.LEGACY_FALLBACK_ACTIVE_METRIC] = 1
             return sample
 
-        self.assertEqual(progress.observe(fallback_sample(42), policy, 100), (True, None))
-        self.assertEqual(progress.observe(fallback_sample(43), policy, 700), (True, None))
-        self.assertEqual(progress.observe(fallback_sample(43), policy, 2499), (False, None))
-        _, failure = progress.observe(fallback_sample(43), policy, 2500)
+        _, failure = progress.observe(fallback_sample(43), policy, 700)
 
-        self.assertIn("legacy fallback committed height 43", failure)
-        self.assertIn("for 1800s", failure)
+        self.assertIn("handed off to legacy fallback", failure)
 
     def test_continuous_local_header_backlog_reaches_stall_deadline(self):
         policy = sync.Policy(p2p_stack="zakura", stall_seconds=600)
@@ -456,15 +464,18 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertIn("down_confirmation_samples = 2", rendered["alert-monitor.toml"])
         self.assertIn("zakura.service", rendered)
 
-    def test_deploy_gives_dual_stack_fallback_time_after_backlog_detection(self):
+    def test_deploy_keeps_the_dual_stack_stall_deadline_at_the_fleet_default(self):
         nodes = deploy.load_nodes(
             ROOT / "deploy" / "continuous-sync" / "nodes.toml",
             ["temp-zakura-sync-test-1"],
         )
         rendered = deploy.render_files(nodes[0])
 
+        # The deadline deliberately matches the node's own 600-second fallback
+        # threshold: PR #732 established that catching a v2 stall before legacy
+        # takes over is the point of this canary.
         self.assertIn('p2p_stack = "dual"', rendered["zakurad.toml.template"])
-        self.assertIn("stall_seconds = 1800", rendered["controller.toml"])
+        self.assertIn("stall_seconds = 600", rendered["controller.toml"])
 
     def test_deploy_renders_expanded_legacy_alert_inventory(self):
         nodes = deploy.load_nodes(

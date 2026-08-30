@@ -47,10 +47,11 @@ interval does not start the stall deadline. A higher header height starts the
 deadline because the node has a local backlog that it can process. New
 committed progress restarts the deadline.
 
-While legacy fallback owns block sync, the controller uses exact committed
-progress instead of the Zakura header height. This policy gives fallback its
-configured recovery window even when the selected Zakura header branch does not
-move with the committed chain.
+A dual-stack node that hands block sync to legacy fallback stops the run
+immediately, naming the handoff as the reason. The canary exists to catch v2
+stalls before legacy masks them, so an active fallback is the failure it is
+looking for, not a recovery window to wait out. Measuring legacy progress after
+the handoff would report a healthy node while the v2 stack stayed stalled.
 
 The controller records a metrics error or missing exact height as unavailable
 status evidence. It does not classify that sample as a sync stall. Continuous

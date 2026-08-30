@@ -84,6 +84,20 @@ becomes available. The existing bounded application and QUIC queues then apply f
 peer. This may delay later messages on the same ordered stream, but it does not block another peer
 or service stream.
 
+A one-shot reservation has this lifecycle:
+
+```mermaid
+sequenceDiagram
+    participant R as Requester
+    participant P as Responder
+    R->>R: Create local reservation
+    R->>P: Request
+    Note over R: Work may be reassigned<br/>Reservation remains live
+    P->>R: Response
+    R->>R: Match and consume reservation
+    R->>R: Run handler
+```
+
 Header sync demonstrates every message role:
 
 | Message | Role | Filters | Result when a filter stops it |
@@ -114,25 +128,35 @@ cursor. Locators and acknowledgements authorize work; they do not prove applicat
 work budgets bound dishonest claims, while peer-set policy handles peers that make no useful
 progress.
 
+A subscription renews the reservation and drains in-flight responses before it closes:
+
 ```mermaid
 sequenceDiagram
-    participant S as Scheduler
-    participant R as Peer routine
-    participant P as Peer
-    P->>R: Status for target
-    R->>S: offer target
-    S->>R: select target and credit
-    R->>R: open subscription
-    R->>P: SubscribeHeaders open
-    P->>R: Headers page
-    R->>R: consume credit<br/>decode and verify
-    R->>S: accepted page
-    S->>R: acknowledge cursor<br/>grant more credit
-    R->>R: add credit before send
-    R->>P: SubscribeHeaders grant
-    P->>P: selected chain extends
-    P->>R: Headers push
-    R->>R: consume credit<br/>decode and verify
+    participant S as Subscriber
+    participant P as Publisher
+    S->>S: Create local reservation and add credit
+    S->>P: Open with credit
+    P->>P: Validate open and record credit
+    loop For each authorized response
+        P->>P: Consume send credit
+        P->>S: Response
+        S->>S: Consume local credit and run handler
+        opt Renew from accepted progress
+            S->>S: Add credit locally
+            S->>P: Acknowledge and grant credit
+            P->>P: Validate update and add credit
+        end
+    end
+    opt Close
+        S->>P: Close
+        P->>P: Stop new responses
+        opt A response is already queued
+            P-->>S: Response
+            S->>S: Consume existing credit and run handler
+        end
+        P->>S: Terminal response
+        S->>S: Close local reservation
+    end
 ```
 
 Block sync currently destroys reservations when it retires work. Its unmatched-response exceptions

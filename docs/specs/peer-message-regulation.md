@@ -58,24 +58,21 @@ split into a precheck and an exact match. The precheck MUST establish decode bou
 allocation. The exact match MUST run before Verify. A fixed-prefix read used by either step MUST NOT
 allocate from a peer-declared value.
 
-### Requirements common to every filter
+### Common requirements
 
-1. Every message type MUST have one declaration and one handler. Every handler MUST have one
-   declaration.
-2. Every declaration MUST select exactly one role and one work bound.
-3. Every filter MUST limit its state for each peer to a receiver-configured capacity.
-4. Peer-provided messages, keys, and counts MAY consume that capacity but MUST NOT increase it. The
-   filter MUST define its behavior when a container reaches capacity.
-5. Every enforced inbound rule MUST have a matching outbound obligation.
-6. Local scheduling, finality, reorganization, and work reassignment MUST NOT produce a peer
-   violation.
-7. Every non-`Continue` result MUST emit the service, message type, filter, direction, peer, key,
-   result, and reason to `regulation.jsonl`. A full-trace mode SHOULD emit `Continue` results.
-   The implementation MUST rotate `regulation.jsonl` and bound its total size.
-8. Each peer MUST have an independent processing path. Admitted work from one peer MUST NOT starve
+1. Each message type MUST have exactly one declaration and one handler. Each handler MUST have a
+   declaration. Each declaration MUST select exactly one role and one work bound.
+2. Each filter MUST cap its per-peer state at a receiver-configured capacity. Peer-provided
+   messages, keys, and counts MAY consume that capacity but MUST NOT increase it. The filter MUST
+   define its behavior at capacity. The receiver MUST size each capacity so its aggregate across the
+   maximum peer count fits the corresponding resource budget.
+3. Every enforced inbound rule MUST have a matching outbound obligation. Local scheduling,
+   finality, reorganization, and work reassignment MUST NOT produce a peer violation.
+4. Every non-`Continue` result MUST record the service, message type, filter, direction, peer, key,
+   result, and reason in `regulation.jsonl`. A full-trace mode SHOULD also record `Continue` results.
+   The implementation MUST rotate the file and bound its total size.
+5. Each peer MUST have an independent processing path. Admitted work from one peer MUST NOT starve
    another peer's path.
-9. The receiver MUST size every per-peer bound so that the bound multiplied by the maximum peer
-   count fits its resource budget.
 
 This specification bounds complete messages. The transport MUST bound the time a frame may remain
 incomplete. The stream layout specification states that bound.
@@ -134,33 +131,35 @@ Verify performs checks that need no chain state or mutable service state.
 
 ### Reservation
 
-A reservation authorizes one protocol exchange independently of the scheduler's current interest
-in the work.
+A reservation is the requester's local authorization for an expected response. It keeps that
+response admissible even when the scheduler no longer wants the work.
 
-- The requester MUST create a reservation before sending a request. The reservation MUST capture
-  its work scope and record the peer, response kind, correlation identity, decode bounds, and
-  expected object identity.
+- The requester MUST create the reservation before sending the request. The reservation MUST
+  identify and bound the authorized response.
 - Each response MUST match and consume one live reservation or one unconsumed part of a bounded
   range reservation. A missing, duplicate, or mismatched reservation MUST return `Disconnect`.
-- A reservation MUST remain live until the complete response arrives or the connection ends. A
-  local work deadline MAY reassign the work but MUST NOT change the reservation.
-- A protocol deadline MAY close a connection that produces no terminal response. It MUST remain
-  separate from every work deadline.
+- A local work deadline MAY reassign the work. It MUST NOT change or remove the reservation. A
+  separate protocol deadline MAY close a connection that produces no terminal response. The
+  reservation MUST remain live until the exchange completes or the connection ends.
 - Reservation state MUST remain within the requester's inflight limit.
 
-A subscription adds renewable object and byte credit to a reservation.
+A subscription turns one request into a bounded response stream. The publisher can push follow-on
+work without a new request for each response. The subscriber controls the stream with object and
+byte credit. Each response spends that credit. An acknowledgement advances the accepted cursor. A
+later grant renews the credit from that cursor. Closing the subscription stops future responses.
+The subscriber still admits responses that it already authorized.
 
-- The subscriber MUST add credit to its reservation before sending the corresponding update.
-- Every response MUST consume its object and byte credit before the handler starts.
+- The subscriber MUST add each credit grant to its local reservation before sending the update that
+  carries the grant. Each response MUST consume its object and byte credit before the subscriber's
+  handler starts.
 - The subscriber MUST acknowledge only progress accepted by its handler. The publisher MUST retain
-  bounded acknowledgement state and validate each acknowledgement and update sequence before adding
-  credit.
-- A close update MUST stop new responses. The reservation MUST remain live until every sent response
-  and the terminal response arrive.
-- A subscriber that stops wanting the work MUST stop granting credit and MAY close the
-  subscription. It MUST NOT revoke existing credit.
-- A protocol deadline MAY cover initial catch-up or close. It MUST NOT require a terminal response
-  while no push obligation is outstanding.
+  bounded sent-response state. It MUST validate each update sequence and acknowledgement against
+  that state before it applies added credit.
+- A subscriber that stops wanting the work MUST stop granting credit. It MAY close the subscription.
+  It MUST NOT revoke existing credit. After a close update, the publisher MUST stop producing new
+  responses. The subscriber MUST keep its local reservation live through the terminal response.
+- A protocol deadline MAY cover required initial progress or close completion. An idle subscription
+  with no push obligation MUST NOT require a terminal response.
 
 A matched response MUST reach its handler despite work reassignment, a competing response, or a
 change in local interest. The receiver MAY stop issuing requests or granting credit for future work.
@@ -212,36 +211,35 @@ Cadence {
 
 ### Work
 
-Work uses one token bucket and one concurrency bound per `(peer, request_type)`.
+Work bounds how much response work one peer can start. Each `(peer, request_type)` has one token
+bucket and one concurrency bound. The token bucket grants response bandwidth. The concurrency bound
+caps active requests. Work reserves the worst-case charge before dispatch and later refunds unused
+charge.
 
 ```text
 charge = upper_bound_response_bytes + REQUEST_OVERHEAD
 refund = charge - actual_response_bytes
 ```
 
-- `REQUEST_OVERHEAD` MUST equal 64 KiB.
-- Work SHOULD refund unused response bytes after the terminal response is queued. It MUST refund
-  unused charge after `LocalFault`.
-- The bucket capacity MUST be at least the largest request that the receiver accepts.
-- The refill MUST state the per-peer response bandwidth that the receiver grants.
-- After every preceding filter passes, Work MUST acquire one concurrency slot and charge the upper
-  bound immediately before the handler starts. The request MUST hold that slot until its terminal
-  response is queued, `LocalFault` occurs, or the connection ends. A subscription update releases
-  its slot when the handler atomically commits the update.
-- Work MUST return `Disconnect` when a request exceeds the declared concurrency bound.
-- When Work is unavailable, the peer routine MUST retain the current request at the admission
-  boundary without dispatching its handler. It MUST return `Delay` for tracing and stop reading
-  further frames from that peer's ordered stream until the Work budget allows dispatch.
-- `Delay` MUST use the existing bounded application and QUIC queues for backpressure. It MUST NOT
-  create a separate delayed-request queue or scheduler. Every application and transport buffer
-  MUST fit within the declared per-peer resource bound.
-- A delayed request MUST hold no shared lock, stream writer, or handler permit. Backpressure on one
-  peer's stream MUST NOT block another peer or service stream. Later messages on the same ordered
-  stream MAY wait behind the delayed request.
-- A Work refund or refill MUST wake the peer routine when the request can proceed. The peer routine
-  MUST NOT rerun preceding filters or charge the request more than once.
-- The sender MUST respect the advertised concurrency and inflight limits. The protocol-specific
-  outbound obligation MUST keep its request rate within the service capacity.
+- `REQUEST_OVERHEAD` MUST equal 64 KiB. The bucket capacity MUST cover the largest accepted request.
+  Its refill MUST state the granted per-peer response bandwidth.
+- Work MUST run after every other selected filter. Immediately before the handler starts, it MUST
+  acquire one concurrency slot and apply the computed charge once. The request MUST hold the slot
+  until its terminal response is queued, `LocalFault` occurs, or the connection ends. A subscription
+  update releases its slot when the handler atomically commits the update. Work SHOULD apply the
+  computed refund after the terminal response is queued. It MUST refund unused charge after
+  `LocalFault`.
+- Work MUST return `Disconnect` when a request exceeds the concurrency bound. The sender MUST stay
+  within the advertised concurrency and inflight limits. Its request rate MUST stay within the
+  protocol's service capacity.
+- When Work is unavailable, the peer routine MUST return `Delay` and leave the request at the
+  admission boundary. It MUST stop reading that peer's ordered stream until Work becomes available.
+  The existing bounded application and QUIC queues MUST provide backpressure. The implementation
+  MUST NOT add a delayed-request queue or scheduler.
+- A delayed request MUST hold no shared lock, stream writer, or handler permit. All buffering MUST
+  fit the per-peer resource bound. The delay MUST NOT block another peer or service stream. Later
+  messages on the same ordered stream MAY wait. A refund or refill MUST wake the peer routine. The
+  peer routine MUST NOT rerun preceding filters or charge the request again.
 
 ## Message declarations
 
@@ -482,17 +480,17 @@ the sender retains headers.
 `Open` MUST carry `1..=13` unique locator hashes. Its acknowledged cursor MUST equal the first
 locator. Its acknowledged header and byte counts MUST equal zero. It MUST add nonzero header and byte
 credit. The byte credit MUST fit the fixed response fields and one entry under the selected schema.
-The subscriber MUST select the target from a relevant `Status`. It MUST create the inbound
+The subscriber MUST select the target from a relevant `Status`. It MUST create the local
 subscription reservation before it sends `Open`.
 
 `Grant` MUST carry no locator hashes. It MUST acknowledge a cursor accepted from this subscription.
-It MUST add nonzero header or byte credit. The subscriber MUST add the credit to its inbound
-reservation before it sends `Grant`. Until the subscription reaches its initial target, the
-resulting header and byte credit MUST fit at least one legal nonempty page. A smaller grant stalls
-the subscription: the publisher cannot legally send a page, and the subscriber waits for one. After
-the subscription reaches its target the publisher may have nothing to send, so the subscriber need
-not hold credit for a full page. The subscriber SHOULD keep header and byte
-credit for at least one page outstanding on a live subscription.
+It MUST add nonzero header or byte credit. The subscriber MUST add the credit to its local
+subscription reservation before it sends `Grant`. Until the subscription reaches its initial
+target, the resulting header and byte credit MUST fit at least one legal nonempty page. A smaller
+grant stalls the subscription: the publisher cannot legally send a page, and the subscriber waits
+for one. After the subscription reaches its target, the publisher may have nothing to send. The
+subscriber does not need to hold credit for a full page in that state. The subscriber SHOULD keep
+header and byte credit for at least one page outstanding on a live subscription.
 
 `Close` MUST carry no locator hashes or added credit. The publisher MUST stop producing new pages
 when it receives `Close`. It MUST send `HeadersOutcome(SubscriptionClosed)` after every page already

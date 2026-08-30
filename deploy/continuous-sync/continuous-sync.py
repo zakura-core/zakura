@@ -41,6 +41,8 @@ HEADER_HEIGHT_METRICS = (
     "sync.block.best_header_tip.height",
 )
 
+LEGACY_FALLBACK_ACTIVE_METRIC = "sync.zakura.legacy_fallback.active"
+
 DIAGNOSTIC_METRICS = (
     "state_finalized_block_height",
     "state_checkpoint_finalized_block_height",
@@ -160,18 +162,19 @@ class SyncProgress:
                 )
             return progressed, None
 
-        if evidence == "caught_up":
+        if evidence == "no_local_header_backlog":
             self.backlog_since = None
             self.status_unavailable_since = None
             return progressed, None
 
-        if evidence == "legacy_height_only":
+        if evidence in ("legacy_height_only", "legacy_fallback"):
             self.backlog_since = None
             self.status_unavailable_since = None
             stalled_for = observed_at - self.last_progress_at
             if self.last_height is not None and stalled_for >= policy.stall_seconds:
+                mode = "legacy fallback" if evidence == "legacy_fallback" else "legacy"
                 return progressed, (
-                    f"legacy committed height {self.last_height} has not progressed for "
+                    f"{mode} committed height {self.last_height} has not progressed for "
                     f"{stalled_for}s (threshold {policy.stall_seconds}s)"
                 )
             return progressed, None
@@ -574,16 +577,23 @@ def classify_sync_evidence(sample: dict[str, Any], p2p_stack: str) -> tuple[str,
     if p2p_stack in ("legacy", "zebra"):
         return "legacy_height_only", "Zakura header state is disabled"
 
+    if sample.get(LEGACY_FALLBACK_ACTIVE_METRIC) == 1:
+        return "legacy_fallback", "legacy fallback is the active block-sync driver"
+
     header_height = sample.get("header_height")
     if not isinstance(header_height, int):
         return "unknown", "authoritative local header height is missing"
     if header_height < committed_height:
         return (
-            "unknown",
-            f"local header height {header_height} is below committed height {committed_height}",
+            "no_local_header_backlog",
+            f"local header height {header_height} has no backlog above committed height "
+            f"{committed_height}",
         )
     if header_height == committed_height:
-        return "caught_up", f"local header height equals committed height {committed_height}"
+        return (
+            "no_local_header_backlog",
+            f"local header height equals committed height {committed_height}",
+        )
     return (
         "local_header_backlog",
         f"local header height {header_height} is ahead of committed height {committed_height}",
@@ -595,7 +605,12 @@ def sample_status(config: Config) -> dict[str, Any]:
     try:
         metrics = fetch_text(config.policy.metrics_url)
         status["metrics_status"] = "ok"
-        for key in (*COMMITTED_HEIGHT_METRICS, *HEADER_HEIGHT_METRICS, *DIAGNOSTIC_METRICS):
+        for key in (
+            *COMMITTED_HEIGHT_METRICS,
+            *HEADER_HEIGHT_METRICS,
+            LEGACY_FALLBACK_ACTIVE_METRIC,
+            *DIAGNOSTIC_METRICS,
+        ):
             value = metric_value(metrics, key)
             if value is not None:
                 status[key] = int(value)

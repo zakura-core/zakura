@@ -41,10 +41,16 @@ continuous sync canary, not a once-per-SHA CI job.
 
 For Zakura and dual-stack nodes, the controller distinguishes an idle chain from
 a stalled node. It compares the exact committed block height with the exact
-local header-chain height. Equal heights mean that the node has no known work,
-so a long Mainnet block interval does not start the stall deadline. A higher
-header height starts the deadline because the node has a local backlog that it
-can process. New committed progress restarts the deadline.
+local header-chain height. A header height at or below the committed height
+means that the node has no local header backlog, so a long Mainnet block
+interval does not start the stall deadline. A higher header height starts the
+deadline because the node has a local backlog that it can process. New
+committed progress restarts the deadline.
+
+While legacy fallback owns block sync, the controller uses exact committed
+progress instead of the Zakura header height. This policy gives fallback its
+configured recovery window even when the selected Zakura header branch does not
+move with the committed chain.
 
 The controller records a metrics error or missing exact height as unavailable
 status evidence. It does not classify that sample as a sync stall. Continuous

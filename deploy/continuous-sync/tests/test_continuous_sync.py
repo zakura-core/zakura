@@ -78,6 +78,7 @@ class ContinuousSyncTests(unittest.TestCase):
             [
                 "state_memory_best_committed_block_height 42",
                 "sync_header_chain_frontier_header_best_height 45",
+                "sync_zakura_legacy_fallback_active 1",
                 "sync_estimated_network_tip_height 1000",
                 "sync_estimated_distance_to_tip 100",
             ]
@@ -102,6 +103,8 @@ class ContinuousSyncTests(unittest.TestCase):
             "sync.header_chain.frontier.header_best_height",
         )
         self.assertEqual(status["height"], 42)
+        self.assertEqual(status["sync.zakura.legacy_fallback.active"], 1)
+        self.assertEqual(status["stall_evidence"], "legacy_fallback")
 
     def test_sample_status_classifies_metrics_timeout_as_unknown(self):
         config = make_config(Path("/tmp"))
@@ -142,8 +145,35 @@ class ContinuousSyncTests(unittest.TestCase):
 
         self.assertEqual(progress.observe(sample, policy, 100), (True, None))
         self.assertEqual(progress.observe(sample, policy, 701), (False, None))
-        self.assertEqual(sample["stall_evidence"], "caught_up")
+        self.assertEqual(sample["stall_evidence"], "no_local_header_backlog")
         self.assertIsNone(progress.backlog_since)
+
+    def test_committed_height_above_header_height_has_no_local_backlog(self):
+        policy = sync.Policy(p2p_stack="zakura", status_unavailable_seconds=600)
+        progress = sync.SyncProgress(started_at=100)
+        sample = exact_sync_sample(45, 42)
+
+        self.assertEqual(progress.observe(sample, policy, 100), (True, None))
+        self.assertEqual(progress.observe(sample, policy, 701), (False, None))
+        self.assertEqual(sample["stall_evidence"], "no_local_header_backlog")
+        self.assertIsNone(progress.status_unavailable_since)
+
+    def test_active_legacy_fallback_uses_committed_progress(self):
+        policy = sync.Policy(p2p_stack="dual", stall_seconds=1800)
+        progress = sync.SyncProgress(started_at=100)
+
+        def fallback_sample(committed_height: int) -> dict[str, object]:
+            sample = exact_sync_sample(committed_height, 45)
+            sample[sync.LEGACY_FALLBACK_ACTIVE_METRIC] = 1
+            return sample
+
+        self.assertEqual(progress.observe(fallback_sample(42), policy, 100), (True, None))
+        self.assertEqual(progress.observe(fallback_sample(43), policy, 700), (True, None))
+        self.assertEqual(progress.observe(fallback_sample(43), policy, 2499), (False, None))
+        _, failure = progress.observe(fallback_sample(43), policy, 2500)
+
+        self.assertIn("legacy fallback committed height 43", failure)
+        self.assertIn("for 1800s", failure)
 
     def test_continuous_local_header_backlog_reaches_stall_deadline(self):
         policy = sync.Policy(p2p_stack="zakura", stall_seconds=600)

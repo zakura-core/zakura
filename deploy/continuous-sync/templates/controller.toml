@@ -28,6 +28,7 @@ healthy_url = "{{HEALTHY_URL}}"
 poll_interval_seconds = {{POLL_INTERVAL_SECONDS}}
 startup_timeout_seconds = {{STARTUP_TIMEOUT_SECONDS}}
 stall_seconds = {{STALL_SECONDS}}
+status_unavailable_seconds = {{STATUS_UNAVAILABLE_SECONDS}}
 max_run_seconds = {{MAX_RUN_SECONDS}}
 ready_samples = {{READY_SAMPLES}}
 ready_sample_interval_seconds = {{READY_SAMPLE_INTERVAL_SECONDS}}

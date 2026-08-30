@@ -27,6 +27,35 @@ from typing import Any
 
 STATE_VERSION = 1
 
+COMMITTED_HEIGHT_METRICS = (
+    "state.memory.best.committed.block.height",
+    "state.memory.committed.block.height",
+    "state_finalized_block_height",
+    "state_checkpoint_finalized_block_height",
+    "zcash_chain_verified_block_height",
+    "sync.block.verified_tip.height",
+    "checkpoint_verified_height",
+)
+
+HEADER_HEIGHT_METRICS = (
+    "sync.header_chain.frontier.header_best_height",
+    "sync.block.best_header_tip.height",
+)
+
+DIAGNOSTIC_METRICS = (
+    "checkpoint_processing_next_height",
+    "sync.estimated_network_tip_height",
+    "sync.estimated_distance_to_tip",
+    "sync.prospective_tips.len",
+    "sync.reserve.depth",
+    "sync.downloads.in_flight",
+    "sync.downloads.waiting_network",
+    "sync.downloads.downloading",
+    "sync.downloads.response_received",
+    "sync.downloads.waiting_verifier",
+    "sync.downloads.verifying",
+)
+
 
 class ControllerError(Exception):
     """Operator-facing failure that should halt the sync loop."""
@@ -65,6 +94,7 @@ class Policy:
     poll_interval_seconds: int = 30
     startup_timeout_seconds: int = 600
     stall_seconds: int = 600
+    status_unavailable_seconds: int = 600
     max_run_seconds: int = 172800
     ready_samples: int = 6
     ready_sample_interval_seconds: int = 30
@@ -81,6 +111,75 @@ class Policy:
 class Config:
     paths: Paths
     policy: Policy = field(default_factory=Policy)
+
+
+@dataclass
+class SyncProgress:
+    started_at: int
+    last_height: int | None = None
+    highest_height: int | None = None
+    last_progress_at: int = field(init=False)
+    backlog_since: int | None = None
+    status_unavailable_since: int | None = None
+
+    def __post_init__(self) -> None:
+        self.last_progress_at = self.started_at
+
+    def observe(
+        self,
+        sample: dict[str, Any],
+        policy: Policy,
+        observed_at: int,
+    ) -> tuple[bool, str | None]:
+        committed_height = sample.get("committed_height")
+        progressed = False
+        if isinstance(committed_height, int):
+            self.last_height = committed_height
+            if self.highest_height is None or committed_height > self.highest_height:
+                self.highest_height = committed_height
+                self.last_progress_at = observed_at
+                progressed = True
+
+        evidence, detail = classify_sync_evidence(sample, policy.p2p_stack)
+        sample["stall_evidence"] = evidence
+        sample["stall_evidence_detail"] = detail
+
+        if evidence == "local_header_backlog":
+            self.status_unavailable_since = None
+            if progressed or self.backlog_since is None:
+                self.backlog_since = observed_at
+            stalled_for = observed_at - self.backlog_since
+            if stalled_for >= policy.stall_seconds:
+                return progressed, (
+                    f"committed height {self.last_height} has not progressed while "
+                    f"{detail} for {stalled_for}s (threshold {policy.stall_seconds}s)"
+                )
+            return progressed, None
+
+        self.backlog_since = None
+        if evidence == "caught_up":
+            self.status_unavailable_since = None
+            return progressed, None
+
+        if evidence == "legacy_height_only":
+            self.status_unavailable_since = None
+            stalled_for = observed_at - self.last_progress_at
+            if self.last_height is not None and stalled_for >= policy.stall_seconds:
+                return progressed, (
+                    f"legacy committed height {self.last_height} has not progressed for "
+                    f"{stalled_for}s (threshold {policy.stall_seconds}s)"
+                )
+            return progressed, None
+
+        if self.status_unavailable_since is None:
+            self.status_unavailable_since = observed_at
+        unavailable_for = observed_at - self.status_unavailable_since
+        if unavailable_for >= policy.status_unavailable_seconds:
+            return progressed, (
+                f"sync status evidence unavailable for {unavailable_for}s "
+                f"(threshold {policy.status_unavailable_seconds}s): {detail}"
+            )
+        return progressed, None
 
 
 def now() -> int:
@@ -448,49 +547,65 @@ def metric_value(metrics: str, name: str) -> float | None:
     return float(match.group(1)) if match else None
 
 
+def first_metric(status: dict[str, Any], names: tuple[str, ...]) -> tuple[int | None, str | None]:
+    for name in names:
+        value = status.get(name)
+        if isinstance(value, int):
+            return value, name
+    return None, None
+
+
+def classify_sync_evidence(sample: dict[str, Any], p2p_stack: str) -> tuple[str, str]:
+    metrics_status = sample.get("metrics_status")
+    if metrics_status != "ok":
+        return "unknown", f"metrics={metrics_status}"
+
+    committed_height = sample.get("committed_height")
+    if not isinstance(committed_height, int):
+        return "unknown", "committed block height is missing"
+
+    if p2p_stack in ("legacy", "zebra"):
+        return "legacy_height_only", "Zakura header state is disabled"
+
+    header_height = sample.get("header_height")
+    if not isinstance(header_height, int):
+        return "unknown", "authoritative local header height is missing"
+    if header_height < committed_height:
+        return (
+            "unknown",
+            f"local header height {header_height} is below committed height {committed_height}",
+        )
+    if header_height == committed_height:
+        return "caught_up", f"local header height equals committed height {committed_height}"
+    return (
+        "local_header_backlog",
+        f"local header height {header_height} is ahead of committed height {committed_height}",
+    )
+
+
 def sample_status(config: Config) -> dict[str, Any]:
     status: dict[str, Any] = {"service_active": service_active(config)}
     try:
         metrics = fetch_text(config.policy.metrics_url)
         status["metrics_status"] = "ok"
-        for key in (
-            "state.memory.best.committed.block.height",
-            "state.memory.committed.block.height",
-            "state_finalized_block_height",
-            "state_checkpoint_finalized_block_height",
-            "zcash_chain_verified_block_height",
-            "sync_block_verified_tip_height",
-            "checkpoint_verified_height",
-            "checkpoint_processing_next_height",
-            "sync.estimated_network_tip_height",
-            "sync.estimated_distance_to_tip",
-            "sync.prospective_tips.len",
-            "sync.reserve.depth",
-            "sync.downloads.in_flight",
-            "sync.downloads.waiting_network",
-            "sync.downloads.downloading",
-            "sync.downloads.response_received",
-            "sync.downloads.waiting_verifier",
-            "sync.downloads.verifying",
-        ):
+        for key in (*COMMITTED_HEIGHT_METRICS, *HEADER_HEIGHT_METRICS, *DIAGNOSTIC_METRICS):
             value = metric_value(metrics, key)
             if value is not None:
                 status[key] = int(value)
-        status["height"] = None
-        for key in (
-            "state.memory.best.committed.block.height",
-            "state.memory.committed.block.height",
-            "state_finalized_block_height",
-            "state_checkpoint_finalized_block_height",
-            "zcash_chain_verified_block_height",
-            "sync_block_verified_tip_height",
-            "checkpoint_verified_height",
-            "checkpoint_processing_next_height",
-        ):
-            if status.get(key) is not None:
-                status["height"] = status[key]
-                status["height_source"] = key
-                break
+
+        committed_height, committed_source = first_metric(status, COMMITTED_HEIGHT_METRICS)
+        status["committed_height"] = committed_height
+        if committed_source is not None:
+            status["committed_height_source"] = committed_source
+
+        header_height, header_source = first_metric(status, HEADER_HEIGHT_METRICS)
+        status["header_height"] = header_height
+        if header_source is not None:
+            status["header_height_source"] = header_source
+
+        status["height"] = committed_height
+        if committed_source is not None:
+            status["height_source"] = committed_source
         if status["height"] is None:
             tip = status.get("sync.estimated_network_tip_height")
             distance = status.get("sync.estimated_distance_to_tip")
@@ -503,13 +618,15 @@ def sample_status(config: Config) -> dict[str, Any]:
     ready, ready_detail = fetch_ready(config)
     status["ready"] = ready
     status["ready_detail"] = ready_detail
+    evidence, detail = classify_sync_evidence(status, config.policy.p2p_stack)
+    status["stall_evidence"] = evidence
+    status["stall_evidence_detail"] = detail
     return status
 
 
 def wait_for_completion(config: Config, run_dir: Path, run_state: dict[str, Any]) -> None:
     started = now()
-    last_height: int | None = None
-    last_progress = started
+    progress = SyncProgress(started)
     ready_samples = 0
     samples_path = run_dir / "samples.jsonl"
 
@@ -523,29 +640,24 @@ def wait_for_completion(config: Config, run_dir: Path, run_state: dict[str, Any]
 
         sample = sample_status(config)
         sample["time"] = utc_stamp(ts)
+        progressed, failure = progress.observe(sample, config.policy, ts)
         with samples_path.open("a", encoding="utf-8") as samples:
             samples.write(json.dumps(sample, sort_keys=True) + "\n")
 
-        height = sample.get("height")
-        if isinstance(height, int) and height != last_height:
-            last_height = height
-            last_progress = ts
-            run_state["height"] = height
+        if progressed:
+            run_state["height"] = progress.last_height
             run_state["last_progress_at"] = utc_stamp(ts)
             write_run_json(run_dir, run_state)
 
-        if last_height is None and ts - started >= config.policy.startup_timeout_seconds:
+        if progress.last_height is None and ts - started >= config.policy.startup_timeout_seconds:
             raise ControllerError(
-                f"no height observed within startup timeout "
+                f"no committed height observed within startup timeout "
                 f"{config.policy.startup_timeout_seconds}s; metrics={sample.get('metrics_status')}, "
                 f"ready={sample.get('ready_detail')}"
             )
 
-        if ts - last_progress >= config.policy.stall_seconds:
-            raise ControllerError(
-                f"height {last_height} has not progressed for {ts - last_progress}s "
-                f"(threshold {config.policy.stall_seconds}s)"
-            )
+        if failure is not None:
+            raise ControllerError(failure)
 
         if sample.get("ready") is True:
             ready_samples += 1

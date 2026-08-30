@@ -160,6 +160,7 @@ def subst_for(node: Node) -> dict[str, str]:
         "POLL_INTERVAL_SECONDS": str(raw["poll_interval_seconds"]),
         "STARTUP_TIMEOUT_SECONDS": str(raw["startup_timeout_seconds"]),
         "STALL_SECONDS": str(raw["stall_seconds"]),
+        "STATUS_UNAVAILABLE_SECONDS": str(raw["status_unavailable_seconds"]),
         "MAX_RUN_SECONDS": str(raw["max_run_seconds"]),
         "READY_SAMPLES": str(raw["ready_samples"]),
         "READY_SAMPLE_INTERVAL_SECONDS": str(raw["ready_sample_interval_seconds"]),

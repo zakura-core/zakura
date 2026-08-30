@@ -54,8 +54,10 @@ evidence.
 
 The legacy-only node does not run the Zakura header chain. It retains its
 1800-second height-only deadline. The cluster monitor independently requires a
-healthy peer to advance before it reports a local sync stall. That peer evidence
-covers a header-sync failure where the local node never learns the newer header.
+healthy peer with an exact committed height to advance before it reports a local
+sync stall. It never uses a wall-clock estimate as peer evidence. That peer
+evidence covers a header-sync failure where the local node never learns the
+newer header.
 
 ## Failure Semantics
 

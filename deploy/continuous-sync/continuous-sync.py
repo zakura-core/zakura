@@ -27,14 +27,13 @@ from typing import Any
 
 STATE_VERSION = 1
 
+# These gauges track the best committed tip. Finalized and verifier-only gauges
+# can trail or lead that tip, so they remain diagnostics.
 COMMITTED_HEIGHT_METRICS = (
     "state.memory.best.committed.block.height",
     "state.memory.committed.block.height",
-    "state_finalized_block_height",
-    "state_checkpoint_finalized_block_height",
     "zcash_chain_verified_block_height",
     "sync.block.verified_tip.height",
-    "checkpoint_verified_height",
 )
 
 HEADER_HEIGHT_METRICS = (
@@ -43,6 +42,9 @@ HEADER_HEIGHT_METRICS = (
 )
 
 DIAGNOSTIC_METRICS = (
+    "state_finalized_block_height",
+    "state_checkpoint_finalized_block_height",
+    "checkpoint_verified_height",
     "checkpoint_processing_next_height",
     "sync.estimated_network_tip_height",
     "sync.estimated_distance_to_tip",
@@ -145,6 +147,8 @@ class SyncProgress:
         sample["stall_evidence_detail"] = detail
 
         if evidence == "local_header_backlog":
+            if self.status_unavailable_since is not None and self.backlog_since is not None:
+                self.backlog_since += observed_at - self.status_unavailable_since
             self.status_unavailable_since = None
             if progressed or self.backlog_since is None:
                 self.backlog_since = observed_at
@@ -156,12 +160,13 @@ class SyncProgress:
                 )
             return progressed, None
 
-        self.backlog_since = None
         if evidence == "caught_up":
+            self.backlog_since = None
             self.status_unavailable_since = None
             return progressed, None
 
         if evidence == "legacy_height_only":
+            self.backlog_since = None
             self.status_unavailable_since = None
             stalled_for = observed_at - self.last_progress_at
             if self.last_height is not None and stalled_for >= policy.stall_seconds:
@@ -171,6 +176,8 @@ class SyncProgress:
                 )
             return progressed, None
 
+        if progressed:
+            self.backlog_since = None
         if self.status_unavailable_since is None:
             self.status_unavailable_since = observed_at
         unavailable_for = observed_at - self.status_unavailable_since

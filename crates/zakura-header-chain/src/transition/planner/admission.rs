@@ -1,13 +1,13 @@
 //! Bounded admission, authentication, and header-insertion rebasing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use zakura_chain::block;
 
 use super::{InvalidTransitionEvidence, LimitViolation, TransitionFailure};
 use crate::{
     BodyWorkOwner, EngineLimits, EngineMetadata, EngineMode, EngineSnapshot, EventAdmission,
-    EvidenceId, FinalityRecord, Frontier, HeaderChainEngine, HeaderSyncWorkOwner, MemHeaderStore,
+    FinalityRecord, Frontier, HeaderChainEngine, HeaderSyncWorkOwner, MemHeaderStore,
     TargetCompletion, TransitionContext, TransitionEvent, TransitionInput,
 };
 
@@ -73,7 +73,7 @@ pub(super) fn authenticate_and_admit(
     }
     validate_retention_references(input, context)?;
     let event = input.event();
-    validate_event_resource_bounds(engine, &event, context.config.limits)?;
+    validate_event_resource_bounds(&event, context.config.limits)?;
     validate_authority(&event, context)?;
     let full_state_authorization_version = context
         .full_state_authority
@@ -138,7 +138,6 @@ pub(super) fn validate_snapshot(
 }
 
 fn validate_event_resource_bounds(
-    engine: &HeaderChainEngine,
     event: &TransitionEvent,
     limits: EngineLimits,
 ) -> Result<(), TransitionFailure> {
@@ -155,28 +154,6 @@ fn validate_event_resource_bounds(
         );
     }
     if insert.aux.len() > limits.max_aux_deliveries_total.get() {
-        return Err(TransitionFailure::AuxiliaryLimitExceeded);
-    }
-    let mut additions = HashMap::<block::Hash, HashSet<EvidenceId>>::new();
-    for delivery in &insert.aux {
-        additions
-            .entry(delivery.header_hash)
-            .or_default()
-            .insert(delivery.delivery_id);
-    }
-    let mut new_total = engine.aux_delivery_count();
-    for (hash, delivery_ids) in additions {
-        let existing = engine.aux_deliveries(hash);
-        let new_count = delivery_ids
-            .iter()
-            .filter(|id| !existing.iter().any(|row| row.delivery_id == **id))
-            .count();
-        if existing.len().saturating_add(new_count) > limits.max_aux_deliveries_per_header.get() {
-            return Err(TransitionFailure::AuxiliaryLimitExceeded);
-        }
-        new_total = new_total.saturating_add(new_count);
-    }
-    if new_total > limits.max_aux_deliveries_total.get() {
         return Err(TransitionFailure::AuxiliaryLimitExceeded);
     }
     Ok(())

@@ -60,6 +60,17 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
             AuxDelta::Delete { .. } => None,
         })
         .collect();
+    let projected_aux_count = engine_before_commit
+        .aux_delivery_count()
+        .saturating_sub(deleted_ids.len())
+        .saturating_add(
+            puts.keys()
+                .filter(|delivery_id| engine_before_commit.aux_delivery(**delivery_id).is_none())
+                .count(),
+        );
+    if projected_aux_count > plan.limits.max_aux_deliveries_total.get() {
+        return Err(InvariantViolation::Limits);
+    }
     let mut nodes: Vec<&HeaderNode> = match mode {
         #[cfg(any(test, feature = "fuzz-impl"))]
         VerificationMode::Exhaustive => graph.view_header_nodes(),
@@ -88,6 +99,9 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
     };
     nodes.sort_unstable_by_key(|node| node.hash.0);
     for node in nodes {
+        if node.aux_delivery_ids.len() > plan.limits.max_aux_deliveries_per_header.get() {
+            return Err(InvariantViolation::Limits);
+        }
         let mut deliveries = engine_before_commit.aux_deliveries(node.hash).to_vec();
         deliveries.retain(|delivery| !deleted_ids.contains(&delivery.delivery_id));
         for delivery in puts
@@ -132,6 +146,8 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use super::super::super::test_support::{
         candidate_with_delta, delivery, fixture, no_change_candidate, projected_graph,
     };
@@ -187,6 +203,66 @@ mod tests {
             [
                 Err(InvariantViolation::Auxiliary(fixture.child.hash)),
                 Err(InvariantViolation::Auxiliary(fixture.child.hash)),
+            ]
+        );
+    }
+
+    #[test]
+    fn projected_auxiliary_total_must_stay_within_the_plan_limit() {
+        let fixture = fixture(EngineMode::HeadersOnly);
+        let ids = [
+            EvidenceId::from_digest([0x73; 32]),
+            EvidenceId::from_digest([0x74; 32]),
+        ];
+        let mut overlay = GraphOverlay::new(fixture.engine.graph());
+        for id in ids {
+            overlay
+                .record_auxiliary_evidence_delivery(fixture.child.hash, id)
+                .expect("the fixture child accepts the delivery identity");
+        }
+        let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
+        plan.change_set.aux_changes = ids
+            .into_iter()
+            .map(|id| AuxDelta::Put(Box::new(delivery(&fixture.engine, fixture.child.hash, id))))
+            .collect();
+        plan.limits.max_aux_deliveries_per_header = NonZeroUsize::new(2).expect("two is nonzero");
+        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(1).expect("one is nonzero");
+
+        assert_eq!(
+            verify_in_both_modes(&fixture, &plan),
+            [
+                Err(InvariantViolation::Limits),
+                Err(InvariantViolation::Limits),
+            ]
+        );
+    }
+
+    #[test]
+    fn projected_per_header_auxiliary_count_must_stay_within_the_plan_limit() {
+        let fixture = fixture(EngineMode::HeadersOnly);
+        let ids = [
+            EvidenceId::from_digest([0x75; 32]),
+            EvidenceId::from_digest([0x76; 32]),
+        ];
+        let mut overlay = GraphOverlay::new(fixture.engine.graph());
+        for id in ids {
+            overlay
+                .record_auxiliary_evidence_delivery(fixture.child.hash, id)
+                .expect("the fixture child accepts the delivery identity");
+        }
+        let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
+        plan.change_set.aux_changes = ids
+            .into_iter()
+            .map(|id| AuxDelta::Put(Box::new(delivery(&fixture.engine, fixture.child.hash, id))))
+            .collect();
+        plan.limits.max_aux_deliveries_per_header = NonZeroUsize::new(1).expect("one is nonzero");
+        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(2).expect("two is nonzero");
+
+        assert_eq!(
+            verify_in_both_modes(&fixture, &plan),
+            [
+                Err(InvariantViolation::Limits),
+                Err(InvariantViolation::Limits),
             ]
         );
     }

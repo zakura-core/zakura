@@ -128,6 +128,66 @@ fn same_transition_auxiliary_eviction_has_no_generation_effect() {
 }
 
 #[test]
+fn auxiliary_limit_uses_the_post_retention_delivery_set() {
+    use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
+
+    let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let anchor = store.graph.finalized_frontier();
+    let easy = store
+        .graph
+        .header_node(anchor.hash)
+        .expect("the anchor exists")
+        .header
+        .difficulty_threshold;
+    let easy_target: U256 = easy.to_expanded().expect("the target expands").into();
+    let hard = ExpandedDifficulty::from(easy_target >> 3).into();
+    let selected = insert_verified_branch(&mut store.graph, anchor, 1, hard, 0xa1);
+    let evicted = insert_verified_branch(&mut store.graph, anchor, 1, easy, 0xa2);
+    synchronize_fixture(&mut store, selected);
+    assert_eq!(store.metadata.frontiers.header_best, selected);
+
+    config.limits.max_non_finalized_nodes = std::num::NonZeroUsize::new(2).expect("two is nonzero");
+    config.limits.max_aux_deliveries_per_header =
+        std::num::NonZeroUsize::new(1).expect("one is nonzero");
+    config.limits.max_aux_deliveries_total =
+        std::num::NonZeroUsize::new(1).expect("one is nonzero");
+
+    let mut request = insertion(&store, 1, EvidenceId::from_digest([0xa3; 32]));
+    let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
+        unreachable!("the fixture constructs a header insertion")
+    };
+    let incoming = unauthenticated_delivery(insert, EvidenceId::from_digest([0xa4; 32]));
+    let retained = crate::AuxDelivery::new(
+        EvidenceId::from_digest([0xa5; 32]),
+        evicted.hash,
+        insert.source,
+        insert.owner,
+        crate::BodySizeHint::Unknown,
+        None,
+    );
+    store
+        .graph
+        .record_auxiliary_evidence_delivery(retained.header_hash, retained.delivery_id)
+        .expect("the losing branch remains retained before projection");
+    store.aux.push(retained);
+    insert.aux.push(incoming);
+
+    let plan = apply_transition(&store, request, &context(&config, &clock, None))
+        .expect("retention frees aggregate auxiliary capacity for the incoming delivery");
+
+    assert!(plan.change_set.delete_nodes.contains(&evicted.hash));
+    assert!(plan.change_set.aux_changes.contains(&AuxDelta::Delete {
+        header_hash: evicted.hash,
+        delivery_id: retained.delivery_id,
+    }));
+    assert!(plan
+        .change_set
+        .aux_changes
+        .contains(&AuxDelta::Put(Box::new(incoming))));
+}
+
+#[test]
 fn auxiliary_deletes_for_evicted_headers_are_sorted_by_hash_and_delivery_id() {
     use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
 

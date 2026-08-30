@@ -7,14 +7,15 @@
 
 ## Problem
 
-Zakura must fully utilize each p2p connection without letting a peer overwhelm the node. Denial of
-service exhausts finite resources, so Zakura prices messages by the work they can cause across multiple dimensions. Each message role has a bound for its CPU, memory, disk, lock, and response costs.
+Zakura must fully utilize each p2p connection without letting a peer overwhelm the node. Zakura
+bounds attacker-controlled CPU, memory, disk, lock, and response work. It maps those costs to
+cadence, response-byte, concurrency, and reservation bounds for each message role.
 
 Before Zakura handles an inbound message, it applies every filter required by that message's role:
 
-1. **Safe** — Frame checks and bounded decoding precede allocation and expensive verification.
+1. **Safe** — Frame checks precede allocation, and bounded decoding precedes expensive verification.
 2. **Authorized** — Each response matches a live reservation created by a request Zakura sent.
-3. **Useful** — The message is relevant and does not repeat completed work.
+3. **Useful** — The message can affect a receiver decision.
 4. **Budgeted** — The message fits the work bound for its role.
 
 Only bounded announcement metadata may arrive without a reservation, and a strict cadence limits
@@ -59,8 +60,8 @@ An illustrative API could keep both layers small:
 let headers = MessageDeclaration::response::<Headers>()
     .with(Frame::max_bytes(MAX_HEADERS_BYTES))
     .with(Decode::bounded())
-    .with(Verify::using(prepare_headers))
-    .with(Reservation::subscription());
+    .with(Reservation::subscription())
+    .with(Verify::using(prepare_headers));
 
 let mut admission = Admission::new(Declarations::new().with(headers));
 
@@ -104,7 +105,7 @@ Header sync demonstrates every message role:
 | --- | --- | --- | --- |
 | `Status` | Announcement | Frame, Decode, Relevant, Cadence | Disconnect on a broken cadence; drop a status that cannot affect a receiver decision |
 | `SubscribeHeaders` | Request | Frame, Decode, Reservation, Work | Disconnect an invalid subscription update; delay a credit grant when the work budget is empty |
-| `Headers` | Response | Frame, Decode, Verify, Reservation | Disconnect a page outside its subscription |
+| `Headers` | Response | Frame, Decode, Reservation, Verify | Disconnect a page outside its subscription |
 | `HeadersOutcome` | Response | Frame, Decode, Reservation | Disconnect an unsolicited or invalid outcome |
 
 Header sync uses a credit-based subscription to make pushed headers authorized and bounded. The
@@ -178,7 +179,7 @@ Four test layers keep declarations, codecs, gate state, and runtime behavior ali
 | **Property tests** | Legal messages have one canonical encoding and fit within their declared caps. Generated gate-event sequences preserve reservation, budget, and state-size invariants. A conformant sender never produces `Disconnect`. |
 | **Fuzz tests** | The decoder never panics on arbitrary frames. It rejects trailing bytes and bounds every allocation before decode. |
 | **Panic isolation** | A panic in a decoder, handler, or port operation is caught at its boundary. The process survives, other peers keep running, and the work returns to the scheduler. |
-| **Trace tests** | Declared unique keys appear at most once. Honest regtest nodes never produce a `Disconnect` verdict. |
+| **Trace tests** | Each response key consumes at most one reservation part. Honest regtest nodes never produce a `Disconnect` verdict. |
 
 Each gate emits a structured decision to `regulation.jsonl`. Production records non-`Continue`
 decisions. The regtest harness records every decision and checks the full trace with
@@ -201,9 +202,10 @@ Implement the design in five steps:
 2. Build one cadence budget per `(peer, message type)` from the message declarations.
 3. Preserve block-sync reservations until a response arrives or the connection ends. Then remove
    the unmatched-response exceptions.
-4. Give each peer an independent processing path. This must land before any `Drop` becomes `Delay`.
+4. Give each peer an independent processing path. Add Work and `Delay` for discovery and block-sync
+   requests only after that path exists.
 5. Replace `GetHeaders` with `SubscribeHeaders`. Price each credit grant by its byte credit and add
-   the subscription reservation.
+   the subscription reservation and header-sync Work bound.
 
 Only the final step adds header push and a work bound that Zakura lacks today. The earlier steps
 create the structure needed to enforce both safely.

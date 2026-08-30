@@ -20,7 +20,7 @@ Each message declaration selects concrete filters from four categories:
 | --- | --- | --- |
 | **Safe** | Frame, Decode, Verify | Bound parsing, allocation, and verification before they occur |
 | **Authorized** | Reservation | Bind responses and subscription updates to receiver-created bounds |
-| **Useful** | Unique, Relevant | Remove repeated or obsolete work without blaming the peer for a race |
+| **Useful** | Relevant | Remove obsolete work without blaming the peer for a race |
 | **Budgeted** | Cadence, Work | Bound message frequency or response work |
 
 The admission path returns one of five results:
@@ -48,7 +48,7 @@ frame
   -> bounded decode
   -> reservation match
   -> stateless verification
-  -> uniqueness and relevance
+  -> relevance
   -> work charge
   -> handler
 ```
@@ -73,9 +73,11 @@ allocate from a peer-declared value.
    The implementation MUST rotate the file and bound its total size.
 5. Each peer MUST have an independent processing path. Admitted work from one peer MUST NOT starve
    another peer's path.
+6. Each peer response path MUST bound queued unsent bytes. Reaching that bound MUST stop new
+   response work for that peer without blocking another peer or service stream.
 
-This specification bounds complete messages. The transport MUST bound the time a frame may remain
-incomplete. The stream layout specification states that bound.
+This specification bounds complete messages. Transport frame progress and stream layout remain out
+of scope. The transport MUST enforce an independent deadline for an incomplete frame.
 
 ### Panic isolation
 
@@ -164,18 +166,7 @@ The subscriber still admits responses that it already authorized.
 A matched response MUST reach its handler despite work reassignment, a competing response, or a
 change in local interest. The receiver MAY stop issuing requests or granting credit for future work.
 
-## Useful filters
-
-### Unique
-
-Unique stores recent work keys in a fixed-size per-peer ring.
-
-- A declaration MUST state the key, capacity, window, and repeat result. The key MUST identify the
-  work rather than only a peer-chosen request identifier.
-- An announcement repeat MUST return `Drop`. A request repeat MAY return `Disconnect` only when the
-  first request was fulfilled and the key identifies an immutable answer for the entire window.
-  Other requests MUST omit Unique or return `Drop`.
-- The sender MUST NOT repeat a fulfilled request within the declared window.
+## Useful filter
 
 ### Relevant
 
@@ -218,7 +209,7 @@ charge.
 
 ```text
 charge = upper_bound_response_bytes + REQUEST_OVERHEAD
-refund = charge - actual_response_bytes
+refund = upper_bound_response_bytes - actual_response_bytes
 ```
 
 - `REQUEST_OVERHEAD` MUST equal 64 KiB. The bucket capacity MUST cover the largest accepted request.
@@ -226,12 +217,13 @@ refund = charge - actual_response_bytes
 - Work MUST run after every other selected filter. Immediately before the handler starts, it MUST
   acquire one concurrency slot and apply the computed charge once. The request MUST hold the slot
   until its terminal response is queued, `LocalFault` occurs, or the connection ends. A subscription
-  update releases its slot when the handler atomically commits the update. Work SHOULD apply the
-  computed refund after the terminal response is queued. It MUST refund unused charge after
-  `LocalFault`.
+  update releases its slot when the handler atomically commits the update. Work MUST apply the
+  computed refund after the terminal response is queued. The refund MUST return unused response
+  capacity without returning `REQUEST_OVERHEAD`. Work MUST release the slot and refund unused
+  response capacity after `LocalFault`.
 - Work MUST return `Disconnect` when a request exceeds the concurrency bound. The sender MUST stay
-  within the advertised concurrency and inflight limits. Its request rate MUST stay within the
-  protocol's service capacity.
+  within the advertised concurrency and inflight limits. Token exhaustion alone MUST NOT create a
+  peer violation.
 - When Work is unavailable, the peer routine MUST return `Delay` and leave the request at the
   admission boundary. It MUST stop reading that peer's ordered stream until Work becomes available.
   The existing bounded application and QUIC queues MUST provide backpressure. The implementation
@@ -246,7 +238,8 @@ refund = charge - actual_response_bytes
 ### Discovery — stream 4, version 2
 
 Discovery MUST carry discriminators `1..=5` in the frame header. It MUST remove the payload
-discriminator used by version 1. The following limits apply to every discovery message:
+discriminator used by version 1. The remaining field order and integer encodings stay unchanged.
+The following limits apply to every discovery message:
 
 ```text
 MAX_DIRECT_ADDRS             = 8
@@ -273,8 +266,8 @@ DISCOVERY_WORK_REFILL        = 1 MiB/s
   - `protocol_min <= protocol_max`
   - record body <= 580 bytes
   - exact consumption
-- **Verify** — [`ZakuraNodeRecord::verify`][record-verify], which calls
-  [`validate_record_body_for_import`][record-import]
+- **Verify** — [`ZakuraNodeRecord::verify`][record-verify], with time-varying import policy split
+  from [`validate_record_body_for_import`][record-import]
   - record signature
   - network and chain IDs
   - protocol overlap
@@ -288,9 +281,11 @@ DISCOVERY_WORK_REFILL        = 1 MiB/s
   - on_empty = `Disconnect`
 
 The sender MUST send at most one `Hello` every 15 seconds. Verify MUST run before the discovery
-book lock. The handler MUST NOT store an address that is not globally routable unless local policy
-allows that address class. A stored record's sequence comparison ends when the stored record
-expires, so a peer that reset its sequence recovers after expiry.
+book lock. Expiry and sequence checks MUST return `Drop` because clock passage and local record
+state can make an otherwise valid record obsolete. The handler MUST NOT store an address that is
+not globally routable unless local policy allows that address class. A stored record's sequence
+comparison ends when the stored record expires, so a peer that reset its sequence recovers after
+expiry.
 
 #### `GetPeers` — Request, discriminator 2
 
@@ -302,6 +297,7 @@ expires, so a peer that reset its sequence recovers after expiry.
   - excluded node IDs <= 256
   - service IDs are 1..=32 ASCII bytes and unique
   - excluded node IDs are sorted and unique
+  - exact consumption
 - **Work**
   - charge = 2 bytes + limit * 648 bytes + 64 KiB
   - capacity = 4 MiB
@@ -324,22 +320,23 @@ MUST send exactly one `Peers` response for every admitted request.
   - records <= 32
   - node IDs unique
   - exact consumption
-- **Verify** — [`ZakuraNodeRecord::verify`][record-verify] for each record, before the discovery
-  book lock
-  - record signature
-  - record body bounds
-  - network ID and chain ID
-  - protocol range
 - **Reservation**
   - one outstanding `GetPeers` on this stream
   - bounds count and payload bytes
   - consumed by this message
+- **Verify** — the signature and immutable import checks from
+  [`ZakuraNodeRecord::verify`][record-verify] for each record, before the discovery book lock
+  - record signature
+  - record body bounds
+  - network ID and chain ID
+  - protocol range
 
 A malformed record, invalid signature, wrong network, wrong chain, or incompatible protocol range
-MUST disconnect the relaying peer. The handler MUST discard an otherwise valid record when local
-staleness, expiry, address, or storage policy rejects it. The handler MUST NOT store an address
-that is not globally routable unless local policy allows that address class. Storage policy MUST
-bound the number of stored records attributed to each source peer.
+MUST disconnect the relaying peer. Expiry MUST remain a handler policy check because a record can
+expire in transit. The handler MUST discard an otherwise valid record when local staleness, expiry,
+address, or storage policy rejects it. The handler MUST NOT store an address that is not globally
+routable unless local policy allows that address class. Storage policy MUST bound the number of
+stored records attributed to each source peer.
 
 #### `GetServices` — Request, discriminator 4
 
@@ -350,7 +347,8 @@ bound the number of stored records attributed to each source peer.
   - service IDs are 1..=32 ASCII bytes and unique
   - exact consumption
 - **Work**
-  - response_cap = 42 bytes + min(matching local services, 8) * 294 bytes
+  - response_cap = 42 bytes + min(requested service IDs, 8) * 294 bytes
+  - an empty request uses eight requested service IDs for this calculation
   - charge = response_cap + 64 KiB
   - capacity = 4 MiB
   - refill = 1 MiB/s
@@ -372,16 +370,17 @@ MUST send exactly one `Services` response for every admitted request.
   - summary length <= 256 bytes
   - service IDs unique
   - exact consumption
-- **Verify** — [`validate_summary_envelope`][summary-envelope] for the envelope, and
-  [`import_connected_peer_services`][services-peer-binding] for the peer binding
-  - envelope tag matches the service ID
-  - each known summary decodes strictly
-  - `node_id` == authenticated peer
 - **Reservation**
   - one outstanding `GetServices` on this stream
   - supplies allowed service IDs, summary count, and payload cap
   - an empty request reserves all service IDs and eight summaries
   - consumed by this message
+- **Verify** — [`validate_summary_envelope`][summary-envelope] for the envelope, and
+  [`import_connected_peer_services`][services-peer-binding] for the peer binding
+  - each known envelope tag matches the service ID
+  - each known summary decodes strictly
+  - an unknown summary stays length-bounded and is ignored
+  - `node_id` == authenticated peer
 - **Relevant**
   - expiry is not in the past
   - at least one summary differs from stored live state
@@ -390,24 +389,31 @@ An empty summary list remains legal and clears the peer's live service state.
 
 ### Header sync — stream 5, version 9
 
-Header sync version 9 MUST allow discriminators `1..=4`. Let `H` equal 1,487 bytes on Mainnet and
-Testnet and 177 bytes on Regtest. Let `A` equal 156 bytes when the request selects tree auxiliary
-schema V1 and zero otherwise. The following subscription limits apply:
+Header sync version 9 MUST allow discriminators `1..=4` in the frame header. It MUST remove the
+duplicate payload discriminator used by version 8. Let `H` equal 1,487 bytes on Mainnet and Testnet
+and 177 bytes on Regtest. For a selected auxiliary schema, let `A` equal 156 bytes for V1 and zero
+otherwise. The following subscription limits apply:
 
 ```text
 MAX_HS_PUSH_CREDIT_HEADERS   = 4,000
 MAX_HS_PUSH_CREDIT_BYTES     = 8 MiB
-MAX_HS_SUBSCRIPTIONS         = 1 per peer
+MAX_HS_SUBSCRIPTIONS         = 1 live or closing subscription per peer
 MAX_HS_RANGE                 = 4,000 headers per response
-HEADERS_RESPONSE_FIXED_BYTES = encoded size of a Headers response with zero entries
+HEADERS_RESPONSE_FIXED_BYTES = 82 bytes
+HEADERS_OUTCOME_BYTES        = 41 bytes
 HS_SENT_CURSOR_RING          = 4,096 sent cursors per subscription
 HS_PUSH_DEADLINE             = 30 seconds
-HS_WORK_CAPACITY             = MAX_HS_PUSH_CREDIT_BYTES + 64 KiB
+HS_WORK_CAPACITY             = MAX_HS_PUSH_CREDIT_BYTES + HEADERS_OUTCOME_BYTES + 64 KiB
 HS_WORK_REFILL               = 1 MiB/s
 ```
 
 The cap test pins `HEADERS_RESPONSE_FIXED_BYTES` to the codec. The frame cap already has an
 implementation in [`HeaderSyncMessage::check_payload_size`][hs-payload-size].
+
+`Status` retains the version 8 fields in the same order: work-anchor height and hash, selected-tip
+height and hash, 32-byte cumulative work, oldest-retained height, maximum headers per response,
+maximum subscriptions, maximum message bytes, and the auxiliary-schema mask. Removing the payload
+discriminator makes its encoded size 122 bytes.
 
 A subscription has **reached its initial target** when its receive cursor equals
 `initial_target_tip_hash`. Until then the publisher serves the path to that target. After that the
@@ -423,16 +429,23 @@ renewable, so the publisher can keep the link full without accepting an unbounde
 acknowledged counts, a locator-count byte, up to 13 locator hashes, two `u32` credit grants, and a
 schema byte. Its maximum encoded size is 523 bytes.
 
+`Headers` retains the version 8 response fields and order. It renames `request_id` to
+`subscription_id` and `complete` to `reaches_initial_target`. The fixed fields occupy 82 bytes.
+`reaches_initial_target` is true exactly on the page whose last header is the initial target and is
+false on every other page. `HeadersOutcome` encodes the `u64` subscription ID, the 32-byte initial
+target hash, and a one-byte outcome.
+
 #### `Status` — Announcement, discriminator 1
 
 - **Frame**
-  - payload cap = 123 bytes
+  - payload cap = 122 bytes
 - **Decode** — [`HeaderSyncMessage::decode`][hs-decode]
   - `work_anchor_height <= selected_tip_height`
   - `oldest_retained_height <= selected_tip_height`
   - `max_headers_per_response` = 1..=`MAX_HS_RANGE`
   - `max_subscriptions` = 1
-  - `max_message_bytes` = `HEADERS_RESPONSE_FIXED_BYTES + H + 4` ..= 2 MiB
+  - `max_message_bytes` = `HEADERS_RESPONSE_FIXED_BYTES + H + 4 + A` ..= 2 MiB for every advertised
+    auxiliary schema
   - `tree_aux_schema_mask` contains only known bits
   - exact consumption
 - **Relevant**
@@ -470,7 +483,8 @@ the sender retains headers.
   - remaining byte credit <= 8 MiB
   - terminal tombstone capacity = 1
 - **Work**
-  - `Open` or `Grant` charge = `added_byte_credit` + 64 KiB
+  - `Open` charge = `added_byte_credit` + `HEADERS_OUTCOME_BYTES` + 64 KiB
+  - `Grant` charge = `added_byte_credit` + 64 KiB
   - `Close` charge = 0 and cannot `Delay`
   - capacity = `HS_WORK_CAPACITY`
   - refill = `HS_WORK_REFILL`
@@ -505,11 +519,10 @@ MUST return `Drop`, MUST charge no work, and MUST NOT consume the tombstone. A c
 consumes the tombstone. An `Open` that finds no free publisher slot MUST return `Disconnect`,
 because the subscriber knows its own live subscription count.
 
-The next `Open` clears the tombstone. It MUST use a subscription ID that differs from the retained
-tombstone's ID, so a crossing update never matches two subscriptions. The subscriber MUST retain
-the old reservation until its terminal outcome arrives. It MAY open a new subscription while it
-waits for that outcome. The current subscription work charge covers the terminal outcome, which
-consumes no header or byte credit.
+The subscriber MUST receive the terminal outcome before it sends the next `Open`. The next `Open`
+clears the tombstone and MUST use a different subscription ID. This rule bounds each side to one
+live or closing subscription and prevents terminal reservations from accumulating. The current
+subscription work charge covers the terminal outcome, which consumes no header or byte credit.
 
 The publisher MUST split output into frames that satisfy its advertised per-response count and byte
 limits. It MAY send several frames without another `Grant` while credit remains. It MUST NOT treat
@@ -520,7 +533,7 @@ one-header pages, so `HS_SENT_CURSOR_RING` always suffices.
 #### `Headers` — Response, discriminator 3
 
 - **Frame**
-  - absolute payload cap = `computed_max_encoded_size(Headers, network)` <= 2 MiB
+  - absolute payload cap = 2 MiB
   - reservation payload cap = min(publisher_advertised_message_bytes,
     remaining_subscription_byte_credit)
 - **Decode** — [`HeaderSyncMessage::decode`][hs-decode]
@@ -529,9 +542,19 @@ one-header pages, so `HS_SENT_CURSOR_RING` always suffices.
   - encoded payload bytes <= remaining byte credit
   - response schema matches the subscription
   - `header_count >= 1`
+  - `reaches_initial_target` is 0 or 1
   - `body_size <= 2,000,000`
   - canonical network solution size
   - exact consumption
+- **Reservation**
+  - identity = (`subscription_id`, work scope, `initial_target_tip_hash`, sent locator entries,
+    requested schema)
+  - the first parent is a sent locator; each later parent equals the reservation receive cursor
+  - consume `header_count` and the encoded payload bytes
+  - advance the receive cursor
+  - require `reaches_initial_target` exactly when the final header hash equals the initial target
+  - record when the initial target is reached and reject a second such marker
+  - remain live
 - **Verify** — [`prepare_headers`][prepare-headers], the context-free header validator, over the
   decoded page. It establishes the supported encoding version, the locally computed hash, the
   inferred height, the commitment interpretation, the canonical compact target, the hash-to-target
@@ -539,17 +562,9 @@ one-header pages, so `HS_SENT_CURSOR_RING` always suffices.
   Header sync already calls it on this path in
   [`header_sync_driver`][hs-driver]. The individual rules live in
   [`validation::context_free`][context-free].
-- **Reservation**
-  - identity = (`subscription_id`, work scope, `initial_target_tip_hash`, sent locator entries,
-    requested schema)
-  - the first parent is a sent locator; each later parent equals the reservation receive cursor
-  - consume `header_count` and the encoded payload bytes
-  - advance the receive cursor
-  - record when the initial target is reached
-  - remain live
 
-Page linkage is a reservation rule, not a context-free one: it holds against the sent-cursor ring
-this receiver owns, so [`prepare_headers`][prepare-headers] cannot decide it.
+Page linkage is a reservation rule, not a context-free one. It holds against the sent locator and
+receive cursor in the local reservation, so [`prepare_headers`][prepare-headers] cannot decide it.
 
 The first page MUST extend the locator intersection selected by the publisher. The publisher MUST
 reach the initial target before it pushes a descendant beyond that target. Each later page MUST
@@ -572,15 +587,17 @@ The handler MUST disconnect the peer when one of those checks fails.
 #### `HeadersOutcome` — Response, discriminator 4
 
 - **Frame**
-  - payload cap = 42 bytes
+  - payload cap = 41 bytes
 - **Decode** — [`HeaderSyncMessage::decode`][hs-decode]
   - `subscription_id != 0`
+  - `initial_target_tip_hash` matches the subscription
   - outcome is `TargetNotRetained`, `NoLocatorIntersection`, `TargetNotSelected`, `HistoryPruned`,
     `SubscriptionSuperseded`, or `SubscriptionClosed`
   - exact consumption
 - **Reservation**
   - same identity and reservation as `Headers`
   - consumes no header or byte credit
+  - releases unused credit and refunds its unspent response-capacity charge
   - closes this subscription
 
 Each outcome is legal only in its window:
@@ -604,27 +621,29 @@ a peer violation.
 
 ### Block sync — stream 6, version 2
 
-Version 2 requests bodies by height range. That suits the checkpoint range, where the heights are
-contiguous and no validated header identity exists yet. Above the checkpoint a height does not name
-a block: competing branches occupy the same height, and a height range cannot say which branch the
-requester wants. Version 3 addresses that. Version 2 keeps heights.
+Version 2 requests bodies by height range. The requester still reserves the expected header hash for
+each height, but the wire request does not identify that hash. Competing branches can occupy the
+same height, so version 2 cannot safely overlap live ranges on one connection. A future version must
+make request and body correlation explicit.
 
-Block sync MUST allow discriminators `1..=5` in the frame header. It MUST remove the duplicate
-payload discriminator. [`BlockSyncMessage::decode`][bs-decode] reads that duplicate today. The
-following limits apply:
+Block sync MUST allow discriminators `1..=5` in the frame header. Version 2 also carries the same
+one-byte discriminator at the start of each payload. The decoder MUST require both copies to match.
+Removing the payload copy requires a new stream version. The following limits apply:
 
 ```text
 MAX_BLOCKS_PER_RESPONSE  = 128
 MAX_BLOCK_BYTES          = 2,000,000 bytes
 MAX_BS_RESPONSE_BYTES    = 33,554,432 bytes
 MAX_BS_INFLIGHT_REQUESTS = 32,768
-BLOCK_WORK_CAPACITY      >= 8 bytes + min(local_max_blocks_per_response * MAX_BLOCK_BYTES,
+N                        = local_max_blocks_per_response
+BLOCK_WORK_CAPACITY      >= 9 bytes + N + min(N * MAX_BLOCK_BYTES,
                            local_max_response_bytes) + 64 KiB
 BLOCK_WORK_REFILL        = local per-peer serving rate, bytes/second
 ```
 
-The receiver MUST advertise its actual block count, response byte, and inflight limits. It MUST NOT
-inherit the header-sync work budget. `BLOCK_WORK_REFILL` is local policy and is not advertised.
+The receiver MUST advertise its actual block count, response body-byte limit, and inflight limit. It
+MUST NOT inherit the header-sync work budget. `BLOCK_WORK_REFILL` is local policy and is not
+advertised.
 
 Block sync already regulates its rate on the requesting side. Each sender sizes its outstanding
 `GetBlocks` work with a per-peer BBR window ([`DownloadWindow`][bs-window]), clamped by the inflight
@@ -646,13 +665,15 @@ requesting side (inflight requests, inflight block bytes, look-ahead bytes) and 
 setting. An implementation of this specification MUST add one.
 
 `MAX_BLOCKS_PER_RESPONSE` and `MAX_BS_RESPONSE_BYTES` both apply to one range response, and the
-smaller one stops it. The count binds for small blocks. The byte total binds for large ones: at
-`MAX_BLOCK_BYTES` the byte total admits about 16 blocks, so the count never engages there.
+smaller one stops it. `MAX_BS_RESPONSE_BYTES` counts encoded block bodies and excludes message
+discriminators and the terminal response. The count binds for small blocks. The byte total binds for
+large ones: at `MAX_BLOCK_BYTES` the byte total admits about 16 blocks, so the count never engages
+there.
 
 #### `Status` — Announcement, discriminator 1
 
 - **Frame**
-  - payload cap = 20 bytes
+  - payload cap = 53 bytes
 - **Decode** — [`BlockSyncMessage::decode`][bs-decode]
   - `servable_low <= servable_high`
   - `max_blocks_per_response` = 1..=128
@@ -660,8 +681,8 @@ smaller one stops it. The count binds for small blocks. The byte total binds for
   - `max_response_bytes` = 1..=33,554,432
   - exact consumption
 - **Relevant**
-  - the range or a serving-limit change can affect candidate selection, pending demand, failover,
-    or an open request
+  - the range, tip hash, or a serving-limit change can affect candidate selection, pending demand,
+    failover, or an open request
 - **Cadence**
   - capacity = 4
   - refill = 1 message / 15 seconds
@@ -673,13 +694,14 @@ the connection opens.
 #### `GetBlocks` — Request, discriminator 2
 
 - **Frame**
-  - payload cap = 8 bytes
+  - payload cap = 9 bytes
 - **Decode** — [`BlockSyncMessage::decode`][bs-decode], [`validate_block_count`][bs-count]
   - count = 1..=128
   - `start_height + count - 1 <= Height::MAX`
   - exact consumption
 - **Work**
-  - response_cap = 8 bytes + min(min(count, local_max_blocks_per_response) * 2,000,000 bytes,
+  - `N` = min(count, local_max_blocks_per_response)
+  - response_cap = 9 bytes + `N` discriminator bytes + min(`N` * 2,000,000 bytes,
     local_max_response_bytes)
   - charge = response_cap + 64 KiB
   - capacity = `BLOCK_WORK_CAPACITY`
@@ -690,51 +712,47 @@ the connection opens.
 The handler MUST perform at most one contiguous read. It MUST send no more than one `Block` for
 each requested height. It MUST finish with exactly one `BlocksDone` or `RangeUnavailable`.
 
-The sender MUST NOT hold two live ranges with the same `start_height` on one connection. A
-`GetBlocks` whose `start_height` equals a live admitted range from the same peer MUST return
-`Disconnect`, so every terminal response matches exactly one range.
+The requester MUST NOT send overlapping live ranges on one connection. A `GetBlocks` that overlaps
+a live admitted range from the same peer MUST return `Disconnect`. This rule makes every `Block`
+and terminal response match exactly one range despite version 2's missing request ID.
 
 #### `Block` — Response, discriminator 3
 
 - **Frame**
-  - payload cap = 2,000,000 bytes
+  - payload cap = 2,000,001 bytes
 - **Decode** — [`BlockSyncMessage::decode`][bs-decode],
   [`validate_encoded_block_len`][bs-block-len]
   - one complete block
   - exact consumption
+- **Reservation** — [`BlockRangeRequest::expected_hash`][bs-expected-hash]
+  - one live `GetBlocks` range whose next unconsumed height expects this header hash
+  - consumes that hash's part of the reservation
 - **Verify** — [`CheckpointVerifier::check_block`][check-block], the existing stateless block
   check. It establishes the encoding version and hash, the coinbase height, the compact target,
   and the Equihash solution, then recomputes the Merkle root. The individual rules live in
   [`block::check`][block-check].
-- **Reservation** — [`BlockRangeRequest::expected_hash`][bs-expected-hash]
-  - one live `GetBlocks` range expecting this header hash
-  - consumes that hash's part of the reservation
-- **Unique**
-  - key = expected header hash
-  - scope = reservation
-  - capacity = reserved count
-  - window = reservation lifetime
-  - on_repeat = `Drop`
 
 The receiver matches a `Block` by hashing its header and comparing that hash with the committed
-header hashes expected by live ranges. A block whose hash matches no live expectation MUST return
-`Disconnect`. The publisher MUST send the blocks of a range in ascending height order. The
-reservation identity commits to a header that header sync already validated, so Verify re-checks
-Equihash and the target only as defense in depth; an implementation MAY skip both checks when the
-header bytes hash to the expected identity. Block sync takes that option today: it matches the hash
-at [`peer_routine`][bs-expected-hash] and leaves
+header hashes expected by live ranges. A block that does not match the next expected hash of exactly
+one live range MUST return `Disconnect`. The publisher MUST send the blocks of a range in ascending
+height order. The reservation identity commits to a header that header sync already validated, so
+Verify re-checks Equihash and the target only as defense in depth. An implementation MAY skip both
+checks when the header bytes hash to the expected identity. Block sync takes that option today: it
+matches the hash at [`peer_routine`][bs-expected-hash] and leaves
 [`CheckpointVerifier::check_block`][check-block] to run downstream.
 
 #### `BlocksDone` — Response, discriminator 4
 
 - **Frame**
-  - payload cap = 8 bytes
+  - payload cap = 9 bytes
 - **Decode** — [`BlockSyncMessage::decode`][bs-decode], [`validate_block_count`][bs-count]
   - `start_height <= Height::MAX`
   - returned = 1..=128
   - exact consumption
 - **Reservation**
   - live `GetBlocks` range with this `start_height`
+  - `returned` equals the number of blocks consumed from the range and does not exceed its requested
+    count
   - consumes the terminal part and closes the reservation
 
 [`validate_block_count`][bs-count] rejects zero, so `BlocksDone` reports at least one block. A peer
@@ -746,31 +764,41 @@ peer that serves no blocks for heights inside its advertised servable range.
 #### `RangeUnavailable` — Response, discriminator 5
 
 - **Frame**
-  - payload cap = 8 bytes
+  - payload cap = 9 bytes
 - **Decode** — [`BlockSyncMessage::decode`][bs-decode], [`validate_block_count`][bs-count]
   - `start_height <= Height::MAX`
   - count = 1..=128
   - exact consumption
 - **Reservation**
-  - live `GetBlocks` range with this `start_height`
+  - live `GetBlocks` range with this `start_height` and requested count
+  - no block has been consumed from the range
+  - `count` equals the requested count
   - consumes the terminal part and closes the reservation
 
 The handler MUST requeue the range. A retry policy MAY avoid this peer for the immediate retry.
 
-### Block sync — stream 6, version 3 (planned)
+### Block sync successor (planned)
 
-Version 3 names bodies by header hash, the same identity header sync already uses. Each requested
-item carries an optional hash beside its height. When a request supplies a hash, the returned body
-MUST hash to that value; a body that does not MUST return `Disconnect`. When a request omits the
-hash, height alone identifies the item and version 2 behavior applies.
+A successor version should identify each request with a receiver-chosen nonzero request ID and name
+each requested body by header hash. Every body and terminal response must echo the request ID. Those
+fields would remove version 2's overlap restriction and bind each body to the header chain that the
+requester selected.
 
-The hash removes version 2's restriction against two live ranges over the same heights. Two ranges
-on one connection MAY cover the same heights when each supplies a distinct hash, because the hash
-correlates every body and every terminal response to exactly one range. Two live ranges that cover
-the same heights without hashes remain a violation, because nothing separates their terminal
-responses.
+This section is non-normative. The successor message set, encoding, caps, reservation rules, and
+work bounds remain unspecified. Implementations MUST support only version 2 until a separate change
+defines that complete wire contract.
 
-This section is a placeholder. The message set, its caps, and its budgets are not yet specified.
+## Parameters to validate
+
+The wire caps and reservation identities follow from the message encodings. The policy parameters
+below remain candidate values while this specification has first-draft status:
+
+| Parameters | Evidence required before implementation |
+| --- | --- |
+| Cadence capacities and refill rates | Honest-node traces with connect bursts and scheduling jitter, plus a flood test that reaches `Disconnect` within bounded work |
+| `REQUEST_OVERHEAD`, Work capacities, and Work refill rates | CPU, lock, storage, and egress measurements at the maximum peer count; a liveness test for the largest legal request |
+| Header credit, cursor-ring size, and `HS_PUSH_DEADLINE` | Model traces for open, grant, close, crossing updates, reorganization, and slow but conformant links |
+| Incomplete-frame deadline and queued-response byte bound | Transport buffer accounting and partial-frame and non-reading-peer tests |
 
 ## Conformance tests
 

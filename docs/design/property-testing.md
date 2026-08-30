@@ -21,7 +21,7 @@ combinations that no developer wrote by hand.
 
 When a scenario fails, the property-testing framework reduces it to a minimal failing test case. It
 removes actions and simplifies values while preserving the failure. Property-testing libraries call
-this process *shrinking*. It can reduce a long execution to a partial length prefix followed by a
+this process _shrinking_. It can reduce a long execution to a partial length prefix followed by a
 timeout. The runner can replay that test case exactly and preserve it as a regression test.
 
 ## Architecture
@@ -105,6 +105,33 @@ controlled concurrency, and transport confidence.
 | Deterministic system tests | Exercise production protocol logic under generated failures and schedules |
 | Real transport checks | Validate the production adapter and transport boundary |
 
+## Regulation properties
+
+The regulation suite separates conformant scenarios from adversarial scenarios. A conformant
+generator creates only actions that satisfy the sender obligations in the specification. No action
+in that suite may produce `Disconnect`. An adversarial generator may violate one rule at a time and
+checks the declared verdict for that rule. Keeping the suites separate prevents a shrinker from
+turning a conformant case into a malformed case with a different expected result.
+
+Each message declaration supplies its wire bounds and valid-value strategy. The property harness
+must not maintain a second list of message caps. It checks these properties:
+
+- every legal message round-trips through one canonical encoding within its frame cap
+- every bounded payload produces a decode result without a panic or an allocation above its cap
+- every admitted response consumes exactly one live reservation or one unconsumed range part
+- scheduler reassignment, finality changes, and local interest changes do not remove reservations
+- each Work charge is applied once, each refund is applied once, and each concurrency slot is
+  released once on every terminal path
+- per-peer filter, reservation, delayed-frame, and queued-response state stays within its declared
+  capacity
+- delaying one peer does not stop another peer or service stream
+- two runs of the same scenario produce the same verdicts, effects, and final resource state
+
+The first model does not need a general task scheduler. It represents only observable admission
+events: receive a frame or frame fragment, advance monotonic time, refill or refund Work, complete or
+fail a handler, reassign work, and close a connection. A later slice may add explicit task choices
+when a property depends on their order.
+
 ## CI profiles
 
 Fast feedback and broad exploration need different case counts, so property tests run under three
@@ -119,10 +146,12 @@ Each slice sets its own case counts from measured runtime.
 
 ## Rollout
 
-The native control handshake will provide the first protocol slice. It includes two peers, framing,
-deadlines, shared state, and resource cleanup without the topology and reservation state of a
-reactor. This scope can validate the architecture before Zakura commits to a deterministic backend.
+Start with pure declaration and codec properties for all 14 messages. Next, model one existing
+block-sync version 2 range exchange from `GetBlocks` through its terminal response. That slice
+exercises Work, range reservations, duplicate and out-of-order bodies, reassignment, terminal
+validation, and cleanup without depending on the planned header subscription.
 
-The next slice will add one regulated reactor message. It will test whether the same scenario,
-model, oracle, and trace contracts extend beyond connection setup. Later work can add more peers,
-links, contention, partitions, and crash recovery only when a property requires them.
+Run selected minimized block-sync cases through the real transport adapter after the model and
+production admission state agree. Add the header subscription only after its version 9 wire contract
+is final. Add more peers, task choices, partitions, and crash recovery only when a named property
+requires them.

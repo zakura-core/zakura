@@ -38,6 +38,7 @@ pub use identity::{
     AuxObservationId, BodyWorkEpoch, BranchId, CounterExhausted, EvidenceId, FinalityEpoch,
     HeaderGeneration, HeaderId, OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration,
 };
+pub(crate) use transition::semantic_payload_fingerprint;
 pub use transition::*;
 pub use validation::{
     infer_height, prepare_headers, validate_commitment_structure, validate_compact_target,

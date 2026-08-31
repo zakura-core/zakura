@@ -5,8 +5,8 @@ use zakura_chain::block;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AuxiliaryInputFingerprint, EngineSnapshot, Frontier, SourceId, StoreError,
-    UntrustedAuxDeliveryRow, MAX_AUX_DELIVERIES_PER_HEADER_V1,
+    semantic_payload_fingerprint, AuxiliaryInputFingerprint, EngineSnapshot, Frontier, SourceId,
+    StoreError, UntrustedAuxDeliveryRow, MAX_AUX_DELIVERIES_PER_HEADER_V1,
 };
 
 /// Maximum hashes in one v8 header locator.
@@ -23,7 +23,7 @@ pub struct HeaderLocator(Vec<Frontier>);
 pub struct AuxiliaryRequirementEpisode([u8; 32]);
 
 impl AuxiliaryRequirementEpisode {
-    /// Derive one episode from the exact target and its durable rejected or disputed inputs.
+    /// Derive one episode from the exact target and every durable semantic input and outcome.
     fn for_target(
         target: Frontier,
         boundary_hash: Option<block::Hash>,
@@ -32,7 +32,6 @@ impl AuxiliaryRequirementEpisode {
         let mut constraints: Vec<[u8; 32]> = rows
             .iter()
             .copied()
-            .filter(|row| matches!(row.outcome_status_code(), 2 | 3))
             .map(|row| {
                 let mut hasher = Sha256::new();
                 hasher.update(b"zakura-vct-auxiliary-requirement-constraint-v1");
@@ -97,12 +96,18 @@ pub struct VctRepairContext {
     pub locator: HeaderLocator,
     /// Durable evidence episode that owns this replacement.
     pub episode: AuxiliaryRequirementEpisode,
+    /// State version that supplied this atomic repair context.
+    pub state_version: crate::StateVersion,
     /// Selected successor that supplies the applicable authentication boundary.
     pub boundary_hash: Option<block::Hash>,
+    /// Whether current committed state can admit one distinct rooted payload.
+    pub admission_capacity_available: bool,
     /// Semantic inputs that durable rejection or dispute evidence excludes from replacement.
-    excluded_inputs: Vec<AuxiliaryInputFingerprint>,
+    excluded_inputs: Box<[AuxiliaryInputFingerprint]>,
+    /// Every rooted semantic payload already retained for the target.
+    retained_payloads: Box<[[u8; 32]]>,
     /// Sources that already supplied one retained rooted payload for this target.
-    retained_sources: Vec<SourceId>,
+    retained_sources: Box<[SourceId]>,
 }
 
 impl VctRepairContext {
@@ -116,20 +121,26 @@ impl VctRepairContext {
             target,
             locator,
             episode: AuxiliaryRequirementEpisode::for_target(target, boundary_hash, &[]),
+            state_version: crate::StateVersion::new(0),
             boundary_hash,
-            excluded_inputs: Vec::new(),
-            retained_sources: Vec::new(),
+            admission_capacity_available: true,
+            excluded_inputs: Box::new([]),
+            retained_payloads: Box::new([]),
+            retained_sources: Box::new([]),
         }
     }
 
     /// Build a repair claim from one selected target and its durable auxiliary outcome rows.
     ///
-    /// The claim uses rejected rows only as negative recovery constraints. It does not promote a
-    /// recovered outcome into authenticated engine state.
+    /// The claim uses rejected rows as negative recovery constraints. Every retained row binds the
+    /// episode and prevents an idempotent delivery replay from completing the repair. The claim
+    /// does not promote a recovered outcome into authenticated engine state.
     pub fn from_durable_rows(
         target: Frontier,
         locator: HeaderLocator,
+        state_version: crate::StateVersion,
         boundary_hash: Option<block::Hash>,
+        admission_capacity_available: bool,
         rows: &[UntrustedAuxDeliveryRow],
     ) -> Result<Self, StoreError> {
         Self::validate_durable_rows(target, rows)?;
@@ -144,6 +155,16 @@ impl VctRepairContext {
             .collect();
         excluded_inputs.sort_unstable();
         excluded_inputs.dedup();
+        let mut retained_payloads: Vec<_> = rows
+            .iter()
+            .filter_map(|row| {
+                row.delivery()
+                    .tree_aux
+                    .map(|record| semantic_payload_fingerprint(target.hash, Some(record)))
+            })
+            .collect();
+        retained_payloads.sort_unstable();
+        retained_payloads.dedup();
         let mut retained_sources: Vec<_> = rows
             .iter()
             .filter(|row| row.delivery().tree_aux.is_some())
@@ -155,9 +176,12 @@ impl VctRepairContext {
             target,
             locator,
             episode: AuxiliaryRequirementEpisode::for_target(target, boundary_hash, rows),
+            state_version,
             boundary_hash,
-            excluded_inputs,
-            retained_sources,
+            admission_capacity_available,
+            excluded_inputs: excluded_inputs.into_boxed_slice(),
+            retained_payloads: retained_payloads.into_boxed_slice(),
+            retained_sources: retained_sources.into_boxed_slice(),
         })
     }
 
@@ -220,6 +244,12 @@ impl VctRepairContext {
         let fingerprint =
             AuxiliaryInputFingerprint::new(self.target.hash, input, self.boundary_hash);
         self.excluded_inputs.binary_search(&fingerprint).is_ok()
+    }
+
+    /// Return whether state already retains this semantic payload under any outcome boundary.
+    pub fn retains_payload(&self, input: crate::TreeAuxRecordV1) -> bool {
+        let fingerprint = semantic_payload_fingerprint(self.target.hash, Some(input));
+        self.retained_payloads.binary_search(&fingerprint).is_ok()
     }
 
     /// Return whether this source already supplied one retained rooted payload for the target.
@@ -462,27 +492,35 @@ mod tests {
         let first = VctRepairContext::from_durable_rows(
             target,
             locator.clone(),
+            StateVersion::new(1),
             boundary_hash,
+            true,
             &[rejected],
         )
         .expect("the rejected row is coherent");
         let second = VctRepairContext::from_durable_rows(
             target,
             locator.clone(),
+            StateVersion::new(1),
             boundary_hash,
+            true,
             &[same_input_new_transport],
         )
         .expect("the replacement transport row is coherent");
         assert!(first.excludes(record));
+        assert!(first.retains_payload(record));
         assert!(first.retains_source(rejected.delivery().source));
         assert!(second.excludes(record));
+        assert!(second.retains_payload(record));
         assert!(second.retains_source(same_input_new_transport.delivery().source));
         assert!(!first.retains_source(same_input_new_transport.delivery().source));
         assert_eq!(first.episode, second.episode);
         let duplicate_semantic_evidence = VctRepairContext::from_durable_rows(
             target,
             locator.clone(),
+            StateVersion::new(1),
             boundary_hash,
+            true,
             &[same_input_new_transport, rejected],
         )
         .expect("duplicate semantic evidence under distinct transport is coherent");
@@ -491,7 +529,9 @@ mod tests {
         let changed_boundary = VctRepairContext::from_durable_rows(
             target,
             locator.clone(),
+            StateVersion::new(1),
             Some(block::Hash([12; 32])),
+            true,
             &[rejected],
         )
         .expect("the old rejection remains coherent under a new selected boundary");
@@ -507,7 +547,9 @@ mod tests {
         let disputed = VctRepairContext::from_durable_rows(
             target,
             locator,
+            StateVersion::new(1),
             Some(block::Hash([16; 32])),
+            true,
             &[disputed],
         )
         .expect("the disputed row is coherent");

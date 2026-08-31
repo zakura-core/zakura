@@ -1022,7 +1022,6 @@ fn vct_resource_refusal_waits_for_a_newer_committed_state() {
         7,
         HeaderTargetPhase::Applying,
     );
-
     reactor.handle_header_target_admission_ready(
         peer.clone(),
         source,
@@ -1055,14 +1054,88 @@ fn vct_resource_refusal_waits_for_a_newer_committed_state() {
 }
 
 #[test]
+fn vct_auxiliary_capacity_refusal_waits_without_timed_replay() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, mut actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the capacity refusal fixture builds");
+    let peer = peer();
+    let (source, owner, context) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Applying,
+    );
+    let repair_height = context.target.height;
+
+    reactor.handle_header_target_admission_ready(
+        peer.clone(),
+        source,
+        owner,
+        HeaderTargetAdmissionResult::Failed(std::sync::Arc::new(
+            zakura_header_chain::HeaderChainError::auxiliary_capacity(None),
+        )),
+    );
+
+    let task = reactor
+        .vct_repair
+        .current()
+        .expect("the capacity refusal keeps the repair requirement");
+    assert_eq!(
+        task.state,
+        RepairPolicyState::StateBlocked {
+            context,
+            state_version: snapshot.state_version,
+        }
+    );
+    assert_eq!(task.attempts, 1);
+    assert!(task.tried_sources.is_empty());
+    assert!(task.next_deadline().is_none());
+    assert!(reactor.peer_work_queue.active(&peer).is_none());
+
+    reactor.vct_repair_status = zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: repair_height,
+        },
+        generation: 11,
+    };
+    let mut advanced = snapshot;
+    advanced.state_version = advanced
+        .state_version
+        .checked_next()
+        .expect("the committed state version advances");
+    advanced.frontiers.header_best = zakura_header_chain::Frontier::new(
+        repair_height,
+        owner.header_authority().branch.target_tip_hash,
+    );
+    reactor.observe_latest_committed_snapshot(advanced);
+    let actions: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            HeaderPortOperation::QueryVctRepairContext {
+                owner: query_owner,
+                ..
+            } if *query_owner == owner.body_owner().expect("the repair owner is a body owner")
+        )),
+        "new committed state must query the blocked repair context: {actions:?}; task: {:?}",
+        reactor.vct_repair.current()
+    );
+}
+
+#[test]
 fn vct_send_failures_have_explicit_attribution() {
     assert_eq!(
         vct_send_retry_attribution(&OrderedSendError::Full),
-        VctRepairRetryAttribution::Supplier
+        VctRepairRetryAttribution::Local
     );
     assert_eq!(
         vct_send_retry_attribution(&OrderedSendError::Closed),
-        VctRepairRetryAttribution::Supplier
+        VctRepairRetryAttribution::Local
     );
     assert_eq!(
         vct_send_retry_attribution(&OrderedSendError::Encode("fixture failure".into())),
@@ -1262,7 +1335,9 @@ fn retained_rooted_supplier_is_skipped_for_an_untried_supplier() {
     fixture.context = zakura_header_chain::VctRepairContext::from_durable_rows(
         fixture.target,
         zakura_header_chain::HeaderLocator::for_continuation(fixture.anchor),
+        fixture.snapshot.state_version,
         None,
+        true,
         &[zakura_header_chain::UntrustedAuxDeliveryRow::new(
             retained,
             0,
@@ -1520,7 +1595,7 @@ fn replacement_and_disconnect_retain_owned_vct_local_operation() {
 }
 
 #[test]
-fn send_failures_do_not_repeat_suppliers_in_the_same_episode() {
+fn local_send_failures_back_off_without_consuming_a_supplier() {
     let mut fixture = ReadyVctRepairFixture::new();
     let (peers, outbounds) = fixture.connect(&[1, 2, 3, 4], 7);
     fixture.advertise(&peers, 7);
@@ -1534,9 +1609,9 @@ fn send_failures_do_not_repeat_suppliers_in_the_same_episode() {
         .vct_repair
         .current()
         .expect("the repair remains");
-    assert!(matches!(task.state, RepairPolicyState::Ready { .. }));
-    assert_eq!(task.tried_sources.len(), 4);
-    assert_eq!(task.attempts, 4);
+    assert!(matches!(task.state, RepairPolicyState::LocalBackoff { .. }));
+    assert!(task.tried_sources.is_empty());
+    assert_eq!(task.attempts, 1);
     assert_eq!(
         fixture.reactor.vct_supplier_order,
         [
@@ -1551,7 +1626,7 @@ fn send_failures_do_not_repeat_suppliers_in_the_same_episode() {
     let stall = fixture
         .reactor
         .vct_repair_stall
-        .expect("send failures start the stall clock");
+        .expect("the local send failure starts the stall clock");
 
     fixture
         .reactor
@@ -1566,9 +1641,9 @@ fn send_failures_do_not_repeat_suppliers_in_the_same_episode() {
         .vct_repair
         .current()
         .expect("the repair remains");
-    assert!(matches!(task.state, RepairPolicyState::Ready { .. }));
-    assert_eq!(task.tried_sources.len(), 4);
-    assert_eq!(task.attempts, 4);
+    assert!(matches!(task.state, RepairPolicyState::LocalBackoff { .. }));
+    assert!(task.tried_sources.is_empty());
+    assert_eq!(task.attempts, 2);
     assert_eq!(
         fixture.reactor.vct_supplier_order,
         [
@@ -1584,7 +1659,7 @@ fn send_failures_do_not_repeat_suppliers_in_the_same_episode() {
         fixture
             .reactor
             .vct_repair_stall
-            .expect("the repeated scheduling check preserves the stall clock")
+            .expect("the bounded retry preserves the stall clock")
             .since,
         stall.since
     );

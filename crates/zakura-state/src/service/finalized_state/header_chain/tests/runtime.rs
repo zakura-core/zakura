@@ -350,6 +350,7 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
 
     assert_ne!(recovered.episode, before.episode);
     assert!(recovered.excludes(input));
+    assert!(recovered.retains_payload(input));
     assert!(recovered.retains_source(rejected.source));
 
     let parent = Frontier::new(path[2].height, path[2].hash);
@@ -496,6 +497,20 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
         .expect("the target delivery rows remain readable")
         .iter()
         .all(|delivery| delivery.delivery_id != same_source_replacement.delivery_id));
+    let duplicate_input = AuxDelivery::new(
+        EvidenceId::from_digest([0x99; 32]),
+        target.hash,
+        source,
+        owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(input),
+    );
+    assert!(matches!(
+        runtime
+            .apply(repair_request(recovered.episode, duplicate_input), &context)
+            .expect("a retained semantic input cannot complete the repair again"),
+        ApplyResult::Stale(_)
+    ));
     assert!(matches!(
         runtime
             .apply(repair_request(recovered.episode, replacement), &context)

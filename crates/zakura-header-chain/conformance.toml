@@ -742,7 +742,7 @@ id = "LC-AUX-07"
 name = "Authoritative repair progress"
 status = "implemented"
 owner = "zakura_state::service::finalized_state::HeaderChainRuntime"
-tests = ["IN-06::repair_context_reconstructs_rejected_input_after_engine_hydration", "IN-06::supplier_failures_rotate_to_an_untried_fourth_supplier_without_repeating", "IN-06::send_failures_do_not_repeat_suppliers_in_the_same_episode", "IN-06::retained_rooted_supplier_is_skipped_for_an_untried_supplier", "IN-06::supplier_history_bound_fails_closed_without_clearing_the_episode", "IN-06::vct_resource_refusal_waits_for_a_newer_committed_state"]
+tests = ["IN-06::repair_context_reconstructs_rejected_input_after_engine_hydration", "IN-06::supplier_failures_rotate_to_an_untried_fourth_supplier_without_repeating", "IN-06::local_send_failures_back_off_without_consuming_a_supplier", "IN-06::retained_rooted_supplier_is_skipped_for_an_untried_supplier", "IN-06::supplier_history_bound_fails_closed_without_clearing_the_episode", "IN-06::context_without_admission_capacity_waits_without_a_wire_attempt", "IN-06::vct_auxiliary_capacity_refusal_waits_without_timed_replay", "IN-06::vct_resource_refusal_waits_for_a_newer_committed_state"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

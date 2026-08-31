@@ -446,8 +446,9 @@ fn vct_error_retry(
 
 fn vct_send_retry_attribution(error: &OrderedSendError) -> VctRepairRetryAttribution {
     match error {
-        OrderedSendError::Full | OrderedSendError::Closed => VctRepairRetryAttribution::Supplier,
-        OrderedSendError::Encode(_) => VctRepairRetryAttribution::Local,
+        OrderedSendError::Full | OrderedSendError::Closed | OrderedSendError::Encode(_) => {
+            VctRepairRetryAttribution::Local
+        }
     }
 }
 
@@ -1418,7 +1419,7 @@ impl HeaderSyncReactor {
                 };
                 context.target == *selected_target
                     && context.episode == *episode
-                    && context.excludes(input)
+                    && (context.excludes(input) || context.retains_payload(input))
             });
             if excluded {
                 metrics::counter!("sync.header.vct.repair.excluded_input.total").increment(1);
@@ -1835,10 +1836,47 @@ impl HeaderSyncReactor {
                     metrics::counter!("sync.header.vct.repair.admitted.total").increment(1);
                 }
                 HeaderTargetAdmissionResult::Failed(error) => {
-                    self.retry_vct_repair(
-                        repair_owner,
-                        vct_error_retry(source, HeaderRequestTerminal::TargetRejected, &error),
-                    );
+                    if error.is_auxiliary_capacity_refusal() {
+                        let blocked_at = self
+                            .committed_snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.state_version)
+                            .or_else(|| {
+                                self.vct_repair.get(repair_owner).and_then(|task| {
+                                    let RepairPolicyState::Assigned { context } = &task.state
+                                    else {
+                                        return None;
+                                    };
+                                    Some(context.state_version)
+                                })
+                            });
+                        let blocked = blocked_at.is_some_and(|state_version| {
+                            self.vct_repair.get_mut(repair_owner).is_some_and(|task| {
+                                task.wait_for_state_change(state_version).is_ok()
+                            })
+                        });
+                        if blocked {
+                            if let Some(task) = self.vct_repair.get(repair_owner) {
+                                self.emit_vct_repair_state(
+                                    task,
+                                    "wait",
+                                    Some("auxiliary_capacity"),
+                                );
+                            }
+                        } else {
+                            self.retry_vct_repair(
+                                repair_owner,
+                                VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
+                            );
+                        }
+                        metrics::counter!("sync.header.vct.repair.auxiliary_capacity.total")
+                            .increment(1);
+                    } else {
+                        self.retry_vct_repair(
+                            repair_owner,
+                            vct_error_retry(source, HeaderRequestTerminal::TargetRejected, &error),
+                        );
+                    }
                     self.handle_typed_failure(peer, source, &error);
                 }
                 HeaderTargetAdmissionResult::ResourceStalled(receipt) => {
@@ -2873,6 +2911,7 @@ impl HeaderSyncReactor {
         let now = Instant::now();
         self.committed_snapshot = Some(snapshot);
         self.schedule_current_vct_repair();
+        self.request_vct_repair_context();
         for state in self.peer_state.values_mut() {
             match state.status_publisher.as_mut() {
                 Some(publisher) => publisher.observe(status.clone(), now),
@@ -3041,6 +3080,10 @@ impl HeaderSyncReactor {
         }
         match result {
             VctRepairContextResult::Resolved(context) => {
+                let current_state_version = self
+                    .committed_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.state_version);
                 if self
                     .vct_repair
                     .get_mut(owner)
@@ -3051,9 +3094,16 @@ impl HeaderSyncReactor {
                     self.vct_repair.remove(owner);
                     return;
                 }
+                if let Some(current_state_version) = current_state_version {
+                    self.vct_repair
+                        .get_mut(owner)
+                        .expect("the resolved repair remains owned")
+                        .observe_state_change(current_state_version);
+                }
                 if let Some(task) = self.vct_repair.get(owner) {
                     self.emit_vct_repair_state(task, "context_resolved", Some("resolved"));
                 }
+                self.request_vct_repair_context();
                 self.try_assign_vct_repair();
             }
             VctRepairContextResult::Stale => {

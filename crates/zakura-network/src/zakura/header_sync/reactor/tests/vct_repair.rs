@@ -388,6 +388,7 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         .state_version
         .checked_next()
         .expect("the fixture state version can advance");
+    let after_delivery_state_version = after_delivery.state_version;
     snapshots_tx
         .send(Some(after_delivery))
         .expect("the committed metadata-only snapshot is observed");
@@ -458,7 +459,9 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
                 zakura_header_chain::VctRepairContext::from_durable_rows(
                     repair_header,
                     zakura_header_chain::HeaderLocator::for_continuation(anchor),
+                    after_delivery_state_version,
                     Some(selected_tip.hash),
+                    true,
                     &[zakura_header_chain::UntrustedAuxDeliveryRow::new(
                         delivery,
                         2,

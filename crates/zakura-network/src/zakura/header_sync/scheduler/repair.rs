@@ -124,7 +124,14 @@ impl RepairRequirement {
         if context.target.height != self.height {
             return Err(RepairPolicyError::TargetMismatch);
         }
-        self.state = RepairPolicyState::Ready { context };
+        self.state = if context.admission_capacity_available {
+            RepairPolicyState::Ready { context }
+        } else {
+            RepairPolicyState::StateBlocked {
+                state_version: context.state_version,
+                context,
+            }
+        };
         Ok(())
     }
 
@@ -556,6 +563,35 @@ mod tests {
 
         task.observe_state_change(StateVersion::new(4));
         assert_eq!(task.state, RepairPolicyState::NeedsContext);
+    }
+
+    #[test]
+    fn context_without_admission_capacity_waits_without_a_wire_attempt() {
+        let mut task = task(&snapshot());
+        let available = context();
+        let blocked = VctRepairContext::from_durable_rows(
+            available.target,
+            available.locator,
+            StateVersion::new(3),
+            available.boundary_hash,
+            false,
+            &[],
+        )
+        .expect("an empty durable input set is coherent");
+        mark_context_requested(&mut task);
+        task.resolve(blocked.clone())
+            .expect("the exact context resolves into a state wait");
+
+        assert_eq!(
+            task.state,
+            RepairPolicyState::StateBlocked {
+                context: blocked,
+                state_version: StateVersion::new(3),
+            }
+        );
+        assert_eq!(task.attempts, 0);
+        assert!(task.tried_sources.is_empty());
+        assert!(task.next_deadline().is_none());
     }
 
     #[test]

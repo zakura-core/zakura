@@ -379,7 +379,7 @@ impl HeaderChainEngine {
     }
 
     /// Return the total number of retained auxiliary deliveries.
-    pub(crate) fn aux_delivery_count(&self) -> usize {
+    pub fn aux_delivery_count(&self) -> usize {
         self.aux_deliveries.values().map(Vec::len).sum()
     }
 

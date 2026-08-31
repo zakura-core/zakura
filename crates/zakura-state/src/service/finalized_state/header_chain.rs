@@ -1777,13 +1777,24 @@ impl HeaderChainReader {
             } else {
                 None
             };
-        let _deliveries = self.coherent_aux_deliveries(&target)?;
+        let deliveries = self.coherent_aux_deliveries(&target)?;
         let durable_rows = self.store.untrusted_aux_deliveries(target_hash)?;
+        let total_delivery_count = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .aux_delivery_count();
+        let admission_capacity_available = deliveries.len()
+            < self.config.limits.max_aux_deliveries_per_header.get()
+            && total_delivery_count < self.config.limits.max_aux_deliveries_total.get()
+            && !snapshot.alarms.resource_stalled;
         Ok(Some(
             zakura_header_chain::VctRepairContext::from_durable_rows(
                 selected_target,
                 HeaderLocator::for_continuation(parent),
+                snapshot.state_version,
                 boundary_hash,
+                admission_capacity_available,
                 &durable_rows,
             )?,
         ))
@@ -3063,7 +3074,13 @@ impl HeaderChainRuntime {
                 let current = zakura_header_chain::VctRepairContext::from_durable_rows(
                     selected_target,
                     HeaderLocator::for_continuation(common_ancestor),
+                    before.state_version,
                     boundary_hash,
+                    live_deliveries.len()
+                        < context.config.limits.max_aux_deliveries_per_header.get()
+                        && transition_engine.aux_delivery_count()
+                            < context.config.limits.max_aux_deliveries_total.get()
+                        && !before.alarms.resource_stalled,
                     &durable_rows,
                 )?;
                 if current.episode != episode {
@@ -3078,7 +3095,7 @@ impl HeaderChainRuntime {
                     let repeats_retained_payload = live_deliveries.iter().any(|retained| {
                         retained.semantic_fingerprint() == delivery.semantic_fingerprint()
                     });
-                    if current.retains_source(delivery.source) && !repeats_retained_payload {
+                    if repeats_retained_payload || current.retains_source(delivery.source) {
                         return Ok(ApplyResult::Stale(StaleReceipt {
                             current_version: before.state_version,
                             branch,

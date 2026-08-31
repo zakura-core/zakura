@@ -12,7 +12,7 @@ use crate::{AuxObservationId, EvidenceId, HeaderSyncWorkOwner, SourceId};
 
 use super::error::TransitionTypeError;
 
-fn semantic_payload_fingerprint(
+pub(crate) fn semantic_payload_fingerprint(
     header_hash: block::Hash,
     tree_aux: Option<TreeAuxRecordV1>,
 ) -> [u8; 32] {

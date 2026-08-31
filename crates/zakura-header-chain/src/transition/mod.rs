@@ -31,4 +31,5 @@ pub use recovery::{
     RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead, StoreAuditSnapshot,
     ValidationContextRecord,
 };
+pub(crate) use types::semantic_payload_fingerprint;
 pub use types::*;

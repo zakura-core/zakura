@@ -62,6 +62,8 @@ impl QueuedBlocks {
     ///
     /// If a block with the same hash is already queued, this method keeps the
     /// existing block and ignores `new`.
+    /// The ignored request is dropped without sending a result, so its response
+    /// receiver observes a closed channel.
     #[instrument(skip(self), fields(height = ?new.0.height, hash = %new.0.hash))]
     pub fn queue(&mut self, new: QueuedSemanticallyVerified) {
         let new_hash = new.0.hash;

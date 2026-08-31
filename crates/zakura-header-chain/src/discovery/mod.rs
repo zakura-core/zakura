@@ -2,7 +2,12 @@
 
 use zakura_chain::block;
 
-use crate::{EngineSnapshot, Frontier, StoreError};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    AuxiliaryInputFingerprint, EngineSnapshot, Frontier, StoreError, UntrustedAuxDeliveryRow,
+    MAX_AUX_DELIVERIES_PER_HEADER_V1,
+};
 
 /// Maximum hashes in one v8 header locator.
 pub const MAX_HEADER_LOCATOR_HASHES: usize = 13;
@@ -13,6 +18,41 @@ const SELECTED_PATH_OFFSETS: [u32; 12] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 5
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderLocator(Vec<Frontier>);
 
+/// Durable identity of the auxiliary evidence that constrains one repair.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub struct AuxiliaryRequirementEpisode([u8; 32]);
+
+impl AuxiliaryRequirementEpisode {
+    /// Derive one episode from the exact target and its durable rejected or disputed inputs.
+    fn for_target(target: Frontier, rows: &[UntrustedAuxDeliveryRow]) -> Self {
+        let mut constrained: Vec<_> = rows
+            .iter()
+            .copied()
+            .filter(|row| matches!(row.outcome_status_code(), 2 | 3))
+            .collect();
+        constrained.sort_unstable_by_key(|row| row.delivery().delivery_id);
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-vct-auxiliary-requirement-episode-v1");
+        hasher.update(target.height.0.to_le_bytes());
+        hasher.update(target.hash.0);
+        for row in constrained {
+            let delivery = row.delivery();
+            hasher.update([row.outcome_status_code()]);
+            if let Some(record) = delivery.tree_aux {
+                hasher.update(AuxiliaryInputFingerprint::new(target.hash, record).digest());
+            }
+            for observation in row.observation_digests().into_iter().flatten() {
+                hasher.update(observation);
+            }
+            if let Some(boundary) = row.outcome_boundary_hash() {
+                hasher.update(boundary.0);
+            }
+        }
+        Self(hasher.finalize().into())
+    }
+}
+
 /// Exact selected-header request context for one auxiliary VCT repair.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VctRepairContext {
@@ -20,6 +60,80 @@ pub struct VctRepairContext {
     pub target: Frontier,
     /// Single-entry locator naming the target's direct selected predecessor.
     pub locator: HeaderLocator,
+    /// Durable evidence episode that owns this replacement.
+    pub episode: AuxiliaryRequirementEpisode,
+    /// Semantic inputs that durable rejection evidence excludes from replacement.
+    excluded_inputs: Vec<AuxiliaryInputFingerprint>,
+}
+
+impl VctRepairContext {
+    /// Build a repair claim before any durable rejection or dispute exists.
+    pub fn unconstrained(target: Frontier, locator: HeaderLocator) -> Self {
+        Self {
+            target,
+            locator,
+            episode: AuxiliaryRequirementEpisode::for_target(target, &[]),
+            excluded_inputs: Vec::new(),
+        }
+    }
+
+    /// Build a repair claim from one selected target and its durable auxiliary outcome rows.
+    ///
+    /// The claim uses rejected rows only as negative recovery constraints. It does not promote a
+    /// recovered outcome into authenticated engine state.
+    pub fn from_durable_rows(
+        target: Frontier,
+        locator: HeaderLocator,
+        rows: &[UntrustedAuxDeliveryRow],
+    ) -> Result<Self, StoreError> {
+        if rows.len() > MAX_AUX_DELIVERIES_PER_HEADER_V1 {
+            return Err(StoreError::Incoherent(
+                "VCT repair evidence exceeds the per-header auxiliary limit",
+            ));
+        }
+        let mut delivery_ids: Vec<_> = rows.iter().map(|row| row.delivery().delivery_id).collect();
+        delivery_ids.sort_unstable();
+        if delivery_ids.windows(2).any(|ids| ids[0] == ids[1])
+            || rows.iter().any(|row| {
+                let delivery = row.delivery();
+                delivery.header_hash != target.hash
+                    || delivery
+                        .promote_recovered_outcome(
+                            row.outcome_status_code(),
+                            row.observation_digests(),
+                            row.outcome_boundary_hash(),
+                        )
+                        .is_none()
+            })
+        {
+            return Err(StoreError::Incoherent(
+                "VCT repair evidence is malformed or names another target",
+            ));
+        }
+        let mut excluded_inputs: Vec<_> = rows
+            .iter()
+            .filter(|row| row.outcome_status_code() == 2)
+            .filter_map(|row| {
+                row.delivery()
+                    .tree_aux
+                    .map(|record| AuxiliaryInputFingerprint::new(target.hash, record))
+            })
+            .collect();
+        excluded_inputs.sort_unstable();
+        excluded_inputs.dedup();
+        Ok(Self {
+            target,
+            locator,
+            episode: AuxiliaryRequirementEpisode::for_target(target, rows),
+            excluded_inputs,
+        })
+    }
+
+    /// Return whether durable rejection evidence requires different semantic repair input.
+    pub fn excludes(&self, input: crate::TreeAuxRecordV1) -> bool {
+        let fingerprint = AuxiliaryInputFingerprint::new(self.target.hash, input);
+        self.excluded_inputs.binary_search(&fingerprint).is_ok()
+    }
 }
 
 impl HeaderLocator {
@@ -96,8 +210,11 @@ impl HeaderLocator {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use crate::{
-        AlarmSet, ChainScore, EngineMode, FrontierSet, HeaderGeneration, StateVersion, SuffixWork,
+        AlarmSet, AuxDelivery, BodySizeHint, BodyWorkAuthority, ChainScore, EngineMode, EvidenceId,
+        FrontierSet, HeaderGeneration, SourceId, StateVersion, SuffixWork, TreeAuxRecordV1,
         VerifiedGeneration,
     };
     use zakura_chain::work::difficulty::U256;
@@ -208,6 +325,71 @@ mod tests {
             Err(StoreError::Incoherent(
                 "selected locator height is absent from the selected projection"
             ))
+        );
+    }
+
+    #[test]
+    fn repair_context_excludes_rejected_semantic_input_without_transport_identity() {
+        let target = Frontier::new(block::Height(1), block::Hash([0x21; 32]));
+        let locator = HeaderLocator::for_continuation(snapshot(2, 0).frontiers.finalized);
+        let record = TreeAuxRecordV1 {
+            height: target.height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 1,
+            orchard_tx_count: 2,
+            ironwood_tx_count: 3,
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([4; 32]),
+        };
+        let owner = BodyWorkAuthority::for_snapshot(&snapshot(2, 0))
+            .bind(5, NonZeroU64::new(6).expect("six is nonzero"));
+        let delivery = |identity: u8| {
+            AuxDelivery::new(
+                EvidenceId::from_digest([identity; 32]),
+                target.hash,
+                SourceId::from_digest([identity.wrapping_add(1); 32]),
+                owner.into(),
+                BodySizeHint::Unknown,
+                Some(record),
+            )
+        };
+        let rejected = UntrustedAuxDeliveryRow::new(
+            delivery(7),
+            2,
+            [Some([8; 32]), None],
+            Some(block::Hash([9; 32])),
+        );
+        let same_input_new_transport = UntrustedAuxDeliveryRow::new(
+            delivery(10),
+            2,
+            [Some([11; 32]), None],
+            Some(block::Hash([12; 32])),
+        );
+        let first = VctRepairContext::from_durable_rows(target, locator.clone(), &[rejected])
+            .expect("the rejected row is coherent");
+        let second = VctRepairContext::from_durable_rows(
+            target,
+            locator.clone(),
+            &[same_input_new_transport],
+        )
+        .expect("the replacement transport row is coherent");
+        assert!(first.excludes(record));
+        assert!(second.excludes(record));
+        assert_ne!(first.episode, second.episode);
+
+        let disputed = UntrustedAuxDeliveryRow::new(
+            delivery(13),
+            3,
+            [Some([14; 32]), Some([15; 32])],
+            Some(block::Hash([16; 32])),
+        );
+        let disputed = VctRepairContext::from_durable_rows(target, locator, &[disputed])
+            .expect("the disputed row is coherent");
+        assert!(!disputed.excludes(record));
+        assert_ne!(
+            disputed.episode,
+            VctRepairContext::unconstrained(target, disputed.locator.clone()).episode
         );
     }
 }

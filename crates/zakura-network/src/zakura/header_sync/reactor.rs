@@ -324,6 +324,7 @@ enum HeaderRequestTerminal {
     Disconnected,
     LocalError,
     MalformedResponse,
+    RejectedAuxiliaryInput,
     RepairObsolete,
     ResourceStalled,
     SendError,
@@ -358,6 +359,7 @@ impl HeaderRequestTerminal {
             Self::Disconnected => "disconnected",
             Self::LocalError => "local_error",
             Self::MalformedResponse => "malformed_response",
+            Self::RejectedAuxiliaryInput => "rejected_auxiliary_input",
             Self::RepairObsolete => "repair_obsolete",
             Self::ResourceStalled => "resource_stalled",
             Self::SendError => "send_error",
@@ -375,6 +377,7 @@ impl HeaderRequestTerminal {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum VctRepairRetryAttribution {
     Supplier,
+    RejectedInput,
     Local,
 }
 
@@ -399,6 +402,14 @@ impl VctRepairRetry {
             source,
             terminal,
             attribution: VctRepairRetryAttribution::Local,
+        }
+    }
+
+    fn rejected_input(source: zakura_header_chain::SourceId) -> Self {
+        Self {
+            source,
+            terminal: HeaderRequestTerminal::RejectedAuxiliaryInput,
+            attribution: VctRepairRetryAttribution::RejectedInput,
         }
     }
 }
@@ -1375,6 +1386,24 @@ impl HeaderSyncReactor {
                 self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
                 return;
             }
+            let repair_owner = active
+                .owner
+                .body_owner()
+                .expect("an auxiliary repair has body authority");
+            let input = response.entries[0]
+                .tree_aux
+                .expect("the exact repair response has schema-1 auxiliary input");
+            let rejected = self.vct_repair.get(repair_owner).is_some_and(|task| {
+                let RepairPolicyState::Assigned { context } = &task.state else {
+                    return false;
+                };
+                context.target == *selected_target && context.excludes(input)
+            });
+            if rejected {
+                metrics::counter!("sync.header.vct.repair.rejected_input.total").increment(1);
+                self.retry_vct_repair(repair_owner, VctRepairRetry::rejected_input(active.source));
+                return;
+            }
         }
         if !active.matches_response_page(response.target_tip_hash, returned_ancestor) {
             self.retire_peer_work(&peer, HeaderRequestTerminal::MalformedResponse);
@@ -1993,12 +2022,16 @@ impl HeaderSyncReactor {
                 .get_mut(owner)
                 .is_some_and(|task| match retry.attribution {
                     VctRepairRetryAttribution::Supplier => task.retry(source).is_ok(),
+                    VctRepairRetryAttribution::RejectedInput => task.reject_input(source).is_ok(),
                     VctRepairRetryAttribution::Local => task
                         .defer_local_retry_until(now + VCT_REPAIR_RETRY_INTERVAL)
                         .is_ok(),
                 });
         if retry_scheduled {
-            if retry.attribution == VctRepairRetryAttribution::Supplier {
+            if matches!(
+                retry.attribution,
+                VctRepairRetryAttribution::Supplier | VctRepairRetryAttribution::RejectedInput
+            ) {
                 self.rotate_vct_supplier(source);
             }
             if let Some(task) = self.vct_repair.current().cloned() {
@@ -2007,6 +2040,7 @@ impl HeaderSyncReactor {
                     "retry",
                     Some(match retry.attribution {
                         VctRepairRetryAttribution::Supplier => "supplier_retry",
+                        VctRepairRetryAttribution::RejectedInput => "rejected_input",
                         VctRepairRetryAttribution::Local => "local_backoff",
                     }),
                 );
@@ -2019,13 +2053,19 @@ impl HeaderSyncReactor {
                             VctRepairRetryAttribution::Supplier => {
                                 VctRepairStallOutcome::SupplierFailure
                             }
+                            VctRepairRetryAttribution::RejectedInput => {
+                                VctRepairStallOutcome::SupplierFailure
+                            }
                             VctRepairRetryAttribution::Local => VctRepairStallOutcome::LocalFailure,
                         },
                         now,
                     );
                 }
             }
-            if retry.attribution == VctRepairRetryAttribution::Supplier {
+            if matches!(
+                retry.attribution,
+                VctRepairRetryAttribution::Supplier | VctRepairRetryAttribution::RejectedInput
+            ) {
                 self.try_assign_vct_repair();
             }
         }
@@ -3064,11 +3104,13 @@ impl HeaderSyncReactor {
                 VctRepairStallOutcome::SupplierCycleExhausted,
                 now,
             );
-            let _ = self
-                .vct_repair
-                .get_mut(task.owner)
-                .expect("the ready repair was cloned above")
-                .defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
+            if !task.rejected_input_observed {
+                let _ = self
+                    .vct_repair
+                    .get_mut(task.owner)
+                    .expect("the ready repair was cloned above")
+                    .defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
+            }
             return;
         }
         if candidates.is_empty() {
@@ -3079,11 +3121,13 @@ impl HeaderSyncReactor {
                 VctRepairStallOutcome::NoEligibleSupplier,
                 now,
             );
-            let _ = self
-                .vct_repair
-                .get_mut(task.owner)
-                .expect("the ready repair was cloned above")
-                .defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
+            if !task.rejected_input_observed {
+                let _ = self
+                    .vct_repair
+                    .get_mut(task.owner)
+                    .expect("the ready repair was cloned above")
+                    .defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
+            }
             return;
         }
         let mut local_capacity_unavailable = false;
@@ -3109,7 +3153,8 @@ impl HeaderSyncReactor {
                     self.emit_queue_send_failed(&peer, &session, "GetHeaders", &error, None);
                     rejections.send_failed += 1;
                     match vct_send_retry_attribution(&error) {
-                        VctRepairRetryAttribution::Supplier => {
+                        VctRepairRetryAttribution::Supplier
+                        | VctRepairRetryAttribution::RejectedInput => {
                             if let Some(current) = self.vct_repair.get_mut(task.owner) {
                                 let _ = current.record_failed_source(source);
                             }
@@ -3229,10 +3274,16 @@ impl HeaderSyncReactor {
                 self.note_vct_repair_stall(&current, predecessor, rejections, stall_outcome, now);
             }
         }
-        let _ = self
+        if !self
             .vct_repair
-            .get_mut(task.owner)
-            .and_then(|task| task.defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL).ok());
+            .get(task.owner)
+            .is_some_and(|task| task.rejected_input_observed && !local_capacity_unavailable)
+        {
+            let _ = self
+                .vct_repair
+                .get_mut(task.owner)
+                .and_then(|task| task.defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL).ok());
+        }
     }
 
     fn retire_obsolete_work(&mut self, snapshot: &zakura_header_chain::EngineSnapshot) {

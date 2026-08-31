@@ -388,6 +388,11 @@ pub(crate) fn select_vct_auxiliary_delivery(deliveries: Vec<AuxDelivery>) -> Opt
         })
 }
 
+/// Match durable base data and any outcome that the live engine still treats as authoritative.
+///
+/// Recovery deliberately demotes durable outcome claims to unauthenticated engine state. The
+/// durable row still constrains repair input, so a recovered unauthenticated delivery accepts a
+/// structurally validated outcome claim here.
 fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDeliveryRow) -> bool {
     let expected_base = AuxDelivery::new(
         authoritative.delivery_id,
@@ -397,10 +402,23 @@ fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDelive
         authoritative.body_size,
         authoritative.tree_aux,
     );
+    let authoritative_status = if authoritative.is_unauthenticated() {
+        0
+    } else if authoritative.is_authenticated() {
+        1
+    } else if authoritative.is_rejected() {
+        2
+    } else {
+        3
+    };
+    let authoritative_observations = authoritative
+        .observation_ids()
+        .map(|observation| observation.map(|observation| observation.digest()));
     row.delivery() == expected_base
-        && row.outcome_status_code() == 0
-        && row.observation_digests() == [None, None]
-        && row.outcome_boundary_hash().is_none()
+        && (authoritative.is_unauthenticated()
+            || (row.outcome_status_code() == authoritative_status
+                && row.observation_digests() == authoritative_observations
+                && row.outcome_boundary_hash() == authoritative.outcome_boundary_hash()))
 }
 
 /// Failure at the durable header-chain boundary.
@@ -1732,10 +1750,16 @@ impl HeaderChainReader {
             .into());
         }
         let parent = Frontier::new(parent_height, target.parent_hash);
-        Ok(Some(zakura_header_chain::VctRepairContext {
-            target: Frontier::new(height, target_hash),
-            locator: HeaderLocator::for_continuation(parent),
-        }))
+        let selected_target = Frontier::new(height, target_hash);
+        let _deliveries = self.coherent_aux_deliveries(&target)?;
+        let durable_rows = self.store.untrusted_aux_deliveries(target_hash)?;
+        Ok(Some(
+            zakura_header_chain::VctRepairContext::from_durable_rows(
+                selected_target,
+                HeaderLocator::for_continuation(parent),
+                &durable_rows,
+            )?,
+        ))
     }
 
     /// Commit a lease only if the branch has not moved since the caller read its snapshot.

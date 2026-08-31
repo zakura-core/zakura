@@ -173,10 +173,10 @@ fn seed_vct_active_request(
         repair_generation: 11,
     };
     active.phase = phase;
-    let context = zakura_header_chain::VctRepairContext {
+    let context = zakura_header_chain::VctRepairContext::unconstrained(
         target,
-        locator: zakura_header_chain::HeaderLocator::for_continuation(snapshot.frontiers.finalized),
-    };
+        zakura_header_chain::HeaderLocator::for_continuation(snapshot.frontiers.finalized),
+    );
     let mut task = RepairRequirement::new(owner, target.height, 11);
     task.state = RepairPolicyState::Assigned {
         context: context.clone(),
@@ -436,10 +436,10 @@ impl ReadyVctRepairFixture {
             INTERNAL_VCT_REPAIR_SESSION_ID,
             std::num::NonZeroU64::new(1).expect("one is nonzero"),
         );
-        let context = zakura_header_chain::VctRepairContext {
+        let context = zakura_header_chain::VctRepairContext::unconstrained(
             target,
-            locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-        };
+            zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        );
         Self {
             _handle: handle,
             reactor,
@@ -730,10 +730,10 @@ fn vct_request_timeout_keeps_required_work_and_rotates_the_supplier() {
     );
     let mut task = RepairRequirement::new(owner, target.height, 11);
     let deadline = Instant::now();
-    let context = zakura_header_chain::VctRepairContext {
+    let context = zakura_header_chain::VctRepairContext::unconstrained(
         target,
-        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-    };
+        zakura_header_chain::HeaderLocator::for_continuation(anchor),
+    );
     task.state = RepairPolicyState::Assigned {
         context: context.clone(),
     };
@@ -1047,10 +1047,10 @@ fn generation_stall_escalation_owns_a_maintenance_deadline() {
         INTERNAL_VCT_REPAIR_SESSION_ID,
         std::num::NonZeroU64::new(1).expect("one is nonzero"),
     );
-    let context = zakura_header_chain::VctRepairContext {
-        target: repair_target,
-        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-    };
+    let context = zakura_header_chain::VctRepairContext::unconstrained(
+        repair_target,
+        zakura_header_chain::HeaderLocator::for_continuation(anchor),
+    );
     let mut task = RepairRequirement::new(owner, repair_target.height, 11);
     task.state = RepairPolicyState::LocalBackoff {
         context,

@@ -268,6 +268,89 @@ fn reconciled_store_with_finalized_prefix() -> (
     (runtime, db, genesis, path)
 }
 
+#[test]
+fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
+    let (runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix();
+    let target = Frontier::new(path[3].height, path[3].hash);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(7, NonZeroU64::new(8).expect("eight is nonzero"));
+    let before = runtime
+        .reader()
+        .vct_repair_context(owner, target.height)
+        .expect("the initial repair context is coherent")
+        .expect("the retained selected target needs a repair context");
+    let input = zakura_header_chain::TreeAuxRecordV1 {
+        height: target.height,
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: 1,
+        orchard_tx_count: 2,
+        ironwood_tx_count: 3,
+        auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([4; 32]),
+    };
+    let rejected = AuxDelivery::new(
+        EvidenceId::from_digest([0x91; 32]),
+        target.hash,
+        SourceId::from_digest([0x92; 32]),
+        owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(input),
+    )
+    .test_only_with_outcome(2, [Some([0x93; 32]), None], Some(path[2].hash))
+    .expect("the rejected auxiliary outcome is coherent");
+    let mut target_node = runtime
+        .store
+        .header_node(target.hash)
+        .expect("the selected target row decodes")
+        .expect("the selected target remains retained");
+    target_node.aux_delivery_ids.push(rejected.delivery_id);
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_value(
+            &mut batch,
+            HEADER_NODE_BY_HASH,
+            target.hash.0,
+            &HeaderNodeDisk::from_domain(&target_node),
+        )
+        .expect("the selected target with rejection evidence encodes");
+    runtime
+        .store
+        .put_value(
+            &mut batch,
+            HEADER_AUX_DELIVERY,
+            HeaderAuxDeliveryKey {
+                header: target.hash,
+                delivery: rejected.delivery_id,
+            }
+            .as_bytes(),
+            &rejected,
+        )
+        .expect("the rejected auxiliary outcome encodes");
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the durable rejection fixture commits");
+
+    *runtime
+        .transition_engine
+        .lock()
+        .expect("the transition engine mutex is not poisoned") =
+        load_transition_engine(&runtime.store)
+            .expect("startup hydration reconstructs the durable delivery base");
+    let recovered = runtime
+        .reader()
+        .vct_repair_context(owner, target.height)
+        .expect("the recovered repair context is coherent")
+        .expect("the recovered selected target still needs repair");
+
+    assert_ne!(recovered.episode, before.episode);
+    assert!(recovered.excludes(input));
+}
+
 #[tokio::test(start_paused = true)]
 async fn retained_path_serves_a_locator_before_the_header_retention_window() {
     let (runtime, db, genesis, path) = reconciled_store_with_finalized_prefix();

@@ -84,6 +84,8 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
     pub attempts: u64,
     /// Suppliers already tried in the current cycle.
     pub tried_sources: HashSet<SourceId>,
+    /// Whether this episode observed an input that durable state already rejected.
+    pub rejected_input_observed: bool,
 }
 
 impl RepairRequirement {
@@ -96,6 +98,7 @@ impl RepairRequirement {
             state: RepairPolicyState::NeedsContext,
             attempts: 0,
             tried_sources: HashSet::new(),
+            rejected_input_observed: false,
         }
     }
 
@@ -171,6 +174,13 @@ impl RepairRequirement {
         Ok(())
     }
 
+    /// Rotate away from a supplier that returned durably rejected semantic input.
+    pub fn reject_input(&mut self, source: SourceId) -> Result<(), RepairPolicyError> {
+        self.retry(source)?;
+        self.rejected_input_observed = true;
+        Ok(())
+    }
+
     /// Record a supplier whose request could not be queued.
     pub fn record_failed_source(&mut self, source: SourceId) -> Result<(), RepairPolicyError> {
         if !matches!(self.state, RepairPolicyState::Ready { .. }) {
@@ -228,7 +238,9 @@ impl RepairRequirement {
                 self.state = RepairPolicyState::Ready {
                     context: context.clone(),
                 };
-                self.tried_sources.clear();
+                if !self.rejected_input_observed {
+                    self.tried_sources.clear();
+                }
             }
             RepairPolicyState::LocalBackoff { context, retry_at } if *retry_at <= now => {
                 self.state = RepairPolicyState::Ready {
@@ -393,13 +405,13 @@ mod tests {
     }
 
     fn context() -> VctRepairContext {
-        VctRepairContext {
-            target: Frontier::new(block::Height(19), hash(5)),
-            locator: zakura_header_chain::HeaderLocator::for_continuation(Frontier::new(
+        VctRepairContext::unconstrained(
+            Frontier::new(block::Height(19), hash(5)),
+            zakura_header_chain::HeaderLocator::for_continuation(Frontier::new(
                 block::Height(18),
                 hash(4),
             )),
-        }
+        )
     }
 
     #[test]
@@ -490,6 +502,32 @@ mod tests {
         assert!(!task.supplier_cycle_exhausted());
         assert!(task.tried_sources.is_empty());
         assert_eq!(task.state, RepairPolicyState::Ready { context });
+    }
+
+    #[test]
+    fn rejected_input_keeps_tried_suppliers_until_a_new_task_replaces_the_episode() {
+        let snapshot = snapshot();
+        let mut task = task(&snapshot);
+        let context = context();
+        mark_context_requested(&mut task);
+        task.resolve(context.clone())
+            .expect("the exact context resolves");
+        let rejected_source = SourceId::from_digest([1; 32]);
+        task.assign(task.owner).expect("ready work can go on wire");
+        task.reject_input(rejected_source)
+            .expect("durably rejected input rotates its supplier");
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        task.defer_retry_until(deadline)
+            .expect("local capacity can still defer the task");
+        task.resume_retry_cycle(deadline);
+
+        assert!(task.rejected_input_observed);
+        assert!(task.tried_sources.contains(&rejected_source));
+        assert_eq!(task.state, RepairPolicyState::Ready { context });
+
+        let replacement = RepairRequirement::new(task.owner, task.height, 12);
+        assert!(!replacement.rejected_input_observed);
+        assert!(replacement.tried_sources.is_empty());
     }
 
     #[test]

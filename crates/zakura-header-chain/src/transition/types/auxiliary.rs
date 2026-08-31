@@ -12,6 +12,33 @@ use crate::{AuxObservationId, EvidenceId, HeaderSyncWorkOwner, SourceId};
 
 use super::error::TransitionTypeError;
 
+/// Supplier-independent identity of one VCT auxiliary input.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct AuxiliaryInputFingerprint([u8; 32]);
+
+impl AuxiliaryInputFingerprint {
+    /// Bind one schema-1 record to its exact header without transport identity.
+    pub(crate) fn new(header_hash: block::Hash, record: TreeAuxRecordV1) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-vct-auxiliary-input-v1");
+        hasher.update(header_hash.0);
+        hasher.update(record.height.0.to_le_bytes());
+        hasher.update(<[u8; 32]>::from(record.sapling_root));
+        hasher.update(<[u8; 32]>::from(record.orchard_root));
+        hasher.update(<[u8; 32]>::from(record.ironwood_root));
+        hasher.update(record.sapling_tx_count.to_le_bytes());
+        hasher.update(record.orchard_tx_count.to_le_bytes());
+        hasher.update(record.ironwood_tx_count.to_le_bytes());
+        hasher.update(<[u8; 32]>::from(record.auth_data_root));
+        Self(hasher.finalize().into())
+    }
+
+    /// Return the opaque semantic input digest.
+    pub(crate) const fn digest(self) -> [u8; 32] {
+        self.0
+    }
+}
+
 /// Bounded advisory body-size metadata.
 /// Body-size metadata cannot allocate or grant admission credit.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

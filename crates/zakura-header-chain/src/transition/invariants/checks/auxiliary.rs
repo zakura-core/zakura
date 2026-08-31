@@ -118,6 +118,22 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
                 return Err(InvariantViolation::Auxiliary(node.hash));
             }
         }
+        for delivery in puts.values().filter(|delivery| {
+            delivery.header_hash == node.hash
+                && engine_before_commit
+                    .aux_delivery(delivery.delivery_id)
+                    .is_none()
+        }) {
+            if deliveries.iter().any(|other| {
+                other.delivery_id != delivery.delivery_id
+                    && (other.semantic_fingerprint() == delivery.semantic_fingerprint()
+                        || (delivery.tree_aux.is_some()
+                            && other.tree_aux.is_some()
+                            && other.source == delivery.source))
+            }) {
+                return Err(InvariantViolation::Auxiliary(node.hash));
+            }
+        }
         if node.aux_delivery_ids.iter().any(|delivery_id| {
             !deliveries
                 .iter()
@@ -263,6 +279,81 @@ mod tests {
             [
                 Err(InvariantViolation::Limits),
                 Err(InvariantViolation::Limits),
+            ]
+        );
+    }
+
+    #[test]
+    fn projected_auxiliary_rows_cannot_duplicate_a_semantic_payload() {
+        let fixture = fixture(EngineMode::HeadersOnly);
+        let ids = [
+            EvidenceId::from_digest([0x77; 32]),
+            EvidenceId::from_digest([0x78; 32]),
+        ];
+        let mut overlay = GraphOverlay::new(fixture.engine.graph());
+        for id in ids {
+            overlay
+                .record_auxiliary_evidence_delivery(fixture.child.hash, id)
+                .expect("the fixture child accepts the delivery identity");
+        }
+        let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
+        plan.change_set.aux_changes = ids
+            .into_iter()
+            .map(|id| AuxDelta::Put(Box::new(delivery(&fixture.engine, fixture.child.hash, id))))
+            .collect();
+        plan.limits.max_aux_deliveries_per_header = NonZeroUsize::new(2).expect("two is nonzero");
+        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(2).expect("two is nonzero");
+
+        assert_eq!(
+            verify_in_both_modes(&fixture, &plan),
+            [
+                Err(InvariantViolation::Auxiliary(fixture.child.hash)),
+                Err(InvariantViolation::Auxiliary(fixture.child.hash)),
+            ]
+        );
+    }
+
+    #[test]
+    fn projected_auxiliary_rows_allow_one_rooted_payload_per_supplier() {
+        let fixture = fixture(EngineMode::HeadersOnly);
+        let ids = [
+            EvidenceId::from_digest([0x79; 32]),
+            EvidenceId::from_digest([0x7a; 32]),
+        ];
+        let mut overlay = GraphOverlay::new(fixture.engine.graph());
+        for id in ids {
+            overlay
+                .record_auxiliary_evidence_delivery(fixture.child.hash, id)
+                .expect("the fixture child accepts the delivery identity");
+        }
+        let mut deliveries = ids.map(|id| delivery(&fixture.engine, fixture.child.hash, id));
+        for (index, delivery) in deliveries.iter_mut().enumerate() {
+            delivery.tree_aux = Some(crate::TreeAuxRecordV1 {
+                height: fixture.child.height,
+                sapling_root: zakura_chain::sapling::tree::Root::default(),
+                orchard_root: zakura_chain::orchard::tree::Root::default(),
+                ironwood_root: zakura_chain::ironwood::tree::Root::default(),
+                sapling_tx_count: 1,
+                orchard_tx_count: 2,
+                ironwood_tx_count: 3,
+                auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from(
+                    [u8::try_from(index).expect("the fixture index fits in u8"); 32],
+                ),
+            });
+        }
+        let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
+        plan.change_set.aux_changes = deliveries
+            .into_iter()
+            .map(|delivery| AuxDelta::Put(Box::new(delivery)))
+            .collect();
+        plan.limits.max_aux_deliveries_per_header = NonZeroUsize::new(2).expect("two is nonzero");
+        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(2).expect("two is nonzero");
+
+        assert_eq!(
+            verify_in_both_modes(&fixture, &plan),
+            [
+                Err(InvariantViolation::Auxiliary(fixture.child.hash)),
+                Err(InvariantViolation::Auxiliary(fixture.child.hash)),
             ]
         );
     }

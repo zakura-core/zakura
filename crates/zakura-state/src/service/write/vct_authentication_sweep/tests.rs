@@ -869,7 +869,6 @@ fn a_replacement_successor_preserves_and_authenticates_the_honest_predecessor() 
     fixture.sweep(&mut sweeper);
 
     fixture.redeliver(bad, None, 0x71);
-    fixture.redeliver(bad, None, 0x72);
     fixture.sweep(&mut sweeper);
 
     assert!(matches!(

@@ -5,8 +5,8 @@ use zakura_chain::block;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AuxiliaryInputFingerprint, EngineSnapshot, Frontier, StoreError, UntrustedAuxDeliveryRow,
-    MAX_AUX_DELIVERIES_PER_HEADER_V1,
+    AuxiliaryInputFingerprint, EngineSnapshot, Frontier, SourceId, StoreError,
+    UntrustedAuxDeliveryRow, MAX_AUX_DELIVERIES_PER_HEADER_V1,
 };
 
 /// Maximum hashes in one v8 header locator.
@@ -49,10 +49,16 @@ impl AuxiliaryRequirementEpisode {
                             .digest(),
                         );
                     }
-                    None => hasher.update([0]),
-                }
-                if let Some(boundary) = row.outcome_boundary_hash() {
-                    hasher.update(boundary.0);
+                    None => {
+                        hasher.update([0]);
+                        match row.outcome_boundary_hash() {
+                            Some(boundary) => {
+                                hasher.update([1]);
+                                hasher.update(boundary.0);
+                            }
+                            None => hasher.update([0]),
+                        }
+                    }
                 }
                 hasher.finalize().into()
             })
@@ -95,6 +101,8 @@ pub struct VctRepairContext {
     pub boundary_hash: Option<block::Hash>,
     /// Semantic inputs that durable rejection or dispute evidence excludes from replacement.
     excluded_inputs: Vec<AuxiliaryInputFingerprint>,
+    /// Sources that already supplied one retained rooted payload for this target.
+    retained_sources: Vec<SourceId>,
 }
 
 impl VctRepairContext {
@@ -110,6 +118,7 @@ impl VctRepairContext {
             episode: AuxiliaryRequirementEpisode::for_target(target, boundary_hash, &[]),
             boundary_hash,
             excluded_inputs: Vec::new(),
+            retained_sources: Vec::new(),
         }
     }
 
@@ -135,12 +144,20 @@ impl VctRepairContext {
             .collect();
         excluded_inputs.sort_unstable();
         excluded_inputs.dedup();
+        let mut retained_sources: Vec<_> = rows
+            .iter()
+            .filter(|row| row.delivery().tree_aux.is_some())
+            .map(|row| row.delivery().source)
+            .collect();
+        retained_sources.sort_unstable();
+        retained_sources.dedup();
         Ok(Self {
             target,
             locator,
             episode: AuxiliaryRequirementEpisode::for_target(target, boundary_hash, rows),
             boundary_hash,
             excluded_inputs,
+            retained_sources,
         })
     }
 
@@ -203,6 +220,11 @@ impl VctRepairContext {
         let fingerprint =
             AuxiliaryInputFingerprint::new(self.target.hash, input, self.boundary_hash);
         self.excluded_inputs.binary_search(&fingerprint).is_ok()
+    }
+
+    /// Return whether this source already supplied one retained rooted payload for the target.
+    pub fn retains_source(&self, source: SourceId) -> bool {
+        self.retained_sources.binary_search(&source).is_ok()
     }
 }
 
@@ -452,7 +474,10 @@ mod tests {
         )
         .expect("the replacement transport row is coherent");
         assert!(first.excludes(record));
+        assert!(first.retains_source(rejected.delivery().source));
         assert!(second.excludes(record));
+        assert!(second.retains_source(same_input_new_transport.delivery().source));
+        assert!(!first.retains_source(same_input_new_transport.delivery().source));
         assert_eq!(first.episode, second.episode);
         let duplicate_semantic_evidence = VctRepairContext::from_durable_rows(
             target,

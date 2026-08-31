@@ -12,12 +12,35 @@ use crate::{AuxObservationId, EvidenceId, HeaderSyncWorkOwner, SourceId};
 
 use super::error::TransitionTypeError;
 
+fn semantic_payload_fingerprint(
+    header_hash: block::Hash,
+    tree_aux: Option<TreeAuxRecordV1>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-header-aux-semantic-v1");
+    hasher.update(header_hash.0);
+    let Some(aux) = tree_aux else {
+        hasher.update([0]);
+        return hasher.finalize().into();
+    };
+    hasher.update([1]);
+    hasher.update(aux.height.0.to_le_bytes());
+    hasher.update(<[u8; 32]>::from(aux.sapling_root));
+    hasher.update(<[u8; 32]>::from(aux.orchard_root));
+    hasher.update(<[u8; 32]>::from(aux.ironwood_root));
+    hasher.update(aux.sapling_tx_count.to_le_bytes());
+    hasher.update(aux.orchard_tx_count.to_le_bytes());
+    hasher.update(aux.ironwood_tx_count.to_le_bytes());
+    hasher.update(<[u8; 32]>::from(aux.auth_data_root));
+    hasher.finalize().into()
+}
+
 /// Supplier-independent identity of one VCT auxiliary input.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct AuxiliaryInputFingerprint([u8; 32]);
 
 impl AuxiliaryInputFingerprint {
-    /// Bind one schema-1 record to its exact header without transport identity.
+    /// Bind one semantic payload and its authentication boundary without transport identity.
     pub(crate) fn new(
         header_hash: block::Hash,
         record: TreeAuxRecordV1,
@@ -25,15 +48,7 @@ impl AuxiliaryInputFingerprint {
     ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(b"zakura-vct-auxiliary-input-v1");
-        hasher.update(header_hash.0);
-        hasher.update(record.height.0.to_le_bytes());
-        hasher.update(<[u8; 32]>::from(record.sapling_root));
-        hasher.update(<[u8; 32]>::from(record.orchard_root));
-        hasher.update(<[u8; 32]>::from(record.ironwood_root));
-        hasher.update(record.sapling_tx_count.to_le_bytes());
-        hasher.update(record.orchard_tx_count.to_le_bytes());
-        hasher.update(record.ironwood_tx_count.to_le_bytes());
-        hasher.update(<[u8; 32]>::from(record.auth_data_root));
+        hasher.update(semantic_payload_fingerprint(header_hash, Some(record)));
         match boundary_hash {
             Some(boundary_hash) => {
                 hasher.update([1]);
@@ -244,23 +259,7 @@ impl AuxDelivery {
 
     /// Return the semantic payload identity without transport ownership or body-size metadata.
     pub fn semantic_fingerprint(self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(b"zakura-header-aux-semantic-v1");
-        hasher.update(self.header_hash.0);
-        let Some(aux) = self.tree_aux else {
-            hasher.update([0]);
-            return hasher.finalize().into();
-        };
-        hasher.update([1]);
-        hasher.update(aux.height.0.to_le_bytes());
-        hasher.update(<[u8; 32]>::from(aux.sapling_root));
-        hasher.update(<[u8; 32]>::from(aux.orchard_root));
-        hasher.update(<[u8; 32]>::from(aux.ironwood_root));
-        hasher.update(aux.sapling_tx_count.to_le_bytes());
-        hasher.update(aux.orchard_tx_count.to_le_bytes());
-        hasher.update(aux.ironwood_tx_count.to_le_bytes());
-        hasher.update(<[u8; 32]>::from(aux.auth_data_root));
-        hasher.finalize().into()
+        semantic_payload_fingerprint(self.header_hash, self.tree_aux)
     }
 
     /// Return the engine-derived outcome.

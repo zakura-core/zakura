@@ -350,6 +350,7 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
 
     assert_ne!(recovered.episode, before.episode);
     assert!(recovered.excludes(input));
+    assert!(recovered.retains_source(rejected.source));
 
     let parent = Frontier::new(path[2].height, path[2].hash);
     let lease = runtime
@@ -378,11 +379,11 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
         zakura_header_chain::BodySizeHint::Unknown,
         Some(replacement_input),
     );
-    let repair_request = |episode| TransitionRequest {
+    let repair_request = |episode, delivery: AuxDelivery| TransitionRequest {
         expected_version: StateVersion::default(),
         event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
             owner: owner.into(),
-            source,
+            source: delivery.source,
             parent_hash: parent.hash,
             target_tip_hash: target.hash,
             completion: TargetCompletion::SelectedAuxiliaryRepair {
@@ -391,7 +392,7 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
                 episode,
             },
             batch: batch.clone(),
-            aux: vec![replacement],
+            aux: vec![delivery],
         })),
     };
     let context = TransitionContext {
@@ -461,7 +462,7 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
 
     assert!(matches!(
         runtime
-            .apply(repair_request(before.episode), &context)
+            .apply(repair_request(before.episode, replacement), &context)
             .expect("a stale repair episode is a normal apply outcome"),
         ApplyResult::Stale(_)
     ));
@@ -471,9 +472,33 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
         .expect("the target delivery rows remain readable")
         .iter()
         .all(|delivery| delivery.delivery_id != replacement.delivery_id));
+
+    let same_source_replacement = AuxDelivery::new(
+        EvidenceId::from_digest([0x98; 32]),
+        target.hash,
+        rejected.source,
+        owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(replacement_input),
+    );
     assert!(matches!(
         runtime
-            .apply(repair_request(recovered.episode), &context)
+            .apply(
+                repair_request(recovered.episode, same_source_replacement),
+                &context,
+            )
+            .expect("a retained supplier cannot consume another rooted slot"),
+        ApplyResult::Stale(_)
+    ));
+    assert!(runtime
+        .store
+        .aux_deliveries(target.hash)
+        .expect("the target delivery rows remain readable")
+        .iter()
+        .all(|delivery| delivery.delivery_id != same_source_replacement.delivery_id));
+    assert!(matches!(
+        runtime
+            .apply(repair_request(recovered.episode, replacement), &context)
             .expect("the current repair episode can apply replacement input"),
         ApplyResult::Committed
     ));

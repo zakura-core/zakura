@@ -3072,6 +3072,19 @@ impl HeaderChainRuntime {
                         branch,
                     }));
                 }
+                for delivery in insert.aux.iter().filter(|delivery| {
+                    delivery.header_hash == selected_target.hash && delivery.tree_aux.is_some()
+                }) {
+                    let repeats_retained_payload = live_deliveries.iter().any(|retained| {
+                        retained.semantic_fingerprint() == delivery.semantic_fingerprint()
+                    });
+                    if current.retains_source(delivery.source) && !repeats_retained_payload {
+                        return Ok(ApplyResult::Stale(StaleReceipt {
+                            current_version: before.state_version,
+                            branch,
+                        }));
+                    }
+                }
             }
 
             let supplied_boundaries: HashMap<_, _> = insert

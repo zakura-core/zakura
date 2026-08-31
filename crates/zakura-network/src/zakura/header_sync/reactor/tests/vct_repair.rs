@@ -200,22 +200,23 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         .await
         .expect("the repair supplier connects");
     let _status = outbound.recv().await.expect("the local status is sent");
+    let supplier_status = Status {
+        work_anchor_height: anchor.height,
+        work_anchor_hash: anchor.hash,
+        selected_tip_height: selected_tip.height,
+        selected_tip_hash: selected_tip.hash,
+        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+        oldest_retained_height: anchor.height,
+        max_headers_per_response: 1,
+        max_inflight_requests: 1,
+        max_message_bytes: 2_000_000,
+        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+    };
     handle
         .send(Event::WireMessage {
             peer: peer.clone(),
             session_id: 0,
-            msg: HeaderSyncMessage::Status(Status {
-                work_anchor_height: anchor.height,
-                work_anchor_hash: anchor.hash,
-                selected_tip_height: selected_tip.height,
-                selected_tip_hash: selected_tip.hash,
-                suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
-                oldest_retained_height: anchor.height,
-                max_headers_per_response: 1,
-                max_inflight_requests: 1,
-                max_message_bytes: 2_000_000,
-                tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-            }),
+            msg: HeaderSyncMessage::Status(supplier_status.clone()),
         })
         .await
         .expect("the repair supplier status reaches the reactor");
@@ -427,6 +428,29 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         action_owner
     );
 
+    let replacement_peer = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID is bounded");
+    let (replacement_send, mut replacement_outbound) = framed_channel(8);
+    handle
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            replacement_peer.clone(),
+            replacement_send,
+            CancellationToken::new(),
+        )))
+        .await
+        .expect("the replacement supplier connects");
+    let _status = replacement_outbound
+        .recv()
+        .await
+        .expect("the replacement supplier receives local status");
+    handle
+        .send(Event::WireMessage {
+            peer: replacement_peer.clone(),
+            session_id: 0,
+            msg: HeaderSyncMessage::Status(supplier_status),
+        })
+        .await
+        .expect("the replacement supplier status reaches the reactor");
+
     handle
         .send(Event::VctRepairContextReady {
             owner: replacement_owner,
@@ -447,7 +471,7 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         })
         .await
         .expect("the replacement generation resolves fresh context");
-    let replacement_request = outbound
+    let replacement_request = replacement_outbound
         .recv()
         .await
         .expect("the replacement generation fetches another delivery");
@@ -458,14 +482,13 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
     else {
         panic!("the replacement generation uses GetHeaders");
     };
-    assert_ne!(replacement_request.request_id, request.request_id);
     assert_eq!(replacement_request.target_tip_hash, repair_header.hash);
     assert_eq!(replacement_request.max_header_count, 1);
     assert_eq!(replacement_request.tree_aux_schema, AuxSchema::V1);
 
     handle
         .send(Event::SessionResponse {
-            peer: peer.clone(),
+            peer: replacement_peer,
             session_id: 0,
             scope: replacement_owner.header_authority(),
             msg: HeaderSyncMessage::Headers(Headers {
@@ -491,9 +514,12 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         "a rejected semantic input cannot reach state under a new request"
     );
     assert!(
-        time::timeout(std::time::Duration::from_millis(1_100), outbound.recv())
-            .await
-            .is_err(),
+        time::timeout(
+            std::time::Duration::from_millis(1_100),
+            replacement_outbound.recv(),
+        )
+        .await
+        .is_err(),
         "an unchanged episode cannot clear supplier exclusions and repeat the request"
     );
 

@@ -94,6 +94,12 @@ impl UtxoProviderCache {
         self.providers_by_outpoint.len()
     }
 
+    /// Returns `true` when there are no cached outpoints.
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.providers_by_outpoint.is_empty()
+    }
+
     /// Removes every cached outpoint and provider.
     pub(super) fn clear(&mut self) {
         self.providers_by_outpoint.clear();

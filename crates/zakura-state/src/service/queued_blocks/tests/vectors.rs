@@ -22,8 +22,7 @@ use crate::{
         },
     },
     tests::FakeChainHelper,
-    CheckpointVerifiedBlock,
-    CommitBlockError, CommitSemanticallyVerifiedError,
+    CheckpointVerifiedBlock, CommitBlockError, CommitSemanticallyVerifiedError,
     SemanticallyVerifiedBlock,
 };
 
@@ -830,6 +829,59 @@ fn dequeue_descendants_removes_the_complete_failed_subtree() -> Result<()> {
     for response in &mut responses {
         assert_eq!(response.try_recv(), Ok(Err(error.clone())));
     }
+    assert!(queue.blocks.is_empty());
+    assert!(queue.by_parent.is_empty());
+    assert!(queue.by_height.is_empty());
+    assert!(queue.known_utxos.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn fail_descendants_preserves_shared_utxo_from_live_branch_until_removed() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let providers = shared_utxo_providers()?;
+    let failed_grandchild = providers.lower.block.clone().make_fake_child().prepare();
+    let failed_grandchild_hash = failed_grandchild.hash;
+
+    let mut queue = QueuedBlocks::default();
+    let (lower_response, mut lower_receiver) = oneshot::channel();
+    queue.queue((providers.lower.clone(), lower_response));
+    let (grandchild_response, mut grandchild_receiver) = oneshot::channel();
+    queue.queue((failed_grandchild, grandchild_response));
+    queue.queue(providers.higher.clone().into_queued());
+
+    let error = CommitSemanticallyVerifiedError::from(CommitBlockError::HeaderChainError {
+        error: format!("ancestor {} failed", providers.left_child.hash()),
+    });
+    let failed_hashes = queue.fail_descendants(providers.left_child.hash(), error.clone());
+
+    assert_eq!(failed_hashes.len(), 2);
+    assert!(failed_hashes.contains(&providers.lower.hash));
+    assert!(failed_hashes.contains(&failed_grandchild_hash));
+    assert_eq!(lower_receiver.try_recv(), Ok(Err(error.clone())));
+    assert_eq!(grandchild_receiver.try_recv(), Ok(Err(error)));
+    assert_eq!(queue.blocks.len(), 1);
+    assert!(queue.blocks.contains_key(&providers.higher.hash));
+    assert_eq!(queue.by_parent.len(), 1);
+    assert!(queue
+        .by_parent
+        .get(&providers.higher_parent_hash)
+        .is_some_and(|hashes| hashes.contains(&providers.higher.hash)));
+    assert_eq!(queue.by_height.len(), 1);
+    assert!(queue
+        .by_height
+        .get(&providers.higher.height)
+        .is_some_and(|hashes| hashes.contains(&providers.higher.hash)));
+    assert_eq!(
+        queue.utxo(&providers.outpoint),
+        Some(providers.higher_utxo.clone())
+    );
+
+    let remaining = queue.dequeue_children(providers.higher_parent_hash);
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].0.hash, providers.higher.hash);
+    assert_eq!(queue.utxo(&providers.outpoint), None);
     assert!(queue.blocks.is_empty());
     assert!(queue.by_parent.is_empty());
     assert!(queue.by_height.is_empty());

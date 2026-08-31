@@ -324,7 +324,7 @@ enum HeaderRequestTerminal {
     Disconnected,
     LocalError,
     MalformedResponse,
-    RejectedAuxiliaryInput,
+    ExcludedAuxiliaryInput,
     RepairObsolete,
     ResourceStalled,
     SendError,
@@ -359,7 +359,7 @@ impl HeaderRequestTerminal {
             Self::Disconnected => "disconnected",
             Self::LocalError => "local_error",
             Self::MalformedResponse => "malformed_response",
-            Self::RejectedAuxiliaryInput => "rejected_auxiliary_input",
+            Self::ExcludedAuxiliaryInput => "excluded_auxiliary_input",
             Self::RepairObsolete => "repair_obsolete",
             Self::ResourceStalled => "resource_stalled",
             Self::SendError => "send_error",
@@ -377,7 +377,8 @@ impl HeaderRequestTerminal {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum VctRepairRetryAttribution {
     Supplier,
-    RejectedInput,
+    ExcludedInput,
+    Stale,
     Local,
 }
 
@@ -405,11 +406,19 @@ impl VctRepairRetry {
         }
     }
 
-    fn rejected_input(source: zakura_header_chain::SourceId) -> Self {
+    fn excluded_input(source: zakura_header_chain::SourceId) -> Self {
         Self {
             source,
-            terminal: HeaderRequestTerminal::RejectedAuxiliaryInput,
-            attribution: VctRepairRetryAttribution::RejectedInput,
+            terminal: HeaderRequestTerminal::ExcludedAuxiliaryInput,
+            attribution: VctRepairRetryAttribution::ExcludedInput,
+        }
+    }
+
+    fn stale(source: zakura_header_chain::SourceId) -> Self {
+        Self {
+            source,
+            terminal: HeaderRequestTerminal::RepairObsolete,
+            attribution: VctRepairRetryAttribution::Stale,
         }
     }
 }
@@ -419,6 +428,9 @@ fn vct_error_retry(
     terminal: HeaderRequestTerminal,
     error: &zakura_header_chain::HeaderChainError,
 ) -> VctRepairRetry {
+    if error.category == zakura_header_chain::ErrorCategory::StaleTargetOrGeneration {
+        return VctRepairRetry::stale(source);
+    }
     let attributed_source = match error.attribution {
         zakura_header_chain::Attribution::HeaderPeer(attributed)
         | zakura_header_chain::Attribution::BodyPeer(attributed)
@@ -500,6 +512,8 @@ struct VctSupplierRejections {
     already_serving: u64,
     /// Peers already tried in the current supplier cycle.
     already_tried: u64,
+    /// Peers that already returned semantic input excluded by this episode.
+    excluded_input: u64,
     /// Eligible peers whose request could not enter the ordered send queue.
     send_failed: u64,
 }
@@ -588,6 +602,7 @@ impl VctLocalOperation {
         let HeaderTargetPurpose::SelectedAuxiliaryRepair {
             selected_target,
             repair_generation,
+            ..
         } = purpose
         else {
             return None;
@@ -942,6 +957,9 @@ impl HeaderSyncReactor {
         });
         let replaces_existing_peer = self.peer_state.contains_key(&peer);
         if replaces_existing_peer {
+            if let Some(task) = self.vct_repair.current_mut() {
+                task.forget_source(source_id_from_peer(&peer));
+            }
             if !owns_local_repair_operation {
                 self.retire_peer_work(&peer, HeaderRequestTerminal::SessionReplaced);
             }
@@ -1031,6 +1049,9 @@ impl HeaderSyncReactor {
                 owner,
                 VctRepairRetry::supplier(source, HeaderRequestTerminal::Disconnected),
             );
+        }
+        if let Some(task) = self.vct_repair.current_mut() {
+            task.forget_source(source_id_from_peer(peer));
         }
         self.publish_peer_state();
         self.emit_peer_lifecycle(
@@ -1362,7 +1383,9 @@ impl HeaderSyncReactor {
             response.common_ancestor_hash,
         );
         if let HeaderTargetPurpose::SelectedAuxiliaryRepair {
-            selected_target, ..
+            selected_target,
+            episode,
+            ..
         } = &active.purpose
         {
             let exact_shape = response.target_tip_hash == selected_target.hash
@@ -1393,15 +1416,17 @@ impl HeaderSyncReactor {
             let input = response.entries[0]
                 .tree_aux
                 .expect("the exact repair response has schema-1 auxiliary input");
-            let rejected = self.vct_repair.get(repair_owner).is_some_and(|task| {
+            let excluded = self.vct_repair.get(repair_owner).is_some_and(|task| {
                 let RepairPolicyState::Assigned { context } = &task.state else {
                     return false;
                 };
-                context.target == *selected_target && context.excludes(input)
+                context.target == *selected_target
+                    && context.episode == *episode
+                    && context.excludes(input)
             });
-            if rejected {
-                metrics::counter!("sync.header.vct.repair.rejected_input.total").increment(1);
-                self.retry_vct_repair(repair_owner, VctRepairRetry::rejected_input(active.source));
+            if excluded {
+                metrics::counter!("sync.header.vct.repair.excluded_input.total").increment(1);
+                self.retry_vct_repair(repair_owner, VctRepairRetry::excluded_input(active.source));
                 return;
             }
         }
@@ -1505,10 +1530,13 @@ impl HeaderSyncReactor {
                     zakura_header_chain::TargetCompletion::TargetComplete { common_ancestor }
                 }
                 HeaderTargetPurpose::SelectedAuxiliaryRepair {
-                    selected_target, ..
+                    selected_target,
+                    episode,
+                    ..
                 } => zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                     common_ancestor,
                     selected_target,
+                    episode,
                 },
             };
             let repair = matches!(
@@ -2016,13 +2044,21 @@ impl HeaderSyncReactor {
         if let Some(peer) = peer {
             self.request_deadlines.remove(&peer);
         }
+        if retry.attribution == VctRepairRetryAttribution::Stale {
+            if let Some(task) = self.vct_repair.remove(owner) {
+                self.emit_vct_repair_state(&task, "terminal", Some("stale_episode"));
+            }
+            self.schedule_current_vct_repair();
+            return;
+        }
         let now = Instant::now();
         let retry_scheduled =
             self.vct_repair
                 .get_mut(owner)
                 .is_some_and(|task| match retry.attribution {
                     VctRepairRetryAttribution::Supplier => task.retry(source).is_ok(),
-                    VctRepairRetryAttribution::RejectedInput => task.reject_input(source).is_ok(),
+                    VctRepairRetryAttribution::ExcludedInput => task.exclude_input(source).is_ok(),
+                    VctRepairRetryAttribution::Stale => false,
                     VctRepairRetryAttribution::Local => task
                         .defer_local_retry_until(now + VCT_REPAIR_RETRY_INTERVAL)
                         .is_ok(),
@@ -2030,7 +2066,7 @@ impl HeaderSyncReactor {
         if retry_scheduled {
             if matches!(
                 retry.attribution,
-                VctRepairRetryAttribution::Supplier | VctRepairRetryAttribution::RejectedInput
+                VctRepairRetryAttribution::Supplier | VctRepairRetryAttribution::ExcludedInput
             ) {
                 self.rotate_vct_supplier(source);
             }
@@ -2040,7 +2076,8 @@ impl HeaderSyncReactor {
                     "retry",
                     Some(match retry.attribution {
                         VctRepairRetryAttribution::Supplier => "supplier_retry",
-                        VctRepairRetryAttribution::RejectedInput => "rejected_input",
+                        VctRepairRetryAttribution::ExcludedInput => "excluded_input",
+                        VctRepairRetryAttribution::Stale => "stale_episode",
                         VctRepairRetryAttribution::Local => "local_backoff",
                     }),
                 );
@@ -2053,9 +2090,10 @@ impl HeaderSyncReactor {
                             VctRepairRetryAttribution::Supplier => {
                                 VctRepairStallOutcome::SupplierFailure
                             }
-                            VctRepairRetryAttribution::RejectedInput => {
+                            VctRepairRetryAttribution::ExcludedInput => {
                                 VctRepairStallOutcome::SupplierFailure
                             }
+                            VctRepairRetryAttribution::Stale => VctRepairStallOutcome::LocalFailure,
                             VctRepairRetryAttribution::Local => VctRepairStallOutcome::LocalFailure,
                         },
                         now,
@@ -2064,7 +2102,7 @@ impl HeaderSyncReactor {
             }
             if matches!(
                 retry.attribution,
-                VctRepairRetryAttribution::Supplier | VctRepairRetryAttribution::RejectedInput
+                VctRepairRetryAttribution::Supplier | VctRepairRetryAttribution::ExcludedInput
             ) {
                 self.try_assign_vct_repair();
             }
@@ -2187,6 +2225,7 @@ impl HeaderSyncReactor {
                 rejected_schema = record.rejections.unsupported_schema,
                 rejected_busy = record.rejections.already_serving,
                 rejected_tried = record.rejections.already_tried,
+                excluded_input = record.rejections.excluded_input,
                 send_failed = record.rejections.send_failed,
                 ?stalled_for,
                 "VCT: repair has not completed; the parked checkpoint commit cannot advance"
@@ -3090,6 +3129,10 @@ impl HeaderSyncReactor {
                 continue;
             }
             let source = source_id_from_peer(peer);
+            if task.excluded_input_sources.contains(&source) {
+                rejections.excluded_input += 1;
+                continue;
+            }
             if task.tried_sources.contains(&source) {
                 rejections.already_tried += 1;
                 continue;
@@ -3104,13 +3147,11 @@ impl HeaderSyncReactor {
                 VctRepairStallOutcome::SupplierCycleExhausted,
                 now,
             );
-            if !task.rejected_input_observed {
-                let _ = self
-                    .vct_repair
-                    .get_mut(task.owner)
-                    .expect("the ready repair was cloned above")
-                    .defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
-            }
+            let _ = self
+                .vct_repair
+                .get_mut(task.owner)
+                .expect("the ready repair was cloned above")
+                .defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
             return;
         }
         if candidates.is_empty() {
@@ -3121,7 +3162,7 @@ impl HeaderSyncReactor {
                 VctRepairStallOutcome::NoEligibleSupplier,
                 now,
             );
-            if !task.rejected_input_observed {
+            if rejections.excluded_input == 0 || rejections.already_tried > 0 {
                 let _ = self
                     .vct_repair
                     .get_mut(task.owner)
@@ -3154,7 +3195,7 @@ impl HeaderSyncReactor {
                     rejections.send_failed += 1;
                     match vct_send_retry_attribution(&error) {
                         VctRepairRetryAttribution::Supplier
-                        | VctRepairRetryAttribution::RejectedInput => {
+                        | VctRepairRetryAttribution::ExcludedInput => {
                             if let Some(current) = self.vct_repair.get_mut(task.owner) {
                                 let _ = current.record_failed_source(source);
                             }
@@ -3186,6 +3227,9 @@ impl HeaderSyncReactor {
                             }
                             return;
                         }
+                        VctRepairRetryAttribution::Stale => unreachable!(
+                            "ordered-send failures cannot report a stale state episode"
+                        ),
                     }
                     continue;
                 }
@@ -3227,6 +3271,7 @@ impl HeaderSyncReactor {
                 || !self.peer_work_queue.start(ActiveHeaderRequest {
                     purpose: HeaderTargetPurpose::SelectedAuxiliaryRepair {
                         selected_target: context.target,
+                        episode: context.episode,
                         repair_generation: task.repair_generation,
                     },
                     peer: peer.clone(),
@@ -3274,16 +3319,10 @@ impl HeaderSyncReactor {
                 self.note_vct_repair_stall(&current, predecessor, rejections, stall_outcome, now);
             }
         }
-        if !self
+        let _ = self
             .vct_repair
-            .get(task.owner)
-            .is_some_and(|task| task.rejected_input_observed && !local_capacity_unavailable)
-        {
-            let _ = self
-                .vct_repair
-                .get_mut(task.owner)
-                .and_then(|task| task.defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL).ok());
-        }
+            .get_mut(task.owner)
+            .and_then(|task| task.defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL).ok());
     }
 
     fn retire_obsolete_work(&mut self, snapshot: &zakura_header_chain::EngineSnapshot) {
@@ -4276,15 +4315,27 @@ impl HeaderSyncReactor {
                     completion,
                     entries,
                 } => Box::pin(async move {
-                    if matches!(purpose, HeaderTargetPurpose::SelectedAuxiliaryRepair { .. })
-                        && !matches!(
-                            completion,
+                    if matches!(
+                        &purpose,
+                        HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+                    ) && !matches!(
+                        (&purpose, completion),
+                        (
+                            HeaderTargetPurpose::SelectedAuxiliaryRepair {
+                                selected_target: purpose_target,
+                                episode: purpose_episode,
+                                ..
+                            },
                             zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                                 selected_target,
+                                episode,
                                 ..
-                            } if selected_target == target && entries.len() == 1
-                        )
-                    {
+                            },
+                        ) if *purpose_target == target
+                            && selected_target == target
+                            && *purpose_episode == episode
+                            && entries.len() == 1
+                    ) {
                         let result = HeaderTargetPreparationResult::Failed(std::sync::Arc::new(
                             zakura_header_chain::HeaderChainError::stale_target(
                                 zakura_header_chain::ErrorSubject::Branch(

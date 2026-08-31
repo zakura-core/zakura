@@ -115,6 +115,7 @@ async fn committer_repair_replaces_and_then_restores_a_sweep_repair() {
                 zakura_header_chain::VctRepairContext::unconstrained(
                     zakura_header_chain::Frontier::new(sweep_height, block::Hash([11; 32])),
                     zakura_header_chain::HeaderLocator::for_continuation(anchor),
+                    None,
                 ),
             ),
         })
@@ -225,6 +226,7 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
                 zakura_header_chain::VctRepairContext::unconstrained(
                     repair_header,
                     zakura_header_chain::HeaderLocator::for_continuation(anchor),
+                    Some(selected_tip.hash),
                 ),
             ),
         })
@@ -288,13 +290,14 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
     };
     assert_eq!(action_owner.session_id(), 0);
     assert_eq!(target, repair_header);
-    assert!(matches!(
-        purpose,
+    let episode = match purpose {
         HeaderTargetPurpose::SelectedAuxiliaryRepair {
             selected_target,
+            episode,
             ..
-        } if selected_target == repair_header
-    ));
+        } if selected_target == repair_header => episode,
+        _ => panic!("the repair purpose must carry the selected target and episode"),
+    };
     let entry = entries
         .pop()
         .expect("the exact repair preparation contains one header");
@@ -345,6 +348,7 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
             common_ancestor: anchor,
             selected_target: repair_header,
+            episode,
         },
         batch,
         aux: vec![delivery],
@@ -430,6 +434,7 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
                 zakura_header_chain::VctRepairContext::from_durable_rows(
                     repair_header,
                     zakura_header_chain::HeaderLocator::for_continuation(anchor),
+                    Some(selected_tip.hash),
                     &[zakura_header_chain::UntrustedAuxDeliveryRow::new(
                         delivery,
                         2,
@@ -564,6 +569,7 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
                 zakura_header_chain::VctRepairContext::unconstrained(
                     repair_header,
                     zakura_header_chain::HeaderLocator::for_continuation(anchor),
+                    Some(selected_tip.hash),
                 ),
             ),
         })
@@ -705,6 +711,7 @@ async fn repair_awaiting_supplier(
                 zakura_header_chain::VctRepairContext::unconstrained(
                     repair_header,
                     zakura_header_chain::HeaderLocator::for_continuation(anchor),
+                    None,
                 ),
             ),
         })

@@ -24,32 +24,61 @@ pub struct AuxiliaryRequirementEpisode([u8; 32]);
 
 impl AuxiliaryRequirementEpisode {
     /// Derive one episode from the exact target and its durable rejected or disputed inputs.
-    fn for_target(target: Frontier, rows: &[UntrustedAuxDeliveryRow]) -> Self {
-        let mut constrained: Vec<_> = rows
+    fn for_target(
+        target: Frontier,
+        boundary_hash: Option<block::Hash>,
+        rows: &[UntrustedAuxDeliveryRow],
+    ) -> Self {
+        let mut constraints: Vec<[u8; 32]> = rows
             .iter()
             .copied()
             .filter(|row| matches!(row.outcome_status_code(), 2 | 3))
+            .map(|row| {
+                let mut hasher = Sha256::new();
+                hasher.update(b"zakura-vct-auxiliary-requirement-constraint-v1");
+                hasher.update([row.outcome_status_code()]);
+                match row.delivery().tree_aux {
+                    Some(record) => {
+                        hasher.update([1]);
+                        hasher.update(
+                            AuxiliaryInputFingerprint::new(
+                                target.hash,
+                                record,
+                                row.outcome_boundary_hash(),
+                            )
+                            .digest(),
+                        );
+                    }
+                    None => hasher.update([0]),
+                }
+                if let Some(boundary) = row.outcome_boundary_hash() {
+                    hasher.update(boundary.0);
+                }
+                hasher.finalize().into()
+            })
             .collect();
-        constrained.sort_unstable_by_key(|row| row.delivery().delivery_id);
+        constraints.sort_unstable();
+        constraints.dedup();
 
         let mut hasher = Sha256::new();
         hasher.update(b"zakura-vct-auxiliary-requirement-episode-v1");
         hasher.update(target.height.0.to_le_bytes());
         hasher.update(target.hash.0);
-        for row in constrained {
-            let delivery = row.delivery();
-            hasher.update([row.outcome_status_code()]);
-            if let Some(record) = delivery.tree_aux {
-                hasher.update(AuxiliaryInputFingerprint::new(target.hash, record).digest());
+        match boundary_hash {
+            Some(boundary_hash) => {
+                hasher.update([1]);
+                hasher.update(boundary_hash.0);
             }
-            for observation in row.observation_digests().into_iter().flatten() {
-                hasher.update(observation);
-            }
-            if let Some(boundary) = row.outcome_boundary_hash() {
-                hasher.update(boundary.0);
-            }
+            None => hasher.update([0]),
+        }
+        for constraint in constraints {
+            hasher.update(constraint);
         }
         Self(hasher.finalize().into())
+    }
+
+    pub(crate) const fn digest(self) -> [u8; 32] {
+        self.0
     }
 }
 
@@ -62,17 +91,24 @@ pub struct VctRepairContext {
     pub locator: HeaderLocator,
     /// Durable evidence episode that owns this replacement.
     pub episode: AuxiliaryRequirementEpisode,
-    /// Semantic inputs that durable rejection evidence excludes from replacement.
+    /// Selected successor that supplies the applicable authentication boundary.
+    pub boundary_hash: Option<block::Hash>,
+    /// Semantic inputs that durable rejection or dispute evidence excludes from replacement.
     excluded_inputs: Vec<AuxiliaryInputFingerprint>,
 }
 
 impl VctRepairContext {
     /// Build a repair claim before any durable rejection or dispute exists.
-    pub fn unconstrained(target: Frontier, locator: HeaderLocator) -> Self {
+    pub fn unconstrained(
+        target: Frontier,
+        locator: HeaderLocator,
+        boundary_hash: Option<block::Hash>,
+    ) -> Self {
         Self {
             target,
             locator,
-            episode: AuxiliaryRequirementEpisode::for_target(target, &[]),
+            episode: AuxiliaryRequirementEpisode::for_target(target, boundary_hash, &[]),
+            boundary_hash,
             excluded_inputs: Vec::new(),
         }
     }
@@ -84,8 +120,54 @@ impl VctRepairContext {
     pub fn from_durable_rows(
         target: Frontier,
         locator: HeaderLocator,
+        boundary_hash: Option<block::Hash>,
         rows: &[UntrustedAuxDeliveryRow],
     ) -> Result<Self, StoreError> {
+        Self::validate_durable_rows(target, rows)?;
+        let mut excluded_inputs: Vec<_> = rows
+            .iter()
+            .filter(|row| matches!(row.outcome_status_code(), 2 | 3))
+            .filter_map(|row| {
+                row.delivery().tree_aux.map(|record| {
+                    AuxiliaryInputFingerprint::new(target.hash, record, row.outcome_boundary_hash())
+                })
+            })
+            .collect();
+        excluded_inputs.sort_unstable();
+        excluded_inputs.dedup();
+        Ok(Self {
+            target,
+            locator,
+            episode: AuxiliaryRequirementEpisode::for_target(target, boundary_hash, rows),
+            boundary_hash,
+            excluded_inputs,
+        })
+    }
+
+    /// Check one input against durable rejection or dispute evidence without transport identity.
+    pub fn durable_rows_exclude(
+        target: Frontier,
+        boundary_hash: Option<block::Hash>,
+        rows: &[UntrustedAuxDeliveryRow],
+        input: crate::TreeAuxRecordV1,
+    ) -> Result<bool, StoreError> {
+        Self::validate_durable_rows(target, rows)?;
+        let input = AuxiliaryInputFingerprint::new(target.hash, input, boundary_hash);
+        Ok(rows
+            .iter()
+            .filter(|row| matches!(row.outcome_status_code(), 2 | 3))
+            .filter_map(|row| {
+                row.delivery().tree_aux.map(|record| {
+                    AuxiliaryInputFingerprint::new(target.hash, record, row.outcome_boundary_hash())
+                })
+            })
+            .any(|rejected| rejected == input))
+    }
+
+    fn validate_durable_rows(
+        target: Frontier,
+        rows: &[UntrustedAuxDeliveryRow],
+    ) -> Result<(), StoreError> {
         if rows.len() > MAX_AUX_DELIVERIES_PER_HEADER_V1 {
             return Err(StoreError::Incoherent(
                 "VCT repair evidence exceeds the per-header auxiliary limit",
@@ -97,6 +179,9 @@ impl VctRepairContext {
             || rows.iter().any(|row| {
                 let delivery = row.delivery();
                 delivery.header_hash != target.hash
+                    || delivery
+                        .tree_aux
+                        .is_some_and(|record| record.height != target.height)
                     || delivery
                         .promote_recovered_outcome(
                             row.outcome_status_code(),
@@ -110,28 +195,13 @@ impl VctRepairContext {
                 "VCT repair evidence is malformed or names another target",
             ));
         }
-        let mut excluded_inputs: Vec<_> = rows
-            .iter()
-            .filter(|row| row.outcome_status_code() == 2)
-            .filter_map(|row| {
-                row.delivery()
-                    .tree_aux
-                    .map(|record| AuxiliaryInputFingerprint::new(target.hash, record))
-            })
-            .collect();
-        excluded_inputs.sort_unstable();
-        excluded_inputs.dedup();
-        Ok(Self {
-            target,
-            locator,
-            episode: AuxiliaryRequirementEpisode::for_target(target, rows),
-            excluded_inputs,
-        })
+        Ok(())
     }
 
-    /// Return whether durable rejection evidence requires different semantic repair input.
+    /// Return whether durable rejection or dispute evidence requires different repair input.
     pub fn excludes(&self, input: crate::TreeAuxRecordV1) -> bool {
-        let fingerprint = AuxiliaryInputFingerprint::new(self.target.hash, input);
+        let fingerprint =
+            AuxiliaryInputFingerprint::new(self.target.hash, input, self.boundary_hash);
         self.excluded_inputs.binary_search(&fingerprint).is_ok()
     }
 }
@@ -364,19 +434,44 @@ mod tests {
             delivery(10),
             2,
             [Some([11; 32]), None],
-            Some(block::Hash([12; 32])),
+            Some(block::Hash([9; 32])),
         );
-        let first = VctRepairContext::from_durable_rows(target, locator.clone(), &[rejected])
-            .expect("the rejected row is coherent");
+        let boundary_hash = Some(block::Hash([9; 32]));
+        let first = VctRepairContext::from_durable_rows(
+            target,
+            locator.clone(),
+            boundary_hash,
+            &[rejected],
+        )
+        .expect("the rejected row is coherent");
         let second = VctRepairContext::from_durable_rows(
             target,
             locator.clone(),
+            boundary_hash,
             &[same_input_new_transport],
         )
         .expect("the replacement transport row is coherent");
         assert!(first.excludes(record));
         assert!(second.excludes(record));
-        assert_ne!(first.episode, second.episode);
+        assert_eq!(first.episode, second.episode);
+        let duplicate_semantic_evidence = VctRepairContext::from_durable_rows(
+            target,
+            locator.clone(),
+            boundary_hash,
+            &[same_input_new_transport, rejected],
+        )
+        .expect("duplicate semantic evidence under distinct transport is coherent");
+        assert_eq!(first.episode, duplicate_semantic_evidence.episode);
+
+        let changed_boundary = VctRepairContext::from_durable_rows(
+            target,
+            locator.clone(),
+            Some(block::Hash([12; 32])),
+            &[rejected],
+        )
+        .expect("the old rejection remains coherent under a new selected boundary");
+        assert!(!changed_boundary.excludes(record));
+        assert_ne!(first.episode, changed_boundary.episode);
 
         let disputed = UntrustedAuxDeliveryRow::new(
             delivery(13),
@@ -384,12 +479,25 @@ mod tests {
             [Some([14; 32]), Some([15; 32])],
             Some(block::Hash([16; 32])),
         );
-        let disputed = VctRepairContext::from_durable_rows(target, locator, &[disputed])
-            .expect("the disputed row is coherent");
-        assert!(!disputed.excludes(record));
+        let disputed = VctRepairContext::from_durable_rows(
+            target,
+            locator,
+            Some(block::Hash([16; 32])),
+            &[disputed],
+        )
+        .expect("the disputed row is coherent");
+        assert!(disputed.excludes(record));
+        let mut independent = record;
+        independent.sapling_tx_count = independent.sapling_tx_count.saturating_add(1);
+        assert!(!disputed.excludes(independent));
         assert_ne!(
             disputed.episode,
-            VctRepairContext::unconstrained(target, disputed.locator.clone()).episode
+            VctRepairContext::unconstrained(
+                target,
+                disputed.locator.clone(),
+                disputed.boundary_hash,
+            )
+            .episode
         );
     }
 }

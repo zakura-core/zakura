@@ -308,6 +308,8 @@ pub enum HeaderTargetPurpose {
     SelectedAuxiliaryRepair {
         /// Selected target fixed by the durable repair context.
         selected_target: Frontier,
+        /// Durable auxiliary evidence episode that owns the attempt.
+        episode: zakura_header_chain::AuxiliaryRequirementEpisode,
         /// Durable repair-signal generation that owns this attempt.
         repair_generation: u64,
     },
@@ -1408,8 +1410,18 @@ mod tests {
     #[test]
     fn selected_auxiliary_repair_is_an_exact_one_header_target_purpose() {
         let selected_target = Frontier::new(zakura_chain::block::Height(11), hash(11));
+        let episode = zakura_header_chain::VctRepairContext::unconstrained(
+            selected_target,
+            zakura_header_chain::HeaderLocator::for_continuation(Frontier::new(
+                zakura_chain::block::Height(10),
+                hash(10),
+            )),
+            None,
+        )
+        .episode;
         let purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
             selected_target,
+            episode,
             repair_generation: 7,
         };
 

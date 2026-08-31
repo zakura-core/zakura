@@ -2,7 +2,7 @@
 
 use zakura_chain::block;
 
-use crate::{Frontier, HeaderSyncWorkOwner, SourceId};
+use crate::{AuxiliaryRequirementEpisode, Frontier, HeaderSyncWorkOwner, SourceId};
 
 use super::super::auxiliary::PreparedAuxDelivery;
 use super::super::error::TransitionTypeError;
@@ -30,6 +30,8 @@ pub enum TargetCompletion {
         common_ancestor: Frontier,
         /// Exact selected header whose metadata the peer redelivered.
         selected_target: Frontier,
+        /// Durable auxiliary evidence episode that authorized this replacement.
+        episode: AuxiliaryRequirementEpisode,
     },
 }
 

@@ -168,15 +168,17 @@ fn seed_vct_active_request(
         active.target.status.selected_tip_height,
         active.target.status.selected_tip_hash,
     );
-    active.purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
-        selected_target: target,
-        repair_generation: 11,
-    };
-    active.phase = phase;
     let context = zakura_header_chain::VctRepairContext::unconstrained(
         target,
         zakura_header_chain::HeaderLocator::for_continuation(snapshot.frontiers.finalized),
+        None,
     );
+    active.purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
+        selected_target: target,
+        episode: context.episode,
+        repair_generation: 11,
+    };
+    active.phase = phase;
     let mut task = RepairRequirement::new(owner, target.height, 11);
     task.state = RepairPolicyState::Assigned {
         context: context.clone(),
@@ -272,6 +274,7 @@ fn prepared_vct_target(
             completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                 common_ancestor: anchor,
                 selected_target: context.target,
+                episode: context.episode,
             },
             batch,
             aux: vec![delivery],
@@ -330,6 +333,7 @@ impl VctLocalFixture {
                 completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                     common_ancestor: self.snapshot.frontiers.finalized,
                     selected_target: self.context.target,
+                    episode: self.context.episode,
                 },
                 entries: active.entries.clone(),
             },
@@ -439,6 +443,7 @@ impl ReadyVctRepairFixture {
         let context = zakura_header_chain::VctRepairContext::unconstrained(
             target,
             zakura_header_chain::HeaderLocator::for_continuation(anchor),
+            None,
         );
         Self {
             _handle: handle,
@@ -733,6 +738,7 @@ fn vct_request_timeout_keeps_required_work_and_rotates_the_supplier() {
     let context = zakura_header_chain::VctRepairContext::unconstrained(
         target,
         zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        None,
     );
     task.state = RepairPolicyState::Assigned {
         context: context.clone(),
@@ -744,6 +750,7 @@ fn vct_request_timeout_keeps_required_work_and_rotates_the_supplier() {
         .expect("the fixture has one applying request")
         .purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
         selected_target: target,
+        episode: context.episode,
         repair_generation: 11,
     };
     reactor
@@ -1023,6 +1030,47 @@ fn vct_send_failures_have_explicit_attribution() {
 }
 
 #[test]
+fn stale_vct_episode_discards_the_claim_and_reads_current_state() {
+    let (mut reactor, mut snapshot) = direct_vct_reactor(PendingVctLocalPort::pending(true));
+    let peer = peer();
+    let (source, owner, context) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer,
+        7,
+        HeaderTargetPhase::Applying,
+    );
+    let owner = owner
+        .body_owner()
+        .expect("the seeded auxiliary repair has body authority");
+    snapshot.frontiers.header_best = context.target;
+    snapshot.header_best_score = zakura_header_chain::ChainScore::new(
+        zakura_header_chain::SuffixWork::new(zakura_chain::work::difficulty::U256::from(1_u8)),
+        context.target.hash,
+    );
+    reactor.committed_snapshot = Some(snapshot);
+    reactor.vct_repair_status = zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: context.target.height,
+        },
+        generation: 11,
+    };
+
+    reactor.retry_vct_repair(owner, VctRepairRetry::stale(source));
+
+    let replacement = reactor
+        .vct_repair
+        .current()
+        .expect("the unchanged durable need schedules a fresh context read");
+    assert_eq!(replacement.repair_generation, 11);
+    assert_eq!(replacement.height, context.target.height);
+    assert!(matches!(
+        replacement.state,
+        RepairPolicyState::QueryingContext { .. }
+    ));
+}
+
+#[test]
 fn resource_stall_has_an_exact_terminal_label() {
     assert_eq!(
         HeaderRequestTerminal::ResourceStalled.label(),
@@ -1050,6 +1098,7 @@ fn generation_stall_escalation_owns_a_maintenance_deadline() {
     let context = zakura_header_chain::VctRepairContext::unconstrained(
         repair_target,
         zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        None,
     );
     let mut task = RepairRequirement::new(owner, repair_target.height, 11);
     task.state = RepairPolicyState::LocalBackoff {

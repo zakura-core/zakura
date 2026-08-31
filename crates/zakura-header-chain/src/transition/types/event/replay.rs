@@ -181,10 +181,12 @@ pub(super) fn hash_transition_payload(hasher: &mut Sha256, event: &TransitionEve
                 TargetCompletion::SelectedAuxiliaryRepair {
                     common_ancestor,
                     selected_target,
+                    episode,
                 } => {
                     hasher.update([2]);
                     hash_frontier(hasher, common_ancestor);
                     hash_frontier(hasher, selected_target);
+                    hasher.update(episode.digest());
                 }
             }
             let receipt = event.batch.receipt();

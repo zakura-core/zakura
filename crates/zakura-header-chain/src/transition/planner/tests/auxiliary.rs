@@ -401,6 +401,12 @@ fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
             completion: TargetCompletion::SelectedAuxiliaryRepair {
                 common_ancestor: anchor,
                 selected_target,
+                episode: crate::VctRepairContext::unconstrained(
+                    selected_target,
+                    crate::HeaderLocator::for_continuation(anchor),
+                    None,
+                )
+                .episode,
             },
             batch: PreparedHeaderBatch::new(
                 vec![repaired],

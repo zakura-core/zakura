@@ -18,7 +18,11 @@ pub(crate) struct AuxiliaryInputFingerprint([u8; 32]);
 
 impl AuxiliaryInputFingerprint {
     /// Bind one schema-1 record to its exact header without transport identity.
-    pub(crate) fn new(header_hash: block::Hash, record: TreeAuxRecordV1) -> Self {
+    pub(crate) fn new(
+        header_hash: block::Hash,
+        record: TreeAuxRecordV1,
+        boundary_hash: Option<block::Hash>,
+    ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(b"zakura-vct-auxiliary-input-v1");
         hasher.update(header_hash.0);
@@ -30,6 +34,13 @@ impl AuxiliaryInputFingerprint {
         hasher.update(record.orchard_tx_count.to_le_bytes());
         hasher.update(record.ironwood_tx_count.to_le_bytes());
         hasher.update(<[u8; 32]>::from(record.auth_data_root));
+        match boundary_hash {
+            Some(boundary_hash) => {
+                hasher.update([1]);
+                hasher.update(boundary_hash.0);
+            }
+            None => hasher.update([0]),
+        }
         Self(hasher.finalize().into())
     }
 
@@ -388,6 +399,17 @@ impl UntrustedAuxDeliveryRow {
     /// Return the raw durable outcome boundary.
     pub const fn outcome_boundary_hash(self) -> Option<block::Hash> {
         self.outcome_boundary_hash
+    }
+
+    /// Return whether the raw outcome fields form one valid recovered outcome.
+    pub fn has_valid_outcome(self) -> bool {
+        self.delivery
+            .promote_recovered_outcome(
+                self.outcome_status_code,
+                self.observation_digests,
+                self.outcome_boundary_hash,
+            )
+            .is_some()
     }
 
     pub(crate) const fn into_parts(

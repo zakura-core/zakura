@@ -99,6 +99,12 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
         .expect("the selected header redelivery passes production validation");
         let repair_owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&before)
             .bind(53, NonZeroU64::new(54).expect("fifty-four is nonzero"));
+        let repair_episode = runtime
+            .reader()
+            .vct_repair_context(repair_owner, child.height)
+            .expect("the selected repair context is coherent")
+            .expect("the selected repair target remains current")
+            .episode;
         let source = SourceId::from_digest([marker.wrapping_add(2); 32]);
         let delivery = AuxDelivery::new(
             EvidenceId::from_digest([marker.wrapping_add(3); 32]),
@@ -149,6 +155,7 @@ pub(super) fn crash_fixture_selected_auxiliary_repair_reopens_complete_before_or
                     completion: TargetCompletion::SelectedAuxiliaryRepair {
                         common_ancestor: anchor_frontier,
                         selected_target: child,
+                        episode: repair_episode,
                     },
                     batch: repair_batch,
                     aux: vec![delivery],

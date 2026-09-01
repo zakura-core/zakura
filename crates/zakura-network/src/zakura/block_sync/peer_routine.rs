@@ -42,7 +42,7 @@ use super::{
         ThroughputMeter,
     },
     work_queue::{WorkItem, WorkQueue, WorkReturnOutcome},
-    BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
+    BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
 use crate::zakura::{
@@ -317,7 +317,6 @@ pub(super) struct PeerRoutine {
     sequencer_input: mpsc::Sender<SequencedBody>,
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
-    actions: mpsc::Sender<BlockSyncAction>,
     /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
     /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
@@ -357,7 +356,6 @@ impl PeerRoutine {
         sequencer_input: mpsc::Sender<SequencedBody>,
         sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
         sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
-        actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
         sequencer_view: watch::Receiver<SequencerView>,
         cancel: CancellationToken,
@@ -402,7 +400,6 @@ impl PeerRoutine {
             sequencer_input,
             sequencer_input_bytes,
             sequencer_input_decoded_attributed_memory_bytes,
-            actions,
             routine_to_reactor,
             sequencer_view,
             last_reset_epoch,
@@ -2155,11 +2152,15 @@ impl PeerRoutine {
         // Misbehavior is record-only: observe and forward it, but never cancel the
         // session. Peer scoring no longer drives disconnects.
         metrics::counter!("sync.block.peer.violation").increment(1);
-        // `Misbehavior` is best-effort: never block the routine.
-        let _ = self.actions.try_send(BlockSyncAction::Misbehavior {
-            peer: self.peer.clone(),
-            reason,
-        });
+        // `Misbehavior` is best-effort: never block the routine. The reactor owns
+        // action dispatch so attacker-triggered reports cannot bypass its reserved
+        // control capacity.
+        let _ = self
+            .routine_to_reactor
+            .try_send(RoutineToReactor::Misbehavior {
+                peer: self.peer.clone(),
+                reason,
+            });
     }
 
     // ===================== view reads ======================================
@@ -2368,7 +2369,6 @@ mod tests {
         );
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (actions_tx, _actions_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
         let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
             finalized_height: block::Height(0),
@@ -2390,7 +2390,6 @@ mod tests {
             sequencer_input_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
-            actions_tx,
             routine_to_reactor_tx,
             view_rx,
             cancel,
@@ -2459,7 +2458,6 @@ mod tests {
         let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (actions_tx, _actions_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
         let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
             finalized_height: block::Height(0),
@@ -2482,7 +2480,6 @@ mod tests {
             sequencer_input_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
-            actions_tx,
             routine_to_reactor_tx,
             view_rx,
             cancel,
@@ -2555,7 +2552,6 @@ mod tests {
         let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (actions_tx, _actions_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
         let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
             finalized_height: block::Height(0),
@@ -2578,7 +2574,6 @@ mod tests {
             sequencer_input_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
-            actions_tx,
             routine_to_reactor_tx,
             view_rx,
             cancel,

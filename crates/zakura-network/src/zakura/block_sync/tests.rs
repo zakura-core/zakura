@@ -16,7 +16,6 @@ use super::{
         DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
         MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
-    events::RoutineToReactor,
     peer_registry::{OutstandingMeta, PeerRegistry},
     reactor::{
         node_id_from_block_peer_id, BS_ACTION_CONTROL_RESERVE, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
@@ -14020,7 +14019,7 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
+    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
         63,
@@ -14054,23 +14053,32 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
             .expect("the test fills one unreserved action slot");
     }
 
-    wiring
-        .routine_to_reactor
-        .send(RoutineToReactor::Misbehavior {
-            peer: peer_id.clone(),
-            reason: BlockSyncMisbehavior::InvalidBlock,
-        })
-        .await
-        .expect("the attacker-controlled misbehavior report queues");
-    wiring
-        .routine_to_reactor
-        .send(RoutineToReactor::StatusReceived {
-            peer: peer_id,
-            send_reply: true,
-        })
-        .await
-        .expect("the routine-channel barrier queues");
-    wait_for_outbound_status(&mut outbound_rx).await;
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::Status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(2),
+            tip_hash: blocks[1].hash(),
+            max_blocks_per_response: 16,
+            max_inflight_requests: 1,
+            max_response_bytes: MAX_BS_RESPONSE_BYTES,
+        }),
+    )
+    .await;
+    await_until(
+        "the download routine handles the unsolicited body before its status barrier",
+        Duration::from_secs(1),
+        || {
+            wiring.registry.candidate_snapshot().iter().any(
+                |(peer, received_status, _, servable_high)| {
+                    peer == &peer_id && *received_status && *servable_high == block::Height(2)
+                },
+            )
+        },
+    )
+    .await
+    .expect("the download routine reports the attacker-controlled body");
     assert_eq!(
         wiring.actions.capacity(),
         BS_ACTION_CONTROL_RESERVE,

@@ -235,6 +235,7 @@ pub fn spawn_block_sync_reactor(
         sequencer_input_bytes: sequencer_input_bytes.clone(),
         sequencer_input_decoded_attributed_memory_bytes:
             sequencer_input_decoded_attributed_memory_bytes.clone(),
+        #[cfg(test)]
         actions: actions_tx.clone(),
         routine_to_reactor: routine_to_reactor_tx,
         view: sequencer_view_rx.clone(),

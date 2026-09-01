@@ -73,10 +73,20 @@ fn exporting_metrics_refreshes_cached_disk_size() {
         "the flushed SST file should use disk space"
     );
     db.cached_size.store(u64::MAX, Ordering::Relaxed);
+    assert_eq!(
+        db.size(),
+        expected_size,
+        "the on-demand size must not return the cached estimate"
+    );
+    assert_eq!(
+        db.cached_size(),
+        u64::MAX,
+        "the test must replace the cached estimate"
+    );
     db.export_metrics();
 
     assert_eq!(
-        db.size(),
+        db.cached_size(),
         expected_size,
         "the metrics export should refresh the cached disk size"
     );

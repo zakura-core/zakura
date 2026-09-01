@@ -1440,7 +1440,10 @@ impl Request {
 /// [`ReadStateService`](crate::service::ReadStateService).
 pub enum ReadRequest {
     /// Returns [`ReadResponse::UsageInfo(num_bytes: u64)`](ReadResponse::UsageInfo)
-    /// with the current disk space usage in bytes.
+    /// with a recent estimate of the disk space usage in bytes.
+    ///
+    /// The state service refreshes this estimate with its RocksDB metrics, normally every 30
+    /// seconds.
     UsageInfo,
 
     /// Returns [`ReadResponse::PruningInfo`] with

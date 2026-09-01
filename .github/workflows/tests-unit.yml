@@ -363,6 +363,36 @@ jobs:
           cargo test --locked --features zip218 \
             -p zakura-consensus -p zakura-rpc --lib
 
+  zip233:
+    name: ZIP 233 feature tests
+    needs: changes
+    # Compiles its own binaries, because the shared nextest archive is built
+    # without this feature, and because the feature needs its own RUSTFLAGS.
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # ZIP 233 changes the v6 transaction format on both sides of the
+      # `zakura-primitives` boundary, and that crate gates its half on this cfg.
+      RUSTFLAGS: --cfg zcash_unstable="nu7"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Test the crates that ZIP 233 changes
+        run: |
+          cargo test --locked --features zakura-chain/zip233 -p zakura-chain --lib
+          cargo test --locked --features zip233 \
+            -p zakura-consensus -p zakura-rpc --lib
+
   network-dependent:
     name: network-dependent acceptance tests
     needs: changes
@@ -492,6 +522,7 @@ jobs:
       - unit-tests
       - zakura-config
       - zip218
+      - zip233
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
@@ -509,7 +540,7 @@ jobs:
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, zip218, publish-graph
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, zip218, zip233, publish-graph
 
   report-nightly-result:
     name: report nightly release test result

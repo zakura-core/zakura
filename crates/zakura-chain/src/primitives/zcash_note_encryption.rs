@@ -256,6 +256,7 @@ mod tests {
         ironwood_shielded_data: Option<chain_orchard::ShieldedData>,
     ) -> Transaction {
         Transaction::V6 {
+            zip233_amount: Default::default(),
             network_upgrade: NetworkUpgrade::Nu6_3,
             lock_time: LockTime::unlocked(),
             expiry_height: height,

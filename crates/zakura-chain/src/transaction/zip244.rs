@@ -33,7 +33,7 @@ use blake2b_simd::{Hash as Blake2bHash, Params, State};
 
 use crate::{
     orchard,
-    parameters::{NetworkUpgrade, TX_V5_VERSION_GROUP_ID, TX_V6_VERSION_GROUP_ID},
+    parameters::{NetworkUpgrade, TX_V5_VERSION_GROUP_ID, TX_V6_VERSION_GROUP_ID, ZIP233_ENABLED},
     sapling,
     serialization::ZcashSerialize,
     transaction::{sighash::CanonicalHashType, AuthDigest, Hash, SigHash, Transaction},
@@ -345,6 +345,7 @@ struct Zip244Parts<'a> {
     network_upgrade: NetworkUpgrade,
     lock_time: u32,
     expiry_height: crate::block::Height,
+    zip233_amount: u64,
     inputs: &'a [transparent::Input],
     outputs: &'a [transparent::Output],
     sapling: Option<&'a sapling::ShieldedData<sapling::SharedAnchor>>,
@@ -364,6 +365,8 @@ fn zip244_parts(tx: &Transaction) -> Option<Zip244Parts<'_>> {
         network_upgrade: tx.network_upgrade()?,
         lock_time: tx.raw_lock_time(),
         expiry_height: tx.expiry_height().unwrap_or(crate::block::Height(0)),
+        zip233_amount: u64::try_from(i64::from(tx.zip233_amount()))
+            .expect("Amount<NonNegative> is never negative"),
         inputs: tx.inputs(),
         outputs: tx.outputs(),
         sapling: tx.sapling_shielded_data(),
@@ -397,6 +400,14 @@ fn hash_header(parts: &Zip244Parts) -> Blake2bHash {
     // lock_time and expiry_height are each a single LE u32.
     h.update(&parts.lock_time.to_le_bytes());
     h.update(&parts.expiry_height.0.to_le_bytes());
+
+    // ZIP 233 §T.1f: an 8-byte little-endian `zip233_amount`, committed to by v6
+    // transactions only. Without the `zip233` feature the field is absent from the
+    // digest, so a default build reproduces the pre-ZIP 233 txid and sighash.
+    if ZIP233_ENABLED && parts.version == Zip244Version::V6 {
+        h.update(&parts.zip233_amount.to_le_bytes());
+    }
+
     h.finalize()
 }
 

@@ -1220,6 +1220,7 @@ mod tests {
         };
 
         let tx = Arc::new(Transaction::V6 {
+            zip233_amount: Default::default(),
             network_upgrade: NetworkUpgrade::Nu6_3,
             lock_time: LockTime::unlocked(),
             expiry_height: Height(1),
@@ -1275,6 +1276,7 @@ mod tests {
         let _init_guard = zakura_test::init();
 
         let tx = Arc::new(Transaction::V6 {
+            zip233_amount: Default::default(),
             network_upgrade: NetworkUpgrade::Nu6_3,
             lock_time: LockTime::unlocked(),
             expiry_height: Height(1),

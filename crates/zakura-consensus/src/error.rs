@@ -116,6 +116,9 @@ pub enum TransactionError {
     #[error("transaction version number MUST be >= 4")]
     WrongVersion,
 
+    #[error("transaction removes value from circulation before ZIP 233 activates at NU7")]
+    Zip233AmountBeforeNu7,
+
     #[error("transaction version {0} not supported by the network upgrade {1:?}")]
     UnsupportedByNetworkUpgrade(u32, zakura_chain::parameters::NetworkUpgrade),
 
@@ -445,6 +448,7 @@ impl TransactionError {
             Self::ExpiredTransaction { .. } => consensus("transaction.expired"),
             Self::Subsidy(_) => consensus("transaction.subsidy"),
             Self::WrongVersion => consensus("transaction.wrong_version"),
+            Self::Zip233AmountBeforeNu7 => consensus("transaction.zip233_amount_before_nu7"),
             Self::UnsupportedByNetworkUpgrade(_, _) => {
                 consensus("transaction.unsupported_by_network_upgrade")
             }
@@ -553,6 +557,7 @@ impl TransactionError {
             | IncorrectFee
             | Subsidy(_)
             | WrongVersion
+            | Zip233AmountBeforeNu7
             | NoInputs
             | NoOutputs
             | BadBalance

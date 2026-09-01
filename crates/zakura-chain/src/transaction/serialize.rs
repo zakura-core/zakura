@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-use crate::parameters::TX_V6_VERSION_GROUP_ID;
+use crate::parameters::{TX_V6_VERSION_GROUP_ID, ZIP233_ENABLED};
 
 use super::*;
 use crate::sapling;
@@ -810,6 +810,7 @@ impl ZcashSerialize for Transaction {
                 network_upgrade,
                 lock_time,
                 expiry_height,
+                zip233_amount,
                 inputs,
                 outputs,
                 sapling_shielded_data,
@@ -841,6 +842,16 @@ impl ZcashSerialize for Transaction {
 
                 // Denoted as `nExpiryHeight` in the spec.
                 writer.write_u32::<LittleEndian>(expiry_height.0)?;
+
+                // Denoted as `zip233Amount` in ZIP 233, an 8-byte little-endian amount.
+                // Only a `zip233` build carries the field, so the v6 wire format is
+                // unchanged in any other build.
+                if ZIP233_ENABLED {
+                    writer.write_u64::<LittleEndian>(
+                        u64::try_from(i64::from(*zip233_amount))
+                            .expect("Amount<NonNegative> is never negative"),
+                    )?;
+                }
 
                 // Denoted as `tx_in_count` and `tx_in` in the spec.
                 inputs.zcash_serialize(&mut writer)?;
@@ -1189,6 +1200,18 @@ impl ZcashDeserialize for Transaction {
                 // Denoted as `nExpiryHeight` in the spec.
                 let expiry_height = block::Height(limited_reader.read_u32::<LittleEndian>()?);
 
+                // Denoted as `zip233Amount` in ZIP 233, an 8-byte little-endian amount.
+                // Only a `zip233` build carries the field, so the v6 wire format is
+                // unchanged in any other build.
+                //
+                // > The zip233_amount MUST be in the range {0 .. MAX_MONEY}.
+                let zip233_amount = if ZIP233_ENABLED {
+                    Amount::try_from(limited_reader.read_u64::<LittleEndian>()?)
+                        .map_err(|_| SerializationError::Parse("zip233Amount out of range"))?
+                } else {
+                    Amount::zero()
+                };
+
                 // Denoted as `tx_in_count` and `tx_in` in the spec.
                 let inputs: Vec<transparent::Input> = Vec::zcash_deserialize(&mut limited_reader)?;
 
@@ -1228,6 +1251,7 @@ impl ZcashDeserialize for Transaction {
                     network_upgrade,
                     lock_time,
                     expiry_height,
+                    zip233_amount,
                     inputs,
                     outputs,
                     sapling_shielded_data,

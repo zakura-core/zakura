@@ -75,6 +75,7 @@ fn zip317_counts_ironwood_actions() {
         binding_sig: [0u8; 64].into(),
     };
     let transaction = Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: crate::block::Height(1),

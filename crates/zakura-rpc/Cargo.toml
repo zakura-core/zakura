@@ -32,6 +32,16 @@ zip218 = [
     "zakura-state/zip218",
 ]
 
+# ZIP 233 "Network Sustainability Mechanism: Removing Funds From Circulation": the
+# `zip233Amount` field on v6 transactions, which removes value from circulation.
+#
+# Also needs `RUSTFLAGS='--cfg zcash_unstable="nu7"'`; see `zakura-chain`.
+zip233 = [
+    "zakura-chain/zip233",
+    "zakura-consensus/zip233",
+    "zakura-state/zip233",
+]
+
 # Production features that activate extra dependencies, or extra features in
 # dependencies
 

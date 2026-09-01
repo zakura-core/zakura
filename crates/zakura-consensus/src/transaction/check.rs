@@ -131,11 +131,37 @@ pub fn lock_time_has_passed(
 pub fn has_inputs_and_outputs(tx: &Transaction) -> Result<(), TransactionError> {
     if !tx.has_transparent_or_shielded_inputs() {
         Err(TransactionError::NoInputs)
-    } else if !tx.has_transparent_or_shielded_outputs() {
+    } else if !tx.has_transparent_or_shielded_outputs() && !tx.has_zip233_amount() {
+        // A ZIP 233 burn is the transaction's effect on circulation, so a transaction
+        // whose only effect is a burn has somewhere for its value to go.
         Err(TransactionError::NoOutputs)
     } else {
         Ok(())
     }
+}
+
+/// Checks that a transaction's [ZIP 233] `zip233Amount` is allowed at `height` on
+/// `network`.
+///
+/// # Consensus
+///
+/// > The zip233_amount MUST be in the range {0 .. MAX_MONEY}.
+///
+/// ZIP 233 activates with NU7, so a transaction before NU7 must not remove value from
+/// circulation. `Amount<NonNegative>` already bounds the amount to `{0 .. MAX_MONEY}`,
+/// so only the activation height is checked here.
+///
+/// [ZIP 233]: https://zips.z.cash/zip-0233
+pub fn zip233_amount_is_valid(
+    tx: &Transaction,
+    height: Height,
+    network: &Network,
+) -> Result<(), TransactionError> {
+    if tx.has_zip233_amount() && !NetworkUpgrade::is_zip233_active(network, height) {
+        return Err(TransactionError::Zip233AmountBeforeNu7);
+    }
+
+    Ok(())
 }
 
 /// Checks that the transaction has enough orchard flags.

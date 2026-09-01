@@ -1521,6 +1521,7 @@ fn transaction_v6_with_ironwood_shielded_data(
     }
 
     Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: Nu6_3,
         inputs: Vec::new(),
         outputs: Vec::new(),

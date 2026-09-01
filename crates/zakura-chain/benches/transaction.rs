@@ -67,6 +67,7 @@ fn v6_ironwood_only_tx(orchard_tx: &Transaction) -> Arc<Transaction> {
         .expect("Orchard-only tx has Orchard shielded data");
 
     Arc::new(Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(1),

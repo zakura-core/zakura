@@ -613,6 +613,7 @@ fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifi
 
     (
         Arc::new(Transaction::V6 {
+            zip233_amount: Default::default(),
             network_upgrade: NetworkUpgrade::Nu6_3,
             lock_time: LockTime::unlocked(),
             expiry_height,

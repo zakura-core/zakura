@@ -239,8 +239,14 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu6_2, ConsensusBranchId(0x5437f330)),
     (Nu6_3, ConsensusBranchId(0x37a5165b)),
     // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
-    #[cfg(any(test, feature = "zakura-test"))]
+    //
+    // A `zcash_unstable = "nu7"` build must use the value `zcash_protocol` maps to NU7,
+    // because `Transaction::to_librustzcash` round-trips the branch ID through it. Such a
+    // build also gives NU7 a branch ID outside tests, because it is a NU7 build.
+    #[cfg(all(any(test, feature = "zakura-test"), not(zcash_unstable = "nu7")))]
     (Nu7, ConsensusBranchId(0xfffffffe)),
+    #[cfg(zcash_unstable = "nu7")]
+    (Nu7, ConsensusBranchId(0xffffffff)),
     #[cfg(zcash_unstable = "zfuture")]
     (ZFuture, ConsensusBranchId(0xfffffffd)),
 ];
@@ -262,6 +268,28 @@ pub const POST_BLOSSOM_POW_TARGET_SPACING: u32 = 75;
 ///
 /// Enabled by the `zip218` feature.
 pub const ZIP218_ENABLED: bool = cfg!(feature = "zip218");
+
+/// Whether the ZIP 233 rules are compiled into this build.
+///
+/// ZIP 233 adds the `zip233Amount` field to the v6 transaction format, which removes
+/// value from circulation. The field changes the v6 wire format and the ZIP 244 header
+/// digest, so a build with this feature disabled parses, serializes, and hashes v6
+/// transactions exactly as before, and every transaction has a `zip233_amount` of zero.
+///
+/// The rules are still dormant until NU7 activates on the configured network.
+///
+/// Enabled by the `zip233` feature.
+pub const ZIP233_ENABLED: bool = cfg!(feature = "zip233");
+
+// The `zip233` feature only reaches the matching `zakura-primitives` code, which parses
+// and hashes the field on the `librustzcash` side, when the build also sets the
+// `zcash_unstable = "nu7"` cfg. Without it the two sides disagree on the v6 wire format,
+// which would be a consensus split rather than a compile error, so fail the build here.
+#[cfg(all(feature = "zip233", not(zcash_unstable = "nu7")))]
+compile_error!(
+    "the `zip233` feature needs RUSTFLAGS='--cfg zcash_unstable=\"nu7\"' so that \
+     `zakura-primitives` compiles its matching ZIP 233 code"
+);
 
 /// The target block spacing after NU7 activation, in seconds.
 ///
@@ -622,6 +650,14 @@ impl NetworkUpgrade {
             .values()
             .any(|upgrade| *upgrade == NetworkUpgrade::Nu7)
             && NetworkUpgrade::current(network, height) >= NetworkUpgrade::Nu7
+    }
+
+    /// Returns `true` if the ZIP 233 rules are compiled in and active for
+    /// `network` at `height`.
+    ///
+    /// See [`ZIP233_ENABLED`] and [`NetworkUpgrade::is_nu7_active`].
+    pub fn is_zip233_active(network: &Network, height: block::Height) -> bool {
+        ZIP233_ENABLED && Self::is_nu7_active(network, height)
     }
 
     /// Returns `true` if the ZIP 218 rules are compiled in and active for

@@ -158,6 +158,17 @@ pub enum Transaction {
         lock_time: LockTime,
         /// The latest block height that this transaction can be added to the chain.
         expiry_height: block::Height,
+        /// The value this transaction removes from circulation, in zatoshis.
+        ///
+        /// [ZIP 233] calls this `zip233Amount`. It produces no output in any chain value
+        /// pool, and is subtracted from the issued supply.
+        ///
+        /// The field is only serialized, and only committed to by the ZIP 244 header
+        /// digest, in a `zip233` build. In any other build it is always zero, so the v6
+        /// wire format is unchanged.
+        ///
+        /// [ZIP 233]: https://zips.z.cash/zip-0233
+        zip233_amount: Amount<NonNegative>,
         /// The transparent inputs to the transaction.
         inputs: Vec<transparent::Input>,
         /// The transparent outputs from the transaction.
@@ -1880,6 +1891,30 @@ impl Transaction {
             Transaction::V5 { .. } => Some(TX_V5_VERSION_GROUP_ID),
             Transaction::V6 { .. } => Some(TX_V6_VERSION_GROUP_ID),
         }
+    }
+
+    /// Returns the value this transaction removes from circulation, in zatoshis.
+    ///
+    /// [ZIP 233] calls this `zip233Amount`. Only v6 transactions carry the field, and
+    /// only in a `zip233` build, so this returns zero for every other transaction.
+    ///
+    /// [ZIP 233]: https://zips.z.cash/zip-0233
+    pub fn zip233_amount(&self) -> Amount<NonNegative> {
+        match self {
+            Transaction::V1 { .. }
+            | Transaction::V2 { .. }
+            | Transaction::V3 { .. }
+            | Transaction::V4 { .. }
+            | Transaction::V5 { .. } => Amount::zero(),
+            Transaction::V6 { zip233_amount, .. } => *zip233_amount,
+        }
+    }
+
+    /// Returns whether this transaction removes value from circulation under [ZIP 233].
+    ///
+    /// [ZIP 233]: https://zips.z.cash/zip-0233
+    pub fn has_zip233_amount(&self) -> bool {
+        self.zip233_amount() > Amount::<NonNegative>::zero()
     }
 }
 

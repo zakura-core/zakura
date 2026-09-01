@@ -853,6 +853,7 @@ fn miner_fees_validation_includes_ironwood_balance() {
     let height = Height(1);
     let output_value = Amount::try_from(10).expect("valid test amount");
     let coinbase_tx = Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::Height(Height(0)),
         expiry_height: height,

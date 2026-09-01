@@ -106,6 +106,7 @@ fn shielded_proof_sizes_are_enforced_for_in_memory_transactions() {
         orchard_shielded_data: Some(orchard_shielded_data),
     };
     let make_v6 = |ironwood_shielded_data| Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(1),
@@ -160,6 +161,7 @@ fn matching_orchard_and_ironwood_nullifiers_are_not_conflicts() {
         .find_map(|transaction| transaction.orchard_shielded_data().cloned())
         .expect("test vectors include an Orchard transaction");
     let transaction = Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(1),
@@ -269,6 +271,7 @@ fn v6_pool_flow_transaction(
     transparent_outputs: Vec<transparent::Output>,
 ) -> Transaction {
     Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::Height(block::Height(0)),
         expiry_height: Height(1),
@@ -356,6 +359,7 @@ fn coinbase_rejects_orchard_shielded_data_after_nu6_3() {
     // zero value balance, so `disabled_add_to_orchard_pool` does NOT catch it — this
     // structural rule is what rejects it (the two rules are not redundant).
     let coinbase_with_orchard = Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::Height(Height(0)),
         expiry_height: height,
@@ -377,6 +381,7 @@ fn coinbase_rejects_orchard_shielded_data_after_nu6_3() {
 
     // A V6 coinbase paying shielded output through Ironwood (no Orchard bundle) is allowed.
     let coinbase_with_ironwood = Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::Height(Height(0)),
         expiry_height: height,
@@ -3932,6 +3937,109 @@ async fn v5_with_duplicate_orchard_action() {
 }
 
 /// Checks the activation boundary of the temporary Orchard-disabling soft fork:
+/// Checks that a ZIP 233 burn is only valid once NU7 activates, and that the miner fee
+/// excludes it.
+#[test]
+fn zip233_amount_activates_at_nu7_and_is_not_a_fee() {
+    let _init_guard = zakura_test::init();
+
+    let nu7 = Height(2_000_000);
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu6_2: Some(10),
+            nu6_3: Some(11),
+            nu7: Some(nu7.0),
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+
+    let input_value = Amount::<NonNegative>::try_from(1_000_000).expect("valid amount");
+    let output_value = Amount::<NonNegative>::try_from(400_000).expect("valid amount");
+    let burn = Amount::<NonNegative>::try_from(250_000).expect("valid amount");
+
+    let outpoint = transparent::OutPoint::from_usize(Hash([0u8; 32]), 0);
+    let utxo = transparent::Utxo {
+        output: transparent::Output {
+            value: input_value,
+            lock_script: transparent::Script::new(&[]),
+        },
+        height: Height(1),
+        from_coinbase: false,
+    };
+    let spent_utxos = HashMap::from([(outpoint, utxo)]);
+
+    let make_tx = |zip233_amount| Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu7,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        zip233_amount,
+        inputs: vec![transparent::Input::PrevOut {
+            outpoint,
+            unlock_script: transparent::Script::new(&[]),
+            sequence: 0,
+        }],
+        outputs: vec![transparent::Output {
+            value: output_value,
+            lock_script: transparent::Script::new(&[]),
+        }],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+    };
+
+    let plain = make_tx(Amount::zero());
+    let burning = make_tx(burn);
+
+    // A transaction that removes nothing from circulation is valid at any height.
+    assert_eq!(
+        check::zip233_amount_is_valid(&plain, Height(12), &network),
+        Ok(())
+    );
+    assert_eq!(check::zip233_amount_is_valid(&plain, nu7, &network), Ok(()));
+
+    // A burn is invalid before NU7.
+    assert_eq!(
+        check::zip233_amount_is_valid(&burning, Height(12), &network),
+        Err(TransactionError::Zip233AmountBeforeNu7),
+    );
+
+    if zakura_chain::parameters::ZIP233_ENABLED {
+        assert_eq!(
+            check::zip233_amount_is_valid(&burning, nu7, &network),
+            Ok(())
+        );
+    } else {
+        // A build without the feature never reads the field from the wire, so a burn is
+        // invalid at every height. This transaction only exists because the test built
+        // it in memory.
+        assert_eq!(
+            check::zip233_amount_is_valid(&burning, nu7, &network),
+            Err(TransactionError::Zip233AmountBeforeNu7),
+        );
+    }
+
+    // The burn leaves circulation instead of paying the miner, so the fee excludes it.
+    let plain_fee = TestVerifier::miner_fee(&plain, &spent_utxos).expect("valid fee");
+    let burning_fee = TestVerifier::miner_fee(&burning, &spent_utxos).expect("valid fee");
+
+    assert_eq!(
+        plain_fee,
+        (input_value - output_value).expect("valid amount")
+    );
+    assert_eq!(burning_fee, (plain_fee - burn).expect("valid amount"));
+}
+
 /// Checks the ZIP 2003 version 4 deprecation boundary: a V4 transaction is valid below
 /// the deprecation height and invalid at and above it, the default deprecation is the NU7
 /// activation height, a network can name a later height, and a network can keep accepting

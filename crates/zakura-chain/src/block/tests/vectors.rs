@@ -216,6 +216,7 @@ fn ironwood_block_accessors_preserve_pool_and_wire_order() {
         |orchard_shielded_data: orchard::ShieldedData,
          ironwood_shielded_data: ironwood::ShieldedData| {
             Arc::new(Transaction::V6 {
+                zip233_amount: Default::default(),
                 network_upgrade: Nu6_3,
                 lock_time: LockTime::unlocked(),
                 expiry_height: Height(1),
@@ -308,6 +309,7 @@ fn ironwood_transaction_count_is_pool_specific_and_counts_bundles() {
         |orchard_shielded_data: Option<orchard::ShieldedData>,
          ironwood_shielded_data: Option<ironwood::ShieldedData>| {
             Arc::new(Transaction::V6 {
+                zip233_amount: Default::default(),
                 network_upgrade: Nu6_3,
                 lock_time: LockTime::unlocked(),
                 expiry_height: Height(1),

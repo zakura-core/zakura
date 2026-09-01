@@ -464,6 +464,10 @@ where
             }
             check::sapling_point_encodings_are_valid(&tx)?;
 
+            // ZIP 233 activates with NU7: a transaction cannot remove value from
+            // circulation before then.
+            check::zip233_amount_is_valid(&tx, req.height(), &network)?;
+
             // A transaction whose own shielded counts exceed a per-block ZIP 218
             // limit can never be mined, so reject it on submission.
             crate::block::check::shielded_action_limits_are_valid(
@@ -754,14 +758,25 @@ where
     }
 
     /// Calculate the miner fee from the transaction's value balance.
+    ///
+    /// The [ZIP 233] `zip233Amount` is part of the transaction's remaining value but is
+    /// not a fee: it leaves circulation instead of paying the miner, so the coinbase
+    /// cannot claim it. Subtracting it here is what makes the burn permanent, because
+    /// the block's coinbase output is checked against the block subsidy plus these fees.
+    ///
+    /// [ZIP 233]: https://zips.z.cash/zip-0233
     fn miner_fee(
         tx: &Transaction,
         spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
     ) -> Result<Amount<NonNegative>, TransactionError> {
         match tx.value_balance(spent_utxos) {
-            Ok(value_balance) => value_balance
-                .remaining_transaction_value()
-                .map_err(|_| TransactionError::IncorrectFee),
+            Ok(value_balance) => {
+                let remaining_value = value_balance
+                    .remaining_transaction_value()
+                    .map_err(|_| TransactionError::IncorrectFee)?;
+
+                (remaining_value - tx.zip233_amount()).map_err(|_| TransactionError::IncorrectFee)
+            }
             Err(_) => Err(TransactionError::IncorrectFee),
         }
     }

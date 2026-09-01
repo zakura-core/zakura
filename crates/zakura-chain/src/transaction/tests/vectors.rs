@@ -297,6 +297,7 @@ fn v6_orchard_cross_address_flag_fails_serialization_and_deserialization() {
         .expect("test vectors include an Orchard transaction");
 
     let make_tx = |shielded_data: crate::orchard::ShieldedData| Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(1),
@@ -359,6 +360,7 @@ fn v6_ironwood_cross_address_flag_round_trips_and_rejects_reserved_bits() {
         .insert(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
 
     let make_tx = |shielded_data: crate::ironwood::ShieldedData| Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(1),
@@ -804,7 +806,10 @@ fn native_zip244_matches_test_vectors() -> Result<()> {
             .to_le_bytes(),
         );
 
-        assert_native_zip244_matches_librustzcash_for_test_vector(&tx_bytes, test.scenario)?;
+        assert_native_zip244_matches_librustzcash_for_test_vector(
+            &with_zip233_amount(&tx_bytes),
+            test.scenario,
+        )?;
     }
 
     Ok(())
@@ -1369,6 +1374,79 @@ fn zip244_rejects_the_raw_pre_v5_sighash_path() {
     let _ = sighasher.sighash_v4_raw(0x41, None);
 }
 
+/// Checks that ZIP 233's `zip233Amount` is committed to by the txid and the auth digest,
+/// and that a `zip233` build agrees with `librustzcash` on both.
+///
+/// Without this commitment the amount would be malleable: a relaying node could change
+/// how much value a transaction removes from circulation without changing its txid.
+#[test]
+fn zip233_amount_is_committed_to_by_the_txid() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    let (transaction, _, _) = v6_transparent_sighash_test_data()?;
+    let Transaction::V6 { zip233_amount, .. } = &transaction else {
+        panic!("the transparent sighash vector is a V6 transaction");
+    };
+    assert_eq!(
+        *zip233_amount,
+        Amount::<NonNegative>::zero(),
+        "the V6 test vectors remove nothing from circulation",
+    );
+
+    let mut burning = transaction.clone();
+    let Transaction::V6 { zip233_amount, .. } = &mut burning else {
+        unreachable!("cloned a V6 transaction");
+    };
+    *zip233_amount = Amount::try_from(100_000)?;
+
+    if !crate::parameters::ZIP233_ENABLED {
+        // A build without the feature does not serialize the field, so it cannot commit
+        // to it either. `zip233_amount` is always zero on such a build, and this
+        // transaction only exists because the test constructed it in memory.
+        assert_eq!(transaction.hash(), burning.hash());
+        return Ok(());
+    }
+
+    assert_ne!(
+        transaction.hash(),
+        burning.hash(),
+        "the txid must commit to zip233Amount",
+    );
+
+    // Both transactions must round-trip, and the native digests must match librustzcash.
+    for (tx, name) in [(&transaction, "zero zip233Amount"), (&burning, "burn")] {
+        let tx_bytes = tx.zcash_serialize_to_vec()?;
+        assert_eq!(
+            &tx_bytes.zcash_deserialize_into::<Transaction>()?,
+            tx,
+            "{name} must round-trip",
+        );
+        assert_native_zip244_matches_librustzcash_for_test_vector(&tx_bytes, name)?;
+    }
+
+    Ok(())
+}
+
+/// Returns `tx_bytes` with a zero `zip233Amount` spliced in, if this build reads one.
+///
+/// The V6 test vectors were generated before ZIP 233 added `zip233Amount` after
+/// `nExpiryHeight`, so a `zip233` build needs the field to parse them. Zero is the
+/// amount those vectors imply: they remove nothing from circulation.
+fn with_zip233_amount(tx_bytes: &[u8]) -> Vec<u8> {
+    if !crate::parameters::ZIP233_ENABLED {
+        return tx_bytes.to_vec();
+    }
+
+    // nVersion, nVersionGroupId, nConsensusBranchId, lock_time, and nExpiryHeight are
+    // four bytes each, and `zip233Amount` follows them.
+    const ZIP233_AMOUNT_OFFSET: usize = 20;
+
+    let mut padded = tx_bytes[..ZIP233_AMOUNT_OFFSET].to_vec();
+    padded.extend_from_slice(&0u64.to_le_bytes());
+    padded.extend_from_slice(&tx_bytes[ZIP233_AMOUNT_OFFSET..]);
+    padded
+}
+
 fn v6_transparent_sighash_test_data() -> Result<(Transaction, Arc<Vec<transparent::Output>>, usize)>
 {
     let test = ironwood_v6_tx_hash::TEST_VECTORS
@@ -1386,7 +1464,7 @@ fn v6_transparent_sighash_test_data() -> Result<(Transaction, Arc<Vec<transparen
         .to_le_bytes(),
     );
 
-    let transaction = tx_bytes.zcash_deserialize_into::<Transaction>()?;
+    let transaction = with_zip233_amount(&tx_bytes).zcash_deserialize_into::<Transaction>()?;
     let previous_outputs: Arc<Vec<transparent::Output>> = Arc::new(
         test.amounts
             .iter()
@@ -1796,6 +1874,7 @@ fn v6_version_group_id_matches_librustzcash_and_wire_format() {
     );
 
     let tx = Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(0),
@@ -1838,11 +1917,15 @@ fn v6_transactions_accept_nu6_3_and_later_branch_ids() {
         tx_bytes.extend_from_slice(&u32::from(branch_id).to_le_bytes());
         tx_bytes.extend_from_slice(&0u32.to_le_bytes());
         tx_bytes.extend_from_slice(&0u32.to_le_bytes());
+        if crate::parameters::ZIP233_ENABLED {
+            tx_bytes.extend_from_slice(&0u64.to_le_bytes());
+        }
         tx_bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
         tx_bytes
     };
 
     let empty_v6_transaction = |network_upgrade| Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(0),
@@ -1925,6 +2008,7 @@ fn v6_sighasher_preserves_distinct_orchard_and_ironwood_bundle_slots() {
         .expect("the test bundle has at least one action");
 
     let tx = Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(1),
@@ -1983,6 +2067,7 @@ fn v6_txid_commits_to_ironwood_digest() {
     let _init_guard = zakura_test::init();
 
     let tx_without_ironwood = Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(1),
@@ -2070,6 +2155,7 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
     };
 
     let tx_a = Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(1),
@@ -2210,6 +2296,7 @@ fn v6_noncanonical_orchard_proof_is_rejected_during_deserialization() {
         .expect("test vectors include an Orchard transaction");
 
     let make_tx = |orchard_shielded_data| Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(1),
@@ -2261,6 +2348,7 @@ fn v6_noncanonical_ironwood_proof_is_rejected_during_deserialization() {
         .expect("test vectors include an Orchard-shaped bundle");
 
     let make_tx = |ironwood_shielded_data| Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(1),
@@ -2406,6 +2494,7 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
         };
 
         let v6_tx = Transaction::V6 {
+            zip233_amount: Default::default(),
             network_upgrade: NetworkUpgrade::Nu6_3,
             lock_time: LockTime::unlocked(),
             expiry_height: Height(0),
@@ -2762,6 +2851,7 @@ fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() 
                 orchard_shielded_data: None,
             },
             Transaction::V6 {
+                zip233_amount: Default::default(),
                 network_upgrade: NetworkUpgrade::Nu6_3,
                 lock_time: LockTime::unlocked(),
                 expiry_height: Height(0),
@@ -2998,6 +3088,7 @@ fn sapling_point_encodings_check_rejects_bad_points() {
 
     let make_v6 = |cv: [u8; 32], epk: [u8; 32]| -> Transaction {
         Transaction::V6 {
+            zip233_amount: Default::default(),
             network_upgrade: NetworkUpgrade::Nu6_3,
             lock_time: LockTime::unlocked(),
             expiry_height: Height(0),

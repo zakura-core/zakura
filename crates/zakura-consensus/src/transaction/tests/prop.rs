@@ -322,6 +322,7 @@ fn mock_transparent_transaction(
             network_upgrade,
         },
         6 => Transaction::V6 {
+            zip233_amount: Default::default(),
             inputs,
             outputs,
             lock_time,

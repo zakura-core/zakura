@@ -117,6 +117,18 @@ fn v5_tx_strategy(
         .boxed()
 }
 
+/// A strategy for the ZIP 233 `zip233Amount` of a v6 transaction.
+///
+/// Only a `zip233` build serializes the field, so any other build must generate zero:
+/// a non-zero amount would not survive a serialization round-trip there.
+fn zip233_amount_strategy() -> BoxedStrategy<Amount<NonNegative>> {
+    if crate::parameters::ZIP233_ENABLED {
+        any::<Amount<NonNegative>>().boxed()
+    } else {
+        Just(Amount::zero()).boxed()
+    }
+}
+
 fn v6_tx_strategy(
     sapling_shielded_data: BoxedStrategy<Option<sapling::ShieldedData<sapling::SharedAnchor>>>,
     orchard_shielded_data: BoxedStrategy<Option<orchard::ShieldedData>>,
@@ -125,6 +137,7 @@ fn v6_tx_strategy(
     (
         any::<LockTime>(),
         any::<Height>(),
+        zip233_amount_strategy(),
         vec(any_with::<transparent::Input>(None), 0..MAX_ARBITRARY_ITEMS),
         vec(any::<transparent::Output>(), 0..MAX_ARBITRARY_ITEMS),
         sapling_shielded_data,
@@ -135,12 +148,14 @@ fn v6_tx_strategy(
             |(
                 lock_time,
                 expiry_height,
+                zip233_amount,
                 inputs,
                 outputs,
                 sapling_shielded_data,
                 orchard_shielded_data,
                 ironwood_shielded_data,
             )| Transaction::V6 {
+                zip233_amount,
                 network_upgrade: NetworkUpgrade::Nu6_3,
                 lock_time,
                 expiry_height,

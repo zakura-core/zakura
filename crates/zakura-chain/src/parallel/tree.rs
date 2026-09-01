@@ -359,6 +359,7 @@ mod tests {
             |orchard_shielded_data: orchard::ShieldedData,
              ironwood_shielded_data: ironwood::ShieldedData| {
                 Arc::new(Transaction::V6 {
+                    zip233_amount: Default::default(),
                     network_upgrade: Nu6_3,
                     lock_time: LockTime::unlocked(),
                     expiry_height: Height(1),
@@ -372,6 +373,7 @@ mod tests {
 
         let height = Height(123);
         let coinbase = Arc::new(Transaction::V6 {
+            zip233_amount: Default::default(),
             network_upgrade: Nu6_3,
             lock_time: LockTime::unlocked(),
             expiry_height: height,

@@ -51,6 +51,7 @@ fn ironwood_v6_tx(
     };
 
     std::sync::Arc::new(Transaction::V6 {
+        zip233_amount: Default::default(),
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height,

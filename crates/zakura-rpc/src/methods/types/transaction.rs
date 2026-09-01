@@ -297,9 +297,12 @@ impl TransactionTemplate<NegativeOrZero> {
         }
 
         // The ZIP 233 field carries the ZIP 235 burn. It is set after the outputs, so the
-        // builder's value balance already accounts for the reduced miner reward. The
-        // setter only exists in a build that compiles `zakura-primitives`' ZIP 233 code.
-        #[cfg(feature = "zip235")]
+        // builder's value balance already accounts for the reduced miner reward.
+        //
+        // The setter only exists where `zakura-primitives` compiles its ZIP 233 code,
+        // which needs the `zcash_unstable = "nu7"` cfg as well as the feature. That is
+        // exactly when `ZIP235_ENABLED` is true, so `fee_burn` is zero otherwise.
+        #[cfg(all(feature = "zip235", zcash_unstable = "nu7"))]
         if fee_burn > Amount::<NonNegative>::zero() {
             builder.set_zip233_amount(Zatoshis::try_from(fee_burn)?);
         }

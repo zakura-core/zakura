@@ -4,11 +4,10 @@ This directory tests the native Zakura control handshake as one protocol exchang
 executes the production codecs, validation, framing, deadlines, nonce binding, and limit
 negotiation.
 
-The [MVP design](../../../../../../../art/inbox/expectations/handshake-property-testing-design.md)
-defines the intended coverage. The
-[message regulation design](../../../../../../../zakura.peer-message-regulation/docs/design/peer-message-regulation.md)
+The
+[message regulation design](../../../../../../docs/design/peer-message-regulation.md)
 and
-[message regulation specification](../../../../../../../zakura.peer-message-regulation/docs/specs/peer-message-regulation.md)
+[message regulation specification](../../../../../../docs/specs/peer-message-regulation.md)
 define the receiver-owned bounds that motivate these properties.
 
 ## Test shape

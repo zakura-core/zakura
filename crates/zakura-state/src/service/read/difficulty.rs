@@ -5,10 +5,12 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use zakura_chain::{
+    amount::NonNegative,
     block::{self, Block, Hash, Height},
     history_tree::HistoryTree,
     parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
     serialization::{DateTime32, Duration32},
+    value_balance::ValueBalance,
     work::difficulty::{CompactDifficulty, PartialCumulativeWork, Work, U256},
 };
 
@@ -71,12 +73,19 @@ pub fn get_block_template_chain_info(
     let (best_tip_height, best_tip_hash, best_relevant_chain, best_tip_history_tree) =
         best_relevant_chain_and_history_tree_result?;
 
+    // A candidate block's ZIP 234 subsidy comes from the money reserve after its parent,
+    // which is this tip.
+    let value_pools = read::block_info(non_finalized_state.best_chain(), db, best_tip_hash.into())
+        .map(|block_info| *block_info.value_pools())
+        .unwrap_or_else(ValueBalance::zero);
+
     Ok(difficulty_time_and_history_tree(
         best_relevant_chain,
         best_tip_height,
         best_tip_hash,
         network,
         best_tip_history_tree,
+        value_pools,
     ))
 }
 
@@ -212,6 +221,7 @@ fn difficulty_time_and_history_tree(
     tip_hash: block::Hash,
     network: &Network,
     history_tree: Arc<HistoryTree>,
+    value_pools: ValueBalance<NonNegative>,
 ) -> GetBlockTemplateChainInfo {
     let relevant_data: Vec<(CompactDifficulty, DateTime<Utc>)> = relevant_chain
         .iter()
@@ -263,6 +273,7 @@ fn difficulty_time_and_history_tree(
         cur_time,
         min_time,
         max_time,
+        value_pools,
     };
 
     adjust_difficulty_and_time_for_testnet(&mut result, network, tip_height, relevant_data);

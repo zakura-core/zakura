@@ -84,6 +84,24 @@ zip218 = [
     "zakura-header-chain/zip218",
 ]
 
+# ZIP 234 "Network Sustainability Mechanism: Issuance Smoothing", the "smooth issuance
+# curve" option on the NU7 ballot.
+zip234 = [
+    "zakura-chain/zip234",
+    "zakura-consensus/zip234",
+    "zakura-state/zip234",
+    "zakura-rpc/zip234",
+]
+
+# ZIP 234's "preserve halvings" option on the NU7 ballot.
+zip234-halvings = [
+    "zakura-chain/zip234-halvings",
+    "zakura-consensus/zip234-halvings",
+    "zakura-state/zip234-halvings",
+    "zakura-rpc/zip234-halvings",
+    "zip234",
+]
+
 # In release builds, don't compile debug logging code, to improve performance.
 default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "sentry", "opentelemetry"]
 

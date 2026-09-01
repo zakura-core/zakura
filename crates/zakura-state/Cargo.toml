@@ -23,6 +23,18 @@ zip218 = [
     "zakura-header-chain/zip218",
 ]
 
+# ZIP 234 "Network Sustainability Mechanism: Issuance Smoothing", the "smooth issuance
+# curve" option on the NU7 ballot.
+zip234 = [
+    "zakura-chain/zip234",
+]
+
+# ZIP 234's "preserve halvings" option on the NU7 ballot.
+zip234-halvings = [
+    "zakura-chain/zip234-halvings",
+    "zip234",
+]
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 # Exposes narrow internal hooks used by benchmarks.

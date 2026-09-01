@@ -317,7 +317,7 @@ fn subsidy_is_valid_for_network(network: Network) -> Result<(), Report> {
         // TODO: first halving, second halving, third halving, and very large halvings
         if height >= canopy_activation_height {
             let expected_block_subsidy =
-                zakura_chain::parameters::subsidy::block_subsidy(height, &network)
+                zakura_chain::parameters::subsidy::block_subsidy(height, &network, None)
                     .expect("valid block subsidy");
 
             check::subsidy_is_valid(&block, &network, expected_block_subsidy)
@@ -376,8 +376,8 @@ fn local_genesis_nu6_3_activation_has_satisfiable_lockbox_rule() -> Result<(), R
             .clone(),
         transactions: vec![Arc::new(coinbase)],
     };
-    let expected_block_subsidy =
-        block_subsidy(height, &network).expect("the local activation height has a block subsidy");
+    let expected_block_subsidy = block_subsidy(height, &network, None)
+        .expect("the local activation height has a block subsidy");
 
     // `subsidy_is_valid` skips all checks (including the lockbox rule) for a
     // zero subsidy, which would make this test vacuous.
@@ -407,6 +407,7 @@ fn coinbase_validation_failure() -> Result<(), Report> {
             .coinbase_height()
             .expect("block should have coinbase height"),
         &network,
+        None,
     )
     .expect("valid block subsidy");
 
@@ -433,6 +434,7 @@ fn coinbase_validation_failure() -> Result<(), Report> {
             .coinbase_height()
             .expect("block should have coinbase height"),
         &network,
+        None,
     )
     .expect("valid block subsidy");
 
@@ -473,6 +475,7 @@ fn coinbase_validation_failure() -> Result<(), Report> {
             .coinbase_height()
             .expect("block should have coinbase height"),
         &network,
+        None,
     )
     .expect("valid block subsidy");
 
@@ -505,7 +508,7 @@ fn funding_stream_validation_for_network(network: Network) -> Result<(), Report>
         if height >= canopy_activation_height {
             let block = Block::zcash_deserialize(&block[..]).expect("block should deserialize");
             let expected_block_subsidy =
-                zakura_chain::parameters::subsidy::block_subsidy(height, &network)
+                zakura_chain::parameters::subsidy::block_subsidy(height, &network, None)
                     .expect("valid block subsidy");
 
             // Validate
@@ -558,6 +561,7 @@ fn funding_stream_validation_failure() -> Result<(), Report> {
             .coinbase_height()
             .expect("block should have coinbase height"),
         &network,
+        None,
     )
     .expect("valid block subsidy");
 
@@ -589,7 +593,7 @@ fn miner_fees_validation_for_network(network: Network) -> Result<(), Report> {
             let block = Block::zcash_deserialize(&block[..]).expect("block should deserialize");
             let coinbase_tx = check::coinbase_is_first(&block)?;
 
-            let expected_block_subsidy = block_subsidy(height, &network)?;
+            let expected_block_subsidy = block_subsidy(height, &network, None)?;
             // See [ZIP-1015](https://zips.z.cash/zip-1015).
             let deferred_pool_balance_change =
                 match NetworkUpgrade::Canopy.activation_height(&network) {
@@ -622,7 +626,7 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
     let block = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..])
         .expect("block should deserialize");
     let height = block.coinbase_height().expect("valid coinbase height");
-    let expected_block_subsidy = block_subsidy(height, &network)?;
+    let expected_block_subsidy = block_subsidy(height, &network, None)?;
     // See [ZIP-1015](https://zips.z.cash/zip-1015).
     let deferred_pool_balance_change = match NetworkUpgrade::Canopy.activation_height(&network) {
         Some(activation_height) if height >= activation_height => {
@@ -767,7 +771,7 @@ fn v5_coinbase_transaction(
     network: &Network,
 ) -> Transaction {
     let mut outputs = vec![transparent::Output {
-        value: block_subsidy(height, network).expect("valid test block subsidy"),
+        value: block_subsidy(height, network, None).expect("valid test block subsidy"),
         lock_script: transparent::Script::new(&[0]),
     }];
 

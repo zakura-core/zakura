@@ -118,7 +118,7 @@ pub fn select_mempool_transactions(
     // Use a fake coinbase transaction to break the dependency between transaction
     // selection, the miner fee, and the fee payment in the coinbase transaction.
     let fake_coinbase_tx =
-        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero())
+        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero(), None)
             .expect("valid coinbase transaction template");
 
     let tx_dependencies = mempool_tx_deps.dependencies();

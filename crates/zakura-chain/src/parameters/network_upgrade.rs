@@ -263,6 +263,35 @@ pub const POST_BLOSSOM_POW_TARGET_SPACING: u32 = 75;
 /// Enabled by the `zip218` feature.
 pub const ZIP218_ENABLED: bool = cfg!(feature = "zip218");
 
+/// Whether either ZIP 234 issuance option is compiled into this build.
+pub const ZIP234_ENABLED: bool = cfg!(feature = "zip234");
+
+/// Whether ZIP 234's smoothed issuance curve applies in this build.
+///
+/// The curve replaces halvings: each block subsidy is a fixed fraction of the money
+/// reserve, so issuance decays smoothly. This is the "smooth issuance curve" option on
+/// the NU7 ballot.
+///
+/// The rules are still dormant until [`zip234_start_height`] is reached.
+///
+/// The `zip234` feature selects this option unless `zip234-halvings` is also enabled.
+///
+/// [`zip234_start_height`]: crate::parameters::subsidy::zip234_start_height
+pub const ZIP234_SMOOTHING_ENABLED: bool = ZIP234_ENABLED && !cfg!(feature = "zip234-halvings");
+
+/// Whether ZIP 234's halving-preserving issuance applies in this build.
+///
+/// Halvings stay, and each block subsidy gains a bonus that reissues value left outside
+/// the chain value pools at the same smoothing fraction. This is the "preserve halvings"
+/// option on the NU7 ballot.
+///
+/// The rules are still dormant until [`zip234_start_height`] is reached.
+///
+/// The additive `zip234-halvings` feature enables `zip234` and selects this option.
+///
+/// [`zip234_start_height`]: crate::parameters::subsidy::zip234_start_height
+pub const ZIP234_HALVINGS_ENABLED: bool = ZIP234_ENABLED && cfg!(feature = "zip234-halvings");
+
 /// The target block spacing after NU7 activation, in seconds.
 ///
 /// `PostNU7PoWTargetSpacing` in ZIP 218.

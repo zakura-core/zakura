@@ -183,24 +183,24 @@ Six test categories keep declarations, codecs, gate state, and runtime behavior 
 | **Bounded model exploration** | A finite two-peer block-sync model visits every reachable state within its declared bounds and checks reservation, Work, queue, cleanup, isolation, and bounded-progress invariants. |
 
 Each gate emits a structured decision to `regulation.jsonl`. Production records non-`Continue`
-decisions. The regtest harness records every decision and checks the full trace with
-`trace_oracle.py`.
+decisions. The regtest harness records every decision. The `trace_oracle.py` script checks each
+recorded decision against the expected regtest behavior.
 
 Reservation handling uses a model-based property test. A generator opens, grants, and closes
 subscriptions. It also reassigns work, advances finality, delivers responses and duplicates, and
 closes connections. The generator uses reference-model state to select actions whose sender
 preconditions hold. It does not construct the production invariants that the test checks.
 
-The oracle compares the model and production observations after every action. It checks that each
-admitted response consumes live header and byte credit. It also checks that local scheduler actions
-never remove reservations and that subscription state never exceeds its declared bounds. The
-Proptest strategy interprets shrunk choices from reference-model state and retains the original
+The property test compares the model and production observations after every action. It checks that
+each admitted response consumes live header and byte credit. It also checks that local scheduler
+actions never remove reservations and that subscription state never exceeds its declared bounds.
+The Proptest strategy interprets shrunk choices from reference-model state and retains the original
 conformant or adversarial class.
 
 The [property-testing design](property-testing.md) defines claim strength, stepwise observations,
 the compiler-enforced message addition contract, regression scenarios, and CI profiles. The
-[first block-sync infrastructure](property-testing-block-sync-infrastructure.md) defines the initial
-two-peer bounded model and identifies the existing test infrastructure that it reuses.
+[`GetBlocks` property-testing infrastructure](property-testing-block-sync-infrastructure.md) defines
+the initial two-peer bounded model and identifies the existing test infrastructure that it reuses.
 
 Each message verifier has no I/O, locks, or shared state. This makes every verifier an independent
 fuzz target. The regtest corpus provides the initial fuzz inputs.

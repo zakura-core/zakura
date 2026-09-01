@@ -1,8 +1,8 @@
-# First property-testing infrastructure: `GetBlocks` regulation
+# `GetBlocks` property-testing infrastructure
 
-> **Status: first draft.** This document defines the first implementation slice for the
-> [property-testing architecture](property-testing.md). It covers block-sync version 2 regulation.
-> It does not cover the planned header subscription.
+> **Status: first draft.** This document defines the `GetBlocks` prototype and planned stateful
+> checks for the [property-testing architecture](property-testing.md). It covers block-sync version
+> 2 regulation. It does not cover the planned header subscription.
 
 ## Goal
 
@@ -53,8 +53,8 @@ The stateful expansion adds only these protocol-specific components:
 
 - a serializable block-sync action sequence
 - a small independent reference model and its invariants
-- a canonical observation type
-- a production admission adapter and stepwise oracle
+- an observation type shared by the model and production runner
+- a production admission adapter and stepwise observation comparison
 - one conformant generated property test
 
 The stateful expansion does not add:
@@ -96,7 +96,7 @@ The current scenario harness does not provide the following components:
 - a serializable action sequence
 - state-dependent action generation
 - state-aware shrinking
-- a stepwise production oracle
+- a stepwise production comparison
 - exhaustive exploration of a finite model
 - complete clock control in the block-sync reactor
 - explicit regulation Work charges, refunds, and concurrency slots
@@ -109,8 +109,9 @@ The stateful expansion must not treat a current harness seed as a stable replay 
 
 The stateful expansion checks regulation at two boundaries.
 
-The admission boundary runs one action at a time. It exposes a canonical observation after each
-action. This boundary provides the reference-model oracle and bounded state exploration.
+The admission boundary runs one action at a time. It returns an `Observation` after each action. The
+property test compares that record with the reference model after each action. The bounded explorer
+applies the same reference-model transition without running production.
 
 The synthetic-peer boundary sends real frames through `SyntheticBlockSyncPeers`. It checks framing,
 decoding, peer-routine integration, reactor integration, and backpressure. It replays selected
@@ -146,9 +147,9 @@ Sufficient = available >= request charge
 ```
 
 The production declaration computes charges in bytes. The production admission state uses those
-declaration-derived charges. The oracle compares verdicts, ownership, charge and refund
-cardinality, and the production conservation equation. It does not compare abstract units with
-production bytes.
+declaration-derived charges. The property test compares verdicts, ownership, charge and refund
+cardinality. It checks the production conservation equation separately. It does not compare the
+model's abstract Work units with production byte counts.
 
 The finite model permits at most two response frames across both peers to remain queued or
 delivered but not handled. Each peer queue has capacity two. These bounds expose cross-peer
@@ -204,7 +205,7 @@ Every action defines:
 
 - its protocol preconditions
 - its model transition
-- its expected canonical observation
+- its expected observation
 - its conformant or adversarial classification
 - its shrink rules
 
@@ -212,9 +213,9 @@ Conformant action generation selects only actions whose sender preconditions hol
 generation selects one rule to violate and records that rule in the scenario. The model never uses
 production admission code to decide whether an action applies.
 
-### Canonical observation
+### Observation
 
-The model and production runner return the same bounded observation shape after every action:
+The model and production runner return the same bounded `Observation` shape after every action:
 
 ```rust
 struct Observation {
@@ -229,8 +230,8 @@ struct Observation {
 ```
 
 The observation excludes task identifiers, wall-clock timestamps, channel implementation details,
-and unrelated reactor state. The trace retains those details for diagnosis but the oracle does not
-compare them.
+and unrelated reactor state. The trace retains those details for diagnosis. The stepwise comparison
+uses only the fields in `Observation`.
 
 ## Properties
 
@@ -389,7 +390,7 @@ The stateful expansion then has five steps:
 
 1. Add versioned action, scenario, and observation types.
 2. Add the two-peer reference model and its safety invariants.
-3. Add the direct production admission runner and stepwise oracle.
+3. Add the direct production admission runner and stepwise observation comparison.
 4. Add one conformant Proptest using a shrinkable choice sequence.
 5. Print and replay one serialized scenario.
 

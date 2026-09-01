@@ -844,8 +844,8 @@ The implementation MUST provide these checks:
    the peer routine resumes after a refund or refill, and that another peer and service stream make
    progress within the test's declared scheduling and progress bounds.
 10. Bounded model exploration MUST visit every reachable state in the finite model declared by the
-    [first block-sync infrastructure](../design/property-testing-block-sync-infrastructure.md). It
-    MUST check reservation, Work, slot, queue, isolation, cleanup, and bounded-progress invariants.
+    [`GetBlocks` property-testing infrastructure](../design/property-testing-block-sync-infrastructure.md).
+    It MUST check reservation, Work, slot, queue, isolation, cleanup, and bounded-progress invariants.
     If a resource limit stops exploration before its frontier is empty, the check MUST report an
     incomplete result instead of an exhaustive result.
 

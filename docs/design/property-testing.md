@@ -3,8 +3,8 @@
 > **Status: first draft.** The [peer message regulation design](peer-message-regulation.md) and
 > [specification](../specs/peer-message-regulation.md) define correct protocol behavior. This
 > document defines the property-testing architecture that checks that behavior. The
-> [first block-sync infrastructure](property-testing-block-sync-infrastructure.md) defines the
-> first bounded model and implementation slice.
+> [`GetBlocks` property-testing infrastructure](property-testing-block-sync-infrastructure.md)
+> defines the message-level prototype and planned stateful checks.
 
 TL;DR: Property testing runs production protocol code through generated executions and searches
 for counterexamples to required properties. Bounded model exploration checks every reachable state
@@ -43,27 +43,58 @@ model counterexamples and compare production behavior with the model after every
 
 ## Implementation discipline
 
-The first slice uses one existing testing stack:
+Use the existing testing stack unless a required property exposes a measured gap:
 
 - `proptest` generates and shrinks choices
 - `serde` and `serde_json` serialize confirmed regression scenarios
 - Tokio test time and `TestClock` control time at existing seams
 - the Zakura testkit provides synthetic peers, trace capture, and reactor integration
 
-Zakura implements only protocol-specific code: actions, reference state, transitions, invariants,
-canonical observations, and the production adapter. A small bounded explorer may enumerate the
-finite reference model after that model works under generated tests.
+Zakura adds only protocol-specific code: actions, reference state, transitions, invariants,
+observations, and the production adapter. A small bounded explorer may enumerate the finite
+reference model after that model works under generated tests.
 
-The first slice does not add a general model-checking framework, symbolic executor, concurrency
-testing framework, task scheduler, artifact service, or testing support crate. It does not implement
-a custom Proptest `ValueTree`. Add one of those tools only when a measured limitation blocks a named
-property.
+This design does not require a general model-checking framework, symbolic executor, concurrency
+testing framework, task scheduler, artifact service, testing support crate, or custom Proptest
+`ValueTree`. Add one only when a measured limitation blocks a named property.
 
-## Architecture
+## One-message flow
+
+Each message starts with checks that need no protocol history. `GetBlocks` provides the first
+example:
+
+```text
+declaration -> legal value -> production encode -> cap check -> production decode
+            -> value equality -> canonical re-encode
+
+declaration -> bounded payload -> production decode -> error or canonical re-encode
+
+declaration -> one declared rule -> one-rule mutation -> production boundary
+            -> exact expected result
+```
+
+1. Its declaration supplies the 9-byte payload cap, zero decode allocation, legal count and height
+   ranges, deterministic boundary values, and a legal-value strategy.
+2. For each legal value, the test calls the production encoder, checks the payload cap, calls the
+   production decoder, compares the decoded value with the input, and checks that re-encoding
+   produces the same bytes.
+3. For each generated payload of at most 9 bytes whose first byte identifies `GetBlocks`, the test
+   calls the production decoder. An accepted payload must re-encode to the same bytes. A rejected
+   payload must return an error without a panic or an allocation above the declaration.
+4. For each declared rule, the test starts from a legal value and violates only that rule. It then
+   checks the exact rejection class. The deterministic suite executes every rule at least once.
+5. Because `GetBlocks` is a request, the test also checks its response bound and Work equation from
+   independently written arithmetic.
+
+These checks cover the message in isolation. `Delay`, concurrency-slot ownership, handler dispatch,
+and terminal refunds depend on prior state and later events. The stateful flow below checks those
+properties with action sequences.
+
+## Stateful message flow
 
 One serializable scenario drives two independent paths. A reference model predicts the required
 behavior. The production protocol core runs with the scenario's protocol inputs and action order.
-The oracle compares their observations after every action. This stepwise comparison identifies the
+The property test compares their observations after every action. This comparison identifies the
 first divergence and prevents later transitions from hiding compensating errors.
 
 ```mermaid
@@ -71,10 +102,10 @@ flowchart TD
     generator[Property generator or bounded explorer] -->|creates one execution| scenario["Serializable scenario<br/>protocol inputs + action order"]
     scenario -->|predict each action| model[Independent reference model]
     scenario -->|run each action| production["Production protocol core<br/>controlled runner"]
-    model -->|expected observation| oracle{Same observation and state summary?}
-    production -->|observed behavior + trace| oracle
-    oracle -->|yes: continue| generator
-    oracle -->|no: reduce while preserving failure| failure[Minimal failing scenario]
+    model -->|expected observation| comparison{Same observation and state summary?}
+    production -->|observed behavior + trace| comparison
+    comparison -->|yes: continue| generator
+    comparison -->|no: reduce while preserving failure| failure[Minimal failing scenario]
 ```
 
 ### Components
@@ -86,24 +117,24 @@ flowchart TD
 | Reference model | Predict protocol observations and state changes | Provide an expected result independent of production transitions |
 | Bounded explorer | Visit every reachable state in the configured finite model | Check small state spaces without relying on random selection |
 | Production runner | Apply one scenario to the production protocol core | Exercise the code Zakura ships |
-| Controlled runtime | Control byte delivery, monotonic time, randomness, and the action order required by the current slice | Reach timing-dependent behavior quickly and repeatably |
-| Oracle and execution trace | Compare every action and record the first semantic divergence | Detect transient and compensating errors |
+| Controlled runtime | Apply the scenario's byte chunks, monotonic time advances, and action order | Reach timing-dependent behavior repeatably |
+| Observation comparison and execution trace | Compare expected and production observations after every action and record the first difference | Detect transient and compensating errors |
 | Real transport check | Run selected scenarios through the production transport adapter | Detect integration errors below the controlled boundary |
 
 ### Runtime boundary
 
-The controlled runtime replaces only capabilities that can change an execution. The boundary
-covers byte delivery, monotonic time, and randomness in the first slice. Protocol framing,
-decoding, validation, state transitions, and resource accounting remain above it so the test runs
-the code Zakura ships.
+The generated scenario owns every test choice before execution starts. The production adapter
+applies the scenario's byte chunks, monotonic time advances, and action order. It does not replace
+protocol framing, decoding, validation, state transitions, or resource accounting.
 
-The first slice controls observable admission events. It does not claim to control every Tokio task
-choice. A later slice can add explicit task scheduling when a named property depends on task order.
-Real transport tests retain the production runtime and accept its scheduling behavior.
+The admission adapter controls observable admission events. It does not control every Tokio task
+choice. A property that depends on a task choice needs an explicit task action or a real-runtime
+test. Real-transport tests retain production scheduling.
 
-The boundary must stay narrow. An adapter that delivers only decoded messages cannot check partial
-reads and length limits. A general runtime abstraction would add production structure before a
-protocol slice shows that the structure is useful.
+The test boundary follows the property. A framing or decode property starts with payload bytes and
+calls the production frame reader or decoder. A reservation or cleanup property may start with an
+already decoded message and call the production admission boundary. The latter cannot support a
+claim about partial reads, payload caps, or decode allocation.
 
 ### Reference model
 
@@ -111,18 +142,18 @@ The reference model describes only the protocol states and effects needed to pre
 does not call the production state transitions that it checks. Otherwise, the same defect could
 make both paths agree.
 
-The model also avoids duplicating unrelated production logic. It can use a decoded message when a
-property concerns scheduling or resource cleanup. Codec properties and fuzzing remain responsible
-for raw byte behavior.
+The model avoids duplicating unrelated production logic. It may receive a decoded message when the
+property concerns scheduling or resource cleanup. That starting point makes no claim about framing
+or decoding; the one-message flow checks those behaviors from payload bytes.
 
 The generator uses model state only to select actions whose protocol preconditions hold. The
 production runner, not the generator, must preserve reservation, Work, slot, and state-capacity
 invariants.
 
-### Stepwise oracle
+### Stepwise comparison
 
-Each action produces a canonical observation from the model and production runner. The observation
-contains only protocol concepts that the property needs:
+The model and production runner each return an `Observation` after an action. This normalized record
+contains only protocol effects that the property compares:
 
 - admission verdict
 - reservation and credit changes
@@ -132,9 +163,9 @@ contains only protocol concepts that the property needs:
 - handler dispatch or completion
 - connection state
 
-The oracle compares the observation after every action. It also compares a bounded state summary
-after every action. The state summary omits backend identifiers and internal ordering that cannot
-affect protocol behavior.
+The property test compares the two observations after every action. It also compares a bounded
+state summary after every action. The state summary omits backend identifiers and internal ordering
+that cannot affect protocol behavior.
 
 ### Deterministic replay
 
@@ -151,8 +182,8 @@ identifiers, and records:
 
 Stable inputs and observations let Zakura replay a failure after a backend change. They also let
 controlled and real-transport runs compare the same protocol behavior. The runner executes a
-scenario twice before it trusts the result. Unequal canonical observations or final resource states
-mean the boundary missed a source of nondeterminism.
+scenario twice before it trusts the result. Unequal observations or final resource states mean the
+boundary missed a source of nondeterminism.
 
 The failure output contains the generation seed, test profile, and first divergent observation. A
 confirmed regression scenario is one JSON value with a schema version, suite, model bounds, and
@@ -269,9 +300,9 @@ The stateful suite checks these protocol properties after every action:
 - each concurrency slot has one owner and every terminal path releases that slot once
 - per-peer filter, reservation, delayed-frame, and queued-response state stays within its declared
   capacity
-- two runs of the same scenario produce the same canonical observations and final resource state
+- two runs of the same scenario produce the same observations and final resource state
 
-Metamorphic properties provide an oracle that does not depend on the reference model:
+Metamorphic properties compare related executions without using the reference model:
 
 - splitting one frame at different byte boundaries preserves its semantic result
 - renaming peers preserves observations after applying the same renaming to those observations
@@ -288,14 +319,14 @@ initial capacity + refills + refunds
 
 The suite expresses progress as a bounded property. If another peer or service stream remains
 runnable, and the runner schedules every runnable participant within `N` steps, that participant
-must produce an observable transition within `M` steps. Each slice states `N`, `M`, and its fairness
-assumption. An unbounded statement such as “one peer never stops another” is not a finite test
-oracle.
+must produce an observable transition within `M` steps. Each stateful suite states `N`, `M`, and its
+fairness assumption. An unbounded statement such as “one peer never stops another” does not define
+a finite test condition.
 
-The first model does not need a general task scheduler. It represents only observable admission
-actions: receive a frame or frame fragment, advance monotonic time, refill or refund Work, complete
-or fail a handler, reassign work, and close a connection. A later slice may add explicit task
-choices when a property depends on their order.
+The initial stateful model does not need a general task scheduler. It represents only observable
+admission actions: receive a frame or frame fragment, advance monotonic time, refill or refund Work,
+complete or fail a handler, reassign work, and close a connection. Add explicit task choices when a
+property depends on their order.
 
 ## CI profiles
 
@@ -303,25 +334,26 @@ Fast feedback and broad exploration need different case counts, so property test
 profiles:
 
 - A developer profile runs a small generated set and replays every checked-in regression scenario.
-- Pull requests replay regression scenarios, run a stable seed set, add one deterministic seed derived
-  from the CI run, and run the bounded explorer.
+- Pull requests replay regression scenarios, run a stable seed set, add one deterministic seed
+  derived from the CI run, and run the bounded explorer.
 - A scheduled job explores many seeds and reports minimized scenarios for new failures.
 
-Each slice sets its case counts and exploration bounds from measured runtime. CI reports action and
-transition coverage so a passing run cannot hide a generator that never reaches a required state.
+Each protocol suite sets its case counts and exploration bounds from measured runtime. CI reports
+action and transition coverage so a passing run cannot hide a generator that never reaches a
+required state.
 
 ## Rollout
 
 Start with the closed message inventory and pure declaration and codec properties for every current
 message. Next, implement the
-[first block-sync infrastructure](property-testing-block-sync-infrastructure.md). It models the
-existing block-sync version 2 range exchange from `GetBlocks` through its terminal response. The
-first bounded model uses two peers, one request type, ranges of at most three blocks, at most two
-in-flight responses, and small queues.
+[`GetBlocks` property-testing infrastructure](property-testing-block-sync-infrastructure.md). It
+models the existing block-sync version 2 range exchange from `GetBlocks` through its terminal
+response. The bounded model uses two peers, one request type, ranges of at most three blocks, at
+most two in-flight responses, and small queues.
 
-The first model checks Work, range reservations, duplicate and out-of-order bodies, reassignment,
-terminal validation, timeout, connection closure, and cleanup without depending on the planned
-header subscription. Two peers provide the first isolation and bounded-progress checks.
+The model checks Work, range reservations, duplicate and out-of-order bodies, reassignment, terminal
+validation, timeout, connection closure, and cleanup without depending on the planned header
+subscription. Two peers support isolation and bounded-progress checks.
 
 Run minimized block-sync scenarios through the existing synthetic-peer adapter and selected cases
 through the real transport after the model and production admission state agree. Add the header

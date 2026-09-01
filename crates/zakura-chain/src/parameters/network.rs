@@ -30,6 +30,33 @@ const MAINNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT: Height = Height(3_36
 // lands 3_500 blocks later.
 const TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT: Height = Height(4_048_500);
 
+/// When a network stops accepting version 4 transactions.
+///
+/// [ZIP 2003] disallows version 4 transactions from NU7 onwards. The Zcash
+/// community polls that decide NU7's scope also offer a deprecation date later
+/// than NU7 activation, and the option of setting no date at all, so a network
+/// chooses between the three rather than inheriting the NU7 activation height.
+///
+/// [ZIP 2003]: https://zips.z.cash/zip-2003
+#[derive(Copy, Clone, Default, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum V4Deprecation {
+    /// Version 4 transactions are invalid from the NU7 activation height onwards,
+    /// which is what ZIP 2003 proposes.
+    ///
+    /// A network that does not activate NU7 keeps accepting version 4 transactions.
+    #[default]
+    AtNu7,
+
+    /// Version 4 transactions are invalid from this height onwards.
+    ///
+    /// The height is independent of the NU7 activation height, so a network can
+    /// activate NU7 and deprecate version 4 transactions later.
+    AtHeight(Height),
+
+    /// Version 4 transactions stay valid at every height.
+    Never,
+}
+
 /// An enum describing the kind of network, whether it's the production mainnet or a testnet.
 // Note: The order of these variants is important for correct bincode (de)serialization
 //       of history trees in the db format.
@@ -340,6 +367,37 @@ impl Network {
                 )
             })
             .collect()
+    }
+
+    /// Returns when this network stops accepting version 4 transactions.
+    ///
+    /// See [`V4Deprecation`] and [ZIP 2003].
+    ///
+    /// [ZIP 2003]: https://zips.z.cash/zip-2003
+    pub fn v4_deprecation(&self) -> V4Deprecation {
+        match self {
+            Network::Mainnet => V4Deprecation::AtNu7,
+            Network::Testnet(parameters) => parameters.v4_deprecation(),
+        }
+    }
+
+    /// Returns the first height at which version 4 transactions are invalid on this
+    /// network, or `None` if they stay valid at every height.
+    ///
+    /// [`V4Deprecation::AtNu7`] resolves to the NU7 activation height, so a network
+    /// that does not activate NU7 keeps accepting version 4 transactions.
+    pub fn v4_deprecation_height(&self) -> Option<Height> {
+        match self.v4_deprecation() {
+            V4Deprecation::AtNu7 => NetworkUpgrade::Nu7.activation_height(self),
+            V4Deprecation::AtHeight(height) => Some(height),
+            V4Deprecation::Never => None,
+        }
+    }
+
+    /// Returns whether version 4 transactions are invalid at `height` on this network.
+    pub fn is_v4_deprecated(&self, height: Height) -> bool {
+        self.v4_deprecation_height()
+            .is_some_and(|deprecation_height| height >= deprecation_height)
     }
 
     /// Returns the height at which the soft fork that temporarily disables Orchard

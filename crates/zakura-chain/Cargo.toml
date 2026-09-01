@@ -34,8 +34,8 @@ zip218 = []
 # money reserve, replacing halvings.
 zip234 = []
 
-# ZIP 234's "preserve halvings" option on the NU7 ballot: halvings keep issuing new ZEC,
-# and a bonus reissues what has been removed from circulation.
+# ZIP 234's "preserve halvings" option on the NU7 ballot: halvings continue, and a
+# bonus applies the smoothing fraction to the issuance deficit.
 #
 # Cargo features are additive. This feature enables ZIP 234 and selects the
 # preserve-halvings calculation.

@@ -126,4 +126,15 @@ pub enum ParametersBuilderError {
     )]
     #[non_exhaustive]
     InvalidLockboxDisbursementTotal,
+
+    #[error(
+        "the configured ZIP 234 deployment height {deployment_height:?} must not be below the \
+         NU7 activation height {nu7_activation_height:?}, because ZIP 234 deploys with or \
+         after NU7"
+    )]
+    #[non_exhaustive]
+    Zip234DeploymentBeforeNu7 {
+        deployment_height: Height,
+        nu7_activation_height: Height,
+    },
 }

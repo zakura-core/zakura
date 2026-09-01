@@ -486,18 +486,7 @@ fn zip234_issuance() {
         .expect("configured testnet is valid");
 
     let start = zip234_start_height(&network).expect("NU7 is configured");
-
-    // # Consensus
-    //
-    // > the lowest height after the second halving following the activation of NU7
-    let nu7_halving = halving(Height(nu7), &network);
-    assert_eq!(halving(start, &network), nu7_halving + 2);
-    assert_eq!(
-        halving(start.previous().expect("start is above genesis"), &network),
-        nu7_halving + 1,
-        "the start height must be the lowest height of its halving era",
-    );
-    assert!(start > Height(nu7));
+    assert_eq!(start, Height(nu7));
 
     // `cumulative_halving_subsidies` walks halving and spacing boundaries rather than
     // every height, so check it against the sum it is standing in for.
@@ -543,8 +532,6 @@ fn zip234_issuance() {
     let reserve = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
     let subsidy = block_subsidy(start, &network, Some(reserve)).expect("valid subsidy");
 
-    // `start` is the first height of a new halving era, so take the halving schedule's
-    // subsidy at `start` rather than at the height before it.
     let halving_subsidy = halving_block_subsidy(start, &network).expect("valid subsidy");
 
     if ZIP234_SMOOTHING_ENABLED {
@@ -586,6 +573,13 @@ fn zip234_issuance() {
             (halving_subsidy + Amount::try_from(412_600).expect("valid amount"))
                 .expect("valid amount"),
         );
+
+        // The subsidy cannot issue more than the remaining money reserve.
+        let final_zatoshi = Amount::<NonNegative>::try_from(1).expect("valid amount");
+        assert_eq!(
+            block_subsidy(start, &network, Some(final_zatoshi)).expect("valid subsidy"),
+            final_zatoshi,
+        );
     }
 
     // The money reserve is what has never been issued plus everything removed from
@@ -594,4 +588,69 @@ fn zip234_issuance() {
         ValueBalance::<NonNegative>::zero().money_reserve(),
         Amount::<NonNegative>::try_from(MAX_MONEY).expect("valid amount"),
     );
+}
+
+/// Checks that a network starts ZIP 234 at NU7 or at a configured later height.
+#[test]
+fn zip234_deployment_height() {
+    use crate::parameters::{
+        network::error::ParametersBuilderError, subsidy::zip234_start_height, Zip234Deployment,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let nu7 = 3_600_000;
+    let mainnet_shaped = |zip234_deployment| {
+        testnet::Parameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                blossom: Some(653_600),
+                heartwood: Some(903_000),
+                canopy: Some(1_046_400),
+                nu7: Some(nu7),
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .clear_funding_streams()
+            .with_zip234_deployment(zip234_deployment)
+            .to_network()
+    };
+
+    let at_nu7 = mainnet_shaped(Zip234Deployment::AtNu7)
+        .expect("configured testnet is valid");
+    assert_eq!(zip234_start_height(&at_nu7), Some(Height(nu7)));
+
+    // A configured height can select either later ballot date once its block height is known.
+    let ballot_height = Height(3_900_000);
+    let configured = mainnet_shaped(Zip234Deployment::AtHeight(ballot_height))
+        .expect("configured testnet is valid");
+    assert_eq!(zip234_start_height(&configured), Some(ballot_height));
+
+    // ZIP 234 deploys with or after NU7, so a height below NU7 activation is rejected.
+    assert_eq!(
+        mainnet_shaped(Zip234Deployment::AtHeight(Height(nu7 - 1))),
+        Err(ParametersBuilderError::Zip234DeploymentBeforeNu7 {
+            deployment_height: Height(nu7 - 1),
+            nu7_activation_height: Height(nu7),
+        }),
+    );
+
+    // A network built without those checks is clamped to NU7 rather than changing the
+    // subsidy before NU7 activates.
+    let unchecked = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(nu7),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .with_zip234_deployment(Zip234Deployment::AtHeight(Height(1)))
+        .to_network_unchecked();
+    assert_eq!(zip234_start_height(&unchecked), Some(Height(nu7)));
+
+    // A network that never activates NU7 never starts reissuance, however it is
+    // configured.
+    let no_nu7 = testnet::Parameters::build()
+        .with_zip234_deployment(Zip234Deployment::AtHeight(Height(1)))
+        .to_network()
+        .expect("configured testnet is valid");
+    assert_eq!(zip234_start_height(&no_nu7), None);
 }

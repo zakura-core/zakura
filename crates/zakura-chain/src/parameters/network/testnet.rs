@@ -31,7 +31,7 @@ use crate::{
     work::difficulty::{ExpandedDifficulty, U256},
 };
 
-use super::{magic::Magic, V4Deprecation};
+use super::{magic::Magic, V4Deprecation, Zip234Deployment};
 
 /// Reserved network names that should not be allowed for configured Testnets.
 pub const RESERVED_NETWORK_NAMES: [&str; 6] = [
@@ -438,6 +438,36 @@ const FOUNDERS_REWARD_DIVISOR: u64 = 5;
 /// slow start rate is the block subsidy limit divided by the configured slow start interval,
 /// truncated. An interval that leaves a remainder modulo five therefore crashes block
 /// validation at the first block that pays a founders reward.
+/// Checks that a configured ZIP 234 deployment height is not below the NU7 activation
+/// height, because ZIP 234 deploys with or after NU7.
+///
+/// A network that does not activate NU7 never starts reissuance, so a height configured
+/// there is unreachable rather than wrong.
+fn check_zip234_deployment(
+    activation_heights: &BTreeMap<Height, NetworkUpgrade>,
+    zip234_deployment: Zip234Deployment,
+) -> Result<(), ParametersBuilderError> {
+    let Zip234Deployment::AtHeight(deployment_height) = zip234_deployment else {
+        return Ok(());
+    };
+
+    let Some((&nu7_activation_height, _)) = activation_heights
+        .iter()
+        .find(|(_, upgrade)| **upgrade == NetworkUpgrade::Nu7)
+    else {
+        return Ok(());
+    };
+
+    if deployment_height < nu7_activation_height {
+        return Err(ParametersBuilderError::Zip234DeploymentBeforeNu7 {
+            deployment_height,
+            nu7_activation_height,
+        });
+    }
+
+    Ok(())
+}
+
 fn check_founders_reward_is_exact(network: &Network) -> Result<(), ParametersBuilderError> {
     let slow_start_interval = network.slow_start_interval();
 
@@ -636,6 +666,8 @@ pub struct ParametersBuilder {
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
     /// When this network stops accepting version 4 transactions, see ZIP 2003
     v4_deprecation: V4Deprecation,
+    /// When this network starts ZIP 234 issuance
+    zip234_deployment: Zip234Deployment,
 }
 
 impl Default for ParametersBuilder {
@@ -677,6 +709,7 @@ impl Default for ParametersBuilder {
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
             ),
             v4_deprecation: V4Deprecation::AtNu7,
+            zip234_deployment: Zip234Deployment::AtNu7,
         }
     }
 }
@@ -1003,6 +1036,12 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets when this network starts ZIP 234 issuance.
+    pub fn with_zip234_deployment(mut self, zip234_deployment: Zip234Deployment) -> Self {
+        self.zip234_deployment = zip234_deployment;
+        self
+    }
+
     /// Converts the builder to a [`Parameters`] struct
     fn finish(self) -> Parameters {
         // The builder defaults to public Testnet consensus parameters, so an unset
@@ -1029,6 +1068,7 @@ impl ParametersBuilder {
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
             v4_deprecation,
+            zip234_deployment,
         } = self;
         Parameters {
             network_name,
@@ -1048,11 +1088,12 @@ impl ParametersBuilder {
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
             v4_deprecation,
+            zip234_deployment,
         }
     }
 
     /// Converts the builder to a configured [`Network::Testnet`]
-    fn to_network_unchecked(&self) -> Network {
+    pub(super) fn to_network_unchecked(&self) -> Network {
         Network::new_configured_testnet(self.clone().finish())
     }
 
@@ -1069,6 +1110,7 @@ impl ParametersBuilder {
 
         check_founders_reward_is_exact(&network)?;
         check_lockbox_disbursements(&self.lockbox_disbursements)?;
+        check_zip234_deployment(&self.activation_heights, self.zip234_deployment)?;
 
         // Final check that the configured checkpoints are valid for this network.
         if network.checkpoint_list().hash(Height(0)) != Some(network.genesis_hash()) {
@@ -1104,6 +1146,7 @@ impl ParametersBuilder {
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
             v4_deprecation,
+            zip234_deployment,
         } = Self::default();
 
         self.activation_heights == activation_heights
@@ -1122,6 +1165,8 @@ impl ParametersBuilder {
             // A network that keeps accepting version 4 transactions past the height where
             // the default Testnet rejects them is on a different consensus rule.
             && self.v4_deprecation == v4_deprecation
+            // Reissuing value at a different height is also a different consensus rule.
+            && self.zip234_deployment == zip234_deployment
     }
 }
 
@@ -1189,6 +1234,8 @@ pub struct Parameters {
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
     /// When this network stops accepting version 4 transactions, see ZIP 2003
     v4_deprecation: V4Deprecation,
+    /// When this network starts ZIP 234 issuance
+    zip234_deployment: Zip234Deployment,
 }
 
 impl Default for Parameters {
@@ -1254,6 +1301,7 @@ impl Parameters {
             check_funding_stream_address_types(funding_stream)?;
         }
         check_lockbox_disbursements(&parameters.lockbox_disbursements)?;
+        check_zip234_deployment(&parameters.activation_heights, parameters.zip234_deployment)?;
 
         Ok(Self {
             network_name: "Regtest".to_string(),
@@ -1297,6 +1345,8 @@ impl Parameters {
             // Version 4 deprecation follows the configurable Regtest activation heights,
             // so it is not part of Regtest's identity.
             v4_deprecation: _,
+            // ZIP 234 deployment likewise follows the configurable activation heights.
+            zip234_deployment: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1413,6 +1463,11 @@ impl Parameters {
     /// Returns when this network stops accepting version 4 transactions, see ZIP 2003.
     pub fn v4_deprecation(&self) -> V4Deprecation {
         self.v4_deprecation
+    }
+
+    /// Returns when this network starts ZIP 234 issuance.
+    pub fn zip234_deployment(&self) -> Zip234Deployment {
+        self.zip234_deployment
     }
 }
 

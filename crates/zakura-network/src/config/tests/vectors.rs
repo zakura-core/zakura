@@ -6,7 +6,7 @@ use zakura_chain::{
     block::Height,
     parameters::{
         testnet::{self, ConfiguredFundingStreams},
-        Network, V4Deprecation,
+        Network, V4Deprecation, Zip234Deployment,
     },
 };
 
@@ -813,6 +813,38 @@ fn v4_deprecation_serialization_roundtrip() {
             panic!("deserialized network must be a Testnet");
         };
         assert_eq!(params.v4_deprecation(), v4_deprecation);
+    }
+}
+
+/// Checks that a configured Testnet's ZIP 234 deployment survives a serialization
+/// round-trip in both of its forms.
+#[test]
+fn zip234_deployment_serialization_roundtrip() {
+    let _init_guard = zakura_test::init();
+
+    for zip234_deployment in [
+        Zip234Deployment::AtNu7,
+        Zip234Deployment::AtHeight(Height(2_000_000)),
+    ] {
+        let mut config = Config {
+            network: testnet::Parameters::build()
+                .with_zip234_deployment(zip234_deployment)
+                .to_network()
+                .expect("failed to build configured network"),
+            initial_testnet_peers: [].into(),
+            ..Config::for_test(P2pStack::Dual)
+        };
+        config.zakura.apply_network_defaults(&config.network);
+
+        let serialized = toml::to_string(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(config, deserialized);
+
+        let Network::Testnet(params) = &deserialized.network else {
+            panic!("deserialized network must be a Testnet");
+        };
+        assert_eq!(params.zip234_deployment(), zip234_deployment);
     }
 }
 

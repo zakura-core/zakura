@@ -20,7 +20,8 @@ use crate::{
     amount::{self, Amount, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
     parameters::{
-        Network, NetworkUpgrade, ZIP234_ENABLED, ZIP234_HALVINGS_ENABLED, ZIP234_SMOOTHING_ENABLED,
+        Network, NetworkUpgrade, Zip234Deployment, ZIP234_ENABLED, ZIP234_HALVINGS_ENABLED,
+        ZIP234_SMOOTHING_ENABLED,
     },
     transparent,
 };
@@ -470,40 +471,25 @@ pub const BLOCK_SUBSIDY_FRACTION_DENOMINATOR: u128 = 10_000_000_000;
 /// Returns the height at which [ZIP 234] starts to apply on `network`, or `None` if the
 /// network does not activate NU7.
 ///
-/// # Consensus
+/// The NU7 ballot asks when issuance should begin, so a network chooses the NU7
+/// activation height or a configured height. See [`Zip234Deployment`].
 ///
-/// > `DEPLOYMENT_BLOCK_HEIGHT` [is] the lowest height after the second halving following
-/// > the activation of Network Upgrade 7.
-///
-/// This searches [`halving`] rather than inverting it with [`height_for_halving`],
-/// because [`halving`] already folds over every target spacing era, including the one
-/// ZIP 218 adds at NU7, and the ZIP 234 start height falls inside that era.
+/// A configured height below the NU7 activation height is raised to it, because ZIP 234
+/// deploys with or after NU7. [`ParametersBuilder::to_network`] rejects that
+/// configuration, so the clamp only covers a network built without those checks.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
+/// [`ParametersBuilder::to_network`]: crate::parameters::testnet::ParametersBuilder::to_network
 pub fn zip234_start_height(network: &Network) -> Option<Height> {
-    let nu7 = NetworkUpgrade::Nu7.activation_height(network)?;
-    let target_halving = halving(nu7, network).checked_add(2)?;
+    let nu7 = network
+        .activation_list()
+        .iter()
+        .find_map(|(height, upgrade)| (*upgrade == NetworkUpgrade::Nu7).then_some(*height))?;
 
-    // `halving` is non-decreasing in height, so the lowest height reaching
-    // `target_halving` is a binary search away.
-    let mut low = nu7.0;
-    let mut high = Height::MAX_AS_U32;
-
-    if halving(Height(high), network) < target_halving {
-        return None;
+    match network.zip234_deployment() {
+        Zip234Deployment::AtNu7 => Some(nu7),
+        Zip234Deployment::AtHeight(height) => Some(height.max(nu7)),
     }
-
-    while low < high {
-        let mid = low + (high - low) / 2;
-
-        if halving(Height(mid), network) < target_halving {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-
-    Some(Height(low))
 }
 
 /// Returns whether a ZIP 234 issuance option is compiled in and applies to `network` at
@@ -544,8 +530,7 @@ fn smoothed_block_subsidy(
 /// reserve after its parent.
 ///
 /// This is the "preserve halvings" option on the NU7 ballot: the halving schedule keeps
-/// issuing new ZEC, and the bonus reissues what has been removed from circulation, at the
-/// same fraction that smooths the curve in the other option.
+/// issuing new ZEC, and the bonus applies the smoothing fraction to the issuance deficit.
 ///
 /// The deficit is what the halving schedule has issued so far minus what is actually in
 /// the chain value pools. The only way the chain falls behind its own schedule is value
@@ -563,9 +548,8 @@ fn reissuance_bonus(
     let scheduled_supply = cumulative_halving_subsidies(parent, net)?;
     let issued_supply = (max_money - money_reserve)?;
 
-    // A chain can be ahead of its own schedule, because a coinbase before NU6 could claim
-    // less than the full subsidy without the difference ever being issued. Saturating at
-    // zero leaves nothing to reissue in that case.
+    // A chain can be ahead of its own schedule if its chain pools contain more value than
+    // the scheduled supply. Saturating at zero leaves nothing to reissue in that case.
     let Ok(deficit) = scheduled_supply - issued_supply else {
         return Ok(Amount::zero());
     };
@@ -657,7 +641,7 @@ fn next_subsidy_boundary(height: Height, net: &Network) -> Option<Height> {
         .find(|era_start| *era_start > height);
 
     // `halving` is non-decreasing, so binary search for where it next increases.
-    let mut low = height.0 + 1;
+    let mut low = height.0.checked_add(1)?;
     let mut high = Height::MAX_AS_U32;
     let next_halving = if halving(Height(high), net) > current_halving {
         while low < high {
@@ -699,12 +683,13 @@ pub fn block_subsidy(
         }
 
         if ZIP234_HALVINGS_ENABLED {
-            // Halvings stay, and the bonus reissues what has been removed from
-            // circulation at the same smoothing fraction.
+            // Halvings stay, and the bonus applies the smoothing fraction to the
+            // issuance deficit.
             let halving_subsidy = halving_block_subsidy(height, net)?;
             let bonus = reissuance_bonus(height, net, money_reserve)?;
+            let subsidy = (halving_subsidy + bonus)?;
 
-            return Ok((halving_subsidy + bonus)?);
+            return Ok(subsidy.min(money_reserve));
         }
     }
 

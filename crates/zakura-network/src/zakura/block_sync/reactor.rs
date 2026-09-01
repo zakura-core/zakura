@@ -20,12 +20,12 @@ const ACTION_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// misbehavior actions.
 const BS_ACTION_SPARE_POOL: usize = 128;
 
-/// Action slots that peer serving cannot consume.
+/// Action slots that expendable peer traffic cannot consume.
 ///
 /// The Sequencer's submission bound accounts for its data-plane actions. This
-/// reservation protects a reactor-local needed-body refill from an untrusted
-/// `GetBlocks` flood that occupies the spare pool.
-const BS_ACTION_CONTROL_RESERVE: usize = 1;
+/// reservation protects a reactor-local needed-body refill from untrusted
+/// serving and misbehavior-report floods that occupy the spare pool.
+pub(super) const BS_ACTION_CONTROL_RESERVE: usize = 1;
 
 /// Bound on the shared routine→reactor channel (status-advertise / serve /
 /// re-query / serving-misbehavior). Sized generously so a transient burst of
@@ -2288,8 +2288,10 @@ impl BlockSyncReactor {
     /// accepted.
     fn dispatch_action(&self, action: BlockSyncAction) -> bool {
         let action_label = action.metric_label();
-        if matches!(action, BlockSyncAction::QueryBlocksByHeightRange { .. })
-            && self.actions.capacity() <= BS_ACTION_CONTROL_RESERVE
+        if matches!(
+            action,
+            BlockSyncAction::QueryBlocksByHeightRange { .. } | BlockSyncAction::Misbehavior { .. }
+        ) && self.actions.capacity() <= BS_ACTION_CONTROL_RESERVE
         {
             metrics::counter!(
                 "sync.block.action.control_capacity_reserved",

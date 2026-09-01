@@ -303,7 +303,13 @@ fn daa_context(
     let target_spacing = NetworkUpgrade::target_spacing_for_height(network, candidate_height);
     let difficulty = network.target_difficulty_limit().to_compact();
 
-    (0..difficulty::POW_ADJUSTMENT_BLOCK_SPAN)
+    // The difficulty context spans the whole chain below the adjustment span,
+    // and the span itself above it.
+    let context_len = usize::try_from(candidate_height.0)
+        .expect("test candidate height fits in usize")
+        .min(difficulty::POW_ADJUSTMENT_BLOCK_SPAN);
+
+    (0..context_len)
         .map(|offset| {
             let offset = i32::try_from(offset + 1).expect("test offset fits in i32");
             (difficulty, candidate_time - target_spacing * offset)

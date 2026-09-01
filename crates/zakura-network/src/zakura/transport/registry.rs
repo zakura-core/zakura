@@ -10,7 +10,7 @@ use thiserror::Error;
 use super::{
     Frame, OrderedSessionDemand, OrderedStreamPolicy, Peer, Service, SinkReject, Stream, StreamMode,
 };
-use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId};
+use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES};
 
 /// Errors returned while building a [`ServiceRegistry`].
 #[derive(Debug, Error)]
@@ -58,6 +58,43 @@ pub enum RegistryError {
         /// The invalid capability value.
         capability: u64,
     },
+
+    /// A stream declared the same message-specific payload cap twice.
+    #[error(
+        "service {service} declared duplicate payload caps for stream kind {kind} version \
+         {version} message type {message_type}"
+    )]
+    DuplicateMessagePayloadCap {
+        /// Service that declared the stream.
+        service: &'static str,
+        /// Stream kind containing the duplicate cap.
+        kind: u16,
+        /// Stream version containing the duplicate cap.
+        version: u16,
+        /// Duplicated message type.
+        message_type: u16,
+    },
+
+    /// A message-specific payload cap exceeded its enclosing stream cap.
+    #[error(
+        "service {service} declared payload cap {message_payload_cap} for stream kind {kind} \
+         version {version} message type {message_type}, above stream payload cap \
+         {stream_payload_cap}"
+    )]
+    InvalidMessagePayloadCap {
+        /// Service that declared the stream.
+        service: &'static str,
+        /// Stream kind containing the invalid cap.
+        kind: u16,
+        /// Stream version containing the invalid cap.
+        version: u16,
+        /// Message type with the invalid cap.
+        message_type: u16,
+        /// Declared message-specific payload cap.
+        message_payload_cap: u32,
+        /// Payload bytes available under the stream frame cap.
+        stream_payload_cap: u32,
+    },
 }
 
 /// Registry of Zakura protocol services.
@@ -98,6 +135,29 @@ impl ServiceRegistry {
                         kind: stream.kind,
                         version: stream.version,
                     });
+                }
+
+                let stream_payload_cap = stream.frame_cap.saturating_sub(FRAME_HEADER_BYTES as u32);
+                let mut capped_message_types = HashSet::new();
+                for cap in stream.message_payload_caps {
+                    if !capped_message_types.insert(cap.message_type) {
+                        return Err(RegistryError::DuplicateMessagePayloadCap {
+                            service: service.name(),
+                            kind: stream.kind,
+                            version: stream.version,
+                            message_type: cap.message_type,
+                        });
+                    }
+                    if cap.max_payload_bytes > stream_payload_cap {
+                        return Err(RegistryError::InvalidMessagePayloadCap {
+                            service: service.name(),
+                            kind: stream.kind,
+                            version: stream.version,
+                            message_type: cap.message_type,
+                            message_payload_cap: cap.max_payload_bytes,
+                            stream_payload_cap,
+                        });
+                    }
                 }
 
                 if let Some(first_index) = by_kind.get(&stream.kind).copied() {
@@ -498,7 +558,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::zakura::{framed_channel, Peer, Stream, StreamMode, ZakuraPeerId};
+    use crate::zakura::{
+        framed_channel, MessagePayloadCap, Peer, Stream, StreamMode, ZakuraPeerId,
+    };
 
     #[derive(Debug)]
     struct TestService {
@@ -600,6 +662,7 @@ mod tests {
             kind,
             version: 1,
             frame_cap: 1024,
+            message_payload_caps: &[],
             capability,
             mode: StreamMode::Ordered,
         }
@@ -610,6 +673,58 @@ mod tests {
             version,
             ..stream(kind, capability)
         }
+    }
+
+    #[test]
+    fn registry_rejects_duplicate_message_payload_caps() {
+        const CAPS: [MessagePayloadCap; 2] = [
+            MessagePayloadCap {
+                message_type: 2,
+                max_payload_bytes: 9,
+            },
+            MessagePayloadCap {
+                message_type: 2,
+                max_payload_bytes: 10,
+            },
+        ];
+        let service = TestService::new(
+            "duplicate-caps",
+            vec![Stream {
+                message_payload_caps: &CAPS,
+                ..stream(6, 1 << 3)
+            }],
+        );
+
+        assert!(matches!(
+            ServiceRegistry::new(vec![service]),
+            Err(RegistryError::DuplicateMessagePayloadCap {
+                message_type: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn registry_rejects_message_payload_cap_above_stream_cap() {
+        const CAPS: [MessagePayloadCap; 1] = [MessagePayloadCap {
+            message_type: 2,
+            max_payload_bytes: 1024,
+        }];
+        let service = TestService::new(
+            "oversize-cap",
+            vec![Stream {
+                message_payload_caps: &CAPS,
+                ..stream(6, 1 << 3)
+            }],
+        );
+
+        assert!(matches!(
+            ServiceRegistry::new(vec![service]),
+            Err(RegistryError::InvalidMessagePayloadCap {
+                message_type: 2,
+                ..
+            })
+        ));
     }
 
     #[test]

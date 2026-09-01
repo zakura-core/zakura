@@ -84,10 +84,37 @@ pub struct Stream {
     pub version: u16,
     /// Maximum application frame bytes for this stream.
     pub frame_cap: u32,
+    /// Payload caps for message types whose bound is smaller than the stream cap.
+    ///
+    /// The transport checks these caps from the fixed frame header before it
+    /// allocates or reads the payload.
+    pub message_payload_caps: &'static [MessagePayloadCap],
     /// Capability bit both peers must negotiate before this stream is wired.
     pub capability: u64,
     /// Stream lifetime and opening semantics.
     pub mode: StreamMode,
+}
+
+/// A message-specific payload cap enforced before payload allocation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct MessagePayloadCap {
+    /// Application message type from the frame header.
+    pub message_type: u16,
+    /// Maximum payload bytes for this message type.
+    pub max_payload_bytes: u32,
+}
+
+/// Return the payload cap for one frame header.
+pub(crate) fn message_payload_cap(
+    stream_payload_cap: u32,
+    message_type: u16,
+    message_payload_caps: &[MessagePayloadCap],
+) -> u32 {
+    message_payload_caps
+        .iter()
+        .find(|cap| cap.message_type == message_type)
+        .map(|cap| cap.max_payload_bytes.min(stream_payload_cap))
+        .unwrap_or(stream_payload_cap)
 }
 
 /// Transport state for one ordered service stream.

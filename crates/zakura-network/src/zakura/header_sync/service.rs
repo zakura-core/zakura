@@ -34,6 +34,7 @@ const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_HEADER_SYNC,
     version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
     frame_cap: HEADER_SYNC_FRAME_CAP,
+    message_payload_caps: &[],
     capability: ZAKURA_CAP_HEADER_SYNC,
     mode: StreamMode::Ordered,
 }];
@@ -57,6 +58,7 @@ mod stream_tests {
                 kind: ZAKURA_STREAM_HEADER_SYNC,
                 version: 8,
                 frame_cap: HEADER_SYNC_FRAME_CAP,
+                message_payload_caps: &[],
                 capability: 1 << 5,
                 mode: StreamMode::Ordered,
             }

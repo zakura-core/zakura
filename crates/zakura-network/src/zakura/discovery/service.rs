@@ -46,6 +46,7 @@ const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_DISCOVERY,
     version: ZAKURA_DISCOVERY_STREAM_VERSION,
     frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+    message_payload_caps: &[],
     capability: ZAKURA_CAP_DISCOVERY,
     mode: StreamMode::Ordered,
 }];

@@ -23,7 +23,7 @@ mod transaction;
 pub mod arbitrary;
 
 pub use genesis::*;
-pub use network::{magic::Magic, subsidy, testnet, Network, NetworkKind};
+pub use network::{magic::Magic, subsidy, testnet, Network, NetworkKind, V4Deprecation};
 pub use network_upgrade::*;
 pub use transaction::*;
 

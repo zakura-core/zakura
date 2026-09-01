@@ -25,7 +25,7 @@ use zakura_chain::{
     orchard::{Action, AuthorizedAction, Flags},
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters},
-        Network, NetworkUpgrade,
+        Network, NetworkUpgrade, V4Deprecation,
     },
     primitives::{ed25519, x25519, Groth16Proof},
     sapling,
@@ -46,7 +46,7 @@ use zakura_chain::{ironwood, orchard};
 
 use zakura_node_services::mempool;
 use zakura_state::ValidateContextError;
-use zakura_test::mock_service::MockService;
+use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{error::TransactionError, primitives, transaction::POLL_MEMPOOL_DELAY, BoxError};
 
@@ -3932,6 +3932,123 @@ async fn v5_with_duplicate_orchard_action() {
 }
 
 /// Checks the activation boundary of the temporary Orchard-disabling soft fork:
+/// Checks the ZIP 2003 version 4 deprecation boundary: a V4 transaction is valid below
+/// the deprecation height and invalid at and above it, the default deprecation is the NU7
+/// activation height, a network can name a later height, and a network can keep accepting
+/// V4 transactions.
+#[test]
+fn v4_deprecation_boundary() {
+    let _init_guard = zakura_test::init();
+
+    let nu7 = Height(2_000_000);
+    let later = Height(2_500_000);
+
+    let tx = test_transactions(&Network::Mainnet)
+        .map(|(_, tx)| tx)
+        .find(|tx| matches!(**tx, Transaction::V4 { .. }))
+        .expect("V4 tx");
+
+    let activation_heights = ConfiguredActivationHeights {
+        before_overwinter: Some(1),
+        overwinter: Some(2),
+        sapling: Some(3),
+        blossom: Some(4),
+        heartwood: Some(5),
+        canopy: Some(6),
+        nu5: Some(7),
+        nu6: Some(8),
+        nu6_1: Some(9),
+        nu6_2: Some(10),
+        nu6_3: Some(11),
+        nu7: Some(nu7.0),
+    };
+
+    // A network on the ZIP 2003 default rejects V4 transactions from NU7 onwards.
+    let at_nu7 = Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+
+    assert_eq!(at_nu7.v4_deprecation_height(), Some(nu7));
+    assert!(
+        verify_v4_at(&at_nu7, &tx, nu7.previous().expect("height")).is_ok(),
+        "a V4 transaction must be valid below the deprecation height",
+    );
+    assert_eq!(
+        verify_v4_at(&at_nu7, &tx, nu7),
+        Err(TransactionError::UnsupportedByNetworkUpgrade(
+            4,
+            NetworkUpgrade::Nu7
+        )),
+        "a V4 transaction must be invalid at the deprecation height",
+    );
+
+    // A network can deprecate V4 transactions after NU7 activates.
+    let at_height = Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .with_v4_deprecation(V4Deprecation::AtHeight(later))
+        .to_network()
+        .expect("failed to build configured network");
+
+    assert_eq!(at_height.v4_deprecation_height(), Some(later));
+    assert!(
+        verify_v4_at(&at_height, &tx, nu7).is_ok(),
+        "a V4 transaction must stay valid at NU7 when deprecation is configured later",
+    );
+    assert!(
+        verify_v4_at(&at_height, &tx, later).is_err(),
+        "a V4 transaction must be invalid at the configured deprecation height",
+    );
+
+    // A network can keep accepting V4 transactions at every height.
+    let never = Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .with_v4_deprecation(V4Deprecation::Never)
+        .to_network()
+        .expect("failed to build configured network");
+
+    assert_eq!(never.v4_deprecation_height(), None);
+    assert!(
+        verify_v4_at(&never, &tx, later).is_ok(),
+        "a V4 transaction must stay valid on a network that never deprecates it",
+    );
+
+    // A network without NU7 keeps accepting V4 transactions on the ZIP 2003 default.
+    let no_nu7 = Parameters::build()
+        .to_network()
+        .expect("failed to build configured network");
+
+    assert_eq!(no_nu7.v4_deprecation_height(), None);
+    assert!(!no_nu7.is_v4_deprecated(Height::MAX));
+}
+
+/// A [`Verifier`] with concrete service types, so a test can name its associated
+/// functions without the compiler inferring the services from a call.
+type TestVerifier = Verifier<
+    MockService<zakura_state::Request, zakura_state::Response, PanicAssertion>,
+    MockService<mempool::Request, mempool::Response, PanicAssertion>,
+>;
+
+/// Runs the V4 network upgrade check for `tx` at `height` on `network`.
+fn verify_v4_at(
+    network: &Network,
+    tx: &Transaction,
+    height: Height,
+) -> Result<(), TransactionError> {
+    TestVerifier::verify_v4_transaction_network_upgrade(
+        tx,
+        network,
+        height,
+        NetworkUpgrade::current(network, height),
+    )
+}
+
 /// it is inactive below the configured height and active at and above it, can be
 /// disabled entirely, and Mainnet uses its fixed activation height.
 #[test]

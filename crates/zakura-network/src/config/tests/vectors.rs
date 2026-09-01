@@ -6,7 +6,7 @@ use zakura_chain::{
     block::Height,
     parameters::{
         testnet::{self, ConfiguredFundingStreams},
-        Network,
+        Network, V4Deprecation,
     },
 };
 
@@ -781,6 +781,39 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
         params.temporary_orchard_disabling_soft_fork_height(),
         Some(soft_fork_height),
     );
+}
+
+/// Checks that a configured Testnet's ZIP 2003 version 4 deprecation survives a
+/// serialization round-trip in each of its three forms.
+#[test]
+fn v4_deprecation_serialization_roundtrip() {
+    let _init_guard = zakura_test::init();
+
+    for v4_deprecation in [
+        V4Deprecation::AtNu7,
+        V4Deprecation::AtHeight(Height(2_000_000)),
+        V4Deprecation::Never,
+    ] {
+        let mut config = Config {
+            network: testnet::Parameters::build()
+                .with_v4_deprecation(v4_deprecation)
+                .to_network()
+                .expect("failed to build configured network"),
+            initial_testnet_peers: [].into(),
+            ..Config::for_test(P2pStack::Dual)
+        };
+        config.zakura.apply_network_defaults(&config.network);
+
+        let serialized = toml::to_string(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(config, deserialized);
+
+        let Network::Testnet(params) = &deserialized.network else {
+            panic!("deserialized network must be a Testnet");
+        };
+        assert_eq!(params.v4_deprecation(), v4_deprecation);
+    }
 }
 
 #[test]

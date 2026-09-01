@@ -131,16 +131,19 @@ impl Drop for BlockSyncDriverExitGuard {
     }
 }
 
-async fn supervise_block_sync_driver(
+fn supervise_block_sync_driver(
     driver: impl std::future::Future<Output = ()>,
     fatal_events: mpsc::UnboundedSender<()>,
     shutdown: CancellationToken,
-) {
-    let _exit_guard = BlockSyncDriverExitGuard {
+) -> impl std::future::Future<Output = ()> {
+    let exit_guard = BlockSyncDriverExitGuard {
         fatal_events,
         shutdown,
     };
-    driver.await;
+    async move {
+        let _exit_guard = exit_guard;
+        driver.await;
+    }
 }
 
 #[cfg(feature = "internal-miner")]
@@ -1739,6 +1742,20 @@ mod tests {
             .await
             .expect_err("the simulated driver panic propagates");
         assert!(error.is_panic(), "the driver task reports a panic");
+    }
+
+    #[tokio::test]
+    async fn unpolled_block_sync_driver_cancellation_notifies_the_node_root() {
+        let shutdown = CancellationToken::new();
+        let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let driver = supervise_block_sync_driver(std::future::pending(), fatal_tx, shutdown);
+
+        drop(driver);
+
+        fatal_rx
+            .recv()
+            .await
+            .expect("canceling an unpolled driver must notify the node root");
     }
 
     #[tokio::test]

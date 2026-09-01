@@ -170,9 +170,6 @@ __pycache__/
 !.agents/rules
 local_data/**
 
-# fuzzing artifacts
-crates/zakura-chain/fuzz/artifacts
-crates/zakura-chain/fuzz/corpus
 stako/**/*
 perf-artifacts/**/*
 

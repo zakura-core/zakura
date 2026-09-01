@@ -19,7 +19,7 @@ use super::{
     peer_registry::{OutstandingMeta, PeerRegistry},
     reactor::{
         node_id_from_block_peer_id, BS_ACTION_CONTROL_RESERVE, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
-        EMPTY_STATE_HEADER_QUIET_PERIOD,
+        EMPTY_STATE_HEADER_QUIET_PERIOD, NEEDED_BLOCK_QUERY_RETRY_DELAY,
     },
     reorder::*,
     request::*,
@@ -13456,6 +13456,76 @@ async fn failed_needed_block_query_retries_without_losing_newer_query_ownership(
         BlockSyncAction::QueryNeededBlocks { query_id, .. }
             if query_id != first_query_id && query_id != second_query_id
     ));
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn failed_needed_block_query_keeps_retrying_when_action_queue_is_full() {
+    let best_header_tip = block::Height(10);
+    let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (best_header_tip, block::Hash([10; 32])),
+        tip_rx,
+        ZakuraBlockSyncConfig::default(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id: first_query_id,
+        scope,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup must query needed blocks");
+    };
+    handle
+        .send(BlockSyncEvent::NeededBlocksQueryFailed {
+            query_id: first_query_id,
+            scope,
+        })
+        .await
+        .expect("query failure queues");
+
+    let action_sender = &handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes its shared test wiring")
+        .actions;
+    while action_sender.capacity() > 0 {
+        action_sender
+            .try_send(BlockSyncAction::Misbehavior {
+                peer: peer(0xfe),
+                reason: BlockSyncMisbehavior::InvalidBlock,
+            })
+            .expect("the test fills one available action slot");
+    }
+    tokio::time::sleep(NEEDED_BLOCK_QUERY_RETRY_DELAY + Duration::from_millis(50)).await;
+
+    let _ = actions.recv().await.expect("one filler action drains");
+    tokio::time::timeout(
+        NEEDED_BLOCK_QUERY_RETRY_DELAY + Duration::from_secs(1),
+        async {
+            loop {
+                match actions.recv().await {
+                    Some(BlockSyncAction::QueryNeededBlocks { query_id, .. })
+                        if query_id != first_query_id =>
+                    {
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("the action stream closed before the retry"),
+                }
+            }
+        },
+    )
+    .await
+    .expect("the failed dispatch retains a bounded retry obligation");
 
     reactor_task.abort();
 }

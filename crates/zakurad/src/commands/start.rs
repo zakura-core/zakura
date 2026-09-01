@@ -3603,6 +3603,61 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[tokio::test]
+    async fn block_sync_driver_stops_when_needed_query_failure_receiver_closes() {
+        let (action_tx, action_rx) = mpsc::channel(1);
+        let (tip_tx, tip_rx) = watch::channel((block::Height(2), block::Hash([2; 32])));
+        drop(tip_tx);
+        let startup = block_sync_startup_with_snapshot(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            (block::Height(2), block::Hash([2; 32])),
+            tip_rx,
+            zakura_network::zakura::ZakuraBlockSyncConfig::default(),
+        );
+        let (block_sync, mut reactor_actions, reactor_task) =
+            zakura_network::zakura::spawn_block_sync_reactor(startup);
+        let first_query = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
+            .await
+            .expect("startup needed-body query arrives")
+            .expect("reactor action channel stays open");
+        reactor_task.abort();
+        reactor_task
+            .await
+            .expect_err("the test aborts the block-sync reactor");
+
+        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
+            match request {
+                zakura_state::ReadRequest::MissingBlockBodyMetadata { .. } => {
+                    Err::<zakura_state::ReadResponse, zakura_state::BoxError>(
+                        std::io::Error::other("simulated needed-body query failure").into(),
+                    )
+                }
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let (verifier, _commit_rx) = commit_channel_verifier();
+        let (driver, _shutdown_tx) = DriverParams::default().spawn(
+            action_rx,
+            block_sync,
+            zakura_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+        );
+        action_tx
+            .send(first_query)
+            .await
+            .expect("driver action channel stays open");
+
+        tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .expect("closed completion receiver stops the driver")
+            .expect("driver task exits without panicking");
+    }
+
+    #[tokio::test]
     async fn block_sync_driver_throughput_probe_advances_without_consensus_commit() {
         let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);

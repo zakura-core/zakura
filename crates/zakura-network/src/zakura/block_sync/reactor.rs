@@ -39,7 +39,7 @@ const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
 const NEEDED_BLOCK_REFILL_LIMIT: u32 = 4_000;
 
 /// Delay before the reactor retries a failed body-missing metadata query.
-const NEEDED_BLOCK_QUERY_RETRY_DELAY: Duration = Duration::from_millis(250);
+pub(super) const NEEDED_BLOCK_QUERY_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Delay checkpoint body application until a far-ahead empty-state header bootstrap settles.
 /// Each selected-header page advances the body-work scope. Applying bodies between
@@ -1251,8 +1251,7 @@ impl BlockSyncReactor {
         }
 
         self.pending_needed_query = None;
-        self.needed_query_retry_at = Some(Instant::now() + NEEDED_BLOCK_QUERY_RETRY_DELAY);
-        metrics::counter!("sync.block.needed_query.retry_scheduled").increment(1);
+        self.schedule_needed_query_retry();
     }
 
     /// Header tip minus verified body tip, emitted as the `body_lag` trace field
@@ -1669,6 +1668,11 @@ impl BlockSyncReactor {
         self.needed_query_retry_at = None;
     }
 
+    fn schedule_needed_query_retry(&mut self) {
+        self.needed_query_retry_at = Some(Instant::now() + NEEDED_BLOCK_QUERY_RETRY_DELAY);
+        metrics::counter!("sync.block.needed_query.retry_scheduled").increment(1);
+    }
+
     /// Producer refill. When `force` is set (destructive reset), skip the
     /// low-water gate so a still-uncleared registry outstanding snapshot cannot
     /// suppress the post-`reset_above` re-query.
@@ -1731,6 +1735,8 @@ impl BlockSyncReactor {
             self.pending_needed_query = Some(query);
             self.needed_query_retry_at = None;
             self.next_needed_query_id = query_id.get().checked_add(1).and_then(NonZeroU64::new);
+        } else {
+            self.schedule_needed_query_retry();
         }
         dispatched
     }

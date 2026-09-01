@@ -17,7 +17,7 @@ use std::{
     ops::RangeBounds,
     path::Path,
     sync::{
-        atomic::{self, AtomicBool},
+        atomic::{self, AtomicBool, AtomicU64},
         Arc,
     },
 };
@@ -136,6 +136,9 @@ pub struct DiskDb {
     //
     // Everything contained in this state must be shared by all clones, or read-only.
     //
+    /// Database startup and each metrics export update this cached disk size.
+    cached_size: Arc<AtomicU64>,
+
     /// The shared inner RocksDB database.
     ///
     /// RocksDB allows reads and writes via a shared reference.
@@ -737,6 +740,8 @@ impl DiskDb {
         }
 
         metrics::gauge!("zakura.state.rocksdb.total_disk_size_bytes").set(total_disk as f64);
+        self.cached_size
+            .store(total_disk, atomic::Ordering::Relaxed);
         metrics::gauge!("zakura.state.rocksdb.live_data_size_bytes").set(total_live as f64);
         metrics::gauge!("zakura.state.rocksdb.total_memory_size_bytes").set(total_mem as f64);
 
@@ -765,6 +770,11 @@ impl DiskDb {
 
     /// Returns the estimated total disk space usage of the database.
     pub fn size(&self) -> u64 {
+        self.cached_size.load(atomic::Ordering::Relaxed)
+    }
+
+    /// Refreshes the cached estimate of the database's disk usage.
+    fn refresh_cached_size(&self) {
         let db: &Arc<DB> = &self.db;
         let db_options = DiskDb::options();
         let mut total_size_on_disk = 0;
@@ -781,7 +791,8 @@ impl DiskDb {
                 .unwrap_or(0);
         }
 
-        total_size_on_disk
+        self.cached_size
+            .store(total_size_on_disk, atomic::Ordering::Relaxed);
     }
 
     /// Sets `finished_format_upgrades` to true to indicate that Zebra has
@@ -1177,9 +1188,11 @@ impl DiskDb {
                     db: Arc::new(db),
                     _secondary_dir: secondary_dir,
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
+                    cached_size: Arc::new(AtomicU64::new(0)),
                 };
 
                 db.assert_default_cf_is_empty();
+                db.refresh_cached_size();
 
                 Ok(db)
             }

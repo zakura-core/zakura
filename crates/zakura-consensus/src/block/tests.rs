@@ -615,6 +615,103 @@ fn miner_fees_validation_for_network(network: Network) -> Result<(), Report> {
     Ok(())
 }
 
+/// Checks the ZIP 235 fee burn: the coinbase must remove at least 60% of the block's
+/// transaction fees from circulation, and the burn counts towards its total output value.
+#[test]
+fn zip235_coinbase_must_burn_sixty_percent_of_fees() -> Result<(), Report> {
+    use zakura_chain::{
+        amount::NonNegative,
+        parameters::{
+            subsidy::minimum_fee_burn,
+            testnet::{ConfiguredActivationHeights, Parameters},
+            ZIP235_ENABLED,
+        },
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let nu7 = Height(1);
+    let network = Parameters::build()
+        .with_slow_start_interval(Height::MIN)
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(nu7.0),
+            ..Default::default()
+        })?
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let block_miner_fees = Amount::<NonNegative>::try_from(1_000)?;
+    let expected_block_subsidy = block_subsidy(nu7, &network)?;
+    let expected_deferred_pool_balance_change = DeferredPoolBalanceChange::zero();
+
+    // 60% of 1000, rounded down in the miner's favour.
+    let required_burn = minimum_fee_burn(block_miner_fees)?;
+    assert_eq!(required_burn, Amount::<NonNegative>::try_from(600)?);
+
+    // A coinbase pays out the subsidy plus the fees it did not burn, and burns the rest,
+    // so its total output value is unchanged.
+    let coinbase_with_burn = |zip233_amount: Amount<NonNegative>| -> Result<Transaction, Report> {
+        let payout = ((expected_block_subsidy + block_miner_fees) - zip233_amount)?;
+
+        Ok(Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu7,
+            lock_time: LockTime::unlocked(),
+            expiry_height: nu7,
+            zip233_amount,
+            inputs: vec![transparent::Input::Coinbase {
+                height: nu7,
+                data: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![transparent::Output {
+                value: payout,
+                lock_script: transparent::Script::new(&[]),
+            }],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+        })
+    };
+
+    let check = |coinbase: &Transaction| {
+        check::miner_fees_are_valid(
+            coinbase,
+            nu7,
+            block_miner_fees,
+            expected_block_subsidy,
+            expected_deferred_pool_balance_change,
+            &network,
+        )
+    };
+
+    // Burning exactly the minimum is valid, and so is burning more.
+    assert!(check(&coinbase_with_burn(required_burn)?).is_ok());
+    assert!(check(&coinbase_with_burn(Amount::<NonNegative>::try_from(700)?)?).is_ok());
+
+    let too_little = coinbase_with_burn(Amount::<NonNegative>::try_from(599)?)?;
+    let none = coinbase_with_burn(Amount::zero())?;
+
+    if ZIP235_ENABLED {
+        for coinbase in [&too_little, &none] {
+            assert_eq!(
+                check(coinbase),
+                Err(BlockError::Transaction(TransactionError::Subsidy(
+                    SubsidyError::InsufficientFeeBurn
+                ))),
+                "a coinbase that burns less than 60% of the fees must be invalid",
+            );
+        }
+    } else {
+        // Without the feature there is no minimum, and the burn still counts towards the
+        // coinbase's total output value, so these coinbases balance.
+        assert!(check(&too_little).is_ok());
+        assert!(check(&none).is_ok());
+    }
+
+    Ok(())
+}
+
 #[test]
 fn miner_fees_validation_failure() -> Result<(), Report> {
     let _init_guard = zakura_test::init();

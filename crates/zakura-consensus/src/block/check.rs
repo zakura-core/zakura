@@ -11,8 +11,8 @@ use zakura_chain::{
     block::{Block, Hash, Header, Height},
     parameters::{
         subsidy::{
-            founders_reward, founders_reward_address, funding_stream_values, FundingStreamReceiver,
-            ParameterSubsidy, SubsidyError,
+            founders_reward, founders_reward_address, funding_stream_values, minimum_fee_burn,
+            FundingStreamReceiver, ParameterSubsidy, SubsidyError,
         },
         Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT,
         SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
@@ -341,6 +341,28 @@ pub fn miner_fees_are_valid(
     let orchard_value_balance = coinbase_tx.orchard_value_balance().orchard_amount();
     let ironwood_value_balance = coinbase_tx.ironwood_value_balance().ironwood_amount();
 
+    // A coinbase transaction can remove value from circulation too, under ZIP 233. That
+    // value comes out of the same block subsidy and fees as its outputs, so it counts
+    // towards the coinbase's total output value below.
+    let zip233_amount: Amount<NegativeAllowed> = coinbase_tx
+        .zip233_amount()
+        .constrain()
+        .map_err(SubsidyError::InvalidAmount)?;
+
+    // # Consensus
+    //
+    // > For each block, at least 60% (rounded down) of the total fees are to be removed
+    // > from circulation.
+    //
+    // https://zips.z.cash/zip-0235
+    if NetworkUpgrade::is_zip235_active(network, height) {
+        let minimum_fee_burn = minimum_fee_burn(block_miner_fees)?;
+
+        if coinbase_tx.zip233_amount() < minimum_fee_burn {
+            Err(SubsidyError::InsufficientFeeBurn)?
+        }
+    }
+
     // # Consensus
     //
     // > - define the total output value of its coinbase transaction to be the total value in zatoshi of its transparent
@@ -357,8 +379,9 @@ pub fn miner_fees_are_valid(
         - sapling_value_balance
         - orchard_value_balance
         - ironwood_value_balance
-        + expected_deferred_pool_balance_change.value())
-    .map_err(|_| SubsidyError::Overflow)?;
+        + expected_deferred_pool_balance_change.value()
+        + zip233_amount)
+        .map_err(|_| SubsidyError::Overflow)?;
 
     let total_input_value =
         (expected_block_subsidy + block_miner_fees).map_err(|_| SubsidyError::Overflow)?;

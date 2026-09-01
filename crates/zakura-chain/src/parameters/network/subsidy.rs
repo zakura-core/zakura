@@ -385,6 +385,9 @@ pub enum SubsidyError {
     #[error("miner fees are invalid")]
     InvalidMinerFees,
 
+    #[error("coinbase removes less than 60% of the block's transaction fees from circulation")]
+    InsufficientFeeBurn,
+
     #[error("addition of amounts overflowed")]
     Overflow,
 
@@ -449,6 +452,34 @@ pub fn halving(height: Height, network: &Network) -> u32 {
     (total_block_seconds / pre_blossom_denominator)
         .try_into()
         .expect("halving index is non-negative and fits in u32")
+}
+
+/// The share of a block's transaction fees that [ZIP 235] removes from circulation, as a
+/// numerator over [`FEE_BURN_DENOMINATOR`].
+///
+/// [ZIP 235]: https://zips.z.cash/zip-0235
+pub const FEE_BURN_NUMERATOR: u64 = 6;
+
+/// The denominator of [`FEE_BURN_NUMERATOR`].
+pub const FEE_BURN_DENOMINATOR: u64 = 10;
+
+/// Returns the smallest amount a block's coinbase may remove from circulation under
+/// [ZIP 235], given the block's total transaction fees.
+///
+/// # Consensus
+///
+/// > For each block, at least 60% (rounded down) of the total fees are to be removed from
+/// > circulation.
+///
+/// The rounding favours the miner, so this is `floor(block_miner_fees * 6 / 10)`.
+///
+/// [ZIP 235]: https://zips.z.cash/zip-0235
+pub fn minimum_fee_burn(
+    block_miner_fees: Amount<NonNegative>,
+) -> Result<Amount<NonNegative>, SubsidyError> {
+    let scaled = (block_miner_fees * FEE_BURN_NUMERATOR).map_err(|_| SubsidyError::Overflow)?;
+
+    (scaled / FEE_BURN_DENOMINATOR).map_err(|_| SubsidyError::Overflow)
 }
 
 /// `BlockSubsidy(height)` as described in [protocol specification §7.8][7.8]

@@ -14,7 +14,7 @@ use zakura_chain::{
     block::{self, merkle::AUTH_DIGEST_PLACEHOLDER, Height},
     orchard,
     parameters::{
-        subsidy::{block_subsidy, funding_stream_values, miner_subsidy},
+        subsidy::{block_subsidy, funding_stream_values, miner_subsidy, minimum_fee_burn},
         Network, NetworkUpgrade,
     },
     primitives::ed25519,
@@ -135,7 +135,25 @@ impl TransactionTemplate<NegativeOrZero> {
         txs_fee: Amount<NonNegative>,
     ) -> Result<Self, TransactionError> {
         let block_subsidy = block_subsidy(height, net)?;
-        let miner_reward = miner_subsidy(height, net, block_subsidy)? + txs_fee;
+
+        // # Consensus
+        //
+        // > For each block, at least 60% (rounded down) of the total fees are to be
+        // > removed from circulation.
+        //
+        // https://zips.z.cash/zip-0235
+        //
+        // The burn comes out of the fees, so the miner keeps the block subsidy plus the
+        // remaining 40%. Templates burn exactly the minimum: any more is the miner's to
+        // give away, not this node's.
+        let fee_burn = if NetworkUpgrade::is_zip235_active(net, height) {
+            minimum_fee_burn(txs_fee)?
+        } else {
+            Amount::zero()
+        };
+        let miner_fees = (txs_fee - fee_burn)?;
+
+        let miner_reward = miner_subsidy(height, net, block_subsidy)? + miner_fees;
         let miner_reward = Zatoshis::try_from(miner_reward?)?;
 
         let mut builder = Builder::new(
@@ -276,6 +294,14 @@ impl TransactionTemplate<NegativeOrZero> {
 
         for (fs_amount, fs_addr) in funding_streams {
             builder.add_transparent_output(&fs_addr, fs_amount)?;
+        }
+
+        // The ZIP 233 field carries the ZIP 235 burn. It is set after the outputs, so the
+        // builder's value balance already accounts for the reduced miner reward. The
+        // setter only exists in a build that compiles `zakura-primitives`' ZIP 233 code.
+        #[cfg(feature = "zip235")]
+        if fee_burn > Amount::<NonNegative>::zero() {
+            builder.set_zip233_amount(Zatoshis::try_from(fee_burn)?);
         }
 
         // Reuse the process-wide Sapling prover instead of re-parsing the bundled parameters on

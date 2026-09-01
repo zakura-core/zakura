@@ -31,6 +31,15 @@ zip233 = [
     "zakura-chain/zip233",
 ]
 
+# ZIP 235 "Network Sustainability Mechanism: Burning of Transaction Fees": the coinbase
+# must remove at least 60% of the block's transaction fees from circulation.
+#
+# Enables `zip233`, which carries the burn, and so needs the same RUSTFLAGS.
+zip235 = [
+    "zakura-chain/zip235",
+    "zip233",
+]
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 # Exposes narrow internal hooks used by benchmarks.

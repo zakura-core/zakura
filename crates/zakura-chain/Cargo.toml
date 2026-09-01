@@ -37,6 +37,13 @@ zip218 = []
 # in `zakura-primitives`. A build without that flag fails to compile.
 zip233 = ["zcash_primitives/zip-233"]
 
+# ZIP 235 "Network Sustainability Mechanism: Burning of Transaction Fees": the coinbase
+# must remove at least 60% of the block's transaction fees from circulation.
+#
+# ZIP 235 must deploy at the same time as or after ZIP 233, because the burn is carried
+# by ZIP 233's `zip233Amount` field.
+zip235 = ["zip233"]
+
 # Consensus-critical conversion from JSON to Zcash types
 json-conversion = [
     "serde_json",

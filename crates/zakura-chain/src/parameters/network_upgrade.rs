@@ -281,6 +281,16 @@ pub const ZIP218_ENABLED: bool = cfg!(feature = "zip218");
 /// Enabled by the `zip233` feature.
 pub const ZIP233_ENABLED: bool = cfg!(feature = "zip233");
 
+/// Whether the ZIP 235 rules are compiled into this build.
+///
+/// ZIP 235 requires a block's coinbase transaction to remove at least 60% of the block's
+/// transaction fees from circulation, through ZIP 233's `zip233Amount` field.
+///
+/// The rules are still dormant until NU7 activates on the configured network.
+///
+/// Enabled by the `zip235` feature, which also enables `zip233`.
+pub const ZIP235_ENABLED: bool = cfg!(feature = "zip235");
+
 // The `zip233` feature only reaches the matching `zakura-primitives` code, which parses
 // and hashes the field on the `librustzcash` side, when the build also sets the
 // `zcash_unstable = "nu7"` cfg. Without it the two sides disagree on the v6 wire format,
@@ -658,6 +668,14 @@ impl NetworkUpgrade {
     /// See [`ZIP233_ENABLED`] and [`NetworkUpgrade::is_nu7_active`].
     pub fn is_zip233_active(network: &Network, height: block::Height) -> bool {
         ZIP233_ENABLED && Self::is_nu7_active(network, height)
+    }
+
+    /// Returns `true` if the ZIP 235 rules are compiled in and active for
+    /// `network` at `height`.
+    ///
+    /// See [`ZIP235_ENABLED`] and [`NetworkUpgrade::is_nu7_active`].
+    pub fn is_zip235_active(network: &Network, height: block::Height) -> bool {
+        ZIP235_ENABLED && Self::is_nu7_active(network, height)
     }
 
     /// Returns `true` if the ZIP 218 rules are compiled in and active for

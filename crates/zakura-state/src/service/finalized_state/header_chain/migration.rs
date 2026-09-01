@@ -824,7 +824,9 @@ fn linked_validation_context(
 ) -> Result<Vec<HeaderValidationContextDisk>, HeaderChainInitializationError> {
     let mut contexts = Vec::new();
     let mut height = anchor.height;
-    for _ in 0..27 {
+    // The recovery audit requires exactly the retained predecessor span below
+    // the anchor, which widens with the difficulty averaging window.
+    for _ in 0..zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN {
         let Ok(previous) = height.previous() else {
             break;
         };
@@ -878,10 +880,14 @@ mod tests {
     }
 
     #[test]
-    fn later_anchor_predecessor_context_has_exact_one_to_twenty_eight_boundary() {
-        let headers = linked_headers(30);
+    fn later_anchor_predecessor_context_has_the_exact_span_boundary() {
+        let predecessor_span = zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN;
+        let span_bound =
+            u32::try_from(predecessor_span).expect("the retained predecessor span fits in u32");
+        let chain_len = span_bound + 3;
+        let headers = linked_headers(chain_len);
 
-        for anchor_height in 0..=29 {
+        for anchor_height in 0..chain_len {
             let anchor_index = usize::try_from(anchor_height).expect("the test height fits");
             let anchor_header = &headers[anchor_index];
             let anchor = Frontier::new(block::Height(anchor_height), anchor_header.hash());
@@ -894,12 +900,13 @@ mod tests {
                 .expect("the exact backward-linked context is authenticated");
 
             let expected_predecessors =
-                usize::try_from(anchor_height.min(27)).expect("the bound fits in usize");
+                usize::try_from(anchor_height.min(span_bound)).expect("the bound fits in usize");
             assert_eq!(contexts.len(), expected_predecessors);
             assert_eq!(
                 contexts.len() + 1,
-                usize::try_from((anchor_height + 1).min(28)).expect("the bound fits in usize"),
-                "the anchor plus predecessor facts has the exact one-to-28-header boundary"
+                usize::try_from((anchor_height + 1).min(span_bound + 1))
+                    .expect("the bound fits in usize"),
+                "the anchor plus its predecessor facts spans the retained context exactly"
             );
             if contexts.is_empty() {
                 continue;

@@ -23,8 +23,7 @@ fn custom_target_scaling_clamps_before_overflowing_u256() {
     // The context always spans `POW_ADJUSTMENT_BLOCK_SPAN` blocks, which can be
     // wider than the averaging window in force at this height.
     let candidate_height = block::Height(700_000);
-    let averaging_window =
-        NetworkUpgrade::averaging_window_for_height(&network, candidate_height);
+    let averaging_window = NetworkUpgrade::averaging_window_for_height(&network, candidate_height);
     let mut context = vec![(compact, candidate_time - Duration::seconds(1)); averaging_window];
     context.extend(vec![
         (compact, candidate_time - Duration::seconds(100_000));

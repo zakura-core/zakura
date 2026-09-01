@@ -171,15 +171,16 @@ peer, blocks only that peer's path at the bound, and may disconnect a peer that 
 
 ## Testing and introspection
 
-Four test layers keep declarations, codecs, gate state, and runtime behavior aligned:
+Six test categories keep declarations, codecs, gate state, and runtime behavior aligned:
 
-| Layer | Required properties |
+| Category | Required properties |
 | --- | --- |
-| **Declaration tests** | Every message handler has one declaration. Every declaration has one handler. Every message declares a byte cap and work bound. |
-| **Property tests** | Legal messages have one canonical encoding and fit within their declared caps. Generated gate-event sequences preserve reservation, budget, and state-size invariants. A conformant sender never produces `Disconnect`. |
-| **Fuzz tests** | The decoder never panics on arbitrary frames. It rejects trailing bytes and bounds every allocation before decode. |
+| **Declaration tests** | The closed message inventory has one declaration, one exhaustive handler arm, one exhaustive reference-model arm, legal boundary values, and an explicit state effect for every wire message. |
+| **Property tests** | Encoded legal messages decode to the same value and fit their declared caps. Decoders reject noncanonical encodings. Generated conformant actions satisfy sender preconditions. Production transitions preserve reservation, budget, and state-size invariants. A conformant sender never produces `Disconnect`. |
+| **Fuzz tests** | Fuzz targets search arbitrary frames for decoder panics, trailing-byte acceptance, and allocation-bound violations. |
 | **Panic isolation** | A panic in a decoder, handler, or port operation is caught at its boundary. The process survives, other peers keep running, and the work returns to the scheduler. |
 | **Trace tests** | Each response key consumes at most one reservation part. Honest regtest nodes never produce a `Disconnect` verdict. |
+| **Bounded model exploration** | A finite two-peer block-sync model visits every reachable state within its declared bounds and checks reservation, Work, queue, cleanup, isolation, and bounded-progress invariants. |
 
 Each gate emits a structured decision to `regulation.jsonl`. Production records non-`Continue`
 decisions. The regtest harness records every decision and checks the full trace with
@@ -187,9 +188,19 @@ decisions. The regtest harness records every decision and checks the full trace 
 
 Reservation handling uses a model-based property test. A generator opens, grants, and closes
 subscriptions. It also reassigns work, advances finality, delivers responses and duplicates, and
-closes connections. A small reference model checks that each admitted response consumes live header
-and byte credit. It also checks that local scheduler actions never remove reservations and that
-subscription state never exceeds its declared bounds.
+closes connections. The generator uses reference-model state to select actions whose sender
+preconditions hold. It does not construct the production invariants that the test checks.
+
+The oracle compares the model and production observations after every action. It checks that each
+admitted response consumes live header and byte credit. It also checks that local scheduler actions
+never remove reservations and that subscription state never exceeds its declared bounds. The
+Proptest strategy interprets shrunk choices from reference-model state and retains the original
+conformant or adversarial class.
+
+The [property-testing design](property-testing.md) defines claim strength, stepwise observations,
+the compiler-enforced message addition contract, regression scenarios, and CI profiles. The
+[first block-sync infrastructure](property-testing-block-sync-infrastructure.md) defines the initial
+two-peer bounded model and identifies the existing test infrastructure that it reuses.
 
 Each message verifier has no I/O, locks, or shared state. This makes every verifier an independent
 fuzz target. The regtest corpus provides the initial fuzz inputs.
@@ -198,7 +209,8 @@ fuzz target. The regtest corpus provides the initial fuzz inputs.
 
 Implement the design in five steps:
 
-1. Declare all 14 target message types. Add declaration drift tests and replace `PipeShape`.
+1. Define the closed inventory for every current message. Add compile-time declaration closure,
+   deterministic property-coverage checks, and replace `PipeShape`.
 2. Build one cadence budget per `(peer, message type)` from the message declarations.
 3. Preserve block-sync reservations until a response arrives or the connection ends. Then remove
    the unmatched-response exceptions.

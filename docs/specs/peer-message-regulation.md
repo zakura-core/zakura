@@ -61,7 +61,11 @@ allocate from a peer-declared value.
 ### Common requirements
 
 1. Each message type MUST have exactly one declaration and one handler. Each handler MUST have a
-   declaration. Each declaration MUST select exactly one role and one work bound.
+   declaration. Each declaration MUST select exactly one role and one work bound. It MUST declare
+   the payload cap and an allocation bound for each variable-length decoded field. An allocation
+   bound MAY depend on a checked fixed prefix, a protocol limit, and a live reservation. The wire
+   message, declaration, handler, and reference model MUST use one closed message-kind inventory.
+   Their mappings MUST use exhaustive matches without wildcard arms.
 2. Each filter MUST cap its per-peer state at a receiver-configured capacity. Peer-provided
    messages, keys, and counts MAY consume that capacity but MUST NOT increase it. The filter MUST
    define its behavior at capacity. The receiver MUST size each capacity so its aggregate across the
@@ -115,6 +119,8 @@ Decode converts a bounded payload into one canonical message.
 - Decode MUST bound every allocation before it occurs. A collection allocation MUST NOT exceed the
   smallest of its declared count, protocol limit, and
   `remaining_bytes / minimum_item_size`.
+- The decoder MUST expose requested-allocation and retained decoded-state bounds to tests. A payload
+  cap MUST NOT serve as an allocation bound.
 - A live reservation MUST supply request-selected response bounds.
 - A Decode failure MUST return `Disconnect`.
 
@@ -804,18 +810,27 @@ below remain candidate values while this specification has first-draft status:
 
 The implementation MUST provide these checks:
 
-1. A declaration test MUST prove that the 14 declarations and 14 handler branches match exactly.
-2. A cap test MUST prove that every maximal legal encoding fits its declared cap and that no
+1. A declaration closure check MUST derive the current message kinds from the same closed inventory
+   used by production dispatch. It MUST check that every kind has one declaration, one handler arm,
+   one independent reference-model arm, legal minimum and maximum values, allocation bounds, and an
+   explicit state effect. It MUST NOT use a fixed expected message count or a separately maintained
+   message-kind list.
+2. A cap test MUST check that every maximal legal encoding fits its declared cap and that no
    computed maximum exceeds that cap.
-3. Property tests MUST generate legal messages and gate-event sequences. They MUST preserve
-   reservation, budget, and state-size invariants. A conformant sequence MUST never return
-   `Disconnect`.
+3. Property tests MUST generate legal messages and gate-event sequences whose sender preconditions
+   hold. After every production transition, they MUST check reservation, budget, and state-size
+   invariants. A conformant sequence MUST never return `Disconnect`. A deterministic coverage check
+   MUST execute every current message kind, legal boundary value, and declared adversarial rule at
+   least once. It MUST execute the cadence properties for every announcement, the Work and terminal
+   refund properties for every request, and the reservation properties for every response. Random
+   generation MUST NOT provide the only coverage for any kind, boundary, or rule.
 4. Model-based reservation tests MUST generate subscription opens, grants, closes, exhausted credit,
    crossed and spontaneous terminal responses, work reassignment, finality changes, response
    reordering, duplicate responses, and connection closure. Each pushed response MUST consume the
    exact header and byte credit from one live subscription.
-5. Fuzz tests MUST prove that each decoder is total, exact, and allocation-bounded for arbitrary
-   frames.
+5. Fuzz tests MUST search arbitrary frames for decoder panics, inexact consumption, and allocation-
+   bound violations. Property tests MUST check the corresponding claims over generated bounded
+   payloads.
 6. Honest-node regtest traces MUST contain no `Disconnect` result.
 7. Load tests MUST drive one peer at the maximum conformant rate and show that CPU, memory, and
    filter state stay within their declared bounds. They MUST drive a non-conformant flood and show
@@ -826,8 +841,13 @@ The implementation MUST provide these checks:
    peer-set ban policy nor the peer-violation count.
 9. Backpressure tests MUST exhaust one request type's Work bucket and show that its handler does not
    start. They MUST show that application and QUIC buffering stays within the declared bounds, that
-   the peer routine resumes after a refund or refill, and that another peer and service stream keep
-   making progress.
+   the peer routine resumes after a refund or refill, and that another peer and service stream make
+   progress within the test's declared scheduling and progress bounds.
+10. Bounded model exploration MUST visit every reachable state in the finite model declared by the
+    [first block-sync infrastructure](../design/property-testing-block-sync-infrastructure.md). It
+    MUST check reservation, Work, slot, queue, isolation, cleanup, and bounded-progress invariants.
+    If a resource limit stops exploration before its frontier is empty, the check MUST report an
+    incomplete result instead of an exhaustive result.
 
 Peer-slot selection, message priority, and stream layout are outside this specification. Peer-slot
 selection must remain separate because a conformant peer can waste a slot without violating a

@@ -277,10 +277,12 @@ fn median_and_production_max_time_boundaries_are_exact() {
     ] {
         let context = vec![
             (network.target_difficulty_limit().to_compact(), base);
-            usize::try_from(height.0.min(
-                u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN)
-                    .expect("the difficulty adjustment span fits in u32"),
-            ))
+            usize::try_from(
+                height.0.min(
+                    u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN)
+                        .expect("the difficulty adjustment span fits in u32"),
+                )
+            )
             .expect("bounded height fits in usize")
         ];
         assert!(matches!(

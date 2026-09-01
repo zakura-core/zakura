@@ -25,6 +25,17 @@ pub enum BlockSyncWireError {
     #[error("Zakura block-sync count must be non-zero")]
     ZeroBlockCount,
 
+    /// A `GetBlocks` range extended above the maximum supported height.
+    #[error(
+        "Zakura block-sync range from {start:?} with count {count} exceeds the maximum height"
+    )]
+    BlockRangeOverflow {
+        /// First requested height.
+        start: block::Height,
+        /// Requested block count.
+        count: u32,
+    },
+
     /// A decoded block body exceeded the consensus block-size limit.
     #[error("Zakura block-sync block length {actual} exceeds consensus cap {max}")]
     OversizedBlock {

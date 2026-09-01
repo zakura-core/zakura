@@ -52,21 +52,21 @@ use crate::{peer_registry::PeerRegistry, BoxError, Config, MAX_TX_INV_IN_SENT_ME
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        canonical_ip, direct_endpoint_builder, spawn_block_sync_reactor, spawn_header_sync_reactor,
-        AuthenticatedPeerRegistration, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
-        BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FramedRecv,
-        FramedSend, FullStateFrontiers, HeaderSyncPassthroughService, HeaderSyncService,
-        HeaderSyncStartup, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
-        RealClock, Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject,
-        Stream, StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
-        ZakuraConnId, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole,
-        ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
-        ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
-        ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraUpgradeDialStart,
-        CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION, FRAME_HEADER_BYTES,
-        MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES,
-        ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
-        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        canonical_ip, direct_endpoint_builder, message_payload_cap, spawn_block_sync_reactor,
+        spawn_header_sync_reactor, AuthenticatedPeerRegistration, BlockSyncAction,
+        BlockSyncFrontiers, BlockSyncHandle, BlockSyncService, BlockSyncStartup, BoxRunFuture,
+        Clock, CloseCause, Frame, FramedRecv, FramedSend, FullStateFrontiers,
+        HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, MessagePayloadCap,
+        OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer, RealClock, Service,
+        ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject, Stream, StreamMode,
+        StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraControlAck,
+        ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig,
+        ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits,
+        ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
+        ZakuraUpgradeDialStart, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
+        FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
+        TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 
@@ -1555,6 +1555,7 @@ struct StreamWorkerContext {
     limits: ZakuraConnectionLimits,
     inbound_frame_cap: u32,
     outbound_frame_cap: u32,
+    message_payload_caps: &'static [MessagePayloadCap],
     message_bucket: SharedMessageBucket,
     connection_token: CancellationToken,
     stream_token: CancellationToken,
@@ -2926,6 +2927,7 @@ impl ZakuraProtocolHandler {
             limits,
             inbound_frame_cap: prelude.max_frame_bytes,
             outbound_frame_cap: application_frame_cap(&limits, stream),
+            message_payload_caps: stream.message_payload_caps,
             message_bucket,
             connection_token,
             stream_token,
@@ -3127,6 +3129,7 @@ impl ZakuraProtocolHandler {
                 stream,
                 prelude.max_frame_bytes,
             ),
+            message_payload_caps: stream.message_payload_caps,
             message_bucket,
             connection_token: admission.connection_token.clone(),
             stream_token,
@@ -3946,6 +3949,7 @@ async fn persistent_stream_worker(
                 frame = read_frame(
                     &mut recv,
                     reader_context.inbound_frame_cap,
+                    reader_context.message_payload_caps,
                     reader_context.limits.idle_timeout,
                     // A persistent ordered stream is legitimately quiet between
                     // frames; do not let an inter-frame gap time out and cancel
@@ -4125,6 +4129,7 @@ async fn request_stream_worker(
         frame = read_frame(
             &mut recv,
             context.inbound_frame_cap,
+            context.message_payload_caps,
             context.limits.idle_timeout,
             // A request stream carries its request frame immediately after the
             // prelude, so a peer that opens one and then goes silent is treated
@@ -4296,6 +4301,7 @@ async fn read_stream_prelude(
 async fn read_frame(
     recv: &mut RecvStream,
     max_frame_bytes: u32,
+    message_payload_caps: &'static [MessagePayloadCap],
     read_timeout: Duration,
     first_byte_timeout: Option<Duration>,
 ) -> Result<Frame, ZakuraHandlerError> {
@@ -4330,13 +4336,22 @@ async fn read_frame(
         .expect("u32 payload lengths fit usize on supported targets");
     let max_frame_bytes =
         usize::try_from(max_frame_bytes).expect("u32 frame cap fits usize on supported targets");
+    let stream_payload_cap = max_frame_bytes.saturating_sub(FRAME_HEADER_BYTES);
+    let stream_payload_cap = u32::try_from(stream_payload_cap)
+        .expect("the negotiated u32 frame cap minus its header fits u32");
+    let max_payload_bytes =
+        message_payload_cap(stream_payload_cap, message_type, message_payload_caps);
+    let max_payload_bytes = usize::try_from(max_payload_bytes)
+        .expect("u32 message payload caps fit usize on supported targets");
+    let effective_max_frame_bytes =
+        max_frame_bytes.min(FRAME_HEADER_BYTES.saturating_add(max_payload_bytes));
     let frame_len = FRAME_HEADER_BYTES.saturating_add(payload_len);
-    if frame_len > max_frame_bytes {
+    if frame_len > effective_max_frame_bytes {
         metrics::counter!("zakura.p2p.ratelimit.frame.oversize").increment(1);
         return Err(ZakuraHandlerError::OversizeFrame {
             payload_len,
             frame_len,
-            max_frame_bytes,
+            max_frame_bytes: effective_max_frame_bytes,
         });
     }
     let mut payload = vec![0; payload_len];
@@ -4505,6 +4520,7 @@ async fn write_outbound_request_frame_inner(
         match read_frame(
             &mut recv,
             inbound_frame_cap,
+            &[],
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
             // the responder streams its frames promptly, so a silent gap before
@@ -6105,6 +6121,7 @@ mod tests {
             kind: 61,
             version: 1,
             frame_cap: 1024,
+            message_payload_caps: &[],
             capability: ZAKURA_CAP_LEGACY_GOSSIP,
             mode: StreamMode::Ordered,
         };
@@ -6220,6 +6237,7 @@ mod tests {
             kind: 62,
             version: 1,
             frame_cap: 1024,
+            message_payload_caps: &[],
             capability: ZAKURA_CAP_LEGACY_GOSSIP,
             mode: StreamMode::Ordered,
         };
@@ -7203,6 +7221,7 @@ mod tests {
             kind: ZAKURA_STREAM_HEADER_SYNC,
             version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
             frame_cap: 1,
+            message_payload_caps: &[],
             capability: ZAKURA_CAP_HEADER_SYNC,
             mode: StreamMode::Ordered,
         };
@@ -7313,6 +7332,7 @@ mod tests {
                 kind: ZAKURA_STREAM_BLOCK_SYNC,
                 version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
                 frame_cap: 1,
+                message_payload_caps: &[],
                 capability: ZAKURA_CAP_BLOCK_SYNC,
                 mode: StreamMode::Ordered,
             },
@@ -7348,6 +7368,7 @@ mod tests {
             kind: ZAKURA_STREAM_HEADER_SYNC,
             version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
             frame_cap: 1,
+            message_payload_caps: &[],
             capability: ZAKURA_CAP_HEADER_SYNC,
             mode: StreamMode::Ordered,
         };
@@ -7365,6 +7386,7 @@ mod tests {
             kind: ZAKURA_STREAM_HEADER_SYNC,
             version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
             frame_cap: 1,
+            message_payload_caps: &[],
             capability: ZAKURA_CAP_HEADER_SYNC,
             mode: StreamMode::Ordered,
         }
@@ -7627,6 +7649,7 @@ mod tests {
             kind: stream_kind,
             version: ZAKURA_STREAM_VERSION_1,
             frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+            message_payload_caps: &[],
             capability: ZAKURA_CAP_DISCOVERY,
             mode: StreamMode::Ordered,
         };
@@ -7638,6 +7661,7 @@ mod tests {
             limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
             outbound_frame_cap: application_frame_cap(&limits, stream),
+            message_payload_caps: stream.message_payload_caps,
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
             connection_token: connection_token.clone(),
             stream_token: stream_token.clone(),
@@ -7808,6 +7832,7 @@ mod tests {
                 kind: stream_kind,
                 version: ZAKURA_STREAM_VERSION_1,
                 frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+                message_payload_caps: &[],
                 capability: ZAKURA_CAP_LEGACY_GOSSIP,
                 mode: StreamMode::Ordered,
             };
@@ -7819,6 +7844,7 @@ mod tests {
                 limits,
                 inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
                 outbound_frame_cap: application_frame_cap(&limits, stream),
+                message_payload_caps: stream.message_payload_caps,
                 message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
                     limits.message_rate_per_second,
                 ))),
@@ -7948,6 +7974,7 @@ mod tests {
             kind: DISCOVERY_STREAM_KIND,
             version: ZAKURA_STREAM_VERSION_1,
             frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+            message_payload_caps: &[],
             capability: ZAKURA_CAP_DISCOVERY,
             mode: StreamMode::Ordered,
         };
@@ -8121,6 +8148,7 @@ mod tests {
             kind: LEGACY_GOSSIP_STREAM_KIND,
             version: ZAKURA_STREAM_VERSION_1,
             frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+            message_payload_caps: &[],
             capability: ZAKURA_CAP_LEGACY_GOSSIP,
             mode: StreamMode::Ordered,
         };
@@ -8196,6 +8224,7 @@ mod tests {
         let rejected = read_frame(
             &mut s1_recv,
             inbound_cap,
+            &[],
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -8229,6 +8258,7 @@ mod tests {
         let allocated = read_frame(
             &mut s2_recv,
             raw_cap,
+            &[],
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -8267,6 +8297,7 @@ mod tests {
         let frame = read_frame(
             &mut s3_recv,
             inbound_cap,
+            &[],
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -8275,6 +8306,47 @@ mod tests {
         assert_eq!(
             frame.payload, valid_payload,
             "an in-cap frame payload must round-trip unchanged"
+        );
+
+        // Stream 4: a message-specific cap must reject the header before the
+        // absent payload can be allocated or read. The stream cap still permits
+        // this length, so only the typed cap can produce OversizeFrame.
+        const MESSAGE_PAYLOAD_CAPS: [MessagePayloadCap; 1] = [MessagePayloadCap {
+            message_type: 2,
+            max_payload_bytes: 9,
+        }];
+        let (mut typed_send, _typed_recv) = timeout(Duration::from_secs(1), conn_b.open_bi())
+            .await
+            .expect("client opens the typed-cap stream")?;
+        let mut typed_header = frame_header(10);
+        typed_header[..2].copy_from_slice(&2u16.to_le_bytes());
+        timeout(Duration::from_secs(1), typed_send.write_all(&typed_header))
+            .await
+            .expect("client writes the typed-cap frame header")?;
+        let _ = typed_send.finish();
+        let (_typed_server_send, mut typed_server_recv) =
+            timeout(Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("server accepts the typed-cap stream")
+                .expect("capture handler forwards the typed-cap stream");
+        let rejected = read_frame(
+            &mut typed_server_recv,
+            raw_cap,
+            &MESSAGE_PAYLOAD_CAPS,
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+        )
+        .await;
+        assert!(
+            matches!(
+                rejected,
+                Err(ZakuraHandlerError::OversizeFrame {
+                    payload_len: 10,
+                    max_frame_bytes: 17,
+                    ..
+                })
+            ),
+            "the message-specific cap must reject the frame from its header; got {rejected:?}"
         );
 
         conn_a.close(0u32.into(), b"done");
@@ -8438,6 +8510,7 @@ mod tests {
             kind: 42,
             version: ZAKURA_STREAM_VERSION_1,
             frame_cap: CUSTOM_FRAME_CAP,
+            message_payload_caps: &[],
             capability: 1 << 20,
             mode: StreamMode::RequestResponse,
         };
@@ -8511,6 +8584,7 @@ mod tests {
                     kind: LEGACY_GOSSIP_STREAM_KIND,
                     version: ZAKURA_STREAM_VERSION_1,
                     frame_cap: 1024,
+                    message_payload_caps: &[],
                     capability: ZAKURA_CAP_LEGACY_GOSSIP,
                     mode: StreamMode::Ordered,
                 },
@@ -8518,6 +8592,7 @@ mod tests {
                     kind: LEGACY_REQUEST_STREAM_KIND,
                     version: ZAKURA_STREAM_VERSION_1,
                     frame_cap: 1024,
+                    message_payload_caps: &[],
                     capability: ZAKURA_CAP_LEGACY_GOSSIP,
                     mode: StreamMode::RequestResponse,
                 },
@@ -8525,6 +8600,7 @@ mod tests {
                     kind: DISCOVERY_STREAM_KIND,
                     version: ZAKURA_STREAM_VERSION_1,
                     frame_cap: 1024,
+                    message_payload_caps: &[],
                     capability: ZAKURA_CAP_DISCOVERY,
                     mode: StreamMode::Ordered,
                 },
@@ -8532,6 +8608,7 @@ mod tests {
                     kind: HEADER_SYNC_STREAM_KIND,
                     version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
                     frame_cap: 1024,
+                    message_payload_caps: &[],
                     capability: ZAKURA_CAP_HEADER_SYNC,
                     mode: StreamMode::Ordered,
                 },
@@ -8539,6 +8616,7 @@ mod tests {
                     kind: ZAKURA_STREAM_BLOCK_SYNC,
                     version: ZAKURA_STREAM_VERSION_1,
                     frame_cap: MAX_BS_FRAME_BYTES,
+                    message_payload_caps: &[],
                     capability: crate::zakura::ZAKURA_CAP_BLOCK_SYNC,
                     mode: StreamMode::Ordered,
                 },

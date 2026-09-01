@@ -25,9 +25,10 @@ pub(crate) use pipe::{
     Node, NodeKind, Pipe, PipeCx, PipeShape,
 };
 pub use registry::{RegistryError, ServiceRegistry};
-pub(crate) use service::ServiceStream;
+pub(crate) use service::{message_payload_cap, ServiceStream};
 pub use service::{
-    BoxRunFuture, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
-    RequestResponseService, Service, Sink, SinkReject, Source, Stream, StreamMode,
+    BoxRunFuture, MessagePayloadCap, OrderedSessionDemand, OrderedStreamOpening,
+    OrderedStreamPolicy, Peer, RequestResponseService, Service, Sink, SinkReject, Source, Stream,
+    StreamMode,
 };
 pub use session::{OrderedSendError, PeerStreamSession};

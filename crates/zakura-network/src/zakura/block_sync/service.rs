@@ -1,9 +1,11 @@
-use super::{config::*, events::*, peer_registry::SessionAdmission, wire::*, *};
+use super::{
+    config::*, declaration::GET_BLOCKS, events::*, peer_registry::SessionAdmission, wire::*, *,
+};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError,
-    OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer, PeerStreamSession,
-    Service, ServicePeerSnapshot, SinkReject, Stream, StreamMode, ZakuraBlockSyncCandidateState,
-    ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, MessagePayloadCap,
+    OrderedSendError, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
+    PeerStreamSession, Service, ServicePeerSnapshot, SinkReject, Stream, StreamMode,
+    ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -21,10 +23,17 @@ pub const MAX_BS_FRAME_BYTES: u32 = {
     (MAX_BS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32
 };
 
+const BLOCK_SYNC_MESSAGE_PAYLOAD_CAPS: [MessagePayloadCap; 1] = [MessagePayloadCap {
+    // A one-byte message type always fits in the frame's u16 field.
+    message_type: MSG_BS_GET_BLOCKS as u16,
+    max_payload_bytes: GET_BLOCKS.payload_cap,
+}];
+
 const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_BLOCK_SYNC,
     version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
     frame_cap: MAX_BS_FRAME_BYTES,
+    message_payload_caps: &BLOCK_SYNC_MESSAGE_PAYLOAD_CAPS,
     capability: ZAKURA_CAP_BLOCK_SYNC,
     mode: StreamMode::Ordered,
 }];

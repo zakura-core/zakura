@@ -13386,6 +13386,80 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
     reactor_task.abort();
 }
 
+#[tokio::test]
+async fn failed_needed_block_query_retries_without_losing_newer_query_ownership() {
+    let best_header_tip = block::Height(10);
+    let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (best_header_tip, block::Hash([10; 32])),
+        tip_rx,
+        ZakuraBlockSyncConfig::default(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id: first_query_id,
+        scope,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup must query needed blocks");
+    };
+    handle
+        .send(BlockSyncEvent::NeededBlocksQueryFailed {
+            query_id: first_query_id,
+            scope,
+        })
+        .await
+        .expect("query failure queues");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), actions.recv())
+            .await
+            .is_err(),
+        "a failed state query must use the bounded retry delay",
+    );
+
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id: second_query_id,
+        scope: second_scope,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("the failed query must retry");
+    };
+    assert_ne!(first_query_id, second_query_id);
+    assert_eq!(scope, second_scope);
+
+    handle
+        .send(BlockSyncEvent::NeededBlocksQueryFailed {
+            query_id: first_query_id,
+            scope,
+        })
+        .await
+        .expect("stale failure queues");
+    handle
+        .send(BlockSyncEvent::NeededBlocksQueryFailed {
+            query_id: second_query_id,
+            scope: second_scope,
+        })
+        .await
+        .expect("current failure queues");
+
+    assert!(matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { query_id, .. }
+            if query_id != first_query_id && query_id != second_query_id
+    ));
+
+    reactor_task.abort();
+}
+
 /// The bounded-refill window must advance past the already-claimed heights rather
 /// than re-scanning from the download floor every time.
 ///

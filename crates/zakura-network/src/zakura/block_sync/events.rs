@@ -60,6 +60,13 @@ pub enum BlockSyncEvent {
         /// Header-known bodies missing under `scope`.
         blocks: Vec<BlockSyncBlockMeta>,
     },
+    /// Driver could not complete a body-missing metadata query.
+    NeededBlocksQueryFailed {
+        /// Reactor-local query identifier echoed by the driver.
+        query_id: NonZeroU64,
+        /// Durable generation and branch coordinates echoed from the query.
+        scope: zakura_header_chain::BodyWorkAuthority,
+    },
     /// Ownerless unit-test fixture for the pre-ownership scheduling surface.
     #[cfg(test)]
     NeededBlocks(Vec<BlockSyncBlockMeta>),

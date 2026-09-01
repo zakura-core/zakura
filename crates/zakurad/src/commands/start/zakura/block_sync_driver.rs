@@ -465,6 +465,11 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     }
                     Err(error) => {
                         trace.trace_needed_blocks_query_failed(&format!("{error}"), started);
+                        let _ = block_sync.send_control(BlockSyncEvent::NeededBlocksQueryFailed {
+                            query_id,
+                            scope,
+                        });
+                        trace.trace_block_reactor_event("needed_blocks_query_failed");
                         warn!(
                             ?from,
                             ?limit,

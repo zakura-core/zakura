@@ -1889,6 +1889,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_action_receiver_retains_exact_required_evidence() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, actions_rx) = mpsc::channel(1);
+        drop(actions_rx);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            body_rx,
+            control_rx,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            view_tx,
+            Duration::from_millis(20),
+            ZakuraTrace::noop(),
+        );
+
+        let rule: Arc<str> = Arc::from("test.retained_consensus_invalid");
+        let retained_rule = Arc::downgrade(&rule);
+        let action = BlockSyncAction::RecordBodyInvalid {
+            expected_version: zakura_header_chain::StateVersion::new(9),
+            invalid: zakura_header_chain::ConsensusBodyInvalid {
+                hash: block::Hash([0xa3; 32]),
+                evidence: zakura_header_chain::EvidenceId::from_digest([0xa4; 32]),
+                rule: zakura_header_chain::BodyRuleId::new(rule),
+                source: zakura_header_chain::SourceId::from_digest([0xa5; 32]),
+            },
+        };
+        let mut handoff = tokio::spawn(async move {
+            task.send_required_action(action).await;
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut handoff)
+                .await
+                .is_err(),
+            "a closed receiver must leave the required handoff fail-closed",
+        );
+        assert!(
+            retained_rule.upgrade().is_some(),
+            "the fail-closed handoff must retain the exact invalidity evidence",
+        );
+
+        handoff.abort();
+        let _ = handoff.await;
+        assert!(
+            retained_rule.upgrade().is_none(),
+            "supervision cancellation releases the retained evidence",
+        );
+    }
+
+    #[tokio::test]
     // IN-02: enumerate every commitment mismatch so each proves body-only
     // attribution while preserving the independently valid header.
     async fn each_commitment_mismatch_scores_only_body_delivery() {

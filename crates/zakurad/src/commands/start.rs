@@ -86,7 +86,7 @@ use color_eyre::eyre::{eyre, Report};
 use futures::FutureExt;
 use tokio::{
     pin, select,
-    sync::{oneshot, watch},
+    sync::{mpsc, oneshot, watch},
     task::{AbortHandle, JoinHandle},
 };
 use tokio_util::sync::CancellationToken;
@@ -117,6 +117,31 @@ use crate::{
     config::ZakuradConfig,
     prelude::*,
 };
+
+struct BlockSyncDriverExitGuard {
+    fatal_events: mpsc::UnboundedSender<()>,
+    shutdown: CancellationToken,
+}
+
+impl Drop for BlockSyncDriverExitGuard {
+    fn drop(&mut self) {
+        if !self.shutdown.is_cancelled() {
+            let _ = self.fatal_events.send(());
+        }
+    }
+}
+
+async fn supervise_block_sync_driver(
+    driver: impl std::future::Future<Output = ()>,
+    fatal_events: mpsc::UnboundedSender<()>,
+    shutdown: CancellationToken,
+) {
+    let _exit_guard = BlockSyncDriverExitGuard {
+        fatal_events,
+        shutdown,
+    };
+    driver.await;
+}
 
 #[cfg(feature = "internal-miner")]
 use crate::components;
@@ -527,6 +552,7 @@ impl StartCmd {
             Some(endpoint) => endpoint.take_header_sync_fatal_events().await,
             None => None,
         };
+        let mut block_sync_fatal_events = None;
 
         // Not added to node_tasks, because it must outlive start() being dropped to shutdown the
         // endpoint
@@ -564,25 +590,32 @@ impl StartCmd {
                     endpoint.block_sync(),
                     endpoint.take_block_sync_actions().await,
                 ) {
+                    let (block_sync_fatal_tx, block_sync_fatal_rx) = mpsc::unbounded_channel();
+                    block_sync_fatal_events = Some(block_sync_fatal_rx);
+                    let block_driver_shutdown = shutdown.clone();
                     let block_driver_task = tokio::spawn(
-                        drive_block_sync_actions(
-                            block_actions,
-                            endpoint.supervisor(),
-                            Some(endpoint.clone()),
-                            block_sync.clone(),
-                            latest_chain_tip.clone(),
-                            read_only_state_service.clone(),
-                            Some(tower::util::BoxCloneService::new(state.clone())),
-                            Some(header_chain_body_evidence.clone()),
-                            block_verifier_router.clone(),
-                            max_checkpoint_height,
-                            config.sync.checkpoint_verify_concurrency_limit,
-                            config.sync.full_verify_concurrency_limit,
-                            config.sync.zakura_block_apply_concurrency_limit,
-                            trace.clone(),
-                            blocksync_throughput_probe.clone(),
-                            zakura_block_sync_handoff.clone(),
-                            shutdown.clone().cancelled_owned(),
+                        supervise_block_sync_driver(
+                            drive_block_sync_actions(
+                                block_actions,
+                                endpoint.supervisor(),
+                                Some(endpoint.clone()),
+                                block_sync.clone(),
+                                latest_chain_tip.clone(),
+                                read_only_state_service.clone(),
+                                Some(tower::util::BoxCloneService::new(state.clone())),
+                                Some(header_chain_body_evidence.clone()),
+                                block_verifier_router.clone(),
+                                max_checkpoint_height,
+                                config.sync.checkpoint_verify_concurrency_limit,
+                                config.sync.full_verify_concurrency_limit,
+                                config.sync.zakura_block_apply_concurrency_limit,
+                                trace.clone(),
+                                blocksync_throughput_probe.clone(),
+                                zakura_block_sync_handoff.clone(),
+                                shutdown.clone().cancelled_owned(),
+                            ),
+                            block_sync_fatal_tx,
+                            block_driver_shutdown,
                         )
                         .in_current_span(),
                     );
@@ -954,6 +987,20 @@ impl StartCmd {
                     }
                 },
 
+                block_sync_fatal_event = async {
+                    match block_sync_fatal_events.as_mut() {
+                        Some(events) => events.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match block_sync_fatal_event {
+                    Some(()) => Self::handle_block_sync_driver_exit(&shutdown),
+                    None => {
+                        block_sync_fatal_events = None;
+                        exit_when_task_finishes = false;
+                        Ok(())
+                    }
+                },
+
                 rpc_join_result = &mut rpc_task_handle => {
                     let rpc_server_result = rpc_join_result
                         .expect("unexpected panic in the rpc task");
@@ -1168,6 +1215,13 @@ impl StartCmd {
         Err(eyre!(event))
     }
 
+    fn handle_block_sync_driver_exit(shutdown: &CancellationToken) -> Result<(), Report> {
+        shutdown.cancel();
+        Err(eyre!(
+            "critical Zakura block-sync driver exited unexpectedly"
+        ))
+    }
+
     /// Returns the bound for the state service buffer,
     /// based on the configurations of the services that use the state concurrently.
     fn state_buffer_bound(config: &ZakuradConfig) -> usize {
@@ -1286,7 +1340,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use zakura_chain::block;
 
-    use super::StartCmd;
+    use super::{supervise_block_sync_driver, StartCmd};
     use crate::components::zcashd_compat;
     use crate::config::ZakuradConfig;
     use zakura_network::types::PeerServices;
@@ -1647,6 +1701,24 @@ mod tests {
 
         assert!(shutdown.is_cancelled(), "the node starts normal shutdown");
         assert!(error.to_string().contains("VCT local apply operation"));
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_exit_returns_an_error_and_starts_shutdown() {
+        let shutdown = CancellationToken::new();
+        let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        supervise_block_sync_driver(async {}, fatal_tx, shutdown.clone()).await;
+        fatal_rx
+            .recv()
+            .await
+            .expect("an unexpected driver exit must notify the node root");
+
+        let error = StartCmd::handle_block_sync_driver_exit(&shutdown)
+            .expect_err("a critical block-sync driver exit must stop the node");
+
+        assert!(shutdown.is_cancelled(), "the node starts normal shutdown");
+        assert!(error.to_string().contains("block-sync driver exited"));
     }
 }
 

@@ -1720,6 +1720,41 @@ mod tests {
         assert!(shutdown.is_cancelled(), "the node starts normal shutdown");
         assert!(error.to_string().contains("block-sync driver exited"));
     }
+
+    #[tokio::test]
+    async fn block_sync_driver_panic_notifies_the_node_root() {
+        let shutdown = CancellationToken::new();
+        let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let driver = tokio::spawn(supervise_block_sync_driver(
+            async { panic!("simulated block-sync driver panic") },
+            fatal_tx,
+            shutdown,
+        ));
+
+        fatal_rx
+            .recv()
+            .await
+            .expect("a driver panic must notify the node root");
+        let error = driver
+            .await
+            .expect_err("the simulated driver panic propagates");
+        assert!(error.is_panic(), "the driver task reports a panic");
+    }
+
+    #[tokio::test]
+    async fn requested_shutdown_suppresses_block_sync_driver_fatal_event() {
+        let shutdown = CancellationToken::new();
+        let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+        shutdown.cancel();
+
+        supervise_block_sync_driver(async {}, fatal_tx, shutdown).await;
+
+        assert_eq!(
+            fatal_rx.recv().await,
+            None,
+            "requested shutdown closes the channel without a fatal event",
+        );
+    }
 }
 
 #[cfg(test)]

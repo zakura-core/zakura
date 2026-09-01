@@ -16,7 +16,10 @@ use rand::{
 use zakura_chain::{
     amount::{self, Amount},
     block::{Height, MAX_BLOCK_BYTES},
-    parameters::Network,
+    parameters::{
+        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT,
+        SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
+    },
     serialization::{CompactSizeMessage, TrustedPreallocate, ZcashDeserializeInto, ZcashSerialize},
     transaction::{self, zip317::BLOCK_UNPAID_ACTION_LIMIT, VerifiedUnminedTx},
     work::equihash::Solution,
@@ -131,18 +134,7 @@ pub fn select_mempool_transactions(
     let mut selected_txs = Vec::new();
 
     // Set up limit tracking
-    let max_block_bytes: usize = MAX_BLOCK_BYTES.try_into().expect("fits in memory");
-    let reserved_block_bytes = block_template_overhead_bytes(net)
-        .checked_add(max_coinbase_bytes(&fake_coinbase_tx))
-        .expect("block template byte reservation fits in memory");
-    let mut remaining_block_bytes = max_block_bytes
-        .checked_sub(reserved_block_bytes)
-        .expect("the fake coinbase and block overhead fit in a block");
-    let mut remaining_block_sigops = MAX_BLOCK_SIGOPS;
-    let mut remaining_block_unpaid_actions: u32 = BLOCK_UNPAID_ACTION_LIMIT;
-
-    // Adjust the sigop limit based on the coinbase transaction.
-    remaining_block_sigops -= fake_coinbase_tx.sigops;
+    let mut limits = BlockTemplateLimits::initial(net, height, &fake_coinbase_tx);
 
     // > Repeat while there is any candidate transaction
     // > that pays at least the conventional fee:
@@ -155,11 +147,7 @@ pub fn select_mempool_transactions(
             tx_weights,
             &mut selected_txs,
             &mempool_tx_deps,
-            &mut remaining_block_bytes,
-            &mut remaining_block_sigops,
-            // The number of unpaid actions is always zero for transactions that pay the
-            // conventional fee, so this check and limit is effectively ignored.
-            &mut remaining_block_unpaid_actions,
+            &mut limits,
         );
     }
 
@@ -173,9 +161,7 @@ pub fn select_mempool_transactions(
             tx_weights,
             &mut selected_txs,
             &mempool_tx_deps,
-            &mut remaining_block_bytes,
-            &mut remaining_block_sigops,
-            &mut remaining_block_unpaid_actions,
+            &mut limits,
         );
     }
 
@@ -267,20 +253,14 @@ fn checked_add_transaction_weighted_random(
     tx_weights: WeightedIndex<f32>,
     selected_txs: &mut Vec<SelectedMempoolTx>,
     mempool_tx_deps: &TransactionDependencies,
-    remaining_block_bytes: &mut usize,
-    remaining_block_sigops: &mut u32,
-    remaining_block_unpaid_actions: &mut u32,
+    limits: &mut BlockTemplateLimits,
 ) -> Option<WeightedIndex<f32>> {
     // > Pick one of those transactions at random with probability in direct proportion
     // > to its weight_ratio, and remove it from the set of candidate transactions
     let (new_tx_weights, candidate_tx) =
         choose_transaction_weighted_random(candidate_txs, tx_weights);
 
-    if !candidate_tx.try_update_block_template_limits(
-        remaining_block_bytes,
-        remaining_block_sigops,
-        remaining_block_unpaid_actions,
-    ) {
+    if !limits.try_add(&candidate_tx) {
         return new_tx_weights;
     }
 
@@ -321,11 +301,7 @@ fn checked_add_transaction_weighted_random(
                     continue;
                 }
 
-                if !candidate_tx.try_update_block_template_limits(
-                    remaining_block_bytes,
-                    remaining_block_sigops,
-                    remaining_block_unpaid_actions,
-                ) {
+                if !limits.try_add(&candidate_tx) {
                     continue;
                 }
 
@@ -348,52 +324,104 @@ fn checked_add_transaction_weighted_random(
     new_tx_weights
 }
 
-trait TryUpdateBlockLimits {
-    /// Checks if a transaction fits within the provided remaining block bytes,
-    /// sigops, and unpaid actions limits.
-    ///
-    /// Updates the limits and returns true if the transaction does fit, or
-    /// returns false otherwise.
-    fn try_update_block_template_limits(
-        &self,
-        remaining_block_bytes: &mut usize,
-        remaining_block_sigops: &mut u32,
-        remaining_block_unpaid_actions: &mut u32,
-    ) -> bool;
+/// Tracks the remaining capacity of a block template against every limit a
+/// candidate mempool transaction can exhaust: the ZIP-317 byte, sigop, and
+/// unpaid-action limits, and, once ZIP 218 is active, the per-pool shielded
+/// action limits and the global shielded budget.
+///
+/// The shielded fields start at [`u32::MAX`] while ZIP 218 is inactive, so the
+/// new limits have no effect on those templates.
+struct BlockTemplateLimits {
+    remaining_bytes: usize,
+    remaining_sigops: u32,
+    remaining_unpaid_actions: u32,
+    remaining_orchard_actions: u32,
+    remaining_sapling_ios: u32,
+    remaining_sprout_joinsplits: u32,
+    remaining_shielded_cost: u32,
 }
 
-impl TryUpdateBlockLimits for VerifiedUnminedTx {
-    fn try_update_block_template_limits(
-        &self,
-        remaining_block_bytes: &mut usize,
-        remaining_block_sigops: &mut u32,
-        remaining_block_unpaid_actions: &mut u32,
-    ) -> bool {
-        // > If the block template with this transaction included
-        // > would be within the block size limit and block sigop limit,
-        // > and block_unpaid_actions <=  block_unpaid_action_limit,
-        // > add the transaction to the block template
-        //
-        // Unpaid actions are always zero for transactions that pay the conventional fee, so the
-        // unpaid action check always passes for those transactions. Use the full block-level sigop
-        // count (legacy + P2SH) so template selection cannot produce blocks that the block verifier
-        // would reject for exceeding `MAX_BLOCK_SIGOPS`.
-        let tx_block_sigops = self.block_sigop_count();
-        if self.transaction.size() <= *remaining_block_bytes
-            && tx_block_sigops <= *remaining_block_sigops
-            && self.unpaid_actions <= *remaining_block_unpaid_actions
-        {
-            *remaining_block_bytes -= self.transaction.size();
-            *remaining_block_sigops -= tx_block_sigops;
+impl BlockTemplateLimits {
+    /// Returns the initial limits for a block template at `height`, with the
+    /// block overhead and `fake_coinbase_tx` already deducted from the byte and
+    /// sigop limits.
+    fn initial(
+        network: &Network,
+        height: Height,
+        fake_coinbase_tx: &TransactionTemplate<amount::NegativeOrZero>,
+    ) -> Self {
+        let (orchard_actions, sapling_ios, sprout_joinsplits, shielded_cost) =
+            if NetworkUpgrade::is_zip218_active(network, height) {
+                (
+                    ORCHARD_BLOCK_ACTION_LIMIT,
+                    SAPLING_BLOCK_IO_LIMIT,
+                    SPROUT_BLOCK_JOINSPLIT_LIMIT,
+                    GLOBAL_SHIELDED_BUDGET,
+                )
+            } else {
+                (u32::MAX, u32::MAX, u32::MAX, u32::MAX)
+            };
 
-            // Unpaid actions are always zero for transactions that pay the conventional fee,
-            // so this limit always remains the same after they are added.
-            *remaining_block_unpaid_actions -= self.unpaid_actions;
+        let max_block_bytes: usize = MAX_BLOCK_BYTES.try_into().expect("fits in memory");
+        let reserved_block_bytes = block_template_overhead_bytes(network)
+            .checked_add(max_coinbase_bytes(fake_coinbase_tx))
+            .expect("block template byte reservation fits in memory");
 
-            true
-        } else {
-            false
+        Self {
+            remaining_bytes: max_block_bytes
+                .checked_sub(reserved_block_bytes)
+                .expect("the fake coinbase and block overhead fit in a block"),
+            remaining_sigops: MAX_BLOCK_SIGOPS - fake_coinbase_tx.sigops,
+            remaining_unpaid_actions: BLOCK_UNPAID_ACTION_LIMIT,
+            remaining_orchard_actions: orchard_actions,
+            remaining_sapling_ios: sapling_ios,
+            remaining_sprout_joinsplits: sprout_joinsplits,
+            remaining_shielded_cost: shielded_cost,
         }
+    }
+
+    /// Adds `tx` to the block template and returns `true` if it fits within
+    /// every remaining limit. Otherwise leaves `self` unchanged and returns
+    /// `false`.
+    ///
+    /// > If the block template with this transaction included
+    /// > would be within the block size limit and block sigop limit,
+    /// > and block_unpaid_actions <= block_unpaid_action_limit,
+    /// > add the transaction to the block template
+    ///
+    /// Unpaid actions are always zero for transactions that pay the conventional
+    /// fee, so the unpaid action check always passes for those transactions. The
+    /// sigop count is the full block-level count (legacy + P2SH), so template
+    /// selection cannot produce blocks the block verifier would reject for
+    /// exceeding `MAX_BLOCK_SIGOPS`. The shielded counts come from the same
+    /// [`ShieldedActionCounts`](zakura_chain::transaction::ShieldedActionCounts)
+    /// the block verifier sums, so a template cannot exceed the ZIP 218 limits
+    /// either.
+    fn try_add(&mut self, tx: &VerifiedUnminedTx) -> bool {
+        let counts = tx.transaction.transaction().shielded_action_counts();
+        let cost = counts.cost();
+        let tx_block_sigops = tx.block_sigop_count();
+
+        if tx.transaction.size() > self.remaining_bytes
+            || tx_block_sigops > self.remaining_sigops
+            || tx.unpaid_actions > self.remaining_unpaid_actions
+            || counts.orchard_actions > self.remaining_orchard_actions
+            || counts.sapling_ios > self.remaining_sapling_ios
+            || counts.sprout_joinsplits > self.remaining_sprout_joinsplits
+            || cost > self.remaining_shielded_cost
+        {
+            return false;
+        }
+
+        self.remaining_bytes -= tx.transaction.size();
+        self.remaining_sigops -= tx_block_sigops;
+        self.remaining_unpaid_actions -= tx.unpaid_actions;
+        self.remaining_orchard_actions -= counts.orchard_actions;
+        self.remaining_sapling_ios -= counts.sapling_ios;
+        self.remaining_sprout_joinsplits -= counts.sprout_joinsplits;
+        self.remaining_shielded_cost -= cost;
+
+        true
     }
 }
 

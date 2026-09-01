@@ -12,6 +12,12 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
+
+# ZIP 218 "25-second Block Target Spacing" consensus rules, dormant until NU7 activates.
+zip218 = [
+    "zakura-chain/zip218",
+]
+
 fuzz-impl = []
 test-support = []
 

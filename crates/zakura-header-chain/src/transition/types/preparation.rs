@@ -372,7 +372,16 @@ mod tests {
     #[test]
     fn validation_lease_coherence_enforces_context_boundaries() {
         let network = Network::new_regtest(RegtestParameters::default());
-        for (height, expected_len) in [(0, 1), (27, 28), (28, 28), (40, 28)] {
+        // A lease retains every predecessor below the difficulty adjustment
+        // span, and caps at the span above it.
+        let span = crate::POW_ADJUSTMENT_BLOCK_SPAN;
+        let span_height = u32::try_from(span).expect("the difficulty adjustment span fits in u32");
+        for (height, expected_len) in [
+            (0, 1),
+            (span_height - 1, span),
+            (span_height, span),
+            (span_height + 12, span),
+        ] {
             let lease = lease_at(height);
             assert_eq!(lease.predecessors.len(), expected_len, "height {height}");
             assert!(

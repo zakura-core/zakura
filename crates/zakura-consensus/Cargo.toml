@@ -22,6 +22,13 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
+# ZIP 218 "25-second Block Target Spacing" consensus rules, dormant until NU7 activates.
+zip218 = [
+    "zakura-chain/zip218",
+    "zakura-state/zip218",
+    "zakura-header-chain/zip218",
+]
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 progress-bar = [

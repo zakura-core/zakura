@@ -758,7 +758,7 @@ impl SequencerTask {
         if let zakura_header_chain::BodyVerificationOutcome::Retryable(failure) =
             outcome.verification()
         {
-            self.send_action(BlockSyncAction::RecordBodyUnavailable {
+            self.send_required_action(BlockSyncAction::RecordBodyUnavailable {
                 expected_version: semantic_state_version,
                 failure: *failure,
             })
@@ -1068,13 +1068,14 @@ impl SequencerTask {
         }
     }
 
-    /// Retain a consensus-critical action until the driver accepts it.
+    /// Retain a durability-relevant action until the driver accepts it.
     ///
     /// A bounded timeout is correct for replaceable submissions and telemetry.
-    /// It is not correct for deterministic invalidity. Waiting on the bounded
-    /// channel gives this sender FIFO capacity ahead of later peer-serving
-    /// `try_send` calls. A closed receiver leaves this future fail-closed with
-    /// the exact action retained until subsystem supervision cancels the task.
+    /// It is not correct for deterministic invalidity or the latest retry state.
+    /// Waiting on the bounded channel gives this sender FIFO capacity ahead of
+    /// later peer-serving `try_send` calls. A closed receiver leaves this future
+    /// fail-closed with the exact action retained until subsystem supervision
+    /// cancels the task.
     async fn send_required_action(&self, action: BlockSyncAction) {
         let action_label = action.metric_label();
         if let Err(error) = self.actions.send(action).await {
@@ -1087,8 +1088,9 @@ impl SequencerTask {
                 action = action_label,
                 "required block-sync action receiver closed"
             );
-            let _retained_action = error.0;
+            let retained_action = error.0;
             std::future::pending::<()>().await;
+            drop(retained_action);
         }
     }
 
@@ -1771,6 +1773,119 @@ mod tests {
                 ..
             }) if actual == invalid
         ));
+    }
+
+    #[tokio::test]
+    async fn retryable_evidence_waits_for_action_capacity() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, mut actions_rx) = mpsc::channel(1);
+        let action_sender = actions.clone();
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_millis(20),
+            ZakuraTrace::noop(),
+        );
+
+        let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.submit_pending_blocks().await;
+        let BlockSyncAction::SubmitBlock {
+            owner,
+            source,
+            token,
+            block,
+        } = actions_rx.recv().await.expect("body is submitted")
+        else {
+            panic!("expected a body submission");
+        };
+        let height = block.coinbase_height().expect("test block has height");
+        let hash = block.hash();
+        let mut outcome = BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
+            hash,
+            evidence: zakura_header_chain::EvidenceId::from_digest([0xa2; 32]),
+            kind: zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
+            availability: zakura_header_chain::BodyUnavailableSummary::default(),
+        });
+
+        action_sender
+            .send(BlockSyncAction::Misbehavior {
+                peer: ZakuraPeerId::new(vec![0xee; 32])
+                    .expect("the filler peer ID has the required length"),
+                reason: BlockSyncMisbehavior::InvalidBlock,
+            })
+            .await
+            .expect("the filler occupies the action channel");
+        let completion = tokio::spawn(async move {
+            let result = task
+                .handle_apply_finished(
+                    owner,
+                    source,
+                    token,
+                    height,
+                    hash,
+                    &mut outcome,
+                    BTreeSet::new(),
+                    None,
+                    Some((owner, zakura_header_chain::StateVersion::new(8))),
+                )
+                .await;
+            (task, result)
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !completion.is_finished(),
+            "retry state must remain pending after the ordinary action timeout",
+        );
+        assert!(matches!(
+            actions_rx.recv().await,
+            Some(BlockSyncAction::Misbehavior {
+                reason: BlockSyncMisbehavior::InvalidBlock,
+                ..
+            })
+        ));
+        assert!(matches!(
+            actions_rx.recv().await,
+            Some(BlockSyncAction::RecordBodyUnavailable {
+                expected_version,
+                failure,
+            }) if expected_version == zakura_header_chain::StateVersion::new(8)
+                && failure.hash == hash
+                && failure.evidence
+                    == zakura_header_chain::EvidenceId::from_digest([0xa2; 32])
+                && failure.kind
+                    == zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable
+        ));
+
+        let (task, result) = completion.await.expect("the sequencer task does not panic");
+        assert_eq!(result, (true, true));
+        assert!(
+            !task.sequencer.applying_contains(height),
+            "the sequencer retires the body only after it hands off retry state",
+        );
     }
 
     #[tokio::test]

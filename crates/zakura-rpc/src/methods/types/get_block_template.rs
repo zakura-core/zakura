@@ -328,8 +328,18 @@ impl BlockTemplateResponse {
             .expect("mempool tx fees must be non-negative");
 
         let coinbase_txn = precomputed_coinbase.unwrap_or_else(|| {
-            TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                .expect("valid coinbase tx")
+            // ZIP 234 derives the subsidy from the money reserve after the parent, which
+            // is the chain tip this template builds on.
+            let money_reserve = chain_info.value_pools.money_reserve();
+
+            TransactionTemplate::new_coinbase(
+                net,
+                height,
+                miner_params,
+                txs_fee,
+                Some(money_reserve),
+            )
+            .expect("valid coinbase tx")
         });
 
         let default_roots = DefaultRoots::from_coinbase(

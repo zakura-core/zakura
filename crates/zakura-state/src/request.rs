@@ -1244,6 +1244,16 @@ pub enum Request {
     /// [`block::Height`] using `.into()`.
     Block(HashOrHeight),
 
+    /// Looks up the [`BlockInfo`] of a block by hash or height, in any non-finalized
+    /// chain, falling back to the finalized state.
+    ///
+    /// Returns
+    ///
+    /// * [`Response::BlockInfo(Some(block_info))`](Response::BlockInfo) if the block is
+    ///   in any chain;
+    /// * [`Response::BlockInfo(None)`](Response::BlockInfo) otherwise.
+    BlockInfo(HashOrHeight),
+
     /// Looks up a block by hash in any current chain or by height in the current best chain.
     ///
     /// Returns
@@ -1408,6 +1418,7 @@ impl Request {
             Request::Transaction(_) => "transaction",
             Request::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
             Request::Block(_) => "block",
+            Request::BlockInfo(_) => "block_info",
             Request::AnyChainBlock(_) => "any_chain_block",
             Request::BlockHeader(_) => "block_header",
             Request::FindBlockHashes { .. } => "find_block_hashes",
@@ -2018,6 +2029,7 @@ impl TryFrom<Request> for ReadRequest {
             Request::BestChainBlockHash(hash) => Ok(ReadRequest::BestChainBlockHash(hash)),
 
             Request::Block(hash_or_height) => Ok(ReadRequest::Block(hash_or_height)),
+            Request::BlockInfo(hash_or_height) => Ok(ReadRequest::BlockInfo(hash_or_height)),
             Request::AnyChainBlock(hash_or_height) => {
                 Ok(ReadRequest::AnyChainBlock(hash_or_height))
             }

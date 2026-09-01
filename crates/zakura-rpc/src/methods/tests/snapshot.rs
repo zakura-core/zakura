@@ -1174,6 +1174,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
                 .expect_request_that(|req| matches!(req, ReadRequest::ChainInfo))
                 .await
                 .respond(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                    value_pools: Default::default(),
                     expected_difficulty: fake_difficulty,
                     tip_height: fake_tip_height,
                     tip_hash: fake_tip_hash,

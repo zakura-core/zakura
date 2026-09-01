@@ -65,7 +65,7 @@ use zakura_chain::{
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
     parameters::{
         subsidy::{
-            block_subsidy, founders_reward, funding_stream_values, miner_subsidy,
+            block_subsidy, founders_reward, funding_stream_values, is_zip234_active, miner_subsidy,
             FundingStreamReceiver,
         },
         ConsensusBranchId, Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING,
@@ -2691,8 +2691,14 @@ where
                 // when the tip changes.
                 let precompute_coinbase = |network, height, params| {
                     tokio::task::spawn_blocking(move || {
-                        TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
-                            .expect("valid coinbase tx")
+                        TransactionTemplate::new_coinbase(
+                            &network,
+                            height,
+                            &params,
+                            Amount::zero(),
+                            None,
+                        )
+                        .expect("valid coinbase tx")
                     })
                 };
 
@@ -3113,7 +3119,31 @@ where
             None => best_chain_tip_height(&self.latest_chain_tip)?,
         };
 
-        let subsidy = block_subsidy(height, &net).map_misc_error()?;
+        // ZIP 234 derives the block subsidy from the money reserve after the parent
+        // block, so look the parent's chain value pools up when the rules apply.
+        let money_reserve = if is_zip234_active(&net, height) {
+            let parent = height.previous().map_misc_error()?;
+
+            let zakura_state::ReadResponse::BlockInfo(parent_info) = call_service(
+                self.read_state.clone(),
+                zakura_state::ReadRequest::BlockInfo(parent.into()),
+            )
+            .await?
+            else {
+                unreachable!("unmatched response to a BlockInfo request");
+            };
+
+            Some(
+                parent_info
+                    .ok_or_misc_error("parent block is not in any chain")?
+                    .value_pools()
+                    .money_reserve(),
+            )
+        } else {
+            None
+        };
+
+        let subsidy = block_subsidy(height, &net, money_reserve).map_misc_error()?;
 
         let (lockbox_streams, mut funding_streams): (Vec<_>, Vec<_>) =
             funding_stream_values(height, &net, subsidy)

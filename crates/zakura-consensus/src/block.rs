@@ -328,8 +328,39 @@ where
 
             check::shielded_action_limits_are_valid(&block.transactions, height, &network)?;
 
+            // ZIP 234 derives the block subsidy from the money reserve after the parent
+            // block, so a block at or above the start height needs its parent's chain
+            // value pools. Fetching them is a state round trip, so only do it where the
+            // rules apply.
+            let money_reserve =
+                if zakura_chain::parameters::subsidy::is_zip234_active(&network, height) {
+                    let parent_hash = block.header.previous_block_hash;
+
+                    let zs::Response::BlockInfo(parent_info) = state_service
+                        .ready()
+                        .await
+                        .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                        .call(zs::Request::BlockInfo(parent_hash.into()))
+                        .await
+                        .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                    else {
+                        unreachable!("wrong response to Request::BlockInfo");
+                    };
+
+                    let parent_info = parent_info.ok_or_else(|| {
+                        BlockError::Other(format!(
+                            "parent block {parent_hash:?} of {hash:?} is in no chain, \
+                             so the ZIP 234 money reserve is unknown"
+                        ))
+                    })?;
+
+                    Some(parent_info.value_pools().money_reserve())
+                } else {
+                    None
+                };
+
             let expected_block_subsidy =
-                zakura_chain::parameters::subsidy::block_subsidy(height, &network)?;
+                zakura_chain::parameters::subsidy::block_subsidy(height, &network, money_reserve)?;
 
             // See [ZIP-1015](https://zips.z.cash/zip-1015).
             let deferred_pool_balance_change =

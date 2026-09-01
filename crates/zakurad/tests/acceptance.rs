@@ -3876,6 +3876,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         Height(block_template.height()),
         &miner_params,
         Amount::zero(),
+        None,
     )
     .expect("coinbase transaction should be valid under the given parameters");
 
@@ -3941,6 +3942,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         Height(block_template.height()),
         &miner_params,
         Amount::zero(),
+        None,
     )
     .expect("coinbase transaction should be valid under the given parameters");
 

@@ -20,6 +20,13 @@ const ACTION_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// misbehavior actions.
 const BS_ACTION_SPARE_POOL: usize = 128;
 
+/// Action slots that peer serving cannot consume.
+///
+/// The Sequencer's submission bound accounts for its data-plane actions. This
+/// reservation protects a reactor-local needed-body refill from an untrusted
+/// `GetBlocks` flood that occupies the spare pool.
+const BS_ACTION_CONTROL_RESERVE: usize = 1;
+
 /// Bound on the shared routine→reactor channel (status-advertise / serve /
 /// re-query / serving-misbehavior). Sized generously so a transient burst of
 /// per-peer events never makes a routine's `try_send` drop a serving/status
@@ -378,10 +385,9 @@ impl BlockSyncReactor {
         let mut header_tip_open = header_tip.is_some();
         let mut committed_views = self.startup.committed_views.clone();
         set_block_reactor_active_connection_gauge(self.state.peers.len());
-        // Metrics/trace snapshot cadence only. Per-peer request timeouts are owned
-        // by the routines (each sleeps to its own earliest deadline), so this timer
-        // no longer drives any timeout; it reuses `request_timeout` purely as a
-        // reasonable periodic refresh interval.
+        // Per-peer request timeouts are owned by the routines. This local tick
+        // also retries the level-triggered needed-body query, so a lost routine
+        // notification or a full action queue cannot consume the refill need.
         let mut metrics_ticks = time::interval(self.startup.config.request_timeout);
         let mut status_ticks = time::interval(
             self.startup
@@ -479,6 +485,7 @@ impl BlockSyncReactor {
                     }
                 }
                 _ = metrics_ticks.tick() => {
+                    self.query_needed_blocks().await;
                     self.publish_metrics();
                     self.refresh_throughput();
                     self.trace_sync_state(true);
@@ -2281,6 +2288,16 @@ impl BlockSyncReactor {
     /// accepted.
     fn dispatch_action(&self, action: BlockSyncAction) -> bool {
         let action_label = action.metric_label();
+        if matches!(action, BlockSyncAction::QueryBlocksByHeightRange { .. })
+            && self.actions.capacity() <= BS_ACTION_CONTROL_RESERVE
+        {
+            metrics::counter!(
+                "sync.block.action.control_capacity_reserved",
+                "action" => action_label
+            )
+            .increment(1);
+            return false;
+        }
         let queue_depth = self
             .actions
             .max_capacity()

@@ -126,10 +126,10 @@ zcash_protocol = { workspace = true }
 zcash_script = { workspace = true }
 zcash_transparent = { workspace = true }
 
-zakura-chain = { path = "../zakura-chain", version = "6.1.0", features = [
+zakura-chain = { path = "../zakura-chain", version = "7.0.0", features = [
     "json-conversion",
 ] }
-zakura-consensus = { path = "../zakura-consensus", version = "8.0.0" }
+zakura-consensus = { path = "../zakura-consensus", version = "9.0.0" }
 zakura-network = { path = "../zakura-network", version = "7.0.1" }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.2", features = [
     "rpc-client",
@@ -153,10 +153,10 @@ proptest = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-chain = { path = "../zakura-chain", version = "6.1.0", features = [
+zakura-chain = { path = "../zakura-chain", version = "7.0.0", features = [
     "proptest-impl",
 ] }
-zakura-consensus = { path = "../zakura-consensus", version = "8.0.0", features = [
+zakura-consensus = { path = "../zakura-consensus", version = "9.0.0", features = [
     "proptest-impl",
 ] }
 zakura-network = { path = "../zakura-network", version = "7.0.1", features = [

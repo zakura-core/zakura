@@ -273,23 +273,19 @@ pub const ZIP218_ENABLED: bool = cfg!(feature = "zip218");
 ///
 /// ZIP 233 adds the `zip233Amount` field to the v6 transaction format, which removes
 /// value from circulation. The field changes the v6 wire format and the ZIP 244 header
-/// digest, so a build with this feature disabled parses, serializes, and hashes v6
+/// digest, so a build with this constant false parses, serializes, and hashes v6
 /// transactions exactly as before, and every transaction has a `zip233_amount` of zero.
 ///
-/// The rules are still dormant until NU7 activates on the configured network.
+/// The matching `zakura-primitives` code, which parses and hashes the field on the
+/// `librustzcash` side, is gated on its own `zip-233` feature *and* on the
+/// `zcash_unstable = "nu7"` cfg, which no cargo feature can set on a dependency. This
+/// constant requires the same cfg, so the two sides are on and off together and cannot
+/// disagree about the v6 wire format. A `zip233` build without
+/// `RUSTFLAGS='--cfg zcash_unstable="nu7"'` therefore follows today's consensus rather
+/// than half of ZIP 233.
 ///
-/// Enabled by the `zip233` feature.
-pub const ZIP233_ENABLED: bool = cfg!(feature = "zip233");
-
-// The `zip233` feature only reaches the matching `zakura-primitives` code, which parses
-// and hashes the field on the `librustzcash` side, when the build also sets the
-// `zcash_unstable = "nu7"` cfg. Without it the two sides disagree on the v6 wire format,
-// which would be a consensus split rather than a compile error, so fail the build here.
-#[cfg(all(feature = "zip233", not(zcash_unstable = "nu7")))]
-compile_error!(
-    "the `zip233` feature needs RUSTFLAGS='--cfg zcash_unstable=\"nu7\"' so that \
-     `zakura-primitives` compiles its matching ZIP 233 code"
-);
+/// The rules are still dormant until NU7 activates on the configured network.
+pub const ZIP233_ENABLED: bool = cfg!(feature = "zip233") && cfg!(zcash_unstable = "nu7");
 
 /// The target block spacing after NU7 activation, in seconds.
 ///

@@ -1,6 +1,6 @@
 [package]
 name = "zakura-chain"
-version = "6.1.0"
+version = "7.0.0"
 authors.workspace = true
 description = "Core Zcash data structures for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -32,9 +32,11 @@ zip218 = []
 # ZIP 233 "Network Sustainability Mechanism: Removing Funds From Circulation": the
 # `zip233Amount` field on v6 transactions, which removes value from circulation.
 #
-# The field changes the v6 transaction format and the ZIP 244 header digest, so this
-# feature also needs `RUSTFLAGS='--cfg zcash_unstable="nu7"'` to reach the matching code
-# in `zakura-primitives`. A build without that flag fails to compile.
+# The field changes the v6 transaction format and the ZIP 244 header digest, and the
+# matching `zakura-primitives` code is gated on the `zcash_unstable = "nu7"` cfg as well
+# as on its own feature. `ZIP233_ENABLED` requires that cfg too, so a build without
+# `RUSTFLAGS='--cfg zcash_unstable="nu7"'` follows today's consensus rather than half of
+# ZIP 233.
 zip233 = ["zcash_primitives/zip-233"]
 
 # Consensus-critical conversion from JSON to Zcash types

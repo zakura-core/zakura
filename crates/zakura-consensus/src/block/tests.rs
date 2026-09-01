@@ -758,6 +758,10 @@ async fn block_rejects_transactions_failing_librustzcash_conversion() {
     let _init_guard = zakura_test::init();
 
     let cases = [
+        // A `zcash_unstable = "nu7"` build gives NU7 the branch ID `zcash_protocol`
+        // recognises, so this case has no unrecognized branch ID to offer there. The
+        // remaining cases still cover a failed conversion.
+        #[cfg(not(zcash_unstable = "nu7"))]
         LibrustzcashConversionFailure {
             name: "unrecognized consensus branch ID",
             network_upgrade: NetworkUpgrade::Nu7,

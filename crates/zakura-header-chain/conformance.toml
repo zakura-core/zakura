@@ -710,7 +710,7 @@ id = "LC-AUX-03"
 name = "Branch-scoped VCT repair"
 status = "implemented"
 owner = "zakura_network::zakura::header_sync::ActiveHeaderRequest + HeaderTargetPurpose::SelectedAuxiliaryRepair"
-tests = ["AUD-09::generation_change_retires_every_repair_state", "IN-06::vct_repair_uses_one_exact_canonical_auxiliary_request", "IN-06::retired_vct_request_response_has_no_actions_or_peer_score", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+tests = ["AUD-09::generation_change_retires_every_repair_state", "IN-06::vct_repair_restarts_after_state_rejects_an_admitted_replacement", "IN-06::retired_vct_request_response_has_no_actions_or_peer_score", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

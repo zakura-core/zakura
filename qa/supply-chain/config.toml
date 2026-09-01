@@ -73,7 +73,7 @@ audit-as-crates-io = false
 [[exemptions.addchain]]
 version = "0.3.0"
 criteria = "safe-to-deploy"
-notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+notes = "Introduced by the Zakura Common fork migration; retain this exact-version exemption pending dedicated review."
 
 [[exemptions.addr2line]]
 version = "0.21.0"
@@ -95,9 +95,9 @@ criteria = "safe-to-deploy"
 notes = "Audit held: safe set_file_name and set_extension methods mutate the wrapped path without re-canonicalizing it, breaking the advertised canonical-path invariant; is_dir also delegates to is_file. A version-wide safe-to-deploy certification is deferred pending an upstream fix."
 
 [[exemptions.chacha20]]
-version = "0.10.1"
+version = "0.10.2"
 criteria = "safe-to-deploy"
-notes = "Audit hold: the public RNG get_block_pos method subtracts the four-block buffer width without wrapping. After set_block_pos(u64::MAX) followed by one generated word, the internal counter wraps to 3 and get_block_pos panics on 3 - 4 in debug builds. Reproduced with ChaCha20Rng; retain the exemption pending wrapping arithmetic or an upstream fix."
+notes = "Audit hold: the public RNG get_block_pos method subtracts the four-block buffer width without wrapping. After set_block_pos(u64::MAX) followed by one generated word, the internal counter wraps to 3 and get_block_pos panics on 3 - 4 in debug builds. Reproduced with ChaCha20Rng; retain the exemption pending wrapping arithmetic or an upstream fix. 0.10.2 replaces the yanked 0.10.1 (its SSE2 backend emitted an SSE4.1 instruction, crashing x86 CPUs without SSE4.1) and does not resolve this hold."
 
 [[exemptions.console]]
 version = "0.15.11"
@@ -130,12 +130,12 @@ notes = "Audit deferred: the safe single-sink wrappers preserve the documented e
 [[exemptions.ff]]
 version = "0.14.0"
 criteria = "safe-to-deploy"
-notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+notes = "Introduced by the Zakura Common fork migration; retain this exact-version exemption pending dedicated review."
 
 [[exemptions.ff_derive]]
 version = "0.14.0"
 criteria = "safe-to-deploy"
-notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+notes = "Introduced by the Zakura Common fork migration; retain this exact-version exemption pending dedicated review."
 
 [[exemptions.fixedbitset]]
 version = "0.5.7"
@@ -151,7 +151,7 @@ notes = "Audit hold: recursive directory enumeration follows directory symlinks,
 [[exemptions.group]]
 version = "0.14.0"
 criteria = "safe-to-deploy"
-notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+notes = "Introduced by the Zakura Common fork migration; retain this exact-version exemption pending dedicated review."
 
 [[exemptions.h2]]
 version = "0.4.16"
@@ -269,7 +269,7 @@ notes = "Audit hold: the UEFI protocol tables expose firmware operations that ac
 [[exemptions.rand_chacha]]
 version = "0.10.0"
 criteria = "safe-to-deploy"
-notes = "Introduced by the Zakura cryptography fork migration; retain this exact-version exemption pending dedicated review."
+notes = "Introduced by the Zakura Common fork migration; retain this exact-version exemption pending dedicated review."
 
 [[exemptions.redox_users]]
 version = "0.4.5"
@@ -392,89 +392,89 @@ version = "0.52.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.zakura-bellman]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-bls12-381]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-halo2-gadgets]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-halo2-legacy-pdqsort]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-halo2-poseidon]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-halo2-proofs]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-jubjub]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-keys]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-orchard]]
-version = "1.0.0-rc.3"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "Retain this exact-version exemption: rc3 adds batched key agreement whose variable-time behavior depends on the incoming viewing key. Functional behavior was reviewed, but a complete timing-safety argument is still pending. Zakurad does not perform trial decryption or hold incoming viewing keys."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-pairing]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-pasta-curves]]
-version = "1.0.0-rc.3"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "Retain this exact-version exemption: rc3 makes Field::invert variable-time, and the package graph reaches secret-bearing signing, key, decryption, and proving paths. A safe-to-deploy audit requires a constant-time default or a complete timing-safety argument."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-primitives]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-proofs]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-reddsa]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-redjubjub]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-sapling-crypto]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-sinsemilla]]
-version = "1.0.0-rc.2"
+version = "1.0.1"
 criteria = "safe-to-deploy"
-notes = "rc2 migration baseline for the reviewed rc2-to-rc3 delta audit; rc2 itself is still pending a direct package audit."
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zerovec]]
 version = "0.11.6"

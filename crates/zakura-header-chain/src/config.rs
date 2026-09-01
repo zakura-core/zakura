@@ -46,8 +46,8 @@ pub const MAX_HEADERS_PER_TRANSITION_V1: usize = 4_000;
 pub const MAX_AUX_DELIVERIES_PER_HEADER_V1: usize = 16;
 /// Exact v1 maximum auxiliary deliveries retained across the graph.
 pub const MAX_AUX_DELIVERIES_TOTAL_V1: usize = MAX_NON_FINALIZED_NODES_V1;
-/// Full-state fork policy sets the exact v1 candidate-tip cap.
-pub const MAX_CANDIDATE_TIPS_V1: usize = MAX_NON_FINALIZED_CHAIN_FORKS;
+/// Full-state fork policy plus one independent selected header tip set the candidate-tip cap.
+pub const MAX_CANDIDATE_TIPS_V1: usize = MAX_NON_FINALIZED_CHAIN_FORKS + 1;
 /// Exact v1 maximum active retained-path references supplied to one transition.
 pub const MAX_RETENTION_REFERENCES_V1: usize = MAX_STAGED_TARGETS_V1 + MAX_CANDIDATE_TIPS_V1;
 
@@ -493,13 +493,13 @@ impl Default for EngineLimits {
 }
 
 const _: () = assert!(MAX_BLOCK_REORG_HEIGHT == 1_000);
-const _: () = assert!(MAX_CANDIDATE_TIPS_V1 == 10);
+const _: () = assert!(MAX_CANDIDATE_TIPS_V1 == 11);
 const _: () = assert!(MAX_NON_FINALIZED_NODES_V1 == 65_536);
 const _: () = assert!(MAX_STAGED_TARGETS_V1 == 16);
 const _: () = assert!(MAX_HEADERS_PER_TRANSITION_V1 == 4_000);
 const _: () = assert!(MAX_AUX_DELIVERIES_PER_HEADER_V1 == 16);
 const _: () = assert!(MAX_AUX_DELIVERIES_TOTAL_V1 == 65_536);
-const _: () = assert!(MAX_RETENTION_REFERENCES_V1 == 26);
+const _: () = assert!(MAX_RETENTION_REFERENCES_V1 == 27);
 
 #[cfg(test)]
 mod tests {
@@ -517,7 +517,7 @@ mod tests {
     fn engine_limits_v1_match_the_frozen_specification() {
         let limits = EngineLimits::v1();
         assert_eq!(limits.local_finality_depth.get(), 1_000);
-        assert_eq!(limits.max_candidate_tips.get(), 10);
+        assert_eq!(limits.max_candidate_tips.get(), 11);
         assert_eq!(limits.max_non_finalized_nodes.get(), 65_536);
         assert_eq!(
             limits.max_retention_references.get(),

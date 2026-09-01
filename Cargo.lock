@@ -687,9 +687,9 @@ dependencies = [
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -2310,15 +2310,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec9d92d097f4749b64e8cc33d924d9f40a2d4eb91402b458014b781f5733d60f"
 
 [[package]]
-name = "home"
-version = "0.5.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
-dependencies = [
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "hostname-validator"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3193,15 +3184,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "known-folders"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a1886916523694cd6ea3d175f03a1e5010699a2a4cc13696d83d7bea1d80638"
-dependencies = [
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3221,9 +3203,6 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-dependencies = [
- "spin 0.9.9",
-]
 
 [[package]]
 name = "libc"
@@ -3825,16 +3804,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "num_cpus"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
-dependencies = [
- "hermit-abi",
- "libc",
 ]
 
 [[package]]
@@ -4774,7 +4743,7 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
- "chacha20 0.10.1",
+ "chacha20 0.10.2",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
 ]
@@ -7581,12 +7550,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "xdg"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
-
-[[package]]
 name = "xml-rs"
 version = "0.8.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7644,7 +7607,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
 name = "zakura"
-version = "1.3.0-rc2"
+version = "1.3.0"
 dependencies = [
  "abscissa_core",
  "bytes",
@@ -7727,25 +7690,20 @@ dependencies = [
 
 [[package]]
 name = "zakura-assets"
-version = "0.3457371.0"
+version = "0.3462171.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "380d37960ac8b518a75c17fcf8554a1b81e7387267d6b42a56fbed298255b723"
+checksum = "1518d74211e0ae2422cab4560acdc67f72ae8fcdb871294eb03476a5a4586a74"
 
 [[package]]
 name = "zakura-bellman"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ab49244f0020cb3e51d66070204f126a5f938bf1f960641e89658c597443522"
+checksum = "82c72c84165959b2578cbf8800ff491e74d819397b53658bbf1b2b170b3ee9fc"
 dependencies = [
  "bitvec",
  "blake2s_simd",
- "byteorder",
- "crossbeam-channel",
  "ff",
  "group",
- "lazy_static",
- "log",
- "num_cpus",
  "rand 0.10.2",
  "rand_core 0.10.1",
  "rayon",
@@ -7755,9 +7713,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-bls12-381"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a56ae6036dbd383c68dd407a69f7325c29f429d30539092fe8f0dced4cb05b9b"
+checksum = "2d9c833a85b5ba3303a5f14ed760d613bee8a9769923da5a1e7f51851849e7f5"
 dependencies = [
  "ff",
  "group",
@@ -7768,7 +7726,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "6.0.0-rc2"
+version = "6.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -7837,7 +7795,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "7.0.0-rc2"
+version = "7.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -7886,18 +7844,14 @@ dependencies = [
 
 [[package]]
 name = "zakura-halo2-gadgets"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df3af75089fb0e2056c34fe7d56df8fb452c69f0deca8de9daa7ef41fbf1fa16"
+checksum = "c601160505e513507664516f16a38b8e875a31b48155a93964b6e97c1e07d315"
 dependencies = [
  "arrayvec",
- "bitvec",
  "ff",
  "group",
- "lazy_static",
- "rand 0.10.2",
  "subtle",
- "uint 0.9.5",
  "zakura-halo2-poseidon",
  "zakura-halo2-proofs",
  "zakura-pasta-curves",
@@ -7906,15 +7860,15 @@ dependencies = [
 
 [[package]]
 name = "zakura-halo2-legacy-pdqsort"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f59499e588bd68c58298f1a11e3d2e7fa47d9c746d5dcf3776e5a687ff39667"
+checksum = "f7e2ecc4b9f643499164caceb5fe3339d1cdd9088dac084dd14314d6f6a75b0e"
 
 [[package]]
 name = "zakura-halo2-poseidon"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bee31c45dcc963002d73119291d54feb02628b1dff95c322bad0eba16216ccf"
+checksum = "531ec02070913e40067ae2df9aab21139a55b239f289140d116af5d5e25e5240"
 dependencies = [
  "bitvec",
  "ff",
@@ -7924,14 +7878,13 @@ dependencies = [
 
 [[package]]
 name = "zakura-halo2-proofs"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520b25c1fb619ce3b05f84e6c2d5b1c8983696d6f57472e8c959fc63cd398904"
+checksum = "2c39132f1dae675ef4105321da11dee1d70c2b07bbc7d78a31c4044ed381fd74"
 dependencies = [
  "blake2b_simd",
  "ff",
  "group",
- "indexmap 1.9.3",
  "maybe-rayon",
  "rand 0.10.2",
  "rand_core 0.10.1",
@@ -7942,7 +7895,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "1.0.0-rc2"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -7957,7 +7910,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-jsonl-trace"
-version = "1.2.0-rc0"
+version = "1.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7969,9 +7922,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-jubjub"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b5bbe1f733ae656ba1a03f5d2701419f2543f85586d8db1f20ac2553ac566c4"
+checksum = "4b10077e35b311a780366567771c4730245a4df7bd23b1f3414444b0e5c3a9cd"
 dependencies = [
  "bitvec",
  "ff",
@@ -7983,23 +7936,20 @@ dependencies = [
 
 [[package]]
 name = "zakura-keys"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37cad4f2abd1ab654cc648a0dde622af3f05a964e310f13140953c7bfc1a7a0f"
+checksum = "ac02340ce2b8eecc13047a936efe6545cc6de3761e2eda11eb5ab30cde8a6bed"
 dependencies = [
  "bech32",
  "blake2b_simd",
  "bs58",
  "corez",
  "document-features",
- "group",
  "memuse",
  "nonempty",
  "rand_core 0.6.4",
  "secrecy",
  "subtle",
- "tracing",
- "zakura-bls12-381",
  "zakura-orchard",
  "zakura-sapling-crypto",
  "zcash_address",
@@ -8011,7 +7961,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "7.0.0-rc2"
+version = "7.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -8057,7 +8007,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "3.2.1-rc2"
+version = "3.2.1"
 dependencies = [
  "jsonrpsee-types",
  "reqwest 0.12.28",
@@ -8071,9 +8021,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-orchard"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abbb21f5c148e06e370d91da0b1aadc07680968d46589eaf3012e7577c893eb4"
+checksum = "79f40234883ea702da695f1cbf470a0ba3b9fe0ac51d24af588a058afc383d68"
 dependencies = [
  "aes",
  "bitvec",
@@ -8085,16 +8035,15 @@ dependencies = [
  "group",
  "hex",
  "incrementalmerkletree",
- "lazy_static",
  "memuse",
  "nonempty",
+ "once_cell",
  "rand 0.10.2",
  "rand_core 0.10.1",
  "rand_core 0.6.4",
  "serde",
  "subtle",
  "tracing",
- "visibility",
  "zakura-halo2-gadgets",
  "zakura-halo2-poseidon",
  "zakura-halo2-proofs",
@@ -8108,24 +8057,25 @@ dependencies = [
 
 [[package]]
 name = "zakura-pairing"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fefa17420b54d7a08bbb4afcb35cde18fa9ddcc3897628bad80520ea084ec8fd"
+checksum = "93d3f4e77bb286c0f1770c90e721edcd99bd493acce6199734fa1eaeb4037f12"
 dependencies = [
  "group",
 ]
 
 [[package]]
 name = "zakura-pasta-curves"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7ae7848bc9fafb0ec81847251ce3d36a25d605377222c453de753323484ab9a"
+checksum = "6c906d3541e9e6b71aaa77af25c229a0c1ed38df58930fa75f2fd569632989dd"
 dependencies = [
  "blake2b_simd",
  "cc",
  "ff",
  "group",
- "lazy_static",
+ "maybe-rayon",
+ "once_cell",
  "rand 0.10.2",
  "static_assertions",
  "subtle",
@@ -8133,9 +8083,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-primitives"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87ffcd0f3a2c4d8ed0aa3087378c48b8e362bd693008c3cc88502e7bbf67f8c2"
+checksum = "268f6d451f4870f763b5ba51e5f84fd2843d86b103cc01b8fbf9cae84115c36c"
 dependencies = [
  "blake2b_simd",
  "block-buffer 0.11.0-rc.3",
@@ -8164,20 +8114,16 @@ dependencies = [
 
 [[package]]
 name = "zakura-proofs"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c62244ceceb01c085e1ec8f548490dfb33e1d2d23dfe2277327b477127a85c7"
+checksum = "fce73755c38fa3d0de97d420d547855b0111083b0f1270ab7d4e53896cb16a7c"
 dependencies = [
  "blake2b_simd",
  "document-features",
  "group",
- "home",
- "known-folders",
  "rand 0.10.2",
  "rand_core 0.10.1",
- "tracing",
  "wagyu-zcash-parameters",
- "xdg",
  "zakura-bellman",
  "zakura-bls12-381",
  "zakura-jubjub",
@@ -8188,12 +8134,11 @@ dependencies = [
 
 [[package]]
 name = "zakura-reddsa"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8351c15be16d8716d0ccc56f3e8a54c2585ecd03b7bfdf87d932a424606e8a2"
+checksum = "8ecd8e46ef79bd3675733cee6741c432ccd259b9e060e4838d2cc311a654744f"
 dependencies = [
  "blake2b_simd",
- "byteorder",
  "frost-rerandomized",
  "group",
  "hex",
@@ -8207,20 +8152,20 @@ dependencies = [
 
 [[package]]
 name = "zakura-redjubjub"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1ac2ad992df5bb713921d18ffa77c14b9f0460fc21312e4afc61e97dc7e7a56"
+checksum = "37aa0ca5f5747caad4527ee92ad538271e7124949bc799cdc30b09c631b447fe"
 dependencies = [
  "rand_core 0.10.1",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "zakura-reddsa",
  "zeroize",
 ]
 
 [[package]]
 name = "zakura-rpc"
-version = "8.0.0-rc2"
+version = "8.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8288,9 +8233,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-sapling-crypto"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0583b3ff0a183b41d49cf9dc41d0fe1d3d050246bfe725ca3017e1df852069e"
+checksum = "6fcd5a8073598e33ffaa2694ca59d7c522a60dd349a3d74d239e6eb929733107"
 dependencies = [
  "aes",
  "bitvec",
@@ -8304,8 +8249,8 @@ dependencies = [
  "group",
  "hex",
  "incrementalmerkletree",
- "lazy_static",
  "memuse",
+ "once_cell",
  "rand 0.10.2",
  "rand_core 0.10.1",
  "rand_core 0.6.4",
@@ -8322,7 +8267,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "3.2.1-rc2"
+version = "3.2.1"
 dependencies = [
  "hex",
  "lazy_static",
@@ -8340,19 +8285,19 @@ dependencies = [
 
 [[package]]
 name = "zakura-sinsemilla"
-version = "1.0.0-rc.3"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f24c3c8ebb5cf5e988b840470eec86f955f2ee2e3b4fa7b64ca5d9bbc6d0f78e"
+checksum = "043da1b236d2b976b2046112811dc1be3f734c566a6edb1a0a52b5379231e212"
 dependencies = [
  "group",
- "lazy_static",
+ "once_cell",
  "subtle",
  "zakura-pasta-curves",
 ]
 
 [[package]]
 name = "zakura-state"
-version = "7.0.0-rc2"
+version = "7.0.0"
 dependencies = [
  "bincode",
  "chrono",
@@ -8429,7 +8374,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-tower-batch-control"
-version = "1.3.0-rc0"
+version = "1.3.0"
 dependencies = [
  "color-eyre",
  "ed25519-zebra",
@@ -8463,7 +8408,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.1-rc2"
+version = "2.2.1"
 dependencies = [
  "clap",
  "color-eyre",

@@ -33,7 +33,8 @@ use zakura_network::{
 };
 use zakura_node_services::BoxError;
 use zakura_state::{
-    GetBlockTemplateChainInfo, IntoDisk, ReadRequest, ReadResponse, ReadStateService,
+    ChainTipInfo, ChainTipStatus, GetBlockTemplateChainInfo, IntoDisk, ReadRequest, ReadResponse,
+    ReadStateService,
 };
 use zakura_test::mock_service::MockService;
 
@@ -4200,4 +4201,150 @@ async fn rpc_gettxout() {
     // The queue task should continue without errors or panics
     let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
     assert!(rpc_tx_queue_task_result.is_none());
+}
+
+/// `getchaintips` maps every state-level tip to zcashd's JSON shape: the `height`,
+/// `hash`, `branchlen`, and `status` fields, with zcashd's status spellings.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getchaintips() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let get_chain_tips_future = tokio::spawn(async move { rpc.get_chain_tips().await });
+
+    // One tip of every status the state can report.
+    let state_tips = vec![
+        ChainTipInfo {
+            // Every byte differs, so the `hash` assertion below detects a hash that
+            // is serialized in the wrong byte order.
+            height: Height(1_000_412),
+            hash: Hash(std::array::from_fn(|index| index as u8)),
+            branch_len: 412,
+            status: ChainTipStatus::HeadersOnly,
+        },
+        ChainTipInfo {
+            height: Height(1_000_000),
+            hash: Hash([0xa1; 32]),
+            branch_len: 0,
+            status: ChainTipStatus::Active,
+        },
+        ChainTipInfo {
+            height: Height(999_998),
+            hash: Hash([0xb7; 32]),
+            branch_len: 2,
+            status: ChainTipStatus::ValidFork,
+        },
+        ChainTipInfo {
+            height: Height(999_995),
+            hash: Hash([0xc3; 32]),
+            branch_len: 5,
+            status: ChainTipStatus::Invalid,
+        },
+    ];
+
+    read_state
+        .expect_request(ReadRequest::ChainTips)
+        .await
+        .respond(ReadResponse::ChainTips(state_tips));
+
+    let tips = get_chain_tips_future
+        .await
+        .expect("getchaintips future should not panic")
+        .expect("getchaintips future should not return an error");
+
+    let json = serde_json::to_value(&tips).expect("chain tips should serialize");
+    let json = json.as_array().expect("getchaintips returns a JSON array");
+
+    assert_eq!(json.len(), 4, "every state tip should reach the response");
+
+    // zcashd's field names and status spellings, in the order the state returned.
+    assert_eq!(json[0]["height"], 1_000_412);
+    // zcashd prints block hashes in big-endian display order, which reverses the
+    // bytes of the internal representation.
+    assert_eq!(
+        json[0]["hash"],
+        "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
+    );
+    assert_eq!(json[0]["branchlen"], 412);
+    assert_eq!(json[0]["status"], "headers-only");
+
+    assert_eq!(json[1]["height"], 1_000_000);
+    assert_eq!(json[1]["branchlen"], 0);
+    assert_eq!(json[1]["status"], "active");
+
+    assert_eq!(json[2]["status"], "valid-fork");
+    assert_eq!(json[2]["branchlen"], 2);
+
+    assert_eq!(json[3]["status"], "invalid");
+    assert_eq!(json[3]["branchlen"], 5);
+
+    read_state.expect_no_requests().await;
+}
+
+/// `getchaintips` on a node with no blocks returns an empty array, not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getchaintips_empty_state() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let get_chain_tips_future = tokio::spawn(async move { rpc.get_chain_tips().await });
+
+    read_state
+        .expect_request(ReadRequest::ChainTips)
+        .await
+        .respond(ReadResponse::ChainTips(Vec::new()));
+
+    let tips = get_chain_tips_future
+        .await
+        .expect("getchaintips future should not panic")
+        .expect("getchaintips future should not return an error");
+
+    assert!(
+        tips.is_empty(),
+        "a node with no blocks should return an empty array, got {tips:?}"
+    );
+
+    read_state.expect_no_requests().await;
 }

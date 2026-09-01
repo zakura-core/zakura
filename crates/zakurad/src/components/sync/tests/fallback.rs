@@ -14,9 +14,10 @@ use zakura_chain::{
 
 use super::super::{
     cap_checkpoint_bootstrap_hashes, checkpoint_bootstrap_hash_limit,
-    engage_legacy_fallback_alongside_zakura, legacy_probe_supports_fallback,
-    zakura_block_sync_stalled, zakura_sync_status_length, zakura_watchdog_action, SyncStatus,
-    ZakuraLegacyProbe, ZakuraStallTracker, ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
+    engage_legacy_fallback_alongside_zakura, handle_legacy_fallback_acquisition,
+    legacy_probe_supports_fallback, zakura_block_sync_stalled, zakura_sync_status_length,
+    zakura_watchdog_action, SyncStatus, ZakuraLegacyProbe, ZakuraStallTracker,
+    ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
 };
 
 #[test]
@@ -70,6 +71,21 @@ fn completed_legacy_fallback_returns_apply_ownership_to_zakura() {
     assert!(
         handoff.begin_apply().is_some(),
         "a drained legacy recovery round must return apply ownership to Zakura"
+    );
+}
+
+#[test]
+fn syncer_propagates_the_fallback_drain_deadline() {
+    let error = crate::commands::start::zakura::LegacyFallbackError::ApplyDrainTimedOut {
+        epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch::INITIAL,
+        in_flight: 1,
+        operations: 1,
+    };
+
+    let result = handle_legacy_fallback_acquisition(Err(error));
+    assert!(
+        result.is_err(),
+        "the syncer must return the fatal drain error"
     );
 }
 

@@ -28,15 +28,46 @@ use crate::{
         arbitrary::populated_state,
         chain_tip::TipAction,
         finalized_state::{DiskWriteBatch, FinalizedState, FrontierArtifact, FrontierEntry},
+        write::NonFinalizedWriteFailureKind,
         StateService,
     },
     tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
-    BoxError, CheckpointVerifiedBlock, Config, HistoricalTreeUnavailable, PruningConfig, Request,
-    Response, SemanticallyVerifiedBlock, StateInitError, StorageMode, CHAIN_TIP_UPDATE_WAIT_LIMIT,
-    MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    BoxError, CheckpointVerifiedBlock, CommitBlockError, Config, HistoricalTreeUnavailable,
+    PruningConfig, Request, Response, SemanticallyVerifiedBlock, StateInitError, StorageMode,
+    CHAIN_TIP_UPDATE_WAIT_LIMIT, MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+#[tokio::test]
+async fn descendant_arriving_after_a_local_parent_failure_completes_immediately() {
+    let network = Network::Mainnet;
+    let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+        .await
+        .expect("the ephemeral state opens");
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_419201_BYTES
+        .zcash_deserialize_into()
+        .expect("the child block vector decodes");
+    let block = block.prepare();
+    let ancestor = block.block.header.previous_block_hash;
+    state.remember_failed_ancestor(ancestor, ancestor, NonFinalizedWriteFailureKind::Retryable);
+
+    let response = state
+        .queue_and_commit_to_non_finalized_state(block.clone())
+        .await
+        .expect("the state keeps the response channel open")
+        .expect_err("the failed parent prevents this request from waiting");
+
+    assert!(matches!(
+        response.inner(),
+        CommitBlockError::HeaderChainError { error }
+            if error.contains(&ancestor.to_string())
+    ));
+    assert_eq!(
+        state.non_finalized_failed_ancestors.get(&block.hash),
+        Some(&(ancestor, NonFinalizedWriteFailureKind::Retryable))
+    );
+}
 
 #[tokio::test]
 async fn state_init_loads_the_embedded_mainnet_frontier_grid() {

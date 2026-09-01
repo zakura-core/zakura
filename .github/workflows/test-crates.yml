@@ -12,6 +12,7 @@ on:
       - .cargo/config.toml
       - .github/actions/setup-zakura-build/**
       - .github/workflows/test-crates.yml
+      - scripts/check-crate-packaging.sh
 
   push:
     branches: [main, "feat/**", "release/**"]
@@ -24,6 +25,7 @@ on:
       - .cargo/config.toml
       - .github/actions/setup-zakura-build/**
       - .github/workflows/test-crates.yml
+      - scripts/check-crate-packaging.sh
 
   # Run the full crate-build suite when a PR is queued so the merge queue
   # validates the merged result against the latest `main`. `merge_group` ignores
@@ -101,6 +103,9 @@ jobs:
         env:
           # Treat warnings as errors, preserving the old `features` job behavior.
           RUSTFLAGS: -D warnings
+
+      - name: Check publishable crate packaging
+        run: ./scripts/check-crate-packaging.sh
 
   test-crate-build-success:
     name: test crate build success

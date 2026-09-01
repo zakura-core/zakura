@@ -475,7 +475,10 @@ jobs:
       # the canonical public repository; private rehearsal repos skip it.
       - name: Attest build provenance
         if: ${{ github.repository == 'zakura-core/zakura' }}
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 #v4.2.2
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d #v4.2.1
+        env:
+          # Preserve the response-header limit set by the former wrapper.
+          NODE_OPTIONS: --max-http-header-size=32768
         with:
           subject-path: |
             ./publish/final/zakurad-*.tar.gz

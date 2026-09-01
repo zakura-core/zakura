@@ -222,23 +222,8 @@ impl PreparedFullStateTransition {
                 return Err(PreparedFullStateTransitionError::VerifiedPathMismatch);
             }
         }
-        let mut staged_headers = non_finalized_after
-            .chain_iter()
-            .flat_map(|chain| chain.blocks.values())
-            .map(|block| VerifiedHeaderRef {
-                height: block.height,
-                hash: block.hash,
-                header: block.block.header.clone(),
-            })
-            .collect::<Vec<_>>();
-        staged_headers.sort_unstable_by_key(|header| (header.height, header.hash.0));
-        staged_headers.dedup_by_key(|header| header.hash);
-        let mut staged_tips = non_finalized_after
-            .chain_iter()
-            .filter_map(|chain| chain.blocks.last_key_value().map(|(_, block)| block.hash))
-            .collect::<Vec<_>>();
-        staged_tips.sort_unstable_by_key(|hash| hash.0);
-        staged_tips.dedup();
+        let staged_headers = verified_headers(&non_finalized_after);
+        let staged_tips = verified_tips(&non_finalized_after);
         Ok(Self {
             transition_id,
             old_frontier,
@@ -284,7 +269,7 @@ impl PreparedFullStateTransition {
             staged_tips.clone(),
         )?;
         let mut retention_references = context.retention_references.to_vec();
-        retention_references.extend(staged_tips);
+        retention_references.extend(staged_tips.iter().copied());
         retention_references.sort_unstable_by_key(|hash| hash.0);
         retention_references.dedup();
         let guarded_context = TransitionContext {
@@ -293,13 +278,17 @@ impl PreparedFullStateTransition {
             full_state_authority: Some(&authority),
             retention_references: &retention_references,
         };
+        let committed_tips = staged_tips.clone();
         match runtime.apply_combined_expected(
             header_request,
             &guarded_context,
             finalized_batch.unwrap_or_else(DiskWriteBatch::new),
             expected_verified,
             &staged_headers,
-            || *live_non_finalized = non_finalized_after,
+            || {
+                *live_non_finalized = non_finalized_after;
+                runtime.replace_full_state_retention_references(committed_tips);
+            },
         )? {
             ApplyResult::Stale(receipt) => Err(HeaderChainStoreError::StaleFullStateTransition {
                 current_version: receipt.current_version,
@@ -543,6 +532,8 @@ impl HeaderChainWriter {
         )?;
         let restored_path = verified_path(non_finalized_state);
         let restored_side_paths = verified_side_paths(non_finalized_state, &restored_path);
+        let restored_headers = verified_headers(non_finalized_state);
+        let restored_tips = verified_tips(non_finalized_state);
         let store = HeaderChainStore::new(finalized_state.db.header_chain_disk_db());
         store.migrate_to_current(&config)?;
         let runtime = if store.is_initialized()? {
@@ -583,7 +574,9 @@ impl HeaderChainWriter {
         } else {
             initialize_header_chain_reconciled(&finalized_state.db, &config, restored_path)?.0
         };
-        restore_verified_side_paths(&runtime, &config, restored_side_paths)?;
+        restore_verified_side_paths(&runtime, &config, restored_side_paths, &restored_tips)?;
+        runtime.replace_full_state_retention_references(restored_tips);
+        runtime.verify_full_state_headers(&restored_headers)?;
         Ok(Self::new(runtime, config))
     }
 
@@ -916,6 +909,31 @@ fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
         .collect()
 }
 
+fn verified_headers(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
+    let mut headers = state
+        .chain_iter()
+        .flat_map(|chain| chain.blocks.values())
+        .map(|block| VerifiedHeaderRef {
+            height: block.height,
+            hash: block.hash,
+            header: block.block.header.clone(),
+        })
+        .collect::<Vec<_>>();
+    headers.sort_unstable_by_key(|header| (header.height, header.hash.0));
+    headers.dedup_by_key(|header| header.hash);
+    headers
+}
+
+fn verified_tips(state: &NonFinalizedState) -> Vec<block::Hash> {
+    let mut tips = state
+        .chain_iter()
+        .filter_map(|chain| chain.blocks.last_key_value().map(|(_, block)| block.hash))
+        .collect::<Vec<_>>();
+    tips.sort_unstable_by_key(|hash| hash.0);
+    tips.dedup();
+    tips
+}
+
 fn verified_side_paths(
     state: &NonFinalizedState,
     selected: &[VerifiedHeaderRef],
@@ -952,6 +970,7 @@ fn restore_verified_side_paths(
     runtime: &HeaderChainRuntime,
     config: &EngineConfig,
     paths: Vec<Vec<VerifiedHeaderRef>>,
+    full_state_tips: &[block::Hash],
 ) -> Result<(), HeaderChainStoreError> {
     for path in paths {
         let snapshot = runtime.publisher().snapshot();
@@ -969,7 +988,8 @@ fn restore_verified_side_paths(
             full_state_transition_id: evidence,
             path,
         });
-        let authority = PreparedAuthority::for_event(&event)?;
+        let authority =
+            PreparedAuthority::for_event_with_retention(&event, full_state_tips.to_vec())?;
         let result = runtime.apply(
             TransitionRequest {
                 expected_version: snapshot.state_version,
@@ -979,7 +999,7 @@ fn restore_verified_side_paths(
                 config,
                 clock: &SystemClock,
                 full_state_authority: Some(&authority),
-                retention_references: &[],
+                retention_references: full_state_tips,
             },
         )?;
         match result {
@@ -1418,7 +1438,7 @@ struct WriteBlockWorkerTask {
     /// Without this, a rejected same-hash block locks out a later honest
     /// re-delivery of a block at the same hash as a "duplicate" until restart
     /// or reorg.
-    non_finalized_rejected_sender: UnboundedSender<block::Hash>,
+    non_finalized_rejected_sender: UnboundedSender<NonFinalizedWriteFailure>,
     chain_tip_sender: ChainTipSender,
     non_finalized_state_sender: watch::Sender<NonFinalizedState>,
     vct_root_repair_sender: watch::Sender<VctRootRepairStatus>,
@@ -1428,6 +1448,38 @@ struct WriteBlockWorkerTask {
     header_chain: Option<HeaderChainWriter>,
     attach_header_chain_at_handoff: bool,
     header_chain_observers: HeaderChainObservers,
+}
+
+/// One failed non-finalized write that can strand queued descendants.
+#[derive(Copy, Clone, Debug)]
+pub(in crate::service) struct NonFinalizedWriteFailure {
+    pub(in crate::service) hash: block::Hash,
+    pub(in crate::service) kind: NonFinalizedWriteFailureKind,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::service) enum NonFinalizedWriteFailureKind {
+    Invalid,
+    Retryable,
+}
+
+impl NonFinalizedWriteFailureKind {
+    fn from_error(error: &CommitBlockError) -> Self {
+        use zakura_header_chain::BodyVerificationClass;
+
+        if matches!(
+            error,
+            CommitBlockError::ValidateContextError(error)
+                if matches!(**error, ValidateContextError::InvalidAncestorBlock(_))
+        ) || matches!(
+            error.body_verification_class(),
+            BodyVerificationClass::ConsensusInvalid(_)
+        ) {
+            Self::Invalid
+        } else {
+            Self::Retryable
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1638,7 +1690,7 @@ impl BlockWriteSender {
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
-        tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
+        tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteFailure>,
         watch::Receiver<VctRootRepairStatus>,
         Arc<OnceLock<BlockWriteTaskFailure>>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
@@ -1674,7 +1726,7 @@ impl BlockWriteSender {
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
-        tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
+        tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteFailure>,
         watch::Receiver<VctRootRepairStatus>,
         Arc<OnceLock<BlockWriteTaskFailure>>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
@@ -2623,9 +2675,11 @@ impl WriteBlockWorkerTask {
             //       after `update_latest_chain_channels()`,
             //       and send the result on rsp_tx here
 
-            if result.is_err() {
+            if let Err(error) = &result {
+                let failure_kind = NonFinalizedWriteFailureKind::from_error(error);
+
                 // If the block is invalid, mark any descendant blocks as rejected.
-                if matches!(result, Err(CommitBlockError::ValidateContextError(_))) {
+                if failure_kind == NonFinalizedWriteFailureKind::Invalid {
                     rejected_ancestor_map
                         .insert(child_hash, rejected_ancestor_hash.unwrap_or(child_hash));
                 }
@@ -2645,7 +2699,10 @@ impl WriteBlockWorkerTask {
                 // If the receiver was dropped (the StateService is shutting
                 // down), ignore the error: the lockout cannot matter once the
                 // service exits.
-                let _ = non_finalized_rejected_sender.send(child_hash);
+                let _ = non_finalized_rejected_sender.send(NonFinalizedWriteFailure {
+                    hash: child_hash,
+                    kind: failure_kind,
+                });
 
                 // Update the caller with the error.
                 let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));

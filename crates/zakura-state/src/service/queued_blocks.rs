@@ -141,6 +141,39 @@ impl QueuedBlocks {
         queued_children
     }
 
+    /// Dequeue every queued descendant of a parent whose local write failed.
+    pub fn dequeue_descendants(
+        &mut self,
+        failed_parent: block::Hash,
+    ) -> Vec<QueuedSemanticallyVerified> {
+        let mut parents = vec![failed_parent];
+        let mut descendants = Vec::new();
+        while let Some(parent) = parents.pop() {
+            let children = self.dequeue_children(parent);
+            parents.extend(children.iter().map(|(block, _, _)| block.hash));
+            descendants.extend(children);
+        }
+        descendants
+    }
+
+    /// Complete every queued descendant after its parent fails locally.
+    pub fn fail_descendants(
+        &mut self,
+        failed_parent: block::Hash,
+        error: CommitSemanticallyVerifiedError,
+    ) -> Vec<block::Hash> {
+        let descendants = self.dequeue_descendants(failed_parent);
+        let mut failed_hashes = Vec::with_capacity(descendants.len());
+        for (block, response, admission) in descendants {
+            failed_hashes.push(block.hash);
+            if let Some(admission) = admission {
+                admission.reject();
+            }
+            let _ = response.send(Err(error.clone()));
+        }
+        failed_hashes
+    }
+
     /// Remove all queued blocks whose height is less than or equal to the given
     /// `finalized_tip_height`.
     #[instrument(skip(self))]

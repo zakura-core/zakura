@@ -321,6 +321,11 @@ The mainnet workflow writes it locally on `us-east-0`; the testnet workflow
 refreshes it on `us-east-0` over SSH on a best-effort basis. While the marker is
 in the future, new failure alerts are logged but not posted to Slack.
 
+Restart deploys that include `zakura-compat` also refresh that host's node-local
+watchdog marker and restart the active watchdog before `zakurad-compat`. This
+suppresses expected Sentry transitions and stays in the workflow so rollback
+refs whose deployer predates the marker remain covered.
+
 Manual dry run from `us-east-0`:
 
 ```bash

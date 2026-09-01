@@ -13,6 +13,7 @@ use crate::{
         QueuedBlocks, QueuedSemanticallyVerified, SentHashes, MAX_QUEUED_BLOCKS,
     },
     tests::FakeChainHelper,
+    CommitBlockError, CommitSemanticallyVerifiedError,
 };
 
 // Quick helper trait for making queued blocks with throw away channels
@@ -282,6 +283,39 @@ fn dequeue_children_preserves_same_height_siblings() -> Result<()> {
             .contains(&right_grandchild.hash()),
         "sibling must remain indexed by height after unrelated dequeue"
     );
+
+    Ok(())
+}
+
+#[test]
+fn dequeue_descendants_removes_the_complete_failed_subtree() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let root: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
+    let failed_child: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.zcash_deserialize_into()?;
+    let failed_grandchild = failed_child.make_fake_child();
+    let sibling = root.make_fake_child();
+
+    let mut queue = QueuedBlocks::default();
+    let mut responses = Vec::new();
+    for block in [failed_child, failed_grandchild, sibling] {
+        let (response, receiver) = oneshot::channel();
+        queue.queue((block.prepare(), response, None));
+        responses.push(receiver);
+    }
+    let error = CommitSemanticallyVerifiedError::from(CommitBlockError::HeaderChainError {
+        error: format!("ancestor {} failed", root.hash()),
+    });
+
+    assert_eq!(queue.fail_descendants(root.hash(), error.clone()).len(), 3);
+    for response in &mut responses {
+        assert_eq!(response.try_recv(), Ok(Err(error.clone())));
+    }
+    assert!(queue.blocks.is_empty());
+    assert!(queue.by_parent.is_empty());
+    assert!(queue.by_height.is_empty());
+    assert!(queue.known_utxos.is_empty());
 
     Ok(())
 }

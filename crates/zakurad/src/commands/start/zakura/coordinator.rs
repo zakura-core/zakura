@@ -4,11 +4,30 @@ use std::{
     time::Duration,
 };
 
+use thiserror::Error;
 use tokio::sync::{watch, Notify};
 use zakura_node_services::sync_lifecycle::{
     ApplyPhase, ApplyTransition, HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
     LifecycleTransitionError, SyncServiceDemand,
 };
+
+const LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+/// A checked lifecycle transition or a terminal native-apply drain failure.
+#[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
+pub(crate) enum LegacyFallbackError {
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleTransitionError),
+    #[error(
+        "native apply epoch {} did not drain before the fallback deadline: {in_flight} permits and {operations} operations remain",
+        epoch.get()
+    )]
+    ApplyDrainTimedOut {
+        epoch: LifecycleEpoch,
+        in_flight: usize,
+        operations: usize,
+    },
+}
 
 /// Sole process-local owner of bulk block-apply lifecycle transitions.
 #[derive(Debug)]
@@ -85,6 +104,7 @@ pub(crate) enum BlockApplyTerminal {
 pub(crate) struct LegacyFallbackLease {
     coordinator: Arc<SyncCoordinator>,
     epoch: LifecycleEpoch,
+    restore_native_on_drop: bool,
 }
 
 impl SyncCoordinator {
@@ -286,19 +306,45 @@ impl SyncCoordinator {
     pub(crate) async fn acquire_legacy_fallback(
         self: &Arc<Self>,
         diagnostic_interval: Duration,
-    ) -> Result<LegacyFallbackLease, LifecycleTransitionError> {
+    ) -> Result<LegacyFallbackLease, LegacyFallbackError> {
         let ApplyPhase::Native { epoch } = self.apply_phase() else {
-            return Err(LifecycleTransitionError::IllegalPhase);
+            return Err(LifecycleTransitionError::IllegalPhase.into());
         };
         self.transition(ApplyTransition::BeginFallback {
             expected_epoch: epoch,
         })?;
         self.request_operation_cancellation();
-        let lease = LegacyFallbackLease {
+        let mut lease = LegacyFallbackLease {
             coordinator: self.clone(),
             epoch,
+            restore_native_on_drop: true,
         };
-        self.wait_for_applies(diagnostic_interval).await;
+        if let Err(error) = self.wait_for_applies(diagnostic_interval).await {
+            let phase = self.apply_phase();
+            let LegacyFallbackError::ApplyDrainTimedOut {
+                in_flight,
+                operations,
+                ..
+            } = error
+            else {
+                return Err(error);
+            };
+            tracing::error!(
+                phase = phase.label(),
+                apply_epoch = epoch.get(),
+                in_flight,
+                operations,
+                elapsed_ms = u64::try_from(LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE.as_millis())
+                    .unwrap_or(u64::MAX),
+                "native block applies did not drain before the legacy fallback deadline"
+            );
+            metrics::counter!("sync.zakura.legacy_fallback.apply_drain_fatal.total").increment(1);
+            lease.restore_native_on_drop = false;
+            self.transition(ApplyTransition::Fail {
+                expected_epoch: epoch,
+            })?;
+            return Err(error);
+        }
         self.transition(ApplyTransition::ActivateFallback {
             expected_epoch: epoch,
         })?;
@@ -306,13 +352,23 @@ impl SyncCoordinator {
         Ok(lease)
     }
 
-    async fn wait_for_applies(&self, diagnostic_interval: Duration) {
+    async fn wait_for_applies(
+        &self,
+        diagnostic_interval: Duration,
+    ) -> Result<(), LegacyFallbackError> {
         let diagnostic_interval = if diagnostic_interval.is_zero() {
             Duration::from_secs(1)
         } else {
             diagnostic_interval
         };
+        if self.in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && self.operation_count() == 0
+        {
+            return Ok(());
+        }
         let started = tokio::time::Instant::now();
+        let deadline = tokio::time::sleep(LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE);
+        tokio::pin!(deadline);
         loop {
             let drained = self.drained.notified();
             tokio::pin!(drained);
@@ -320,19 +376,32 @@ impl SyncCoordinator {
             let in_flight = self.in_flight.load(std::sync::atomic::Ordering::SeqCst);
             let operations = self.operation_count();
             if in_flight == 0 && operations == 0 {
-                return;
+                return Ok(());
             }
-            if tokio::time::timeout(diagnostic_interval, drained)
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    in_flight,
-                    operations,
-                    apply_epoch = self.apply_phase().epoch().get(),
-                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    "native block applies remain active while fallback waits for its exclusive lease"
-                );
+            tokio::select! {
+                biased;
+                _ = drained => {}
+                _ = &mut deadline => {
+                    let in_flight = self.in_flight.load(std::sync::atomic::Ordering::SeqCst);
+                    let operations = self.operation_count();
+                    if in_flight == 0 && operations == 0 {
+                        return Ok(());
+                    }
+                    return Err(LegacyFallbackError::ApplyDrainTimedOut {
+                        epoch: self.apply_phase().epoch(),
+                        in_flight,
+                        operations,
+                    });
+                }
+                _ = tokio::time::sleep(diagnostic_interval) => {
+                    tracing::warn!(
+                        in_flight,
+                        operations,
+                        apply_epoch = self.apply_phase().epoch().get(),
+                        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "native block applies remain active while fallback waits for its exclusive lease"
+                    );
+                }
             }
         }
     }
@@ -674,6 +743,9 @@ impl Drop for AcceptedBlockApplyOperation {
 
 impl Drop for LegacyFallbackLease {
     fn drop(&mut self) {
+        if !self.restore_native_on_drop {
+            return;
+        }
         if let Err(error) = self.coordinator.transition(ApplyTransition::ResumeNative {
             expected_epoch: self.epoch,
         }) {
@@ -712,6 +784,7 @@ mod tests {
         let stale = LegacyFallbackLease {
             coordinator: coordinator.clone(),
             epoch: LifecycleEpoch::INITIAL,
+            restore_native_on_drop: true,
         };
         drop(stale);
         assert_eq!(coordinator.apply_phase(), resumed);
@@ -928,7 +1001,9 @@ mod tests {
             .expect("the fallback task remains live");
         assert!(matches!(
             result,
-            Err(LifecycleTransitionError::IllegalPhase)
+            Err(LegacyFallbackError::Lifecycle(
+                LifecycleTransitionError::IllegalPhase
+            ))
         ));
         assert!(matches!(
             coordinator.apply_phase(),
@@ -941,6 +1016,75 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_fails_when_an_apply_remains_pending_for_thirty_minutes() {
+        let coordinator = SyncCoordinator::new();
+        let operation = coordinator
+            .queue_apply()
+            .expect("native ownership admits a queued operation");
+        let fallback_coordinator = coordinator.clone();
+        let fallback = tokio::spawn(async move {
+            fallback_coordinator
+                .acquire_legacy_fallback(Duration::from_secs(30))
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE - Duration::from_secs(1)).await;
+        assert!(!fallback.is_finished());
+        assert!(matches!(
+            coordinator.apply_phase(),
+            ApplyPhase::FallbackDraining { .. }
+        ));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = fallback.await.expect("the fallback task remains live");
+        assert!(matches!(
+            result,
+            Err(LegacyFallbackError::ApplyDrainTimedOut {
+                in_flight: 0,
+                operations: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            coordinator.apply_phase(),
+            ApplyPhase::Failed { .. }
+        ));
+        drop(operation);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_apply_wins_before_the_fallback_deadline() {
+        let coordinator = SyncCoordinator::new();
+        let accepted = coordinator
+            .queue_apply()
+            .expect("native ownership admits a queued operation")
+            .accept()
+            .expect("the queued operation becomes accepted");
+        let fallback_coordinator = coordinator.clone();
+        let fallback = tokio::spawn(async move {
+            fallback_coordinator
+                .acquire_legacy_fallback(Duration::from_secs(30))
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE - Duration::from_nanos(1)).await;
+        accepted.complete(BlockApplyTerminal::Committed);
+        tokio::time::advance(Duration::from_nanos(1)).await;
+
+        let lease = fallback
+            .await
+            .expect("the fallback task remains live")
+            .expect("the completed operation lets fallback activate");
+        assert!(matches!(
+            coordinator.apply_phase(),
+            ApplyPhase::LegacyFallback { .. }
+        ));
+        drop(lease);
     }
 
     #[tokio::test]

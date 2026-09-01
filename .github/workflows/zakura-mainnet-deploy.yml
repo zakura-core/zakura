@@ -325,6 +325,41 @@ jobs:
           printf '%s\n' "$(( $(date +%s) + 1200 ))" \
             | sudo tee /run/zakura-fleet-watchdog/deploy-suppressed-until >/dev/null
 
+      - name: Suppress compatibility watchdog alerts during deploy
+        # This stays in workflow-owned code so rollback refs whose deployer
+        # predates suppression are still covered.
+        if: ${{ !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
+        run: |
+          set -euo pipefail
+
+          if ! timeout --signal=TERM --kill-after=5s 60s \
+            ssh \
+              -o BatchMode=yes \
+              -o ConnectTimeout=20 \
+              -o ServerAliveInterval=10 \
+              -o ServerAliveCountMax=3 \
+              -o StrictHostKeyChecking=yes \
+              -- root@159.203.113.196 bash -s <<'REMOTE'; then
+          set -euo pipefail
+
+          marker=/run/zakura-watchdog/deployment-suppressed-until
+          mkdir -p -m 755 "$(dirname "$marker")"
+          marker_tmp="$(mktemp "${marker}.tmp.XXXXXX")"
+          cleanup() {
+            rm -f "$marker_tmp"
+          }
+          trap cleanup EXIT
+          printf '%s\n' "$(( $(date +%s) + 1200 ))" > "$marker_tmp"
+          chmod 644 "$marker_tmp"
+          mv -f "$marker_tmp" "$marker"
+          trap - EXIT
+          if systemctl is-active --quiet zakura-watchdog; then
+            systemctl restart zakura-watchdog
+          fi
+          REMOTE
+            echo "::warning::failed to suppress compatibility watchdog alerts; continuing deploy" >&2
+          fi
+
       - name: Deploy fleet
         working-directory: deploy/deployer
         env:

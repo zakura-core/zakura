@@ -68,6 +68,10 @@ Tracked repository files:
 - Each node's `public_ip` controls its advertised legacy and Zakura addresses.
   The legacy address uses port 8233. Zakura combines the same public IP with
   its port 8234 listener when it creates the signed discovery record.
+- `health_min_connected_peers` controls the health endpoint's legacy peer
+  threshold. The v2-only node sets this threshold to zero because the health
+  endpoint does not count Zakura connections. Its readiness check still
+  requires a recent chain tip within the configured block distance.
 - `continuous-sync.py` is the host-local controller.
 - `alert-monitor.py` is the cluster Slack alerter.
 - `alert-status.py` emits one node's local status as JSON for peer queries.

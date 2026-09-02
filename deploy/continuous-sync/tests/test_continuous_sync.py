@@ -278,6 +278,26 @@ class ContinuousSyncTests(unittest.TestCase):
                     f"{node.raw['public_ip']}:8233",
                 )
 
+    def test_deploy_disables_legacy_peer_health_gate_only_for_v2_only_node(self):
+        nodes = deploy.load_nodes(
+            ROOT / "deploy" / "continuous-sync" / "nodes.toml",
+            None,
+        )
+        expected = {
+            "temp-zakura-sync-test-1": 1,
+            "temp-zakura-sync-test-2": 0,
+            "temp-zakura-sync-test-5": 1,
+        }
+
+        for node in nodes:
+            with self.subTest(node=node.name):
+                rendered = deploy.render_files(node)
+                config = tomllib.loads(rendered["zakurad.toml.template"])
+                self.assertEqual(
+                    config["health"]["min_connected_peers"],
+                    expected[node.name],
+                )
+
     def test_deploy_rejects_node_without_public_ip(self):
         inventory = """
 [[nodes]]

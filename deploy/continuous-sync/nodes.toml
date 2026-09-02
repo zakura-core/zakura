@@ -33,6 +33,7 @@ stall_seconds = 600
 max_run_seconds = 172800
 ready_samples = 6
 ready_sample_interval_seconds = 30
+health_min_connected_peers = 1
 min_free_bytes = 10737418240
 retention_runs = 3
 cooldown_seconds = 60
@@ -68,6 +69,7 @@ alias = "temp-zakura-sync-test-2"
 public_ip = "138.197.218.91"
 mode_label = "Zakura/v2-only"
 p2p_stack = "zakura"
+health_min_connected_peers = 0
 
 [[nodes]]
 name = "temp-zakura-sync-test-5"

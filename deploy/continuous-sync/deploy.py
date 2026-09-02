@@ -174,6 +174,7 @@ def subst_for(node: Node) -> dict[str, str]:
         "MAX_RUN_SECONDS": str(raw["max_run_seconds"]),
         "READY_SAMPLES": str(raw["ready_samples"]),
         "READY_SAMPLE_INTERVAL_SECONDS": str(raw["ready_sample_interval_seconds"]),
+        "HEALTH_MIN_CONNECTED_PEERS": str(raw["health_min_connected_peers"]),
         "MIN_FREE_BYTES": str(raw["min_free_bytes"]),
         "RETENTION_RUNS": str(raw["retention_runs"]),
         "COOLDOWN_SECONDS": str(raw["cooldown_seconds"]),

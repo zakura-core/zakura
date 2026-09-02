@@ -4,6 +4,7 @@
 [network]
 network = "Mainnet"
 listen_addr = "0.0.0.0:8233"
+external_addr = "{{PUBLIC_IP}}:8233"
 cache_dir = "{{STATE_CACHE_DIR}}"
 p2p_stack = "{{P2P_STACK}}"
 

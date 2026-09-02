@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -261,6 +262,40 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertIn("OnUnitActiveSec=1m", rendered["zakura-monitor.timer"])
         self.assertIn("down_confirmation_samples = 2", rendered["alert-monitor.toml"])
         self.assertIn("zakura.service", rendered)
+
+    def test_deploy_renders_each_node_public_ip_as_external_address(self):
+        nodes = deploy.load_nodes(
+            ROOT / "deploy" / "continuous-sync" / "nodes.toml",
+            None,
+        )
+
+        for node in nodes:
+            with self.subTest(node=node.name):
+                rendered = deploy.render_files(node)
+                config = tomllib.loads(rendered["zakurad.toml.template"])
+                self.assertEqual(
+                    config["network"]["external_addr"],
+                    f"{node.raw['public_ip']}:8233",
+                )
+
+    def test_deploy_rejects_node_without_public_ip(self):
+        inventory = """
+[[nodes]]
+name = "missing-public-ip"
+hostname = "missing-public-ip"
+ssh_string = "root@example.test"
+mode_label = "test"
+p2p_stack = "zakura"
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nodes.toml"
+            path.write_text(inventory, encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                deploy.DeployError,
+                "node missing required field 'public_ip'",
+            ):
+                deploy.load_nodes(path, None)
 
     def test_deploy_renders_expanded_legacy_alert_inventory(self):
         nodes = deploy.load_nodes(

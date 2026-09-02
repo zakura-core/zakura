@@ -65,6 +65,9 @@ or run the **Zakura continuous genesis sync fleet** workflow with
 Tracked repository files:
 
 - `nodes.toml` is the source-of-truth fleet inventory and policy.
+- Each node's `public_ip` controls its advertised legacy and Zakura addresses.
+  The legacy address uses port 8233. Zakura combines the same public IP with
+  its port 8234 listener when it creates the signed discovery record.
 - `continuous-sync.py` is the host-local controller.
 - `alert-monitor.py` is the cluster Slack alerter.
 - `alert-status.py` emits one node's local status as JSON for peer queries.

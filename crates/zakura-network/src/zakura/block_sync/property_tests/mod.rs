@@ -4,4 +4,6 @@
 //! in [`support`]; it must not become another validation layer.
 
 mod get_blocks;
+mod get_blocks_serving;
+mod get_blocks_serving_api;
 mod support;

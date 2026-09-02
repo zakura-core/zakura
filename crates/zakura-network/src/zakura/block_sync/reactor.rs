@@ -133,6 +133,7 @@ pub fn spawn_block_sync_reactor(
         mpsc::channel(startup.config.peer_limits.inbound_queue_depth.max(1));
     let events_keepalive = events_tx.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+    let lifecycle_keepalive = lifecycle_tx.clone();
     let (peer_lifecycle_tx, peer_lifecycle_rx) = mpsc::unbounded_channel();
     // Size the action channel so the Sequencer can dispatch a full checkpoint
     // window of `SubmitBlock`s (`submitted_apply_limit`) plus the query/misbehavior
@@ -268,6 +269,7 @@ pub fn spawn_block_sync_reactor(
         events: events_rx,
         _events_keepalive: events_keepalive,
         lifecycle: lifecycle_rx,
+        _lifecycle_keepalive: lifecycle_keepalive,
         peer_lifecycle: peer_lifecycle_rx,
         actions: actions_tx,
         routine_to_reactor: routine_to_reactor_rx,
@@ -304,6 +306,10 @@ pub(super) struct BlockSyncReactor {
     /// as a consumer moved (not cloned) the handle. The reactor never sends on it.
     _events_keepalive: mpsc::Sender<BlockSyncEvent>,
     lifecycle: mpsc::UnboundedReceiver<BlockSyncEvent>,
+    /// A keep-alive sender clone for the public control channel. The service
+    /// stores only the private peer lifecycle sender, so consuming the public
+    /// handle must not make this receiver close and stop the reactor.
+    _lifecycle_keepalive: mpsc::UnboundedSender<BlockSyncEvent>,
     /// Service-owned session lifecycle events with generation identity.
     peer_lifecycle: mpsc::UnboundedReceiver<BlockSyncPeerLifecycleEvent>,
     actions: mpsc::Sender<BlockSyncAction>,

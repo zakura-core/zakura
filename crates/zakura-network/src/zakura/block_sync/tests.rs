@@ -6474,6 +6474,30 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     ));
 }
 
+/// Moving the public handle into the service must not close the now-unused
+/// public control channel and terminate the reactor before peer admission.
+#[tokio::test]
+async fn service_owned_handle_keeps_public_control_channel_alive() {
+    let config = ZakuraBlockSyncConfig::default();
+    let startup = BlockSyncStartup::inert(config.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle);
+
+    let _peer = connect_peer_with_status(
+        &service,
+        &mut actions,
+        92,
+        block::Height(1),
+        block::Hash([1; 32]),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    reactor_task.abort();
+    let _ = reactor_task.await;
+}
+
 /// A delayed connect for an older session must not replace the newer session
 /// already installed for the same peer. Its later disconnect must be stale too.
 #[tokio::test]

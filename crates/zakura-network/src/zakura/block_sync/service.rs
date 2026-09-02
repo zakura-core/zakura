@@ -9,6 +9,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
+use tokio::sync::Notify;
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
@@ -41,6 +42,7 @@ pub struct BlockSyncPeerSession {
     direction: ServicePeerDirection,
     send: FramedSend,
     cancel_token: CancellationToken,
+    reactor_ready: Arc<Notify>,
 }
 
 impl BlockSyncPeerSession {
@@ -50,6 +52,7 @@ impl BlockSyncPeerSession {
             direction,
             send: session.sender(),
             cancel_token: session.cancel_token(),
+            reactor_ready: Arc::new(Notify::new()),
         }
     }
 
@@ -67,12 +70,23 @@ impl BlockSyncPeerSession {
             direction: ServicePeerDirection::Outbound,
             send,
             cancel_token,
+            reactor_ready: Arc::new(Notify::new()),
         }
     }
 
     /// Authenticated peer identity for this block-sync session.
     pub fn peer_id(&self) -> &ZakuraPeerId {
         &self.peer_id
+    }
+
+    /// Wait until the reactor has installed or rejected this session.
+    pub(super) async fn wait_until_reactor_ready(&self) {
+        self.reactor_ready.notified().await;
+    }
+
+    /// Release the peer routine after the reactor resolves session admission.
+    pub(super) fn mark_reactor_ready(&self) {
+        self.reactor_ready.notify_one();
     }
 
     /// Direction of the underlying Zakura connection.
@@ -686,39 +700,60 @@ impl Service for BlockSyncService {
             let block_sync_session = block_sync_session.clone();
             let peer_id = peer_id.clone();
             async move {
-                let result = match routine_wiring {
-                    Some(wiring) => {
-                        let generation = routine_generation.expect(
-                            "production block-sync wiring allocates a routine generation before spawn",
-                        );
-                        let routine = super::peer_routine::PeerRoutine::new(
-                            peer_id,
-                            conn_id,
-                            block_sync_session,
-                            recv,
-                            wiring.config,
-                            !re_admitted_after_no_progress,
-                            generation,
-                            wiring.budget,
-                            wiring.work,
-                            wiring.registry,
-                            wiring.received_throughput,
-                            wiring.sequencer_input,
-                            wiring.sequencer_input_bytes,
-                            wiring.sequencer_input_decoded_attributed_memory_bytes,
-                            wiring.actions,
-                            wiring.routine_to_reactor,
-                            wiring.view,
-                            run_cancel,
-                            wiring.trace,
-                        );
-                        routine.run().await
+                let reactor_ready = if routine_wiring.is_some() {
+                    tokio::select! {
+                        () = block_sync_session.wait_until_reactor_ready() => true,
+                        () = run_cancel.cancelled() => false,
                     }
-                    None => drain_inbound(recv, run_cancel).await,
+                } else {
+                    true
+                };
+                let result = if !reactor_ready || run_cancel.is_cancelled() {
+                    Ok(())
+                } else if let Some(wiring) = routine_wiring {
+                    let generation = routine_generation.expect(
+                        "production block-sync wiring allocates a routine generation before spawn",
+                    );
+                    let routine = super::peer_routine::PeerRoutine::new(
+                        peer_id,
+                        conn_id,
+                        block_sync_session,
+                        recv,
+                        wiring.config,
+                        !re_admitted_after_no_progress,
+                        generation,
+                        wiring.budget,
+                        wiring.work,
+                        wiring.registry,
+                        wiring.received_throughput,
+                        wiring.sequencer_input,
+                        wiring.sequencer_input_bytes,
+                        wiring.sequencer_input_decoded_attributed_memory_bytes,
+                        wiring.actions,
+                        wiring.routine_to_reactor,
+                        wiring.view,
+                        run_cancel,
+                        wiring.trace,
+                    );
+                    routine.run().await
+                } else {
+                    drain_inbound(recv, run_cancel).await
                 };
                 handle_pipe_exit("block-sync", &connection_cancel_token, &close_cause, result);
             }
         };
+        // Queue admission before the supervised task can emit its teardown, so
+        // even an already-cancelled transport is observed as connect then
+        // disconnect by the reactor.
+        if self
+            .inner
+            .lifecycle
+            .send(BlockSyncEvent::PeerConnected(block_sync_session))
+            .is_err()
+        {
+            service_cancel_token.cancel();
+        }
+
         // Let the returned handle drop to detach the supervised task (like
         // `tokio::spawn`); the `PipeTeardown` still runs on every exit path.
         spawn_supervised_pipe(
@@ -728,11 +763,6 @@ impl Service for BlockSyncService {
             on_panic,
             pipe,
         );
-
-        let _ = self
-            .inner
-            .lifecycle
-            .send(BlockSyncEvent::PeerConnected(block_sync_session));
     }
 
     fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {

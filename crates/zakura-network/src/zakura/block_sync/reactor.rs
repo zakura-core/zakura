@@ -719,6 +719,7 @@ impl BlockSyncReactor {
     async fn handle_peer_connected(&mut self, session: BlockSyncPeerSession) {
         let peer = session.peer_id().clone();
         let direction = session.direction();
+        let reactor_ready = session.clone();
         let decision = self.admission_decision_for(&peer, direction);
         if decision != ServiceAdmissionDecision::Admit {
             // Reject: cancel the session (which also cancels the already-spawned
@@ -736,6 +737,7 @@ impl BlockSyncReactor {
             self.registry.remove(&peer);
             self.publish_peer_snapshot();
             self.publish_candidate_state();
+            session.mark_reactor_ready();
             return;
         }
 
@@ -753,6 +755,7 @@ impl BlockSyncReactor {
         self.publish_peer_snapshot();
         self.publish_candidate_state();
         self.send_status_and_mark_refresh(&peer, "peer_connected", Instant::now());
+        reactor_ready.mark_reactor_ready();
         // The routine fills its own slots; it begins want-work as soon as it has
         // a status and work.
     }

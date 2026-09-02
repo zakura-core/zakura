@@ -1,9 +1,7 @@
-//! Executable candidate contracts for the two block-sync pilot messages.
+//! Executable contract evidence for the GetBlocks wire-contract pilot.
 //!
-//! Keep message-specific oracles and generators in their named modules. Shared
-//! reporting belongs in [`support`]; it must not become a second production
-//! codec or validation layer.
+//! The oracle stays separate from the production codec. Shared reporting belongs
+//! in [`support`]; it must not become another validation layer.
 
 mod get_blocks;
-mod status;
 mod support;

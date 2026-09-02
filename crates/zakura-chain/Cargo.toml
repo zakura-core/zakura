@@ -39,7 +39,7 @@ zip218 = []
 # ZIP 233.
 zip233 = ["zcash_primitives/zip-233"]
 
-# ZIP 235 "Network Sustainability Mechanism: Burning of Transaction Fees": the coinbase
+# ZIP 235 "Remove 60% of Transaction Fees From Circulation": the coinbase
 # must remove at least 60% of the block's transaction fees from circulation.
 #
 # ZIP 235 must deploy at the same time as or after ZIP 233, because the burn is carried

@@ -146,7 +146,7 @@ zakura-node-services = { path = "../zakura-node-services", version = "3.2.2", fe
     "rpc-client",
 ] }
 zakura-script = { path = "../zakura-script", version = "3.2.2" }
-zakura-state = { path = "../zakura-state", version = "7.1.0" }
+zakura-state = { path = "../zakura-state", version = "7.2.0" }
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"] }
 # Only used to read the validity dates of the configured RPC TLS certificates.
@@ -173,7 +173,7 @@ zakura-consensus = { path = "../zakura-consensus", version = "9.0.0", features =
 zakura-network = { path = "../zakura-network", version = "7.0.1", features = [
     "proptest-impl",
 ] }
-zakura-state = { path = "../zakura-state", version = "7.1.0", features = [
+zakura-state = { path = "../zakura-state", version = "7.2.0", features = [
     "proptest-impl",
 ] }
 

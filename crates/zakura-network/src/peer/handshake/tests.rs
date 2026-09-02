@@ -82,6 +82,38 @@ fn diagnostic_remote_addr_excludes_proxy_connection_identifiers() {
 }
 
 #[test]
+fn only_non_serving_outbound_peers_are_rejected_while_syncing() {
+    let outbound = ConnectedAddr::new_outbound_direct(peer_addr(8233));
+    let inbound = ConnectedAddr::new_inbound_direct(peer_addr(8233));
+
+    assert!(is_non_serving_outbound_peer(
+        &outbound,
+        PeerServices::empty(),
+        true,
+    ));
+    assert!(!is_non_serving_outbound_peer(
+        &outbound,
+        PeerServices::NODE_NETWORK,
+        true,
+    ));
+    assert!(!is_non_serving_outbound_peer(
+        &outbound,
+        PeerServices::empty(),
+        false,
+    ));
+    assert!(!is_non_serving_outbound_peer(
+        &inbound,
+        PeerServices::empty(),
+        true,
+    ));
+    assert!(!is_non_serving_outbound_peer(
+        &ConnectedAddr::new_isolated(),
+        PeerServices::empty(),
+        true,
+    ));
+}
+
+#[test]
 fn noncanonical_shielded_proof_size_gets_ban_score() {
     let addr = peer_addr(8233);
     let change = inbound_error_address_change(

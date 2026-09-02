@@ -724,6 +724,17 @@ fn should_attempt_zakura_upgrade(config: &Config, connection_info: &ConnectionIn
             .contains(PeerServices::NODE_P2P_V2)
 }
 
+/// Returns true if this outbound peer cannot serve the historical blocks needed during sync.
+fn is_non_serving_outbound_peer(
+    connected_addr: &ConnectedAddr,
+    remote_services: PeerServices,
+    is_syncing: bool,
+) -> bool {
+    is_syncing
+        && matches!(connected_addr, OutboundDirect { .. } | OutboundProxy { .. })
+        && !remote_services.contains(PeerServices::NODE_NETWORK)
+}
+
 /// Negotiate the Zcash network protocol version with the remote peer at `connected_addr`, using
 /// the connection `peer_conn`.
 ///
@@ -811,6 +822,11 @@ where
         .timestamp_opt(now - now.rem_euclid(5 * 60), 0)
         .single()
         .expect("in-range number of seconds and valid nanosecond");
+
+    // Outbound peers must be able to serve historical blocks while this node is syncing.
+    let is_syncing = !minimum_peer_version
+        .chain_tip()
+        .is_at_or_near_network_tip(&config.network);
 
     let (their_addr, our_services, our_listen_addr) = match connected_addr {
         // Version messages require an address, so we use
@@ -951,6 +967,28 @@ where
 
         // Disconnect if peer is using an obsolete version.
         return Err(HandshakeError::ObsoleteVersion(remote.version));
+    }
+
+    // Non-serving peers can occupy every outbound slot without satisfying block requests,
+    // stalling initial block download. Near the tip, accept them because pruned peers can still
+    // serve recent blocks and transactions. Inbound and isolated connections remain unaffected.
+    if is_non_serving_outbound_peer(connected_addr, remote.services, is_syncing) {
+        debug!(
+            remote_ip = %addr_label,
+            ?remote.services,
+            ?remote.user_agent,
+            "disconnecting from non-serving peer",
+        );
+
+        metrics::counter!(
+            "zcash.net.peers.missing_services",
+            "remote_services" => format!("{:?}", remote.services),
+        )
+        .increment(1);
+
+        return Err(HandshakeError::MissingRequiredServices {
+            services: remote.services,
+        });
     }
 
     let negotiated_version = min(constants::CURRENT_NETWORK_PROTOCOL_VERSION, remote.version);
@@ -1613,6 +1651,9 @@ where
                         HandshakeError::Io(_) => "io_error",
                         HandshakeError::Serialization(_) => "serialization",
                         HandshakeError::ObsoleteVersion(_) => "obsolete_version",
+                        HandshakeError::MissingRequiredServices { .. } => {
+                            "missing_required_services"
+                        }
                         HandshakeError::Timeout => "timeout",
                         HandshakeError::ZakuraUpgradeSelected
                         | HandshakeError::ZakuraUpgrade(_)

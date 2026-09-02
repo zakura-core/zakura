@@ -71,10 +71,20 @@ fn end_of_support_height_per_network() {
 fn end_of_support_remaining_blocks() {
     let last_supported_height =
         Height(ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY));
+    let warning_height =
+        Height(ESTIMATED_RELEASE_HEIGHT + (EOS_WARN_AFTER * ESTIMATED_BLOCKS_PER_DAY));
 
     assert_eq!(
         end_of_support::remaining_blocks(Height(ESTIMATED_RELEASE_HEIGHT), &Network::Mainnet),
         Some(i64::from(EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY)),
+    );
+    assert_eq!(
+        end_of_support::remaining_blocks(warning_height, &Network::Mainnet),
+        Some(i64::from(3 * ESTIMATED_BLOCKS_PER_DAY)),
+    );
+    assert_eq!(
+        end_of_support::remaining_blocks(Height(warning_height.0 + 1), &Network::Mainnet),
+        Some(i64::from(3 * ESTIMATED_BLOCKS_PER_DAY) - 1),
     );
     assert_eq!(
         end_of_support::remaining_blocks(last_supported_height, &Network::Mainnet),

@@ -70,6 +70,7 @@ public_ip = "138.197.218.91"
 mode_label = "Zakura/v2-only"
 p2p_stack = "zakura"
 health_min_connected_peers = 0
+branch = "fix/continuous-sync-native-discovery-address"
 
 [[nodes]]
 name = "temp-zakura-sync-test-5"

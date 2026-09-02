@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 
 use crate::{
-    amount::{Amount, NegativeAllowed, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative, MAX_MONEY},
     value_balance::{ValueBalance, ValueBalanceError},
 };
 
@@ -59,6 +59,24 @@ fn ironwood_chain_pool_underflow_is_reported_as_ironwood() {
         ValueBalance::<NonNegative>::zero().add_chain_value_pool_change(chain_value_pool_change),
         Err(ValueBalanceError::Ironwood(_))
     ));
+}
+
+#[test]
+fn total_over_max_money_is_rejected() {
+    let _init_guard = zakura_test::init();
+
+    let mut chain = ValueBalance::<NonNegative>::zero();
+    chain.set_transparent_value_balance(ValueBalance::from_transparent_amount(
+        Amount::try_from(MAX_MONEY).expect("MAX_MONEY is a valid amount"),
+    ));
+
+    let error = chain
+        .add_chain_value_pool_change(ValueBalance::from_sprout_amount(
+            Amount::<NegativeAllowed>::try_from(MAX_MONEY).expect("MAX_MONEY is a valid amount"),
+        ))
+        .expect_err("a total exceeding MAX_MONEY must be rejected");
+
+    assert!(matches!(error, ValueBalanceError::Total(_)));
 }
 
 #[test]

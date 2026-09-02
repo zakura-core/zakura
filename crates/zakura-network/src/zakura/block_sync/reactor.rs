@@ -249,6 +249,7 @@ pub fn spawn_block_sync_reactor(
         pending_body_supplier_restart: None,
         pending_operator_body_retry: None,
         next_needed_query_id: NonZeroU64::new(1),
+        next_serving_request_id: NonZeroU64::new(1),
         last_reset_epoch: 0,
         last_reaction_epoch: 0,
         last_view: initial_view(startup.frontiers),
@@ -343,6 +344,9 @@ pub(super) struct BlockSyncReactor {
     /// Next reactor-local identity for a body-work state query.
     /// `None` means the reactor exhausted the identifier space and stops scheduling.
     next_needed_query_id: Option<NonZeroU64>,
+    /// Next identity for an inbound `GetBlocks` request sent to the state driver.
+    /// `None` means the reactor exhausted the identifier space and stops serving.
+    next_serving_request_id: Option<BlockRangeRequestId>,
     /// Last `reset_epoch` the reactor reacted to, so it can tell an advance from
     /// a destructive reset.
     last_reset_epoch: u64,
@@ -626,21 +630,30 @@ impl BlockSyncReactor {
                 .await
             }
             BlockSyncEvent::BlockRangeResponseReady {
+                request_id,
                 peer,
                 start_height,
                 requested_count,
                 blocks,
             } => {
-                self.handle_block_range_response_ready(peer, start_height, requested_count, blocks)
-                    .await;
+                self.handle_block_range_response_ready(
+                    request_id,
+                    peer,
+                    start_height,
+                    requested_count,
+                    blocks,
+                )
+                .await;
             }
             BlockSyncEvent::BlockRangeResponseFinished {
+                request_id,
                 peer,
                 start_height,
                 requested_count,
                 returned_count,
             } => {
                 self.handle_block_range_response_finished(
+                    request_id,
                     peer,
                     start_height,
                     requested_count,
@@ -1425,8 +1438,14 @@ impl BlockSyncReactor {
             return;
         }
 
+        let Some(request_id) = self.next_serving_request_id else {
+            let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
+            self.send_range_unavailable(&peer, start_height, unavailable_count);
+            return;
+        };
+        self.next_serving_request_id = request_id.get().checked_add(1).and_then(NonZeroU64::new);
         let started_serving = self.state.peers.get_mut(&peer).is_some_and(|peer_state| {
-            peer_state.try_start_serving_blocks(local_inflight_cap, start_height)
+            peer_state.try_start_serving_blocks(local_inflight_cap, request_id, start_height)
         });
         if !started_serving {
             let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
@@ -1438,27 +1457,32 @@ impl BlockSyncReactor {
         if requested_count == 0 {
             let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
             self.send_range_unavailable(&peer, start_height, unavailable_count);
-            self.finish_serving_blocks(&peer, start_height);
+            self.finish_serving_blocks(&peer, request_id, start_height);
             return;
         }
 
         if !self.dispatch_action(BlockSyncAction::QueryBlocksByHeightRange {
+            request_id,
             peer: peer.clone(),
             start: start_height,
             count: requested_count,
         }) {
-            self.finish_serving_blocks(&peer, start_height);
+            self.finish_serving_blocks(&peer, request_id, start_height);
         }
     }
 
     async fn handle_block_range_response_ready(
         &mut self,
+        request_id: BlockRangeRequestId,
         peer: ZakuraPeerId,
         start_height: block::Height,
         requested_count: u32,
         blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
     ) {
-        let prepare_elapsed = self.serving_blocks_elapsed(&peer, start_height);
+        let Some(prepare_elapsed) = self.serving_blocks_elapsed(&peer, request_id, start_height)
+        else {
+            return;
+        };
         let send_started = Instant::now();
         let max_response_bytes = u64::from(self.startup.config.advertised_max_response_bytes());
         let mut sent_blocks = 0u32;
@@ -1496,7 +1520,7 @@ impl BlockSyncReactor {
         } else {
             self.send_blocks_done(&peer, start_height, sent_blocks);
         }
-        let total_elapsed = self.finish_serving_blocks(&peer, start_height);
+        let total_elapsed = self.finish_serving_blocks(&peer, request_id, start_height);
         self.trace_range_response_sent(
             &peer,
             RangeResponseTrace {
@@ -1505,7 +1529,7 @@ impl BlockSyncReactor {
                 sent_count: sent_blocks,
                 sent_bytes,
                 reason,
-                prepare_elapsed,
+                prepare_elapsed: Some(prepare_elapsed),
                 send_elapsed: send_started.elapsed(),
                 total_elapsed,
             },
@@ -1514,15 +1538,18 @@ impl BlockSyncReactor {
 
     async fn handle_block_range_response_finished(
         &mut self,
+        request_id: BlockRangeRequestId,
         peer: ZakuraPeerId,
         start_height: block::Height,
         requested_count: u32,
         returned_count: u32,
     ) {
+        let Some(elapsed) = self.finish_serving_blocks(&peer, request_id, start_height) else {
+            return;
+        };
         if returned_count == 0 {
             self.send_range_unavailable(&peer, start_height, requested_count);
         }
-        let elapsed = self.finish_serving_blocks(&peer, start_height);
         self.trace_range_response_sent(
             &peer,
             RangeResponseTrace {
@@ -1531,9 +1558,9 @@ impl BlockSyncReactor {
                 sent_count: returned_count,
                 sent_bytes: 0,
                 reason: "driver_finished",
-                prepare_elapsed: elapsed,
+                prepare_elapsed: Some(elapsed),
                 send_elapsed: Duration::ZERO,
-                total_elapsed: elapsed,
+                total_elapsed: Some(elapsed),
             },
         );
     }
@@ -1602,21 +1629,23 @@ impl BlockSyncReactor {
     fn serving_blocks_elapsed(
         &self,
         peer: &ZakuraPeerId,
+        request_id: BlockRangeRequestId,
         start_height: block::Height,
     ) -> Option<Duration> {
         self.state
             .peers
             .get(peer)
-            .and_then(|peer_state| peer_state.serving_blocks_elapsed(start_height))
+            .and_then(|peer_state| peer_state.serving_blocks_elapsed(request_id, start_height))
     }
 
     fn finish_serving_blocks(
         &mut self,
         peer: &ZakuraPeerId,
+        request_id: BlockRangeRequestId,
         start_height: block::Height,
     ) -> Option<Duration> {
         if let Some(peer_state) = self.state.peers.get_mut(peer) {
-            peer_state.finish_serving_blocks(start_height)
+            peer_state.finish_serving_blocks(request_id, start_height)
         } else {
             None
         }

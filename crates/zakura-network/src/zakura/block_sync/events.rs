@@ -85,6 +85,8 @@ pub enum BlockSyncEvent {
     },
     /// Node wiring finished or abandoned a `Block` response to an inbound `GetBlocks`.
     BlockRangeResponseFinished {
+        /// Exact inbound request being completed.
+        request_id: BlockRangeRequestId,
         /// Peer whose served-response slot can be released.
         peer: ZakuraPeerId,
         /// First requested height.
@@ -96,6 +98,8 @@ pub enum BlockSyncEvent {
     },
     /// State returned committed bodies requested by a peer and the reactor should send them.
     BlockRangeResponseReady {
+        /// Exact inbound request being completed.
+        request_id: BlockRangeRequestId,
         /// Peer whose inbound request is being served.
         peer: ZakuraPeerId,
         /// First requested height.
@@ -258,6 +262,12 @@ impl BlockApplyOutcome {
 /// ignore those stale completions instead of releasing a newer in-flight body.
 pub type BlockApplyToken = u64;
 
+/// Monotonic identity assigned to each inbound `GetBlocks` request.
+///
+/// The state driver echoes this identity so a delayed completion cannot release
+/// a newer serving slot or send blocks through a replacement peer session.
+pub type BlockRangeRequestId = NonZeroU64;
+
 /// Actions emitted by the future block-sync reactor for the service seam.
 #[derive(Clone, Debug)]
 pub enum BlockSyncAction {
@@ -276,6 +286,8 @@ pub enum BlockSyncAction {
     },
     /// Ask node wiring to read committed bodies for an inbound `GetBlocks`.
     QueryBlocksByHeightRange {
+        /// Exact inbound request identity to echo in the response event.
+        request_id: BlockRangeRequestId,
         /// Peer that requested the range.
         peer: ZakuraPeerId,
         /// First height.

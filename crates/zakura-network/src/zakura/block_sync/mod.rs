@@ -67,8 +67,8 @@ pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
 pub use config::{BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
 pub use error::BlockSyncWireError;
 pub use events::{
-    BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
-    BlockSyncEvent, BlockSyncMisbehavior,
+    BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockRangeRequestId, BlockSyncAction,
+    BlockSyncBlockMeta, BlockSyncEvent, BlockSyncMisbehavior,
 };
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;

@@ -50,6 +50,22 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Wait a few seconds at startup so `best_tip_height` is always `Some`.
 const INITIAL_WAIT: Duration = Duration::from_secs(10);
 
+/// The metric that reports whether end of support is enforced on this network.
+///
+/// Set to `1` on Mainnet and `0` on every other network.
+const EOS_ENFORCED_METRIC: &str = "end_of_support.enforced";
+
+/// The metric that reports the last height this release supports.
+///
+/// Only set when end of support is enforced.
+const EOS_HEIGHT_METRIC: &str = "end_of_support.last_supported_height";
+
+/// The metric that reports how many blocks are left before this release halts.
+///
+/// Only set when end of support is enforced. It is negative once the tip goes
+/// past the last supported height, which is the check that halts the node.
+const EOS_REMAINING_BLOCKS_METRIC: &str = "end_of_support.remaining_blocks";
+
 /// Start the end of support checking task for Mainnet.
 pub async fn start(
     network: Network,
@@ -57,11 +73,22 @@ pub async fn start(
 ) -> Result<(), Report> {
     info!("Starting end of support task");
 
+    if let Some(last_supported_height) = end_of_support_height(&network) {
+        metrics::gauge!(EOS_ENFORCED_METRIC).set(1.0);
+        metrics::gauge!(EOS_HEIGHT_METRIC).set(f64::from(last_supported_height.0));
+    } else {
+        metrics::gauge!(EOS_ENFORCED_METRIC).set(0.0);
+    }
+
     tokio::time::sleep(INITIAL_WAIT).await;
 
     loop {
         if network == Network::Mainnet {
             if let Some(tip_height) = latest_chain_tip.best_tip_height() {
+                if let Some(remaining_blocks) = remaining_blocks(tip_height, &network) {
+                    // A difference between two u32 heights is exactly representable as f64.
+                    metrics::gauge!(EOS_REMAINING_BLOCKS_METRIC).set(remaining_blocks as f64);
+                }
                 check(tip_height, &network);
             }
         } else {
@@ -79,6 +106,16 @@ pub fn end_of_support_height(network: &Network) -> Option<Height> {
     (network == &Network::Mainnet).then_some(Height(
         ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY),
     ))
+}
+
+/// Returns the number of blocks left before this release halts, or `None` when
+/// support is not enforced.
+///
+/// The count is negative once `tip_height` goes past the last supported height,
+/// which is the state that halts the node.
+pub fn remaining_blocks(tip_height: Height, network: &Network) -> Option<i64> {
+    end_of_support_height(network)
+        .map(|last_supported_height| i64::from(last_supported_height.0) - i64::from(tip_height.0))
 }
 
 /// Check if the current release is too old and panic if so.

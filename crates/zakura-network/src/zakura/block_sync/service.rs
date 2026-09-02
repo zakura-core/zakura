@@ -38,15 +38,21 @@ pub(crate) fn block_sync_streams() -> &'static [Stream] {
 #[derive(Clone, Debug)]
 pub struct BlockSyncPeerSession {
     peer_id: ZakuraPeerId,
+    session_id: u64,
     direction: ServicePeerDirection,
     send: FramedSend,
     cancel_token: CancellationToken,
 }
 
 impl BlockSyncPeerSession {
-    pub(crate) fn new(session: &PeerStreamSession, direction: ServicePeerDirection) -> Self {
+    pub(crate) fn new(
+        session: &PeerStreamSession,
+        session_id: u64,
+        direction: ServicePeerDirection,
+    ) -> Self {
         Self {
             peer_id: session.peer_id().clone(),
+            session_id,
             direction,
             send: session.sender(),
             cancel_token: session.cancel_token(),
@@ -64,6 +70,7 @@ impl BlockSyncPeerSession {
     ) -> Self {
         Self {
             peer_id,
+            session_id: 0,
             direction: ServicePeerDirection::Outbound,
             send,
             cancel_token,
@@ -73,6 +80,11 @@ impl BlockSyncPeerSession {
     /// Authenticated peer identity for this block-sync session.
     pub fn peer_id(&self) -> &ZakuraPeerId {
         &self.peer_id
+    }
+
+    /// Reactor generation that owns this stream session.
+    pub(super) fn session_id(&self) -> u64 {
+        self.session_id
     }
 
     /// Direction of the underlying Zakura connection.
@@ -550,21 +562,9 @@ impl Service for BlockSyncService {
         let service_cancel_token = session.cancel_token();
         let connection_cancel_token = peer.cancel_token();
         let close_cause = peer.close_cause();
-        let block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
-        let session_id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
         let conn_id = peer.conn_id;
-        let (_session_peer, _stream_kind, _stream_version, recv, send, _session_cancel) =
-            session.into_parts();
 
-        // Production outbound block-sync frames go directly through
-        // `BlockSyncPeerSession` (the per-peer routine's `try_send_get_blocks` /
-        // the reactor's `try_send_status`/serving sends), so the raw transport
-        // sender taken from the stream here is redundant. The outbound stream stays
-        // alive through the `BlockSyncPeerSession` clone the reactor holds, so
-        // nothing is lost by dropping it.
-        drop(send);
-
-        let (old_record, re_admitted_after_no_progress, routine_generation) = {
+        let (old_record, re_admitted_after_no_progress, routine_generation, session_id) = {
             let mut active_peers = self
                 .inner
                 .active_peers
@@ -625,6 +625,10 @@ impl Service for BlockSyncService {
                 } else {
                     (None, false)
                 };
+            // A production session uses the registry's globally unique routine
+            // generation. Handle-less tests use the service-local fallback.
+            let session_id = routine_generation
+                .unwrap_or_else(|| self.inner.next_session_id.fetch_add(1, Ordering::Relaxed));
             let old_record = active_peers.insert(
                 peer_id.clone(),
                 BlockSyncPeerRecord {
@@ -638,8 +642,20 @@ impl Service for BlockSyncService {
                 old_record,
                 re_admitted_after_no_progress,
                 routine_generation,
+                session_id,
             )
         };
+        let block_sync_session = BlockSyncPeerSession::new(&session, session_id, peer.direction);
+        let (_session_peer, _stream_kind, _stream_version, recv, send, _session_cancel) =
+            session.into_parts();
+
+        // Production outbound block-sync frames go directly through
+        // `BlockSyncPeerSession` (the per-peer routine's `try_send_get_blocks` /
+        // the reactor's `try_send_status`/serving sends), so the raw transport
+        // sender taken from the stream here is redundant. The outbound stream stays
+        // alive through the `BlockSyncPeerSession` clone the reactor holds, so
+        // nothing is lost by dropping it.
+        drop(send);
         if let Some(old_record) = old_record {
             old_record.cancel_token.cancel();
         }
@@ -659,7 +675,10 @@ impl Service for BlockSyncService {
                 let should_notify = inner.finish_session(&peer_id, conn_id, session_id);
 
                 if should_notify {
-                    let _ = lifecycle.send(BlockSyncEvent::PeerDisconnected(peer_id));
+                    let _ = lifecycle.send(BlockSyncEvent::PeerDisconnected {
+                        peer: peer_id,
+                        session_id,
+                    });
                 }
             }
         };
@@ -804,10 +823,10 @@ impl Service for BlockSyncService {
         };
 
         record.cancel_token.cancel();
-        let _ = self
-            .inner
-            .lifecycle
-            .send(BlockSyncEvent::PeerDisconnected(peer.clone()));
+        let _ = self.inner.lifecycle.send(BlockSyncEvent::PeerDisconnected {
+            peer: peer.clone(),
+            session_id: record.session_id,
+        });
     }
 
     fn deliver_frame(

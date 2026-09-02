@@ -598,8 +598,19 @@ impl PeerRegistry {
         }
     }
 
-    /// Remove a peer's entry entirely (disconnect/teardown/admission-reject).
-    pub(super) fn remove(&self, peer: &ZakuraPeerId) {
+    /// Remove a peer only when the disconnect still owns its current session.
+    pub(super) fn remove_session(&self, peer: &ZakuraPeerId, session_id: u64) {
+        let mut peers = self.lock();
+        if peers
+            .get(peer)
+            .is_some_and(|entry| entry.generation == session_id)
+        {
+            peers.remove(peer);
+        }
+    }
+
+    #[cfg(test)]
+    fn remove(&self, peer: &ZakuraPeerId) {
         self.lock().remove(peer);
     }
 

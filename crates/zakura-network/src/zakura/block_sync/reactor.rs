@@ -133,6 +133,7 @@ pub fn spawn_block_sync_reactor(
         mpsc::channel(startup.config.peer_limits.inbound_queue_depth.max(1));
     let events_keepalive = events_tx.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+    let (peer_lifecycle_tx, peer_lifecycle_rx) = mpsc::unbounded_channel();
     // Size the action channel so the Sequencer can dispatch a full checkpoint
     // window of `SubmitBlock`s (`submitted_apply_limit`) plus the query/misbehavior
     // spare pool. The resident look-ahead gate — not this channel — bounds body
@@ -237,6 +238,7 @@ pub fn spawn_block_sync_reactor(
     let handle = BlockSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
+        peer_lifecycle: peer_lifecycle_tx,
         peers: peers_rx,
         status: status_rx,
         candidates: candidates_rx,
@@ -266,6 +268,7 @@ pub fn spawn_block_sync_reactor(
         events: events_rx,
         _events_keepalive: events_keepalive,
         lifecycle: lifecycle_rx,
+        peer_lifecycle: peer_lifecycle_rx,
         actions: actions_tx,
         routine_to_reactor: routine_to_reactor_rx,
         _routine_to_reactor_keepalive: routine_to_reactor_keepalive,
@@ -301,6 +304,8 @@ pub(super) struct BlockSyncReactor {
     /// as a consumer moved (not cloned) the handle. The reactor never sends on it.
     _events_keepalive: mpsc::Sender<BlockSyncEvent>,
     lifecycle: mpsc::UnboundedReceiver<BlockSyncEvent>,
+    /// Service-owned session lifecycle events with generation identity.
+    peer_lifecycle: mpsc::UnboundedReceiver<BlockSyncPeerLifecycleEvent>,
     actions: mpsc::Sender<BlockSyncAction>,
     /// Shared routine→reactor channel: serving (`ServeGetBlocks`), status
     /// advertisement (`StatusReceived`), the producer re-query ping
@@ -409,6 +414,10 @@ impl BlockSyncReactor {
                 event = self.lifecycle.recv() => {
                     let Some(event) = event else { break };
                     self.handle_event(event).await;
+                }
+                event = self.peer_lifecycle.recv() => {
+                    let Some(event) = event else { break };
+                    self.handle_peer_lifecycle_event(event).await;
                 }
                 event = self.events.recv() => {
                     let Some(event) = event else { break };
@@ -569,8 +578,17 @@ impl BlockSyncReactor {
             .emit_event(|| BlockEventReceived::new(&event));
         match event {
             BlockSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
-            BlockSyncEvent::PeerDisconnected { peer, session_id } => {
-                self.handle_peer_disconnected(peer, session_id)
+            BlockSyncEvent::PeerDisconnected(peer) => {
+                if let Some(session_id) = self
+                    .state
+                    .peers
+                    .get(&peer)
+                    .map(|peer_state| peer_state.session.session_id())
+                {
+                    self.handle_peer_disconnected(peer, session_id);
+                } else {
+                    self.registry.remove(&peer);
+                }
             }
             BlockSyncEvent::RetryBodyAvailability { hash } => self.retry_body_availability(hash),
             #[cfg(any(test, feature = "proptest-impl"))]
@@ -652,6 +670,28 @@ impl BlockSyncReactor {
         self.publish_metrics();
     }
 
+    /// Apply service-owned session lifecycle changes using exact generation
+    /// identity, so delayed events cannot mutate a replacement session.
+    async fn handle_peer_lifecycle_event(&mut self, event: BlockSyncPeerLifecycleEvent) {
+        match event {
+            BlockSyncPeerLifecycleEvent::Connected(session) => {
+                let trace_event = BlockSyncEvent::PeerConnected(session.clone());
+                self.startup
+                    .trace
+                    .emit_event(|| BlockEventReceived::new(&trace_event));
+                self.handle_peer_connected(session).await;
+            }
+            BlockSyncPeerLifecycleEvent::Disconnected { peer, session_id } => {
+                let trace_event = BlockSyncEvent::PeerDisconnected(peer.clone());
+                self.startup
+                    .trace
+                    .emit_event(|| BlockEventReceived::new(&trace_event));
+                self.handle_peer_disconnected(peer, session_id);
+            }
+        }
+        self.publish_metrics();
+    }
+
     fn admission_decision_for(
         &self,
         peer: &ZakuraPeerId,
@@ -722,6 +762,16 @@ impl BlockSyncReactor {
         let peer = session.peer_id().clone();
         let session_id = session.session_id();
         let direction = session.direction();
+        if self
+            .state
+            .peers
+            .get(&peer)
+            .is_some_and(|peer_state| peer_state.session.session_id() >= session_id)
+        {
+            session.cancel_token().cancel();
+            self.registry.remove_session(&peer, session_id);
+            return;
+        }
         let decision = self.admission_decision_for(&peer, direction);
         if decision != ServiceAdmissionDecision::Admit {
             // Reject: cancel the session (which also cancels the already-spawned

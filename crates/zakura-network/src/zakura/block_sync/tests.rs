@@ -6392,9 +6392,8 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
     drop(old_inbound_tx);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    if let Ok(Some(BlockSyncEvent::PeerDisconnected {
-        peer: disconnected, ..
-    })) = tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+    if let Ok(Some(BlockSyncEvent::PeerDisconnected(disconnected))) =
+        tokio::time::timeout(Duration::from_millis(50), events.recv()).await
     {
         panic!("stale teardown disconnected replacement session for {disconnected:?}");
     }
@@ -6422,13 +6421,15 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
             hash: block::Hash([1; 32]),
         })
         .expect("test fills bounded wire queue");
-    let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+    let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (peer_lifecycle, mut peer_lifecycle_rx) = mpsc::unbounded_channel();
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
         events,
         lifecycle,
+        peer_lifecycle,
         peers,
         status,
         candidates,
@@ -6453,24 +6454,102 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let _inbound_tx = inbound_tx;
 
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), lifecycle_rx.recv())
+        tokio::time::timeout(Duration::from_secs(1), peer_lifecycle_rx.recv())
             .await
             .expect("lifecycle event arrives")
             .expect("lifecycle channel stays open"),
-        BlockSyncEvent::PeerConnected(session) if session.peer_id() == &peer
+        BlockSyncPeerLifecycleEvent::Connected(session) if session.peer_id() == &peer
     ));
 
     service.remove_peer(&peer, 0);
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), lifecycle_rx.recv())
+        tokio::time::timeout(Duration::from_secs(1), peer_lifecycle_rx.recv())
             .await
             .expect("lifecycle event arrives")
             .expect("lifecycle channel stays open"),
-        BlockSyncEvent::PeerDisconnected {
+        BlockSyncPeerLifecycleEvent::Disconnected {
             peer: disconnected,
             ..
         } if disconnected == peer
     ));
+}
+
+/// A delayed connect for an older session must not replace the newer session
+/// already installed for the same peer. Its later disconnect must be stale too.
+#[tokio::test]
+async fn older_peer_connected_event_cannot_replace_newer_session() {
+    let startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    let shutdown = startup.shutdown.clone();
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let target_peer = peer(93);
+    let barrier_peer = peer(94);
+    let old_cancel = CancellationToken::new();
+    let new_cancel = CancellationToken::new();
+    let barrier_cancel = CancellationToken::new();
+    let (old_send, _old_recv) = framed_channel(4);
+    let (new_send, _new_recv) = framed_channel(4);
+    let (barrier_send, _barrier_recv) = framed_channel(4);
+    let old_session = BlockSyncPeerSession::for_test_with_session_id(
+        target_peer.clone(),
+        1,
+        old_send,
+        old_cancel.clone(),
+    );
+    let new_session = BlockSyncPeerSession::for_test_with_session_id(
+        target_peer.clone(),
+        2,
+        new_send,
+        new_cancel.clone(),
+    );
+    let barrier_session = BlockSyncPeerSession::for_test_with_session_id(
+        barrier_peer,
+        3,
+        barrier_send,
+        barrier_cancel,
+    );
+    let mut snapshots = handle.subscribe_peer_snapshot();
+
+    // These events intentionally form one uninterrupted lifecycle step. The
+    // final peer is a FIFO barrier proving the preceding stale events ran.
+    handle
+        .peer_lifecycle
+        .send(BlockSyncPeerLifecycleEvent::Connected(new_session))
+        .expect("reactor keeps the peer lifecycle channel open");
+    handle
+        .peer_lifecycle
+        .send(BlockSyncPeerLifecycleEvent::Connected(old_session))
+        .expect("reactor keeps the peer lifecycle channel open");
+    handle
+        .peer_lifecycle
+        .send(BlockSyncPeerLifecycleEvent::Disconnected {
+            peer: target_peer,
+            session_id: 1,
+        })
+        .expect("reactor keeps the peer lifecycle channel open");
+    handle
+        .peer_lifecycle
+        .send(BlockSyncPeerLifecycleEvent::Connected(barrier_session))
+        .expect("reactor keeps the peer lifecycle channel open");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while snapshots.borrow_and_update().outbound_peers != 2 {
+            snapshots
+                .changed()
+                .await
+                .expect("reactor keeps the peer snapshot channel open");
+        }
+    })
+    .await
+    .expect("reactor processes the lifecycle step");
+
+    assert!(old_cancel.is_cancelled());
+    assert!(!new_cancel.is_cancelled());
+    assert_eq!(handle.peer_snapshot().outbound_peers, 2);
+
+    shutdown.cancel();
+    reactor_task
+        .await
+        .expect("block-sync reactor exits cleanly");
 }
 
 #[tokio::test]

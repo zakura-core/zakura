@@ -543,7 +543,7 @@ impl BlockEventReceived {
             BlockSyncEvent::PeerConnected(session) => BlockEventDetail::PeerConnected {
                 peer: peer_label(session.peer_id()),
             },
-            BlockSyncEvent::PeerDisconnected { peer, .. } => BlockEventDetail::PeerDisconnected {
+            BlockSyncEvent::PeerDisconnected(peer) => BlockEventDetail::PeerDisconnected {
                 peer: peer_label(peer),
             },
             BlockSyncEvent::RetryBodyAvailability { hash: body_hash } => {

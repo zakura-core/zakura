@@ -23,14 +23,9 @@ pub struct BlockSyncBlockMeta {
 pub enum BlockSyncEvent {
     /// A peer became available for stream-6 block sync.
     PeerConnected(BlockSyncPeerSession),
-    /// A peer stream session disconnected.
-    /// The routine drops all work owned by that session.
-    PeerDisconnected {
-        /// Peer whose stream session disconnected.
-        peer: ZakuraPeerId,
-        /// Exact reactor generation that disconnected.
-        session_id: u64,
-    },
+    /// A peer disconnected.
+    /// The routine drops all work owned by that peer.
+    PeerDisconnected(ZakuraPeerId),
     /// An authenticated local operator requested a fresh retry of one persistent alarm.
     RetryBodyAvailability {
         /// Exact selected header with an alarm.
@@ -104,6 +99,24 @@ pub enum BlockSyncEvent {
         requested_count: u32,
         /// Bounded committed blocks returned by state.
         blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
+    },
+}
+
+/// Session lifecycle facts sent from [`BlockSyncService`] to the reactor.
+///
+/// This internal channel carries the session generation needed to reject stale
+/// connect and disconnect events. Keeping it separate from [`BlockSyncEvent`]
+/// prevents transport bookkeeping from becoming part of the public driver API.
+#[derive(Clone, Debug)]
+pub(super) enum BlockSyncPeerLifecycleEvent {
+    /// A newly admitted stream session is ready for reactor bookkeeping.
+    Connected(BlockSyncPeerSession),
+    /// One exact stream session has ended.
+    Disconnected {
+        /// Peer whose stream session ended.
+        peer: ZakuraPeerId,
+        /// Generation assigned when the session was admitted.
+        session_id: u64,
     },
 }
 

@@ -66,6 +66,7 @@ pub use bench::{
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
 pub use config::{BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
 pub use error::BlockSyncWireError;
+use events::BlockSyncPeerLifecycleEvent;
 pub use events::{
     BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
     BlockSyncEvent, BlockSyncMisbehavior,

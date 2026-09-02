@@ -115,6 +115,9 @@ impl BlockSyncStartup {
 pub struct BlockSyncHandle {
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
+    /// Internal peer-session lifecycle path. This stays separate from the
+    /// public driver events so generation ownership is crate-private.
+    pub(super) peer_lifecycle: mpsc::UnboundedSender<BlockSyncPeerLifecycleEvent>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) status: watch::Receiver<BlockSyncStatus>,
     pub(super) candidates: watch::Receiver<ZakuraBlockSyncCandidateState>,

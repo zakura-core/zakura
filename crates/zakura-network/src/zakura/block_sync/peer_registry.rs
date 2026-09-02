@@ -609,8 +609,8 @@ impl PeerRegistry {
         }
     }
 
-    #[cfg(test)]
-    fn remove(&self, peer: &ZakuraPeerId) {
+    /// Remove the current peer entry for a public, ownerless teardown event.
+    pub(super) fn remove(&self, peer: &ZakuraPeerId) {
         self.lock().remove(peer);
     }
 

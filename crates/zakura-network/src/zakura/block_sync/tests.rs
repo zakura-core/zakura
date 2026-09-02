@@ -6395,8 +6395,9 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
     drop(old_inbound_tx);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    if let Ok(Some(BlockSyncEvent::PeerDisconnected(disconnected))) =
-        tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+    if let Ok(Some(BlockSyncEvent::PeerDisconnected {
+        peer: disconnected, ..
+    })) = tokio::time::timeout(Duration::from_millis(50), events.recv()).await
     {
         panic!("stale teardown disconnected replacement session for {disconnected:?}");
     }
@@ -6468,7 +6469,10 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
             .await
             .expect("lifecycle event arrives")
             .expect("lifecycle channel stays open"),
-        BlockSyncEvent::PeerDisconnected(disconnected) if disconnected == peer
+        BlockSyncEvent::PeerDisconnected {
+            peer: disconnected,
+            ..
+        } if disconnected == peer
     ));
 }
 

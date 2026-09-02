@@ -23,9 +23,14 @@ pub struct BlockSyncBlockMeta {
 pub enum BlockSyncEvent {
     /// A peer became available for stream-6 block sync.
     PeerConnected(BlockSyncPeerSession),
-    /// A peer disconnected.
-    /// The routine drops all work owned by that peer.
-    PeerDisconnected(ZakuraPeerId),
+    /// A peer stream session disconnected.
+    /// The routine drops all work owned by that session.
+    PeerDisconnected {
+        /// Peer whose stream session disconnected.
+        peer: ZakuraPeerId,
+        /// Exact reactor generation that disconnected.
+        session_id: u64,
+    },
     /// An authenticated local operator requested a fresh retry of one persistent alarm.
     RetryBodyAvailability {
         /// Exact selected header with an alarm.

@@ -569,7 +569,9 @@ impl BlockSyncReactor {
             .emit_event(|| BlockEventReceived::new(&event));
         match event {
             BlockSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
-            BlockSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),
+            BlockSyncEvent::PeerDisconnected { peer, session_id } => {
+                self.handle_peer_disconnected(peer, session_id)
+            }
             BlockSyncEvent::RetryBodyAvailability { hash } => self.retry_body_availability(hash),
             #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::HeaderTipChanged { height, hash } => {
@@ -718,6 +720,7 @@ impl BlockSyncReactor {
 
     async fn handle_peer_connected(&mut self, session: BlockSyncPeerSession) {
         let peer = session.peer_id().clone();
+        let session_id = session.session_id();
         let direction = session.direction();
         let reactor_ready = session.clone();
         let decision = self.admission_decision_for(&peer, direction);
@@ -734,7 +737,7 @@ impl BlockSyncReactor {
             );
             self.state.parked_peers.insert(peer.clone());
             session.cancel_token().cancel();
-            self.registry.remove(&peer);
+            self.registry.remove_session(&peer, session_id);
             self.publish_peer_snapshot();
             self.publish_candidate_state();
             session.mark_reactor_ready();
@@ -760,20 +763,26 @@ impl BlockSyncReactor {
         // a status and work.
     }
 
-    fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId) {
+    fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId, session_id: u64) {
         // The pipe-routine cancels on the session token (transport disconnect);
         // its `Drop` guard returns its unreceived outstanding heights to
         // `work.pending` and releases their budget. The reactor only drops its
         // thin serving handle and the registry entry.
+        let owns_session = self
+            .state
+            .peers
+            .get(&peer)
+            .is_some_and(|peer_state| peer_state.session.session_id() == session_id);
+        if !owns_session {
+            self.registry.remove_session(&peer, session_id);
+            return;
+        }
+        let received_status = self.registry_received_status(&peer);
         if self.state.peers.remove(&peer).is_some() {
             set_block_reactor_active_connection_gauge(self.state.peers.len());
-            self.trace_peer_disconnected(
-                &peer,
-                self.registry_received_status(&peer),
-                self.state.peers.len(),
-            );
+            self.trace_peer_disconnected(&peer, received_status, self.state.peers.len());
         }
-        self.registry.remove(&peer);
+        self.registry.remove_session(&peer, session_id);
         self.state.parked_peers.remove(&peer);
         self.publish_peer_snapshot();
         self.publish_candidate_state();

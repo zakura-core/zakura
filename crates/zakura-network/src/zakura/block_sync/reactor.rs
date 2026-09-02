@@ -249,7 +249,7 @@ pub fn spawn_block_sync_reactor(
         pending_body_supplier_restart: None,
         pending_operator_body_retry: None,
         next_needed_query_id: NonZeroU64::new(1),
-        next_serving_request_id: NonZeroU64::new(1),
+        next_serving_request_id: BlockRangeRequestId::new(1),
         last_reset_epoch: 0,
         last_reaction_epoch: 0,
         last_view: initial_view(startup.frontiers),
@@ -1431,9 +1431,18 @@ impl BlockSyncReactor {
             self.send_range_unavailable(&peer, start_height, unavailable_count);
             return;
         };
-        self.next_serving_request_id = request_id.get().checked_add(1).and_then(NonZeroU64::new);
+        self.next_serving_request_id = request_id
+            .get()
+            .checked_add(1)
+            .and_then(BlockRangeRequestId::new);
+        let requested_count = self.clamp_served_block_count(start_height, count);
         let started_serving = self.state.peers.get_mut(&peer).is_some_and(|peer_state| {
-            peer_state.try_start_serving_blocks(local_inflight_cap, request_id, start_height)
+            peer_state.try_start_serving_blocks(
+                local_inflight_cap,
+                request_id,
+                start_height,
+                requested_count,
+            )
         });
         if !started_serving {
             let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
@@ -1441,7 +1450,6 @@ impl BlockSyncReactor {
             return;
         }
 
-        let requested_count = self.clamp_served_block_count(start_height, count);
         if requested_count == 0 {
             let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
             self.send_range_unavailable(&peer, start_height, unavailable_count);
@@ -1464,13 +1472,23 @@ impl BlockSyncReactor {
         request_id: BlockRangeRequestId,
         peer: ZakuraPeerId,
         start_height: block::Height,
-        requested_count: u32,
+        reported_requested_count: u32,
         blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
     ) {
-        let Some(prepare_elapsed) = self.serving_blocks_elapsed(&peer, request_id, start_height)
-        else {
+        let Some(request) = self.serving_block_request(&peer, request_id, start_height) else {
             return;
         };
+        let requested_count = request.requested_count();
+        if reported_requested_count != requested_count {
+            tracing::warn!(
+                ?peer,
+                %request_id,
+                reported_requested_count,
+                requested_count,
+                "block-range ready count did not match the serving ledger"
+            );
+        }
+        let prepare_elapsed = request.elapsed();
         let send_started = Instant::now();
         let max_response_bytes = u64::from(self.startup.config.advertised_max_response_bytes());
         let mut sent_blocks = 0u32;
@@ -1478,6 +1496,10 @@ impl BlockSyncReactor {
         let mut reason = "complete";
 
         for (height, block, size) in blocks {
+            if sent_blocks >= requested_count {
+                reason = "count_cap";
+                break;
+            }
             let Ok(size) = u64::try_from(size) else {
                 reason = "size_overflow";
                 break;
@@ -1508,7 +1530,9 @@ impl BlockSyncReactor {
         } else {
             self.send_blocks_done(&peer, start_height, sent_blocks);
         }
-        let total_elapsed = self.finish_serving_blocks(&peer, request_id, start_height);
+        let total_elapsed = self
+            .finish_serving_blocks(&peer, request_id, start_height)
+            .map(ServingBlockRequest::elapsed);
         self.trace_range_response_sent(
             &peer,
             RangeResponseTrace {
@@ -1529,12 +1553,23 @@ impl BlockSyncReactor {
         request_id: BlockRangeRequestId,
         peer: ZakuraPeerId,
         start_height: block::Height,
-        requested_count: u32,
+        reported_requested_count: u32,
         returned_count: u32,
     ) {
-        let Some(elapsed) = self.finish_serving_blocks(&peer, request_id, start_height) else {
+        let Some(request) = self.finish_serving_blocks(&peer, request_id, start_height) else {
             return;
         };
+        let requested_count = request.requested_count();
+        if reported_requested_count != requested_count {
+            tracing::warn!(
+                ?peer,
+                %request_id,
+                reported_requested_count,
+                requested_count,
+                "block-range finished count did not match the serving ledger"
+            );
+        }
+        let elapsed = request.elapsed();
         if returned_count == 0 {
             self.send_range_unavailable(&peer, start_height, requested_count);
         }
@@ -1614,16 +1649,16 @@ impl BlockSyncReactor {
         );
     }
 
-    fn serving_blocks_elapsed(
+    fn serving_block_request(
         &self,
         peer: &ZakuraPeerId,
         request_id: BlockRangeRequestId,
         start_height: block::Height,
-    ) -> Option<Duration> {
+    ) -> Option<ServingBlockRequest> {
         self.state
             .peers
             .get(peer)
-            .and_then(|peer_state| peer_state.serving_blocks_elapsed(request_id, start_height))
+            .and_then(|peer_state| peer_state.serving_block_request(request_id, start_height))
     }
 
     fn finish_serving_blocks(
@@ -1631,7 +1666,7 @@ impl BlockSyncReactor {
         peer: &ZakuraPeerId,
         request_id: BlockRangeRequestId,
         start_height: block::Height,
-    ) -> Option<Duration> {
+    ) -> Option<ServingBlockRequest> {
         if let Some(peer_state) = self.state.peers.get_mut(peer) {
             peer_state.finish_serving_blocks(request_id, start_height)
         } else {

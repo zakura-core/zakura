@@ -791,11 +791,25 @@ pub(super) struct PeerBlockState {
     served_block_requests: VecDeque<ServingBlockRequest>,
 }
 
-#[derive(Debug)]
-struct ServingBlockRequest {
+/// Ledger entry for one accepted inbound `GetBlocks` request.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct ServingBlockRequest {
     id: BlockRangeRequestId,
     start_height: block::Height,
+    requested_count: u32,
     started: Instant,
+}
+
+impl ServingBlockRequest {
+    /// Count accepted after the wire, configuration, and servable-range clamps.
+    pub(super) fn requested_count(self) -> u32 {
+        self.requested_count
+    }
+
+    /// Time elapsed since this request acquired its serving slot.
+    pub(super) fn elapsed(self) -> Duration {
+        self.started.elapsed()
+    }
 }
 
 impl PeerBlockState {
@@ -813,6 +827,7 @@ impl PeerBlockState {
         local_inflight_cap: u32,
         request_id: BlockRangeRequestId,
         start_height: block::Height,
+        requested_count: u32,
     ) -> bool {
         if self.served_block_requests.len()
             >= usize::try_from(local_inflight_cap)
@@ -823,32 +838,32 @@ impl PeerBlockState {
         self.served_block_requests.push_back(ServingBlockRequest {
             id: request_id,
             start_height,
+            requested_count,
             started: Instant::now(),
         });
         true
     }
 
-    pub(super) fn serving_blocks_elapsed(
+    pub(super) fn serving_block_request(
         &self,
         request_id: BlockRangeRequestId,
         start_height: block::Height,
-    ) -> Option<Duration> {
+    ) -> Option<ServingBlockRequest> {
         self.served_block_requests
             .iter()
             .find(|request| request.id == request_id && request.start_height == start_height)
-            .map(|request| request.started.elapsed())
+            .copied()
     }
 
     pub(super) fn finish_serving_blocks(
         &mut self,
         request_id: BlockRangeRequestId,
         start_height: block::Height,
-    ) -> Option<Duration> {
+    ) -> Option<ServingBlockRequest> {
         self.served_block_requests
             .iter()
             .position(|request| request.id == request_id && request.start_height == start_height)
             .and_then(|index| self.served_block_requests.remove(index))
-            .map(|request| request.started.elapsed())
     }
 }
 

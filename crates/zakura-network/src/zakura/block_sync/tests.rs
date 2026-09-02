@@ -13879,11 +13879,16 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
             request_id,
             peer: peer_id.clone(),
             start_height: block::Height(1),
-            requested_count: 1,
-            returned_count: 1,
+            requested_count: u32::MAX,
+            returned_count: 0,
         })
         .await
         .expect("serving slot release queues");
+    assert_eq!(
+        wait_for_outbound_range_unavailable(&mut outbound_rx).await,
+        (block::Height(1), 1),
+        "the serving ledger, not the driver's echoed count, owns the response",
+    );
 
     reactor_task.abort();
 }

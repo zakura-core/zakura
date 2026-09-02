@@ -1,7 +1,7 @@
 #[cfg(any(test, feature = "proptest-impl"))]
 use super::state::BlockSyncFrontiers;
 use super::{request::*, *};
-use std::num::NonZeroU64;
+use std::{fmt, num::NonZeroU64};
 
 /// Committed header metadata used by block sync to schedule and validate a body.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -86,7 +86,8 @@ pub enum BlockSyncEvent {
         peer: ZakuraPeerId,
         /// First requested height.
         start_height: block::Height,
-        /// Requested block count.
+        /// Driver echo retained for diagnostics. The reactor uses the count in
+        /// its serving ledger when it processes this completion.
         requested_count: u32,
         /// Number of blocks read from state and sent in the response.
         returned_count: u32,
@@ -99,7 +100,8 @@ pub enum BlockSyncEvent {
         peer: ZakuraPeerId,
         /// First requested height.
         start_height: block::Height,
-        /// Requested block count.
+        /// Driver echo retained for diagnostics. The reactor uses the count in
+        /// its serving ledger when it processes this completion.
         requested_count: u32,
         /// Bounded committed blocks returned by state.
         blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
@@ -261,7 +263,29 @@ pub type BlockApplyToken = u64;
 ///
 /// The state driver echoes this identity so a delayed completion cannot release
 /// a newer serving slot or send blocks through a replacement peer session.
-pub type BlockRangeRequestId = NonZeroU64;
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BlockRangeRequestId(NonZeroU64);
+
+impl BlockRangeRequestId {
+    /// Construct an ID, returning `None` for the reserved zero value.
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Return the nonzero integer carried by this request identity.
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for BlockRangeRequestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 /// Actions emitted by the future block-sync reactor for the service seam.
 #[derive(Clone, Debug)]

@@ -43,6 +43,9 @@ use zakura_chain::{
 };
 use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES};
 
+#[path = "property_tests/mod.rs"]
+mod message_contracts;
+
 fn peer(byte: u8) -> ZakuraPeerId {
     ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds")
 }

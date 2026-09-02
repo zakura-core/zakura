@@ -41,6 +41,9 @@ Zakura enforces code quality through review. For the full list of architecture r
 - **Error handling**: Use `thiserror`; `expect()` messages explain why the invariant holds
 - **Async**: CPU-heavy work in `spawn_blocking`; all waits need timeouts
 - **Security**: Bound allocations from untrusted data; validate at system boundaries
+- **P2P message testing**: Follow the
+  [property-testing standard](testing/p2p-message-property-testing.md) when adding
+  or changing a Zakura P2P message
 - **Changelog**: After opening a draft PR, add one
   `docs/changelog/unreleased/<PR-number>.md` fragment. Internal-only PRs use an
   explicit no-changelog marker (see

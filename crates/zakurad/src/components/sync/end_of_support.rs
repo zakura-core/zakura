@@ -13,7 +13,7 @@ use zakura_chain::{
 use crate::application::release_version;
 
 /// The estimated height that this release will be published.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_470_027;
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_470_235;
 
 /// The estimated number of blocks per day after Blossom.
 ///
@@ -28,12 +28,12 @@ pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET
 ///
 /// - Zebra will exit with a panic if the current tip height is bigger than the
 ///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
-/// - Currently set to 31 days
+/// - Currently set to 27 days
 ///
-/// Note: v1.3.0 is estimated to release at height 3,465,627 (~2026-08-30)
-/// and halts 31 days later at height 3,501,339 (~2026-09-30), the day before
-/// October 1st.
-pub const EOS_PANIC_AFTER: u32 = 31;
+/// Note: v1.3.1 is estimated to release at height 3,470,235 (~2026-09-03)
+/// and halts 27 days later at height 3,501,339 (~2026-09-30) — the same
+/// halt block as v1.3.0, the day before October 1st.
+pub const EOS_PANIC_AFTER: u32 = 27;
 
 /// The number of days before the end of support where Zebra will display warnings.
 pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;

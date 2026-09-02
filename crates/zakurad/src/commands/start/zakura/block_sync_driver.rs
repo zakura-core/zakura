@@ -475,7 +475,12 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     }
                 }
             }
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+            BlockSyncAction::QueryBlocksByHeightRange {
+                request_id,
+                peer,
+                start,
+                count,
+            } => {
                 trace.trace_block_range_query_started(&peer, start, count);
                 let started = Instant::now();
                 match tokio::time::timeout(
@@ -500,6 +505,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                             count,
                         );
                         let _ = block_sync.send_control(BlockSyncEvent::BlockRangeResponseReady {
+                            request_id,
                             peer,
                             start_height: start,
                             requested_count: count,
@@ -518,6 +524,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         trace.trace_block_range_finished(&peer, start, count, 0);
                         let _ =
                             block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
+                                request_id,
                                 peer,
                                 start_height: start,
                                 requested_count: count,
@@ -540,6 +547,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         trace.trace_block_range_finished(&peer, start, count, 0);
                         let _ =
                             block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
+                                request_id,
                                 peer,
                                 start_height: start,
                                 requested_count: count,
@@ -552,6 +560,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         trace.trace_block_range_finished(&peer, start, count, 0);
                         let _ =
                             block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
+                                request_id,
                                 peer,
                                 start_height: start,
                                 requested_count: count,

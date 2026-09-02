@@ -11859,21 +11859,27 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
         .await
         .expect("GetBlocks frame queues");
 
-    loop {
+    let request_id = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+            BlockSyncAction::QueryBlocksByHeightRange {
+                request_id,
+                peer,
+                start,
+                count,
+            } => {
                 assert_eq!(peer, peer_id);
                 assert_eq!(start, block::Height(1));
                 assert_eq!(count, 2);
-                break;
+                break request_id;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before block range query: {action:?}"),
         }
-    }
+    };
 
     handle
         .send(BlockSyncEvent::BlockRangeResponseReady {
+            request_id,
             peer: peer_id.clone(),
             start_height: block::Height(1),
             requested_count: 2,
@@ -13853,10 +13859,13 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
             .await
             .expect("GetBlocks frame queues");
     }
-    while !matches!(
-        next_action(&mut actions).await,
-        BlockSyncAction::QueryBlocksByHeightRange { .. }
-    ) {}
+    let request_id = loop {
+        if let BlockSyncAction::QueryBlocksByHeightRange { request_id, .. } =
+            next_action(&mut actions).await
+        {
+            break request_id;
+        }
+    };
 
     assert_eq!(
         wait_for_outbound_range_unavailable(&mut outbound_rx).await,
@@ -13867,6 +13876,7 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
 
     handle
         .send(BlockSyncEvent::BlockRangeResponseFinished {
+            request_id,
             peer: peer_id.clone(),
             start_height: block::Height(1),
             requested_count: 1,
@@ -13958,18 +13968,23 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         )
         .await
         .expect("GetBlocks frame queues");
-    loop {
+    let first_request_id = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+            BlockSyncAction::QueryBlocksByHeightRange {
+                request_id,
+                peer,
+                start,
+                count,
+            } => {
                 assert_eq!(peer, peer_id);
                 assert_eq!(start, block::Height(1));
                 assert_eq!(count, 3);
-                break;
+                break request_id;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before block range query: {action:?}"),
         }
-    }
+    };
     let served: Vec<_> = blocks
         .iter()
         .map(|block| {
@@ -13982,6 +13997,7 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         .collect();
     handle
         .send(BlockSyncEvent::BlockRangeResponseReady {
+            request_id: first_request_id,
             peer: peer_id.clone(),
             start_height: block::Height(1),
             requested_count: 3,
@@ -13998,8 +14014,9 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
     );
     assert_eq!(handle.peer_snapshot().outbound_peers, 1);
 
-    // Self-heal: drain the queue, release the serving slot, and re-request. The
-    // earlier drop neither wedged nor scored the peer, so a fresh serve lands.
+    // Self-heal: drain the queue and re-request. The earlier response already
+    // released its serving slot, and the dropped sends neither wedged nor scored
+    // the peer, so a fresh serve lands.
     while tokio::time::timeout(
         Duration::from_millis(100),
         next_outbound_message(&mut outbound_rx),
@@ -14007,15 +14024,6 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
     .await
     .is_ok()
     {}
-    handle
-        .send(BlockSyncEvent::BlockRangeResponseFinished {
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 3,
-            returned_count: 3,
-        })
-        .await
-        .expect("serving slot release queues");
     inbound_tx
         .send(
             BlockSyncMessage::GetBlocks {
@@ -14027,19 +14035,25 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         )
         .await
         .expect("re-request GetBlocks frame queues");
-    loop {
+    let second_request_id = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { start, count, .. } => {
+            BlockSyncAction::QueryBlocksByHeightRange {
+                request_id,
+                start,
+                count,
+                ..
+            } => {
                 assert_eq!(start, block::Height(1));
                 assert_eq!(count, 1);
-                break;
+                break request_id;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before re-request query: {action:?}"),
         }
-    }
+    };
     handle
         .send(BlockSyncEvent::BlockRangeResponseReady {
+            request_id: second_request_id,
             peer: peer_id.clone(),
             start_height: block::Height(1),
             requested_count: 1,

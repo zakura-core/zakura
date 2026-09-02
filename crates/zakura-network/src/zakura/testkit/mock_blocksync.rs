@@ -602,7 +602,12 @@ async fn drive_mock_block_sync_actions(
                         })
                         .await;
                 }
-                BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+                BlockSyncAction::QueryBlocksByHeightRange {
+                    request_id,
+                    peer,
+                    start,
+                    count,
+                } => {
                     let blocks = corpus.blocks_in_range(start, count, servable_high);
                     let response_bytes = blocks
                         .iter()
@@ -610,6 +615,7 @@ async fn drive_mock_block_sync_actions(
                     stats.record_request(blocks.len(), response_bytes);
                     let _ = handle
                         .send(BlockSyncEvent::BlockRangeResponseReady {
+                            request_id,
                             peer,
                             start_height: start,
                             requested_count: count,

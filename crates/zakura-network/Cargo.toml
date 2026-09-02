@@ -92,6 +92,7 @@ zakura-node-services = { path = "../zakura-node-services", version = "3.2.0" }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+commonware-runtime = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 criterion = { workspace = true }
@@ -100,6 +101,7 @@ static_assertions = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 toml = { workspace = true }
 tracing-subscriber = { workspace = true }
+turmoil-net = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "6.0.0", features = ["proptest-impl"] }
 zakura-test = { path = "../zakura-test/", version = "2.1.0" }

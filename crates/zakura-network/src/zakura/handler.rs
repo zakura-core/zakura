@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use futures::StreamExt as _;
 use iroh::Watcher as _;
 use iroh::{
@@ -52,21 +52,20 @@ use crate::{peer_registry::PeerRegistry, BoxError, Config, MAX_TX_INV_IN_SENT_ME
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        canonical_ip, direct_endpoint_builder, spawn_block_sync_reactor, spawn_header_sync_reactor,
+        canonical_ip, direct_endpoint_builder, run_native_initiator_control,
+        run_native_responder_control, spawn_block_sync_reactor, spawn_header_sync_reactor,
         AuthenticatedPeerRegistration, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FramedRecv,
         FramedSend, FullStateFrontiers, HeaderSyncPassthroughService, HeaderSyncService,
-        HeaderSyncStartup, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
-        RealClock, Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject,
-        Stream, StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
-        ZakuraConnId, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole,
-        ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
-        ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
-        ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraUpgradeDialStart,
-        CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION, FRAME_HEADER_BYTES,
-        MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES,
-        ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
-        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        HeaderSyncStartup, NativeHandshakeNegotiated, NoopControlHandshakeObserver,
+        OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer, RealClock, Service,
+        ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject, Stream, StreamMode,
+        StreamPrelude, TokioControlHandshakeClock, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
+        ZakuraConnId, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraInitialLimits,
+        ZakuraLimits, ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
+        ZakuraUpgradeDialStart, FRAME_HEADER_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
+        TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 
@@ -157,7 +156,6 @@ pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Maximum backoff between re-dials of a configured Zakura bootstrap peer.
 pub const DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF: Duration = Duration::from_secs(30);
-const CONTROL_LENGTH_BYTES: usize = 4;
 const STREAM_PRELUDE_FIXED_BYTES: usize = 4 + 2 + 2 + 1;
 const STREAM_PRELUDE_REQUEST_ID_FLAG_OFFSET: usize = STREAM_PRELUDE_FIXED_BYTES - 1;
 const STREAM_PRELUDE_REQUEST_ID_BYTES: usize = 8;
@@ -1841,12 +1839,6 @@ fn admit_inbound_message(
     InboundMessageAdmission::Admit
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NativeHandshakeNegotiated {
-    pub(crate) limits: ZakuraAcceptedLimits,
-    pub(crate) accepted_capabilities: u64,
-}
-
 pub(crate) fn service_registry(
     _supervisor: &ZakuraSupervisorHandle,
     header_sync: Option<super::HeaderSyncHandle>,
@@ -2067,6 +2059,11 @@ impl ZakuraProtocolHandler {
         config
     }
 
+    #[cfg(test)]
+    pub(crate) fn available_pending_handshake_permits(&self) -> usize {
+        self.pending_handshakes.available_permits()
+    }
+
     fn set_header_sync_enabled(&self, enabled: bool) {
         if enabled {
             self.supported_capabilities
@@ -2200,70 +2197,26 @@ impl ZakuraProtocolHandler {
             .await
             .map_err(|_| ZakuraHandlerError::Timeout("accept control stream"))??;
 
-        let hello_bytes = read_control_payload(
-            &mut recv,
-            handshake_config.max_control_frame_bytes,
-            self.limits.control_timeout,
-        )
-        .await?;
-        let hello = ZakuraControlHello::decode(&hello_bytes)?;
-        let expected = ZakuraControlValidation {
-            local: &handshake_config,
-            authenticated_remote_id: remote_peer_id.as_bytes(),
-            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_1,
-            handshake_path: ZakuraHandshakePath::Native,
-            remote_role: ZakuraControlRole::Initiator,
-            initiator_upgrade_nonce: [0; 32],
-            responder_upgrade_nonce: [0; 32],
-            legacy_upgrade_transcript: [0; 32],
-        };
-        hello.validate(&expected)?;
-
         let mut local_nonce = [0; 32];
         OsRng.fill_bytes(&mut local_nonce);
-
-        let accepted_limits = self.accepted_limits_for(&hello.initial_limits);
-        let ack = ZakuraControlAck {
-            magic: CONTROL_ACK_MAGIC,
-            control_version: CONTROL_VERSION,
-            selected_zakura_protocol: hello.selected_zakura_protocol,
-            peer_nonce: local_nonce,
-            remote_peer_nonce: hello.peer_nonce,
-            accepted_capabilities: hello.capabilities & handshake_config.supported_capabilities,
-            accepted_channels: hello.required_channels & handshake_config.supported_channels,
-            accepted_limits,
-        };
-        write_control_payload(&mut send, &ack.encode()?, self.limits.control_timeout).await?;
+        let negotiated = run_native_responder_control(
+            &mut send,
+            &mut recv,
+            &self.limits,
+            &handshake_config,
+            remote_peer_id,
+            local_nonce,
+            &TokioControlHandshakeClock,
+            &NoopControlHandshakeObserver,
+        )
+        .await?;
         conn.trace_handshake(
             "control.succeeded",
             "responder",
-            Some(ack.selected_zakura_protocol),
+            Some(ZAKURA_PROTOCOL_VERSION_1),
             handshake_config.network_label(),
         );
-        Ok(NativeHandshakeNegotiated {
-            limits: accepted_limits,
-            accepted_capabilities: ack.accepted_capabilities,
-        })
-    }
-
-    fn accepted_limits_for(&self, remote_limits: &ZakuraInitialLimits) -> ZakuraAcceptedLimits {
-        ZakuraLimits {
-            max_frame_bytes: remote_limits
-                .max_frame_bytes
-                .min(self.limits.max_frame_bytes),
-            max_message_bytes: remote_limits
-                .max_message_bytes
-                .min(self.limits.max_message_bytes),
-            max_open_streams: remote_limits
-                .max_open_streams
-                .min(self.limits.max_open_streams),
-            max_inbound_queue_depth: remote_limits
-                .max_inbound_queue_depth
-                .min(self.limits.max_inbound_queue_depth),
-            idle_timeout_millis: remote_limits
-                .idle_timeout_millis
-                .min(self.limits.initial_limits().idle_timeout_millis),
-        }
+        Ok(negotiated)
     }
 
     async fn serve_connection(
@@ -3820,50 +3773,24 @@ async fn run_native_initiator_handshake(
         .map_err(|_| ZakuraHandlerError::Timeout("open control stream"))??;
     let mut local_nonce = [0; 32];
     OsRng.fill_bytes(&mut local_nonce);
-
-    let hello = ZakuraControlHello {
-        magic: CONTROL_HELLO_MAGIC,
-        control_version: CONTROL_VERSION,
-        selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_1,
-        handshake_path: ZakuraHandshakePath::Native,
-        role: ZakuraControlRole::Initiator,
-        network_id: handshake_config.network_id,
-        chain_id: handshake_config.chain_id,
-        iroh_node_id: local_peer_id.as_bytes().to_vec(),
-        peer_nonce: local_nonce,
-        initiator_upgrade_nonce: [0; 32],
-        responder_upgrade_nonce: [0; 32],
-        legacy_upgrade_transcript: [0; 32],
-        capabilities: handshake_config.supported_capabilities,
-        required_channels: 0,
-        initial_limits: limits.initial_limits(),
-    };
-
-    write_control_payload(&mut send, &hello.encode()?, limits.control_timeout).await?;
-    let ack_bytes = read_control_payload(
+    let negotiated = run_native_initiator_control(
+        &mut send,
         &mut recv,
-        handshake_config.max_control_frame_bytes,
-        limits.control_timeout,
+        limits,
+        handshake_config,
+        local_peer_id,
+        local_nonce,
+        &TokioControlHandshakeClock,
+        &NoopControlHandshakeObserver,
     )
     .await?;
-    let ack = ZakuraControlAck::decode(&ack_bytes)?;
-    ack.validate(
-        ZAKURA_PROTOCOL_VERSION_1,
-        local_nonce,
-        ack.peer_nonce,
-        &limits.initial_limits(),
-        handshake_config,
-    )?;
     conn.trace_handshake(
         "control.succeeded",
         "initiator",
-        Some(ack.selected_zakura_protocol),
+        Some(ZAKURA_PROTOCOL_VERSION_1),
         handshake_config.network_label(),
     );
-    Ok(NativeHandshakeNegotiated {
-        limits: ack.accepted_limits,
-        accepted_capabilities: ack.accepted_capabilities,
-    })
+    Ok(negotiated)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4348,52 +4275,6 @@ async fn read_frame(
         flags,
         payload,
     })
-}
-
-async fn read_control_payload(
-    recv: &mut RecvStream,
-    max_bytes: u32,
-    read_timeout: Duration,
-) -> Result<Vec<u8>, ZakuraHandlerError> {
-    // Control payloads (Hello/Ack) carry a hard 16 KiB cap that is otherwise only
-    // enforced later in ZakuraControlHello/Ack::decode. Clamp the caller-supplied
-    // frame cap (the configured `max_control_frame_bytes`, 1 MiB by default) to it
-    // here so a peer cannot make us allocate/read a payload up to the much larger
-    // frame cap before decode rejects it as oversized.
-    //
-    // `MAX_CONTROL_PAYLOAD_BYTES` (16 KiB) is a small compile-time constant, so the
-    // cast to u32 cannot truncate; `.min` also preserves any tighter negotiated cap.
-    let max_bytes = max_bytes.min(MAX_CONTROL_PAYLOAD_BYTES as u32);
-    let mut len_bytes = [0; CONTROL_LENGTH_BYTES];
-    timeout(read_timeout, recv.read_exact(&mut len_bytes))
-        .await
-        .map_err(|_| ZakuraHandlerError::Timeout("control length"))??;
-    let len = (&len_bytes[..]).read_u32::<LittleEndian>()?;
-    if len == 0 || len > max_bytes {
-        return Err(ZakuraHandlerError::Oversize);
-    }
-    let mut bytes = vec![0; len as usize];
-    timeout(read_timeout, recv.read_exact(&mut bytes))
-        .await
-        .map_err(|_| ZakuraHandlerError::Timeout("control payload"))??;
-    Ok(bytes)
-}
-
-async fn write_control_payload(
-    send: &mut SendStream,
-    bytes: &[u8],
-    write_timeout: Duration,
-) -> Result<(), ZakuraHandlerError> {
-    let mut len = Vec::with_capacity(CONTROL_LENGTH_BYTES);
-    len.write_u32::<LittleEndian>(bytes.len() as u32)?;
-    timeout(write_timeout, send.write_all(&len))
-        .await
-        .map_err(|_| ZakuraHandlerError::Timeout("control length write"))??;
-    timeout(write_timeout, send.write_all(bytes))
-        .await
-        .map_err(|_| ZakuraHandlerError::Timeout("control payload write"))??;
-    let _ = send.finish();
-    Ok(())
 }
 
 async fn write_ordered_frame(
@@ -5353,12 +5234,13 @@ mod tests {
         protocol::internal::{InventoryResponse, Response},
         zakura::{
             legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
+            read_control_payload,
             testkit::{await_until, LocalEndpointFactory, ZakuraTestNode},
-            Event, HeaderSyncMisbehavior, PeerSession, ServicePeerLimits,
+            ControlHandshakeRole, Event, HeaderSyncMisbehavior, PeerSession, ServicePeerLimits,
             LOCAL_MAX_CONTROL_FRAME_BYTES, LOCAL_MAX_MESSAGE_BYTES, MAX_BS_FRAME_BYTES,
-            MAX_HS_MESSAGE_BYTES, ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC,
-            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-            ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            ZAKURA_CAP_BLOCK_SYNC, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
         },
         P2pStack,
     };
@@ -8048,6 +7930,9 @@ mod tests {
             &mut over_server_recv,
             LOCAL_MAX_CONTROL_FRAME_BYTES,
             Duration::from_secs(2),
+            ControlHandshakeRole::Responder,
+            &TokioControlHandshakeClock,
+            &NoopControlHandshakeObserver,
         )
         .await;
         assert!(
@@ -8083,6 +7968,9 @@ mod tests {
             &mut ok_server_recv,
             LOCAL_MAX_CONTROL_FRAME_BYTES,
             Duration::from_secs(2),
+            ControlHandshakeRole::Responder,
+            &TokioControlHandshakeClock,
+            &NoopControlHandshakeObserver,
         )
         .await
         .expect("a control payload within the hard cap is read");

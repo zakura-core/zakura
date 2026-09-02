@@ -51,6 +51,14 @@ pub const MAX_PRELUDE_PAYLOAD_BYTES: usize = 4 * 1024;
 /// Hard cap for any control handshake payload.
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 16 * 1024;
 
+/// Returns whether a declared control payload length passes every receiver cap.
+pub fn control_payload_length_is_admissible(declared: u32, configured_max: u32) -> bool {
+    let hard_max =
+        u32::try_from(MAX_CONTROL_PAYLOAD_BYTES).expect("the 16 KiB control payload cap fits u32");
+    let effective_max = configured_max.min(hard_max);
+    declared != 0 && declared <= effective_max
+}
+
 /// Maximum encoded Iroh node id length accepted in Zakura handshakes.
 pub const MAX_IROH_NODE_ID_BYTES: usize = 128;
 
@@ -1174,6 +1182,11 @@ impl ZakuraControlAck {
         if self.remote_peer_nonce != local_peer_nonce || self.peer_nonce != remote_peer_nonce {
             return Err(ZakuraValidationError::ControlNonceMismatch);
         }
+        if self.accepted_capabilities & !local.supported_capabilities != 0
+            || self.accepted_channels & !local.supported_channels != 0
+        {
+            return Err(ZakuraValidationError::MissingRequiredCapability);
+        }
         validate_initial_limits(self.accepted_limits, local)
             .map_err(ZakuraValidationError::from_wire_reject)?;
         if self.accepted_limits.max_frame_bytes > requested_limits.max_frame_bytes
@@ -2250,6 +2263,23 @@ mod tests {
         assert_eq!(
             malicious_ack.validate(1, [1; 32], [2; 32], &requested_limits, &local),
             Err(ZakuraValidationError::ResourceLimit)
+        );
+
+        let unsupported_capability = ZakuraControlAck {
+            accepted_capabilities: 1 << 63,
+            ..ack
+        };
+        assert_eq!(
+            unsupported_capability.validate(1, [1; 32], [2; 32], &requested_limits, &local),
+            Err(ZakuraValidationError::MissingRequiredCapability)
+        );
+        let unsupported_channel = ZakuraControlAck {
+            accepted_channels: 1,
+            ..ack
+        };
+        assert_eq!(
+            unsupported_channel.validate(1, [1; 32], [2; 32], &requested_limits, &local),
+            Err(ZakuraValidationError::MissingRequiredCapability)
         );
 
         // A malicious ack that over-caps any other field is rejected too.

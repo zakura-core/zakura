@@ -283,6 +283,7 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         source,
         owner: action_owner,
         target,
+        completion,
         mut entries,
         ..
     } = next_action(&mut actions).await
@@ -291,13 +292,19 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
     };
     assert_eq!(action_owner.session_id(), 0);
     assert_eq!(target, repair_header);
-    let episode = match purpose {
+    match purpose {
         HeaderTargetPurpose::SelectedAuxiliaryRepair {
+            selected_target, ..
+        } if selected_target == repair_header => {}
+        _ => panic!("the repair purpose must carry the selected target"),
+    };
+    let episode = match completion {
+        zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
             selected_target,
             episode,
             ..
         } if selected_target == repair_header => episode,
-        _ => panic!("the repair purpose must carry the selected target and episode"),
+        _ => panic!("the repair completion must carry the selected target and episode"),
     };
     let entry = entries
         .pop()

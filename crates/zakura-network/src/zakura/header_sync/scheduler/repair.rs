@@ -7,10 +7,6 @@ use tokio::time::Instant;
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, SourceId, VctRepairContext};
 
-/// Maximum supplier identities retained for one durable episode.
-pub(in crate::zakura::header_sync) const MAX_SUPPLIERS_PER_EPISODE: usize =
-    crate::zakura::DEFAULT_SERVICE_MAX_PEERS * 2;
-
 /// Structurally complete state of one auxiliary repair task.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::zakura::header_sync) enum RepairPolicyState {
@@ -83,7 +79,8 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
     pub state: RepairPolicyState,
     /// Failed or abandoned on-wire attempts, saturated only for diagnostics.
     pub attempts: u64,
-    /// Suppliers already tried in the current durable episode.
+    /// Connected suppliers already tried in the current durable episode.
+    /// The configured inbound and outbound peer limits bound this set.
     pub tried_sources: HashSet<SourceId>,
     /// Connected suppliers that returned input excluded by this durable episode.
     pub excluded_input_sources: HashSet<SourceId>,
@@ -175,9 +172,7 @@ impl RepairRequirement {
             _ => return Err(RepairPolicyError::IllegalState),
         };
         self.attempts = self.attempts.saturating_add(1);
-        if self.tried_sources.len() < MAX_SUPPLIERS_PER_EPISODE {
-            self.tried_sources.insert(source);
-        }
+        self.tried_sources.insert(source);
         self.state = RepairPolicyState::Ready { context };
         Ok(())
     }
@@ -185,9 +180,7 @@ impl RepairRequirement {
     /// Rotate away from a supplier that returned semantic input excluded by durable state.
     pub fn exclude_input(&mut self, source: SourceId) -> Result<(), RepairPolicyError> {
         self.retry(source)?;
-        if self.tried_sources.contains(&source) {
-            self.excluded_input_sources.insert(source);
-        }
+        self.excluded_input_sources.insert(source);
         Ok(())
     }
 
@@ -197,15 +190,20 @@ impl RepairRequirement {
             return Err(RepairPolicyError::IllegalState);
         }
         self.attempts = self.attempts.saturating_add(1);
-        if self.tried_sources.len() < MAX_SUPPLIERS_PER_EPISODE {
-            self.tried_sources.insert(source);
-        }
+        self.tried_sources.insert(source);
         Ok(())
     }
 
-    /// Return whether supplier identity history reached its fail-closed bound.
-    pub fn supplier_history_full(&self) -> bool {
-        self.tried_sources.len() >= MAX_SUPPLIERS_PER_EPISODE
+    /// Forget supplier identities that no longer have a live session.
+    ///
+    /// Durable state retains rejected and disputed semantic input. The reactor only needs the
+    /// identity sets to prevent repeated requests to a supplier while that supplier stays
+    /// connected.
+    pub fn retain_connected_sources(&mut self, connected_sources: &HashSet<SourceId>) {
+        self.tried_sources
+            .retain(|source| connected_sources.contains(source));
+        self.excluded_input_sources
+            .retain(|source| connected_sources.contains(source));
     }
 
     /// Back off ready or assigned repair work after a local failure.
@@ -507,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn supplier_history_bound_fails_closed_without_clearing_the_episode() {
+    fn supplier_history_releases_disconnected_sources_without_clearing_the_episode() {
         let mut task = task(&snapshot());
         let context = context();
         mark_context_requested(&mut task);
@@ -522,19 +520,19 @@ mod tests {
                 .expect("four u64 values fill one source digest");
             SourceId::from_digest(bytes)
         };
-        for index in 0..MAX_SUPPLIERS_PER_EPISODE {
+        let previous_default_capacity = crate::zakura::DEFAULT_SERVICE_MAX_PEERS * 2;
+        for index in 0..previous_default_capacity {
             task.record_failed_source(source(index))
                 .expect("ready work can record each supplier");
         }
-        assert!(task.supplier_history_full());
+        let retained = source(previous_default_capacity - 1);
+        task.excluded_input_sources.insert(retained);
 
-        let excluded = source(MAX_SUPPLIERS_PER_EPISODE);
-        task.record_failed_source(excluded)
-            .expect("a full history remains a normal wait condition");
-        task.resume_retry(Instant::now() + std::time::Duration::from_secs(1));
+        let connected_sources = [retained].into_iter().collect();
+        task.retain_connected_sources(&connected_sources);
 
-        assert_eq!(task.tried_sources.len(), MAX_SUPPLIERS_PER_EPISODE);
-        assert!(!task.tried_sources.contains(&excluded));
+        assert_eq!(task.tried_sources, connected_sources);
+        assert_eq!(task.excluded_input_sources, connected_sources);
         assert_eq!(task.state, RepairPolicyState::Ready { context });
     }
 

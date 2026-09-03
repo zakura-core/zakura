@@ -5,6 +5,7 @@ use std::sync::{
 
 use futures::{FutureExt, StreamExt};
 use tokio::sync::Notify;
+use zakura_header_chain::SourceId;
 use zakura_node_services::header_chain as port;
 
 use super::*;
@@ -173,10 +174,12 @@ fn seed_vct_active_request(
     );
     active.purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
         selected_target: target,
-        episode: context.episode,
         repair_generation: 11,
     };
     active.phase = phase;
+    reactor
+        .peer_work_queue
+        .bind_repair_episode_for_test(owner.into(), context.episode);
     let mut task = RepairRequirement::new(owner, target.height, 11);
     task.state = RepairPolicyState::Assigned {
         context: context.clone(),
@@ -704,7 +707,7 @@ fn request_timeout_retires_owned_work_and_wakes_maintenance() {
 }
 
 #[test]
-fn vct_request_timeout_keeps_required_work_and_rotates_the_supplier() {
+fn vct_request_timeout_keeps_required_work_and_releases_a_disconnected_supplier() {
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let snapshot = committed_snapshot(anchor);
@@ -748,9 +751,11 @@ fn vct_request_timeout_keeps_required_work_and_rotates_the_supplier() {
         .expect("the fixture has one applying request")
         .purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
         selected_target: target,
-        episode: context.episode,
         repair_generation: 11,
     };
+    reactor
+        .peer_work_queue
+        .bind_repair_episode_for_test(owner.into(), context.episode);
     reactor
         .peer_work_queue
         .active_mut(&peer)
@@ -770,7 +775,7 @@ fn vct_request_timeout_keeps_required_work_and_rotates_the_supplier() {
         RepairPolicyState::Ready { context: retained } if retained == &context
     ));
     assert_eq!(task.attempts, 1);
-    assert!(task.tried_sources.contains(&source));
+    assert!(!task.tried_sources.contains(&source));
     assert!(task.next_deadline().is_none());
 }
 
@@ -971,9 +976,9 @@ fn vct_admission_failures_preserve_retry_policy_state() {
             .current()
             .expect("an admission failure cannot recreate the repair task");
         assert_eq!(task.attempts, 2);
-        assert!(task.tried_sources.contains(&prior));
         if supplier_attributed {
-            assert!(task.tried_sources.contains(&source));
+            assert!(!task.tried_sources.contains(&prior));
+            assert!(!task.tried_sources.contains(&source));
             assert!(matches!(
                 &task.state,
                 RepairPolicyState::Ready { context: retained } if retained == &context
@@ -986,6 +991,7 @@ fn vct_admission_failures_preserve_retry_policy_state() {
                 VctRepairStallOutcome::NoEligibleSupplier
             );
         } else {
+            assert!(task.tried_sources.contains(&prior));
             assert!(!task.tried_sources.contains(&source));
             assert!(matches!(
                 &task.state,
@@ -1483,6 +1489,52 @@ fn established_supplier_precedes_new_identities_after_adversarial_churn() {
     assert!(churn
         .iter()
         .all(|peer| fixture.reactor.peer_work_queue.active(peer).is_none()));
+    let task = fixture
+        .reactor
+        .vct_repair
+        .current()
+        .expect("the established supplier keeps the repair requirement");
+    assert!(established[..3]
+        .iter()
+        .all(|peer| !task.tried_sources.contains(&source_id_from_peer(peer))));
+}
+
+#[test]
+fn disconnected_supplier_history_cannot_block_a_new_supplier() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    let source = source_id_from_peer(peer);
+    fixture.schedule();
+    {
+        let task = fixture
+            .reactor
+            .vct_repair
+            .current_mut()
+            .expect("the repair requirement is scheduled");
+        let previous_default_capacity = crate::zakura::DEFAULT_SERVICE_MAX_PEERS * 2;
+        for index in 0..previous_default_capacity {
+            let bytes = u64::try_from(index)
+                .expect("the fixture index fits in u64")
+                .to_le_bytes()
+                .repeat(4)
+                .try_into()
+                .expect("four u64 values fill one source digest");
+            task.tried_sources.insert(SourceId::from_digest(bytes));
+        }
+        assert_eq!(task.tried_sources.len(), previous_default_capacity);
+        assert!(!task.tried_sources.contains(&source));
+    }
+
+    fixture.advertise(&peers, 7);
+
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_some());
+    let task = fixture
+        .reactor
+        .vct_repair
+        .current()
+        .expect("the new supplier owns the repair requirement");
+    assert!(task.tried_sources.is_empty());
 }
 
 #[test]

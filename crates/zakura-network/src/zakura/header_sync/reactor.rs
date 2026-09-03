@@ -529,7 +529,6 @@ enum VctRepairStallOutcome {
     LocalSendFailure,
     NoEligibleSupplier,
     SupplierFailure,
-    SupplierHistoryFull,
     SupplierSendFailure,
 }
 
@@ -542,7 +541,6 @@ impl VctRepairStallOutcome {
             Self::LocalSendFailure => "local_send_failed",
             Self::NoEligibleSupplier => "no_eligible_supplier",
             Self::SupplierFailure => "supplier_failure",
-            Self::SupplierHistoryFull => "supplier_history_full",
             Self::SupplierSendFailure => "supplier_send_failed",
         }
     }
@@ -553,10 +551,9 @@ impl VctRepairStallOutcome {
             | Self::LocalFailure
             | Self::LocalOperationPending
             | Self::LocalSendFailure => "local",
-            Self::NoEligibleSupplier
-            | Self::SupplierFailure
-            | Self::SupplierHistoryFull
-            | Self::SupplierSendFailure => "supplier",
+            Self::NoEligibleSupplier | Self::SupplierFailure | Self::SupplierSendFailure => {
+                "supplier"
+            }
         }
     }
 }
@@ -1379,12 +1376,12 @@ impl HeaderSyncReactor {
             response.common_ancestor_height,
             response.common_ancestor_hash,
         );
+        let repair_episode = self.peer_work_queue.repair_episode(active.owner);
         if let HeaderTargetPurpose::SelectedAuxiliaryRepair {
-            selected_target,
-            episode,
-            ..
+            selected_target, ..
         } = &active.purpose
         {
+            let episode = repair_episode.expect("an active repair binds its evidence episode");
             let exact_shape = response.target_tip_hash == selected_target.hash
                 && active.sent_locator.entries() == [returned_ancestor]
                 && response.entries.len() == 1
@@ -1418,7 +1415,7 @@ impl HeaderSyncReactor {
                     return false;
                 };
                 context.target == *selected_target
-                    && context.episode == *episode
+                    && context.episode == episode
                     && (context.excludes(input) || context.retains_payload(input))
             });
             if excluded {
@@ -1527,13 +1524,11 @@ impl HeaderSyncReactor {
                     zakura_header_chain::TargetCompletion::TargetComplete { common_ancestor }
                 }
                 HeaderTargetPurpose::SelectedAuxiliaryRepair {
-                    selected_target,
-                    episode,
-                    ..
+                    selected_target, ..
                 } => zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                     common_ancestor,
                     selected_target,
-                    episode,
+                    episode: repair_episode.expect("an active repair binds its evidence episode"),
                 },
             };
             let repair = matches!(
@@ -3127,7 +3122,10 @@ impl HeaderSyncReactor {
 
     fn try_assign_vct_repair(&mut self) {
         let now = Instant::now();
+        let connected_sources: HashSet<_> =
+            self.peer_state.keys().map(source_id_from_peer).collect();
         if let Some(task) = self.vct_repair.current_mut() {
+            task.retain_connected_sources(&connected_sources);
             task.resume_retry(now);
         }
         let Some(task) = self.vct_repair.ready().cloned() else {
@@ -3139,16 +3137,6 @@ impl HeaderSyncReactor {
         let Some(predecessor) = context.locator.entries().first().copied() else {
             return;
         };
-        if task.supplier_history_full() {
-            self.note_vct_repair_stall(
-                &task,
-                predecessor,
-                VctSupplierRejections::default(),
-                VctRepairStallOutcome::SupplierHistoryFull,
-                now,
-            );
-            return;
-        }
         let response_bytes = headers_response_bytes(&self.startup.network, AuxSchema::V1, 1)
             .expect("one fixed-width response fits in usize");
         // A peer can serve the exact repair target from its retained header graph or from its
@@ -3239,13 +3227,6 @@ impl HeaderSyncReactor {
                                 let _ = current.record_failed_source(source);
                             }
                             self.rotate_vct_supplier(source);
-                            if self
-                                .vct_repair
-                                .get(task.owner)
-                                .is_some_and(RepairRequirement::supplier_history_full)
-                            {
-                                break;
-                            }
                         }
                         VctRepairRetryAttribution::Local => {
                             let deferred =
@@ -3307,24 +3288,26 @@ impl HeaderSyncReactor {
                 .peer_work_queue
                 .stage(peer.clone(), target.clone(), PeerWorkPriority::Normal)
                 != QueueWorkResult::NeedsLocator
-                || !self.peer_work_queue.start(ActiveHeaderRequest {
-                    purpose: HeaderTargetPurpose::SelectedAuxiliaryRepair {
-                        selected_target: context.target,
-                        episode: context.episode,
-                        repair_generation: task.repair_generation,
+                || !self.peer_work_queue.start_repair(
+                    ActiveHeaderRequest {
+                        purpose: HeaderTargetPurpose::SelectedAuxiliaryRepair {
+                            selected_target: context.target,
+                            repair_generation: task.repair_generation,
+                        },
+                        peer: peer.clone(),
+                        source,
+                        target,
+                        sent_locator: context.locator.clone(),
+                        request_id,
+                        owner: wire_owner.into(),
+                        common_ancestor: None,
+                        entries: Vec::new(),
+                        phase: HeaderTargetPhase::Receiving,
+                        max_header_count: 1,
+                        tree_aux_schema: AuxSchema::V1,
                     },
-                    peer: peer.clone(),
-                    source,
-                    target,
-                    sent_locator: context.locator.clone(),
-                    request_id,
-                    owner: wire_owner.into(),
-                    common_ancestor: None,
-                    entries: Vec::new(),
-                    phase: HeaderTargetPhase::Receiving,
-                    max_header_count: 1,
-                    tree_aux_schema: AuxSchema::V1,
-                })
+                    context.episode,
+                )
             {
                 session.cancel_request(request_id);
                 self.peer_work_queue.cancel_request_reservation(&peer);
@@ -4365,17 +4348,14 @@ impl HeaderSyncReactor {
                         (
                             HeaderTargetPurpose::SelectedAuxiliaryRepair {
                                 selected_target: purpose_target,
-                                episode: purpose_episode,
                                 ..
                             },
                             zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                                 selected_target,
-                                episode,
                                 ..
                             },
                         ) if *purpose_target == target
                             && selected_target == target
-                            && *purpose_episode == episode
                             && entries.len() == 1
                     ) {
                         let result = HeaderTargetPreparationResult::Failed(std::sync::Arc::new(

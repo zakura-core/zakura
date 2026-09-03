@@ -36,9 +36,9 @@ and inflight limit.
   - `max_inflight_requests` = 1..=32,768
   - `max_response_bytes` = 1..=33,554,432
   - exact consumption
-- **Relevant**
-  - the range, tip hash, or a serving-limit change can affect candidate selection, pending demand,
-    failover, or an open request
+- **Ignore without penalty**
+  - ignore when none of the range, tip hash, or serving-limit changes can affect candidate selection,
+    pending demand, failover, or an open request
 - **Cadence**
   - capacity = 4
   - refill = 1 message / 15 seconds

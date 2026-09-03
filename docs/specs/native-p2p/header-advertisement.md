@@ -49,9 +49,9 @@ discriminator makes its encoded size 122 bytes.
     auxiliary schema
   - `tree_aux_schema_mask` contains only known bits
   - exact consumption
-- **Relevant**
-  - the advertised target or a serving-limit change can affect target selection, failover, or a
-    future credit grant
+- **Ignore without penalty**
+  - ignore when neither the advertised target nor a serving-limit change can affect target selection,
+    failover, or a future credit grant
 - **Cadence**
   - capacity = 4
   - refill = 2 messages/s
@@ -60,3 +60,7 @@ discriminator makes its encoded size 122 bytes.
 The sender MUST coalesce changes to at most one `Status` per second. `work_anchor_height` is the
 height of the sender's finality anchor. `oldest_retained_height` is the lowest height for which
 the sender retains headers.
+
+Before this draft becomes **Specified**, honest connection and update traces MUST show that the
+candidate cadence accepts startup bursts and scheduling jitter. A flood test MUST show that a sender
+which exceeds its stated obligation reaches `Disconnect` within bounded work.

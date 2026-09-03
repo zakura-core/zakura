@@ -39,23 +39,23 @@ DISCOVERY_WORK_REFILL        = 1 MiB/s
   - `protocol_min <= protocol_max`
   - record body <= 580 bytes
   - exact consumption
-- **Verify** — `ZakuraNodeRecord::verify`, with time-varying import policy split
+- **Message validity** — `ZakuraNodeRecord::verify`, with time-varying import policy split
   from `validate_record_body_for_import`
   - record signature
   - network and chain IDs
   - protocol overlap
   - record author == authenticated peer
-- **Relevant**
-  - sequence > peer-local stored sequence
-  - expiry is acceptable under local policy
+- **Ignore without penalty**
+  - ignore when the sequence does not advance the peer-local stored record
+  - ignore when local expiry policy rejects the record
 - **Cadence**
   - capacity = 4
   - refill = 1 message / 7 seconds
   - on_empty = `Disconnect`
 
-The sender MUST send at most one `Hello` every 15 seconds. Verify MUST run before the discovery
-book lock. Expiry and sequence checks MUST return `Drop` because clock passage and local record
-state can make an otherwise valid record obsolete. The handler MUST NOT store an address that is
-not globally routable unless local policy allows that address class. A stored record's sequence
-comparison ends when the stored record expires, so a peer that reset its sequence recovers after
-expiry.
+The sender MUST send at most one `Hello` every 15 seconds. The message validity checks MUST run
+before the discovery book lock. Expiry and sequence checks MUST return `Drop` because clock passage
+and local record state can make an otherwise valid record obsolete. The handler MUST NOT store an
+address that is not globally routable unless local policy allows that address class. A stored
+record's sequence comparison ends when the stored record expires, so a peer that reset its sequence
+recovers after expiry.

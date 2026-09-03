@@ -31,7 +31,8 @@ Every wire kind MUST have:
 - one codec and exhaustive dispatch arm;
 - a payload cap known before payload allocation;
 - bounds for variable-length decoded state;
-- a wire-format contract; and
+- a wire-format contract;
+- the sender obligation for any rule that can disconnect; and
 - an explicit state effect or no-state-effect marker.
 
 Each regulated exchange root MUST have:
@@ -70,6 +71,11 @@ Local scheduling, finality, replacement, cancellation, and capacity exhaustion
 MUST NOT become peer violations. A contract MAY drop or reject excess valid
 requests when replying would itself violate a resource bound.
 
+Every inbound rule that can disconnect a peer MUST identify the matching
+obligation on a conformant sender. Local configuration, scheduling, finality,
+replacement, or work reassignment MUST NOT cause a conformant sender to violate
+that obligation.
+
 ## Processing order
 
 Checks MUST run before the work they bound. A serving request uses this order:
@@ -89,12 +95,30 @@ Checks MUST run before the work they bound. A serving request uses this order:
 An announcement replaces resource admission with its declared cadence check. A
 response also checks the reservation created by the request Zakura sent.
 
+## Message validity and harmless ignores
+
+**Message validity** asks whether the peer sent a valid message. These checks
+use the decoded message, the authenticated peer identity, and fixed network
+rules. They run before consulting mutable chain or service state. A failure
+follows the contract's declared invalid-message outcome.
+
+**Ignore without penalty** applies to a valid message that is stale or cannot
+affect the receiver's current state. The decision MUST use a cheap, bounded
+snapshot without waiting for I/O or a shared-state lock. It MUST NOT disconnect
+the peer, record misbehavior, or discard a response that still matches a live
+reservation merely because local interest changed. Cadence, reservation, or
+another declared limit MUST bound repeated ignored messages.
+
 ## Framing and decoding
 
 The fixed frame header MUST identify the message kind before its payload buffer
 is allocated. The transport MUST reject a payload longer than that kind's
 declared cap before allocation. A stream-wide frame maximum MUST remain as a
 defense in depth limit but MUST NOT replace the per-message cap.
+
+The transport MUST separately bound partial-frame state and enforce a read
+deadline for an incomplete frame. Complete-message admission limits do not
+prevent a peer from starting a frame and then withholding the remaining bytes.
 
 For every payload within the cap, decoding MUST return a result without
 panicking. Accepted payloads MUST be canonical and consumed exactly. Decoding
@@ -265,9 +289,11 @@ A regulation layer is implemented only when:
 4. Under-budget histories preserve the pre-regulation behavior.
 5. Native traffic checks reading floods, stopped readers, transport buffering,
    cleanup, and useful peer progress under a named topology.
-6. Configuration tests reject any value set that cannot admit the largest legal
+6. Transport tests bound partial-frame state and expire incomplete frames under
+   the configured read deadline.
+7. Configuration tests reject any value set that cannot admit the largest legal
    request or cannot bound aggregate state.
-7. Sensitivity checks demonstrate that each observed production channel can
+8. Sensitivity checks demonstrate that each observed production channel can
    make the suite fail.
 
 CPU, resident memory, and throughput are diagnostics unless the contract names

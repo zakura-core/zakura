@@ -90,7 +90,7 @@ target hash, and a one-byte outcome.
 `Open` MUST carry `1..=13` unique locator hashes. Its acknowledged cursor MUST equal the first
 locator. Its acknowledged header and byte counts MUST equal zero. It MUST add nonzero header and byte
 credit. The byte credit MUST fit the fixed response fields and one entry under the selected schema.
-The subscriber MUST select the target from a relevant `Status`. It MUST create the local
+The subscriber MUST select the target from an applicable `Status`. It MUST create the local
 subscription reservation before it sends `Open`.
 
 `Grant` MUST carry no locator hashes. It MUST acknowledge a cursor accepted from this subscription.
@@ -151,16 +151,15 @@ one-header pages, so `HS_SENT_CURSOR_RING` always suffices.
   - require `reaches_initial_target` exactly when the final header hash equals the initial target
   - record when the initial target is reached and reject a second such marker
   - remain live
-- **Verify** — `prepare_headers`, the context-free header validator, over the
-  decoded page. It establishes the supported encoding version, the locally computed hash, the
-  inferred height, the commitment interpretation, the canonical compact target, the hash-to-target
-  filter, the Equihash solution under the network proof-of-work policy, and the per-block work.
-  Header sync already calls it on this path in
-  `header_sync_driver`. The individual rules live in
-  `validation::context_free`.
+- **Message validity** — `prepare_headers`, which checks the decoded page before
+  consulting mutable chain state. It establishes the supported encoding version, the locally
+  computed hash, the inferred height, the commitment interpretation, the canonical compact target,
+  the hash-to-target filter, the Equihash solution under the network proof-of-work policy, and the
+  per-block work. Header sync already calls it on this path in `header_sync_driver`. The individual
+  checks live in `validation::context_free`.
 
-Page linkage is a reservation rule, not a context-free one. It holds against the sent locator and
-receive cursor in the local reservation, so `prepare_headers` cannot decide it.
+Page linkage is a reservation rule, not a message validity check. It depends on the sent locator and
+receive cursor in the local reservation, so `prepare_headers` cannot decide it from the page alone.
 
 The first page MUST extend the locator intersection selected by the publisher. The publisher MUST
 reach the initial target before it pushes a descendant beyond that target. Each later page MUST
@@ -214,3 +213,13 @@ admission. A local failure after admission MUST return `LocalFault`. `TargetNotS
 that the publisher changed its selected chain between `Status` and `Open`. `SubscriptionSuperseded`
 reports that the publisher's selected chain stopped extending the subscription cursor. Neither is
 a peer violation.
+
+## Evidence required before promotion
+
+The proposed limits remain candidate values until the following evidence exists:
+
+| Parameters | Required evidence |
+| --- | --- |
+| 4,000-header credit, 8 MiB byte credit, and 4,096-entry cursor ring | Generated histories covering open, grant, close, crossing updates, one-header pages, exhausted credit, and reorganization; the ring must retain every cursor that can still be acknowledged. |
+| 30-second push deadline | Native tests over slow but conformant links and target changes; a conformant publisher must queue within 30 seconds, and the subscriber must wait 60 seconds before treating the obligation as violated. |
+| Work capacity and refill | CPU, state, and egress measurements at the maximum peer count, plus a liveness test for the largest legal grant. |

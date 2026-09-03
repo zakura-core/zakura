@@ -65,7 +65,7 @@ MUST send exactly one `Peers` response for every admitted request.
   - one outstanding `GetPeers` on this stream
   - bounds count and payload bytes
   - consumed by this message
-- **Verify** — the signature and immutable import checks from
+- **Message validity** — the signature and immutable import checks from
   `ZakuraNodeRecord::verify` for each record, before the discovery book lock
   - record signature
   - record body bounds
@@ -74,7 +74,7 @@ MUST send exactly one `Peers` response for every admitted request.
 
 A malformed record, invalid signature, wrong network, wrong chain, or incompatible protocol range
 MUST disconnect the relaying peer. Expiry MUST remain a handler policy check because a record can
-expire in transit. The handler MUST discard an otherwise valid record when local staleness, expiry,
-address, or storage policy rejects it. The handler MUST NOT store an address that is not globally
-routable unless local policy allows that address class. Storage policy MUST bound the number of
-stored records attributed to each source peer.
+expire in transit. The handler MUST ignore an otherwise valid record without penalizing the peer
+when local staleness, expiry, address, or storage policy rejects it. The handler MUST NOT store an
+address that is not globally routable unless local policy allows that address class. Storage policy
+MUST bound the number of stored records attributed to each source peer.

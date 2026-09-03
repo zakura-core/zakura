@@ -233,18 +233,18 @@ ID. That policy remains deferred until the receiving-side contract is written.
 - **Reservation** — `BlockRangeRequest::expected_hash`
   - one live `GetBlocks` range whose next unconsumed height expects this header hash
   - consumes that hash's part of the reservation
-- **Verify** — `CheckpointVerifier::check_block`, the existing stateless block
-  check. It establishes the encoding version and hash, the coinbase height, the compact target,
-  and the Equihash solution, then recomputes the Merkle root. The individual rules live in
-  `block::check`.
+- **Message validity** — `CheckpointVerifier::check_block`, the existing block
+  check that uses the block and fixed network rules rather than current chain state. It establishes
+  the encoding version and hash, the coinbase height, the compact target, and the Equihash solution,
+  then recomputes the Merkle root. The individual checks live in `block::check`.
 
 The receiver matches a `Block` by hashing its header and comparing that hash with the committed
 header hashes expected by live ranges. A block that does not match the next expected hash of exactly
 one live range MUST return `Disconnect`. The publisher MUST send the blocks of a range in ascending
 height order. The reservation identity commits to a header that header sync already validated, so
-Verify re-checks Equihash and the target only as defense in depth. An implementation MAY skip both
-checks when the header bytes hash to the expected identity. Block sync takes that option today: it
-matches the hash at `peer_routine` and leaves
+message validation re-checks Equihash and the target only as defense in depth. An implementation
+MAY skip both checks when the header bytes hash to the expected identity. Block sync takes that
+option today: it matches the hash at `peer_routine` and leaves
 `CheckpointVerifier::check_block` to run downstream.
 
 ### `BlocksDone` — Response, discriminator 4

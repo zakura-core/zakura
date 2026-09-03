@@ -65,14 +65,14 @@ MUST send exactly one `Services` response for every admitted request.
   - supplies allowed service IDs, summary count, and payload cap
   - an empty request reserves all service IDs and eight summaries
   - consumed by this message
-- **Verify** — `validate_summary_envelope` for the envelope, and
+- **Message validity** — `validate_summary_envelope` for the envelope, and
   `import_connected_peer_services` for the peer binding
   - each known envelope tag matches the service ID
   - each known summary decodes strictly
   - an unknown summary stays length-bounded and is ignored
   - `node_id` == authenticated peer
-- **Relevant**
-  - expiry is not in the past
-  - at least one summary differs from stored live state
+- **Ignore without penalty**
+  - ignore an expired response
+  - ignore when every summary matches stored live state
 
 An empty summary list remains legal and clears the peer's live service state.

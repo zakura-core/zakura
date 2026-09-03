@@ -20,8 +20,13 @@ The keywords **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
 ## Contract inventories
 
-Each native protocol MUST derive a closed wire-kind inventory from production
-code. Every kind MUST have:
+A completed multi-exchange implementation MUST derive a closed wire-kind
+inventory from production code. For the first exchange, the catalog and
+machine-checked test manifests are the temporary review gate. Compiler-derived
+closure is required before a second exchange is called a reusable
+implementation of this standard.
+
+Every wire kind MUST have:
 
 - one codec and exhaustive dispatch arm;
 - a payload cap known before payload allocation;

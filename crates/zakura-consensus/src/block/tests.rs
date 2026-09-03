@@ -252,6 +252,38 @@ async fn prepared_mined_commit_rechecks_equihash() {
 }
 
 #[tokio::test]
+async fn prepared_mined_commit_rechecks_difficulty() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let candidate = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
+    let mut verifier = prepared_test_verifier(&network);
+    prepare_for_test(&mut verifier, candidate.clone()).await;
+
+    let mut solved = (*candidate).clone();
+    Arc::make_mut(&mut solved.header).difficulty_threshold = INVALID_COMPACT_DIFFICULTY;
+    let result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::CommitMined {
+            block: Arc::new(solved),
+            work_id: Some("work".to_owned()),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(VerifyBlockError::Block {
+            source: BlockError::InvalidDifficulty(_, _)
+        })
+    ));
+}
+
+#[tokio::test]
 async fn prepared_mined_commit_rechecks_header_time() {
     let _init_guard = zakura_test::init();
     let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
@@ -370,6 +402,72 @@ async fn failed_preparation_does_not_populate_the_cache() {
 }
 
 #[tokio::test]
+async fn cache_eviction_between_resolution_and_commit_uses_full_verification() {
+    const SERVER_CANDIDATE_LIMIT: u32 = 24;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let candidate = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
+    let state = service_fn(|request: zs::Request| async move {
+        let response = match request {
+            zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+            zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            _ => panic!("cache-eviction test received an unexpected state request: {request:?}"),
+        };
+        Ok::<_, BoxError>(response)
+    });
+    let transaction =
+        service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
+    let (mut verifier, resolver) =
+        SemanticBlockVerifier::new_with_prepared_candidates(&network, state, transaction);
+    prepare_for_test(&mut verifier, candidate.clone()).await;
+
+    let resolved = resolver
+        .resolve("work", *candidate.header)
+        .expect("the candidate resolves before eviction");
+    for index in 0..=SERVER_CANDIDATE_LIMIT {
+        let mut replacement = (*candidate).clone();
+        Arc::make_mut(&mut replacement.header).version = index.saturating_add(5);
+        resolver.insert_for_test(
+            Arc::new(replacement),
+            &format!("replacement-{index}"),
+            PreparedCandidateSource::ServerTemplate,
+            &network,
+        );
+    }
+    assert_eq!(
+        resolver.resolve("work", *candidate.header),
+        Err(ResolvePreparedCandidateError::StaleWork)
+    );
+
+    let mut tampered = (*resolved).clone();
+    let extra_transaction: Transaction = zakura_test::vectors::DUMMY_TX1
+        .zcash_deserialize_into()
+        .expect("the dummy transaction deserializes");
+    tampered.transactions.push(Arc::new(extra_transaction));
+    let result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::CommitMined {
+            block: Arc::new(tampered),
+            work_id: Some("work".to_owned()),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(VerifyBlockError::Block {
+            source: BlockError::BadMerkleRoot { .. }
+        })
+    ));
+}
+
+#[tokio::test]
 async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -425,7 +523,94 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
         })
         .await;
     assert!(commit_result.is_ok());
-    assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
+    // The conflicting work ID prevents cache insertion, so commit verifies once more.
+    assert_eq!(transaction_calls.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn prepared_and_full_commits_produce_the_same_state_input() {
+    use std::sync::Mutex;
+
+    let state_service = |committed: Arc<Mutex<Option<zs::SemanticallyVerifiedBlock>>>| {
+        service_fn(move |request: zs::Request| {
+            let committed = committed.clone();
+            async move {
+                let response = match request {
+                    zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                    zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+                    zs::Request::CheckPreparedMinedRelayEligibility(_) => {
+                        zs::Response::PreparedMinedRelayEligibility(
+                            zs::PreparedMinedRelayEligibility::CommitFirst,
+                        )
+                    }
+                    zs::Request::CommitSemanticallyVerifiedBlock(block)
+                    | zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
+                        let hash = block.hash;
+                        *committed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(block);
+                        zs::Response::Committed(hash)
+                    }
+                    _ => {
+                        panic!("equivalence test received an unexpected state request: {request:?}")
+                    }
+                };
+                Ok(response)
+            }
+        })
+    };
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let block = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
+    let full_commit = Arc::new(Mutex::new(None));
+    let prepared_commit = Arc::new(Mutex::new(None));
+    let transaction = || {
+        service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) })
+    };
+
+    let mut full_verifier =
+        SemanticBlockVerifier::new(&network, state_service(full_commit.clone()), transaction());
+    let full_hash = full_verifier
+        .ready()
+        .await
+        .expect("the full verifier is ready")
+        .call(Request::Commit(block.clone()))
+        .await
+        .expect("full verification commits the block");
+
+    let mut prepared_verifier = SemanticBlockVerifier::new(
+        &network,
+        state_service(prepared_commit.clone()),
+        transaction(),
+    );
+    prepare_for_test(&mut prepared_verifier, block.clone()).await;
+    let prepared_hash = prepared_verifier
+        .ready()
+        .await
+        .expect("the prepared verifier is ready")
+        .call(Request::CommitMined {
+            block,
+            work_id: Some("work".to_owned()),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await
+        .expect("prepared verification commits the block");
+
+    assert_eq!(prepared_hash, full_hash);
+    assert_eq!(
+        prepared_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref(),
+        full_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref(),
+    );
 }
 
 // TODO: enable this test after implementing contextual verification

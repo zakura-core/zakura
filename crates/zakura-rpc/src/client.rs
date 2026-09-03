@@ -26,7 +26,10 @@ pub use crate::methods::{
         get_raw_mempool::{GetRawMempoolResponse, MempoolObject},
         network_info::GetNetworkInfoResponse,
         peer_info::{GetPeerInfoResponse, PeerInfo},
-        submit_block::{SubmitBlockErrorResponse, SubmitBlockResponse},
+        submit_block::{
+            SubmitBlockErrorResponse, SubmitBlockResponse, SubmitSolutionErrorResponse,
+            SubmitSolutionParameters, SubmitSolutionResponse,
+        },
         subsidy::{FundingStream, GetBlockSubsidyResponse},
         transaction::{
             Input, JoinSplit, Orchard, OrchardAction, OrchardFlags, Output, ScriptPubKey,

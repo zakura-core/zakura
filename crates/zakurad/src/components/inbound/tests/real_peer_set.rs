@@ -1204,6 +1204,7 @@ mod submitblock_test {
             .send(MinedBlockEvent::Committed {
                 hash: block::Hash([1; 32]),
                 height: block::Height(1),
+                early_advertised: false,
             })
             .unwrap();
         let gossip_task_handle = tokio::spawn(

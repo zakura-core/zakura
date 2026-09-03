@@ -3447,6 +3447,202 @@ async fn rpc_submitblock_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rpc_client_proposal_can_submit_solution() {
+    let _init_guard = zakura_test::init();
+
+    let network = testnet::Parameters::build()
+        .to_network()
+        .expect("the default testnet parameters are valid");
+    let candidate: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis test vector is valid");
+    let prepared_candidates = PreparedCandidateResolver::default();
+    let mut block_verifier_router: MockService<_, _, _, BoxError> =
+        MockService::build().for_unit_tests();
+    let submit_block_channel = types::submit_block::SubmitBlockChannel::new();
+    let mined_block_sender = submit_block_channel.sender();
+    let mut mined_block_events = submit_block_channel.receiver();
+    let pending_blocks = PendingBlockRegistry::default();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _) = RpcImpl::new_with_prepared_candidates(
+        network.clone(),
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        block_verifier_router.clone(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        Some(mined_block_sender),
+        pending_blocks.clone(),
+        prepared_candidates.clone(),
+    );
+
+    let proposal = rpc.get_block_template(Some(GetBlockTemplateParameters {
+        mode: GetBlockTemplateRequestMode::Proposal,
+        data: Some(HexData(
+            candidate
+                .zcash_serialize_to_vec()
+                .expect("candidate serialization succeeds"),
+        )),
+        work_id: Some("proposal-work".to_owned()),
+        ..Default::default()
+    }));
+    let mut proposal_verifier = block_verifier_router.clone();
+    let proposal_candidate = candidate.clone();
+    let proposal_cache = prepared_candidates.clone();
+    let proposal_network = network.clone();
+    let prepare = async move {
+        let request = proposal_verifier
+            .expect_request_that(|request| {
+                matches!(
+                    request,
+                    zakura_consensus::Request::Prepare {
+                        work_id: Some(work_id),
+                        source: zakura_consensus::PreparedCandidateSource::ClientProposal,
+                        ..
+                    } if work_id == "proposal-work"
+                )
+            })
+            .await;
+        let (block, source) = match request.request() {
+            zakura_consensus::Request::Prepare { block, source, .. } => (block.clone(), *source),
+            _ => unreachable!("the request matcher requires Prepare"),
+        };
+        proposal_cache.insert_for_test(block, "proposal-work", source, &proposal_network);
+        request.respond(proposal_candidate.hash());
+    };
+    let (proposal, ()) = tokio::join!(proposal, prepare);
+    assert!(matches!(
+        proposal,
+        Ok(GetBlockTemplateResponse::ProposalMode(response)) if response.is_valid()
+    ));
+
+    let stale = rpc
+        .submit_solution(SubmitSolutionParameters {
+            work_id: "missing-work".to_owned(),
+            header: HexData(
+                candidate
+                    .header
+                    .zcash_serialize_to_vec()
+                    .expect("header serialization succeeds"),
+            ),
+        })
+        .await;
+    assert_eq!(stale, Ok(SubmitSolutionErrorResponse::StaleWork.into()));
+
+    let mut header_with_trailing_byte = candidate
+        .header
+        .zcash_serialize_to_vec()
+        .expect("header serialization succeeds");
+    header_with_trailing_byte.push(0);
+    let malformed = rpc
+        .submit_solution(SubmitSolutionParameters {
+            work_id: "proposal-work".to_owned(),
+            header: HexData(header_with_trailing_byte),
+        })
+        .await;
+    assert_eq!(malformed, Ok(SubmitSolutionErrorResponse::Rejected.into()));
+
+    let mut changed_header = *candidate.header;
+    changed_header.version ^= 1;
+    let mismatch = rpc
+        .submit_solution(SubmitSolutionParameters {
+            work_id: "proposal-work".to_owned(),
+            header: HexData(
+                changed_header
+                    .zcash_serialize_to_vec()
+                    .expect("header serialization succeeds"),
+            ),
+        })
+        .await;
+    assert_eq!(
+        mismatch,
+        Ok(SubmitSolutionErrorResponse::CandidateMismatch.into())
+    );
+
+    let candidate_hash = candidate.hash();
+    let submission = tokio::spawn(async move {
+        rpc.submit_solution(SubmitSolutionParameters {
+            work_id: "proposal-work".to_owned(),
+            header: HexData(
+                candidate
+                    .header
+                    .zcash_serialize_to_vec()
+                    .expect("header serialization succeeds"),
+            ),
+        })
+        .await
+    });
+    let verifier_response = block_verifier_router
+        .expect_request_that(|request| {
+            matches!(
+                request,
+                zakura_consensus::Request::CommitMined {
+                    block,
+                    work_id: Some(work_id),
+                    ..
+                } if block.hash() == candidate_hash && work_id == "proposal-work"
+            )
+        })
+        .await;
+    let admission = match verifier_response.request() {
+        zakura_consensus::Request::CommitMined { admission, .. } => admission.clone(),
+        _ => unreachable!("the request matcher requires CommitMined"),
+    };
+    admission.authorize_optimistic_relay();
+    admission.admit_for_test();
+
+    let early_event =
+        tokio::time::timeout(std::time::Duration::from_secs(1), mined_block_events.recv())
+            .await
+            .expect("state admission promptly sends an early inventory event")
+            .expect("state admission sends an early inventory event");
+    let advertised = match early_event {
+        MinedBlockEvent::Early {
+            hash, advertised, ..
+        } => {
+            assert_eq!(hash, candidate_hash);
+            advertised
+        }
+        _ => panic!("state admission must send the early event first"),
+    };
+    assert_eq!(
+        pending_blocks.get(candidate_hash).map(|block| block.hash()),
+        Some(candidate_hash),
+    );
+    advertised
+        .send(true)
+        .expect("the lifecycle waits for the gossip result");
+
+    verifier_response.respond(candidate_hash);
+    assert_eq!(
+        submission.await.expect("the RPC task completes"),
+        Ok(SubmitSolutionResponse::Accepted)
+    );
+    assert_eq!(pending_blocks.get(candidate_hash), None);
+    assert!(matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            mined_block_events.recv()
+        )
+        .await
+        .expect("commit promptly sends its lifecycle event"),
+        Some(MinedBlockEvent::Committed {
+            hash,
+            early_advertised: true,
+            ..
+        }) if hash == candidate_hash
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_validateaddress() {
     let _init_guard = zakura_test::init();
 

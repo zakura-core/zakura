@@ -35,7 +35,7 @@ use zakura_node_services::mempool;
 use zakura_state as zs;
 
 use crate::{
-    block::{Request, SemanticBlockVerifier, VerifyBlockError},
+    block::{PreparedCandidateResolver, Request, SemanticBlockVerifier, VerifyBlockError},
     checkpoint::{CheckpointVerifier, VerifyCheckpointError},
     error::TransactionError,
     transaction, BoxError, Config,
@@ -403,6 +403,7 @@ async fn init_with_transaction_state<S, TransactionState, Mempool>(
     >,
     BackgroundTaskHandles,
     Height,
+    PreparedCandidateResolver,
 )
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
@@ -524,7 +525,11 @@ where
         "initializing block verifier router"
     );
 
-    let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
+    let (block, prepared_candidates) = SemanticBlockVerifier::new_with_prepared_candidates(
+        network,
+        state_service.clone(),
+        transaction.clone(),
+    );
     let checkpoint = CheckpointVerifier::from_checkpoint_list(list, network, tip, state_service);
     let router = BlockVerifierRouter {
         checkpoint,
@@ -538,7 +543,13 @@ where
         state_checkpoint_verify_handle,
     };
 
-    (router, transaction, task_handles, max_checkpoint_height)
+    (
+        router,
+        transaction,
+        task_handles,
+        max_checkpoint_height,
+        prepared_candidates,
+    )
 }
 
 /// Initializes block and transaction verification with one shared state service.
@@ -568,7 +579,10 @@ where
     Mempool::Future: Send + 'static,
 {
     let transaction_state = state_service.clone();
-    init_with_transaction_state(config, network, state_service, transaction_state, mempool).await
+    let (router, transaction, task_handles, max_checkpoint_height, _) =
+        init_with_transaction_state(config, network, state_service, transaction_state, mempool)
+            .await;
+    (router, transaction, task_handles, max_checkpoint_height)
 }
 
 /// Initializes verification and routes transaction read-only queries through `read_state_service`.
@@ -586,6 +600,44 @@ pub async fn init_with_read_state<S, R, Mempool>(
     >,
     BackgroundTaskHandles,
     Height,
+)
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+    R: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    R::Future: Send + 'static,
+    Mempool: Service<mempool::Request, Response = mempool::Response, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    Mempool::Future: Send + 'static,
+{
+    let transaction_state = TransactionStateRouter::new(state_service.clone(), read_state_service);
+    let (router, transaction, task_handles, max_checkpoint_height, _) =
+        init_with_transaction_state(config, network, state_service, transaction_state, mempool)
+            .await;
+    (router, transaction, task_handles, max_checkpoint_height)
+}
+
+/// Initializes verification with a separate read service and exports the mining candidate resolver.
+pub async fn init_with_prepared_candidates<S, R, Mempool>(
+    config: Config,
+    network: &Network,
+    state_service: S,
+    read_state_service: R,
+    mempool: oneshot::Receiver<Mempool>,
+) -> (
+    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<
+        BoxService<transaction::Request, transaction::Response, TransactionError>,
+        transaction::Request,
+    >,
+    BackgroundTaskHandles,
+    Height,
+    PreparedCandidateResolver,
 )
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,

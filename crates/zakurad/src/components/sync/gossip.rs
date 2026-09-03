@@ -178,7 +178,8 @@ where
                     hash,
                     height,
                     submitted_at,
-                    pending,
+                    submission,
+                    advertised,
                 }) => (
                     (
                         (hash, height),
@@ -186,9 +187,21 @@ where
                         chain_state,
                     ),
                     true,
-                    Some((pending, submitted_at)),
+                    Some((advertised, submitted_at, submission)),
                 ),
-                GossipEvent::MinedBlock(MinedBlockEvent::Committed { hash, height }) => (
+                GossipEvent::MinedBlock(MinedBlockEvent::Committed {
+                    hash,
+                    height: _,
+                    early_advertised: true,
+                }) => {
+                    chain_state.mark_last_change_hash(hash);
+                    continue;
+                }
+                GossipEvent::MinedBlock(MinedBlockEvent::Committed {
+                    hash,
+                    height,
+                    early_advertised: false,
+                }) => (
                     (
                         (hash, height),
                         "sending committed mined block broadcast",
@@ -197,6 +210,19 @@ where
                     true,
                     None,
                 ),
+                GossipEvent::MinedBlock(MinedBlockEvent::Failed {
+                    hash,
+                    height,
+                    early_advertised,
+                }) => {
+                    tracing::debug!(
+                        ?hash,
+                        ?height,
+                        early_advertised,
+                        "mined block lifecycle failed"
+                    );
+                    continue;
+                }
                 GossipEvent::CommittedTip(tip_change_close_to_network_tip) => {
                     (tip_change_close_to_network_tip?, false, None)
                 }
@@ -215,40 +241,26 @@ where
         };
 
         info!(?height, ?request, log_msg);
-        // Include readiness in the deadline. The event loop must keep consuming lifecycle and tip
-        // events when the peer set has no ready service.
         let network = broadcast_network.clone();
         let mark_tx = mined_block_mark_sender.clone();
         tokio::spawn(async move {
-            let broadcast = async move {
-                tokio::time::timeout(TIPS_RESPONSE_TIMEOUT, network.oneshot(request))
-                    .await
-                    .is_ok_and(|result| result.is_ok())
-            };
-            let succeeded = match early {
-                Some((mut pending, submitted_at)) => {
-                    if !pending.is_valid() {
-                        false
-                    } else {
-                        let succeeded = tokio::select! {
-                            biased;
-                            _ = pending.wait_for_failure() => false,
-                            succeeded = broadcast => succeeded,
-                        };
-                        if succeeded {
-                            metrics::counter!("mining.optimistic_inventory.early_inventories")
-                                .increment(1);
-                            metrics::histogram!("mining.submit_to_inventory.duration_seconds")
-                                .record(submitted_at.elapsed().as_secs_f64());
-                        }
-                        succeeded
-                    }
-                }
-                None => broadcast.await,
-            };
+            let succeeded = tokio::time::timeout(TIPS_RESPONSE_TIMEOUT, network.oneshot(request))
+                .await
+                .is_ok_and(|result| result.is_ok());
 
             if succeeded && is_block_submission {
                 let _ = mark_tx.send(hash);
+            }
+            if let Some((advertised, submitted_at, submission)) = early {
+                if succeeded {
+                    metrics::counter!("mining.optimistic_inventory.early_inventories").increment(1);
+                    metrics::histogram!(
+                        "mining.submit_to_inventory.duration_seconds",
+                        "method" => submission.rpc_method()
+                    )
+                    .record(submitted_at.elapsed().as_secs_f64());
+                }
+                let _ = advertised.send(succeeded);
             }
         });
     }
@@ -280,6 +292,7 @@ mod tests {
                 .send(MinedBlockEvent::Committed {
                     hash: submitted_hash,
                     height: block::Height(1),
+                    early_advertised: false,
                 })
                 .unwrap();
             mark_sender.send(submitted_hash).unwrap();
@@ -308,6 +321,7 @@ mod tests {
                 GossipEvent::MinedBlock(MinedBlockEvent::Committed {
                     hash,
                     height: block::Height(1),
+                    early_advertised: false,
                 }) if hash == submitted_hash
             ));
 

@@ -37,7 +37,8 @@ use crate::components::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
         },
-        FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT,
+        BLOCK_DOWNLOAD_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT,
+        FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT,
     },
 };
 
@@ -506,9 +507,9 @@ where
 
     /// Queue a block for download and verification.
     ///
-    /// This method waits for the network to become ready, and returns an error
-    /// only if the network service fails. It returns immediately after queuing
-    /// the request.
+    /// This method waits up to [`BLOCK_DOWNLOAD_TIMEOUT`] for the network to become ready. It
+    /// returns an error if readiness fails or times out. It returns immediately after queuing the
+    /// request.
     #[instrument(level = "debug", skip(self), fields(%hash))]
     pub async fn download_and_verify(
         &mut self,
@@ -534,13 +535,20 @@ where
         // if we waited for readiness and did the service call in the spawned
         // tasks, all of the spawned tasks would race each other waiting for the
         // network to become ready.
-        let network = match self.network.ready().await {
-            Ok(network) => network,
-            Err(error) => {
+        let network = match timeout(BLOCK_DOWNLOAD_TIMEOUT, self.network.ready()).await {
+            Ok(Ok(network)) => network,
+            Ok(Err(error)) => {
                 let state = take_task_state(&self.task_states, hash);
                 self.trace
                     .block_finish(hash, LegacyBlockOutcome::Error(&error), state);
                 return Err(BlockDownloadVerifyError::NetworkServiceError { error });
+            }
+            Err(error) => {
+                let error = BlockDownloadVerifyError::from(error);
+                let state = take_task_state(&self.task_states, hash);
+                self.trace
+                    .block_finish(hash, LegacyBlockOutcome::Error(&error), state);
+                return Err(error);
             }
         };
         let block_req = network.call(zn::Request::BlocksByHash(std::iter::once(hash).collect()));

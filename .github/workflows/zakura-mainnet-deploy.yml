@@ -202,6 +202,7 @@ jobs:
           # Read-only fields below: consumed by the status dashboard's SSH probe,
           # not written to any node (manage_config = false).
           rpc_listen_addr = "0.0.0.0:8232"
+          metrics_endpoint = "127.0.0.1:9999"
           log_file        = "/root/logs/zakura-tracing.log"
           # Verified on the fleet: the nine regional nodes keep state here, the
           # compat host does not. Used only for the dashboard's disk probe.
@@ -323,6 +324,41 @@ jobs:
           sudo install -d -m 755 /run/zakura-fleet-watchdog
           printf '%s\n' "$(( $(date +%s) + 1200 ))" \
             | sudo tee /run/zakura-fleet-watchdog/deploy-suppressed-until >/dev/null
+
+      - name: Suppress compatibility watchdog alerts during deploy
+        # This stays in workflow-owned code so rollback refs whose deployer
+        # predates suppression are still covered.
+        if: ${{ !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
+        run: |
+          set -euo pipefail
+
+          if ! timeout --signal=TERM --kill-after=5s 60s \
+            ssh \
+              -o BatchMode=yes \
+              -o ConnectTimeout=20 \
+              -o ServerAliveInterval=10 \
+              -o ServerAliveCountMax=3 \
+              -o StrictHostKeyChecking=yes \
+              -- root@159.203.113.196 bash -s <<'REMOTE'; then
+          set -euo pipefail
+
+          marker=/run/zakura-watchdog/deployment-suppressed-until
+          mkdir -p -m 755 "$(dirname "$marker")"
+          marker_tmp="$(mktemp "${marker}.tmp.XXXXXX")"
+          cleanup() {
+            rm -f "$marker_tmp"
+          }
+          trap cleanup EXIT
+          printf '%s\n' "$(( $(date +%s) + 1200 ))" > "$marker_tmp"
+          chmod 644 "$marker_tmp"
+          mv -f "$marker_tmp" "$marker"
+          trap - EXIT
+          if systemctl is-active --quiet zakura-watchdog; then
+            systemctl restart zakura-watchdog
+          fi
+          REMOTE
+            echo "::warning::failed to suppress compatibility watchdog alerts; continuing deploy" >&2
+          fi
 
       - name: Deploy fleet
         working-directory: deploy/deployer
@@ -584,6 +620,7 @@ jobs:
           ssh_string = "root@159.203.113.196"
           probe_kind = "zcashd"
           service_name = ""
+          metrics_endpoint = ""
           # Managed/path install from zcashd-compat-manifest.json (v1.0.0-compat-rc0).
           bin_path = "/mnt/data/import-zebra/zcashd-compat/bin/v1.0.0-compat-rc0/x86_64-pc-linux-gnu/zcashd"
           log_file = ""

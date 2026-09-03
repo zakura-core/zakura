@@ -302,8 +302,10 @@ where
 
             if request.is_mined_commit() {
                 let solved_header_start = std::time::Instant::now();
-                if let Some(mut prepared_block) =
-                    prepared_candidates.lookup(&block, request.work_id(), &network)
+                if let Some(prepared::CachedPreparedCandidate {
+                    source,
+                    prepared: cached_prepared_block,
+                }) = prepared_candidates.lookup(&block, request.work_id(), &network)
                 {
                     let pow_policy = zakura_header_chain::PowPolicy::for_network(&network)?;
                     if pow_policy.is_authenticated_custom_waiver() {
@@ -326,24 +328,27 @@ where
                     check::merkle_root_validity(
                         &network,
                         &block,
-                        &prepared_block.transaction_hashes,
+                        &cached_prepared_block.transaction_hashes,
                     )?;
                     metrics::histogram!("mining.solved_header_check.duration_seconds")
                         .record(solved_header_start.elapsed().as_secs_f64());
 
+                    let mut prepared_block = cached_prepared_block.as_ref().clone();
                     prepared_block.block = block;
                     prepared_block.hash = hash;
                     prepared_block.height = height;
                     let admission = request.admission();
-                    if let Some(admission) = &admission {
-                        if check_prepared_mined_relay_eligibility(
-                            &mut state_service,
-                            (&prepared_block).into(),
-                        )
-                        .await?
-                            == zs::PreparedMinedRelayEligibility::Authorized
-                        {
-                            admission.authorize_optimistic_relay();
+                    if source == PreparedCandidateSource::ServerTemplate {
+                        if let Some(admission) = &admission {
+                            if check_prepared_mined_relay_eligibility(
+                                &mut state_service,
+                                (&prepared_block).into(),
+                            )
+                            .await?
+                                == zs::PreparedMinedRelayEligibility::Authorized
+                            {
+                                admission.authorize_optimistic_relay();
+                            }
                         }
                     }
                     return commit_prepared_block(state_service, prepared_block, admission).await;

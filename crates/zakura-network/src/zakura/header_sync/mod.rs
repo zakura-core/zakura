@@ -24,9 +24,9 @@ pub use error::HeaderSyncStartError;
 pub use events::HeaderSyncAction;
 pub use events::{
     Event, FullStateFrontiers, HeaderPathLease, HeaderPathLeaseResult, HeaderPathPage,
-    HeaderPathPageResult, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncRequestId,
-    HeaderSyncStartup, HeaderTargetAdmissionResult, HeaderTargetPreparationResult,
-    VctRepairContextResult,
+    HeaderPathPageResult, HeaderSyncFatalEvent, HeaderSyncHandle, HeaderSyncMisbehavior,
+    HeaderSyncRequestId, HeaderSyncStartup, HeaderTargetAdmissionResult,
+    HeaderTargetPreparationResult, VctRepairContextResult,
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use fuzz::{replay_header_pursuit_bytes, HeaderPursuitReplaySummary, NoEffectsProbe};

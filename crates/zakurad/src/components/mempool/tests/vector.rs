@@ -6,7 +6,7 @@ use std::{sync::Arc, time::Duration};
 
 use color_eyre::Report;
 use tokio::time::{self, timeout};
-use tower::{ServiceBuilder, ServiceExt};
+use tower::{util::BoxCloneService, ServiceBuilder, ServiceExt};
 
 use rand::{seq::SliceRandom, thread_rng};
 use zakura_chain::{
@@ -2704,7 +2704,7 @@ async fn setup_with_mempool_config_and_misbehavior_sender(
 
     // UTXO verification doesn't matter here.
     let state_config = StateConfig::ephemeral();
-    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change) =
+    let (state, read_only_state_service, latest_chain_tip, mut chain_tip_change) =
         zakura_state::init(state_config, network, Height::MAX, 0)
             .await
             .expect("ephemeral state initialization succeeds");
@@ -2718,6 +2718,7 @@ async fn setup_with_mempool_config_and_misbehavior_sender(
         false,
         Buffer::new(BoxService::new(peer_set.clone()), 1),
         state_service.clone(),
+        BoxCloneService::new(read_only_state_service),
         Buffer::new(BoxService::new(tx_verifier.clone()), 1),
         sync_status,
         latest_chain_tip,
@@ -2784,7 +2785,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
     let _init_guard = zakura_test::init();
 
     let peer_set: MockPeerSet = MockService::build().for_unit_tests();
-    let state: MockService<zs::Request, zs::Response, PanicAssertion> =
+    let state: MockService<zs::ReadRequest, zs::ReadResponse, PanicAssertion> =
         MockService::build().for_unit_tests();
     let tx_verifier: MockTxVerifier = MockService::build().for_unit_tests();
 

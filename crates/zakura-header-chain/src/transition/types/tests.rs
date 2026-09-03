@@ -1,6 +1,9 @@
 //! Semantic coverage for the typed transition surface.
 
-use std::{num::NonZeroU64, sync::Arc};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    sync::Arc,
+};
 
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block},
@@ -449,6 +452,35 @@ fn body_size_hints_enforce_zero_sentinel_and_canonical_limit() {
         BodySizeHint::new(maximum + 1),
         Err(TransitionTypeError::InvalidBodySize(maximum + 1))
     );
+}
+
+#[test]
+fn auxiliary_semantic_fingerprint_excludes_transport_metadata() {
+    let header_hash = block::Hash([0x81; 32]);
+    let first = delivery(
+        EvidenceId::from_digest([0x82; 32]),
+        header_hash,
+        header_owner(),
+    );
+    let mut second = first;
+    second.delivery_id = EvidenceId::from_digest([0x83; 32]);
+    second.source = SourceId::from_digest([0x84; 32]);
+    second.owner = HeaderWorkAuthority {
+        header_generation: HeaderGeneration::new(9),
+        branch: BranchId::new(block::Hash([0x85; 32]), block::Hash([0x86; 32])),
+    }
+    .bind(
+        10,
+        NonZeroU64::new(11).expect("the fixture request ID is nonzero"),
+    )
+    .into();
+    second.body_size =
+        BodySizeHint::Known(NonZeroU32::new(12).expect("the fixture body size is nonzero"));
+
+    assert_eq!(first.semantic_fingerprint(), second.semantic_fingerprint());
+
+    second.header_hash = block::Hash([0x87; 32]);
+    assert_ne!(first.semantic_fingerprint(), second.semantic_fingerprint());
 }
 
 #[test]

@@ -1332,7 +1332,7 @@ async fn setup_with_misbehavior_receiver(
     let (sync_status, mut recent_syncs) = SyncStatus::new();
 
     // UTXO verification doesn't matter for these tests.
-    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change) =
+    let (state, read_only_state_service, latest_chain_tip, mut chain_tip_change) =
         zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
             .await
             .expect("ephemeral state initialization succeeds");
@@ -1414,6 +1414,7 @@ async fn setup_with_misbehavior_receiver(
         false,
         buffered_peer_set.clone(),
         state_service.clone(),
+        tower::util::BoxCloneService::new(read_only_state_service),
         buffered_tx_verifier.clone(),
         sync_status.clone(),
         latest_chain_tip.clone(),

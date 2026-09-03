@@ -523,7 +523,8 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
         })
         .await;
     assert!(commit_result.is_ok());
-    assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
+    // The conflicting work ID prevents cache insertion, so commit verifies once more.
+    assert_eq!(transaction_calls.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]

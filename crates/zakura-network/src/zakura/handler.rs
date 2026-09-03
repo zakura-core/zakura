@@ -4044,8 +4044,10 @@ async fn persistent_stream_worker(
                 biased;
                 _ = reader_context.connection_token.cancelled() => break,
                 _ = reader_context.stream_token.cancelled() => break,
-                frame = read_frame(
+                frame = read_service_frame(
                     &mut recv,
+                    prelude.stream_kind,
+                    prelude.stream_version,
                     reader_context.inbound_frame_cap,
                     reader_context.limits.idle_timeout,
                     // A persistent ordered stream is legitimately quiet between
@@ -4223,8 +4225,10 @@ async fn request_stream_worker(
     let frame = tokio::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
-        frame = read_frame(
+        frame = read_service_frame(
             &mut recv,
+            prelude.stream_kind,
+            prelude.stream_version,
             context.inbound_frame_cap,
             context.limits.idle_timeout,
             // A request stream carries its request frame immediately after the
@@ -4375,30 +4379,60 @@ async fn read_stream_prelude(
     })
 }
 
-/// Read one length-prefixed frame from an ordered/request stream.
-///
-/// `read_timeout` always bounds a frame that is *in progress*: once its first
-/// byte has arrived, a peer cannot stall the rest of the header or the payload
-/// past this deadline.
-///
-/// `first_byte_timeout` bounds only the wait for the *next* frame to begin.
-/// Passing `None` waits indefinitely for that first byte -- correct for a
-/// long-lived ordered stream that is legitimately quiet between frames (e.g. the
-/// gossip stream while syncing far below the tip, or header sync after the
-/// header frontier has caught up while bodies download). Treating that
-/// inter-frame quiet as a fatal read timeout would `connection_token.cancel()`
-/// the whole connection -- dropping every active sibling stream on it -- even
-/// though the connection-level [`freshness_reaper`] (which resets on ANY
-/// stream's activity) and the QUIC idle timeout already own connection-level
-/// idleness. Callers race this future against their cancellation tokens, so a
-/// genuinely dead connection is still torn down promptly. Passing `Some(_)` is
-/// for one-shot streams (a request/response stream where the request, or a
-/// response frame, is expected promptly).
+/// Read a raw frame without a service-owned message cap in transport tests.
+#[cfg(test)]
 async fn read_frame(
     recv: &mut RecvStream,
     max_frame_bytes: u32,
     read_timeout: Duration,
     first_byte_timeout: Option<Duration>,
+) -> Result<Frame, ZakuraHandlerError> {
+    read_frame_with_message_cap(
+        recv,
+        max_frame_bytes,
+        read_timeout,
+        first_byte_timeout,
+        None,
+    )
+    .await
+}
+
+/// Read a service frame while enforcing any fixed-size allocation cap declared
+/// by the codec that owns the negotiated stream.
+async fn read_service_frame(
+    recv: &mut RecvStream,
+    stream_kind: u16,
+    stream_version: u16,
+    max_frame_bytes: u32,
+    read_timeout: Duration,
+    first_byte_timeout: Option<Duration>,
+) -> Result<Frame, ZakuraHandlerError> {
+    read_frame_with_message_cap(
+        recv,
+        max_frame_bytes,
+        read_timeout,
+        first_byte_timeout,
+        Some((stream_kind, stream_version)),
+    )
+    .await
+}
+
+/// Read one length-prefixed frame from an ordered or request stream.
+///
+/// `read_timeout` bounds a frame after its first byte arrives. The optional
+/// `first_byte_timeout` separately bounds how long a one-shot stream may remain
+/// silent before its next frame. Long-lived ordered streams pass `None` because
+/// connection freshness and the QUIC idle timeout own inter-frame idleness.
+///
+/// When `service_message` is present, the owning codec may lower the effective
+/// cap after the fixed header reveals the message type. This check happens
+/// before allocating or reading the payload.
+async fn read_frame_with_message_cap(
+    recv: &mut RecvStream,
+    max_frame_bytes: u32,
+    read_timeout: Duration,
+    first_byte_timeout: Option<Duration>,
+    service_message: Option<(u16, u16)>,
 ) -> Result<Frame, ZakuraHandlerError> {
     let mut header = [0; FRAME_HEADER_BYTES];
     // The first header byte is the boundary between "waiting for the next frame"
@@ -4429,8 +4463,15 @@ async fn read_frame(
     let flags = reader.read_u16::<LittleEndian>()?;
     let payload_len = usize::try_from(reader.read_u32::<LittleEndian>()?)
         .expect("u32 payload lengths fit usize on supported targets");
-    let max_frame_bytes =
+    let mut max_frame_bytes =
         usize::try_from(max_frame_bytes).expect("u32 frame cap fits usize on supported targets");
+    if let Some((stream_kind, stream_version)) = service_message {
+        if let Some(payload_cap) =
+            preallocation_payload_cap(stream_kind, stream_version, message_type)
+        {
+            max_frame_bytes = max_frame_bytes.min(FRAME_HEADER_BYTES.saturating_add(payload_cap));
+        }
+    }
     let frame_len = FRAME_HEADER_BYTES.saturating_add(payload_len);
     if frame_len > max_frame_bytes {
         metrics::counter!("zakura.p2p.ratelimit.frame.oversize").increment(1);
@@ -4449,6 +4490,21 @@ async fn read_frame(
         flags,
         payload,
     })
+}
+
+/// Resolve message-specific allocation caps through the codec that owns the
+/// negotiated stream. Unknown and variable-size messages use the stream cap.
+fn preallocation_payload_cap(
+    stream_kind: u16,
+    stream_version: u16,
+    message_type: u16,
+) -> Option<usize> {
+    match (stream_kind, stream_version) {
+        (ZAKURA_STREAM_BLOCK_SYNC, super::block_sync::ZAKURA_BLOCK_SYNC_STREAM_VERSION) => {
+            super::block_sync::preallocation_payload_cap(message_type)
+        }
+        _ => None,
+    }
 }
 
 async fn read_control_payload(
@@ -4603,8 +4659,10 @@ async fn write_outbound_request_frame_inner(
 
     let mut frames = Vec::new();
     loop {
-        match read_frame(
+        match read_service_frame(
             &mut recv,
+            stream.kind,
+            stream.version,
             inbound_frame_cap,
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
@@ -8511,6 +8569,106 @@ mod tests {
 
         conn_a.close(0u32.into(), b"done");
         conn_b.close(0u32.into(), b"done");
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gb_wf_09_get_blocks_payload_cap_precedes_allocation() -> Result<(), BoxError> {
+        const ALPN: &[u8] = b"/zakura/testkit/get-blocks-payload-cap/0";
+        const OVERSIZE_GET_BLOCKS_PAYLOAD: u32 = 10;
+
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(92).await?;
+        let (connection_tx, _connection_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(93).await?;
+        let server_addr = router.endpoint().node_addr().initialized().await;
+        client.add_node_addr(server_addr.clone())?;
+        let connection = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
+            .await
+            .expect("client connects for the GetBlocks cap test")?;
+        let (mut peer_send, _peer_recv) = timeout(Duration::from_secs(1), connection.open_bi())
+            .await
+            .expect("client opens the block-sync stream")?;
+
+        let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
+        header.extend_from_slice(&u16::from(crate::zakura::MSG_BS_GET_BLOCKS).to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&OVERSIZE_GET_BLOCKS_PAYLOAD.to_le_bytes());
+        timeout(Duration::from_secs(1), peer_send.write_all(&header))
+            .await
+            .expect("client writes the oversized GetBlocks header")?;
+        let _ = peer_send.finish();
+
+        let (_server_send, mut server_recv) = timeout(Duration::from_secs(1), stream_rx.recv())
+            .await
+            .expect("server accepts the block-sync stream")
+            .expect("capture handler forwards the block-sync stream");
+        let rejected = read_service_frame(
+            &mut server_recv,
+            ZAKURA_STREAM_BLOCK_SYNC,
+            ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            MAX_BS_FRAME_BYTES,
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+        )
+        .await;
+        assert!(matches!(
+            rejected,
+            Err(ZakuraHandlerError::OversizeFrame {
+                payload_len: 10,
+                max_frame_bytes: 17,
+                ..
+            })
+        ));
+
+        let valid_payload = [crate::zakura::MSG_BS_GET_BLOCKS, 1, 0, 0, 0, 1, 0, 0, 0];
+        let (mut valid_send, _valid_recv) = timeout(Duration::from_secs(1), connection.open_bi())
+            .await
+            .expect("client opens the valid block-sync stream")?;
+        let mut valid_frame = Vec::with_capacity(FRAME_HEADER_BYTES + valid_payload.len());
+        valid_frame.extend_from_slice(&u16::from(crate::zakura::MSG_BS_GET_BLOCKS).to_le_bytes());
+        valid_frame.extend_from_slice(&0u16.to_le_bytes());
+        valid_frame.extend_from_slice(
+            &u32::try_from(valid_payload.len())
+                .expect("the fixed GetBlocks payload length fits u32")
+                .to_le_bytes(),
+        );
+        valid_frame.extend_from_slice(&valid_payload);
+        timeout(Duration::from_secs(1), valid_send.write_all(&valid_frame))
+            .await
+            .expect("client writes the valid GetBlocks frame")?;
+        let _ = valid_send.finish();
+
+        let (_server_send, mut valid_server_recv) =
+            timeout(Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("server accepts the valid block-sync stream")
+                .expect("capture handler forwards the valid block-sync stream");
+        let valid = read_service_frame(
+            &mut valid_server_recv,
+            ZAKURA_STREAM_BLOCK_SYNC,
+            ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            MAX_BS_FRAME_BYTES,
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("the exact GetBlocks payload is admitted");
+        assert_eq!(valid.payload, valid_payload);
+
+        connection.close(0u32.into(), b"done");
         client.close().await;
         router.shutdown().await?;
         Ok(())

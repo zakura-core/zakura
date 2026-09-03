@@ -387,7 +387,7 @@ pub struct BlockSyncBodyMetadata {
 /// A response to a read-only
 /// [`ReadStateService`](crate::service::ReadStateService)'s [`ReadRequest`].
 pub enum ReadResponse {
-    /// Response to [`ReadRequest::UsageInfo`] with the current best chain tip.
+    /// Response to [`ReadRequest::UsageInfo`] with a recent disk space usage estimate.
     UsageInfo(u64),
 
     /// Response to [`ReadRequest::PruningInfo`] with this node's pruning status.

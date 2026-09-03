@@ -42,7 +42,7 @@ Zakura enforces code quality through review. For the full list of architecture r
 - **Async**: CPU-heavy work in `spawn_blocking`; all waits need timeouts
 - **Security**: Bound allocations from untrusted data; validate at system boundaries
 - **P2P messages**: Specify and test native exchanges through the
-  [P2P contract catalog](testing/p2p-message-contracts.md)
+  [P2P contract catalog](specs/native-p2p/README.md)
 - **Changelog**: After opening a draft PR, add one
   `docs/changelog/unreleased/<PR-number>.md` fragment. Internal-only PRs use an
   explicit no-changelog marker (see

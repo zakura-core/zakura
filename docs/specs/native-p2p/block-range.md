@@ -1,4 +1,4 @@
-# GetBlocks serving exchange contract
+# Block-range exchange (`GetBlocks`)
 
 > **Status: specified.** Implementation PRs must add evidence before changing
 > any layer to implemented.
@@ -7,12 +7,12 @@ This contract covers the stream-6 block-range serving exchange initiated by
 `GetBlocks`. It specifies the request wire format, the server's state and
 lifecycle behavior, and regulation for the response work it causes.
 
-`Block`, `BlocksDone`, and `RangeUnavailable` are covered here only as
-responses Zakura sends. Their standalone wire and receiving-side contracts
-remain TBD. Block-sync `Status` also needs its own contract.
+`Block`, `BlocksDone`, and `RangeUnavailable` are specified here as responses
+Zakura sends. Their earlier standalone wire and receiving-side proposal is
+preserved as a draft below. Block-sync `Status` has a separate draft.
 
 The contract follows the
-[native P2P contract standard](p2p-message-contracts.md). `GB-WF` means
+[native P2P contract catalog](README.md). `GB-WF` means
 GetBlocks wire format, `GB-SM` means GetBlocks serving model, and `GB-RL` means
 GetBlocks regulated load.
 
@@ -209,6 +209,90 @@ The first native topology uses:
 These are reproducible experiments, not network-wide proofs. CPU, RSS, UDP
 traffic, and throughput are diagnostics. The request timeout, write timeout,
 application budgets, and configured QUIC envelope are contract gates.
+
+## Draft response-receiving contract
+
+> **Status: draft.** The serving rules above cover responses Zakura sends.
+> This section preserves the original proposal for responses Zakura receives.
+> It is not part of the currently specified GetBlocks layers. Stable response
+> wire and receiving-side IDs still need to be assigned.
+
+The requester must not send overlapping live ranges on one connection. The
+original proposal treated an overlapping request as a protocol violation so
+each response could match one range despite version 2 having no wire request
+ID. That policy remains deferred until the receiving-side contract is written.
+
+### `Block` — Response, discriminator 3
+
+- **Frame**
+  - payload cap = 2,000,001 bytes
+- **Decode** — `BlockSyncMessage::decode`,
+  `validate_encoded_block_len`
+  - one complete block
+  - exact consumption
+- **Reservation** — `BlockRangeRequest::expected_hash`
+  - one live `GetBlocks` range whose next unconsumed height expects this header hash
+  - consumes that hash's part of the reservation
+- **Verify** — `CheckpointVerifier::check_block`, the existing stateless block
+  check. It establishes the encoding version and hash, the coinbase height, the compact target,
+  and the Equihash solution, then recomputes the Merkle root. The individual rules live in
+  `block::check`.
+
+The receiver matches a `Block` by hashing its header and comparing that hash with the committed
+header hashes expected by live ranges. A block that does not match the next expected hash of exactly
+one live range MUST return `Disconnect`. The publisher MUST send the blocks of a range in ascending
+height order. The reservation identity commits to a header that header sync already validated, so
+Verify re-checks Equihash and the target only as defense in depth. An implementation MAY skip both
+checks when the header bytes hash to the expected identity. Block sync takes that option today: it
+matches the hash at `peer_routine` and leaves
+`CheckpointVerifier::check_block` to run downstream.
+
+### `BlocksDone` — Response, discriminator 4
+
+- **Frame**
+  - payload cap = 9 bytes
+- **Decode** — `BlockSyncMessage::decode`, `validate_block_count`
+  - `start_height <= Height::MAX`
+  - returned = 1..=128
+  - exact consumption
+- **Reservation**
+  - live `GetBlocks` range with this `start_height`
+  - `returned` equals the number of blocks consumed from the range and does not exceed its requested
+    count
+  - consumes the terminal part and closes the reservation
+
+`validate_block_count` rejects zero, so `BlocksDone` reports at least one block. A peer
+that serves none of a range MUST send `RangeUnavailable` instead.
+
+The handler MUST return every unreceived height to the work queue. A retry policy SHOULD avoid a
+peer that serves no blocks for heights inside its advertised servable range.
+
+### `RangeUnavailable` — Response, discriminator 5
+
+- **Frame**
+  - payload cap = 9 bytes
+- **Decode** — `BlockSyncMessage::decode`, `validate_block_count`
+  - `start_height <= Height::MAX`
+  - count = 1..=128
+  - exact consumption
+- **Reservation**
+  - live `GetBlocks` range with this `start_height` and requested count
+  - no block has been consumed from the range
+  - `count` equals the requested count
+  - consumes the terminal part and closes the reservation
+
+The handler MUST requeue the range. A retry policy MAY avoid this peer for the immediate retry.
+
+### Successor stream version (planned)
+
+A successor version should identify each request with a receiver-chosen nonzero request ID and name
+each requested body by header hash. Every body and terminal response must echo the request ID. Those
+fields would remove version 2's overlap restriction and bind each body to the header chain that the
+requester selected.
+
+This section is non-normative. The successor message set, encoding, caps, reservation rules, and
+work bounds remain unspecified. Implementations MUST support only version 2 until a separate change
+defines that complete wire contract.
 
 ## Deferred behavior
 

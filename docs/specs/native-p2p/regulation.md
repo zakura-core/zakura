@@ -2,8 +2,8 @@
 
 > **Status: proposal.** This specification defines traffic-control requirements
 > for Zakura's native P2P exchanges. The
-> [design](../design/peer-message-regulation.md) explains the choices. The
-> [property-testing standard](../design/property-testing.md) defines the
+> [design](../../design/peer-message-regulation.md) explains the choices. The
+> [property-testing standard](../../design/property-testing.md) defines the
 > required evidence.
 
 ## Scope
@@ -252,7 +252,7 @@ MUST remain bounded.
 
 A regulation layer is implemented only when:
 
-1. The [property-testing standard](../design/property-testing.md) maps every
+1. The [property-testing standard](../../design/property-testing.md) maps every
    regulation requirement to an ID-named test.
 2. Fast properties check charge arithmetic, conservation, rollback,
    settlement, session ownership, and configured bounds.
@@ -269,4 +269,4 @@ CPU, resident memory, and throughput are diagnostics unless the contract names
 the build, topology, and deadline that make one an acceptance gate.
 
 The first concrete declaration is the
-[GetBlocks serving exchange](../testing/get-blocks-serving-contract.md).
+[block-range exchange](block-range.md).

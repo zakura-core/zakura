@@ -1,7 +1,7 @@
 # Native P2P message regulation: design
 
 > **Status: proposal.** The
-> [message-regulation specification](../specs/peer-message-regulation.md)
+> [message-regulation specification](../specs/native-p2p/regulation.md)
 > defines the required behavior. This document explains why the controls are
 > separate and how they compose. The
 > [property-testing design](property-testing.md) defines how that behavior is

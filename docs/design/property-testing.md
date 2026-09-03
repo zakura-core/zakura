@@ -222,7 +222,7 @@ For a new or changed native P2P exchange:
 7. Test load only after the regulation policy and overload outcomes are
    defined.
 
-The [P2P contract catalog](../testing/p2p-message-contracts.md) tracks which
+The [P2P contract catalog](../specs/native-p2p/README.md) tracks which
 layers are specified and implemented. The
-[GetBlocks serving contract](../testing/get-blocks-serving-contract.md) is the
+[block-range contract](../specs/native-p2p/block-range.md) is the
 first concrete exchange.

@@ -4425,8 +4425,9 @@ async fn read_service_frame(
 /// connection freshness and the QUIC idle timeout own inter-frame idleness.
 ///
 /// When `service_message` is present, the owning codec may lower the effective
-/// cap after the fixed header reveals the message type. This check happens
-/// before allocating or reading the payload.
+/// cap after the fixed header reveals the outer message type. The first payload
+/// byte is then read separately so its duplicate discriminator can lower the
+/// cap before allocating or reading the rest of the payload.
 async fn read_frame_with_message_cap(
     recv: &mut RecvStream,
     max_frame_bytes: u32,
@@ -4472,6 +4473,47 @@ async fn read_frame_with_message_cap(
             max_frame_bytes = max_frame_bytes.min(FRAME_HEADER_BYTES.saturating_add(payload_cap));
         }
     }
+    validate_declared_frame_len(payload_len, max_frame_bytes)?;
+    let payload = timeout(read_timeout, async {
+        if payload_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut payload_discriminator = [0];
+        recv.read_exact(&mut payload_discriminator).await?;
+        if let Some((stream_kind, stream_version)) = service_message {
+            if let Some(payload_cap) = preallocation_payload_cap(
+                stream_kind,
+                stream_version,
+                u16::from(payload_discriminator[0]),
+            ) {
+                let discriminator_frame_cap = FRAME_HEADER_BYTES.saturating_add(payload_cap);
+                validate_declared_frame_len(
+                    payload_len,
+                    max_frame_bytes.min(discriminator_frame_cap),
+                )?;
+            }
+        }
+
+        let mut payload = vec![0; payload_len];
+        payload[0] = payload_discriminator[0];
+        recv.read_exact(&mut payload[1..]).await?;
+        Ok::<_, ZakuraHandlerError>(payload)
+    })
+    .await
+    .map_err(|_| ZakuraHandlerError::Timeout("frame payload"))??;
+    Ok(Frame {
+        message_type,
+        flags,
+        payload,
+    })
+}
+
+/// Reject a peer-declared frame length before allocating its payload.
+fn validate_declared_frame_len(
+    payload_len: usize,
+    max_frame_bytes: usize,
+) -> Result<(), ZakuraHandlerError> {
     let frame_len = FRAME_HEADER_BYTES.saturating_add(payload_len);
     if frame_len > max_frame_bytes {
         metrics::counter!("zakura.p2p.ratelimit.frame.oversize").increment(1);
@@ -4481,15 +4523,7 @@ async fn read_frame_with_message_cap(
             max_frame_bytes,
         });
     }
-    let mut payload = vec![0; payload_len];
-    timeout(read_timeout, recv.read_exact(&mut payload))
-        .await
-        .map_err(|_| ZakuraHandlerError::Timeout("frame payload"))??;
-    Ok(Frame {
-        message_type,
-        flags,
-        payload,
-    })
+    Ok(())
 }
 
 /// Resolve message-specific allocation caps through the codec that owns the
@@ -8577,15 +8611,23 @@ mod tests {
     #[tokio::test]
     async fn gb_wf_09_get_blocks_payload_cap_precedes_allocation() -> Result<(), BoxError> {
         const ALPN: &[u8] = b"/zakura/testkit/get-blocks-payload-cap/0";
+        const VALID_ALPN: &[u8] = b"/zakura/testkit/get-blocks-payload-cap-valid/0";
         const OVERSIZE_GET_BLOCKS_PAYLOAD: u32 = 10;
 
         let _guard = zakura_test::init();
         let server = LocalEndpointFactory::new().endpoint(92).await?;
-        let (connection_tx, _connection_rx) = mpsc::channel(1);
+        let (connection_tx, _connection_rx) = mpsc::channel(2);
         let (stream_tx, mut stream_rx) = mpsc::channel(1);
         let router = Router::builder(server)
             .accept(
                 ALPN,
+                CaptureConnection {
+                    connection_tx: connection_tx.clone(),
+                    stream_tx: stream_tx.clone(),
+                },
+            )
+            .accept(
+                VALID_ALPN,
                 CaptureConnection {
                     connection_tx,
                     stream_tx,
@@ -8595,9 +8637,12 @@ mod tests {
         let client = LocalEndpointFactory::new().endpoint(93).await?;
         let server_addr = router.endpoint().node_addr().initialized().await;
         client.add_node_addr(server_addr.clone())?;
-        let connection = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
-            .await
-            .expect("client connects for the GetBlocks cap test")?;
+        let connection = timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr.clone(), ALPN),
+        )
+        .await
+        .expect("client connects for the GetBlocks cap test")?;
         let (mut peer_send, _peer_recv) = timeout(Duration::from_secs(1), connection.open_bi())
             .await
             .expect("client opens the block-sync stream")?;
@@ -8633,10 +8678,60 @@ mod tests {
             })
         ));
 
+        let (mut mismatched_send, _mismatched_recv) =
+            timeout(Duration::from_secs(1), connection.open_bi())
+                .await
+                .expect("client opens the mismatched block-sync stream")?;
+        let mut mismatched_prefix = Vec::with_capacity(FRAME_HEADER_BYTES + 1);
+        mismatched_prefix.extend_from_slice(&u16::from(crate::zakura::MSG_BS_BLOCK).to_le_bytes());
+        mismatched_prefix.extend_from_slice(&0u16.to_le_bytes());
+        mismatched_prefix.extend_from_slice(&OVERSIZE_GET_BLOCKS_PAYLOAD.to_le_bytes());
+        mismatched_prefix.push(crate::zakura::MSG_BS_GET_BLOCKS);
+        timeout(
+            Duration::from_secs(1),
+            mismatched_send.write_all(&mismatched_prefix),
+        )
+        .await
+        .expect("client writes the mismatched GetBlocks prefix")?;
+
+        let (_server_send, mut mismatched_server_recv) =
+            timeout(Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("server accepts the mismatched block-sync stream")
+                .expect("capture handler forwards the mismatched block-sync stream");
+        let mismatched_rejection = timeout(
+            Duration::from_secs(1),
+            read_service_frame(
+                &mut mismatched_server_recv,
+                ZAKURA_STREAM_BLOCK_SYNC,
+                ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                MAX_BS_FRAME_BYTES,
+                Duration::from_secs(2),
+                Some(Duration::from_secs(2)),
+            ),
+        )
+        .await
+        .expect("the payload discriminator rejects before its declared remainder is read");
+        assert!(matches!(
+            mismatched_rejection,
+            Err(ZakuraHandlerError::OversizeFrame {
+                payload_len: 10,
+                max_frame_bytes: 17,
+                ..
+            })
+        ));
+
         let valid_payload = [crate::zakura::MSG_BS_GET_BLOCKS, 1, 0, 0, 0, 1, 0, 0, 0];
-        let (mut valid_send, _valid_recv) = timeout(Duration::from_secs(1), connection.open_bi())
-            .await
-            .expect("client opens the valid block-sync stream")?;
+        let valid_connection = timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr, VALID_ALPN),
+        )
+        .await
+        .expect("client connects for the valid GetBlocks frame")?;
+        let (mut valid_send, _valid_recv) =
+            timeout(Duration::from_secs(1), valid_connection.open_bi())
+                .await
+                .expect("client opens the valid block-sync stream")?;
         let mut valid_frame = Vec::with_capacity(FRAME_HEADER_BYTES + valid_payload.len());
         valid_frame.extend_from_slice(&u16::from(crate::zakura::MSG_BS_GET_BLOCKS).to_le_bytes());
         valid_frame.extend_from_slice(&0u16.to_le_bytes());
@@ -8669,6 +8764,7 @@ mod tests {
         assert_eq!(valid.payload, valid_payload);
 
         connection.close(0u32.into(), b"done");
+        valid_connection.close(0u32.into(), b"done");
         client.close().await;
         router.shutdown().await?;
         Ok(())

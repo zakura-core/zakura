@@ -1,4 +1,4 @@
-//! Tests for public and authenticated RPC method surfaces.
+//! Tests for restricted unauthenticated and authenticated RPC method surfaces.
 
 use std::{
     collections::BTreeSet,
@@ -54,15 +54,15 @@ fn access_policy_matches_the_openrpc_method_set() {
 }
 
 #[test]
-fn public_surface_contains_only_allowlisted_methods() {
+fn restricted_surface_contains_only_unauthenticated_methods() {
     let mut module = classified_module();
-    configure_rpc_methods(&mut module, RpcSurface::Public)
+    configure_rpc_methods(&mut module, RpcSurface::Restricted)
         .expect("the reviewed method classification should be complete");
 
     let actual: BTreeSet<_> = module.method_names().collect();
     let expected: BTreeSet<_> = RPC_METHOD_ACCESS
         .iter()
-        .filter_map(|(name, access)| (*access == RpcAccess::Public).then_some(*name))
+        .filter_map(|(name, access)| (*access == RpcAccess::Unauthenticated).then_some(*name))
         .collect();
 
     assert_eq!(actual, expected);
@@ -97,21 +97,21 @@ fn unclassified_methods_fail_closed() {
         })
         .expect("test method should register");
 
-    let error = configure_rpc_methods(&mut module, RpcSurface::Public)
+    let error = configure_rpc_methods(&mut module, RpcSurface::Restricted)
         .expect_err("an unclassified method must prevent server startup");
 
     assert!(error.to_string().contains("new_unreviewed_method"));
 }
 
 #[test]
-fn unauthenticated_production_networks_use_the_public_surface() {
+fn unauthenticated_production_networks_use_the_restricted_surface() {
     assert_eq!(
         primary_rpc_surface(&Network::Mainnet, false),
-        RpcSurface::Public
+        RpcSurface::Restricted
     );
     assert_eq!(
         primary_rpc_surface(&Network::new_default_testnet(), false),
-        RpcSurface::Public
+        RpcSurface::Restricted
     );
 
     assert_eq!(
@@ -128,18 +128,19 @@ fn unauthenticated_production_networks_use_the_public_surface() {
 async fn segmented_listeners_enforce_methods_and_cookie_auth() {
     let _init_guard = zakura_test::init();
 
-    let public_port = zakura_test::net::random_known_port();
+    let restricted_port = zakura_test::net::random_known_port();
     let admin_port = loop {
         let port = zakura_test::net::random_known_port();
-        if port != public_port {
+        if port != restricted_port {
             break port;
         }
     };
-    let public_addr: SocketAddr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, public_port).into();
+    let restricted_addr: SocketAddr =
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, restricted_port).into();
     let admin_addr: SocketAddr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, admin_port).into();
     let cookie_dir = tempfile::tempdir().expect("temporary cookie directory should be created");
     let conf = Config {
-        listen_addr: Some(public_addr),
+        listen_addr: Some(restricted_addr),
         admin_listen_addr: Some(admin_addr),
         cookie_dir: cookie_dir.path().to_path_buf(),
         cookie_file_name: "admin.cookie".to_string(),
@@ -170,9 +171,9 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
         None,
     );
 
-    let public_task = RpcServer::start(rpc_impl.clone(), conf.clone())
+    let restricted_task = RpcServer::start(rpc_impl.clone(), conf.clone())
         .await
-        .expect("public RPC listener should start");
+        .expect("restricted RPC listener should start");
     let admin_task = RpcServer::start_admin(rpc_impl, conf)
         .await
         .expect("admin RPC listener should start");
@@ -182,61 +183,68 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
         .build()
         .expect("test HTTP client should build");
 
-    let public_discovery = client
-        .post(format!("http://{public_addr}"))
+    let restricted_discovery = client
+        .post(format!("http://{restricted_addr}"))
         .header("content-type", "application/json")
         .body(r#"{"jsonrpc":"2.0","method":"rpc.discover","id":1}"#)
         .send()
         .await
-        .expect("public discovery request should complete")
+        .expect("restricted discovery request should complete")
         .text()
         .await
-        .expect("public discovery response body should be readable");
-    let public_discovery: serde_json::Value =
-        serde_json::from_str(&public_discovery).expect("public discovery response should be JSON");
-    let public_methods = discovered_methods(&public_discovery);
+        .expect("restricted discovery response body should be readable");
+    let restricted_discovery: serde_json::Value = serde_json::from_str(&restricted_discovery)
+        .expect("restricted discovery response should be JSON");
+    let restricted_methods = discovered_methods(&restricted_discovery);
     for method in [
+        "getinfo",
+        "getblockchaininfo",
+        "getpeerinfo",
         "getblockcount",
+        "getrawtransaction",
+        "getaddresstxids",
+        "getaddressbalance",
+        "getaddressutxos",
         "sendrawtransaction",
         "getblocktemplate",
         "submitblock",
     ] {
         assert!(
-            public_methods.contains(method),
-            "required public method {method} should remain available"
+            restricted_methods.contains(method),
+            "existing unauthenticated integrations require {method}"
         );
     }
-    assert!(!public_methods.contains("invalidateblock"));
-    assert!(!public_methods.contains("reconsiderblock"));
+    assert!(!restricted_methods.contains("invalidateblock"));
+    assert!(!restricted_methods.contains("reconsiderblock"));
 
     let blocked_call = client
-        .post(format!("http://{public_addr}"))
+        .post(format!("http://{restricted_addr}"))
         .header("content-type", "application/json")
         .body(r#"{"jsonrpc":"2.0","method":"invalidateblock","params":["00"],"id":2}"#)
         .send()
         .await
-        .expect("blocked public request should complete")
+        .expect("blocked restricted request should complete")
         .text()
         .await
-        .expect("blocked public response body should be readable");
+        .expect("blocked restricted response body should be readable");
     let blocked_call: serde_json::Value =
-        serde_json::from_str(&blocked_call).expect("blocked public response should be JSON");
+        serde_json::from_str(&blocked_call).expect("blocked restricted response should be JSON");
     assert_eq!(blocked_call["error"]["code"], -32601);
 
     let batch_call = client
-        .post(format!("http://{public_addr}"))
+        .post(format!("http://{restricted_addr}"))
         .header("content-type", "application/json")
         .body(
             r#"[{"jsonrpc":"2.0","method":"getblockcount","id":6},{"jsonrpc":"2.0","method":"reconsiderblock","params":["00"],"id":7}]"#,
         )
         .send()
         .await
-        .expect("mixed public batch request should complete")
+        .expect("mixed restricted batch request should complete")
         .text()
         .await
-        .expect("mixed public batch response body should be readable");
+        .expect("mixed restricted batch response body should be readable");
     let batch_call: serde_json::Value =
-        serde_json::from_str(&batch_call).expect("mixed public batch response should be JSON");
+        serde_json::from_str(&batch_call).expect("mixed restricted batch response should be JSON");
     let blocked_batch_item = batch_call
         .as_array()
         .expect("batch response should be an array")
@@ -301,7 +309,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
         "authenticated admin methods must remain registered"
     );
 
-    public_task.abort();
+    restricted_task.abort();
     admin_task.abort();
     rpc_queue_task.abort();
 }

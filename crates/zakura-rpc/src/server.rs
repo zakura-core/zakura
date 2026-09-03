@@ -95,8 +95,8 @@ impl RpcServer {
     /// Starts the primary RPC server.
     ///
     /// Authenticated listeners and Regtest listeners expose the full method
-    /// set. Unauthenticated Mainnet and Testnet listeners expose only methods
-    /// explicitly classified as public.
+    /// set. Unauthenticated Mainnet and Testnet listeners expose only the
+    /// restricted compatibility method set.
     ///
     /// # Panics
     ///
@@ -366,8 +366,8 @@ impl RpcServer {
     }
 }
 
-/// Validates the RPC method classification and removes non-public methods from
-/// public listeners.
+/// Validates the RPC method classification and removes methods that are not
+/// available on restricted unauthenticated listeners.
 fn configure_rpc_methods<Context>(
     methods: &mut jsonrpsee::RpcModule<Context>,
     surface: RpcSurface,
@@ -393,9 +393,9 @@ where
         )));
     }
 
-    if surface == RpcSurface::Public {
+    if surface == RpcSurface::Restricted {
         for method_name in registered {
-            if rpc_method_access(method_name) != Some(RpcAccess::Public) {
+            if rpc_method_access(method_name) != Some(RpcAccess::Unauthenticated) {
                 methods
                     .remove_method(method_name)
                     .expect("method exists because it came from method_names");
@@ -411,7 +411,7 @@ fn primary_rpc_surface(network: &Network, enable_cookie_auth: bool) -> RpcSurfac
     if enable_cookie_auth || network.is_regtest() {
         RpcSurface::Full
     } else {
-        RpcSurface::Public
+        RpcSurface::Restricted
     }
 }
 

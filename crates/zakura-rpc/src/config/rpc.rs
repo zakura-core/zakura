@@ -26,10 +26,15 @@ pub struct Config {
     /// # Security
     ///
     /// On Mainnet and Testnet, disabling [`Self::enable_cookie_auth`] restricts
-    /// this listener to the explicitly classified public RPC methods. Public
-    /// clients can still query chain state, submit transactions, and use the
-    /// mining RPCs, but they cannot call administrative methods such as
+    /// this listener to the explicitly classified unauthenticated compatibility
+    /// methods. Clients can still query chain state, submit transactions, and
+    /// use the mining RPCs, but they cannot call administrative methods such as
     /// `invalidateblock` or `reconsiderblock`.
+    ///
+    /// The restricted method set is defense in depth, not Internet hardening.
+    /// Allowed methods can expose node metadata or consume significant
+    /// resources. Keep unauthenticated RPC behind a firewall, private network,
+    /// or gateway that limits access to trusted clients.
     ///
     /// Do not expose a cookie-authenticated listener over an untrusted plaintext
     /// network. HTTP Basic credentials are reusable; keep authenticated RPC on
@@ -40,7 +45,7 @@ pub struct Config {
     ///
     /// This listener exposes the full RPC method set and always requires the
     /// cookie in [`Self::cookie_dir`] and [`Self::cookie_file_name`]. It is a
-    /// companion to an unauthenticated public [`Self::listen_addr`]:
+    /// companion to a restricted unauthenticated [`Self::listen_addr`]:
     /// ```toml
     /// [rpc]
     /// listen_addr = '0.0.0.0:8232'
@@ -116,9 +121,9 @@ pub struct Config {
     /// Enable cookie-based authentication for the primary RPC listener.
     ///
     /// Authenticated listeners expose the full RPC method set. On Mainnet and
-    /// Testnet, unauthenticated listeners expose only the public method set.
-    /// Regtest keeps the full method set so its local test-control RPCs remain
-    /// available.
+    /// Testnet, unauthenticated listeners expose only the restricted
+    /// compatibility method set. Regtest keeps the full method set so its local
+    /// test-control RPCs remain available.
     pub enable_cookie_auth: bool,
 
     /// The maximum size of the response body in bytes.
@@ -189,7 +194,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Validates the relationship between the public and admin RPC listeners.
+    /// Validates the relationship between the primary and admin RPC listeners.
     pub fn validate(&self) -> Result<(), String> {
         let Some(admin_listen_addr) = self.admin_listen_addr else {
             return Ok(());
@@ -300,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_admin_port_overlapped_by_public_wildcard_listener() {
+    fn rejects_admin_port_overlapped_by_primary_wildcard_listener() {
         let config: Config = toml::from_str(
             r#"
             listen_addr = "0.0.0.0:8232"

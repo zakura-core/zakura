@@ -157,8 +157,8 @@ include!("methods/rpc_openrpc.rs");
 /// fail closed until their intended exposure is reviewed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RpcAccess {
-    /// Available on unauthenticated Mainnet and Testnet RPC listeners.
-    Public,
+    /// Available on restricted unauthenticated Mainnet and Testnet RPC listeners.
+    Unauthenticated,
 
     /// Available only on authenticated listeners, except on Regtest.
     Admin,
@@ -170,8 +170,8 @@ pub(crate) enum RpcAccess {
 /// The method set exposed by one RPC listener.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RpcSurface {
-    /// The explicitly classified public method set.
-    Public,
+    /// The explicitly classified unauthenticated compatibility method set.
+    Restricted,
 
     /// Every registered method.
     Full,
@@ -181,7 +181,7 @@ impl RpcSurface {
     /// Returns whether this surface exposes `method_name`.
     pub(crate) fn exposes(self, method_name: &str) -> bool {
         match self {
-            Self::Public => rpc_method_access(method_name) == Some(RpcAccess::Public),
+            Self::Restricted => rpc_method_access(method_name) == Some(RpcAccess::Unauthenticated),
             Self::Full => true,
         }
     }
@@ -189,48 +189,53 @@ impl RpcSurface {
 
 /// The reviewed access class for every registered JSON-RPC method.
 ///
+/// The unauthenticated set preserves compatibility with existing lightwalletd,
+/// mining, and fleet health consumers. It does not mean that these methods are
+/// hardened for arbitrary Internet traffic. Narrowing this set requires a
+/// coordinated migration of those consumers and their node configuration.
+///
 /// Keep this list synchronized with the generated [`RpcServer`] trait. Server
 /// startup and unit tests reject methods that are missing from either side.
 pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
-    ("getinfo", RpcAccess::Public),
-    ("getdeprecationinfo", RpcAccess::Public),
-    ("getblockchaininfo", RpcAccess::Public),
-    ("getaddressbalance", RpcAccess::Public),
-    ("sendrawtransaction", RpcAccess::Public),
-    ("getblock", RpcAccess::Public),
-    ("getblockheader", RpcAccess::Public),
-    ("getbestblockhash", RpcAccess::Public),
-    ("getbestblockheightandhash", RpcAccess::Public),
-    ("getchaintips", RpcAccess::Public),
-    ("getmempoolinfo", RpcAccess::Public),
-    ("getrawmempool", RpcAccess::Public),
-    ("z_gettreestate", RpcAccess::Public),
-    ("z_getsubtreesbyindex", RpcAccess::Public),
-    ("getrawtransaction", RpcAccess::Public),
-    ("getaddresstxids", RpcAccess::Public),
-    ("getaddressutxos", RpcAccess::Public),
+    ("getinfo", RpcAccess::Unauthenticated),
+    ("getdeprecationinfo", RpcAccess::Unauthenticated),
+    ("getblockchaininfo", RpcAccess::Unauthenticated),
+    ("getaddressbalance", RpcAccess::Unauthenticated),
+    ("sendrawtransaction", RpcAccess::Unauthenticated),
+    ("getblock", RpcAccess::Unauthenticated),
+    ("getblockheader", RpcAccess::Unauthenticated),
+    ("getbestblockhash", RpcAccess::Unauthenticated),
+    ("getbestblockheightandhash", RpcAccess::Unauthenticated),
+    ("getchaintips", RpcAccess::Unauthenticated),
+    ("getmempoolinfo", RpcAccess::Unauthenticated),
+    ("getrawmempool", RpcAccess::Unauthenticated),
+    ("z_gettreestate", RpcAccess::Unauthenticated),
+    ("z_getsubtreesbyindex", RpcAccess::Unauthenticated),
+    ("getrawtransaction", RpcAccess::Unauthenticated),
+    ("getaddresstxids", RpcAccess::Unauthenticated),
+    ("getaddressutxos", RpcAccess::Unauthenticated),
     ("stop", RpcAccess::Test),
-    ("getblockcount", RpcAccess::Public),
-    ("getblockhash", RpcAccess::Public),
-    ("getblocktemplate", RpcAccess::Public),
-    ("submitblock", RpcAccess::Public),
-    ("getmininginfo", RpcAccess::Public),
-    ("getnetworksolps", RpcAccess::Public),
-    ("getnetworkhashps", RpcAccess::Public),
-    ("getnetworkinfo", RpcAccess::Public),
-    ("getpeerinfo", RpcAccess::Public),
-    ("ping", RpcAccess::Public),
-    ("validateaddress", RpcAccess::Public),
-    ("z_validateaddress", RpcAccess::Public),
-    ("getblocksubsidy", RpcAccess::Public),
-    ("getdifficulty", RpcAccess::Public),
-    ("z_listunifiedreceivers", RpcAccess::Public),
+    ("getblockcount", RpcAccess::Unauthenticated),
+    ("getblockhash", RpcAccess::Unauthenticated),
+    ("getblocktemplate", RpcAccess::Unauthenticated),
+    ("submitblock", RpcAccess::Unauthenticated),
+    ("getmininginfo", RpcAccess::Unauthenticated),
+    ("getnetworksolps", RpcAccess::Unauthenticated),
+    ("getnetworkhashps", RpcAccess::Unauthenticated),
+    ("getnetworkinfo", RpcAccess::Unauthenticated),
+    ("getpeerinfo", RpcAccess::Unauthenticated),
+    ("ping", RpcAccess::Unauthenticated),
+    ("validateaddress", RpcAccess::Unauthenticated),
+    ("z_validateaddress", RpcAccess::Unauthenticated),
+    ("getblocksubsidy", RpcAccess::Unauthenticated),
+    ("getdifficulty", RpcAccess::Unauthenticated),
+    ("z_listunifiedreceivers", RpcAccess::Unauthenticated),
     ("invalidateblock", RpcAccess::Admin),
     ("reconsiderblock", RpcAccess::Admin),
     ("generate", RpcAccess::Test),
     ("addnode", RpcAccess::Test),
-    ("rpc.discover", RpcAccess::Public),
-    ("gettxout", RpcAccess::Public),
+    ("rpc.discover", RpcAccess::Unauthenticated),
+    ("gettxout", RpcAccess::Unauthenticated),
 ];
 
 /// Returns the reviewed access class for `method_name`.

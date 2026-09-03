@@ -126,6 +126,37 @@ bytes sent on the ordered stream as new credit. The sent-cursor ring MUST hold a
 maximum number of unacknowledged pages. The header credit bound limits that number to 4,000
 one-header pages, so `HS_SENT_CURSOR_RING` always suffices.
 
+A subscription renews its reservation and drains responses already in flight before it closes:
+
+```mermaid
+sequenceDiagram
+    participant S as Subscriber
+    participant P as Publisher
+    S->>S: Create local reservation and add credit
+    S->>P: Open with credit
+    P->>P: Validate open and record credit
+    loop For each authorized response
+        P->>P: Consume send credit
+        P->>S: Send Headers page
+        S->>S: Consume local credit and handle page
+        opt Renew from accepted progress
+            S->>S: Add credit locally
+            S->>P: Acknowledge and grant credit
+            P->>P: Validate update and add credit
+        end
+    end
+    opt Close
+        S->>P: Close
+        P->>P: Stop new responses
+        opt A response is already queued
+            P-->>S: Send queued Headers page
+            S->>S: Consume existing credit and handle page
+        end
+        P->>S: Send terminal outcome
+        S->>S: Close local reservation
+    end
+```
+
 ## `Headers` — Response, discriminator 3
 
 - **Frame**

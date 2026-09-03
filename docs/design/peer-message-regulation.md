@@ -20,15 +20,21 @@ per-peer limit alone is not sufficient because one operator can create many
 peer identities. A node-wide limit alone allows one peer to consume the whole
 node.
 
-Every regulated exchange therefore needs:
+Before Zakura acts on an inbound message, it answers four questions:
 
-- a message-specific frame cap enforced before payload allocation;
-- peer and node admission limits;
-- an upper-bound charge computed from local policy;
-- ownership that survives asynchronous handoffs;
-- bounded waiting and outbound buffering;
-- one cleanup path for completion, failure, cancellation, and replacement; and
-- a declared overload outcome that does not blame a peer for local scheduling.
+1. **Safe** — Can it frame, allocate, decode, and validate the message within
+   fixed bounds?
+2. **Expected** — If it is a response, does it match a live request or
+   reservation?
+3. **Actionable** — If it is valid but stale or unable to affect Zakura's state,
+   should it be ignored without penalizing the peer?
+4. **Affordable** — Can the peer and node admit all work and response bytes
+   caused by the exchange? Otherwise, use the contract's declared wait, reject,
+   or drop outcome.
+
+For a request, **Affordable** covers the entire exchange: peer and node limits,
+ownership across asynchronous handoffs, bounded pending and outbound buffers,
+and cleanup on completion, failure, cancellation, or replacement.
 
 Peer selection remains separate. A conformant peer can waste a connection slot
 without violating any message rule.
@@ -48,6 +54,21 @@ A request declaration names its possible response messages and reserves their
 worst-case cost. Each response frame spends bytes from that reservation. This
 prevents counting `GetBlocks`, `Block`, and `BlocksDone` as three unrelated
 load regulators when they are one serving exchange.
+
+For a one-response exchange, Zakura creates the reservation before sending the
+request and keeps it live even if local work moves elsewhere:
+
+```mermaid
+sequenceDiagram
+    participant Z as Zakura requester
+    participant P as Peer responder
+    Z->>Z: Create response reservation
+    Z->>P: Send request
+    Note over Z: Work may be reassigned<br/>Reservation remains live
+    P->>Z: Send response
+    Z->>Z: Match and consume reservation
+    Z->>Z: Validate and handle response
+```
 
 Response messages still have independent wire and receiving-side contracts.
 Exchange ownership changes resource accounting, not the wire inventory.

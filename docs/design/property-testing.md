@@ -48,6 +48,10 @@ Use the smallest production boundary that proves the claim:
 | Fuzzing | Search arbitrary bytes for panics, inexact decoding, and allocation failures. |
 | Bounded exploration | Visit every state in a stated finite model when that stronger claim is useful. |
 
+Keep each message validity check callable without I/O, locks, or mutable shared
+state. Pass fixed network rules and the authenticated peer identity as explicit
+inputs so generated tests and fuzz targets can exercise the check directly.
+
 Native load tests must exercise a declared policy boundary. An unregulated
 flood mostly measures the machine running it.
 

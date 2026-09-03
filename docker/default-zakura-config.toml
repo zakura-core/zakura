@@ -39,7 +39,7 @@ cookie_dir = "/home/zebra/.cache/zakura"
 
 # Cookie authentication is enabled by default. To serve the restricted Mainnet
 # or Testnet compatibility method set without authentication, set this value to
-# false.
+# false. Leave it enabled when every method should require credentials.
 # Administrative methods such as invalidateblock and reconsiderblock are not
 # registered on that listener. This restriction is defense in depth, not a
 # substitute for network access controls. Keep unauthenticated RPC behind a

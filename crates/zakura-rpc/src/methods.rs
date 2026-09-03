@@ -189,10 +189,11 @@ impl RpcSurface {
 
 /// The reviewed access class for every registered JSON-RPC method.
 ///
-/// The unauthenticated set preserves compatibility with existing lightwalletd,
-/// mining, and fleet health consumers. It does not mean that these methods are
-/// hardened for arbitrary Internet traffic. Narrowing this set requires a
-/// coordinated migration of those consumers and their node configuration.
+/// The unauthenticated set intentionally preserves existing access for normal
+/// query, transaction submission, mining, lightwalletd, and fleet health use.
+/// Operators that want credentials on every method can enable cookie
+/// authentication. This classification does not mean that these methods are
+/// hardened for arbitrary Internet traffic.
 ///
 /// Keep this list synchronized with the generated [`RpcServer`] trait. Server
 /// startup and unit tests reject methods that are missing from either side.

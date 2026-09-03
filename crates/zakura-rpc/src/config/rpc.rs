@@ -30,6 +30,8 @@ pub struct Config {
     /// methods. Clients can still query chain state, submit transactions, and
     /// use the mining RPCs, but they cannot call administrative methods such as
     /// `invalidateblock` or `reconsiderblock`.
+    /// Set [`Self::enable_cookie_auth`] when every method should require
+    /// credentials.
     ///
     /// The restricted method set is defense in depth, not Internet hardening.
     /// Allowed methods can expose node metadata or consume significant

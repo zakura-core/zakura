@@ -730,6 +730,14 @@ tests = ["IN-06::vct_boundary_failure_attribution_never_weakens_authenticated_ev
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
+id = "LC-AUX-06"
+name = "Semantic auxiliary capacity"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
+tests = ["IN-06::auxiliary_admission_preserves_semantic_diversity_under_duplicate_delivery_pressure", "DG-06::projected_auxiliary_rows_cannot_duplicate_a_semantic_payload", "DG-06::projected_per_header_auxiliary_count_must_stay_within_the_plan_limit"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
 id = "LC-WIRE-01"
 name = "Bounded decoding"
 status = "implemented"

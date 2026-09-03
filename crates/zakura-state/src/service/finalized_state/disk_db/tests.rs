@@ -3,9 +3,15 @@
 #![allow(clippy::unwrap_in_result)]
 #![allow(dead_code)]
 
-use std::ops::Deref;
+use std::{ops::Deref, sync::atomic::Ordering};
 
-use crate::service::finalized_state::disk_db::{format_bytes, DiskDb, DB};
+use semver::Version;
+use zakura_chain::parameters::Network;
+
+use crate::{
+    service::finalized_state::disk_db::{format_bytes, DiskDb, DB},
+    Config,
+};
 
 // Enable older test code to automatically access the inner database via Deref coercion.
 impl Deref for DiskDb {
@@ -37,6 +43,53 @@ fn format_bytes_preserves_decimal_unit_boundaries() {
     assert_eq!(format_bytes(999_950), "1000 KB");
     assert_eq!(format_bytes(1_000_000), "1 MB");
     assert_eq!(format_bytes(u64::MAX), "18.4 EB");
+}
+
+#[test]
+fn exporting_metrics_refreshes_cached_disk_size() {
+    let _init_guard = zakura_test::init();
+    let db = DiskDb::new(
+        &Config::ephemeral(),
+        "cached-size-test",
+        &Version::new(1, 0, 0),
+        &Network::Mainnet,
+        ["cached_size".to_owned()],
+        false,
+    )
+    .expect("the ephemeral database configuration is valid");
+
+    let cf = db
+        .cf_handle("cached_size")
+        .expect("the test column family was configured");
+    db.put_cf(cf, b"key", [0xa5; 4096])
+        .expect("writing the test value should succeed");
+    db.flush_cf(cf)
+        .expect("flushing the test column family should succeed");
+    db.refresh_cached_size();
+
+    let expected_size = db.size();
+    assert!(
+        expected_size > 0,
+        "the flushed SST file should use disk space"
+    );
+    db.cached_size.store(u64::MAX, Ordering::Relaxed);
+    assert_eq!(
+        db.size(),
+        expected_size,
+        "the on-demand size must not return the cached estimate"
+    );
+    assert_eq!(
+        db.cached_size(),
+        u64::MAX,
+        "the test must replace the cached estimate"
+    );
+    db.export_metrics();
+
+    assert_eq!(
+        db.cached_size(),
+        expected_size,
+        "the metrics export should refresh the cached disk size"
+    );
 }
 
 /// Check that zs_iter_opts returns an upper bound one greater than provided inclusive end bounds.

@@ -49,7 +49,8 @@ edition = "2021"
 # gate refers to `zakura-assets` and nothing else.
 zakura-assets = { version = "=0.3466571.0" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
-orchard = { version = "1.0.1", package = "zakura-orchard" }
+# This feature selects the consensus-relevant weighted Orchard Merkle hash.
+orchard = { version = "1.0.1", package = "zakura-orchard", features = ["weighted-merkle"] }
 sapling-crypto = { version = "1.0.1", package = "zakura-sapling-crypto" }
 zcash_address = "0.13.0"
 zcash_history = "0.5.0"

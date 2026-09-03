@@ -82,6 +82,24 @@ const POLL_MEMPOOL_DELAY: std::time::Duration = Duration::from_millis(50);
 /// does not count as peer misbehavior.
 const NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS: i64 = 40;
 
+/// Runs transaction parser construction on Tokio's blocking pool.
+///
+/// A task cancellation means the runtime is shutting down. A parser panic is a
+/// deterministic failure for the submitted transaction and must not enter the retry loop.
+async fn spawn_transaction_parser<T, F>(parser: F) -> Result<T, TransactionError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::task::spawn_blocking(parser).await {
+        Ok(result) => Ok(result),
+        Err(error) if error.is_panic() => Err(TransactionError::TransactionParserPanicked),
+        Err(_) => Err(TransactionError::Other(
+            "transaction parser worker dropped its response".to_string(),
+        )),
+    }
+}
+
 /// Returns whether a mempool transaction with a NU6.2 branch ID is within the
 /// NU6.3 peer-misbehavior grace period.
 fn is_nu6_3_branch_id_misbehavior_grace_period(
@@ -582,8 +600,15 @@ where
             }
 
             let nu = req.upgrade(&network);
-            let cached_ffi_transaction =
-                Arc::new(CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
+            let ffi_tx = tx.clone();
+            let cached_ffi_transaction = Arc::new(
+                spawn_transaction_parser(move || {
+                    CachedFfiTransaction::new(ffi_tx, Arc::new(spent_outputs), nu)
+                })
+                .await
+                ?
+                .map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?,
+            );
 
             tracing::trace!(?tx_id, "got state UTXOs");
 

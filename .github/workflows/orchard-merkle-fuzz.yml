@@ -1,0 +1,57 @@
+name: Orchard Merkle fuzzing
+
+on:
+  # Run a longer campaign every Sunday.
+  schedule:
+    - cron: "37 6 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_FUZZ_VERSION: 0.13.2
+  ORCHARD_FUZZ_NIGHTLY: nightly-2026-07-15
+  RUST_BACKTRACE: 1
+  CXXFLAGS: -include cstdint
+
+jobs:
+  fuzz:
+    name: orchard_merkle_equivalence
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: ${{ env.ORCHARD_FUZZ_NIGHTLY }}
+          cache: true
+          cache-on-failure: true
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version "${CARGO_FUZZ_VERSION}" --locked
+      - name: Run bounded campaign
+        working-directory: fuzz/orchard-merkle
+        run: |
+          cargo fuzz run --fuzz-dir . orchard_merkle_equivalence -- \
+            -max_total_time=3600 \
+            -rss_limit_mb=4096 \
+            -max_len=65 \
+            -detect_leaks=1
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: orchard-merkle-fuzz-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: fuzz/orchard-merkle/artifacts/orchard_merkle_equivalence

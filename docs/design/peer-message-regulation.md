@@ -32,12 +32,14 @@ Before Zakura acts on an inbound message, it answers four questions:
    caused by the exchange? Otherwise, use the contract's declared wait, reject,
    or drop outcome.
 
-For a request, **Affordable** covers the entire exchange: peer and node limits,
-ownership across asynchronous handoffs, bounded pending and outbound buffers,
-and cleanup on completion, failure, cancellation, or replacement.
+For a request, Zakura accounts for the whole exchange, not just the inbound
+frame. Its work and response bytes remain bounded through pending queues,
+service handoffs, and outbound buffers, and are released when the exchange
+completes or ends early.
 
-Peer selection remains separate. A conformant peer can waste a connection slot
-without violating any message rule.
+Message regulation controls traffic from connected peers; it does not choose
+those peers. A peer can follow the protocol without contributing useful work,
+which is handled separately by peer-selection policy.
 
 ## Exchange ownership
 

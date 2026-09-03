@@ -47,7 +47,7 @@ edition = "2021"
 # Published from `crates/zakura-assets/` in this repository. The dependency name and the
 # published name now match, so no `package` rename is needed: every consumer, script, and
 # gate refers to `zakura-assets` and nothing else.
-zakura-assets = { version = "=0.3462171.0" }
+zakura-assets = { version = "=0.3466571.0" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 orchard = { version = "1.0.1", package = "zakura-orchard" }
 sapling-crypto = { version = "1.0.1", package = "zakura-sapling-crypto" }

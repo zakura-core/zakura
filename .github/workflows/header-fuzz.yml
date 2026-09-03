@@ -73,7 +73,7 @@ jobs:
       - name: Install pinned cargo-fuzz
         run: cargo install cargo-fuzz --version "${CARGO_FUZZ_VERSION}" --locked
       - name: Run bounded campaign
-        working-directory: fuzz/header-chain
+        working-directory: qa/fuzz/header-chain
         env:
           NORMAL_SECONDS: ${{ matrix.seconds }}
           WEEKLY_SECONDS: ${{ matrix.weekly_seconds }}
@@ -100,4 +100,4 @@ jobs:
           name: header-fuzz-${{ matrix.target }}-${{ github.run_id }}
           if-no-files-found: ignore
           retention-days: 14
-          path: fuzz/header-chain/artifacts/${{ matrix.target }}
+          path: qa/fuzz/header-chain/artifacts/${{ matrix.target }}

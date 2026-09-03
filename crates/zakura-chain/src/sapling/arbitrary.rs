@@ -114,9 +114,7 @@ fn spendauth_verification_key_bytes() -> impl Strategy<Value = ValidatingKey> {
     prop::array::uniform32(any::<u8>()).prop_map(|bytes| {
         let rng = ChaChaRng::from_seed(bytes);
         let sk = redjubjub::SigningKey::<redjubjub::SpendAuth>::new(rng);
-        redjubjub::VerificationKey::<redjubjub::SpendAuth>::from(&sk)
-            .try_into()
-            .unwrap()
+        redjubjub::VerificationKey::<redjubjub::SpendAuth>::from(&sk).into()
     })
 }
 

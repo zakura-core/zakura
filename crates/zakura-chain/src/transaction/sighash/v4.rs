@@ -118,7 +118,7 @@ fn sapling_spends_hash(
         state.update(&spend.cv.to_bytes());
         update_serialized(&mut state, &spend.per_spend_anchor);
         state.update(&<[u8; 32]>::from(spend.nullifier));
-        state.update(&<[u8; 32]>::from(spend.rk.clone()));
+        state.update(&<[u8; 32]>::from(&spend.rk));
         update_serialized(&mut state, &spend.zkproof);
     }
     Some(state.finalize())

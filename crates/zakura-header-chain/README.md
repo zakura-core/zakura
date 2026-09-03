@@ -59,4 +59,4 @@ cargo test -p zakura-header-chain
 ```
 
 Property and mutation fuzzing are documented in the
-[header-chain fuzz target](../../fuzz/header-chain/README.md).
+[header-chain fuzz target](../../qa/fuzz/header-chain/README.md).

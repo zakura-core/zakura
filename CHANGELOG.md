@@ -11,6 +11,30 @@ independently.
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-02
+
+### Changed
+
+- Updated the Zakura Common (`zakura-core/common`) crates from `1.0.0` to
+  `1.0.1`
+  ([#844](https://github.com/zakura-core/zakura/pull/844)).
+- Shortened the end-of-support window to 27 days so v1.3.1 halts at block
+  3,501,339 — the same halt block and date (~2026-09-30) as v1.3.0
+  ([#863](https://github.com/zakura-core/zakura/pull/863)).
+  <!-- release-readiness: allow-patch; reason: The Changed entries are the backwards-compatible Zakura Common 1.0.1 patch adoption and this end-of-support alignment; v1.3.1 stays on the 1.3 line so it keeps the v1.3.0 halt schedule. -->
+
+### Fixed
+
+- Reduced `getblockchaininfo` latency by reusing the periodic database disk-size measurement
+  ([#854](https://github.com/zakura-core/zakura/pull/854)).
+
+### Security
+
+- Replaced the yanked transitive `chacha20 0.10.1` dependency with `0.10.2`,
+  whose SSE2 backend no longer emits an SSE4.1 instruction that crashes
+  `zakurad` on x86 CPUs without SSE4.1 support
+  ([#844](https://github.com/zakura-core/zakura/pull/844)).
+
 ## [1.3.0] - 2026-08-29
 
 ### Added

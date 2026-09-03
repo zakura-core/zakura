@@ -76,7 +76,7 @@ sapling-crypto = { workspace = true }
 zakura-assets = { workspace = true }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.1" }
 zakura-chain = { path = "../zakura-chain", version = "6.0.0", features = ["async-error"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "2.0.0" }
 
 # prod feature progress-bar
 howudoin = { workspace = true, optional = true }
@@ -88,7 +88,7 @@ derive-getters.workspace = true
 derive-new.workspace = true
 
 [dev-dependencies]
-zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0", features = ["test-support"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "2.0.0", features = ["test-support"] }
 color-eyre = { workspace = true }
 
 once_cell = { workspace = true }

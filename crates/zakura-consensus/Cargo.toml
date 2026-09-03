@@ -71,7 +71,7 @@ zakura-script = { path = "../zakura-script", version = "3.2.1" }
 zakura-state = { path = "../zakura-state", version = "7.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.1" }
 zakura-chain = { path = "../zakura-chain", version = "6.0.0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "2.0.0" }
 
 zcash_protocol.workspace = true
 

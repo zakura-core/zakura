@@ -603,6 +603,13 @@ impl PeerRegistry {
         self.lock().remove(peer);
     }
 
+    /// Return whether `generation` still owns this peer's live routine session.
+    pub(super) fn owns_generation(&self, peer: &ZakuraPeerId, generation: u64) -> bool {
+        self.lock()
+            .get(peer)
+            .is_some_and(|entry| entry.generation == generation)
+    }
+
     /// Publish a freshly-applied `Status` (routine-side, inverted inbound flow): grow
     /// servable range, clamp the advertised caps, and mark the peer as having sent
     /// a status. Generation-gated like the other routine writers so a superseded

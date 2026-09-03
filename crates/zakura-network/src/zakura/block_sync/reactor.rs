@@ -1239,13 +1239,15 @@ impl BlockSyncReactor {
             }
             RoutineToReactor::ServeGetBlocks {
                 peer,
+                session_generation,
                 start_height,
                 count,
             } => {
                 if self.state.parked_peers.contains(&peer) {
                     return;
                 }
-                self.handle_get_blocks(peer, start_height, count).await;
+                self.handle_get_blocks(peer, session_generation, start_height, count)
+                    .await;
             }
             RoutineToReactor::RequeryNeeded => {
                 self.query_needed_blocks().await;
@@ -1402,9 +1404,16 @@ impl BlockSyncReactor {
     async fn handle_get_blocks(
         &mut self,
         peer: ZakuraPeerId,
+        session_generation: u64,
         start_height: block::Height,
         count: u32,
     ) {
+        // The routine can be superseded after decoding this request but before
+        // the reactor receives it. Never apply that request to the replacement.
+        if !self.registry.owns_generation(&peer, session_generation) {
+            return;
+        }
+
         let local_inflight_cap = self.startup.config.advertised_max_inflight_requests();
         if !self.state.peers.contains_key(&peer) {
             self.report_misbehavior(peer, BlockSyncMisbehavior::GetBlocksSpam)

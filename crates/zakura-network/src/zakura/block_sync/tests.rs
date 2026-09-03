@@ -16,6 +16,7 @@ use super::{
         DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
         MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
+    events::RoutineToReactor,
     peer_registry::{OutstandingMeta, PeerRegistry},
     reactor::{
         node_id_from_block_peer_id, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
@@ -11924,6 +11925,103 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
     assert_eq!(
         wait_for_outbound_range_unavailable(&mut outbound_rx).await,
         (block::Height(4), 1)
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_ignores_get_blocks_from_superseded_routine_generation() {
+    let config = ZakuraBlockSyncConfig::default();
+    let mut startup = BlockSyncStartup::inert(config.clone());
+    startup.frontiers.finalized_height = block::Height(3);
+    startup.frontiers.verified_block_tip = block::Height(3);
+    startup.best_header_tip = (block::Height(3), block::Hash([3; 32]));
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let wiring = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes routine wiring");
+    let peer_id = peer(0x6f);
+    let old_generation = wiring
+        .registry
+        .admit_session(
+            &peer_id,
+            ServicePeerDirection::Outbound,
+            &config,
+            1,
+            Instant::now(),
+        )
+        .generation();
+    let current_generation = wiring
+        .registry
+        .admit_session(
+            &peer_id,
+            ServicePeerDirection::Outbound,
+            &config,
+            2,
+            Instant::now(),
+        )
+        .generation();
+    wiring.registry.upsert_status(
+        &peer_id,
+        current_generation,
+        BlockSyncStatus {
+            servable_low: block::Height::MIN,
+            servable_high: block::Height(3),
+            ..BlockSyncStatus::default()
+        },
+    );
+
+    let (outbound, mut outbound_recv) = framed_channel(4);
+    handle
+        .send(BlockSyncEvent::PeerConnected(
+            BlockSyncPeerSession::for_test(peer_id.clone(), outbound, CancellationToken::new()),
+        ))
+        .await
+        .expect("the peer connection queues");
+    wait_for_outbound_status(&mut outbound_recv).await;
+
+    wiring
+        .routine_to_reactor
+        .send(RoutineToReactor::ServeGetBlocks {
+            peer: peer_id.clone(),
+            session_generation: old_generation,
+            start_height: block::Height(1),
+            count: 1,
+        })
+        .await
+        .expect("the stale serving request queues");
+    wiring
+        .routine_to_reactor
+        .send(RoutineToReactor::ServeGetBlocks {
+            peer: peer_id.clone(),
+            session_generation: current_generation,
+            start_height: block::Height(2),
+            count: 1,
+        })
+        .await
+        .expect("the current serving request queues");
+
+    match next_action(&mut actions).await {
+        BlockSyncAction::QueryBlocksByHeightRange {
+            peer, start, count, ..
+        } => {
+            assert_eq!(peer, peer_id);
+            assert_eq!(start, block::Height(2));
+            assert_eq!(count, 1);
+        }
+        action => panic!("stale serving request produced an observable action: {action:?}"),
+    }
+    assert!(
+        actions.try_recv().is_err(),
+        "the stale serving request must not produce a second action"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), outbound_recv.recv())
+            .await
+            .is_err(),
+        "the stale serving request must not send a frame"
     );
 
     reactor_task.abort();

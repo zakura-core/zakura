@@ -432,6 +432,8 @@ pub(super) enum RoutineToReactor {
     ServeGetBlocks {
         /// Peer that requested the range.
         peer: ZakuraPeerId,
+        /// Registry generation of the session routine that decoded the request.
+        session_generation: u64,
         /// First requested height.
         start_height: block::Height,
         /// Requested block count.

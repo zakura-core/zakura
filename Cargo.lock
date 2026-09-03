@@ -8165,7 +8165,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "8.0.0"
+version = "9.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8194,6 +8194,7 @@ dependencies = [
  "prost",
  "rand 0.10.2",
  "rand 0.8.6",
+ "reqwest 0.12.28",
  "rustls",
  "schemars 1.2.1",
  "semver",

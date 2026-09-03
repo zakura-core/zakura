@@ -341,6 +341,7 @@ impl StartCmd {
 
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
+        config.rpc.validate().map_err(|error| eyre!(error))?;
 
         if config.zcashd_compat.enabled {
             zcashd_compat::run_preflight(&config, self.unsafe_low_specs)?;
@@ -675,6 +676,15 @@ impl StartCmd {
         };
         node_tasks.track(&rpc_task_handle);
 
+        let admin_rpc_task_handle = if config.rpc.admin_listen_addr.is_some() {
+            RpcServer::start_admin(rpc_impl.clone(), config.rpc.clone())
+                .await
+                .expect("admin server should start")
+        } else {
+            tokio::spawn(std::future::pending().in_current_span())
+        };
+        node_tasks.track(&admin_rpc_task_handle);
+
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
         let zcashd_compat_supervisor_config =
@@ -907,6 +917,7 @@ impl StartCmd {
 
         // ongoing tasks
         pin!(rpc_task_handle);
+        pin!(admin_rpc_task_handle);
         pin!(indexer_rpc_task_handle);
         pin!(syncer_task_handle);
         pin!(block_gossip_task_handle);
@@ -958,6 +969,13 @@ impl StartCmd {
                     let rpc_server_result = rpc_join_result
                         .expect("unexpected panic in the rpc task");
                     info!(?rpc_server_result, "rpc task exited");
+                    Ok(())
+                }
+
+                admin_rpc_join_result = &mut admin_rpc_task_handle => {
+                    let admin_rpc_server_result = admin_rpc_join_result
+                        .expect("unexpected panic in the admin rpc task");
+                    info!(?admin_rpc_server_result, "admin rpc task exited");
                     Ok(())
                 }
 
@@ -1073,6 +1091,7 @@ impl StartCmd {
 
         // ongoing tasks
         rpc_task_handle.abort();
+        admin_rpc_task_handle.abort();
         rpc_tx_queue_handle.abort();
         health_task_handle.abort();
         syncer_task_handle.abort();
@@ -1274,6 +1293,7 @@ impl config::Override<ZakuradConfig> for StartCmd {
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         Self::validate_debug_blocksync_throughput_config(&config)
             .map_err(|err| std::io::Error::other(err.to_string()))?;
+        config.rpc.validate().map_err(std::io::Error::other)?;
 
         Ok(config)
     }

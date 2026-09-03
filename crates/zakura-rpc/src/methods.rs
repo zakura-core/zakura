@@ -151,6 +151,95 @@ where
 
 include!("methods/rpc_openrpc.rs");
 
+/// The access class assigned to an RPC method.
+///
+/// Every registered method must have exactly one class. This makes additions
+/// fail closed until their intended exposure is reviewed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RpcAccess {
+    /// Available on unauthenticated Mainnet and Testnet RPC listeners.
+    Public,
+
+    /// Available only on authenticated listeners, except on Regtest.
+    Admin,
+
+    /// A Regtest control method retained on the full RPC surface.
+    Test,
+}
+
+/// The method set exposed by one RPC listener.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RpcSurface {
+    /// The explicitly classified public method set.
+    Public,
+
+    /// Every registered method.
+    Full,
+}
+
+impl RpcSurface {
+    /// Returns whether this surface exposes `method_name`.
+    pub(crate) fn exposes(self, method_name: &str) -> bool {
+        match self {
+            Self::Public => rpc_method_access(method_name) == Some(RpcAccess::Public),
+            Self::Full => true,
+        }
+    }
+}
+
+/// The reviewed access class for every registered JSON-RPC method.
+///
+/// Keep this list synchronized with the generated [`RpcServer`] trait. Server
+/// startup and unit tests reject methods that are missing from either side.
+pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
+    ("getinfo", RpcAccess::Public),
+    ("getdeprecationinfo", RpcAccess::Public),
+    ("getblockchaininfo", RpcAccess::Public),
+    ("getaddressbalance", RpcAccess::Public),
+    ("sendrawtransaction", RpcAccess::Public),
+    ("getblock", RpcAccess::Public),
+    ("getblockheader", RpcAccess::Public),
+    ("getbestblockhash", RpcAccess::Public),
+    ("getbestblockheightandhash", RpcAccess::Public),
+    ("getchaintips", RpcAccess::Public),
+    ("getmempoolinfo", RpcAccess::Public),
+    ("getrawmempool", RpcAccess::Public),
+    ("z_gettreestate", RpcAccess::Public),
+    ("z_getsubtreesbyindex", RpcAccess::Public),
+    ("getrawtransaction", RpcAccess::Public),
+    ("getaddresstxids", RpcAccess::Public),
+    ("getaddressutxos", RpcAccess::Public),
+    ("stop", RpcAccess::Test),
+    ("getblockcount", RpcAccess::Public),
+    ("getblockhash", RpcAccess::Public),
+    ("getblocktemplate", RpcAccess::Public),
+    ("submitblock", RpcAccess::Public),
+    ("getmininginfo", RpcAccess::Public),
+    ("getnetworksolps", RpcAccess::Public),
+    ("getnetworkhashps", RpcAccess::Public),
+    ("getnetworkinfo", RpcAccess::Public),
+    ("getpeerinfo", RpcAccess::Public),
+    ("ping", RpcAccess::Public),
+    ("validateaddress", RpcAccess::Public),
+    ("z_validateaddress", RpcAccess::Public),
+    ("getblocksubsidy", RpcAccess::Public),
+    ("getdifficulty", RpcAccess::Public),
+    ("z_listunifiedreceivers", RpcAccess::Public),
+    ("invalidateblock", RpcAccess::Admin),
+    ("reconsiderblock", RpcAccess::Admin),
+    ("generate", RpcAccess::Test),
+    ("addnode", RpcAccess::Test),
+    ("rpc.discover", RpcAccess::Public),
+    ("gettxout", RpcAccess::Public),
+];
+
+/// Returns the reviewed access class for `method_name`.
+pub(crate) fn rpc_method_access(method_name: &str) -> Option<RpcAccess> {
+    RPC_METHOD_ACCESS
+        .iter()
+        .find_map(|(name, access)| (*name == method_name).then_some(*access))
+}
+
 // TODO: Review the parameter descriptions below, and update them as needed:
 // https://github.com/ZcashFoundation/zebra/issues/10320
 pub(super) const PARAM_VERBOSE_DESC: &str =
@@ -888,6 +977,9 @@ where
     /// no matter what the estimated height or local clock is.
     debug_force_finished_sync: bool,
 
+    /// The RPC methods and OpenRPC schema exposed by this instance.
+    rpc_surface: RpcSurface,
+
     /// The estimated last height this release supports, if enforced.
     end_of_support_height: Option<Height>,
 
@@ -1005,6 +1097,7 @@ where
             user_agent,
             network: network.clone(),
             debug_force_finished_sync,
+            rpc_surface: RpcSurface::Full,
             end_of_support_height: None,
             mempool: mempool.clone(),
             state: state.clone(),
@@ -1036,6 +1129,12 @@ where
     /// When unset, or set to `None`, the RPC omits `end_of_service`.
     pub fn with_end_of_support_height(mut self, end_of_support_height: Option<Height>) -> Self {
         self.end_of_support_height = end_of_support_height;
+        self
+    }
+
+    /// Selects the method set and OpenRPC schema exposed by this instance.
+    pub(crate) fn with_rpc_surface(mut self, rpc_surface: RpcSurface) -> Self {
+        self.rpc_surface = rpc_surface;
         self
     }
 }
@@ -3240,6 +3339,7 @@ where
 
         let methods = METHODS
             .into_iter()
+            .filter(|(name, _)| self.rpc_surface.exposes(name))
             .map(|(name, method)| method.generate(&mut generator, name))
             .collect();
 

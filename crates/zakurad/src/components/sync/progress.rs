@@ -7,7 +7,6 @@ use std::{
 };
 
 use chrono::Utc;
-use num_integer::div_ceil;
 
 use tokio::sync::watch;
 use zakura_chain::{
@@ -260,10 +259,9 @@ pub async fn show_block_chain_progress(
             } else if is_syncer_stopped && current_height <= after_checkpoint_height {
                 // We've stopped syncing blocks,
                 // but we're below the minimum height estimated from our checkpoints.
-                let min_minutes_after_checkpoint_update = div_ceil(
-                    MIN_BLOCKS_MINED_AFTER_CHECKPOINT_UPDATE * POST_BLOSSOM_POW_TARGET_SPACING,
-                    60,
-                );
+                let min_minutes_after_checkpoint_update = (MIN_BLOCKS_MINED_AFTER_CHECKPOINT_UPDATE
+                    * POST_BLOSSOM_POW_TARGET_SPACING)
+                    .div_ceil(60);
 
                 warn!(
                     %sync_percent,

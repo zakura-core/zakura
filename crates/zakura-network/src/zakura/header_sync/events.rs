@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -55,6 +55,8 @@ pub struct HeaderSyncStartup {
     pub trace: ZakuraTrace,
     /// Shared shutdown signal.
     pub shutdown: CancellationToken,
+    /// Private fatal notifications consumed by the node root.
+    pub(crate) fatal_events: Option<mpsc::UnboundedSender<HeaderSyncFatalEvent>>,
 }
 
 impl HeaderSyncStartup {
@@ -89,6 +91,7 @@ impl HeaderSyncStartup {
             status_refresh_interval,
             trace: ZakuraTrace::noop(),
             shutdown: CancellationToken::new(),
+            fatal_events: None,
         }
     }
 
@@ -97,6 +100,40 @@ impl HeaderSyncStartup {
         self.port_dispatch = PortDispatch::Direct;
     }
 }
+
+/// A VCT repair state operation exceeded its local hard deadline.
+///
+/// This event stays inside the process. It does not change the header-sync wire protocol.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderSyncFatalEvent {
+    /// Local state operation phase.
+    pub phase: &'static str,
+    /// Exact operation owner.
+    pub owner: zakura_header_chain::HeaderSyncWorkOwner,
+    /// Repair generation that started the operation.
+    pub repair_generation: u64,
+    /// Selected repair target.
+    pub target: zakura_header_chain::Frontier,
+    /// Time the local operation remained pending.
+    pub elapsed: Duration,
+}
+
+impl fmt::Display for HeaderSyncFatalEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "VCT local {} operation exceeded its hard deadline: owner={:?}, generation={}, branch={:?}, target={:?}, elapsed={:?}",
+            self.phase,
+            self.owner,
+            self.repair_generation,
+            self.owner.header_authority().branch,
+            self.target,
+            self.elapsed,
+        )
+    }
+}
+
+impl std::error::Error for HeaderSyncFatalEvent {}
 
 /// Explicit reactor port-dispatch policy.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

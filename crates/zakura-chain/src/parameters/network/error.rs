@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::{block::Height, parameters::subsidy::FundingStreamReceiver};
+
 /// An error that can occur when building `Parameters` using `ParametersBuilder`.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ParametersBuilderError {
@@ -88,4 +90,40 @@ pub enum ParametersBuilderError {
     )]
     #[non_exhaustive]
     InsufficientCheckpointCoverage,
+
+    #[error(
+        "funding stream address {address} for receiver {receiver:?} must be a P2SH address, \
+         because the funding stream consensus rule only accepts P2SH outputs"
+    )]
+    #[non_exhaustive]
+    FundingStreamAddressNotP2SH {
+        receiver: FundingStreamReceiver,
+        address: String,
+    },
+
+    #[error(
+        "slow start interval {slow_start_interval:?} must divide the block subsidy limit into \
+         a rate that is a multiple of five, because the founders reward is an exact fifth of \
+         the block subsidy"
+    )]
+    #[non_exhaustive]
+    IndivisibleFoundersReward { slow_start_interval: Height },
+
+    #[error("lockbox disbursement address {address} must parse as a transparent address: {err}")]
+    #[non_exhaustive]
+    InvalidLockboxDisbursementAddress { address: String, err: String },
+
+    #[error(
+        "lockbox disbursement address {address} must be a P2SH address, because the lockbox \
+         disbursement consensus rule only accepts P2SH outputs"
+    )]
+    #[non_exhaustive]
+    LockboxDisbursementAddressNotP2SH { address: String },
+
+    #[error(
+        "the configured lockbox disbursement amounts must sum to a valid amount, because the \
+         deferred pool balance is calculated from their total"
+    )]
+    #[non_exhaustive]
+    InvalidLockboxDisbursementTotal,
 }

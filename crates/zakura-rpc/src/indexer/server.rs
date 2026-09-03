@@ -212,7 +212,7 @@ fn load_mtls_config(tls: IndexerTlsConfig) -> Result<ServerTlsConfig, BoxError> 
 
 /// Ensures tonic TLS connections have a rustls crypto provider.
 pub(crate) fn install_tls_crypto_provider() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// Reads an indexer TLS file with its role included in any error.

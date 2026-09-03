@@ -120,26 +120,6 @@ impl ZakuradConfig {
         Self::load_with_env_prefixes(config_path, &["ZEBRA", "ZAKURA"])
     }
 
-    /// Loads configuration using a caller-provided environment variable prefix.
-    ///
-    /// This allows callers that need multiple configs in the same process (e.g.,
-    /// the `copy-state` command) to keep overrides separate. For example:
-    /// - Source/base config uses `ZAKURA_...` env vars (default prefix)
-    /// - Target config uses `ZAKURA_TARGET_...` env vars
-    ///
-    /// The nested key separator remains `__`, e.g., `ZAKURA_TARGET_STATE__CACHE_DIR`.
-    pub fn load_with_env(
-        config_path: Option<PathBuf>,
-        env_prefix: &str,
-    ) -> Result<Self, config::ConfigError> {
-        if let Some(suffix) = env_prefix.strip_prefix("ZAKURA") {
-            let legacy_prefix = format!("ZEBRA{suffix}");
-            Self::load_with_env_prefixes(config_path, &[&legacy_prefix, env_prefix])
-        } else {
-            Self::load_with_env_prefixes(config_path, &[env_prefix])
-        }
-    }
-
     /// Loads configuration using caller-provided environment variable prefixes.
     ///
     /// Prefixes are applied in order, so later prefixes override earlier prefixes.

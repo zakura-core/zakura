@@ -12,6 +12,10 @@ import sys
 # comparison baseline. Maintainers must remove this exclusion after that publication.
 UNPUBLISHED_BASELINE_EXCLUSIONS = {"zakura-header-chain"}
 
+# `zakura` is the node binary package, rather than a supported Rust library API.
+# Its command and configuration types can change without library SemVer bumps.
+SEMVER_ENFORCEMENT_EXCLUSIONS = {"zakura"}
+
 
 def is_publishable(package):
     publish = package.get("publish")
@@ -132,6 +136,7 @@ def affected_publishable_packages(metadata, changed_files=None, check_all=False)
         for package_id in ordered
         if is_publishable(packages[package_id])
         and packages[package_id]["name"] not in UNPUBLISHED_BASELINE_EXCLUSIONS
+        and packages[package_id]["name"] not in SEMVER_ENFORCEMENT_EXCLUSIONS
     ]
 
 

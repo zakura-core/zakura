@@ -29,12 +29,16 @@ use tokio::{
     time::{sleep, Instant},
 };
 use tokio_stream::wrappers::IntervalStream;
+use tokio_util::task::AbortOnDropHandle;
 use tower::{
     buffer::Buffer, discover::Change, layer::Layer, util::BoxService, Service, ServiceExt,
 };
-use tracing_futures::Instrument;
+use tracing::Instrument;
 
-use zakura_chain::{chain_tip::ChainTip, diagnostic::task::WaitForPanics};
+use zakura_chain::{
+    chain_tip::ChainTip,
+    diagnostic::task::{CheckForPanics, WaitForPanics},
+};
 
 use crate::{
     address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
@@ -45,8 +49,10 @@ use crate::{
         OutboundConnectorRequest, PeerPreference,
     },
     peer_cache_updater::peer_cache_updater,
+    peer_registry::PeerRegistry,
     peer_set::{set::MorePeers, ActiveConnectionCounter, CandidateSet, ConnectionTracker, PeerSet},
     protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
+    zakura::{CustomService, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup},
     AddressBook, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
 };
 
@@ -179,13 +185,52 @@ pub async fn init_with_zakura_header_sync<S, C>(
     user_agent: String,
     advertised_services: PeerServices,
     block_gossip_peer_ips: Vec<IpAddr>,
-    header_sync_driver_startup: Option<crate::zakura::ZakuraHeaderSyncDriverStartup>,
+    header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
 ) -> (
     Buffer<BoxService<Request, Response, BoxError>, Request>,
     Arc<std::sync::Mutex<AddressBook>>,
     mpsc::Sender<(PeerSocketAddr, u32)>,
-    Option<crate::zakura::ZakuraEndpoint>,
+    Option<ZakuraEndpoint>,
 )
+where
+    S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + Sync + 'static,
+    S::Future: Send + 'static,
+    C: ChainTip + Clone + Send + Sync + 'static,
+{
+    init_with_zakura(
+        config,
+        inbound_service,
+        latest_chain_tip,
+        user_agent,
+        advertised_services,
+        block_gossip_peer_ips,
+        header_sync_driver_startup,
+        Vec::new(),
+    )
+    .await
+    .expect("Zakura endpoint should start when P2P v2 is enabled")
+}
+
+/// Initialize a peer set with optional Zakura runtime components.
+#[allow(clippy::too_many_arguments)]
+pub async fn init_with_zakura<S, C>(
+    config: Config,
+    inbound_service: S,
+    latest_chain_tip: C,
+    user_agent: String,
+    advertised_services: PeerServices,
+    block_gossip_peer_ips: Vec<IpAddr>,
+    header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
+    custom_services: Vec<CustomService>,
+) -> Result<
+    (
+        Buffer<BoxService<Request, Response, BoxError>, Request>,
+        Arc<std::sync::Mutex<AddressBook>>,
+        mpsc::Sender<(PeerSocketAddr, u32)>,
+        Option<ZakuraEndpoint>,
+    ),
+    BoxError,
+>
 where
     S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + Sync + 'static,
     S::Future: Send + 'static,
@@ -202,7 +247,8 @@ where
     // handshake builder consumes the original below. The factory only runs when
     // `v2_p2p` is enabled; otherwise the endpoint is `None` and the clone drops.
     let inbound_for_zakura_sink = inbound_service.clone();
-    let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_header_sync_driver(
+    let peer_registry = PeerRegistry::default();
+    let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_peer_registry(
         &config,
         move |supervisor, trace| {
             Arc::new(crate::zakura::LegacyGossipSink::spawn_with_trace(
@@ -212,12 +258,21 @@ where
             )) as Arc<dyn crate::zakura::Service>
         },
         header_sync_driver_startup,
+        custom_services,
+        peer_registry.clone(),
     )
-    .await
-    .expect("Zakura endpoint should start when P2P v2 is enabled");
+    .await?;
+    let zakura_startup_shutdown = zakura_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.background_shutdown_token().drop_guard());
 
     let (address_book, bans, address_book_updater, address_metrics, address_book_updater_guard) =
-        AddressBookUpdater::spawn(&config, listen_addr, advertised_services);
+        AddressBookUpdater::spawn_with_peer_registry(
+            &config,
+            listen_addr,
+            advertised_services,
+            peer_registry.clone(),
+        );
 
     let (misbehavior_tx, misbehavior_rx) = mpsc::channel(
         // Leave enough room for a misbehaviour update on every peer connection
@@ -271,6 +326,7 @@ where
             .with_advertised_services(advertised_services)
             .with_user_agent(user_agent)
             .with_latest_chain_tip(latest_chain_tip.clone())
+            .with_peer_registry(peer_registry)
             .with_protected_peer_ips(protected_peer_ips)
             .want_transactions(true);
 
@@ -320,13 +376,29 @@ where
         MinimumPeerVersion::new(latest_chain_tip, &config.network),
         None,
     );
-    let peer_set = Buffer::new(BoxService::new(peer_set), constants::PEERSET_BUFFER_SIZE);
+    let shutdown = zakura_endpoint
+        .as_ref()
+        .map(ZakuraEndpoint::background_shutdown_token)
+        .unwrap_or_default();
+    // Using Buffer::pair returns the background service, letting us inject our cancellation
+    let (peer_set, worker) =
+        Buffer::pair(BoxService::new(peer_set), constants::PEERSET_BUFFER_SIZE);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            _ = worker => {}
+        }
+    });
 
     // Start the peer disk cache updater
     let peer_cache_updater_fut = peer_cache_updater(config.clone(), address_book.clone());
     let peer_cache_updater_guard = tokio::spawn(peer_cache_updater_fut.in_current_span());
 
-    let mut task_handles = vec![address_book_updater_guard, peer_cache_updater_guard];
+    // Abort startup tasks if this initialization future is dropped before handoff.
+    let mut task_handles = vec![
+        AbortOnDropHandle::new(address_book_updater_guard),
+        AbortOnDropHandle::new(peer_cache_updater_guard),
+    ];
 
     if let Some(tcp_listener) = tcp_listener {
         // Connect peerset_tx to the 3 peer sources:
@@ -341,7 +413,9 @@ where
             bans,
             block_gossip_peer_ips,
         );
-        task_handles.push(tokio::spawn(listen_fut.in_current_span()));
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(
+            listen_fut.in_current_span(),
+        )));
 
         // 2. Initial peers, specified in the config and cached on disk.
         let initial_peers_fut = add_initial_peers(
@@ -350,15 +424,17 @@ where
             peerset_tx.clone(),
             address_book_updater.clone(),
         );
-        let initial_peers_join = tokio::spawn(initial_peers_fut.in_current_span());
+        let initial_peers_join =
+            AbortOnDropHandle::new(tokio::spawn(initial_peers_fut.in_current_span()));
 
         // 3. Outgoing peers we connect to in response to load.
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
 
         // Wait for the initial seed peer count
         let mut active_outbound_connections = initial_peers_join
-            .wait_for_panics()
             .await
+            .panic_if_task_has_panicked()
+            .expect("initial peer task is not cancelled")
             .expect("unexpected error connecting to initial peers");
         let active_initial_peer_count = active_outbound_connections.update_count();
 
@@ -396,9 +472,11 @@ where
             address_book_updater,
             Arc::new(AtomicBool::new(false)),
         );
-        task_handles.push(tokio::spawn(crawl_fut.in_current_span()));
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(
+            crawl_fut.in_current_span(),
+        )));
     } else {
-        task_handles.push(tokio::spawn(
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(
             async move {
                 let _peerset_tx = peerset_tx;
                 let mut demand_rx = demand_rx;
@@ -410,7 +488,7 @@ where
                 future::pending::<Result<(), BoxError>>().await
             }
             .in_current_span(),
-        ));
+        )));
     }
 
     // Capture the supervisor before the endpoint is moved into the keep-alive
@@ -421,13 +499,20 @@ where
 
     let returned_zakura_endpoint = zakura_endpoint.clone();
     if let Some(zakura_endpoint) = zakura_endpoint {
-        task_handles.push(tokio::spawn(async move {
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(async move {
             let _zakura_endpoint = zakura_endpoint;
             future::pending::<Result<(), BoxError>>().await
-        }));
+        })));
     }
 
-    handle_tx.send(task_handles).unwrap();
+    handle_tx
+        .send(
+            task_handles
+                .into_iter()
+                .map(AbortOnDropHandle::detach)
+                .collect(),
+        )
+        .unwrap();
 
     // When the Zakura endpoint is active, wrap the legacy peer set so locally
     // originated gossip and inventory fetches also flow over Zakura. The internal
@@ -447,12 +532,16 @@ where
         None => peer_set,
     };
 
-    (
+    if let Some(shutdown) = zakura_startup_shutdown {
+        shutdown.disarm();
+    }
+
+    Ok((
         peer_set,
         address_book,
         misbehavior_tx,
         returned_zakura_endpoint,
-    )
+    ))
 }
 
 /// Use the provided `outbound_connector` to connect to the configured DNS seeder and

@@ -62,6 +62,26 @@ fn connected_addr_labels_require_explicit_opt_in() {
 }
 
 #[test]
+fn diagnostic_remote_addr_excludes_proxy_connection_identifiers() {
+    let proxy_addr: SocketAddr = "192.0.2.10:9050".parse().expect("valid proxy address");
+    let local_addr: SocketAddr = "127.0.0.1:49152".parse().expect("valid local address");
+    let outbound_proxy = ConnectedAddr::new_outbound_proxy(proxy_addr, local_addr);
+    let inbound_proxy = ConnectedAddr::new_inbound_proxy(proxy_addr);
+
+    assert_eq!(
+        outbound_proxy.get_transient_addr(),
+        Some(local_addr.into()),
+        "the transient outbound proxy identifier is the local socket",
+    );
+    assert_eq!(outbound_proxy.diagnostic_remote_addr(), None);
+    assert_eq!(inbound_proxy.diagnostic_remote_addr(), None);
+    assert_eq!(
+        ConnectedAddr::new_outbound_direct(peer_addr(8233)).diagnostic_remote_addr(),
+        Some(peer_addr(8233)),
+    );
+}
+
+#[test]
 fn noncanonical_shielded_proof_size_gets_ban_score() {
     let addr = peer_addr(8233);
     let change = inbound_error_address_change(
@@ -91,6 +111,7 @@ fn test_config(p2p_stack: P2pStack) -> Config {
 fn upgraded_outcome() -> ZakuraUpgradeOutcome {
     ZakuraUpgradeOutcome::Upgraded {
         peer_id: ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds"),
+        conn_id: 1,
     }
 }
 
@@ -206,6 +227,7 @@ fn test_handshake_with_connector(
     config: Config,
     address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
     connector: crate::zakura::ZakuraHandshakeConnector,
+    peer_registry: PeerRegistry,
 ) -> Handshake<MockService<Request, Response, PanicAssertion>> {
     let inbound_service: MockService<Request, Response, PanicAssertion> =
         MockService::build().for_unit_tests();
@@ -217,6 +239,7 @@ fn test_handshake_with_connector(
         .with_advertised_services(PeerServices::NODE_NETWORK)
         .with_user_agent(TEST_HANDSHAKE_USER_AGENT.to_string())
         .with_zakura_handshake_connector(connector)
+        .with_peer_registry(peer_registry)
         .want_transactions(true)
         .finish()
         .unwrap()
@@ -247,6 +270,12 @@ impl ZakuraService for DropSink {
 /// not share the same persisted `~/.zakura` key or write to the user's real
 /// identity file.
 async fn start_test_zakura_endpoint() -> crate::zakura::ZakuraEndpoint {
+    start_test_zakura_endpoint_with_registry().await.0
+}
+
+/// Starts a real Zakura endpoint that publishes active peers to a registry.
+async fn start_test_zakura_endpoint_with_registry() -> (crate::zakura::ZakuraEndpoint, PeerRegistry)
+{
     let key_index = TEST_ZAKURA_SECRET_KEY_COUNTER.fetch_add(1, Ordering::Relaxed) % 255 + 1;
     let key_byte = u8::try_from(key_index).expect("key index is in 1..=255 due to modulo");
     let secret = format!("{key_byte:02x}").repeat(32);
@@ -255,12 +284,19 @@ async fn start_test_zakura_endpoint() -> crate::zakura::ZakuraEndpoint {
     ))
     .expect("test Zakura config with explicit identity key must parse");
 
-    crate::zakura::spawn_zakura_endpoint(&config, |_supervisor, _trace| {
-        Arc::new(DropSink) as Arc<dyn ZakuraService>
-    })
+    let peer_registry = PeerRegistry::default();
+    let endpoint = crate::zakura::spawn_zakura_endpoint_with_peer_registry(
+        &config,
+        |_supervisor, _trace| Arc::new(DropSink) as Arc<dyn ZakuraService>,
+        None,
+        Vec::new(),
+        peer_registry.clone(),
+    )
     .await
     .expect("Zakura endpoint starts")
-    .expect("v2_p2p is enabled in the test config")
+    .expect("v2_p2p is enabled in the test config");
+
+    (endpoint, peer_registry)
 }
 
 /// Two mutually P2P-v2-capable nodes with live Zakura endpoints should exchange
@@ -270,8 +306,8 @@ async fn start_test_zakura_endpoint() -> crate::zakura::ZakuraEndpoint {
 async fn mutual_p2p_v2_legacy_upgrade_forms_zakura_connection() {
     let _init_guard = zakura_test::init();
 
-    let local_endpoint = start_test_zakura_endpoint().await;
-    let remote_endpoint = start_test_zakura_endpoint().await;
+    let (local_endpoint, local_peer_registry) = start_test_zakura_endpoint_with_registry().await;
+    let (remote_endpoint, remote_peer_registry) = start_test_zakura_endpoint_with_registry().await;
 
     let (local_stream, remote_stream) = duplex(16 * 1024);
     let (address_book_tx, _address_book_rx) = tokio::sync::mpsc::channel(8);
@@ -283,11 +319,13 @@ async fn mutual_p2p_v2_legacy_upgrade_forms_zakura_connection() {
         test_config(P2pStack::Dual),
         address_book_tx.clone(),
         local_endpoint.connector(),
+        local_peer_registry.clone(),
     );
     let remote_handshake = test_handshake_with_connector(
         test_config(P2pStack::Dual),
         address_book_tx,
         remote_endpoint.connector(),
+        remote_peer_registry.clone(),
     );
 
     let local_task = tokio::spawn(local_handshake.oneshot(HandshakeRequest {
@@ -332,8 +370,37 @@ async fn mutual_p2p_v2_legacy_upgrade_forms_zakura_connection() {
         "the legacy upgrade should establish a Zakura connection registered on both endpoints",
     );
 
+    let local_peers = local_peer_registry.connected_peers();
+    assert_eq!(local_peers.len(), 1);
+    assert_eq!(local_peers[0].addr, peer_addr(18233));
+    assert_eq!(
+        local_peers[0].user_agent.as_ref(),
+        TEST_HANDSHAKE_USER_AGENT
+    );
+    assert_eq!(
+        local_peers[0].version,
+        constants::CURRENT_NETWORK_PROTOCOL_VERSION
+    );
+    assert!(!local_peers[0].is_inbound);
+
+    let remote_peers = remote_peer_registry.connected_peers();
+    assert_eq!(remote_peers.len(), 1);
+    assert_eq!(remote_peers[0].addr, peer_addr(28233));
+    assert_eq!(
+        remote_peers[0].user_agent.as_ref(),
+        TEST_HANDSHAKE_USER_AGENT
+    );
+    assert_eq!(
+        remote_peers[0].version,
+        constants::CURRENT_NETWORK_PROTOCOL_VERSION
+    );
+    assert!(remote_peers[0].is_inbound);
+
     local_endpoint.shutdown().await;
     remote_endpoint.shutdown().await;
+
+    assert!(local_peer_registry.connected_peers().is_empty());
+    assert!(remote_peer_registry.connected_peers().is_empty());
 }
 
 /// An inbound legacy peer that sends a valid upgrade `Init`, receives our

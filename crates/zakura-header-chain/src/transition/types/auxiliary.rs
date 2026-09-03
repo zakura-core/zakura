@@ -2,6 +2,7 @@
 
 use std::num::NonZeroU32;
 
+use sha2::{Digest, Sha256};
 use zakura_chain::{
     block::{self, merkle::AuthDataRoot},
     ironwood, orchard, sapling,
@@ -203,6 +204,27 @@ impl AuxDelivery {
         }
     }
 
+    /// Return the semantic payload identity without transport ownership or body-size metadata.
+    pub fn semantic_fingerprint(self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-header-aux-semantic-v1");
+        hasher.update(self.header_hash.0);
+        let Some(aux) = self.tree_aux else {
+            hasher.update([0]);
+            return hasher.finalize().into();
+        };
+        hasher.update([1]);
+        hasher.update(aux.height.0.to_le_bytes());
+        hasher.update(<[u8; 32]>::from(aux.sapling_root));
+        hasher.update(<[u8; 32]>::from(aux.orchard_root));
+        hasher.update(<[u8; 32]>::from(aux.ironwood_root));
+        hasher.update(aux.sapling_tx_count.to_le_bytes());
+        hasher.update(aux.orchard_tx_count.to_le_bytes());
+        hasher.update(aux.ironwood_tx_count.to_le_bytes());
+        hasher.update(<[u8; 32]>::from(aux.auth_data_root));
+        hasher.finalize().into()
+    }
+
     /// Return the engine-derived outcome.
     pub(crate) fn outcome(self) -> AuxOutcome {
         self.outcome
@@ -292,11 +314,11 @@ pub struct TreeAuxRecordV1 {
 /// Prepared auxiliary input admitted alongside a header batch.
 pub type PreparedAuxDelivery = AuxDelivery;
 
-/// One auxiliary delivery row decoded from durable state before outcome validation.
+/// One auxiliary delivery row decoded from durable state before recovery validation.
 ///
 /// The row keeps raw outcome fields separate from [`AuxDelivery`] so decoding
-/// cannot construct an authoritative outcome. Recovery validates the complete
-/// row against the retained graph before it promotes the outcome.
+/// cannot construct an authoritative outcome. Recovery validates the encoding
+/// and discards the outcome because the row lacks its full-state observation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct UntrustedAuxDeliveryRow {
     delivery: AuxDelivery,

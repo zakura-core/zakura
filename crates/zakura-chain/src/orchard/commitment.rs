@@ -4,8 +4,7 @@ use std::{fmt, io};
 
 use group::{
     ff::{FromUniformBytes, PrimeField},
-    prime::PrimeCurveAffine,
-    GroupEncoding,
+    CurveAffine as _, GroupEncoding,
 };
 use halo2::{
     arithmetic::{Coordinates, CurveAffine},

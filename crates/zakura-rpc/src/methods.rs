@@ -55,7 +55,7 @@ use tokio::{
     sync::{broadcast, mpsc, watch},
     task::JoinHandle,
 };
-use tower::ServiceExt;
+use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 use zakura_chain::{
@@ -114,6 +114,7 @@ pub(crate) mod types;
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
 use types::{
+    chain_tips::{self, GetChainTipsResponse},
     get_block_template::{
         constants::{
             DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MEMPOOL_LONG_POLL_INTERVAL,
@@ -138,7 +139,17 @@ use types::{
     z_validate_address::ZValidateAddressResponse,
 };
 
-include!(concat!(env!("OUT_DIR"), "/rpc_openrpc.rs"));
+/// Calls a Tower service and maps readiness or call errors to
+/// [`server::error::LegacyCode::Misc`].
+async fn call_service<S, Request>(service: S, request: Request) -> Result<S::Response>
+where
+    S: Service<Request>,
+    S::Error: ToString,
+{
+    service.oneshot(request).await.map_misc_error()
+}
+
+include!("methods/rpc_openrpc.rs");
 
 // TODO: Review the parameter descriptions below, and update them as needed:
 // https://github.com/ZcashFoundation/zebra/issues/10320
@@ -178,7 +189,8 @@ mod tests;
 #[rpc(server)]
 /// RPC method signatures.
 pub trait Rpc {
-    /// Returns software information from the RPC server, as a [`GetInfo`] JSON struct.
+    /// Returns software information from the RPC server, as a
+    /// [`GetInfoResponse`] JSON struct.
     ///
     /// zcashd reference: [`getinfo`](https://zcash.github.io/rpc/getinfo.html)
     /// method: post
@@ -187,10 +199,12 @@ pub trait Rpc {
     /// # Notes
     ///
     /// [The zcashd reference](https://zcash.github.io/rpc/getinfo.html) might not show some fields
-    /// in Zebra's [`GetInfo`]. Zebra uses the field names and formats from the
-    /// [zcashd code](https://github.com/zcash/zcash/blob/v4.6.0-1/src/rpc/misc.cpp#L86-L87).
+    /// in Zebra's [`GetInfoResponse`]. Zebra uses the field names and formats
+    /// from the [zcashd
+    /// code](https://github.com/zcash/zcash/blob/v4.6.0-1/src/rpc/misc.cpp#L86-L87).
     ///
-    /// Some fields from the zcashd reference are missing from Zebra's [`GetInfo`]. It only contains the fields
+    /// Some fields from the zcashd reference are missing from Zebra's
+    /// [`GetInfoResponse`]. It only contains the fields
     /// [required for lightwalletd support.](https://github.com/zcash/lightwalletd/blob/v0.4.9/common/common.go#L91-L95)
     #[method(name = "getinfo")]
     async fn get_info(&self) -> Result<GetInfoResponse>;
@@ -236,7 +250,8 @@ pub trait Rpc {
     #[method(name = "getblockchaininfo")]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse>;
 
-    /// Returns the total balance of a provided `addresses` in an [`AddressBalance`] instance.
+    /// Returns the total balance of provided `addresses` in a
+    /// [`GetAddressBalanceResponse`] instance.
     ///
     /// zcashd reference: [`getaddressbalance`](https://zcash.github.io/rpc/getaddressbalance.html)
     /// method: post
@@ -265,7 +280,8 @@ pub trait Rpc {
     ) -> Result<GetAddressBalanceResponse>;
 
     /// Sends the raw bytes of a signed transaction to the local node's mempool, if the transaction is valid.
-    /// Returns the [`SentTransactionHash`] for the transaction, as a JSON string.
+    /// Returns the [`SendRawTransactionResponse`] for the transaction, as a
+    /// JSON string.
     ///
     /// zcashd reference: [`sendrawtransaction`](https://zcash.github.io/rpc/sendrawtransaction.html)
     /// method: post
@@ -287,7 +303,8 @@ pub trait Rpc {
         _allow_high_fees: Option<bool>,
     ) -> Result<SendRawTransactionResponse>;
 
-    /// Returns the requested block by hash or height, as a [`GetBlock`] JSON string.
+    /// Returns the requested block by hash or height, as a
+    /// [`GetBlockResponse`] JSON string.
     /// If the block is not in Zebra's state, returns
     /// [error code `-8`.](https://github.com/zcash/zcash/issues/5758) if a height was
     /// passed or -5 if a hash was passed.
@@ -317,7 +334,8 @@ pub trait Rpc {
         verbosity: Option<u8>,
     ) -> Result<GetBlockResponse>;
 
-    /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
+    /// Returns the requested block header by hash or height, as a
+    /// [`GetBlockHeaderResponse`] JSON string.
     /// If the block is not in Zebra's state,
     /// returns [error code `-8`.](https://github.com/zcash/zcash/issues/5758)
     /// if a height was passed or -5 if a hash was passed.
@@ -341,7 +359,8 @@ pub trait Rpc {
         verbose: Option<bool>,
     ) -> Result<GetBlockHeaderResponse>;
 
-    /// Returns the hash of the current best blockchain tip block, as a [`GetBlockHash`] JSON string.
+    /// Returns the hash of the current best blockchain tip block, as a
+    /// [`GetBlockHashResponse`] JSON string.
     ///
     /// zcashd reference: [`getbestblockhash`](https://zcash.github.io/rpc/getbestblockhash.html)
     /// method: post
@@ -356,6 +375,38 @@ pub trait Rpc {
     /// tags: blockchain
     #[method(name = "getbestblockheightandhash")]
     fn get_best_block_height_and_hash(&self) -> Result<GetBlockHeightAndHashResponse>;
+
+    /// Returns information about every tip in the block tree that this node still
+    /// tracks, including the best chain and orphaned branches.
+    ///
+    /// zcashd reference: [`getchaintips`](https://zcash.github.io/rpc/getchaintips.html)
+    /// method: post
+    /// tags: blockchain
+    ///
+    /// # Notes
+    ///
+    /// zcashd answers this call by scanning its entire block index under `cs_main`,
+    /// which costs seconds once the index holds millions of entries and blocks every
+    /// other RPC for that whole time. Zakura reads only the chains it holds in
+    /// memory, so the cost is bounded by the number of tracked forks rather than by
+    /// the height of the chain.
+    ///
+    /// The two nodes therefore report different tips. zcashd's block index is never
+    /// pruned, so it lists every stale tip it has ever seen. Zakura drops a fork once
+    /// it falls below the finalized tip, so it lists the tips that are still live:
+    /// the best chain, the non-finalized forks, recently invalidated branches, and
+    /// the selected header chain when some block bodies are unavailable.
+    ///
+    /// Zakura never returns zcashd's `valid-headers` or `unknown` statuses. Every
+    /// block in its non-finalized state is contextually verified, so a tip is either
+    /// fully valid, invalidated, or known only by its header.
+    ///
+    /// `branchlen` can be short for an `invalid` tip. Zakura tracks a limited number
+    /// of forks, and it can drop the chain that an invalidated branch forked from.
+    /// The branch is still reported, but its length is then measured from the deepest
+    /// block the node still tracks.
+    #[method(name = "getchaintips")]
+    async fn get_chain_tips(&self) -> Result<GetChainTipsResponse>;
 
     /// Returns details on the active state of the TX memory pool.
     ///
@@ -425,7 +476,8 @@ pub trait Rpc {
         limit: Option<NoteCommitmentSubtreeIndex>,
     ) -> Result<GetSubtreesByIndexResponse>;
 
-    /// Returns the raw transaction data, as a [`GetRawTransaction`] JSON string or structure.
+    /// Returns the raw transaction data, as a [`GetRawTransactionResponse`]
+    /// JSON string or structure.
     ///
     /// zcashd reference: [`getrawtransaction`](https://zcash.github.io/rpc/getrawtransaction.html)
     /// method: post
@@ -1264,12 +1316,7 @@ where
         let valid_addresses = address_strings.valid_addresses()?;
 
         let request = zakura_state::ReadRequest::AddressBalance(valid_addresses);
-        let response = self
-            .read_state
-            .clone()
-            .oneshot(request)
-            .await
-            .map_misc_error()?;
+        let response = call_service(self.read_state.clone(), request).await?;
 
         match response {
             zakura_state::ReadResponse::AddressBalance { balance, received } => {
@@ -1282,7 +1329,7 @@ where
         }
     }
 
-    // TODO: use HexData or GetRawTransaction::Bytes to handle the transaction data argument
+    // TODO: use HexData to handle the transaction data argument.
     async fn send_raw_transaction(
         &self,
         raw_transaction_hex: String,
@@ -1307,7 +1354,7 @@ where
         let transaction_parameter = mempool::Gossip::Tx(raw_transaction.into());
         let request = mempool::Request::Queue(vec![transaction_parameter]);
 
-        let response = mempool.oneshot(request).await.map_misc_error()?;
+        let response = call_service(mempool, request).await?;
 
         let mut queue_results = match response {
             mempool::Response::Queued(results) => results,
@@ -1369,12 +1416,7 @@ where
 
         if verbosity == 0 {
             let request = zakura_state::ReadRequest::Block(hash_or_height);
-            let response = self
-                .read_state
-                .clone()
-                .oneshot(request)
-                .await
-                .map_misc_error()?;
+            let response = call_service(self.read_state.clone(), request).await?;
 
             match response {
                 zakura_state::ReadResponse::Block(Some(block)) => {
@@ -1452,11 +1494,11 @@ where
             let mut futs = FuturesOrdered::new();
 
             for request in requests {
-                futs.push_back(self.read_state.clone().oneshot(request));
+                futs.push_back(call_service(self.read_state.clone(), request));
             }
 
             let tx_ids_response = futs.next().await.expect("`futs` should not be empty");
-            let (tx, size): (Vec<_>, Option<usize>) = match tx_ids_response.map_misc_error()? {
+            let (tx, size): (Vec<_>, Option<usize>) = match tx_ids_response? {
                 zakura_state::ReadResponse::TransactionIdsForBlock(tx_ids) => (
                     tx_ids
                         .ok_or_misc_error("block not found")?
@@ -1492,8 +1534,7 @@ where
             };
 
             let orchard_tree_response = futs.next().await.expect("`futs` should not be empty");
-            let zakura_state::ReadResponse::OrchardTree(orchard_tree) =
-                orchard_tree_response.map_misc_error()?
+            let zakura_state::ReadResponse::OrchardTree(orchard_tree) = orchard_tree_response?
             else {
                 unreachable!("unmatched response to a OrchardTree request");
             };
@@ -1522,7 +1563,7 @@ where
             let ironwood = if nu6_3_active {
                 let ironwood_tree_response = futs.next().await.expect("`futs` should not be empty");
                 let zakura_state::ReadResponse::IronwoodTree(ironwood_tree) =
-                    ironwood_tree_response.map_misc_error()?
+                    ironwood_tree_response?
                 else {
                     unreachable!("unmatched response to an IronwoodTree request");
                 };
@@ -1543,15 +1584,12 @@ where
             };
 
             let block_info_response = futs.next().await.expect("`futs` should not be empty");
-            let zakura_state::ReadResponse::BlockInfo(prev_block_info) =
-                block_info_response.map_misc_error()?
+            let zakura_state::ReadResponse::BlockInfo(prev_block_info) = block_info_response?
             else {
                 unreachable!("unmatched response to a BlockInfo request");
             };
             let block_info_response = futs.next().await.expect("`futs` should not be empty");
-            let zakura_state::ReadResponse::BlockInfo(block_info) =
-                block_info_response.map_misc_error()?
-            else {
+            let zakura_state::ReadResponse::BlockInfo(block_info) = block_info_response? else {
                 unreachable!("unmatched response to a BlockInfo request");
             };
 
@@ -1638,15 +1676,14 @@ where
         let response = if !verbose {
             GetBlockHeaderResponse::Raw(HexData(header.zcash_serialize_to_vec().map_misc_error()?))
         } else {
-            let zakura_state::ReadResponse::SaplingTree(sapling_tree) = self
-                .read_state
-                .clone()
+            let zakura_state::ReadResponse::SaplingTree(sapling_tree) = call_service(
+                self.read_state.clone(),
                 // Use the resolved hash so a reorg cannot combine this header
                 // with the Sapling tree from a different block at the same
                 // height.
-                .oneshot(zakura_state::ReadRequest::SaplingTree(hash.into()))
-                .await
-                .map_misc_error()?
+                zakura_state::ReadRequest::SaplingTree(hash.into()),
+            )
+            .await?
             else {
                 panic!("unexpected response to SaplingTree request")
             };
@@ -1654,12 +1691,11 @@ where
             // This could be `None` if there's a chain reorg between state queries.
             let sapling_tree = sapling_tree.ok_or_misc_error("missing Sapling tree")?;
 
-            let zakura_state::ReadResponse::Depth(depth) = self
-                .read_state
-                .clone()
-                .oneshot(zakura_state::ReadRequest::Depth(hash))
-                .await
-                .map_misc_error()?
+            let zakura_state::ReadResponse::Depth(depth) = call_service(
+                self.read_state.clone(),
+                zakura_state::ReadRequest::Depth(hash),
+            )
+            .await?
             else {
                 panic!("unexpected response to SaplingTree request")
             };
@@ -1740,14 +1776,22 @@ where
             .ok_or_misc_error("No blocks in state")
     }
 
-    async fn get_mempool_info(&self) -> Result<GetMempoolInfoResponse> {
-        let mut mempool = self.mempool.clone();
+    async fn get_chain_tips(&self) -> Result<GetChainTipsResponse> {
+        let response: zakura_state::ReadResponse = call_service(
+            self.read_state.clone(),
+            zakura_state::ReadRequest::ChainTips,
+        )
+        .await?;
 
-        let response = mempool
-            .ready()
-            .and_then(|service| service.call(mempool::Request::QueueStats))
-            .await
-            .map_misc_error()?;
+        let zakura_state::ReadResponse::ChainTips(tips) = response else {
+            unreachable!("unmatched response to a ChainTips request")
+        };
+
+        Ok(tips.into_iter().map(chain_tips::ChainTip::from).collect())
+    }
+
+    async fn get_mempool_info(&self) -> Result<GetMempoolInfoResponse> {
+        let response = call_service(self.mempool.clone(), mempool::Request::QueueStats).await?;
 
         if let mempool::Response::QueueStats {
             size,
@@ -1773,8 +1817,6 @@ where
 
         use zakura_chain::block::MAX_BLOCK_BYTES;
 
-        let mut mempool = self.mempool.clone();
-
         let request = if verbose {
             mempool::Request::FullTransactions
         } else {
@@ -1782,11 +1824,7 @@ where
         };
 
         // `zcashd` doesn't check if it is synced to the tip here, so we don't either.
-        let response = mempool
-            .ready()
-            .and_then(|service| service.call(request))
-            .await
-            .map_misc_error()?;
+        let response = call_service(self.mempool.clone(), request).await?;
 
         match response {
             mempool::Response::FullTransactions {
@@ -1859,7 +1897,6 @@ where
         verbose: Option<u8>,
         block_hash: Option<String>,
     ) -> Result<GetRawTransactionResponse> {
-        let mut mempool = self.mempool.clone();
         let verbose = verbose.unwrap_or(0) != 0;
 
         // Reference for the legacy error code:
@@ -1869,13 +1906,11 @@ where
 
         // Check the mempool first.
         if block_hash.is_none() {
-            match mempool
-                .ready()
-                .and_then(|service| {
-                    service.call(mempool::Request::TransactionsByMinedId([txid].into()))
-                })
-                .await
-                .map_misc_error()?
+            match call_service(
+                self.mempool.clone(),
+                mempool::Request::TransactionsByMinedId([txid].into()),
+            )
+            .await?
             {
                 mempool::Response::Transactions(txns) => {
                     if let Some(tx) = txns.first() {
@@ -1906,14 +1941,11 @@ where
         let caller_block_context = if let Some(block_hash) = block_hash {
             let block_hash = block::Hash::from_hex(block_hash)
                 .map_error(server::error::LegacyCode::InvalidAddressOrKey)?;
-            match self
-                .read_state
-                .clone()
-                .oneshot(zakura_state::ReadRequest::AnyChainTransactionIdsForBlock(
-                    block_hash.into(),
-                ))
-                .await
-                .map_misc_error()?
+            match call_service(
+                self.read_state.clone(),
+                zakura_state::ReadRequest::AnyChainTransactionIdsForBlock(block_hash.into()),
+            )
+            .await?
             {
                 zakura_state::ReadResponse::AnyChainTransactionIdsForBlock(tx_ids) => {
                     let (ids, in_best_chain) = tx_ids.ok_or_error(
@@ -1937,12 +1969,11 @@ where
         };
 
         // If the tx wasn't in the mempool, check the state.
-        match self
-            .read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::AnyChainTransaction(txid))
-            .await
-            .map_misc_error()?
+        match call_service(
+            self.read_state.clone(),
+            zakura_state::ReadRequest::AnyChainTransaction(txid),
+        )
+        .await?
         {
             zakura_state::ReadResponse::AnyChainTransaction(Some(tx)) => Ok(if verbose {
                 if let Some((caller_block_hash, in_best_chain)) = caller_block_context {
@@ -1976,12 +2007,11 @@ where
                 } else {
                     match tx {
                         AnyTx::Mined(tx) => {
-                            let block_hash = match self
-                                .read_state
-                                .clone()
-                                .oneshot(zakura_state::ReadRequest::BestChainBlockHash(tx.height))
-                                .await
-                                .map_misc_error()?
+                            let block_hash = match call_service(
+                                self.read_state.clone(),
+                                zakura_state::ReadRequest::BestChainBlockHash(tx.height),
+                            )
+                            .await?
                             {
                                 zakura_state::ReadResponse::BlockHash(block_hash) => block_hash,
                                 _ => {
@@ -2053,11 +2083,11 @@ where
         // be based on the hash.
         //
         // TODO: If this RPC is called a lot, just get the block header, rather than the whole block.
-        let block = match read_state
-            .ready()
-            .and_then(|service| service.call(zakura_state::ReadRequest::Block(hash_or_height)))
-            .await
-            .map_misc_error()?
+        let block = match call_service(
+            &mut read_state,
+            zakura_state::ReadRequest::Block(hash_or_height),
+        )
+        .await?
         {
             zakura_state::ReadResponse::Block(Some(block)) => block,
             zakura_state::ReadResponse::Block(None) => {
@@ -2081,13 +2111,11 @@ where
             .expect("Timestamps of valid blocks always fit into u32.");
 
         let sapling = if network.is_nu_active(consensus::NetworkUpgrade::Sapling, height.into()) {
-            match read_state
-                .ready()
-                .and_then(|service| {
-                    service.call(zakura_state::ReadRequest::SaplingTree(hash.into()))
-                })
-                .await
-                .map_misc_error()?
+            match call_service(
+                &mut read_state,
+                zakura_state::ReadRequest::SaplingTree(hash.into()),
+            )
+            .await?
             {
                 zakura_state::ReadResponse::SaplingTree(tree) => {
                     tree.map(|t| (t.to_rpc_bytes(), t.root().bytes_in_display_order().to_vec()))
@@ -2101,13 +2129,11 @@ where
             sapling.map_or((None, None), |(tree, root)| (Some(tree), Some(root)));
 
         let orchard = if network.is_nu_active(consensus::NetworkUpgrade::Nu5, height.into()) {
-            match read_state
-                .ready()
-                .and_then(|service| {
-                    service.call(zakura_state::ReadRequest::OrchardTree(hash.into()))
-                })
-                .await
-                .map_misc_error()?
+            match call_service(
+                &mut read_state,
+                zakura_state::ReadRequest::OrchardTree(hash.into()),
+            )
+            .await?
             {
                 zakura_state::ReadResponse::OrchardTree(tree) => {
                     tree.map(|t| (t.to_rpc_bytes(), t.root().bytes_in_display_order().to_vec()))
@@ -2121,13 +2147,11 @@ where
             orchard.map_or((None, None), |(tree, root)| (Some(tree), Some(root)));
 
         let ironwood = if network.is_nu_active(consensus::NetworkUpgrade::Nu6_3, height.into()) {
-            match read_state
-                .ready()
-                .and_then(|service| {
-                    service.call(zakura_state::ReadRequest::IronwoodTree(hash.into()))
-                })
-                .await
-                .map_misc_error()?
+            match call_service(
+                &mut read_state,
+                zakura_state::ReadRequest::IronwoodTree(hash.into()),
+            )
+            .await?
             {
                 zakura_state::ReadResponse::IronwoodTree(tree) => {
                     tree.map(|t| (t.to_rpc_bytes(), t.root().bytes_in_display_order().to_vec()))
@@ -2167,11 +2191,7 @@ where
 
         if pool == "sapling" {
             let request = zakura_state::ReadRequest::SaplingSubtrees { start_index, limit };
-            let response = read_state
-                .ready()
-                .and_then(|service| service.call(request))
-                .await
-                .map_misc_error()?;
+            let response = call_service(&mut read_state, request).await?;
 
             let subtrees = match response {
                 zakura_state::ReadResponse::SaplingSubtrees(subtrees) => subtrees,
@@ -2193,11 +2213,7 @@ where
             })
         } else if pool == "orchard" {
             let request = zakura_state::ReadRequest::OrchardSubtrees { start_index, limit };
-            let response = read_state
-                .ready()
-                .and_then(|service| service.call(request))
-                .await
-                .map_misc_error()?;
+            let response = call_service(&mut read_state, request).await?;
 
             let subtrees = match response {
                 zakura_state::ReadResponse::OrchardSubtrees(subtrees) => subtrees,
@@ -2219,11 +2235,7 @@ where
             })
         } else if pool == "ironwood" {
             let request = zakura_state::ReadRequest::IronwoodSubtrees { start_index, limit };
-            let response = read_state
-                .ready()
-                .and_then(|service| service.call(request))
-                .await
-                .map_misc_error()?;
+            let response = call_service(&mut read_state, request).await?;
 
             let subtrees = match response {
                 zakura_state::ReadResponse::IronwoodSubtrees(subtrees) => subtrees,
@@ -2253,7 +2265,7 @@ where
     }
 
     async fn get_address_tx_ids(&self, request: GetAddressTxIdsRequest) -> Result<Vec<String>> {
-        let mut read_state = self.read_state.clone();
+        let read_state = self.read_state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
 
         let height_range = build_height_range(
@@ -2268,11 +2280,7 @@ where
             addresses: valid_addresses,
             height_range,
         };
-        let response = read_state
-            .ready()
-            .and_then(|service| service.call(request))
-            .await
-            .map_misc_error()?;
+        let response = call_service(read_state, request).await?;
 
         let hashes = match response {
             zakura_state::ReadResponse::AddressesTransactionIds(hashes) => {
@@ -2305,18 +2313,14 @@ where
         &self,
         utxos_request: GetAddressUtxosRequest,
     ) -> Result<GetAddressUtxosResponse> {
-        let mut read_state = self.read_state.clone();
+        let read_state = self.read_state.clone();
         let mut response_utxos = vec![];
 
         let valid_addresses = utxos_request.valid_addresses()?;
 
         // get utxos data for addresses
         let request = zakura_state::ReadRequest::UtxosByAddresses(valid_addresses);
-        let response = read_state
-            .ready()
-            .and_then(|service| service.call(request))
-            .await
-            .map_misc_error()?;
+        let response = call_service(read_state, request).await?;
         let utxos = match response {
             zakura_state::ReadResponse::AddressUtxos(utxos) => utxos,
             _ => unreachable!("unmatched response to a UtxosByAddresses request"),
@@ -2402,7 +2406,7 @@ where
     }
 
     async fn get_block_hash(&self, index: i32) -> Result<GetBlockHashResponse> {
-        let mut read_state = self.read_state.clone();
+        let read_state = self.read_state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
 
         // TODO: look up this height as part of the state request?
@@ -2411,11 +2415,7 @@ where
         let height = height_from_signed_int(index, tip_height)?;
 
         let request = zakura_state::ReadRequest::BestChainBlockHash(height);
-        let response = read_state
-            .ready()
-            .and_then(|service| service.call(request))
-            .await
-            .map_error(server::error::LegacyCode::default())?;
+        let response = call_service(read_state, request).await?;
 
         match response {
             zakura_state::ReadResponse::BlockHash(Some(hash)) => Ok(GetBlockHashResponse(hash)),
@@ -2774,7 +2774,7 @@ where
         let block_verifier_router_response = block_verifier_router
             .ready()
             .await
-            .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
+            .map_error(0)?
             .call(zakura_consensus::Request::Commit(Arc::new(block)))
             .await;
 
@@ -2843,7 +2843,7 @@ where
 
     async fn get_mining_info(&self) -> Result<GetMiningInfoResponse> {
         let network = self.network.clone();
-        let mut read_state = self.read_state.clone();
+        let read_state = self.read_state.clone();
 
         let chain_tip = self.latest_chain_tip.clone();
         let tip_height = chain_tip.best_tip_height().unwrap_or(Height(0)).0;
@@ -2860,11 +2860,7 @@ where
         let mut current_block_size = None;
         if tip_height > 0 {
             let request = zakura_state::ReadRequest::TipBlockSize;
-            let response: zakura_state::ReadResponse = read_state
-                .ready()
-                .and_then(|service| service.call(request))
-                .await
-                .map_error(server::error::LegacyCode::default())?;
+            let response: zakura_state::ReadResponse = call_service(read_state, request).await?;
             current_block_size = match response {
                 zakura_state::ReadResponse::TipBlockSize(Some(block_size)) => Some(block_size),
                 _ => None,
@@ -2906,7 +2902,7 @@ where
             .ready()
             .and_then(|service| service.call(request))
             .await
-            .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?;
+            .map_error(0)?;
 
         let solution_rate = match response {
             // zcashd returns a 0 rate when the calculation is invalid
@@ -2972,6 +2968,10 @@ where
 
     async fn get_peer_info(&self) -> Result<Vec<PeerInfo>> {
         let address_book = self.address_book.clone();
+        if let Some(connected_peers) = address_book.connected_peers() {
+            return Ok(connected_peers.into_iter().map(PeerInfo::from).collect());
+        }
+
         Ok(address_book
             .recently_live_peers(chrono::Utc::now())
             .into_iter()
@@ -3076,8 +3076,7 @@ where
         let (network, unified_address): (
             zcash_protocol::consensus::NetworkType,
             zcash_address::unified::Address,
-        ) = zcash_address::unified::Encoding::decode(address.clone().as_str())
-            .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?;
+        ) = zcash_address::unified::Encoding::decode(address.clone().as_str()).map_error(0)?;
 
         let mut p2pkh = None;
         let mut p2sh = None;
@@ -3123,12 +3122,12 @@ where
             .parse()
             .map_error(server::error::LegacyCode::InvalidParameter)?;
 
-        self.state
-            .clone()
-            .oneshot(zakura_state::Request::InvalidateBlock(block_hash))
-            .await
-            .map(|rsp| assert_eq!(rsp, zakura_state::Response::Invalidated(block_hash)))
-            .map_misc_error()
+        call_service(
+            self.state.clone(),
+            zakura_state::Request::InvalidateBlock(block_hash),
+        )
+        .await
+        .map(|rsp| assert_eq!(rsp, zakura_state::Response::Invalidated(block_hash)))
     }
 
     async fn reconsider_block(&self, block_hash: String) -> Result<Vec<block::Hash>> {
@@ -3136,15 +3135,15 @@ where
             .parse()
             .map_error(server::error::LegacyCode::InvalidParameter)?;
 
-        self.state
-            .clone()
-            .oneshot(zakura_state::Request::ReconsiderBlock(block_hash))
-            .await
-            .map(|rsp| match rsp {
-                zakura_state::Response::Reconsidered(block_hashes) => block_hashes,
-                _ => unreachable!("unmatched response to a reconsider block request"),
-            })
-            .map_misc_error()
+        call_service(
+            self.state.clone(),
+            zakura_state::Request::ReconsiderBlock(block_hash),
+        )
+        .await
+        .map(|rsp| match rsp {
+            zakura_state::Response::Reconsidered(block_hashes) => block_hashes,
+            _ => unreachable!("unmatched response to a reconsider block request"),
+        })
     }
 
     async fn generate(&self, num_blocks: u32) -> Result<Vec<Hash>> {
@@ -3166,10 +3165,7 @@ where
             // with the same height across different forks would be identical.
             rpc.gbt.randomize_coinbase_data();
 
-            let block_template = rpc
-                .get_block_template(None)
-                .await
-                .map_error(server::error::LegacyCode::default())?;
+            let block_template = rpc.get_block_template(None).await.map_misc_error()?;
 
             let GetBlockTemplateResponse::TemplateMode(block_template) = block_template else {
                 return Err(ErrorObject::borrowed(
@@ -3184,18 +3180,15 @@ where
                 BlockTemplateTimeSource::CurTime,
                 &network,
             )
-            .map_error(server::error::LegacyCode::default())?;
+            .map_misc_error()?;
 
-            let hex_proposal_block = HexData(
-                proposal_block
-                    .zcash_serialize_to_vec()
-                    .map_error(server::error::LegacyCode::default())?,
-            );
+            let hex_proposal_block =
+                HexData(proposal_block.zcash_serialize_to_vec().map_misc_error()?);
 
             let r = rpc
                 .submit_block(hex_proposal_block, None)
                 .await
-                .map_error(server::error::LegacyCode::default())?;
+                .map_misc_error()?;
             match r {
                 SubmitBlockResponse::Accepted => { /* pass */ }
                 SubmitBlockResponse::ErrorResponse(response) => {
@@ -3277,12 +3270,11 @@ where
 
         // Optional mempool path
         if include_mempool.unwrap_or(true) {
-            let rsp = self
-                .mempool
-                .clone()
-                .oneshot(mempool::Request::UnspentOutput(outpoint))
-                .await
-                .map_misc_error()?;
+            let rsp = call_service(
+                self.mempool.clone(),
+                mempool::Request::UnspentOutput(outpoint),
+            )
+            .await?;
 
             match rsp {
                 // Return the output found in the mempool
@@ -3314,12 +3306,7 @@ where
         //       hadn't yet included the queried transaction output.
 
         // Get the best block tip hash
-        let tip_rsp = self
-            .read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::Tip)
-            .await
-            .map_misc_error()?;
+        let tip_rsp = call_service(self.read_state.clone(), zakura_state::ReadRequest::Tip).await?;
 
         let best_block_hash = match tip_rsp {
             zakura_state::ReadResponse::Tip(tip) => tip.ok_or_misc_error("No blocks in state")?.1,
@@ -3327,12 +3314,11 @@ where
         };
 
         // State path
-        let rsp = self
-            .read_state
-            .clone()
-            .oneshot(zakura_state::ReadRequest::Transaction(txid))
-            .await
-            .map_misc_error()?;
+        let rsp = call_service(
+            self.read_state.clone(),
+            zakura_state::ReadRequest::Transaction(txid),
+        )
+        .await?;
 
         match rsp {
             zakura_state::ReadResponse::Transaction(Some(tx)) => {
@@ -3346,14 +3332,11 @@ where
 
                 // Prune state outputs that are spent
                 let is_spent = {
-                    let rsp = self
-                        .read_state
-                        .clone()
-                        .oneshot(zakura_state::ReadRequest::IsTransparentOutputSpent(
-                            outpoint,
-                        ))
-                        .await
-                        .map_misc_error()?;
+                    let rsp = call_service(
+                        self.read_state.clone(),
+                        zakura_state::ReadRequest::IsTransparentOutputSpent(outpoint),
+                    )
+                    .await?;
 
                     match rsp {
                         zakura_state::ReadResponse::IsTransparentOutputSpent(spent) => spent,
@@ -3449,9 +3432,6 @@ pub struct GetInfoResponse {
     errors_timestamp: i64,
 }
 
-#[deprecated(note = "Use `GetInfoResponse` instead")]
-pub use self::GetInfoResponse as GetInfo;
-
 impl Default for GetInfoResponse {
     fn default() -> Self {
         GetInfoResponse {
@@ -3473,42 +3453,7 @@ impl Default for GetInfoResponse {
 }
 
 impl GetInfoResponse {
-    /// Constructs [`GetInfo`] from its constituent parts.
-    #[allow(clippy::too_many_arguments)]
-    #[deprecated(note = "Use `GetInfoResponse::new` instead")]
-    pub fn from_parts(
-        version: u64,
-        build: String,
-        subversion: String,
-        protocol_version: u32,
-        blocks: u32,
-        connections: usize,
-        proxy: Option<String>,
-        difficulty: f64,
-        testnet: bool,
-        pay_tx_fee: f64,
-        relay_fee: f64,
-        errors: String,
-        errors_timestamp: i64,
-    ) -> Self {
-        Self {
-            version,
-            build,
-            subversion,
-            protocol_version,
-            blocks,
-            connections,
-            proxy,
-            difficulty,
-            testnet,
-            pay_tx_fee,
-            relay_fee,
-            errors,
-            errors_timestamp,
-        }
-    }
-
-    /// Returns the contents of ['GetInfo'].
+    /// Returns the contents of [`GetInfoResponse`].
     pub fn into_parts(
         self,
     ) -> (
@@ -3953,7 +3898,7 @@ impl From<DGetAddressBalanceRequest> for GetAddressBalanceRequest {
     }
 }
 
-/// An intermediate type used to deserialize [`AddressStrings`].
+/// An intermediate type used to deserialize [`GetAddressBalanceRequest`].
 #[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum DGetAddressBalanceRequest {
@@ -3962,10 +3907,6 @@ enum DGetAddressBalanceRequest {
     /// A single address string.
     Address(String),
 }
-
-/// A request to get the transparent balance of a set of addresses.
-#[deprecated(note = "Use `GetAddressBalanceRequest` instead.")]
-pub type AddressStrings = GetAddressBalanceRequest;
 
 /// A collection of validatable addresses
 pub trait ValidateAddresses {
@@ -3999,19 +3940,9 @@ impl ValidateAddresses for GetAddressBalanceRequest {
 }
 
 impl GetAddressBalanceRequest {
-    /// Creates a new `AddressStrings` given a vector.
+    /// Creates a new [`GetAddressBalanceRequest`] from a vector.
     pub fn new(addresses: Vec<String>) -> GetAddressBalanceRequest {
         GetAddressBalanceRequest { addresses }
-    }
-
-    /// Creates a new [`AddressStrings`] from a given vector, returns an error if any addresses are incorrect.
-    #[deprecated(
-        note = "Use `AddressStrings::new` instead. Validity will be checked by the server."
-    )]
-    pub fn new_valid(addresses: Vec<String>) -> Result<GetAddressBalanceRequest> {
-        let req = Self { addresses };
-        req.valid_addresses()?;
-        Ok(req)
     }
 }
 
@@ -4035,9 +3966,6 @@ pub struct GetAddressBalanceResponse {
     /// The total received balance, including change.
     pub received: u64,
 }
-
-#[deprecated(note = "Use `GetAddressBalanceResponse` instead.")]
-pub use self::GetAddressBalanceResponse as AddressBalance;
 
 /// Parameters of [`RpcServer::get_address_utxos`] RPC method.
 #[derive(
@@ -4202,9 +4130,6 @@ impl TipConsensusBranch {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SendRawTransactionResponse(#[serde(with = "hex")] transaction::Hash);
 
-#[deprecated(note = "Use `SendRawTransactionResponse` instead")]
-pub use self::SendRawTransactionResponse as SentTransactionHash;
-
 impl Default for SendRawTransactionResponse {
     fn default() -> Self {
         Self(transaction::Hash::from([0; 32]))
@@ -4212,18 +4137,12 @@ impl Default for SendRawTransactionResponse {
 }
 
 impl SendRawTransactionResponse {
-    /// Constructs a new [`SentTransactionHash`].
+    /// Constructs a new [`SendRawTransactionResponse`].
     pub fn new(hash: transaction::Hash) -> Self {
         SendRawTransactionResponse(hash)
     }
 
-    /// Returns the contents of ['SentTransactionHash'].
-    #[deprecated(note = "Use `SentTransactionHash::hash` instead")]
-    pub fn inner(&self) -> transaction::Hash {
-        self.hash()
-    }
-
-    /// Returns the contents of ['SentTransactionHash'].
+    /// Returns the contents of [`SendRawTransactionResponse`].
     pub fn hash(&self) -> transaction::Hash {
         self.0
     }
@@ -4240,9 +4159,6 @@ pub enum GetBlockResponse {
     /// The block object.
     Object(Box<BlockObject>),
 }
-
-#[deprecated(note = "Use `GetBlockResponse` instead")]
-pub use self::GetBlockResponse as GetBlock;
 
 impl Default for GetBlockResponse {
     fn default() -> Self {
@@ -4425,9 +4341,6 @@ pub enum GetBlockHeaderResponse {
     Object(Box<BlockHeaderObject>),
 }
 
-#[deprecated(note = "Use `GetBlockHeaderResponse` instead")]
-pub use self::GetBlockHeaderResponse as GetBlockHeader;
-
 #[allow(clippy::too_many_arguments)]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 /// Verbose response to a `getblockheader` RPC request.
@@ -4506,9 +4419,6 @@ pub struct BlockHeaderObject {
     next_block_hash: Option<block::Hash>,
 }
 
-#[deprecated(note = "Use `BlockHeaderObject` instead")]
-pub use BlockHeaderObject as GetBlockHeaderObject;
-
 impl Default for GetBlockHeaderResponse {
     fn default() -> Self {
         GetBlockHeaderResponse::Object(Box::default())
@@ -4560,9 +4470,6 @@ impl GetBlockHashResponse {
     }
 }
 
-#[deprecated(note = "Use `GetBlockHashResponse` instead")]
-pub use self::GetBlockHashResponse as GetBlockHash;
-
 /// A block hash used by this crate that encodes as hex by default.
 pub type Hash = GetBlockHashResponse;
 
@@ -4576,9 +4483,6 @@ pub struct GetBlockHeightAndHashResponse {
     #[getter(copy)]
     hash: block::Hash,
 }
-
-#[deprecated(note = "Use `GetBlockHeightAndHashResponse` instead.")]
-pub use GetBlockHeightAndHashResponse as GetBestBlockHeightAndHash;
 
 impl Default for GetBlockHeightAndHashResponse {
     fn default() -> Self {
@@ -4606,9 +4510,6 @@ pub enum GetRawTransactionResponse {
     /// The transaction object.
     Object(Box<TransactionObject>),
 }
-
-#[deprecated(note = "Use `GetRawTransactionResponse` instead")]
-pub use self::GetRawTransactionResponse as GetRawTransaction;
 
 impl Default for GetRawTransactionResponse {
     fn default() -> Self {
@@ -4669,9 +4570,6 @@ pub struct Utxo {
     height: Height,
 }
 
-#[deprecated(note = "Use `Utxo` instead")]
-pub use self::Utxo as GetAddressUtxos;
-
 impl Default for Utxo {
     fn default() -> Self {
         Self {
@@ -4689,27 +4587,7 @@ impl Default for Utxo {
 }
 
 impl Utxo {
-    /// Constructs a new instance of [`GetAddressUtxos`].
-    #[deprecated(note = "Use `Utxo::new` instead")]
-    pub fn from_parts(
-        address: transparent::Address,
-        txid: transaction::Hash,
-        output_index: OutputIndex,
-        script: transparent::Script,
-        satoshis: u64,
-        height: Height,
-    ) -> Self {
-        Utxo {
-            address,
-            txid,
-            output_index,
-            script,
-            satoshis,
-            height,
-        }
-    }
-
-    /// Returns the contents of [`GetAddressUtxos`].
+    /// Returns the contents of [`Utxo`].
     pub fn into_parts(
         &self,
     ) -> (
@@ -4749,16 +4627,6 @@ pub struct GetAddressTxIdsRequest {
 }
 
 impl GetAddressTxIdsRequest {
-    /// Constructs [`GetAddressTxIdsRequest`] from its constituent parts.
-    #[deprecated(note = "Use `GetAddressTxIdsRequest::new` instead.")]
-    pub fn from_parts(addresses: Vec<String>, start: u32, end: u32) -> Self {
-        GetAddressTxIdsRequest {
-            addresses,
-            start: Some(start),
-            end: Some(end),
-        }
-    }
-
     /// Returns the contents of [`GetAddressTxIdsRequest`].
     pub fn into_parts(&self) -> (Vec<String>, u32, u32) {
         (
@@ -5111,7 +4979,7 @@ where
         (true, Err(_)) => {
             return Ok((U256::from(network.target_difficulty_limit()) >> 128).as_u128() as f64);
         }
-        (false, Err(error)) => return Err(ErrorObject::owned(0, error.to_string(), None::<()>)),
+        (false, Err(error)) => return Err(error).map_error(0),
     };
 
     let chain_info = match response {

@@ -11,6 +11,7 @@
 
 use std::{collections::BTreeMap, fs, path::Path, process::Command, time::Duration};
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 
 use crate::config::Config;
@@ -38,7 +39,11 @@ pub enum RpcError {
 
     /// The HTTP request failed or returned a non-success status.
     #[error("RPC request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] ureq::Error),
+
+    /// The HTTP response body was not valid JSON.
+    #[error("RPC response was not valid JSON: {0}")]
+    Json(#[from] serde_json::Error),
 
     /// The JSON-RPC response reported an error.
     #[error("RPC error response: {0}")]
@@ -52,16 +57,16 @@ pub enum RpcError {
 /// The zcashd-compat sync check. See the module docs for the predicates.
 pub struct ZcashdCompatSyncCheck {
     config: Config,
-    client: reqwest::blocking::Client,
+    client: ureq::Agent,
 }
 
 impl ZcashdCompatSyncCheck {
     /// Creates the check from watchdog configuration.
     pub fn new(config: &Config) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(config.rpc_timeout))
+        let client = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(config.rpc_timeout)))
             .build()
-            .expect("static client configuration with a timeout is always valid");
+            .new_agent();
 
         Self {
             config: config.clone(),
@@ -84,19 +89,21 @@ impl ZcashdCompatSyncCheck {
                     path: cookie_file.display().to_string(),
                 })?;
 
-        let body: Value = self
+        let authorization = format!("Basic {}", STANDARD.encode(format!("{user}:{password}")));
+        let request = json!({
+            "jsonrpc": "1.0",
+            "id": "zakura-watchdog",
+            "method": method,
+            "params": [],
+        })
+        .to_string();
+        let mut response = self
             .client
             .post(url)
-            .basic_auth(user, Some(password))
-            .json(&json!({
-                "jsonrpc": "1.0",
-                "id": "zakura-watchdog",
-                "method": method,
-                "params": [],
-            }))
-            .send()?
-            .error_for_status()?
-            .json()?;
+            .header("Authorization", authorization)
+            .content_type("application/json")
+            .send(&request)?;
+        let body = serde_json::from_str(&response.body_mut().read_to_string()?)?;
 
         extract_result(body)
     }

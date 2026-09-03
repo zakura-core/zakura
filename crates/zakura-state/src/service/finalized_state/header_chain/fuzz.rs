@@ -23,13 +23,13 @@ use super::{
     },
     HeaderChainStore, HeaderChainStoreError, HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY,
     HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_DEFERRED,
-    HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_NODE_BY_HASH,
-    HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
+    HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_FINALITY_WITNESS,
+    HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
 };
 use crate::Config;
 
 const MAX_INPUT_BYTES: usize = 256;
-const HEADER_FAMILIES: [&str; 12] = [
+const HEADER_FAMILIES: [&str; 13] = [
     HEADER_NODE_BY_HASH,
     HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
     HEADER_BODY_EVIDENCE_AUTHORITY,
@@ -40,6 +40,7 @@ const HEADER_FAMILIES: [&str; 12] = [
     HEADER_AUX_DELIVERY,
     HEADER_DEFERRED,
     HEADER_FINALITY_HISTORY,
+    HEADER_FINALITY_WITNESS,
     HEADER_VALIDATION_CONTEXT,
     HEADER_ENGINE_META,
 ];
@@ -80,14 +81,10 @@ pub fn replay_recovery_rows_bytes(data: &[u8]) -> RecoveryRowsReplaySummary {
     let mut rows = logical_dump(&store);
     let mut mutations = 0;
     let mut mode_operations = Vec::new();
-    for operation in data[..data.len().min(MAX_INPUT_BYTES)].chunks_exact(4) {
+    for operation in data[..data.len().min(MAX_INPUT_BYTES)].as_chunks::<4>().0 {
         if recovery_opcode(operation[0]) == 8 {
             if mode_operations.len() < 2 {
-                mode_operations.push(
-                    operation
-                        .try_into()
-                        .expect("chunks_exact yields four-byte operations"),
-                );
+                mode_operations.push(*operation);
             }
             continue;
         }
@@ -428,6 +425,7 @@ fn expected_key_width(family: u8) -> usize {
         HEADER_NODE_BY_HASH
         | HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE
         | HEADER_BODY_EVIDENCE_AUTHORITY
+        | HEADER_FINALITY_WITNESS
         | HEADER_VALIDATION_CONTEXT => 32,
         HEADER_ENGINE_META => 0,
         _ => unreachable!("all header families have fixed version-one key widths"),

@@ -28,7 +28,7 @@ use iroh::{
 use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{broadcast, mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore},
     task::{AbortHandle, JoinHandle, JoinSet},
     time::{timeout, Instant},
 };
@@ -42,32 +42,33 @@ use zakura_chain::{
 };
 
 use self::trace::ZakuraConnTrace;
-use super::discovery::{native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
+use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
 use super::trace::{reject_reason_label, ZakuraTrace};
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::HeaderSyncAction;
+use crate::{peer_registry::PeerRegistry, BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
         canonical_ip, direct_endpoint_builder, spawn_block_sync_reactor, spawn_header_sync_reactor,
-        BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle, BlockSyncService, BlockSyncStartup,
-        BoxRunFuture, Clock, CloseCause, Frame, FramedRecv, FramedSend, FullStateFrontiers,
-        HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, OrderedSessionDemand,
-        OrderedStreamOpening, OrderedStreamPolicy, Peer, RealClock, Service, ServicePeerDirection,
-        ServiceRegistry, ServiceStream, SinkReject, Stream, StreamMode, StreamPrelude,
-        ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraControlAck,
-        ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig,
-        ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits,
-        ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
-        ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
+        AuthenticatedPeerRegistration, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
+        BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FramedRecv,
+        FramedSend, FullStateFrontiers, HeaderSyncPassthroughService, HeaderSyncService,
+        HeaderSyncStartup, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
+        RealClock, Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject,
+        Stream, StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
+        ZakuraConnId, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole,
+        ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
+        ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
+        ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraServiceId,
+        ZakuraUpgradeDialStart, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
         FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
         TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
         ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
-use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
 
 /// Default total Zakura connections when P2P v2 is enabled.
 pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 256;
@@ -515,6 +516,25 @@ pub struct ZakuraConnectionLimits {
     pub message_rate_per_second: u32,
 }
 
+/// A service supplied by the application embedding Zakura.
+#[derive(Clone, Debug)]
+pub struct CustomService {
+    /// Custom p2p service.
+    pub service: Arc<dyn Service>,
+
+    /// Service ids to advertise to the network.
+    pub provides: Vec<ZakuraServiceId>,
+
+    /// Remote service ids to prefer when selecting outbound discovery peers.
+    pub seeks: Vec<ZakuraServiceId>,
+}
+
+impl From<CustomService> for Arc<dyn Service> {
+    fn from(service: CustomService) -> Self {
+        service.service
+    }
+}
+
 /// Running Zakura endpoint owned by `zakura-network`/`zakurad` startup.
 #[derive(Debug, Clone)]
 pub struct ZakuraEndpoint {
@@ -524,14 +544,21 @@ pub struct ZakuraEndpoint {
     header_sync: Option<super::HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
     header_sync_tasks: Option<Arc<HeaderSyncBackgroundTasks>>,
+    header_sync_fatal_events:
+        Option<Arc<Mutex<Option<mpsc::UnboundedReceiver<super::HeaderSyncFatalEvent>>>>>,
     #[cfg(any(test, feature = "zakura-testkit"))]
     header_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
     block_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
     /// Maintained native dials started by the legacy->Zakura upgrade hand-off,
-    /// keyed by the advertised peer id. The [`AbortHandle`] lets a failed
-    /// hand-off cancel its maintain-forever dial instead of leaking it; see
-    /// [`Self::ensure_upgrade_native_dial`] and [`Self::cancel_upgrade_native_dial`].
-    upgrade_dials: Arc<StdMutex<HashMap<ZakuraPeerId, AbortHandle>>>,
+    /// keyed by the advertised peer id. See [`Self::start_upgrade_native_dial`]
+    /// and [`Self::cancel_upgrade_native_dial`].
+    upgrade_dials: Arc<StdMutex<HashMap<ZakuraPeerId, UpgradeDialOwnership>>>,
+}
+
+#[derive(Debug)]
+struct UpgradeDialOwnership {
+    dial_abort: AbortHandle,
+    lifetime: CancellationToken,
 }
 
 #[derive(Debug)]
@@ -630,6 +657,14 @@ impl ZakuraEndpoint {
             .map(|tasks| tasks.shutdown.clone())
     }
 
+    /// Take the private header-sync fatal event receiver for the node root.
+    pub async fn take_header_sync_fatal_events(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<super::HeaderSyncFatalEvent>> {
+        let events = self.header_sync_fatal_events.as_ref()?;
+        events.lock().await.take()
+    }
+
     /// Cancels and waits for endpoint-owned sync/background tasks.
     ///
     /// Used by dual-stack fallback before legacy ChainSync starts, so already-started
@@ -695,8 +730,8 @@ impl ZakuraEndpoint {
     /// waiting for the legacy crawler to re-dial and re-run the whole upgrade.
     /// Once the legacy TCP connection is dropped, this task is the prompt
     /// recovery path for short Zakura disconnects; the address-book liveness
-    /// keeper prevents the slower legacy crawler from churning while this peer
-    /// remains registered.
+    /// keeper prevents the slower legacy crawler from churning while this dial
+    /// owns the peer.
     pub fn spawn_native_dial(&self, node_addr: NodeAddr) -> tokio::task::JoinHandle<()> {
         let endpoint = self.clone();
         let limits = self.handler.limits.clone();
@@ -707,15 +742,15 @@ impl ZakuraEndpoint {
         tokio::spawn(native_dial_supervised(endpoint, node_addr, limits, policy))
     }
 
-    /// Ensure there is one maintained native dial spawned by the legacy upgrade path.
+    /// Start one maintained native dial for a legacy handoff.
     ///
     /// The legacy crawler can retry the same peer while a short-lived upgraded
     /// connection is still settling. Deduplicate those retries so repeated
     /// legacy upgrades do not create a swarm of independent maintained QUIC
     /// dial loops to the same peer.
-    pub(crate) fn ensure_upgrade_native_dial(&self, node_addr: NodeAddr) -> bool {
+    pub(crate) fn start_upgrade_native_dial(&self, node_addr: NodeAddr) -> ZakuraUpgradeDialStart {
         let Ok(peer_id) = ZakuraPeerId::new(node_addr.node_id.as_bytes().to_vec()) else {
-            return false;
+            return ZakuraUpgradeDialStart::InvalidPeerId;
         };
 
         // Hold the registry lock across the spawn so the dedup check and the
@@ -728,7 +763,7 @@ impl ZakuraEndpoint {
             .lock()
             .expect("Zakura upgrade dial registry mutex is never poisoned");
         if upgrade_dials.contains_key(&peer_id) {
-            return true;
+            return ZakuraUpgradeDialStart::AlreadyRunning;
         }
 
         let endpoint = self.clone();
@@ -737,17 +772,42 @@ impl ZakuraEndpoint {
             DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
             DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
         );
+        let lifetime = CancellationToken::new();
+        let task_lifetime = lifetime.clone();
         let task_peer_id = peer_id.clone();
         let dial = tokio::spawn(async move {
+            let _lifetime_guard = task_lifetime.drop_guard();
             native_dial_supervised(endpoint.clone(), node_addr, limits, policy).await;
+            endpoint
+                .supervisor
+                .forget_retained_native_metadata(&task_peer_id);
             endpoint
                 .upgrade_dials
                 .lock()
                 .expect("Zakura upgrade dial registry mutex is never poisoned")
                 .remove(&task_peer_id);
         });
-        upgrade_dials.insert(peer_id, dial.abort_handle());
-        true
+        upgrade_dials.insert(
+            peer_id,
+            UpgradeDialOwnership {
+                dial_abort: dial.abort_handle(),
+                lifetime,
+            },
+        );
+        ZakuraUpgradeDialStart::Started
+    }
+
+    /// Return a token that is canceled when this endpoint stops owning the
+    /// maintained native dial for `peer_id`.
+    pub(crate) fn upgrade_dial_lifetime(
+        &self,
+        peer_id: &ZakuraPeerId,
+    ) -> Option<CancellationToken> {
+        self.upgrade_dials
+            .lock()
+            .expect("Zakura upgrade dial registry mutex is never poisoned")
+            .get(peer_id)
+            .map(|ownership| ownership.lifetime.clone())
     }
 
     /// Cancel and forget the maintained native dial started by the legacy
@@ -762,13 +822,15 @@ impl ZakuraEndpoint {
     /// registered (its entry is reclaimed only when the maintained dial ends on
     /// shutdown) or if another upgrade owns the dedup slot.
     pub(crate) fn cancel_upgrade_native_dial(&self, peer_id: &ZakuraPeerId) {
-        let handle = self
+        let ownership = self
             .upgrade_dials
             .lock()
             .expect("Zakura upgrade dial registry mutex is never poisoned")
             .remove(peer_id);
-        if let Some(handle) = handle {
-            handle.abort();
+        if let Some(ownership) = ownership {
+            ownership.lifetime.cancel();
+            ownership.dial_abort.abort();
+            self.supervisor.forget_retained_native_metadata(peer_id);
         }
     }
 
@@ -809,6 +871,7 @@ impl ZakuraEndpoint {
             header_sync: None,
             block_sync: None,
             header_sync_tasks: None,
+            header_sync_fatal_events: None,
             header_sync_actions: None,
             block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
@@ -836,6 +899,7 @@ impl ZakuraEndpoint {
                 shutdown,
                 tasks: Mutex::new(tasks),
             })),
+            header_sync_fatal_events: None,
             header_sync_actions: actions.map(|actions| Arc::new(Mutex::new(Some(actions)))),
             block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
@@ -865,6 +929,7 @@ impl ZakuraEndpoint {
                 shutdown,
                 tasks: Mutex::new(tasks),
             })),
+            header_sync_fatal_events: None,
             header_sync_actions: header_sync_actions
                 .map(|actions| Arc::new(Mutex::new(Some(actions)))),
             block_sync_actions: block_sync_actions
@@ -881,6 +946,77 @@ pub struct ZakuraSupervisorHandle {
     inner: Arc<Mutex<ZakuraSupervisorState>>,
     shutdown: CancellationToken,
     peer_set_tx: watch::Sender<Vec<ZakuraPeerId>>,
+    registration_tx: broadcast::Sender<ZakuraConnectionRegistration>,
+    pending_handoffs: Arc<StdMutex<HashMap<ZakuraPeerId, ZakuraHandoffId>>>,
+    peer_registry: Option<PeerRegistry>,
+}
+
+/// One exact authenticated connection generation published by the supervisor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ZakuraConnectionRegistration {
+    peer_id: ZakuraPeerId,
+    conn_id: ZakuraConnId,
+}
+
+/// Monotonic ownership token for one pending legacy-to-native handoff.
+type ZakuraHandoffId = u64;
+
+/// Registration events can burst during startup. A lagged handoff fails closed
+/// instead of attaching metadata to an unobserved connection generation.
+const ZAKURA_REGISTRATION_EVENT_CAPACITY: usize = 1024;
+
+/// Waits for the first new authenticated generation of one peer.
+pub(crate) struct ZakuraConnectionRegistrationWait {
+    peer_id: ZakuraPeerId,
+    handoff_id: ZakuraHandoffId,
+    registrations: broadcast::Receiver<ZakuraConnectionRegistration>,
+    pending_handoffs: Arc<StdMutex<HashMap<ZakuraPeerId, ZakuraHandoffId>>>,
+}
+
+/// Result of reserving a peer identity for one legacy-to-native handoff.
+pub(crate) enum ZakuraConnectionRegistrationWaitStart {
+    /// This handoff owns the next registration for the peer identity.
+    Waiting(ZakuraConnectionRegistrationWait),
+    /// An active connection or another handoff already owns the peer identity.
+    Duplicate,
+    /// The supervisor cannot allocate another handoff identifier.
+    Unavailable,
+}
+
+impl ZakuraConnectionRegistrationWait {
+    /// Returns the exact registered generation, or `None` if the wait cannot
+    /// observe one within `registration_timeout`.
+    pub(crate) async fn wait(mut self, registration_timeout: Duration) -> Option<ZakuraConnId> {
+        timeout(registration_timeout, async {
+            loop {
+                match self.registrations.recv().await {
+                    Ok(registration) if registration.peer_id == self.peer_id => {
+                        return Some(registration.conn_id);
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_))
+                    | Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
+        .await
+        .unwrap_or(None)
+    }
+}
+
+impl Drop for ZakuraConnectionRegistrationWait {
+    fn drop(&mut self) {
+        let peer_id = self.peer_id.clone();
+        let handoff_id = self.handoff_id;
+        let mut pending_handoffs = self
+            .pending_handoffs
+            .lock()
+            .expect("Zakura pending handoff mutex is never poisoned");
+        // A late drop cannot release a newer handoff reservation.
+        if pending_handoffs.get(&peer_id) == Some(&handoff_id) {
+            pending_handoffs.remove(&peer_id);
+        }
+    }
 }
 
 static NEXT_SUPERVISOR_ID: AtomicU64 = AtomicU64::new(1);
@@ -890,6 +1026,7 @@ struct ZakuraSupervisorState {
     supervisor: ZakuraPeerSupervisor,
     active_by_peer: HashMap<ZakuraPeerId, ZakuraPeerConnectionEntry>,
     active_by_ip: HashMap<IpAddr, usize>,
+    next_handoff_id: ZakuraHandoffId,
     max_connections_per_ip: usize,
     next_registration_id: ZakuraConnId,
 }
@@ -1016,17 +1153,33 @@ pub enum ZakuraOutboundFrame {
 impl ZakuraSupervisorHandle {
     /// Create an empty supervisor.
     pub fn new(max_connections_per_ip: usize) -> Self {
+        Self::new_inner(max_connections_per_ip, None)
+    }
+
+    pub(crate) fn new_with_peer_registry(
+        max_connections_per_ip: usize,
+        peer_registry: PeerRegistry,
+    ) -> Self {
+        Self::new_inner(max_connections_per_ip, Some(peer_registry))
+    }
+
+    fn new_inner(max_connections_per_ip: usize, peer_registry: Option<PeerRegistry>) -> Self {
+        let (registration_tx, _) = broadcast::channel(ZAKURA_REGISTRATION_EVENT_CAPACITY);
         Self {
             id: NEXT_SUPERVISOR_ID.fetch_add(1, Ordering::Relaxed),
             inner: Arc::new(Mutex::new(ZakuraSupervisorState {
                 supervisor: ZakuraPeerSupervisor::default(),
                 active_by_peer: HashMap::new(),
                 active_by_ip: HashMap::new(),
+                next_handoff_id: 1,
                 max_connections_per_ip: max_connections_per_ip.max(1),
                 next_registration_id: 1,
             })),
             shutdown: CancellationToken::new(),
             peer_set_tx: watch::channel(Vec::new()).0,
+            registration_tx,
+            pending_handoffs: Arc::new(StdMutex::new(HashMap::new())),
+            peer_registry,
         }
     }
 
@@ -1055,6 +1208,38 @@ impl ZakuraSupervisorHandle {
     /// Subscribe to peer-set changes for event-driven tests and diagnostics.
     pub fn subscribe(&self) -> watch::Receiver<Vec<ZakuraPeerId>> {
         self.peer_set_tx.subscribe()
+    }
+
+    /// Start an atomic wait for the next connection generation of `peer_id`.
+    ///
+    /// The returned wait observes registrations that occur after this call.
+    /// The supervisor lock makes the ownership checks and event subscription
+    /// atomic with connection registration.
+    pub(crate) async fn begin_connection_registration_wait(
+        &self,
+        peer_id: &ZakuraPeerId,
+    ) -> ZakuraConnectionRegistrationWaitStart {
+        let mut state = self.inner.lock().await;
+        let mut pending_handoffs = self
+            .pending_handoffs
+            .lock()
+            .expect("Zakura pending handoff mutex is never poisoned");
+        if state.active_by_peer.contains_key(peer_id) || pending_handoffs.contains_key(peer_id) {
+            return ZakuraConnectionRegistrationWaitStart::Duplicate;
+        }
+        if state.next_handoff_id == u64::MAX {
+            return ZakuraConnectionRegistrationWaitStart::Unavailable;
+        }
+        let handoff_id = state.next_handoff_id;
+        state.next_handoff_id += 1;
+        pending_handoffs.insert(peer_id.clone(), handoff_id);
+        let registrations = self.registration_tx.subscribe();
+        ZakuraConnectionRegistrationWaitStart::Waiting(ZakuraConnectionRegistrationWait {
+            peer_id: peer_id.clone(),
+            handoff_id,
+            registrations,
+            pending_handoffs: self.pending_handoffs.clone(),
+        })
     }
 
     /// Disconnect one active Zakura peer.
@@ -1122,9 +1307,13 @@ impl ZakuraSupervisorHandle {
             .supervisor
             .register_authenticated(peer_id.clone(), transcript_hash)
         {
-            ZakuraUpgradeOutcome::Upgraded { .. } => {
+            AuthenticatedPeerRegistration::Registered => {
                 let conn_id = state.next_registration_id;
                 state.next_registration_id += 1;
+                self.pending_handoffs
+                    .lock()
+                    .expect("Zakura pending handoff mutex is never poisoned")
+                    .remove(&peer_id);
                 let entry = ZakuraPeerConnectionEntry {
                     conn_id,
                     outbound_handle,
@@ -1142,6 +1331,13 @@ impl ZakuraSupervisorHandle {
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
                 set_active_connection_gauge(registered_ids.len());
                 self.peer_set_tx.send_replace(registered_ids);
+                if let Some(peer_registry) = &self.peer_registry {
+                    peer_registry.register_native_connection(peer_id.clone(), conn_id);
+                }
+                let _ = self.registration_tx.send(ZakuraConnectionRegistration {
+                    peer_id: peer_id.clone(),
+                    conn_id,
+                });
                 let disconnect_token = state
                     .active_by_peer
                     .get(&peer_id)
@@ -1154,7 +1350,7 @@ impl ZakuraSupervisorHandle {
                     disconnect_token,
                 }
             }
-            ZakuraUpgradeOutcome::Duplicate { .. } => {
+            AuthenticatedPeerRegistration::Duplicate => {
                 // A duplicate for an identity that already has a connection is
                 // almost always a restart or redial. If the incumbent has been
                 // registered long enough to be a stale connection left behind by
@@ -1187,7 +1383,6 @@ impl ZakuraSupervisorHandle {
                 }
                 ZakuraRegistration::Duplicate { peer_id }
             }
-            ZakuraUpgradeOutcome::Rejected { reason } => ZakuraRegistration::Rejected(reason),
         }
     }
 
@@ -1211,6 +1406,15 @@ impl ZakuraSupervisorHandle {
         let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
         set_active_connection_gauge(registered_ids.len());
         self.peer_set_tx.send_replace(registered_ids);
+        if let Some(peer_registry) = &self.peer_registry {
+            peer_registry.deregister_native_connection(peer_id, conn_id);
+        }
+    }
+
+    fn forget_retained_native_metadata(&self, peer_id: &ZakuraPeerId) {
+        if let Some(peer_registry) = &self.peer_registry {
+            peer_registry.forget_retained_native_metadata(peer_id);
+        }
     }
 
     fn shutdown(&self) {
@@ -1675,6 +1879,7 @@ pub(crate) struct NativeHandshakeNegotiated {
     pub(crate) accepted_capabilities: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn service_registry(
     _supervisor: &ZakuraSupervisorHandle,
     header_sync: Option<super::HeaderSyncHandle>,
@@ -1685,6 +1890,7 @@ pub(crate) fn service_registry(
     service_demand: Option<
         watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
     >,
+    custom_services: Vec<CustomService>,
 ) -> Result<Arc<ServiceRegistry>, BoxError> {
     let mut services = vec![legacy_service.clone()];
     let header_sync_service = if let Some(header_sync) = &header_sync {
@@ -1706,13 +1912,16 @@ pub(crate) fn service_registry(
         },
     };
     let block_sync = Arc::new(block_sync.with_service_demand(service_demand)) as Arc<dyn Service>;
-    discovery_service.set_connection_owners(vec![
-        legacy_service,
-        header_sync_service,
-        block_sync.clone(),
-    ]);
+    let custom_services = custom_services
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    let mut connection_owners = vec![legacy_service, header_sync_service, block_sync.clone()];
+    connection_owners.extend(custom_services.iter().cloned());
+    discovery_service.set_connection_owners(connection_owners);
     services.push(discovery_service as Arc<dyn Service>);
     services.push(block_sync);
+    services.extend(custom_services);
 
     Ok(Arc::new(
         ServiceRegistry::new(services).map_err(|error| -> BoxError { Box::new(error) })?,
@@ -3246,6 +3455,26 @@ async fn enable_header_sync_and_renegotiate(
     disconnected
 }
 
+fn provided_services_with_custom(custom_services: &[CustomService]) -> Vec<ZakuraServiceId> {
+    let mut provided_services = discovery::default_advertised_services();
+    provided_services.extend(
+        custom_services
+            .iter()
+            .flat_map(|custom| custom.provides.iter().cloned()),
+    );
+    provided_services
+}
+
+fn sought_services_with_custom(custom_services: &[CustomService]) -> Vec<ZakuraServiceId> {
+    let mut sought_services: Vec<_> = custom_services
+        .iter()
+        .flat_map(|custom| custom.seeks.iter().cloned())
+        .collect();
+    sought_services.sort_unstable();
+    sought_services.dedup();
+    sought_services
+}
+
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
 pub async fn spawn_zakura_endpoint(
     config: &Config,
@@ -3259,6 +3488,56 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     config: &Config,
     sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
+) -> Result<Option<ZakuraEndpoint>, BoxError> {
+    spawn_zakura_endpoint_with_services(
+        config,
+        sink_factory,
+        header_sync_driver_startup,
+        Vec::new(),
+    )
+    .await
+}
+
+/// Start a Zakura endpoint with optional runtime services.
+pub async fn spawn_zakura_endpoint_with_services(
+    config: &Config,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
+    custom_services: Vec<CustomService>,
+) -> Result<Option<ZakuraEndpoint>, BoxError> {
+    spawn_zakura_endpoint_inner(
+        config,
+        sink_factory,
+        header_sync_driver_startup,
+        custom_services,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
+    config: &Config,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
+    custom_services: Vec<CustomService>,
+    peer_registry: PeerRegistry,
+) -> Result<Option<ZakuraEndpoint>, BoxError> {
+    spawn_zakura_endpoint_inner(
+        config,
+        sink_factory,
+        header_sync_driver_startup,
+        custom_services,
+        Some(peer_registry),
+    )
+    .await
+}
+
+async fn spawn_zakura_endpoint_inner(
+    config: &Config,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
+    custom_services: Vec<CustomService>,
+    peer_registry: Option<PeerRegistry>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     if !config.v2_p2p() {
         return Ok(None);
@@ -3275,7 +3554,13 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     // case does not expose the native P2P_V2_ALPN surface on all interfaces.
     let builder = bind_native_endpoint(builder, config.zakura.listen_addr);
     let endpoint = builder.bind().await?;
-    let supervisor = ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip());
+    let supervisor = match peer_registry {
+        Some(peer_registry) => ZakuraSupervisorHandle::new_with_peer_registry(
+            config.zakura.max_connections_per_ip(),
+            peer_registry,
+        ),
+        None => ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip()),
+    };
     let tracer = config
         .zakura
         .trace_dir
@@ -3287,10 +3572,11 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         &config.network,
         config.zakura.dev_network.as_deref(),
     );
-    let discovery = super::discovery::build_discovery_handle(
+    let sought_services = sought_services_with_custom(&custom_services);
+    let discovery = discovery::build_discovery_handle(
         discovery_secret_key,
         discovery_direct_addrs(config, local_node_id),
-        super::discovery::default_advertised_services(),
+        provided_services_with_custom(&custom_services),
         &handshake_config,
         config.zakura.max_connections,
         remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id),
@@ -3316,6 +3602,8 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.zakura.header_sync.clone(),
         limits.max_frame_bytes,
     );
+    let (header_sync_fatal_tx, header_sync_fatal_rx) = mpsc::unbounded_channel();
+    startup.fatal_events = Some(header_sync_fatal_tx);
     startup.use_direct_port();
     startup.trace = trace.clone();
     startup.committed_snapshots = header_sync_driver_startup
@@ -3368,7 +3656,15 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         legacy_service,
         discovery_service,
         service_demand.clone(),
-    )?;
+        custom_services,
+    );
+    let registry = match registry {
+        Ok(registry) => registry,
+        Err(error) => {
+            header_sync_shutdown.cancel();
+            return Err(error);
+        }
+    };
     let mut tasks = vec![header_sync_task];
     if let Some(task) = block_sync_task {
         tasks.push(task);
@@ -3420,11 +3716,13 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         header_sync: Some(header_sync),
         block_sync,
         header_sync_tasks: Some(header_sync_tasks),
+        header_sync_fatal_events: Some(Arc::new(Mutex::new(Some(header_sync_fatal_rx)))),
         #[cfg(any(test, feature = "zakura-testkit"))]
         header_sync_actions,
         block_sync_actions,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
     };
+    let startup_shutdown = endpoint.background_shutdown_token().drop_guard();
 
     if let Some(mut service_demand) = service_demand {
         let capability_handler = endpoint.handler.clone();
@@ -3500,9 +3798,14 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     ) {
         endpoint.push_header_sync_task(task).await;
     }
-    let discovery_dialer =
-        super::discovery::spawn_native_discovery_dialer(endpoint.clone(), discovery, limits);
+    let discovery_dialer = discovery::spawn_native_discovery_dialer(
+        endpoint.clone(),
+        discovery,
+        limits,
+        sought_services,
+    );
     endpoint.push_header_sync_task(discovery_dialer).await;
+    startup_shutdown.disarm();
     Ok(Some(endpoint))
 }
 
@@ -5462,6 +5765,30 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct OrderedStreamService {
+        stream: Stream,
+        sessions: mpsc::UnboundedSender<(FramedRecv, FramedSend)>,
+    }
+
+    impl Service for OrderedStreamService {
+        fn name(&self) -> &'static str {
+            "ordered-stream"
+        }
+
+        fn streams(&self) -> &[Stream] {
+            std::slice::from_ref(&self.stream)
+        }
+
+        fn add_peer(&self, mut peer: Peer) {
+            if let Some(session) = peer.take_stream(self.stream.kind) {
+                let _ = self.sessions.send(session);
+            }
+        }
+
+        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
+    }
+
+    #[derive(Debug)]
     struct GenerationGuardedRecordingService {
         streams: Vec<Stream>,
         active: std::sync::Mutex<HashMap<ZakuraPeerId, (ZakuraConnId, CancellationToken)>>,
@@ -5571,6 +5898,55 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn handoff_wait_returns_exact_generation_and_rejects_duplicates() {
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let peer_id = test_peer(6);
+        let ZakuraConnectionRegistrationWaitStart::Waiting(registration_wait) = supervisor
+            .begin_connection_registration_wait(&peer_id)
+            .await
+        else {
+            panic!("the first handoff must reserve the peer identity");
+        };
+        assert!(
+            matches!(
+                supervisor
+                    .begin_connection_registration_wait(&peer_id)
+                    .await,
+                ZakuraConnectionRegistrationWaitStart::Duplicate,
+            ),
+            "a concurrent handoff cannot share one connection registration",
+        );
+
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let registration = supervisor
+            .register(
+                test_conn_id(),
+                peer_id.clone(),
+                Some("192.0.2.6".parse().expect("test IP parses")),
+                [6; TRANSCRIPT_HASH_BYTES],
+                ZakuraPeerHandle::new_for_tests(peer_id.clone(), outbound_tx),
+                CancellationToken::new(),
+                ZAKURA_CAP_LEGACY_GOSSIP,
+            )
+            .await;
+        let conn_id = registered_conn_id(registration);
+
+        assert_eq!(
+            registration_wait.wait(Duration::from_secs(1)).await,
+            Some(conn_id),
+        );
+        assert!(
+            matches!(
+                supervisor
+                    .begin_connection_registration_wait(&peer_id)
+                    .await,
+                ZakuraConnectionRegistrationWaitStart::Duplicate,
+            ),
+            "an incumbent connection makes a later legacy handoff a duplicate",
+        );
+    }
+
     #[test]
     fn native_duplicate_tie_breaker_converges_for_simultaneous_open() {
         let node_a = LocalEndpointFactory::secret_key(1).public();
@@ -5595,30 +5971,30 @@ mod tests {
         let mut supervisor_b = ZakuraPeerSupervisor::default();
         assert!(matches!(
             supervisor_a.register_authenticated(peer.clone(), a_outbound),
-            ZakuraUpgradeOutcome::Upgraded { .. }
+            AuthenticatedPeerRegistration::Registered
         ));
         let _ = supervisor_a.register_authenticated(peer.clone(), a_inbound);
         assert!(matches!(
             supervisor_b.register_authenticated(peer.clone(), b_inbound),
-            ZakuraUpgradeOutcome::Upgraded { .. }
+            AuthenticatedPeerRegistration::Registered
         ));
         let _ = supervisor_b.register_authenticated(peer.clone(), b_outbound);
 
         assert!(matches!(
             supervisor_a.register_authenticated(peer.clone(), winning_key),
-            ZakuraUpgradeOutcome::Duplicate { .. }
+            AuthenticatedPeerRegistration::Duplicate
         ));
         assert!(matches!(
             supervisor_b.register_authenticated(peer.clone(), winning_key),
-            ZakuraUpgradeOutcome::Duplicate { .. }
+            AuthenticatedPeerRegistration::Duplicate
         ));
         assert!(matches!(
             supervisor_a.register_authenticated(peer.clone(), losing_key),
-            ZakuraUpgradeOutcome::Duplicate { .. }
+            AuthenticatedPeerRegistration::Duplicate
         ));
         assert!(matches!(
             supervisor_b.register_authenticated(peer, losing_key),
-            ZakuraUpgradeOutcome::Duplicate { .. }
+            AuthenticatedPeerRegistration::Duplicate
         ));
     }
 
@@ -6333,6 +6709,7 @@ mod tests {
             endpoint.clone(),
             discovery,
             limits,
+            Vec::new(),
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -6383,12 +6760,12 @@ mod tests {
 
         let connector =
             crate::zakura::ZakuraHandshakeConnector::new_with_endpoint(endpoint.clone());
-        let upgraded = connector
+        let handoff = connector
             .spawn_zakura_dial_to_hints_and_wait(&peer_id, &node_id, &direct_addresses)
             .await;
 
         assert!(
-            !upgraded,
+            matches!(handoff, crate::zakura::ZakuraNativeHandoff::Failed),
             "an unreachable upgrade peer must not report a completed hand-off",
         );
         assert!(
@@ -6402,6 +6779,140 @@ mod tests {
 
         endpoint.shutdown().await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintained_upgrade_dial_keeps_its_original_handoff_owner() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let config = Config::for_test(P2pStack::Dual);
+        let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await?
+        .expect("v2_p2p is enabled in test config");
+        let node_id = LocalEndpointFactory::secret_key(0x0BAD_CAFE).public();
+        let peer_id = ZakuraPeerId::new(node_id.as_bytes().to_vec())?;
+        let node_addr = NodeAddr::new(node_id)
+            .with_direct_addresses(["192.0.2.2:1".parse().expect("test direct address parses")]);
+
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(node_addr.clone()),
+            crate::zakura::ZakuraUpgradeDialStart::Started,
+        );
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(node_addr),
+            crate::zakura::ZakuraUpgradeDialStart::AlreadyRunning,
+        );
+
+        endpoint.cancel_upgrade_native_dial(&peer_id);
+        endpoint.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn custom_ordered_service_round_trips_over_zakura() -> Result<(), BoxError> {
+        const CUSTOM_STREAM: Stream = Stream {
+            kind: 64,
+            version: 1,
+            frame_cap: 64 * 1024,
+            capability: 1 << 16,
+            mode: StreamMode::Ordered,
+        };
+
+        let _guard = zakura_test::init();
+        let service_id = ZakuraServiceId::new("zakura.test.ordered.v1")?;
+        let listen_addr = "127.0.0.1:0".parse().expect("valid loopback address");
+        let server_identity = tempfile::tempdir()?;
+        let client_identity = tempfile::tempdir()?;
+        let (server_sessions, mut server_session_rx) = mpsc::unbounded_channel();
+        let (client_sessions, mut client_session_rx) = mpsc::unbounded_channel();
+
+        let mut server_config = Config::for_test(P2pStack::Dual);
+        server_config.identity_dir = server_identity.path().to_owned();
+        server_config.zakura.listen_addr = Some(listen_addr);
+        server_config.zakura.bootstrap_peers.clear();
+        let server = spawn_zakura_endpoint_with_services(
+            &server_config,
+            |_supervisor, _trace| Arc::new(NoopService),
+            None,
+            vec![CustomService {
+                service: Arc::new(OrderedStreamService {
+                    stream: CUSTOM_STREAM,
+                    sessions: server_sessions,
+                }),
+                provides: vec![service_id.clone()],
+                seeks: Vec::new(),
+            }],
+        )
+        .await?
+        .expect("test server uses Zakura");
+        let server_addr = server.node_addr().await;
+        let server_direct = server_addr
+            .direct_addresses()
+            .copied()
+            .find(|addr| addr.ip().is_loopback())
+            .ok_or("test server has no loopback address")?;
+
+        let mut client_config = Config::for_test(P2pStack::Dual);
+        client_config.identity_dir = client_identity.path().to_owned();
+        client_config.zakura.listen_addr = Some(listen_addr);
+        client_config.zakura.bootstrap_peers =
+            vec![format!("{}@{server_direct}", server_addr.node_id)];
+        let client = spawn_zakura_endpoint_with_services(
+            &client_config,
+            |_supervisor, _trace| Arc::new(NoopService),
+            None,
+            vec![CustomService {
+                service: Arc::new(OrderedStreamService {
+                    stream: CUSTOM_STREAM,
+                    sessions: client_sessions,
+                }),
+                provides: Vec::new(),
+                seeks: vec![service_id],
+            }],
+        )
+        .await?
+        .expect("test client uses Zakura");
+
+        let round_trip = timeout(Duration::from_secs(10), async {
+            let (mut server_recv, server_send) = server_session_rx
+                .recv()
+                .await
+                .ok_or_else(|| -> BoxError { "server custom stream did not open".into() })?;
+            let (mut client_recv, client_send) = client_session_rx
+                .recv()
+                .await
+                .ok_or_else(|| -> BoxError { "client custom stream did not open".into() })?;
+            let outbound = Frame {
+                message_type: 1_001,
+                flags: 3,
+                payload: b"custom client frame".to_vec(),
+            };
+            client_send.send(outbound.clone()).await?;
+            let received = server_recv
+                .recv()
+                .await
+                .ok_or_else(|| -> BoxError { "server custom stream closed".into() })?;
+            assert_eq!(received, outbound);
+
+            let response = Frame {
+                message_type: 2_002,
+                flags: 5,
+                payload: b"custom server frame".to_vec(),
+            };
+            server_send.send(response.clone()).await?;
+            let received = client_recv
+                .recv()
+                .await
+                .ok_or_else(|| -> BoxError { "client custom stream closed".into() })?;
+            assert_eq!(received, response);
+            Ok::<_, BoxError>(())
+        })
+        .await
+        .map_err(|_| -> BoxError { "custom ordered stream round trip timed out".into() })?;
+        client.shutdown().await;
+        server.shutdown().await;
+        round_trip
     }
 
     #[tokio::test]

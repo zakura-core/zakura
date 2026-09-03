@@ -1,6 +1,10 @@
 //! Randomised property tests for the non-finalized state.
 
-use std::{collections::BTreeMap, env, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env,
+    sync::Arc,
+};
 
 use zakura_test::prelude::*;
 
@@ -10,6 +14,7 @@ use zakura_chain::{
     history_tree::{HistoryTree, NonEmptyHistoryTree},
     parameters::NetworkUpgrade::*,
     parameters::*,
+    transparent,
     value_balance::ValueBalance,
     LedgerState,
 };
@@ -18,7 +23,32 @@ use crate::{
     arbitrary::Prepare,
     request::ContextuallyVerifiedBlock,
     service::{arbitrary::PreparedChain, non_finalized_state::Chain},
+    SemanticallyVerifiedBlock,
 };
+
+fn spent_utxos(
+    block: &SemanticallyVerifiedBlock,
+    chain: &Chain,
+) -> HashMap<transparent::OutPoint, transparent::OrderedUtxo> {
+    let chain_utxos = chain.unspent_utxos();
+
+    block
+        .block
+        .transactions
+        .iter()
+        .flat_map(|transaction| transaction.inputs())
+        .filter_map(transparent::Input::outpoint)
+        .map(|outpoint| {
+            let utxo = block
+                .new_outputs
+                .get(&outpoint)
+                .or_else(|| chain_utxos.get(&outpoint))
+                .expect("prepared test chains provide every spent UTXO")
+                .clone();
+            (outpoint, utxo)
+        })
+        .collect()
+}
 
 /// The default number of proptest cases for long partial chain tests.
 const DEFAULT_PARTIAL_CHAIN_PROPTEST_CASES: u32 = 1;
@@ -48,10 +78,11 @@ fn push_genesis_chain() -> Result<()> {
         chain_values.insert(None, (None, only_chain.chain_value_pools.into()));
 
         for block in chain.iter().take(count).skip(1).cloned() {
+            let spent_utxos = spent_utxos(&block, &only_chain);
             let block =
             ContextuallyVerifiedBlock::with_block_and_spent_utxos(
                     block,
-                    only_chain.unspent_utxos(),
+                    spent_utxos,
                 )
                 .map_err(|e| (e, chain_values.clone()))
                 .expect("invalid block value pool change");
@@ -146,9 +177,10 @@ fn forked_equals_pushed_genesis() -> Result<()> {
             ValueBalance::zero(),
         );
         for block in chain.iter().take(fork_at_count).skip(1).cloned() {
+            let spent_utxos = spent_utxos(&block, &partial_chain);
             let block = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
                 block,
-                partial_chain.unspent_utxos(),
+                spent_utxos,
             )?;
             partial_chain = partial_chain
                 .push(block)
@@ -168,8 +200,8 @@ fn forked_equals_pushed_genesis() -> Result<()> {
         );
 
         for block in chain.iter().cloned() {
-            let block =
-            ContextuallyVerifiedBlock::with_block_and_spent_utxos(block, full_chain.unspent_utxos())?;
+            let spent_utxos = spent_utxos(&block, &full_chain);
+            let block = ContextuallyVerifiedBlock::with_block_and_spent_utxos(block, spent_utxos)?;
 
             // Check some properties of the genesis block and don't push it to the chain.
             if block.height == block::Height(0) {
@@ -204,6 +236,21 @@ fn forked_equals_pushed_genesis() -> Result<()> {
         // This check is redundant, but it's useful for debugging.
         prop_assert_eq!(forked.blocks.len(), partial_chain.blocks.len());
 
+        for (height, forked_block) in &forked.blocks {
+            let original_block = full_chain
+                .blocks
+                .get(height)
+                .expect("the original chain contains every block retained by its fork");
+            prop_assert!(Arc::ptr_eq(
+                &forked_block.new_outputs,
+                &original_block.new_outputs
+            ));
+            prop_assert!(Arc::ptr_eq(
+                &forked_block.spent_outputs,
+                &original_block.spent_outputs
+            ));
+        }
+
         // Check that the entire internal state of the forked chain corresponds to the state of
         // the original chain.
         prop_assert!(forked.eq_internal_state(&partial_chain));
@@ -211,8 +258,8 @@ fn forked_equals_pushed_genesis() -> Result<()> {
         // Re-add blocks to the fork and check if we arrive at the
         // same original full chain.
         for block in chain.iter().skip(fork_at_count).cloned() {
-            let block =
-            ContextuallyVerifiedBlock::with_block_and_spent_utxos(block, forked.unspent_utxos())?;
+            let spent_utxos = spent_utxos(&block, &forked);
+            let block = ContextuallyVerifiedBlock::with_block_and_spent_utxos(block, spent_utxos)?;
             forked = forked.push(block).expect("forked chain push is valid");
         }
 

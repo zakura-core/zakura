@@ -15,10 +15,11 @@ use super::super::{
 use super::{fixture, injected_store_error, violations, AuditRead, AuditStore};
 use crate::{
     AuxDelivery, BodyRuleId, BodySizeHint, BodyValidationState, BranchId, ChainScore,
-    CheckpointSet, ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState,
-    EngineConfig, EngineMode, EvidenceId, FinalityEpoch, FinalityRecord, FinalitySource, Frontier,
+    CheckpointSet, ConsensusInvalidBodyTombstone, DiskMigrationAuthentication, EligibilityReason,
+    EligibilityState, EngineConfig, EngineMode, EvidenceId, FinalityEpoch, FinalityRecord,
+    FinalitySource, Frontier, FullStateFinalityProvenance, HeaderChainDiskVersion,
     HeaderGeneration, HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner,
-    SourceId, StoreError, SuffixWork, WorkCoordinate,
+    SourceId, StateVersion, StoreAuditSnapshot, StoreError, SuffixWork, WorkCoordinate,
 };
 
 #[test]
@@ -409,14 +410,18 @@ fn rebased_work_origin_requires_finality_history_and_canonical_authentication() 
     store.metadata.header_best_score = ChainScore::new(SuffixWork::zero(), child.hash);
     store.metadata.oldest_retained_height = child.height;
     store.metadata.finality_epoch = FinalityEpoch::new(1);
-    store.finality.push(FinalityRecord {
-        previous: config.bootstrap_anchor().frontier,
-        current: child,
-        source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x91; 32]),
-        },
-        epoch: FinalityEpoch::new(1),
-    });
+    store
+        .finality
+        .push(FinalityRecord::full_state_with_provenance(
+            config.bootstrap_anchor().frontier,
+            child,
+            FinalityEpoch::new(1),
+            FullStateFinalityProvenance::finalized(
+                StateVersion::new(1),
+                child,
+                &[config.bootstrap_anchor().frontier.hash, child.hash],
+            ),
+        ));
     store.snapshot = store.metadata.snapshot();
 
     audit_store(&store, &config).expect("the authenticated rebased origin recovers");
@@ -424,6 +429,80 @@ fn rebased_work_origin_requires_finality_history_and_canonical_authentication() 
     store
         .canonical
         .insert(child.height, block::Hash([0x92; 32]));
+    assert!(violations(&store, &config).contains(&AuditViolation::Configuration));
+}
+
+#[test]
+fn disk_migration_preserves_a_rebased_work_origin_below_the_migrated_frontier() {
+    let (mut store, config) = fixture();
+    let genesis_node = store.nodes[0].clone();
+    let child = store.metadata.frontiers.header_best;
+    let child_node = store.nodes[1].clone();
+    let mut grandchild_header = *child_node.header;
+    grandchild_header.previous_block_hash = child.hash;
+    grandchild_header.time += Duration::seconds(1);
+    grandchild_header.nonce = [2; 32].into();
+    let grandchild_header = Arc::new(grandchild_header);
+    let grandchild_hash = grandchild_header.hash();
+    let grandchild_work = grandchild_header
+        .difficulty_threshold
+        .to_work()
+        .expect("the fixture grandchild target has work");
+    let grandchild = Frontier::new(block::Height(2), grandchild_hash);
+    let grandchild_node = HeaderNode::from_durable_parts(
+        grandchild_header,
+        grandchild_hash,
+        child.hash,
+        grandchild.height,
+        grandchild_work,
+        WorkCoordinate::new(child.hash, grandchild_work.as_u256()),
+        HeaderValidationState::Valid,
+        EligibilityState::default(),
+        BodyValidationState::Verified {
+            evidence: EvidenceId::from_digest([0x61; 32]),
+        },
+        Vec::new(),
+    )
+    .expect("the canonical grandchild fields agree");
+
+    store.nodes = vec![grandchild_node];
+    store.children.clear();
+    store.selected = vec![grandchild];
+    store.verified = vec![grandchild];
+    store.contexts = vec![
+        ValidationContextRecord {
+            header: genesis_node.header,
+            height: genesis_node.height,
+        },
+        ValidationContextRecord {
+            header: child_node.header,
+            height: child.height,
+        },
+    ];
+    store.metadata.work_origin = child;
+    store.metadata.frontiers.finalized = grandchild;
+    store.metadata.frontiers.header_best = grandchild;
+    store.metadata.frontiers.verified_best = grandchild;
+    store.metadata.header_best_score = ChainScore::new(SuffixWork::zero(), grandchild.hash);
+    store.metadata.oldest_retained_height = grandchild.height;
+    store.finality = vec![FinalityRecord {
+        previous: grandchild,
+        current: grandchild,
+        source: FinalitySource::DiskMigration {
+            from_version: HeaderChainDiskVersion(3),
+            network_policy_digest: config.network_policy_digest(),
+            authentication: DiskMigrationAuthentication::FullState,
+        },
+        epoch: store.metadata.finality_epoch,
+    }];
+    store.canonical.insert(grandchild.height, grandchild.hash);
+    store.snapshot = store.metadata.snapshot();
+
+    audit_store(&store, &config).expect("a v3 disk migration keeps an earlier rebased work origin");
+
+    store
+        .canonical
+        .insert(child.height, block::Hash([0x93; 32]));
     assert!(violations(&store, &config).contains(&AuditViolation::Configuration));
 }
 
@@ -439,14 +518,18 @@ fn finality_and_historical_pins_require_an_independent_canonical_index() {
     store.nodes[1].body_validation_state = BodyValidationState::Verified {
         evidence: EvidenceId::from_digest([0x71; 32]),
     };
-    store.finality.push(FinalityRecord {
-        previous: config.bootstrap_anchor().frontier,
-        current: child,
-        source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x72; 32]),
-        },
-        epoch: FinalityEpoch::new(1),
-    });
+    store
+        .finality
+        .push(FinalityRecord::full_state_with_provenance(
+            config.bootstrap_anchor().frontier,
+            child,
+            FinalityEpoch::new(1),
+            FullStateFinalityProvenance::finalized(
+                StateVersion::new(1),
+                child,
+                &[config.bootstrap_anchor().frontier.hash, child.hash],
+            ),
+        ));
     store
         .canonical
         .insert(child.height, block::Hash([0x73; 32]));
@@ -490,14 +573,18 @@ fn migrated_finality_is_rejected_after_the_migration_boundary() {
     let anchor_header = store.nodes[0].header.clone();
 
     store.finality[0].source = FinalitySource::MigratedHeadersOnly;
-    store.finality.push(FinalityRecord {
-        previous: anchor,
-        current: child,
-        source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x81; 32]),
-        },
-        epoch: FinalityEpoch::new(1),
-    });
+    store
+        .finality
+        .push(FinalityRecord::full_state_with_provenance(
+            anchor,
+            child,
+            FinalityEpoch::new(1),
+            FullStateFinalityProvenance::finalized(
+                StateVersion::new(1),
+                child,
+                &[anchor.hash, child.hash],
+            ),
+        ));
     store.metadata.headers_only_migration_epoch = Some(FinalityEpoch::new(0));
     store.metadata.finality_epoch = FinalityEpoch::new(1);
     store.metadata.frontiers.finalized = child;
@@ -641,28 +728,105 @@ fn policy_mismatch_fails_before_collection_visit() {
 }
 
 #[test]
-fn bounded_finality_history_continues_from_an_authenticated_checkpoint() {
+fn bounded_finality_history_continues_from_the_bootstrap_checkpoint() {
     let (mut store, config) = fixture();
     let anchor = store.metadata.frontiers.finalized;
     store.finality_checkpoint = Some(crate::FinalityHistoryCheckpoint {
         epoch: FinalityEpoch::new(0),
         frontier: anchor,
     });
-    store.finality = vec![FinalityRecord {
-        previous: anchor,
-        current: anchor,
-        source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x71; 32]),
-        },
-        epoch: FinalityEpoch::new(1),
-    }];
+    store.finality = vec![FinalityRecord::full_state_with_provenance(
+        anchor,
+        anchor,
+        FinalityEpoch::new(1),
+        FullStateFinalityProvenance::checkpoint_grow(StateVersion::new(1), anchor),
+    )];
     store.metadata.finality_epoch = FinalityEpoch::new(1);
     store.snapshot = store.metadata.snapshot();
 
     audit_store(&store, &config).expect("the authenticated checkpoint continues finality audit");
 
     store.canonical.remove(&anchor.height);
+    audit_store(&store, &config)
+        .expect("the configured bootstrap anchor authenticates its checkpoint directly");
+}
+
+#[test]
+fn recovery_rejects_a_replaced_full_state_finality_receipt() {
+    let (mut store, config) = fixture();
+    let FinalitySource::FullState { mut provenance } = store.finality[0].source else {
+        panic!("the integrated fixture starts with full-state finality");
+    };
+    provenance.evidence = EvidenceId::from_digest([0xa1; 32]);
+    store.finality[0].source = FinalitySource::FullState { provenance };
+
     assert!(violations(&store, &config).contains(&AuditViolation::Finality));
+}
+
+#[test]
+fn full_state_finality_provenance_binds_the_original_transition() {
+    let (store, _) = fixture();
+    let previous = store.metadata.frontiers.finalized;
+    let current = store.metadata.frontiers.header_best;
+    let state_version = StateVersion::new(9);
+    let canonical_path = [previous.hash, current.hash];
+    let cases = [
+        FullStateFinalityProvenance::checkpoint_grow(state_version, current),
+        FullStateFinalityProvenance::finalized(state_version, current, &canonical_path),
+    ];
+
+    for provenance in cases {
+        let record = FinalityRecord::full_state_with_provenance(
+            previous,
+            current,
+            FinalityEpoch::new(1),
+            provenance,
+        );
+        assert_eq!(
+            (&store).authenticates_full_state_finality(record, store.metadata.work_origin,),
+            Ok(true)
+        );
+
+        let FinalitySource::FullState { mut provenance } = record.source else {
+            unreachable!("the fixture constructs a full-state source");
+        };
+        provenance.evidence = EvidenceId::from_digest([0xa2; 32]);
+        let forged = FinalityRecord {
+            source: FinalitySource::FullState { provenance },
+            ..record
+        };
+        assert_eq!(
+            (&store).authenticates_full_state_finality(forged, store.metadata.work_origin,),
+            Ok(false)
+        );
+    }
+
+    let forged_initialization = FinalityRecord::full_state_with_provenance(
+        previous,
+        current,
+        FinalityEpoch::new(1),
+        FullStateFinalityProvenance::initialization(state_version, current),
+    );
+    assert_eq!(
+        (&store)
+            .authenticates_full_state_finality(forged_initialization, store.metadata.work_origin,),
+        Ok(false),
+        "only the epoch-zero full-state import may use initialization provenance"
+    );
+}
+
+#[test]
+fn authenticated_checkpoint_cannot_replace_the_complete_finality_history() {
+    let (mut store, config) = fixture();
+    let finalized = store.metadata.frontiers.finalized;
+    store.finality_checkpoint = Some(crate::FinalityHistoryCheckpoint {
+        epoch: store.metadata.finality_epoch,
+        frontier: finalized,
+    });
+    store.finality.clear();
+    store.snapshot = store.metadata.snapshot();
+
+    assert_eq!(violations(&store, &config), vec![AuditViolation::Finality]);
 }
 
 fn extend(parent: &HeaderNode, nonce: u8) -> HeaderNode {

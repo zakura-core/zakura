@@ -1395,24 +1395,33 @@ pub struct ZakuraPeerSupervisor {
     peers: HashMap<ZakuraPeerId, [u8; TRANSCRIPT_HASH_BYTES]>,
 }
 
+/// Result of applying an authenticated transport to the identity registry.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AuthenticatedPeerRegistration {
+    /// The transport became the active connection for its peer identity.
+    Registered,
+    /// The identity registry retained the existing connection.
+    Duplicate,
+}
+
 impl ZakuraPeerSupervisor {
     /// Registers an authenticated peer or returns `Duplicate` without punishment.
     pub fn register_authenticated(
         &mut self,
         peer_id: ZakuraPeerId,
         transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
-    ) -> crate::zakura::ZakuraUpgradeOutcome {
+    ) -> AuthenticatedPeerRegistration {
         if let Some(existing_hash) = self.peers.get(&peer_id) {
             // D6: the lexicographically smaller transcript hash wins; exact ties keep the incumbent.
             if existing_hash <= &transcript_hash {
                 metrics::counter!("zakura.p2p.handshake.duplicate").increment(1);
-                return crate::zakura::ZakuraUpgradeOutcome::Duplicate { peer_id };
+                return AuthenticatedPeerRegistration::Duplicate;
             }
         }
 
-        self.peers.insert(peer_id.clone(), transcript_hash);
+        self.peers.insert(peer_id, transcript_hash);
         metrics::counter!("zakura.p2p.handshake.upgraded").increment(1);
-        crate::zakura::ZakuraUpgradeOutcome::Upgraded { peer_id }
+        AuthenticatedPeerRegistration::Registered
     }
 
     /// Removes an authenticated peer registration.
@@ -2386,15 +2395,15 @@ mod tests {
 
         assert!(matches!(
             supervisor.register_authenticated(peer_id.clone(), [1; 32]),
-            crate::zakura::ZakuraUpgradeOutcome::Upgraded { .. }
+            AuthenticatedPeerRegistration::Registered
         ));
         assert!(matches!(
             supervisor.register_authenticated(peer_id.clone(), [2; 32]),
-            crate::zakura::ZakuraUpgradeOutcome::Duplicate { .. }
+            AuthenticatedPeerRegistration::Duplicate
         ));
         assert!(matches!(
             supervisor.register_authenticated(peer_id, [0; 32]),
-            crate::zakura::ZakuraUpgradeOutcome::Upgraded { .. }
+            AuthenticatedPeerRegistration::Registered
         ));
     }
 

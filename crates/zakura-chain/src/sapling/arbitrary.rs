@@ -2,8 +2,8 @@
 
 use group::Group;
 use jubjub::ExtendedPoint;
-use rand::SeedableRng;
-use rand_chacha::ChaChaRng;
+use rand_chacha_10::ChaChaRng;
+use rand_core_10::SeedableRng;
 
 use proptest::{collection::vec, prelude::*};
 

@@ -19,8 +19,8 @@ use zakura_state::ChainTipSender;
 
 use crate::{
     components::sync::{
-        ChainSync, BLOCK_DOWNLOAD_RETRY_LIMIT, BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT,
-        GENESIS_TIMEOUT_RETRY, SYNC_RESTART_DELAY, SYNC_RESTART_SLEEP,
+        ChainSync, BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT, GENESIS_TIMEOUT_RETRY,
+        MAX_BLOCK_PEER_REQUESTS_PER_QUEUE_ATTEMPT, SYNC_RESTART_DELAY, SYNC_RESTART_SLEEP,
     },
     config::ZakuradConfig,
 };
@@ -41,10 +41,10 @@ fn ensure_timeouts_consistent() {
         "the post-round sync sleep should be shorter than the sync restart timeout"
     );
 
-    // We multiply by 2, because the Hedge can wait up to BLOCK_DOWNLOAD_TIMEOUT
-    // seconds before retrying.
+    // The hedge can wait up to one block timeout before issuing its second and final peer request.
+    // The two-request bound fits in a `u64`.
     const BLOCK_DOWNLOAD_HEDGE_TIMEOUT: u64 =
-        2 * BLOCK_DOWNLOAD_RETRY_LIMIT as u64 * BLOCK_DOWNLOAD_TIMEOUT.as_secs();
+        MAX_BLOCK_PEER_REQUESTS_PER_QUEUE_ATTEMPT as u64 * BLOCK_DOWNLOAD_TIMEOUT.as_secs();
 
     // This constraint avoids spurious failures due to block download timeouts
     assert!(
@@ -179,7 +179,10 @@ fn request_genesis_is_rate_limited() {
 
     let peer_requests_counter = peer_requests_counter.load(Ordering::SeqCst);
     assert!(peer_requests_counter >= RETRIES_TO_RUN);
-    assert!(peer_requests_counter <= RETRIES_TO_RUN * (BLOCK_DOWNLOAD_RETRY_LIMIT as u8) * 2);
+    // The two-request bound fits in a `u8`.
+    assert!(
+        peer_requests_counter <= RETRIES_TO_RUN * MAX_BLOCK_PEER_REQUESTS_PER_QUEUE_ATTEMPT as u8
+    );
     assert_eq!(
         state_requests_counter.load(Ordering::SeqCst),
         RETRIES_TO_RUN

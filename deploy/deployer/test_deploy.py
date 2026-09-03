@@ -118,6 +118,36 @@ class BuildCacheTests(unittest.TestCase):
             })
 
 
+class MainnetWorkflowSuppressionTests(unittest.TestCase):
+    def test_suppression_is_scoped_to_compatibility_restarts(self):
+        workflow = (
+            SCRIPT_DIR.parent.parent
+            / ".github/workflows/zakura-mainnet-deploy.yml"
+        ).read_text()
+        suppression_step = workflow.split(
+            "      - name: Suppress compatibility watchdog alerts during deploy\n",
+            1,
+        )[1].split("      - name: Deploy fleet\n", 1)[0]
+
+        self.assertIn(
+            "inputs.node == '' || inputs.node == 'zakura-compat'",
+            suppression_step,
+        )
+        self.assertIn("!inputs.no_restart", suppression_step)
+        self.assertIn("root@159.203.113.196", suppression_step)
+        self.assertIn(
+            "/run/zakura-watchdog/deployment-suppressed-until",
+            suppression_step,
+        )
+        self.assertIn(
+            "if ! timeout --signal=TERM --kill-after=5s 60s \\",
+            suppression_step,
+        )
+        self.assertIn("systemctl restart zakura-watchdog", suppression_step)
+        self.assertIn("continuing deploy", suppression_step)
+        self.assertNotIn("tomllib", suppression_step)
+
+
 class NodeBuilder:
     """Shared minimal node fixture for the rendering tests."""
 

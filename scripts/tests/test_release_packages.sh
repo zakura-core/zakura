@@ -34,4 +34,41 @@ if [ "$actual" != "$expected" ]; then
   exit 1
 fi
 
+cat > dependent.toml <<'EOF'
+[dependencies]
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.0" }
+zakura-rpc = { path = "../zakura-rpc", version = "7.0.0" }
+zakura-node-services-legacy = { package = "zakura-node-services", path = "../zakura-node-services", version = "3.1.0" }
+
+[dev-dependencies]
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.1", features = [
+    "rpc-client",
+] }
+
+[target.'cfg(unix)'.dependencies]
+zakura-node-services = "3.2.0"
+EOF
+cat > expected-dependent.toml <<'EOF'
+[dependencies]
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.1-rc0" }
+zakura-rpc = { path = "../zakura-rpc", version = "7.0.0" }
+zakura-node-services-legacy = { package = "zakura-node-services", path = "../zakura-node-services", version = "3.2.1-rc0" }
+
+[dev-dependencies]
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.1-rc0", features = [
+    "rpc-client",
+] }
+
+[target.'cfg(unix)'.dependencies]
+zakura-node-services = "3.2.1-rc0"
+EOF
+
+rewrite_prerelease_dependency_requirements \
+  dependent.toml zakura-node-services 3.2.1-rc0
+if ! diff -u expected-dependent.toml dependent.toml; then
+  exit 1
+fi
+
 printf 'release package identity survives manifest moves\n'
+printf 'prerelease dependency rewrites include older compatible requirements\n'
+printf 'prerelease dependency rewrites cover renamed and bare-string requirements\n'

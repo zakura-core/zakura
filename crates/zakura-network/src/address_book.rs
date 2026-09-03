@@ -17,6 +17,7 @@ use zakura_chain::{parameters::Network, serialization::DateTime32};
 use crate::{
     constants::{self, ADDR_RESPONSE_LIMIT_DENOMINATOR, MAX_ADDRS_IN_MESSAGE},
     meta_addr::MetaAddrChange,
+    peer_registry::PeerRegistry,
     protocol::external::{canonical_ip, canonical_peer_addr, canonical_socket_addr},
     types::{MetaAddr, PeerServices},
     AddressBookPeers, PeerAddrState, PeerSocketAddr,
@@ -277,6 +278,9 @@ pub struct AddressBook {
     /// The configured Zcash network.
     network: Network,
 
+    /// Active connection metadata, stored outside address discovery state.
+    peer_registry: Option<PeerRegistry>,
+
     /// The maximum number of addresses in the address book.
     ///
     /// Always set to [`MAX_ADDRS_IN_ADDRESS_BOOK`](constants::MAX_ADDRS_IN_ADDRESS_BOOK),
@@ -360,6 +364,7 @@ impl AddressBook {
             // services set them with `with_local_listener_services`.
             local_listener_services: PeerServices::NODE_NETWORK,
             network: network.clone(),
+            peer_registry: None,
             addr_limit: constants::MAX_ADDRS_IN_ADDRESS_BOOK,
             span,
             expose_peer_addresses: false,
@@ -389,6 +394,13 @@ impl AddressBook {
     #[must_use]
     pub(crate) fn with_expose_peer_addresses(mut self, expose_peer_addresses: bool) -> Self {
         self.expose_peer_addresses = expose_peer_addresses;
+        self
+    }
+
+    /// Attach the active peer registry used by local RPC diagnostics.
+    #[must_use]
+    pub(crate) fn with_peer_registry(mut self, peer_registry: PeerRegistry) -> Self {
+        self.peer_registry = Some(peer_registry);
         self
     }
 
@@ -1063,6 +1075,12 @@ impl AddressBookPeers for AddressBook {
             .collect()
     }
 
+    fn connected_peers(&self) -> Option<Vec<crate::ConnectedPeer>> {
+        self.peer_registry
+            .as_ref()
+            .map(PeerRegistry::connected_peers)
+    }
+
     fn add_peer(&mut self, peer: PeerSocketAddr) -> bool {
         if self.get(peer).is_some() {
             // Peer already exists in the address book, so we don't need to add it again.
@@ -1077,6 +1095,12 @@ impl AddressBookPeers for Arc<Mutex<AddressBook>> {
         self.lock()
             .expect("panic in a previous thread that was holding the mutex")
             .recently_live_peers(now)
+    }
+
+    fn connected_peers(&self) -> Option<Vec<crate::ConnectedPeer>> {
+        self.lock()
+            .expect("panic in a previous thread that was holding the mutex")
+            .connected_peers()
     }
 
     fn add_peer(&mut self, peer: PeerSocketAddr) -> bool {
@@ -1118,6 +1142,7 @@ impl Clone for AddressBook {
             local_listener: self.local_listener,
             local_listener_services: self.local_listener_services,
             network: self.network.clone(),
+            peer_registry: self.peer_registry.clone(),
             addr_limit: self.addr_limit,
             span: self.span.clone(),
             expose_peer_addresses: self.expose_peer_addresses,

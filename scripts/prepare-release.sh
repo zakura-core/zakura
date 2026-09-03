@@ -151,6 +151,8 @@ if [ "$dry_run" = 0 ]; then
         [ -n "$dirty_line" ] || continue
         dirty_path="${dirty_line:3}"
         case "$dirty_path" in
+          Cargo.toml|\
+          Cargo.lock|\
           crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt|\
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin|\
           crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin|\
@@ -198,9 +200,7 @@ set_crate_version() {
       "$manifest_rel"
     local dep_manifest
     while IFS= read -r dep_manifest; do
-      CRATE="$crate" OLD="$current" NEW="$target" perl -0777 -pi -e \
-        's/(\Q$ENV{CRATE}\E\s*=\s*\{[^}]*?version\s*=\s*")\Q$ENV{OLD}\E(")/$1$ENV{NEW}$2/gs' \
-        "$dep_manifest"
+      rewrite_prerelease_dependency_requirements "$dep_manifest" "$crate" "$target"
     done < <(jq -r '.packages[].manifest_path' <<<"$metadata")
   else
     cargo release version "$target" \

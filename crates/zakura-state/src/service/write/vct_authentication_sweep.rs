@@ -38,7 +38,11 @@ use crate::{
             FinalizedState, VctAuthenticationProof, VctAuxiliaryFailureAttribution,
             VctAuxiliaryWindow, VctSuccessorWitness,
         },
-        write::{vct_write_retry::VctWriteRetryManager, HeaderChainWriter, VctAuxiliaryWindowRead},
+        write::{
+            vct_failure_repair_trigger,
+            vct_write_retry::{VctRepairTrigger, VctWriteRetryManager},
+            HeaderChainWriter, VctAuxiliaryWindowRead,
+        },
     },
 };
 
@@ -187,7 +191,8 @@ impl VctAuthenticationSweeper {
                 // No selected delivery carries roots for this height. The committer
                 // also requests a replacement when it reaches this height.
                 Ok(VctAuxiliaryWindowRead::Missing { height }) => {
-                    repair_manager.request_sweep_repair(height);
+                    repair_manager
+                        .request_sweep_repair(height, VctRepairTrigger::MissingRootObserved);
                     break;
                 }
                 Err(error) => {
@@ -202,19 +207,22 @@ impl VctAuthenticationSweeper {
             // Without the successor header there is no commitment that proves these roots.
             let Some(successor_witness) = auxiliary_window.successor.clone() else {
                 if let Some(height) = auxiliary_window.successor_height {
-                    repair_manager.request_sweep_repair(height);
+                    repair_manager
+                        .request_sweep_repair(height, VctRepairTrigger::MissingRootObserved);
                 }
                 break;
             };
             if deliveries_share_dispute_evidence(&auxiliary_window, &successor_witness) {
-                repair_manager.request_sweep_repair(selected_height);
+                repair_manager
+                    .request_sweep_repair(selected_height, VctRepairTrigger::MissingRootObserved);
                 break;
             }
             let (Some(current_delivery_roots), Some(successor_delivery_roots)) = (
                 supplied_roots(&auxiliary_window.delivery),
                 successor_witness.delivery.as_ref().and_then(supplied_roots),
             ) else {
-                repair_manager.request_sweep_repair(selected_height);
+                repair_manager
+                    .request_sweep_repair(selected_height, VctRepairTrigger::MissingRootObserved);
                 break;
             };
 
@@ -368,13 +376,15 @@ impl VctAuthenticationSweeper {
         );
 
         match writer.record_vct_auxiliary_failure(auxiliary_window, attribution, failure) {
-            Ok(Some(ApplyResult::Committed | ApplyResult::NoChange(_))) => {
+            Ok(Some(apply_result @ (ApplyResult::Committed | ApplyResult::NoChange(_)))) => {
                 let Some(repair_height) =
                     attribution.repair_height(delivery_height, Some(successor_witness.height))
                 else {
                     return;
                 };
-                repair_manager.request_sweep_repair(repair_height);
+                let trigger = vct_failure_repair_trigger(&apply_result)
+                    .expect("committed or idempotent evidence has a trigger");
+                repair_manager.request_sweep_repair(repair_height, trigger);
             }
             Ok(Some(apply_result)) => {
                 tracing::debug!(

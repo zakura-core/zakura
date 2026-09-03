@@ -183,7 +183,9 @@ fn fold_to_level<H: Hashable + Clone>(block: &[H], level: u8) -> H {
 
     for current in TRACKED_SUBTREE_HEIGHT..level {
         nodes = nodes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| H::combine(Level::from(current), &pair[0], &pair[1]))
             .collect();
     }

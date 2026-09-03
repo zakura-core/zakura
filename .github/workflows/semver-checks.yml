@@ -20,6 +20,8 @@
 #   keeps optional heavy features (e.g. lightwalletd-grpc-tests and its
 #   protoc dependency) out of the rustdoc builds. Feature-gated public APIs
 #   are not semver-checked, mirroring existing release practice.
+# - The `zakura` node binary package is excluded because its Rust types are not
+#   a supported library API. Its release version is managed separately.
 # - publish = false members (xtask, zakura-watchdog) are skipped automatically.
 # - A NEW publishable crate that has never been published to crates.io fails
 #   with "no baseline": add `--exclude <crate>` to the check command in the
@@ -194,7 +196,7 @@ jobs:
 
       # Deliberately unpinned (like cargo-hack): cargo-semver-checks must
       # track new stable rustdoc formats; pin only if a regression forces it.
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 #v2.86.3
         with:
           tool: cargo-semver-checks
 
@@ -244,7 +246,7 @@ jobs:
           toolchain: stable
           cache: false
 
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 #v2.86.3
         with:
           tool: cargo-public-api
 
@@ -291,7 +293,7 @@ jobs:
             semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-
             semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
 
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 #v2.86.3
         with:
           tool: cargo-semver-checks
 

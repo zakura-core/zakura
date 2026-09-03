@@ -27,8 +27,9 @@ use zakura_chain::work::difficulty::{CompactDifficulty, U256};
 use crate::{ReadRequest, Request};
 
 use crate::{
-    service::read::AddressUtxos, ContextuallyVerifiedBlock, NonFinalizedState, TransactionLocation,
-    WatchReceiver, MAX_BLOCK_REORG_HEIGHT,
+    service::read::{AddressUtxos, ChainTipInfo},
+    ContextuallyVerifiedBlock, NonFinalizedState, TransactionLocation, WatchReceiver,
+    MAX_BLOCK_REORG_HEIGHT,
 };
 
 #[cfg(test)]
@@ -80,17 +81,11 @@ pub enum Response {
     /// Response to [`Request::Transaction`] with the specified transaction.
     Transaction(Option<Arc<Transaction>>),
 
-    /// Response to [`Request::AnyChainTransaction`] with the specified transaction.
-    AnyChainTransaction(Option<AnyTx>),
-
     /// Response to [`Request::UnspentBestChainUtxo`] with the UTXO
     UnspentBestChainUtxo(Option<transparent::Utxo>),
 
     /// Response to [`Request::Block`] with the specified block.
     Block(Option<Arc<Block>>),
-
-    /// Response to [`Request::BlockAndSize`] with the specified block and size.
-    BlockAndSize(Option<(Arc<Block>, usize)>),
 
     /// The response to a `BlockHeader` request.
     BlockHeader {
@@ -392,7 +387,7 @@ pub struct BlockSyncBodyMetadata {
 /// A response to a read-only
 /// [`ReadStateService`](crate::service::ReadStateService)'s [`ReadRequest`].
 pub enum ReadResponse {
-    /// Response to [`ReadRequest::UsageInfo`] with the current best chain tip.
+    /// Response to [`ReadRequest::UsageInfo`] with a recent disk space usage estimate.
     UsageInfo(u64),
 
     /// Response to [`ReadRequest::PruningInfo`] with this node's pruning status.
@@ -515,14 +510,8 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::BestHeaderTip`].
     BestHeaderTip(Option<(block::Height, block::Hash)>),
 
-    /// Response to [`ReadRequest::MissingBlockBodies`].
-    MissingBlockBodies(Vec<block::Height>),
-
     /// Response to [`ReadRequest::MissingBlockBodyMetadata`].
     MissingBlockBodyMetadata(BlockSyncBodyMetadata),
-
-    /// Response to [`ReadRequest::BlockSizeHints`].
-    BlockSizeHints(Vec<(block::Height, Option<u32>)>),
 
     /// Response to [`ReadRequest::BlocksByHeightRange`].
     Blocks(Vec<(block::Height, Arc<Block>, usize)>),
@@ -611,6 +600,10 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::TipBlockSize`]
     TipBlockSize(Option<usize>),
 
+    /// Response to [`ReadRequest::ChainTips`] with the tip of every chain this node
+    /// currently tracks, in descending height order.
+    ChainTips(Vec<ChainTipInfo>),
+
     /// Response to [`ReadRequest::NonFinalizedBlocksListener`]
     NonFinalizedBlocksListener(NonFinalizedBlocksListener),
 
@@ -672,7 +665,9 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::BlockHash(hash) => Ok(Response::BlockHash(hash)),
 
             ReadResponse::Block(block) => Ok(Response::Block(block)),
-            ReadResponse::BlockAndSize(block) => Ok(Response::BlockAndSize(block)),
+            ReadResponse::BlockAndSize(_) => {
+                Err("there is no corresponding Response for this ReadResponse")
+            }
             ReadResponse::BlockHeader {
                 header,
                 hash,
@@ -687,7 +682,9 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::Transaction(tx_info) => {
                 Ok(Response::Transaction(tx_info.map(|tx_info| tx_info.tx)))
             }
-            ReadResponse::AnyChainTransaction(tx) => Ok(Response::AnyChainTransaction(tx)),
+            ReadResponse::AnyChainTransaction(_) => {
+                Err("there is no corresponding Response for this ReadResponse")
+            }
             ReadResponse::UnspentBestChainUtxo(utxo) => Ok(Response::UnspentBestChainUtxo(utxo)),
 
 
@@ -725,9 +722,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::RetainedHeaderPathPage(_)
             | ReadResponse::RetainedHeaderPathReleased(_)
             | ReadResponse::BestHeaderTip(_)
-            | ReadResponse::MissingBlockBodies(_)
             | ReadResponse::MissingBlockBodyMetadata(_)
-            | ReadResponse::BlockSizeHints(_)
             | ReadResponse::Blocks(_)
             | ReadResponse::NonFinalizedBlocksListener(_)
             | ReadResponse::IsTransparentOutputSpent(_) => {
@@ -741,7 +736,9 @@ impl TryFrom<ReadResponse> for Response {
 
             ReadResponse::ValidBlockProposal => Ok(Response::ValidBlockProposal),
 
-            ReadResponse::SolutionRate(_) | ReadResponse::TipBlockSize(_) => {
+            ReadResponse::SolutionRate(_)
+            | ReadResponse::TipBlockSize(_)
+            | ReadResponse::ChainTips(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
         }

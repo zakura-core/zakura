@@ -24,13 +24,465 @@ use zakura_test::{prelude::*, transcript::Transcript};
 use crate::{
     arbitrary::Prepare,
     init_test,
-    service::{arbitrary::populated_state, chain_tip::TipAction, StateService},
+    service::{
+        arbitrary::populated_state,
+        chain_tip::TipAction,
+        finalized_state::{DiskWriteBatch, FinalizedState, FrontierArtifact, FrontierEntry},
+        write::NonFinalizedWriteFailureKind,
+        StateService,
+    },
     tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
-    BoxError, CheckpointVerifiedBlock, Config, Request, Response, SemanticallyVerifiedBlock,
-    CHAIN_TIP_UPDATE_WAIT_LIMIT,
+    BoxError, CheckpointVerifiedBlock, CommitBlockError, Config, HistoricalTreeUnavailable,
+    PruningConfig, Request, Response, SemanticallyVerifiedBlock, StateInitError, StorageMode,
+    CHAIN_TIP_UPDATE_WAIT_LIMIT, MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+#[tokio::test]
+async fn descendant_arriving_after_a_local_parent_failure_completes_immediately() {
+    let network = Network::Mainnet;
+    let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+        .await
+        .expect("the ephemeral state opens");
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_419201_BYTES
+        .zcash_deserialize_into()
+        .expect("the child block vector decodes");
+    let block = block.prepare();
+    let ancestor = block.block.header.previous_block_hash;
+    state.remember_failed_ancestor(ancestor, ancestor, NonFinalizedWriteFailureKind::Retryable);
+
+    let response = state
+        .queue_and_commit_to_non_finalized_state(block.clone())
+        .await
+        .expect("the state keeps the response channel open")
+        .expect_err("the failed parent prevents this request from waiting");
+
+    assert!(matches!(
+        response.inner(),
+        CommitBlockError::HeaderChainError { error }
+            if error.contains(&ancestor.to_string())
+    ));
+    assert_eq!(
+        state.non_finalized_failed_ancestors.get(&block.hash),
+        Some(&(ancestor, NonFinalizedWriteFailureKind::Retryable))
+    );
+}
+
+#[tokio::test]
+async fn state_init_loads_the_embedded_mainnet_frontier_grid() {
+    let network = Network::Mainnet;
+    let config = Config::ephemeral();
+    assert!(
+        config.derive_historical_trees(false),
+        "an ephemeral archive config derives, so this covers the deriving case"
+    );
+
+    assert!(
+        super::init(config.clone(), &network, Height::MAX, 0)
+            .await
+            .is_ok(),
+        "a deriving Mainnet node must start without a frontier grid path"
+    );
+
+    let loaded = super::load_historical_frontier_artifact(&network, &config, false)
+        .expect("the embedded Mainnet grid loads");
+    assert_eq!(
+        loaded.last_checkpoint,
+        Some(network.checkpoint_list().max_height()),
+        "the default grid covers the embedded checkpoint handoff"
+    );
+}
+
+#[tokio::test]
+async fn historical_frontier_load_errors_are_returned_from_state_init() {
+    let network = Network::Mainnet;
+    let temp_dir = tempfile::tempdir().expect("temporary directory is created");
+    let missing_path = temp_dir.path().join("missing.bin");
+    let missing_config = Config {
+        historical_frontier_artifact: Some(missing_path.clone()),
+        ..Config::ephemeral()
+    };
+
+    assert!(matches!(
+        super::init(missing_config, &network, Height::MAX, 0).await,
+        Err(StateInitError::HistoricalFrontierArtifact { path, .. }) if path == missing_path
+    ));
+
+    let corrupt_path = temp_dir.path().join("corrupt.bin");
+    std::fs::write(&corrupt_path, b"not a frontier artifact")
+        .expect("corrupt test artifact is written");
+    let corrupt_config = Config {
+        historical_frontier_artifact: Some(corrupt_path.clone()),
+        ..Config::ephemeral()
+    };
+
+    assert!(matches!(
+        super::init(corrupt_config.clone(), &network, Height::MAX, 0).await,
+        Err(StateInitError::HistoricalFrontierArtifact { path, .. }) if path == corrupt_path
+    ));
+
+    // A node that does not derive never reads the file, so the same broken path is a warning
+    // rather than a refusal to start.
+    let legacy_recompute = Config {
+        vct_fast_sync: false,
+        ..corrupt_config
+    };
+    assert!(
+        super::load_historical_frontier_artifact(&network, &legacy_recompute, false).is_ok(),
+        "an unusable grid must not stop a node that would never have read it"
+    );
+}
+
+#[test]
+fn durable_vct_marker_keeps_historical_derivation_enabled_after_config_change() {
+    let network = Network::Mainnet;
+    let initial_config = Config::ephemeral();
+    let finalized_state =
+        FinalizedState::new(&initial_config, &network).expect("ephemeral finalized state opens");
+    let artifact_checkpoint = Height(11);
+    let artifact_file =
+        tempfile::NamedTempFile::new().expect("temporary frontier artifact is created");
+    let artifact = FrontierArtifact {
+        spacing: 1,
+        last_checkpoint: artifact_checkpoint,
+        entries: vec![FrontierEntry {
+            height: Height(0),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
+        }],
+    };
+    std::fs::write(artifact_file.path(), artifact.encode(&network))
+        .expect("historical frontier artifact is written");
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&finalized_state.db, Height(10));
+    finalized_state
+        .db
+        .write_batch(batch)
+        .expect("VCT handoff marker is written");
+
+    let reopened_config = Config {
+        checkpoint_sync: false,
+        vct_fast_sync: false,
+        historical_frontier_artifact: Some(artifact_file.path().to_path_buf()),
+        ..initial_config
+    };
+    assert!(
+        !reopened_config.derive_historical_trees(false),
+        "the current configuration does not start a VCT fast sync"
+    );
+
+    let loaded = super::load_historical_frontier_artifact(
+        &network,
+        &reopened_config,
+        finalized_state.db.vct_synced_below().is_some(),
+    )
+    .expect("the durable marker loads the configured grid after sync settings change");
+    assert_eq!(
+        loaded.last_checkpoint,
+        Some(artifact_checkpoint),
+        "the reopened archive keeps the grid needed to serve its absent band"
+    );
+}
+
+#[test]
+fn historical_frontier_artifact_older_than_database_vct_handoff_is_ignored() {
+    let network = Network::Mainnet;
+    let temp_dir = tempfile::tempdir().expect("temporary directory is created");
+    let state_config = Config::ephemeral();
+    let finalized_state =
+        FinalizedState::new(&state_config, &network).expect("ephemeral finalized state opens");
+    let vct_handoff = Height(10);
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&finalized_state.db, vct_handoff);
+    finalized_state
+        .db
+        .write_batch(batch)
+        .expect("VCT handoff marker is written");
+
+    let artifact_path = |checkpoint: Height| {
+        let path = temp_dir
+            .path()
+            .join(format!("frontiers-{}.bin", checkpoint.0));
+        let artifact = FrontierArtifact {
+            spacing: 1,
+            last_checkpoint: checkpoint,
+            entries: vec![FrontierEntry {
+                height: checkpoint,
+                sapling: Arc::new(Default::default()),
+                orchard: Arc::new(Default::default()),
+                ironwood: Arc::new(Default::default()),
+            }],
+        };
+        std::fs::write(&path, artifact.encode(&network))
+            .expect("historical frontier artifact is written");
+        path
+    };
+
+    let stale_path = artifact_path(Height(9));
+    let stale_config = Config {
+        historical_frontier_artifact: Some(stale_path.clone()),
+        ..state_config.clone()
+    };
+    let stale_cache = super::load_historical_frontier_artifact(&network, &stale_config, false)
+        .expect("the stale artifact decodes")
+        .discard_if_before_vct_handoff(&stale_config, &finalized_state.db);
+    assert_eq!(
+        stale_cache
+            .lock()
+            .expect("historical tree cache lock is available")
+            .last_checkpoint(),
+        None,
+        "a stale artifact is unavailable rather than preventing startup"
+    );
+
+    for checkpoint in [vct_handoff, Height(11)] {
+        let config = Config {
+            historical_frontier_artifact: Some(artifact_path(checkpoint)),
+            ..state_config.clone()
+        };
+        let cache = super::load_historical_frontier_artifact(&network, &config, false)
+            .expect("the covering artifact decodes")
+            .discard_if_before_vct_handoff(&config, &finalized_state.db);
+        assert_eq!(
+            cache
+                .lock()
+                .expect("historical tree cache lock is available")
+                .last_checkpoint(),
+            Some(checkpoint),
+            "an artifact at or above the VCT handoff must cover the absent band"
+        );
+    }
+}
+
+#[test]
+fn historical_frontier_artifact_must_tile_the_band_within_the_replay_limit() {
+    let network = Network::Mainnet;
+    let temp_dir = tempfile::tempdir().expect("temporary directory is created");
+
+    let write = |name: &str, last_checkpoint: Height, entries: Vec<Height>| {
+        let path = temp_dir.path().join(name);
+        let artifact = FrontierArtifact {
+            spacing: 1,
+            last_checkpoint,
+            entries: entries
+                .into_iter()
+                .map(|height| FrontierEntry {
+                    height,
+                    sapling: Arc::new(Default::default()),
+                    orchard: Arc::new(Default::default()),
+                    ironwood: Arc::new(Default::default()),
+                })
+                .collect(),
+        };
+        std::fs::write(&path, artifact.encode(&network)).expect("artifact writes");
+        path
+    };
+
+    let sparse_path = write("sparse.bin", Height(200_000), vec![Height(0)]);
+    let sparse = Config {
+        historical_frontier_artifact: Some(sparse_path.clone()),
+        ..Config::ephemeral()
+    };
+    assert!(matches!(
+        super::load_historical_frontier_artifact(&network, &sparse, false),
+        Err(StateInitError::HistoricalFrontierArtifactTooSparse {
+            path,
+            blocks: 199_999,
+            limit: MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+        }) if path == sparse_path
+    ));
+
+    let empty_path = write("empty.bin", Height(200_000), vec![]);
+    let empty = Config {
+        historical_frontier_artifact: Some(empty_path.clone()),
+        ..Config::ephemeral()
+    };
+    assert!(matches!(
+        super::load_historical_frontier_artifact(&network, &empty, false),
+        Err(StateInitError::HistoricalFrontierArtifactTooSparse {
+            path,
+            blocks: 200_000,
+            limit: MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+        }) if path == empty_path
+    ));
+
+    let covering = Config {
+        historical_frontier_artifact: Some(write(
+            "covering.bin",
+            Height(10),
+            vec![Height(0), Height(10)],
+        )),
+        ..Config::ephemeral()
+    };
+    assert!(
+        super::load_historical_frontier_artifact(&network, &covering, false).is_ok(),
+        "a grid whose gaps fit the serving replay limit must load"
+    );
+
+    let mid_chain_path = write("mid-chain.bin", Height(2_000_100), vec![Height(2_000_000)]);
+    let mid_chain = Config {
+        historical_frontier_artifact: Some(mid_chain_path.clone()),
+        ..Config::ephemeral()
+    };
+    assert!(matches!(
+        super::load_historical_frontier_artifact(&network, &mid_chain, false),
+        Err(StateInitError::HistoricalFrontierArtifactTooSparse {
+            path,
+            blocks: 2_000_000,
+            limit: MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+        }) if path == mid_chain_path
+    ));
+
+    let unused_sparse = Config {
+        historical_frontier_artifact: Some(sparse_path),
+        storage_mode: StorageMode::Pruned(PruningConfig::default()),
+        ..Config::ephemeral()
+    };
+    assert!(
+        super::load_historical_frontier_artifact(&network, &unused_sparse, false).is_ok(),
+        "a sparse grid is ignored when derivation is off"
+    );
+}
+
+#[test]
+fn frontier_grid_coverage_is_incomparable_until_both_sides_exist() {
+    assert_eq!(
+        super::frontier_grid_ends_before_vct_handoff(None, None),
+        None,
+        "neither side is comparable"
+    );
+    assert_eq!(
+        super::frontier_grid_ends_before_vct_handoff(Some(Height(9)), None),
+        None,
+        "an unmarked database cannot fail coverage"
+    );
+    assert_eq!(
+        super::frontier_grid_ends_before_vct_handoff(None, Some(Height(10))),
+        None,
+        "an unloaded grid cannot fail coverage"
+    );
+    assert_eq!(
+        super::frontier_grid_ends_before_vct_handoff(Some(Height(9)), Some(Height(10))),
+        Some((Height(9), Height(10))),
+        "a grid that ends below the handoff is uncovered"
+    );
+    assert_eq!(
+        super::frontier_grid_ends_before_vct_handoff(Some(Height(10)), Some(Height(10))),
+        None,
+        "a grid that ends on the handoff covers the band"
+    );
+    assert_eq!(
+        super::frontier_grid_ends_before_vct_handoff(Some(Height(11)), Some(Height(10))),
+        None,
+        "a newer grid may cover an older handoff"
+    );
+}
+
+#[test]
+fn historical_frontier_coverage_is_rechecked_once_the_vct_marker_exists() {
+    use std::sync::OnceLock;
+
+    use zakura_node_services::sync_lifecycle::{
+        HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
+    };
+
+    use crate::service::{
+        non_finalized_state::NonFinalizedState, watch_receiver::WatchReceiver,
+        HeaderChainSubscriptions, ReadStateService, VctRootRepairStatus,
+    };
+
+    let network = Network::Mainnet;
+    let temp_dir = tempfile::tempdir().expect("temporary directory is created");
+    let artifact_path = temp_dir.path().join("frontiers.bin");
+    let artifact = FrontierArtifact {
+        spacing: 1,
+        last_checkpoint: Height(9),
+        entries: vec![FrontierEntry {
+            height: Height(9),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
+        }],
+    };
+    std::fs::write(&artifact_path, artifact.encode(&network))
+        .expect("historical frontier artifact is written");
+
+    let config = Config {
+        historical_frontier_artifact: Some(artifact_path),
+        ..Config::ephemeral()
+    };
+    let finalized_state =
+        FinalizedState::new(&config, &network).expect("ephemeral finalized state opens");
+    let historical_trees = super::load_historical_frontier_artifact(&network, &config, false)
+        .expect("the historical frontier artifact loads")
+        .discard_if_before_vct_handoff(&config, &finalized_state.db);
+
+    let (_non_finalized_sender, non_finalized_receiver) =
+        tokio::sync::watch::channel(NonFinalizedState::new(&network));
+    let (_repair_sender, repair_receiver) =
+        tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let (_header_chain_snapshot_sender, header_chain_snapshot_receiver) =
+        tokio::sync::watch::channel(None);
+    let (_header_chain_view_sender, header_chain_view_receiver) = tokio::sync::watch::channel(None);
+    let (_header_runtime_status_sender, header_runtime_status_receiver) =
+        tokio::sync::watch::channel(HeaderRuntimeStatus::Detached {
+            epoch: LifecycleEpoch::INITIAL,
+            reason: HeaderRuntimeDetachedReason::AwaitingSemanticHandoff,
+        });
+    let (_header_chain_reader_sender, header_chain_reader_receiver) =
+        tokio::sync::watch::channel(None);
+
+    let read_state = ReadStateService::new(
+        &finalized_state,
+        None,
+        Arc::new(OnceLock::new()),
+        WatchReceiver::new(non_finalized_receiver),
+        repair_receiver,
+        HeaderChainSubscriptions {
+            snapshots: header_chain_snapshot_receiver,
+            views: header_chain_view_receiver,
+            runtime_status: header_runtime_status_receiver,
+            reader: header_chain_reader_receiver,
+        },
+        historical_trees,
+    );
+
+    assert!(
+        read_state.has_usable_historical_frontier_grid(),
+        "the grid is usable before the durable marker exists"
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.update_vct_sync_marker(&finalized_state.db, Height(10));
+    finalized_state
+        .db
+        .write_batch(batch)
+        .expect("a newer VCT handoff marker is written");
+    let unavailable = HistoricalTreeUnavailable {
+        hash_or_height: Height(9).into(),
+        last_checkpoint: Height(10),
+    };
+    let error = super::historical_frontiers(&read_state, Height(9).into(), unavailable.clone())
+        .expect_err("a stale grid must not serve the uncovered band");
+    assert_eq!(
+        error.downcast_ref::<HistoricalTreeUnavailable>(),
+        Some(&unavailable),
+        "a stale grid makes historical trees unavailable without surfacing an artifact error"
+    );
+    assert_eq!(
+        read_state
+            .historical_trees
+            .lock()
+            .expect("historical tree cache lock is available")
+            .last_checkpoint(),
+        None,
+        "the stale artifact is discarded after the first serving-time check"
+    );
+    assert!(!read_state.has_usable_historical_frontier_grid());
+}
 
 #[test]
 fn block_sync_body_anchor_rolls_back_to_the_selected_fork_intersection() {
@@ -333,7 +785,9 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     // The fixture has no network-supplied auxiliary root.
     config.vct_fast_sync = false;
     let (mut state_service, read, _tip, _tip_change) =
-        StateService::new(config, &network, max_checkpoint_height, 0).await;
+        StateService::new(config, &network, max_checkpoint_height, 0)
+            .await
+            .expect("test state initialization succeeds");
 
     // Commit blocks 0 and 1 to the finalized state and wait for each write to land on disk, so the
     // finalized tip catches up to the maximum checkpoint height and the last block hash we sent.
@@ -446,7 +900,9 @@ async fn legacy_mode_handoff_keeps_header_runtime_detached() -> Result<()> {
         .zcash_deserialize_into::<Arc<Block>>()?;
 
     let (mut state, read, _tip, _tip_change) =
-        StateService::new(Config::ephemeral(), &network, Height(0), 0).await;
+        StateService::new(Config::ephemeral(), &network, Height(0), 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
     let result = state
         .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis))
         .await;
@@ -514,7 +970,9 @@ async fn handoff_trigger_microbench() -> Result<()> {
     // Use `Height::MAX` so the height condition is never met: the helper runs its full guard but
     // never transitions, which is exactly the non-transitioning path we want to measure.
     let (mut state_service, _read, _tip, _tip_change) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
     for block in &blocks[0..=1] {
         let checkpoint = CheckpointVerifiedBlock::from(block.clone());
@@ -706,7 +1164,7 @@ proptest! {
         let (mut state_service, _, _, _) = Runtime::new().unwrap().block_on(async {
             // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
             StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await
-        });
+        }).expect("ephemeral state initialization succeeds");
 
         prop_assert_eq!(state_service.read_service.db.finalized_value_pool(), ValueBalance::zero());
         prop_assert_eq!(
@@ -801,7 +1259,7 @@ proptest! {
         let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change) = runtime.block_on(async {
             // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
             StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await
-        });
+        }).expect("ephemeral state initialization succeeds");
 
         prop_assert_eq!(latest_chain_tip.best_tip_height(), None);
         prop_assert_eq!(chain_tip_change.last_tip_change(), None);

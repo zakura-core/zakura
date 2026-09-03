@@ -9,7 +9,6 @@
 
 pub use zakura_chain;
 
-#[allow(deprecated)]
 pub use crate::methods::{
     hex_data::HexData,
     trees::{
@@ -28,7 +27,7 @@ pub use crate::methods::{
         network_info::GetNetworkInfoResponse,
         peer_info::{GetPeerInfoResponse, PeerInfo},
         submit_block::{SubmitBlockErrorResponse, SubmitBlockResponse},
-        subsidy::{BlockSubsidy, FundingStream, GetBlockSubsidyResponse},
+        subsidy::{FundingStream, GetBlockSubsidyResponse},
         transaction::{
             Input, JoinSplit, Orchard, OrchardAction, OrchardFlags, Output, ScriptPubKey,
             ScriptSig, ShieldedOutput, ShieldedSpend, TransactionObject, TransactionTemplate,
@@ -37,7 +36,7 @@ pub use crate::methods::{
         validate_address::ValidateAddressResponse,
         z_validate_address::{ZValidateAddressResponse, ZValidateAddressType},
     },
-    AddressStrings, BlockHeaderObject, BlockObject, EndOfService, GetAddressBalanceRequest,
+    BlockHeaderObject, BlockObject, EndOfService, GetAddressBalanceRequest,
     GetAddressBalanceResponse, GetAddressTxIdsRequest, GetAddressUtxosResponse,
     GetAddressUtxosResponseObject, GetBlockHashResponse, GetBlockHeaderResponse,
     GetBlockHeightAndHashResponse, GetBlockResponse, GetBlockTransaction, GetBlockTrees,

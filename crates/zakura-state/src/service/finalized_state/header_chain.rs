@@ -19,14 +19,14 @@ use zakura_header_chain::{
     BodyWorkAuthority, BodyWorkOwner, ChangeSet, CommittedHeaderChainView, CommittedStallReceipt,
     CounterExhausted, EligibilityReason, EngineConfig, EngineMetadata, EngineMode, EngineSnapshot,
     EvidenceId, FinalityHistoryCheckpoint, FinalityRecord, FinalitySource, Frontier,
-    FullStateEvidenceAuthority, FullStateFinalized, HeaderChainEngine, HeaderInsertionFacts,
-    HeaderLocator, HeaderNode, HeaderSyncWorkOwner, HeaderValidationFacts, HeaderWorkAuthority,
-    MemHeaderStore, NoChangeReceipt, RecoveryFailure, RecoveryPlan, RecoveryRepair, RowLimit,
-    SourceId, StaleReceipt, StateVersion, StoreAuditRead, StoreAuditSnapshot, StoreCollection,
-    StoreError, SystemClock, TransitionContext, TransitionEffect, TransitionEvent,
-    TransitionFailure, TransitionInput, TransitionRequest, UntrustedAuxDeliveryRow,
-    ValidationContextRecord, ValidationLease, VerifiedChainChanged, VerifiedChangeCause,
-    VerifiedHeaderRef,
+    FullStateEvidenceAuthority, FullStateFinalityProvenance, FullStateFinalized,
+    HeaderChainDiskVersion, HeaderChainEngine, HeaderInsertionFacts, HeaderLocator, HeaderNode,
+    HeaderSyncWorkOwner, HeaderValidationFacts, HeaderWorkAuthority, MemHeaderStore,
+    NoChangeReceipt, RecoveryFailure, RecoveryPlan, RecoveryRepair, RowLimit, SourceId,
+    StaleReceipt, StateVersion, StoreAuditRead, StoreAuditSnapshot, StoreCollection, StoreError,
+    SystemClock, TransitionContext, TransitionEffect, TransitionEvent, TransitionFailure,
+    TransitionInput, TransitionRequest, UntrustedAuxDeliveryRow, ValidationContextRecord,
+    ValidationLease, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
 
 use crate::{
@@ -39,30 +39,228 @@ use super::{
     disk_format::{
         header_chain::{
             EligibilityReasonKind, HeaderAuxDeliveryKey, HeaderChildKey, HeaderDeferredKey,
-            HeaderEligibilityRootKey, HeaderFinalityKey, HeaderHeightKey,
+            HeaderEligibilityRootKey, HeaderFinalityKey, HeaderFinalityWitnessKey, HeaderHeightKey,
         },
         header_chain_values::{
             decode_untrusted_aux_delivery, FullStateBodyValidationEvidenceAuthorityDisk,
-            HeaderChainValueError, HeaderEligibilityReasonDisk, HeaderNodeDisk,
-            HeaderReconstructionPhaseDisk, HeaderReconstructionProgressDisk, HeaderRowCountDisk,
-            HeaderValidationContextDisk,
+            HeaderChainValueError, HeaderEligibilityReasonDisk, HeaderFinalityWitnessDisk,
+            HeaderNodeDisk, HeaderReconstructionPhaseDisk, HeaderReconstructionProgressDisk,
+            HeaderRowCountDisk, HeaderValidationContextDisk,
         },
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
+    zakura_db::block::ZAKURA_HEADER_HASH_BY_HEIGHT,
     DiskDb, DiskWriteBatch, ReadDisk, WriteDisk, HEADER_AUX_DELIVERY,
     HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
     HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
-    HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
+    HEADER_FINALITY_WITNESS, HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT,
+    HEADER_VERIFIED,
 };
 
 const METADATA_KEY: &[u8] = b"";
 const FINALITY_HISTORY_CHECKPOINT_KEY: &[u8] = b"finality-history-checkpoint-v1";
 const FINALITY_HISTORY_COUNT_KEY: &[u8] = b"finality-history-count-v1";
+const FINALITY_WITNESS_COUNT_KEY: &[u8] = b"finality-witness-count-v1";
 const TOMBSTONE_COUNT_KEY: &[u8] = b"consensus-invalid-tombstone-count-v1";
 const FINALITY_HISTORY_LIMIT: usize = 65_536;
+const FINALITY_WITNESS_LIMIT: usize = 2 * FINALITY_HISTORY_LIMIT + 1_000;
 const TOMBSTONE_LIMIT: usize = 65_536;
 const RECONSTRUCTION_PROGRESS_KEY: &[u8] = b"reconstruction-progress-v1";
 const RETAINED_PATH_LEASE_IDLE: Duration = Duration::from_secs(30);
+
+#[cfg(feature = "internal-bench")]
+static BENCH_WITNESS_POINT_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "internal-bench")]
+static BENCH_WITNESS_ROW_WRITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "internal-bench")]
+static BENCH_BATCH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct WitnessMutations<'a> {
+    store: &'a HeaderChainStore,
+    rows: HashMap<Frontier, Option<HeaderFinalityWitnessDisk>>,
+    count: u64,
+}
+
+impl<'a> WitnessMutations<'a> {
+    fn new(store: &'a HeaderChainStore) -> Result<Self, HeaderChainStoreError> {
+        let count = store
+            .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, FINALITY_WITNESS_COUNT_KEY)?
+            .map_or(0, |count| count.0);
+        if count
+            > u64::try_from(FINALITY_WITNESS_LIMIT).map_err(|_| {
+                HeaderChainStoreError::Incoherent("finality witness limit does not fit u64")
+            })?
+        {
+            return Err(StoreError::LimitExceeded {
+                collection: StoreCollection::FinalityHistory,
+                limit: RowLimit::new(FINALITY_WITNESS_LIMIT),
+            }
+            .into());
+        }
+        Ok(Self {
+            store,
+            rows: HashMap::new(),
+            count,
+        })
+    }
+
+    fn row(
+        &mut self,
+        frontier: Frontier,
+    ) -> Result<&mut Option<HeaderFinalityWitnessDisk>, HeaderChainStoreError> {
+        if !self.rows.contains_key(&frontier) {
+            #[cfg(feature = "internal-bench")]
+            BENCH_WITNESS_POINT_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let row = self.store.get_value::<HeaderFinalityWitnessDisk>(
+                HEADER_FINALITY_WITNESS,
+                HeaderFinalityWitnessKey {
+                    height: frontier.height,
+                    hash: frontier.hash,
+                }
+                .as_bytes(),
+            )?;
+            if row.as_ref().is_some_and(|row| {
+                row.context.height != frontier.height || row.context.header.hash() != frontier.hash
+            }) {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "finality witness key contradicts its header",
+                ));
+            }
+            self.rows.insert(frontier, row);
+        }
+        Ok(self
+            .rows
+            .get_mut(&frontier)
+            .expect("the witness mutation exists because this method inserted it"))
+    }
+
+    fn insert(
+        &mut self,
+        frontier: Frontier,
+        header: Arc<block::Header>,
+    ) -> Result<bool, HeaderChainStoreError> {
+        let row = self.row(frontier)?;
+        if let Some(row) = row {
+            if row.context.header != header {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "finality witness hash changed its canonical header",
+                ));
+            }
+            return Ok(false);
+        }
+        *row = Some(HeaderFinalityWitnessDisk {
+            context: HeaderValidationContextDisk {
+                header,
+                height: frontier.height,
+            },
+            root_references: 0,
+            child_references: 0,
+        });
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or(HeaderChainStoreError::Incoherent(
+                "finality witness count overflow",
+            ))?;
+        Ok(true)
+    }
+
+    fn parent(&mut self, frontier: Frontier) -> Result<Frontier, HeaderChainStoreError> {
+        let row = self
+            .row(frontier)?
+            .as_ref()
+            .ok_or(HeaderChainStoreError::Incoherent(
+                "finality witness parent walk reached a missing node",
+            ))?;
+        Ok(Frontier::new(
+            block::Height(frontier.height.0.checked_sub(1).ok_or(
+                HeaderChainStoreError::Incoherent("finality witness height underflow"),
+            )?),
+            row.context.header.previous_block_hash,
+        ))
+    }
+
+    fn collect_unreferenced_branch(
+        &mut self,
+        mut cursor: Frontier,
+        floor: Frontier,
+    ) -> Result<(), HeaderChainStoreError> {
+        while cursor.height > floor.height {
+            let Some(row) = self.row(cursor)?.as_ref() else {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "finality witness branch is incomplete",
+                ));
+            };
+            if row.root_references != 0 || row.child_references != 0 {
+                break;
+            }
+            let parent = Frontier::new(
+                block::Height(cursor.height.0.checked_sub(1).ok_or(
+                    HeaderChainStoreError::Incoherent("finality witness height underflow"),
+                )?),
+                row.context.header.previous_block_hash,
+            );
+            *self.row(cursor)? = None;
+            self.count = self
+                .count
+                .checked_sub(1)
+                .ok_or(HeaderChainStoreError::Incoherent(
+                    "finality witness count underflow",
+                ))?;
+            if parent.height > floor.height {
+                let parent_row =
+                    self.row(parent)?
+                        .as_mut()
+                        .ok_or(HeaderChainStoreError::Incoherent(
+                            "finality witness branch lacks its parent",
+                        ))?;
+                parent_row.child_references = parent_row.child_references.checked_sub(1).ok_or(
+                    HeaderChainStoreError::Incoherent("finality witness child reference underflow"),
+                )?;
+            }
+            cursor = parent;
+        }
+        Ok(())
+    }
+
+    fn finish(self, batch: &mut DiskWriteBatch) -> Result<(), HeaderChainStoreError> {
+        if self.count
+            > u64::try_from(FINALITY_WITNESS_LIMIT).map_err(|_| {
+                HeaderChainStoreError::Incoherent("finality witness limit does not fit u64")
+            })?
+        {
+            return Err(StoreError::LimitExceeded {
+                collection: StoreCollection::FinalityHistory,
+                limit: RowLimit::new(FINALITY_WITNESS_LIMIT),
+            }
+            .into());
+        }
+        for (frontier, row) in self.rows {
+            #[cfg(feature = "internal-bench")]
+            BENCH_WITNESS_ROW_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let key = HeaderFinalityWitnessKey {
+                height: frontier.height,
+                hash: frontier.hash,
+            }
+            .as_bytes();
+            if let Some(row) = row {
+                self.store
+                    .put_value(batch, HEADER_FINALITY_WITNESS, key, &row)?;
+            } else {
+                self.store.delete_raw(batch, HEADER_FINALITY_WITNESS, key)?;
+            }
+        }
+        self.store.put_value(
+            batch,
+            HEADER_ENGINE_META,
+            FINALITY_WITNESS_COUNT_KEY,
+            &HeaderRowCountDisk(self.count),
+        )?;
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 struct TestHeaderCompletionAuthority<'a>(Option<&'a dyn FullStateEvidenceAuthority>);
@@ -98,12 +296,21 @@ struct StateIssuedAuthority<'a> {
     inner: Option<&'a dyn FullStateEvidenceAuthority>,
     validation_leases: &'a [ValidationLease],
     active_retention_references: &'a [block::Hash],
+    full_state_authorization_version: Option<StateVersion>,
 }
 
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.inner
             .is_some_and(|inner| inner.authorizes_full_state(event))
+    }
+
+    fn full_state_authorization_version(&self, event: &TransitionEvent) -> Option<StateVersion> {
+        if self.authorizes_full_state(event) {
+            self.full_state_authorization_version
+        } else {
+            None
+        }
     }
 
     fn authorizes_scheduler_retry(&self, retry: &zakura_header_chain::OperatorBodyRetry) -> bool {
@@ -190,22 +397,10 @@ fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDelive
         authoritative.body_size,
         authoritative.tree_aux,
     );
-    let expected_status = if authoritative.is_unauthenticated() {
-        0
-    } else if authoritative.is_authenticated() {
-        1
-    } else if authoritative.is_rejected() {
-        2
-    } else {
-        3
-    };
-    let expected_observations = authoritative
-        .observation_ids()
-        .map(|id| id.map(|id| id.digest()));
     row.delivery() == expected_base
-        && row.outcome_status_code() == expected_status
-        && row.observation_digests() == expected_observations
-        && row.outcome_boundary_hash() == authoritative.outcome_boundary_hash()
+        && row.outcome_status_code() == 0
+        && row.observation_digests() == [None, None]
+        && row.outcome_boundary_hash().is_none()
 }
 
 /// Failure at the durable header-chain boundary.
@@ -467,6 +662,7 @@ pub struct HeaderChainRuntime {
     store: HeaderChainStore,
     config: EngineConfig,
     publisher: Publisher,
+    full_state_retention_references: Arc<Mutex<Arc<[block::Hash]>>>,
     leases: Arc<Mutex<RetainedPathLeaseRegistry>>,
     transition_engine: Arc<Mutex<HeaderChainEngine>>,
 }
@@ -624,6 +820,21 @@ struct RetainedPathLeaseRegistry {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum RetainedPathCapacity {
+    General,
+    FinalizedFallback,
+}
+
+impl RetainedPathCapacity {
+    fn limit(self) -> usize {
+        match self {
+            Self::General => MAX_RETAINED_PATH_LEASES.saturating_sub(1),
+            Self::FinalizedFallback => MAX_RETAINED_PATH_LEASES,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum CanonicalHeaderPathPosition {
     Finalized {
         next: block::Height,
@@ -759,12 +970,16 @@ impl RetainedPathLeaseRegistry {
         Some(cursor)
     }
 
-    fn reserve(&mut self, peer: SourceId, now: Instant) -> Option<u64> {
+    fn reserve(
+        &mut self,
+        peer: SourceId,
+        now: Instant,
+        capacity: RetainedPathCapacity,
+    ) -> Option<u64> {
         self.expire(now);
         if self.by_peer.contains_key(&peer)
             || self.reservations.contains_key(&peer)
-            || self.by_peer.len().saturating_add(self.reservations.len())
-                >= MAX_RETAINED_PATH_LEASES
+            || self.by_peer.len().saturating_add(self.reservations.len()) >= capacity.limit()
         {
             return None;
         }
@@ -1248,6 +1463,61 @@ impl HeaderChainReader {
         Ok((full_state, projection))
     }
 
+    /// Capture full-state data, the selected header tip, and the selected headers
+    /// that can overlap the block chain, from one transition generation.
+    ///
+    /// `overlap_tip` reads the block chain tip height from the same generation. Only
+    /// the selected headers at or below that height are copied. The selected header
+    /// chain and the block chain agree at and below the finalized frontier, so their
+    /// fork is always in that range, and the range is bounded by the depth of the
+    /// non-finalized state.
+    ///
+    /// Prefer this to [`Self::with_selected_projection`] when only the fork is
+    /// needed. Headers-first sync puts the selected tip far above the block tip, and
+    /// the projection then holds up to [`MAX_NON_FINALIZED_NODES_V1`] headers, nearly
+    /// all of them above the block tip.
+    ///
+    /// [`MAX_NON_FINALIZED_NODES_V1`]: zakura_header_chain::MAX_NON_FINALIZED_NODES_V1
+    pub(crate) fn with_selected_overlap<T>(
+        &self,
+        read_full_state: impl FnOnce() -> T,
+        overlap_tip: impl FnOnce(&T) -> Option<block::Height>,
+    ) -> Result<(T, Frontier, Vec<Frontier>), HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let full_state = read_full_state();
+        let snapshot = engine.snapshot();
+        let projection = engine.selected_projection();
+        if projection.first().copied() != Some(snapshot.frontiers.finalized)
+            || projection.last().copied() != Some(snapshot.frontiers.header_best)
+        {
+            return Err(StoreError::Incoherent(
+                "selected projection disagrees with its published bounds",
+            )
+            .into());
+        }
+
+        let overlap = match overlap_tip(&full_state) {
+            // The projection is ordered by height, so this stops at the block tip
+            // instead of copying the sync gap above it.
+            Some(height) => projection
+                .iter()
+                .take_while(|frontier| frontier.height <= height)
+                .copied()
+                .collect(),
+            None => Vec::new(),
+        };
+
+        Ok((full_state, snapshot.frontiers.header_best, overlap))
+    }
+
     pub(crate) fn selected_hash(
         &self,
         height: block::Height,
@@ -1468,6 +1738,110 @@ impl HeaderChainReader {
         }))
     }
 
+    /// Commit a lease only if the branch has not moved since the caller read its snapshot.
+    ///
+    /// The caller derives the path from a snapshot it holds no lock over. Taking the writer lock
+    /// and re-reading the transition engine closes that window: an unchanged state version and an
+    /// unchanged work authority for the target together mean the derived path is still canonical.
+    /// A branch that moved yields `Busy`, and the dropped reservation frees the peer's slot.
+    fn commit_lease_if_branch_unchanged(
+        &self,
+        reservation: RetainedPathReservation,
+        base_state_version: zakura_header_chain::StateVersion,
+        spec: RetainedPathLeaseSpec,
+    ) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let current_snapshot = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .snapshot();
+        if current_snapshot.state_version != base_state_version
+            || spec.scope != HeaderWorkAuthority::for_target(&current_snapshot, spec.target.hash)
+        {
+            return Ok(RetainedPathLeaseOutcome::Busy);
+        }
+        reservation.commit(spec, Instant::now())
+    }
+
+    /// Lease one canonical header that ends at a finalized target below the header frontier.
+    ///
+    /// Refusing a finalized target would strand any node whose VCT repair height every peer has
+    /// already finalized: the requester has no other way to obtain that exact header and its
+    /// authenticated roots. The fallback requires the target's canonical predecessor as a
+    /// locator. This bound makes every finalized fallback lease complete in one page.
+    fn acquire_finalized_target_path(
+        &self,
+        reservation: RetainedPathReservation,
+        session_id: u64,
+        scope: HeaderWorkAuthority,
+        target_tip_hash: block::Hash,
+        locator_hashes: &[block::Hash],
+        snapshot: &EngineSnapshot,
+    ) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
+        let peer = reservation.peer;
+        let Some(target) = self.finalized_frontier(target_tip_hash)? else {
+            return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
+        };
+        if target.height >= snapshot.frontiers.finalized.height {
+            // A header at or above the finalized frontier belongs to the graph. Its absence there
+            // means the branch moved under the request, so the requester must re-derive it.
+            return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
+        }
+        let Ok(predecessor_height) = target.height.previous() else {
+            return Ok(RetainedPathLeaseOutcome::NoLocatorIntersection);
+        };
+        let mut common_ancestor = None;
+        for locator_hash in locator_hashes {
+            if let Some(frontier) = self.finalized_frontier(*locator_hash)? {
+                if frontier.height == predecessor_height {
+                    common_ancestor = Some(frontier);
+                    break;
+                }
+            }
+        }
+        let Some(common_ancestor) = common_ancestor else {
+            return Ok(RetainedPathLeaseOutcome::NoLocatorIntersection);
+        };
+        let next = common_ancestor.height.next().map_err(|_| {
+            StoreError::Incoherent("canonical header cursor start height overflowed")
+        })?;
+        self.commit_lease_if_branch_unchanged(
+            reservation,
+            snapshot.state_version,
+            RetainedPathLeaseSpec {
+                peer,
+                session_id,
+                target,
+                common_ancestor,
+                scope,
+                position: CanonicalHeaderPathPosition::Finalized {
+                    next,
+                    end: target.height,
+                },
+                retained_ancestor: None,
+                retained_path: Arc::from(Vec::new()),
+            },
+        )
+    }
+
+    /// Lease a canonical header path from a locator intersection up to an exact target.
+    ///
+    /// The target resolves from the retained header graph, or, when it sits below the finalized
+    /// frontier, from the canonical finalized indexes. A VCT repair asks for one stalled height
+    /// that every peer past it has already finalized, so refusing the second band would strand
+    /// the requester.
+    ///
+    /// Returns `TargetNotRetained` when neither band holds the target, `NoLocatorIntersection`
+    /// when no locator hash is a canonical ancestor of it, `HistoryPruned` when the retained
+    /// path no longer reaches the finalized frontier, and `Busy` when the peer already holds a
+    /// lease or the branch moved under the request. On success the peer owns one lease until it
+    /// releases the lease or the idle deadline expires. A finalized fallback requires the exact
+    /// canonical predecessor, so it cannot retain a multi-page historical path.
     pub(crate) fn acquire_retained_path(
         &self,
         peer: SourceId,
@@ -1483,11 +1857,25 @@ impl HeaderChainReader {
                 "retained path locator count is outside protocol bounds",
             )));
         }
+        // General paths may occupy all but one registry slot. A target outside the retained graph
+        // may use the final slot only when it resolves to the bounded finalized fallback below.
+        let capacity = if self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .graph()
+            .header_node(target_tip_hash)
+            .is_some()
+        {
+            RetainedPathCapacity::General
+        } else {
+            RetainedPathCapacity::FinalizedFallback
+        };
         let reservation_id = self
             .leases
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .reserve(peer, Instant::now());
+            .reserve(peer, Instant::now(), capacity);
         let Some(reservation_id) = reservation_id else {
             return Ok(RetainedPathLeaseOutcome::Busy);
         };
@@ -1497,7 +1885,7 @@ impl HeaderChainReader {
             reservation_id,
             active: true,
         };
-        let (snapshot, target, mut reverse_path) = {
+        let (snapshot, retained_target) = {
             let engine = self
                 .transition_engine
                 .lock()
@@ -1506,25 +1894,40 @@ impl HeaderChainReader {
             if scope != HeaderWorkAuthority::for_target(&snapshot, target_tip_hash) {
                 return Ok(RetainedPathLeaseOutcome::Busy);
             }
-            let Some(target_node) = engine.graph().header_node(target_tip_hash) else {
-                return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
-            };
-            let target = Frontier::new(target_node.height, target_tip_hash);
-            let mut reverse_path = vec![target];
-            let mut current = target_node;
-            while current.height > snapshot.frontiers.finalized.height {
-                let Some(parent) = engine.graph().header_node(current.parent_hash) else {
-                    return Ok(RetainedPathLeaseOutcome::HistoryPruned);
-                };
-                if parent.height.next().ok() != Some(current.height) {
-                    return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
-                        "retained target path has non-contiguous heights",
-                    )));
+            match engine.graph().header_node(target_tip_hash) {
+                None => (snapshot, None),
+                Some(target_node) => {
+                    let target = Frontier::new(target_node.height, target_tip_hash);
+                    let mut reverse_path = vec![target];
+                    let mut current = target_node;
+                    while current.height > snapshot.frontiers.finalized.height {
+                        let Some(parent) = engine.graph().header_node(current.parent_hash) else {
+                            return Ok(RetainedPathLeaseOutcome::HistoryPruned);
+                        };
+                        if parent.height.next().ok() != Some(current.height) {
+                            return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
+                                "retained target path has non-contiguous heights",
+                            )));
+                        }
+                        reverse_path.push(Frontier::new(parent.height, parent.hash));
+                        current = parent;
+                    }
+                    (snapshot, Some((target, reverse_path)))
                 }
-                reverse_path.push(Frontier::new(parent.height, parent.hash));
-                current = parent;
             }
-            (snapshot, target, reverse_path)
+        };
+        let Some((target, mut reverse_path)) = retained_target else {
+            // The header graph holds only the retained suffix. A VCT repair asks for the exact
+            // header at one stalled height, which every peer that moved past it has finalized,
+            // so the target is absent here but present and immutable in the finalized indexes.
+            return self.acquire_finalized_target_path(
+                reservation,
+                session_id,
+                scope,
+                target_tip_hash,
+                locator_hashes,
+                &snapshot,
+            );
         };
         if reverse_path.last().copied() != Some(snapshot.frontiers.finalized) {
             return Ok(RetainedPathLeaseOutcome::HistoryPruned);
@@ -1575,22 +1978,9 @@ impl HeaderChainReader {
         {
             position = CanonicalHeaderPathPosition::Complete;
         }
-        let _writer = self
-            .store
-            .writer
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let current_snapshot = self
-            .transition_engine
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .snapshot();
-        if current_snapshot.state_version != snapshot.state_version
-            || scope != HeaderWorkAuthority::for_target(&current_snapshot, target_tip_hash)
-        {
-            return Ok(RetainedPathLeaseOutcome::Busy);
-        }
-        reservation.commit(
+        self.commit_lease_if_branch_unchanged(
+            reservation,
+            snapshot.state_version,
             RetainedPathLeaseSpec {
                 peer,
                 session_id,
@@ -1601,7 +1991,6 @@ impl HeaderChainReader {
                 retained_ancestor,
                 retained_path,
             },
-            Instant::now(),
         )
     }
 
@@ -1797,6 +2186,46 @@ impl HeaderChainReader {
 }
 
 impl HeaderChainRuntime {
+    /// Replace the complete process-local full-state fork-tip retention set.
+    pub(in crate::service) fn replace_full_state_retention_references(
+        &self,
+        mut references: Vec<block::Hash>,
+    ) {
+        references.sort_unstable_by_key(|hash| hash.0);
+        references.dedup();
+        *self
+            .full_state_retention_references
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = references.into();
+    }
+
+    /// Verify that every authenticated full-state header remains coherent in the retained DAG.
+    pub(in crate::service) fn verify_full_state_headers(
+        &self,
+        headers: &[VerifiedHeaderRef],
+    ) -> Result<(), HeaderChainStoreError> {
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        for expected in headers {
+            let matches = engine
+                .graph()
+                .header_node(expected.hash)
+                .is_some_and(|node| {
+                    node.height == expected.height
+                        && node.hash == expected.hash
+                        && node.parent_hash == expected.header.previous_block_hash
+                });
+            if !matches {
+                return Err(HeaderChainStoreError::StagedPathMismatch {
+                    hash: expected.hash,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Captures the complete selected projection and the engine snapshot that produced it.
     ///
     /// The method rejects an engine whose projection bounds disagree with its snapshot.
@@ -2122,10 +2551,34 @@ impl HeaderChainRuntime {
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
             .active_references(Instant::now());
 
+        // The state writer binds checkpoint finality evidence to the durable version it read,
+        // and the auxiliary transition below advances that version. Provenance therefore has
+        // to be checked against the pre-auxiliary snapshot the writer actually authorized.
+        let before = transition_engine.snapshot();
+        if checkpoint_request.expected_version != before.state_version {
+            let branch = checkpoint_request
+                .event
+                .header_sync_owner()
+                .map(HeaderSyncWorkOwner::header_authority)
+                .map(|authority| authority.branch)
+                .or_else(|| {
+                    checkpoint_request
+                        .event
+                        .body_owner()
+                        .map(|owner| owner.branch)
+                });
+            return Ok(ApplyResult::Stale(StaleReceipt {
+                current_version: before.state_version,
+                branch,
+            }));
+        }
+        validate_full_state_finality_provenance(&checkpoint_request.event, &before)?;
+
         let first_authority = StateIssuedAuthority {
             inner: first_context.full_state_authority,
             validation_leases: &[],
             active_retention_references: lease_references.as_ref(),
+            full_state_authorization_version: None,
         };
         let first_context = TransitionContext {
             config: first_context.config,
@@ -2165,6 +2618,7 @@ impl HeaderChainRuntime {
             inner: checkpoint_context.full_state_authority,
             validation_leases: validation_leases.as_slice(),
             active_retention_references: lease_references.as_ref(),
+            full_state_authorization_version: Some(before.state_version),
         };
         let checkpoint_context = TransitionContext {
             config: checkpoint_context.config,
@@ -2436,23 +2890,37 @@ impl HeaderChainRuntime {
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
         let authoritative_full_state_fork_set = matches!(
             &request.event,
-            TransitionEvent::VerifiedChainChanged(_) | TransitionEvent::VerifiedBlockAccepted(_)
+            TransitionEvent::VerifiedChainChanged(_)
+                | TransitionEvent::VerifiedBlockAccepted(_)
+                | TransitionEvent::FullStateFinalized(_)
+                | TransitionEvent::OperatorInvalidate(_)
+                | TransitionEvent::OperatorReconsider(_)
         ) && context
             .full_state_authority
             .is_some_and(|authority| authority.authorizes_full_state(&request.event));
-        let lease_references = if authoritative_full_state_fork_set {
-            None
+        let active_retention_references = if authoritative_full_state_fork_set {
+            Vec::new()
         } else {
-            Some(
+            let mut references = self
+                .full_state_retention_references
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+                .to_vec();
+            references.extend(
                 self.leases
                     .lock()
                     .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-                    .active_references(Instant::now()),
-            )
+                    .active_references(Instant::now())
+                    .iter()
+                    .copied(),
+            );
+            references.sort_unstable_by_key(|hash| hash.0);
+            references.dedup();
+            references
         };
         let retention_references = combined_retention_references(
             context.retention_references,
-            lease_references.as_deref(),
+            Some(&active_retention_references),
         );
         #[cfg(test)]
         let test_header_authority = TestHeaderCompletionAuthority(context.full_state_authority);
@@ -2470,6 +2938,9 @@ impl HeaderChainRuntime {
         if let Some(pin) = before.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
+        if request.expected_version == before.state_version {
+            validate_full_state_finality_provenance(&request.event, &before)?;
+        }
         let event = request.event.idempotency_key();
         let branch = request
             .event
@@ -2485,7 +2956,8 @@ impl HeaderChainRuntime {
         let state_authority = StateIssuedAuthority {
             inner: base_context.full_state_authority,
             validation_leases: &validation_leases,
-            active_retention_references: lease_references.as_deref().unwrap_or_default(),
+            active_retention_references: &active_retention_references,
+            full_state_authorization_version: Some(before.state_version),
         };
         let transition_context = TransitionContext {
             config: base_context.config,
@@ -2600,6 +3072,11 @@ impl HeaderChainRuntime {
         let batch = self
             .store
             .batch_for_combined(transition.change_set(), full_state_batch)?;
+        #[cfg(feature = "internal-bench")]
+        BENCH_BATCH_BYTES.store(
+            u64::try_from(batch.size_in_bytes()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         #[cfg(test)]
         fault(FaultPoint::BeforeCommit)?;
         self.store.db.write(batch)?;
@@ -2617,6 +3094,376 @@ impl HeaderChainRuntime {
         fault(FaultPoint::AfterPublish)?;
         Ok(ApplyResult::Committed)
     }
+}
+
+fn validate_full_state_finality_provenance(
+    event: &TransitionEvent,
+    snapshot: &EngineSnapshot,
+) -> Result<(), HeaderChainStoreError> {
+    let matches = match event {
+        TransitionEvent::FullStateFinalized(event) => {
+            event.full_state_transition_id
+                == zakura_header_chain::full_state_finality_evidence(
+                    snapshot.state_version,
+                    event.new_finalized,
+                    &event.verified_path_proof,
+                )
+        }
+        TransitionEvent::VerifiedChainChanged(event)
+            if event.cause == VerifiedChangeCause::CheckpointFinalizedGrow =>
+        {
+            event.new_path.last().is_none_or(|header| {
+                event.full_state_transition_id
+                    == zakura_header_chain::checkpoint_finality_evidence(
+                        snapshot.state_version,
+                        Frontier::new(header.height, header.hash),
+                    )
+            })
+        }
+        _ => true,
+    };
+    if !matches {
+        return Err(HeaderChainStoreError::Incoherent(
+            "full-state finality provenance does not match the authorized transition",
+        ));
+    }
+    Ok(())
+}
+
+/// One end-to-end headers-only finality sample for the internal RocksDB benchmark.
+#[cfg(feature = "internal-bench")]
+#[derive(Clone, Debug)]
+pub struct FinalityWitnessBenchmarkSample {
+    /// Finality advance number after the configured depth was reached.
+    pub advance: u64,
+    /// End-to-end transition latency.
+    pub elapsed: Duration,
+    /// Logical point reads against witness rows.
+    pub witness_point_reads: u64,
+    /// Witness rows written or deleted by the batch.
+    pub witness_row_writes: u64,
+    /// Exact serialized RocksDB write-batch size.
+    pub batch_bytes: u64,
+    /// Retained finality-history rows after the transition.
+    pub history_rows: u64,
+    /// Retained witness-DAG rows after the transition.
+    pub witness_rows: u64,
+}
+
+/// Bounded result from the internal RocksDB finality benchmark.
+#[cfg(feature = "internal-bench")]
+#[derive(Clone, Debug)]
+pub struct FinalityWitnessBenchmarkReport {
+    /// Per-advance samples.
+    pub samples: Vec<FinalityWitnessBenchmarkSample>,
+    /// A reorg that replaces one selected header.
+    pub one_block_reorg: FinalityWitnessBenchmarkSample,
+    /// A reorg that replaces up to 32 selected headers.
+    pub bounded_reorg: FinalityWitnessBenchmarkSample,
+    /// Startup audit latency after all advances.
+    pub startup_elapsed: Duration,
+}
+
+/// Run sequential headers-only finality advances against an ephemeral RocksDB store.
+#[cfg(feature = "internal-bench")]
+pub fn benchmark_finality_witness(
+    genesis: Arc<block::Block>,
+    advances: u32,
+    depth: u32,
+) -> Result<FinalityWitnessBenchmarkReport, HeaderChainStoreError> {
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    struct BenchmarkAuthority;
+
+    impl FullStateEvidenceAuthority for BenchmarkAuthority {
+        fn authorizes_full_state(&self, _event: &TransitionEvent) -> bool {
+            false
+        }
+
+        fn authorizes_header_completion(
+            &self,
+            _insert: &zakura_header_chain::InsertHeaders,
+        ) -> bool {
+            true
+        }
+    }
+
+    let network =
+        Network::new_regtest(zakura_chain::parameters::testnet::RegtestParameters::default());
+    let anchor = Frontier::new(block::Height(0), genesis.hash());
+    let mut config = EngineConfig::new(
+        EngineMode::HeadersOnly,
+        network,
+        zakura_header_chain::TrustedAnchor {
+            frontier: anchor,
+            header: genesis.header.clone(),
+        },
+        zakura_header_chain::CheckpointSet::default(),
+    )
+    .map_err(|_| HeaderChainStoreError::Incoherent("benchmark configuration is invalid"))?;
+    config.limits.local_finality_depth = NonZeroU32::new(depth).ok_or(
+        HeaderChainStoreError::Incoherent("benchmark finality depth must be nonzero"),
+    )?;
+    let anchor_work =
+        genesis
+            .header
+            .difficulty_threshold
+            .to_work()
+            .ok_or(HeaderChainStoreError::Incoherent(
+                "benchmark anchor work is invalid",
+            ))?;
+    let anchor_node = HeaderNode::from_durable_parts(
+        genesis.header.clone(),
+        anchor.hash,
+        genesis.header.previous_block_hash,
+        anchor.height,
+        anchor_work,
+        zakura_header_chain::WorkCoordinate::new(anchor.hash, anchor_work.as_u256()),
+        zakura_header_chain::HeaderValidationState::Valid,
+        Default::default(),
+        zakura_header_chain::BodyValidationState::Unknown,
+        Vec::new(),
+    )
+    .map_err(|_| HeaderChainStoreError::Incoherent("benchmark anchor is invalid"))?;
+    let metadata = EngineMetadata {
+        disk_format: zakura_header_chain::HeaderChainDiskVersion::CURRENT,
+        mode: EngineMode::HeadersOnly,
+        network_id: config.network().kind(),
+        network_policy_digest: config.network_policy_digest(),
+        anchor_manifest_digest: config.trust_anchor_digest(),
+        work_origin: anchor,
+        state_version: StateVersion::new(1),
+        header_generation: zakura_header_chain::HeaderGeneration::new(1),
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(1),
+        finality_epoch: zakura_header_chain::FinalityEpoch::new(0),
+        headers_only_migration_epoch: None,
+        frontiers: zakura_header_chain::FrontierSet {
+            finalized: anchor,
+            header_best: anchor,
+            verified_best: anchor,
+        },
+        header_best_score: zakura_header_chain::ChainScore::new(
+            zakura_header_chain::SuffixWork::zero(),
+            anchor.hash,
+        ),
+        oldest_retained_height: anchor.height,
+        alarms: zakura_header_chain::AlarmSet::default(),
+        last_transition: None,
+    };
+    let db_config = crate::Config::ephemeral();
+    let db = DiskDb::new(
+        &db_config,
+        crate::constants::STATE_DATABASE_KIND,
+        &crate::constants::state_database_format_version_in_code(),
+        config.network(),
+        super::STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        false,
+    )
+    .map_err(|_| HeaderChainStoreError::Incoherent("benchmark RocksDB could not open"))?;
+    let store = HeaderChainStore::new(db.clone());
+    store.initialize(metadata, anchor_node)?;
+    let (runtime, _) = store.startup(&config)?;
+    let mut parent = anchor;
+    let mut parent_header = genesis.header.clone();
+    let mut selected_chain = vec![(anchor, genesis.header.clone())];
+    let mut samples = Vec::with_capacity(usize::try_from(advances).unwrap_or(0));
+    let authority = BenchmarkAuthority;
+    for height in 1..=advances.saturating_add(depth) {
+        let before = runtime.publisher().snapshot();
+        let lease = runtime.reader().validation_context(parent.hash)?.ok_or(
+            HeaderChainStoreError::Incoherent("benchmark parent is not retained"),
+        )?;
+        let rules = zakura_header_chain::HeaderRules::for_validation_lease(&lease)
+            .map_err(|_| HeaderChainStoreError::Incoherent("benchmark rules are invalid"))?;
+        let mut header = *parent_header;
+        header.previous_block_hash = parent.hash;
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[..4].copy_from_slice(&height.to_be_bytes());
+        let header = Arc::new(header);
+        let next = Frontier::new(block::Height(height), header.hash());
+        let prepared = zakura_header_chain::prepare_headers(
+            zakura_header_chain::HeaderBatchInput::new(std::slice::from_ref(&header)),
+            lease.parent(),
+            &rules,
+            &SystemClock,
+        )
+        .map_err(|_| HeaderChainStoreError::Incoherent("benchmark header did not prepare"))?;
+        let owner = zakura_header_chain::HeaderWorkAuthority::for_target(&before, next.hash)
+            .bind(
+                u64::from(height),
+                NonZeroU64::new(u64::from(height)).expect("height is nonzero"),
+            )
+            .into();
+        let request = TransitionRequest {
+            expected_version: before.state_version,
+            event: TransitionEvent::InsertHeaders(Box::new(zakura_header_chain::InsertHeaders {
+                owner,
+                source: SourceId::from_digest([0x91; 32]),
+                parent_hash: parent.hash,
+                target_tip_hash: next.hash,
+                completion: zakura_header_chain::TargetCompletion::TargetComplete {
+                    common_ancestor: parent,
+                },
+                batch: prepared,
+                aux: Vec::new(),
+            })),
+        };
+        BENCH_WITNESS_POINT_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+        BENCH_WITNESS_ROW_WRITES.store(0, std::sync::atomic::Ordering::Relaxed);
+        BENCH_BATCH_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        runtime.apply(
+            request,
+            &TransitionContext {
+                config: &config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                retention_references: &[],
+            },
+        )?;
+        let elapsed = started.elapsed();
+        if height > depth {
+            samples.push(FinalityWitnessBenchmarkSample {
+                advance: u64::from(height - depth),
+                elapsed,
+                witness_point_reads: BENCH_WITNESS_POINT_READS
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                witness_row_writes: BENCH_WITNESS_ROW_WRITES
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                batch_bytes: BENCH_BATCH_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+                history_rows: runtime
+                    .store
+                    .get_value::<HeaderRowCountDisk>(
+                        HEADER_ENGINE_META,
+                        FINALITY_HISTORY_COUNT_KEY,
+                    )?
+                    .map_or(0, |count| count.0),
+                witness_rows: runtime
+                    .store
+                    .get_value::<HeaderRowCountDisk>(
+                        HEADER_ENGINE_META,
+                        FINALITY_WITNESS_COUNT_KEY,
+                    )?
+                    .map_or(0, |count| count.0),
+            });
+        }
+        parent = next;
+        parent_header = header.clone();
+        selected_chain.push((next, header));
+    }
+    let mut reorg_samples = Vec::with_capacity(2);
+    for (round, replaced_suffix) in [1_u32, depth.clamp(1, 32)].into_iter().enumerate() {
+        let suffix = usize::try_from(replaced_suffix).map_err(|_| {
+            HeaderChainStoreError::Incoherent("benchmark reorg depth does not fit usize")
+        })?;
+        let base_index = selected_chain.len().checked_sub(suffix + 1).ok_or(
+            HeaderChainStoreError::Incoherent("benchmark chain is shorter than its reorg"),
+        )?;
+        let (base, mut fork_parent_header) = selected_chain[base_index].clone();
+        let before = runtime.publisher().snapshot();
+        let lease = runtime.reader().validation_context(base.hash)?.ok_or(
+            HeaderChainStoreError::Incoherent("benchmark reorg parent is not retained"),
+        )?;
+        let rules = zakura_header_chain::HeaderRules::for_validation_lease(&lease)
+            .map_err(|_| HeaderChainStoreError::Incoherent("benchmark reorg rules are invalid"))?;
+        let mut fork_headers = Vec::with_capacity(suffix + 1);
+        let mut fork_parent = base;
+        for offset in 1..=replaced_suffix.saturating_add(1) {
+            let height = u32::from(base.height).saturating_add(offset);
+            let mut header = *fork_parent_header;
+            header.previous_block_hash = fork_parent.hash;
+            header.time += chrono::Duration::seconds(1);
+            header.nonce.0[0] = 0xd0_u8.saturating_add(u8::try_from(round).unwrap_or(0));
+            header.nonce.0[1..5].copy_from_slice(&height.to_be_bytes());
+            let header = Arc::new(header);
+            fork_parent = Frontier::new(block::Height(height), header.hash());
+            fork_parent_header = header.clone();
+            fork_headers.push(header);
+        }
+        let prepared = zakura_header_chain::prepare_headers(
+            zakura_header_chain::HeaderBatchInput::new(&fork_headers),
+            lease.parent(),
+            &rules,
+            &SystemClock,
+        )
+        .map_err(|_| HeaderChainStoreError::Incoherent("benchmark reorg did not prepare"))?;
+        let target_height = u64::from(fork_parent.height);
+        let owner = zakura_header_chain::HeaderWorkAuthority::for_target(&before, fork_parent.hash)
+            .bind(
+                target_height,
+                NonZeroU64::new(target_height).ok_or(HeaderChainStoreError::Incoherent(
+                    "benchmark reorg target height is zero",
+                ))?,
+            )
+            .into();
+        let request = TransitionRequest {
+            expected_version: before.state_version,
+            event: TransitionEvent::InsertHeaders(Box::new(zakura_header_chain::InsertHeaders {
+                owner,
+                source: SourceId::from_digest([0xd1_u8.saturating_add(round as u8); 32]),
+                parent_hash: base.hash,
+                target_tip_hash: fork_parent.hash,
+                completion: zakura_header_chain::TargetCompletion::TargetComplete {
+                    common_ancestor: base,
+                },
+                batch: prepared,
+                aux: Vec::new(),
+            })),
+        };
+        BENCH_WITNESS_POINT_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+        BENCH_WITNESS_ROW_WRITES.store(0, std::sync::atomic::Ordering::Relaxed);
+        BENCH_BATCH_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        runtime.apply(
+            request,
+            &TransitionContext {
+                config: &config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                retention_references: &[],
+            },
+        )?;
+        reorg_samples.push(FinalityWitnessBenchmarkSample {
+            advance: u64::try_from(round).unwrap_or(0),
+            elapsed: started.elapsed(),
+            witness_point_reads: BENCH_WITNESS_POINT_READS
+                .load(std::sync::atomic::Ordering::Relaxed),
+            witness_row_writes: BENCH_WITNESS_ROW_WRITES.load(std::sync::atomic::Ordering::Relaxed),
+            batch_bytes: BENCH_BATCH_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            history_rows: runtime
+                .store
+                .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, FINALITY_HISTORY_COUNT_KEY)?
+                .map_or(0, |count| count.0),
+            witness_rows: runtime
+                .store
+                .get_value::<HeaderRowCountDisk>(HEADER_ENGINE_META, FINALITY_WITNESS_COUNT_KEY)?
+                .map_or(0, |count| count.0),
+        });
+        selected_chain.truncate(base_index + 1);
+        for (offset, header) in fork_headers.into_iter().enumerate() {
+            selected_chain.push((
+                Frontier::new(
+                    block::Height(
+                        u32::from(base.height)
+                            .saturating_add(u32::try_from(offset).unwrap_or(u32::MAX) + 1),
+                    ),
+                    header.hash(),
+                ),
+                header,
+            ));
+        }
+    }
+    drop(runtime);
+    let started = std::time::Instant::now();
+    HeaderChainStore::new(db).startup(&config)?;
+    Ok(FinalityWitnessBenchmarkReport {
+        samples,
+        one_block_reorg: reorg_samples.remove(0),
+        bounded_reorg: reorg_samples.remove(0),
+        startup_elapsed: started.elapsed(),
+    })
 }
 
 fn coherent_engine_aux_deliveries(
@@ -2696,7 +3543,16 @@ impl HeaderChainStore {
     }
 
     pub(in crate::service) fn is_initialized(&self) -> Result<bool, HeaderChainStoreError> {
-        Ok(self.metadata_row()?.is_some())
+        match self.metadata_row() {
+            Ok(metadata) => Ok(metadata.is_some()),
+            // Service construction classifies the durable runtime before the block writer
+            // migrates released legacy rows to the current format. Any older marker is a
+            // supported store; a newer marker stays fail-closed until a migrator exists.
+            Err(HeaderChainStoreError::Codec(HeaderChainValueError::UnsupportedDiskFormat(
+                version,
+            ))) if version < HeaderChainDiskVersion::CURRENT.0 => Ok(true),
+            Err(error) => Err(error),
+        }
     }
 
     /// Exhaustively audit, atomically repair reconstructible caches, then enable publication.
@@ -2768,6 +3624,7 @@ impl HeaderChainStore {
                 store: self,
                 config: config.clone(),
                 publisher,
+                full_state_retention_references: Arc::new(Mutex::new(Arc::from([]))),
                 leases: Arc::new(Mutex::new(RetainedPathLeaseRegistry::default())),
                 transition_engine,
             },
@@ -2851,6 +3708,7 @@ impl HeaderChainStore {
                 store: self,
                 config: integrated_config.clone(),
                 publisher,
+                full_state_retention_references: Arc::new(Mutex::new(Arc::from([]))),
                 leases: Arc::new(Mutex::new(RetainedPathLeaseRegistry::default())),
                 transition_engine,
             },
@@ -2929,6 +3787,7 @@ impl HeaderChainStore {
                 store: self,
                 config: config.clone(),
                 publisher,
+                full_state_retention_references: Arc::new(Mutex::new(Arc::from([]))),
                 leases: Arc::new(Mutex::new(RetainedPathLeaseRegistry::default())),
                 transition_engine,
             },
@@ -3145,6 +4004,7 @@ impl HeaderChainStore {
                 store: self,
                 config: config.clone(),
                 publisher,
+                full_state_retention_references: Arc::new(Mutex::new(Arc::from([]))),
                 leases: Arc::new(Mutex::new(RetainedPathLeaseRegistry::default())),
                 transition_engine,
             },
@@ -3266,15 +4126,11 @@ impl HeaderChainStore {
             .take_while(|frontier| frontier.height <= full_state_finalized.height)
             .map(|frontier| frontier.hash)
             .collect::<Vec<_>>();
-        let mut hasher = Sha256::new();
-        hasher.update(b"zakura-header-chain-startup-finalization-v1");
-        hasher.update(snapshot.state_version.get().to_be_bytes());
-        hasher.update(full_state_finalized.height.0.to_be_bytes());
-        hasher.update(full_state_finalized.hash.0);
-        for hash in &proof {
-            hasher.update(hash.0);
-        }
-        let evidence = EvidenceId::from_digest(hasher.finalize().into());
+        let evidence = zakura_header_chain::full_state_finality_evidence(
+            snapshot.state_version,
+            full_state_finalized,
+            &proof,
+        );
         let event = TransitionEvent::FullStateFinalized(FullStateFinalized {
             full_state_transition_id: evidence,
             new_finalized: full_state_finalized,
@@ -3394,17 +4250,24 @@ impl HeaderChainStore {
             },
             eligibility_changes: Vec::new(),
             aux_changes: Vec::new(),
-            finality_append: Some(FinalityRecord {
-                previous: metadata.work_origin,
-                current: metadata.frontiers.finalized,
-                source: match metadata.mode {
-                    EngineMode::Integrated => FinalitySource::FullState {
-                        evidence: EvidenceId::from_digest(metadata.anchor_manifest_digest),
-                    },
-                    EngineMode::HeadersOnly => FinalitySource::MigratedHeadersOnly,
+            finality_append: Some(match metadata.mode {
+                EngineMode::Integrated => FinalityRecord::full_state_with_provenance(
+                    metadata.work_origin,
+                    metadata.frontiers.finalized,
+                    metadata.finality_epoch,
+                    FullStateFinalityProvenance::initialization(
+                        metadata.state_version,
+                        metadata.frontiers.finalized,
+                    ),
+                ),
+                EngineMode::HeadersOnly => FinalityRecord {
+                    previous: metadata.work_origin,
+                    current: metadata.frontiers.finalized,
+                    source: FinalitySource::MigratedHeadersOnly,
+                    epoch: metadata.finality_epoch,
                 },
-                epoch: metadata.finality_epoch,
             }),
+            finality_ancestry: zakura_header_chain::FinalityWitnessProof::default(),
             metadata: metadata.clone(),
         };
         self.db.write(self.batch_for(&change_set)?)?;
@@ -3650,47 +4513,146 @@ impl HeaderChainStore {
                     }
                     .into());
                 }
-                let next_count = if count == limit {
-                    let cf = self.cf(HEADER_FINALITY_HISTORY)?;
-                    let (first_key, first_value) =
-                        self.db
-                            .raw_first_cf(&cf)?
-                            .ok_or(HeaderChainStoreError::Incoherent(
-                                "bounded finality history is unexpectedly empty",
-                            ))?;
-                    let first = FinalityRecord::decode(&first_value).map_err(|_| {
+                let estimated_new_witnesses = match record.source {
+                    FinalitySource::HeadersOnlyDepth { .. } => {
+                        let history_cf = self.cf(HEADER_FINALITY_HISTORY)?;
+                        let newest_root = self
+                            .db
+                            .raw_last_cf(&history_cf)?
+                            .and_then(|(_, value)| FinalityRecord::decode(&value).ok())
+                            .and_then(|newest| match newest.source {
+                                FinalitySource::HeadersOnlyDepth { selected_tip }
+                                | FinalitySource::DiskMigration {
+                                    authentication:
+                                        zakura_header_chain::DiskMigrationAuthentication::HeadersOnlyDepth {
+                                            selected_tip,
+                                        },
+                                    ..
+                                } => Some(selected_tip),
+                                _ => None,
+                            });
+                        let first_new = newest_root
+                            .and_then(|root| {
+                                changes
+                                    .finality_ancestry
+                                    .iter()
+                                    .position(|entry| entry.frontier == root)
+                                    .map(|index| index + 1)
+                            })
+                            .unwrap_or(0);
+                        changes.finality_ancestry[first_new..]
+                            .iter()
+                            .filter(|entry| entry.frontier.height > record.current.height)
+                            .count()
+                    }
+                    _ => 0,
+                };
+                let witness_count = self
+                    .get_value::<HeaderRowCountDisk>(
+                        HEADER_ENGINE_META,
+                        FINALITY_WITNESS_COUNT_KEY,
+                    )?
+                    .map_or(0, |count| count.0);
+                let witness_limit = u64::try_from(FINALITY_WITNESS_LIMIT).map_err(|_| {
+                    HeaderChainStoreError::Incoherent("finality witness limit does not fit u64")
+                })?;
+                let witness_excess = witness_count
+                    .saturating_add(u64::try_from(estimated_new_witnesses).map_err(|_| {
+                        HeaderChainStoreError::Incoherent(
+                            "estimated witness count does not fit u64",
+                        )
+                    })?)
+                    .saturating_sub(witness_limit);
+                let eviction_count = usize::try_from(u64::from(count == limit).max(witness_excess))
+                    .map_err(|_| {
+                        HeaderChainStoreError::Incoherent(
+                            "finality eviction count does not fit usize",
+                        )
+                    })?;
+                if u64::try_from(eviction_count).map_or(true, |evictions| evictions > count) {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "witness budget cannot retain a non-empty finality history",
+                    ));
+                }
+                let history_cf = self.cf(HEADER_FINALITY_HISTORY)?;
+                // The published checkpoint names the last epoch a previous eviction removed, so
+                // every epoch at or below it is already deleted and the oldest surviving record
+                // sits above it. Seeking from there keeps eviction independent of how many
+                // evictions preceded it. Starting at the beginning of the column family instead
+                // would step over the tombstone left by every previous eviction: the retained
+                // window is a few MB, far too small to trigger the compaction that collects
+                // them, so that cost grows without bound and eventually dominates every block
+                // commit.
+                let retained_low = self
+                    .get_value::<FinalityHistoryCheckpoint>(
+                        HEADER_ENGINE_META,
+                        FINALITY_HISTORY_CHECKPOINT_KEY,
+                    )?
+                    .map_or(0, |checkpoint| checkpoint.epoch.get().saturating_add(1));
+                let prefix = self.db.raw_prefix_cf_from(
+                    &history_cf,
+                    &retained_low.to_be_bytes(),
+                    eviction_count.saturating_add(1),
+                )?;
+                let mut decoded_prefix = Vec::with_capacity(prefix.len());
+                for (key, value) in prefix {
+                    let row = FinalityRecord::decode(&value).map_err(|_| {
                         HeaderChainStoreError::Incoherent("invalid oldest finality record")
                     })?;
-                    if first_key != first.epoch.get().to_be_bytes() {
+                    if key != row.epoch.get().to_be_bytes() {
                         return Err(HeaderChainStoreError::Incoherent(
                             "oldest finality key/value mismatch",
                         ));
                     }
-                    if self.authenticated_canonical_hash(first.current.height)?
-                        != Some(first.current.hash)
+                    decoded_prefix.push((key, row));
+                }
+                let mut evicted_records = Vec::with_capacity(eviction_count);
+                for (key, evicted) in decoded_prefix.iter().take(eviction_count) {
+                    if self.authenticated_canonical_hash(evicted.current.height)?
+                        != Some(evicted.current.hash)
                     {
                         return Err(HeaderChainStoreError::Incoherent(
                             "finality checkpoint lacks canonical authentication",
                         ));
                     }
+                    self.delete_raw(&mut batch, HEADER_FINALITY_HISTORY, key)?;
+                    evicted_records.push(*evicted);
+                }
+                let prune_frontiers: Vec<_> = (0..eviction_count)
+                    .map(|index| {
+                        decoded_prefix
+                            .get(index + 1)
+                            .map_or(record.current, |(_, next)| next.current)
+                    })
+                    .collect();
+                if let Some(last) = evicted_records.last() {
                     self.put_value(
                         &mut batch,
                         HEADER_ENGINE_META,
                         FINALITY_HISTORY_CHECKPOINT_KEY,
                         &FinalityHistoryCheckpoint {
-                            epoch: first.epoch,
-                            frontier: first.current,
+                            epoch: last.epoch,
+                            frontier: last.current,
                         },
                     )?;
-                    self.delete_raw(&mut batch, HEADER_FINALITY_HISTORY, first_key)?;
-                    count
-                } else {
-                    count
-                        .checked_add(1)
-                        .ok_or(HeaderChainStoreError::Incoherent(
-                            "finality history count overflow",
-                        ))?
-                };
+                }
+                let next_count = count
+                    .checked_sub(u64::try_from(eviction_count).map_err(|_| {
+                        HeaderChainStoreError::Incoherent(
+                            "finality eviction count does not fit u64",
+                        )
+                    })?)
+                    .and_then(|count| count.checked_add(1))
+                    .ok_or(HeaderChainStoreError::Incoherent(
+                        "finality history count overflow",
+                    ))?;
+                self.apply_finality_evidence(
+                    &mut batch,
+                    record,
+                    &changes.finality_ancestry,
+                    &evicted_records,
+                    &prune_frontiers,
+                )?;
                 self.put_value(
                     &mut batch,
                     HEADER_FINALITY_HISTORY,
@@ -3714,6 +4676,270 @@ impl HeaderChainStore {
             &changes.metadata,
         )?;
         Ok(batch)
+    }
+
+    fn apply_finality_evidence(
+        &self,
+        batch: &mut DiskWriteBatch,
+        record: FinalityRecord,
+        ancestry: &[zakura_header_chain::FinalityAncestryHeader],
+        evicted: &[FinalityRecord],
+        prune_frontiers: &[Frontier],
+    ) -> Result<(), HeaderChainStoreError> {
+        let mut witnesses = WitnessMutations::new(self)?;
+
+        match record.source {
+            FinalitySource::HeadersOnlyDepth { selected_tip }
+            | FinalitySource::DiskMigration {
+                authentication:
+                    zakura_header_chain::DiskMigrationAuthentication::HeadersOnlyDepth { selected_tip },
+                ..
+            } => {
+                let expected_len = usize::try_from(
+                    selected_tip
+                        .height
+                        .0
+                        .checked_sub(record.previous.height.0)
+                        .ok_or(HeaderChainStoreError::Incoherent(
+                            "headers-only finality ancestry retreats",
+                        ))?,
+                )
+                .map_err(|_| {
+                    HeaderChainStoreError::Incoherent(
+                        "headers-only finality ancestry length does not fit usize",
+                    )
+                })?;
+                if ancestry.len() != expected_len {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "headers-only finality ancestry has the wrong length",
+                    ));
+                }
+                let mut parent = record.previous.hash;
+                let mut height = record.previous.height.next().map_err(|_| {
+                    HeaderChainStoreError::Incoherent(
+                        "headers-only finality ancestry height overflow",
+                    )
+                })?;
+                let mut last = record.previous;
+                let mut ancestry_frontiers = Vec::with_capacity(ancestry.len());
+                for (index, entry) in ancestry.iter().enumerate() {
+                    let hash = entry.frontier.hash;
+                    if entry.frontier.height != height || entry.header.previous_block_hash != parent
+                    {
+                        return Err(HeaderChainStoreError::Incoherent(
+                            "headers-only finality ancestry is discontinuous",
+                        ));
+                    }
+                    let frontier = entry.frontier;
+                    ancestry_frontiers.push(frontier);
+                    if entry.frontier.height <= record.current.height {
+                        if self
+                            .authenticated_canonical_hash(entry.frontier.height)?
+                            .is_some_and(|stored| stored != hash)
+                        {
+                            return Err(HeaderChainStoreError::Incoherent(
+                                "headers-only finalized ancestry changed its canonical hash",
+                            ));
+                        }
+                        self.put_raw(
+                            batch,
+                            ZAKURA_HEADER_HASH_BY_HEIGHT,
+                            entry.frontier.height.as_bytes(),
+                            hash.0,
+                        )?;
+                    }
+                    parent = hash;
+                    last = frontier;
+                    if index + 1 < ancestry.len() {
+                        height = height.next().map_err(|_| {
+                            HeaderChainStoreError::Incoherent(
+                                "headers-only finality ancestry height overflow",
+                            )
+                        })?;
+                    }
+                }
+                if last != selected_tip
+                    || ancestry
+                        .iter()
+                        .find(|entry| entry.frontier.height == record.current.height)
+                        .is_none_or(|entry| entry.frontier.hash != record.current.hash)
+                {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "headers-only finality ancestry does not bind its record",
+                    ));
+                }
+
+                let history_cf = self.cf(HEADER_FINALITY_HISTORY)?;
+                let newest = self
+                    .db
+                    .raw_last_cf(&history_cf)?
+                    .map(|(key, value)| {
+                        let newest = FinalityRecord::decode(&value).map_err(|_| {
+                            HeaderChainStoreError::Incoherent("invalid newest finality record")
+                        })?;
+                        if key != newest.epoch.get().to_be_bytes() {
+                            return Err(HeaderChainStoreError::Incoherent(
+                                "newest finality key/value mismatch",
+                            ));
+                        }
+                        Ok(newest)
+                    })
+                    .transpose()?;
+                let old_root = newest.and_then(|newest| match newest.source {
+                    FinalitySource::HeadersOnlyDepth { selected_tip }
+                    | FinalitySource::DiskMigration {
+                        authentication:
+                            zakura_header_chain::DiskMigrationAuthentication::HeadersOnlyDepth {
+                                selected_tip,
+                            },
+                        ..
+                    } => Some(selected_tip),
+                    FinalitySource::FullState { .. }
+                    | FinalitySource::MigratedHeadersOnly
+                    | FinalitySource::DiskMigration {
+                        authentication: zakura_header_chain::DiskMigrationAuthentication::FullState,
+                        ..
+                    } => None,
+                });
+                let common_index = if let Some(old_root) = old_root {
+                    if let Some(index) = ancestry_frontiers
+                        .iter()
+                        .position(|frontier| *frontier == old_root)
+                    {
+                        Some(index)
+                    } else {
+                        let mut cursor = old_root;
+                        let mut common = None;
+                        while cursor.height > record.previous.height {
+                            if let Some(index) = ancestry_frontiers
+                                .iter()
+                                .position(|frontier| *frontier == cursor)
+                            {
+                                common = Some(index);
+                                break;
+                            }
+                            cursor = witnesses.parent(cursor)?;
+                        }
+                        if common.is_none() && cursor != record.previous {
+                            return Err(HeaderChainStoreError::Incoherent(
+                                "historical finality witness does not reach the previous frontier",
+                            ));
+                        }
+                        common
+                    }
+                } else {
+                    None
+                };
+
+                for (index, evicted) in evicted.iter().enumerate() {
+                    if let FinalitySource::HeadersOnlyDepth { selected_tip }
+                    | FinalitySource::DiskMigration {
+                        authentication:
+                            zakura_header_chain::DiskMigrationAuthentication::HeadersOnlyDepth {
+                                selected_tip,
+                            },
+                        ..
+                    } = evicted.source
+                    {
+                        let root = witnesses.row(selected_tip)?.as_mut().ok_or(
+                            HeaderChainStoreError::Incoherent(
+                                "evicted finality record lacks its witness root",
+                            ),
+                        )?;
+                        root.root_references = root.root_references.checked_sub(1).ok_or(
+                            HeaderChainStoreError::Incoherent(
+                                "finality witness root reference underflow",
+                            ),
+                        )?;
+                        witnesses.collect_unreferenced_branch(selected_tip, evicted.current)?;
+                    }
+                    let prune_frontier = prune_frontiers.get(index).copied().ok_or(
+                        HeaderChainStoreError::Incoherent(
+                            "finality witness pruning frontier is absent",
+                        ),
+                    )?;
+                    if let Some(row) = witnesses.row(prune_frontier)?.as_ref() {
+                        if row.root_references == 0 {
+                            *witnesses.row(prune_frontier)? = None;
+                            witnesses.count = witnesses.count.checked_sub(1).ok_or(
+                                HeaderChainStoreError::Incoherent(
+                                    "finality witness count underflow",
+                                ),
+                            )?;
+                        }
+                    }
+                }
+
+                for (index, (entry, frontier)) in ancestry
+                    .iter()
+                    .zip(ancestry_frontiers.iter().copied())
+                    .enumerate()
+                {
+                    if entry.frontier.height <= record.current.height
+                        || common_index.is_some_and(|common| index <= common)
+                    {
+                        continue;
+                    }
+                    let inserted = witnesses.insert(frontier, entry.header.clone())?;
+                    if inserted {
+                        let parent = Frontier::new(
+                            block::Height(entry.frontier.height.0.checked_sub(1).ok_or(
+                                HeaderChainStoreError::Incoherent(
+                                    "finality witness height underflow",
+                                ),
+                            )?),
+                            entry.header.previous_block_hash,
+                        );
+                        if parent.height > record.current.height {
+                            let parent = witnesses.row(parent)?.as_mut().ok_or(
+                                HeaderChainStoreError::Incoherent(
+                                    "new finality witness edge lacks its parent",
+                                ),
+                            )?;
+                            parent.child_references = parent
+                                .child_references
+                                .checked_add(1)
+                                .ok_or(HeaderChainStoreError::Incoherent(
+                                    "finality witness child reference overflow",
+                                ))?;
+                        }
+                    }
+                }
+                let root = witnesses.row(selected_tip)?.as_mut().ok_or(
+                    HeaderChainStoreError::Incoherent(
+                        "headers-only finality proof lacks its selected-tip root",
+                    ),
+                )?;
+                root.root_references = root.root_references.checked_add(1).ok_or(
+                    HeaderChainStoreError::Incoherent("finality witness root reference overflow"),
+                )?;
+            }
+            FinalitySource::MigratedHeadersOnly => {
+                if !ancestry.is_empty() {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "migrated finality unexpectedly carries ancestry",
+                    ));
+                }
+                self.put_raw(
+                    batch,
+                    ZAKURA_HEADER_HASH_BY_HEIGHT,
+                    record.current.height.as_bytes(),
+                    record.current.hash.0,
+                )?;
+            }
+            FinalitySource::FullState { .. }
+            | FinalitySource::DiskMigration {
+                authentication: zakura_header_chain::DiskMigrationAuthentication::FullState,
+                ..
+            } => {
+                if !ancestry.is_empty() {
+                    return Err(HeaderChainStoreError::Incoherent(
+                        "full-state finality unexpectedly carries headers-only ancestry",
+                    ));
+                }
+            }
+        }
+        witnesses.finish(batch)
     }
 
     /// Apply the bounded tombstone lifecycle through the same atomic batch as its source change.
@@ -3786,12 +5012,12 @@ impl HeaderChainStore {
                     "consensus-invalid tombstone count overflow",
                 ))?;
         if !finality_advanced && prospective_count <= TOMBSTONE_LIMIT {
-            for tombstone in additions {
+            for tombstone in &additions {
                 self.put_value(
                     batch,
                     HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
                     tombstone.hash.0,
-                    &tombstone,
+                    tombstone,
                 )?;
             }
             self.put_value(
@@ -3828,6 +5054,9 @@ impl HeaderChainStore {
         for hash in finalized_hashes {
             tombstones.remove(&hash);
             self.delete_raw(batch, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, hash.0)?;
+            if changes.delete_nodes.contains(&hash) || self.header_node(hash)?.is_none() {
+                self.delete_raw(batch, HEADER_BODY_EVIDENCE_AUTHORITY, hash.0)?;
+            }
         }
         for tombstone in additions {
             tombstones.insert(tombstone.hash, tombstone.clone());
@@ -3838,7 +5067,6 @@ impl HeaderChainStore {
                 &tombstone,
             )?;
         }
-
         if tombstones.len() > TOMBSTONE_LIMIT {
             let deleted: HashSet<_> = changes.delete_nodes.iter().copied().collect();
             let inserted: HashSet<_> = changes.put_nodes.iter().map(|node| node.hash).collect();
@@ -3863,6 +5091,7 @@ impl HeaderChainStore {
             for (_, hash) in evictable.into_iter().take(excess) {
                 tombstones.remove(&hash);
                 self.delete_raw(batch, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, hash.0)?;
+                self.delete_raw(batch, HEADER_BODY_EVIDENCE_AUTHORITY, hash.0)?;
             }
         }
 

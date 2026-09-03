@@ -10,9 +10,17 @@ use tokio::{
 use tracing::{Level, Span};
 
 use crate::{
-    address_book::AddressMetrics, meta_addr::MetaAddrChange, types::PeerServices, AddressBook,
-    BannedIps, BoxError, Config,
+    address_book::AddressMetrics, meta_addr::MetaAddrChange, peer_registry::PeerRegistry,
+    types::PeerServices, AddressBook, BannedIps, BoxError, Config,
 };
+
+type SpawnedAddressBook = (
+    Arc<std::sync::Mutex<AddressBook>>,
+    BannedIps,
+    mpsc::Sender<MetaAddrChange>,
+    watch::Receiver<AddressMetrics>,
+    JoinHandle<Result<(), BoxError>>,
+);
 
 /// The minimum size of the address book updater channel.
 pub const MIN_CHANNEL_SIZE: usize = 10;
@@ -40,6 +48,7 @@ impl AddressBookUpdater {
     /// - the address book updater task join handle.
     ///
     /// The task exits with an error when the returned [`mpsc::Sender`] is closed.
+    #[cfg(test)]
     pub fn spawn(
         config: &Config,
         local_listener: SocketAddr,
@@ -51,6 +60,30 @@ impl AddressBookUpdater {
         watch::Receiver<AddressMetrics>,
         JoinHandle<Result<(), BoxError>>,
     ) {
+        Self::spawn_inner(config, local_listener, advertised_services, None)
+    }
+
+    /// Spawn an address book and attach a separate active peer registry.
+    pub(crate) fn spawn_with_peer_registry(
+        config: &Config,
+        local_listener: SocketAddr,
+        advertised_services: PeerServices,
+        peer_registry: PeerRegistry,
+    ) -> SpawnedAddressBook {
+        Self::spawn_inner(
+            config,
+            local_listener,
+            advertised_services,
+            Some(peer_registry),
+        )
+    }
+
+    fn spawn_inner(
+        config: &Config,
+        local_listener: SocketAddr,
+        advertised_services: PeerServices,
+        peer_registry: Option<PeerRegistry>,
+    ) -> SpawnedAddressBook {
         // Create an mpsc channel for peerset address book updates,
         // based on the maximum number of inbound and outbound peers.
         let (worker_tx, mut worker_rx) = mpsc::channel::<MetaAddrChange>(max(
@@ -58,7 +91,7 @@ impl AddressBookUpdater {
             MIN_CHANNEL_SIZE,
         ));
 
-        let address_book = AddressBook::new(
+        let mut address_book = AddressBook::new(
             local_listener,
             &config.network,
             config.max_connections_per_ip,
@@ -66,6 +99,9 @@ impl AddressBookUpdater {
         )
         .with_local_listener_services(advertised_services)
         .with_expose_peer_addresses(config.expose_peer_addresses);
+        if let Some(peer_registry) = peer_registry {
+            address_book = address_book.with_peer_registry(peer_registry);
+        }
         let address_metrics = address_book.address_metrics_watcher();
 
         // The updater needs mutable address-book access, while peer networking

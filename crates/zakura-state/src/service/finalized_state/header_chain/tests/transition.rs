@@ -1,6 +1,55 @@
 use super::*;
 
 #[test]
+fn state_adapter_rejects_tampered_full_state_finality_provenance() {
+    let (_, anchor, metadata) = fixture();
+    let snapshot = metadata.snapshot();
+    let current = Frontier::new(
+        anchor
+            .height
+            .next()
+            .expect("the anchor has a successor height"),
+        block::Hash([0x91; 32]),
+    );
+    let proof = vec![anchor.hash, current.hash];
+    let mut event = FullStateFinalized {
+        full_state_transition_id: zakura_header_chain::full_state_finality_evidence(
+            snapshot.state_version,
+            current,
+            &proof,
+        ),
+        new_finalized: current,
+        verified_path_proof: proof,
+    };
+    assert!(validate_full_state_finality_provenance(
+        &TransitionEvent::FullStateFinalized(event.clone()),
+        &snapshot,
+    )
+    .is_ok());
+
+    event.full_state_transition_id = EvidenceId::from_digest([0x92; 32]);
+    assert!(matches!(
+        validate_full_state_finality_provenance(
+            &TransitionEvent::FullStateFinalized(event),
+            &snapshot,
+        ),
+        Err(HeaderChainStoreError::Incoherent(
+            "full-state finality provenance does not match the authorized transition"
+        ))
+    ));
+}
+
+fn full_state_source(evidence: EvidenceId) -> FinalitySource {
+    FinalitySource::FullState {
+        provenance: zakura_header_chain::FullStateFinalityProvenance {
+            evidence,
+            state_version: StateVersion::new(1),
+            kind: zakura_header_chain::FullStateFinalityKind::Finalized,
+        },
+    }
+}
+
+#[test]
 fn authenticated_full_state_retention_uses_only_the_staged_fork_set() {
     let staged = [block::Hash([0x21; 32]), block::Hash([0x22; 32])];
     let stale_lease = [block::Hash([0x20; 32])];
@@ -40,25 +89,19 @@ fn finality_rebase_reads_only_the_generation_bounded_recent_suffix() {
     let record_two = FinalityRecord {
         previous: anchor_frontier,
         current: second,
-        source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x22; 32]),
-        },
+        source: full_state_source(EvidenceId::from_digest([0x22; 32])),
         epoch: FinalityEpoch::new(2),
     };
     let record_three = FinalityRecord {
         previous: second,
         current: third,
-        source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x32; 32]),
-        },
+        source: full_state_source(EvidenceId::from_digest([0x32; 32])),
         epoch: FinalityEpoch::new(3),
     };
     let record_four = FinalityRecord {
         previous: third,
         current: fourth,
-        source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x42; 32]),
-        },
+        source: full_state_source(EvidenceId::from_digest([0x42; 32])),
         epoch: FinalityEpoch::new(4),
     };
     metadata.finality_epoch = FinalityEpoch::new(4);
@@ -410,6 +453,7 @@ fn failed_batch_encoding_has_zero_durable_effects() {
         eligibility_changes: Vec::new(),
         aux_changes: Vec::new(),
         finality_append: None,
+        finality_ancestry: zakura_header_chain::FinalityWitnessProof::default(),
         metadata: next_metadata,
     };
 
@@ -442,13 +486,12 @@ fn finality_history_creates_an_authenticated_checkpoint_at_the_retained_bound() 
         .expect("the bounded history fixture initializes");
 
     let mut seed = DiskWriteBatch::new();
+    stage_full_state_canonical_hash(&store, &mut seed, anchor);
     for epoch in 1..u64::try_from(FINALITY_HISTORY_LIMIT).expect("the limit fits u64") {
         let record = FinalityRecord {
             previous: anchor,
             current: anchor,
-            source: FinalitySource::FullState {
-                evidence: EvidenceId::from_digest([0x90; 32]),
-            },
+            source: full_state_source(EvidenceId::from_digest([0x90; 32])),
             epoch: FinalityEpoch::new(epoch),
         };
         store
@@ -473,9 +516,7 @@ fn finality_history_creates_an_authenticated_checkpoint_at_the_retained_bound() 
     let appended = FinalityRecord {
         previous: anchor,
         current: anchor,
-        source: FinalitySource::FullState {
-            evidence: EvidenceId::from_digest([0x91; 32]),
-        },
+        source: full_state_source(EvidenceId::from_digest([0x91; 32])),
         epoch: FinalityEpoch::new(
             u64::try_from(FINALITY_HISTORY_LIMIT).expect("the limit fits u64"),
         ),
@@ -492,6 +533,7 @@ fn finality_history_creates_an_authenticated_checkpoint_at_the_retained_bound() 
         eligibility_changes: Vec::new(),
         aux_changes: Vec::new(),
         finality_append: Some(appended),
+        finality_ancestry: zakura_header_chain::FinalityWitnessProof::default(),
         metadata: next_metadata,
     };
     let batch = store
@@ -529,6 +571,134 @@ fn finality_history_creates_an_authenticated_checkpoint_at_the_retained_bound() 
         .expect("the retained history remains bounded");
     assert_eq!(epochs.first(), Some(&FinalityEpoch::new(1)));
     assert_eq!(epochs.last(), Some(&appended.epoch));
+}
+
+#[test]
+fn finality_history_eviction_does_not_walk_earlier_tombstones() {
+    // Every eviction deletes the lowest key in the retained window, so it leaves a tombstone
+    // exactly where a from-the-start seek begins. The window is a few MB, far too small to
+    // trigger the compaction that would collect those tombstones, so locating the oldest
+    // record by walking from the start costs one skipped delete per eviction ever performed
+    // and eventually dominates every block commit. Eviction must seek past the published
+    // checkpoint instead, which keeps its cost flat.
+    const ROUNDS: u64 = 64;
+    const ALLOWED_GROWTH: u64 = 8;
+
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor_node, metadata) = fixture();
+    let anchor = metadata.frontiers.finalized;
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
+    store
+        .initialize(metadata.clone(), anchor_node)
+        .expect("the bounded history fixture initializes");
+
+    let limit = u64::try_from(FINALITY_HISTORY_LIMIT).expect("the limit fits u64");
+    let mut seed = DiskWriteBatch::new();
+    stage_full_state_canonical_hash(&store, &mut seed, anchor);
+    for epoch in 1..limit {
+        let record = FinalityRecord {
+            previous: anchor,
+            current: anchor,
+            source: full_state_source(EvidenceId::from_digest([0x90; 32])),
+            epoch: FinalityEpoch::new(epoch),
+        };
+        store
+            .put_value(
+                &mut seed,
+                HEADER_FINALITY_HISTORY,
+                HeaderFinalityKey(record.epoch).as_bytes(),
+                &record,
+            )
+            .expect("the retained history row encodes");
+    }
+    store
+        .put_value(
+            &mut seed,
+            HEADER_ENGINE_META,
+            FINALITY_HISTORY_COUNT_KEY,
+            &HeaderRowCountDisk(limit),
+        )
+        .expect("the retained history count encodes");
+    store.db.write(seed).expect("the bounded history seeds");
+
+    let mut next_metadata = metadata;
+    rocksdb::perf::set_perf_stats(rocksdb::PerfStatsLevel::EnableCount);
+    let mut context = rocksdb::PerfContext::default();
+    let mut skipped_deletes =
+        Vec::with_capacity(usize::try_from(ROUNDS).expect("the round count fits usize"));
+
+    for round in 0..ROUNDS {
+        let appended = FinalityRecord {
+            previous: anchor,
+            current: anchor,
+            source: full_state_source(EvidenceId::from_digest([0x91; 32])),
+            epoch: FinalityEpoch::new(limit + round),
+        };
+        next_metadata.finality_epoch = appended.epoch;
+        let changes = ChangeSet {
+            put_nodes: Vec::new(),
+            delete_nodes: Vec::new(),
+            put_consensus_invalid_body_tombstones: Vec::new(),
+            index_changes: zakura_header_chain::IndexChanges::default(),
+            selected_projection: zakura_header_chain::ProjectionDelta::default(),
+            verified_projection: zakura_header_chain::ProjectionDelta::default(),
+            eligibility_changes: Vec::new(),
+            aux_changes: Vec::new(),
+            finality_append: Some(appended),
+            finality_ancestry: zakura_header_chain::FinalityWitnessProof::default(),
+            metadata: next_metadata.clone(),
+        };
+
+        context.reset();
+        let batch = store
+            .batch_for(&changes)
+            .expect("the bounded append evicts the oldest record");
+        skipped_deletes.push(context.metric(rocksdb::PerfMetric::InternalDeleteSkippedCount));
+
+        store
+            .db
+            .write(batch)
+            .expect("the eviction commits atomically");
+    }
+    rocksdb::perf::set_perf_stats(rocksdb::PerfStatsLevel::Disable);
+
+    let first = skipped_deletes.first().copied().expect("a round ran");
+    let last = skipped_deletes.last().copied().expect("a round ran");
+    assert!(
+        last <= first + ALLOWED_GROWTH,
+        "eviction cost grows with the number of prior evictions: the first eviction skipped \
+         {first} deleted keys and eviction {ROUNDS} skipped {last}. Eviction is seeking from \
+         the start of the retained window instead of from the published checkpoint. \
+         Per-round counts: {skipped_deletes:?}"
+    );
+
+    // The window still holds exactly `limit` records, ending at the last epoch appended.
+    let audit = store
+        .audit_snapshot()
+        .expect("the checkpoint snapshot opens");
+    assert_eq!(
+        audit
+            .finality_history_count()
+            .expect("the retained count decodes"),
+        FINALITY_HISTORY_LIMIT
+    );
+    assert_eq!(
+        audit
+            .finality_history_checkpoint()
+            .expect("the checkpoint decodes")
+            .map(|checkpoint| checkpoint.epoch),
+        Some(FinalityEpoch::new(ROUNDS - 1)),
+        "each round must evict exactly one record, advancing the checkpoint by one"
+    );
+    let mut epochs = Vec::with_capacity(FINALITY_HISTORY_LIMIT);
+    audit
+        .visit_finality_history(RowLimit::new(FINALITY_HISTORY_LIMIT), &mut |record| {
+            epochs.push(record.epoch);
+            Ok(())
+        })
+        .expect("the retained history remains bounded");
+    assert_eq!(epochs.first(), Some(&FinalityEpoch::new(ROUNDS)));
+    assert_eq!(epochs.last(), Some(&FinalityEpoch::new(limit + ROUNDS - 1)));
 }
 
 #[test]
@@ -1235,6 +1405,18 @@ fn checkpoint_auxiliary_staging_does_not_clone_the_retained_engine() {
         implementation.contains("transition_engine.graph().header_node(header.hash).is_some()"),
         "the predecessor-lease fast path must be justified by the coherent retained graph"
     );
+    let validated = implementation
+        .find("validate_full_state_finality_provenance")
+        .expect("the combined checkpoint path validates full-state finality provenance");
+    let staged = implementation
+        .find("install_committed_transition")
+        .expect("the combined checkpoint path stages the auxiliary transition");
+    assert!(
+        validated < staged,
+        "checkpoint provenance must be validated against the pre-auxiliary snapshot, \
+         because staging the auxiliary transition advances the state version the \
+         state writer bound its evidence to"
+    );
 }
 
 #[test]
@@ -1294,5 +1476,278 @@ fn repeated_compatible_finality_publications_preserve_body_work_epoch() {
         publisher.view().body_work_epoch,
         zakura_header_chain::BodyWorkEpoch::default(),
         "compatible checkpoint publications must not advance the cumulative epoch"
+    );
+}
+
+#[test]
+fn combined_checkpoint_rejects_stale_version_and_accepts_pre_auxiliary_evidence() {
+    let cache = tempfile::tempdir().expect("the test cache directory is created");
+    let db_config = Config {
+        cache_dir: cache.path().to_owned(),
+        ephemeral: false,
+        debug_skip_non_finalized_state_backup_task: true,
+        ..Config::default()
+    };
+    let (engine_config, anchor, metadata) = fixture();
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the empty schema initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("the initial store audits");
+    let initial = runtime.publisher().snapshot();
+    let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+
+    let lease = runtime
+        .reader()
+        .validation_context(anchor.hash)
+        .expect("the anchor validation context is coherent")
+        .expect("the initialized anchor is retained");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the authenticated regtest policy is valid");
+    let mut child_header = *anchor.header;
+    child_header.previous_block_hash = anchor.hash;
+    child_header.time += chrono::Duration::seconds(1);
+    child_header.nonce.0[0] = 0x81;
+    let child_header = Arc::new(child_header);
+    // Authenticating a VCT delivery reads the delivery's direct successor on the owned
+    // branch, so the fixture admits one header past the checkpoint target.
+    let mut successor_header = *child_header;
+    successor_header.previous_block_hash = child_header.hash();
+    successor_header.time += chrono::Duration::seconds(1);
+    successor_header.nonce.0[0] = 0x85;
+    let successor_header = Arc::new(successor_header);
+    let headers = [child_header.clone(), successor_header.clone()];
+    let insertion_batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&headers),
+        lease.parent(),
+        &rules,
+        &SystemClock,
+    )
+    .expect("the checkpoint fixture passes production validation");
+    let child = Frontier::new(
+        anchor
+            .height
+            .next()
+            .expect("the genesis anchor has a next height"),
+        child_header.hash(),
+    );
+    let successor = Frontier::new(
+        child.height.next().expect("the child has a next height"),
+        successor_header.hash(),
+    );
+
+    // The unauthenticated delivery gives the auxiliary transition real durable work, which is
+    // what advances the state version between the writer's read and the checkpoint plan.
+    let source = SourceId::from_digest([0x82; 32]);
+    // The admission rule requires the delivery and its insertion to share one owner.
+    let insertion_owner = header_owner(&initial, successor.hash, 63, 64);
+    let delivery = zakura_header_chain::AuxDelivery::new(
+        EvidenceId::from_digest([0x83; 32]),
+        child.hash,
+        source,
+        insertion_owner,
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(zakura_header_chain::TreeAuxRecordV1 {
+            height: child.height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 4,
+            orchard_tx_count: 5,
+            ironwood_tx_count: 6,
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0x84; 32]),
+        }),
+    );
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: initial.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner: insertion_owner,
+                    source,
+                    parent_hash: anchor.hash,
+                    target_tip_hash: successor.hash,
+                    completion: TargetCompletion::TargetComplete {
+                        common_ancestor: anchor_frontier,
+                    },
+                    batch: insertion_batch,
+                    aux: vec![delivery],
+                })),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: None,
+                retention_references: &[],
+            },
+        )
+        .expect("the checkpoint header inserts with its unauthenticated delivery");
+
+    let before = runtime.publisher().snapshot();
+    assert_eq!(before.frontiers.verified_best, anchor_frontier);
+
+    // The state writer binds checkpoint finality evidence to the version it read.
+    let checkpoint_evidence =
+        zakura_header_chain::checkpoint_finality_evidence(before.state_version, child);
+    let checkpoint_event = TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+        full_state_transition_id: checkpoint_evidence,
+        old_tip: before.frontiers.verified_best,
+        new_path: vec![zakura_header_chain::VerifiedHeaderRef {
+            height: child.height,
+            hash: child.hash,
+            header: child_header,
+        }],
+        cause: VerifiedChangeCause::CheckpointFinalizedGrow,
+    });
+
+    let observation = zakura_header_chain::AuxObservationV1::from_vct(
+        body_owner(&before, 63, 64),
+        vec![delivery],
+        zakura_header_chain::AuxVerificationFactV1::current_delivery_verified(),
+        Some(zakura_chain::block::merkle::AuthDataRoot::from([0x84; 32])),
+    )
+    .expect("the VCT authentication observation is well formed");
+    let aux_event = TransitionEvent::AuxEvidence(Box::new(
+        zakura_header_chain::AuxEvidence::observed(observation),
+    ));
+    let aux_authority = Authority(
+        aux_event
+            .idempotency_key()
+            .expect("the auxiliary observation has an identity"),
+    );
+    let checkpoint_authority = Authority(checkpoint_evidence);
+
+    let stale_version = StateVersion::new(
+        before
+            .state_version
+            .get()
+            .checked_sub(1)
+            .expect("header insertion advanced the initial version"),
+    );
+    let mut stale_full_state_batch = DiskWriteBatch::new();
+    stage_full_state_canonical_hash(&runtime.store, &mut stale_full_state_batch, child);
+    let mut stale_memory_swapped = false;
+    let stale_result = runtime
+        .apply_aux_then_checkpoint_combined(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: aux_event.clone(),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&aux_authority),
+                retention_references: &[],
+            },
+            TransitionRequest {
+                expected_version: stale_version,
+                event: checkpoint_event.clone(),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&checkpoint_authority),
+                retention_references: &[],
+            },
+            stale_full_state_batch,
+            || stale_memory_swapped = true,
+        )
+        .expect("a stale checkpoint request returns a typed result");
+
+    assert_eq!(
+        stale_result,
+        ApplyResult::Stale(StaleReceipt {
+            current_version: before.state_version,
+            branch: None,
+        })
+    );
+    assert!(!stale_memory_swapped);
+    assert_eq!(runtime.publisher().snapshot(), before);
+
+    let mut full_state_batch = DiskWriteBatch::new();
+    stage_full_state_canonical_hash(&runtime.store, &mut full_state_batch, child);
+
+    let result = runtime
+        .apply_aux_then_checkpoint_combined(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: aux_event,
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&aux_authority),
+                retention_references: &[],
+            },
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: checkpoint_event,
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&checkpoint_authority),
+                retention_references: &[],
+            },
+            full_state_batch,
+            || {},
+        )
+        .expect("the checkpoint commits against evidence bound to the pre-auxiliary version");
+
+    assert!(matches!(result, ApplyResult::Committed));
+    let after = runtime.publisher().snapshot();
+    assert_eq!(after.frontiers.verified_best, child);
+    assert_eq!(
+        after.state_version.get(),
+        before.state_version.get() + 2,
+        "the auxiliary transition must advance the version the checkpoint evidence was bound to"
+    );
+
+    drop(runtime);
+    let (reopened, report) = HeaderChainStore::new(open(&db_config, engine_config.network()))
+        .startup(&engine_config)
+        .expect("recovery authenticates the pre-auxiliary checkpoint provenance");
+    assert_eq!(report.current, after);
+    assert_eq!(reopened.publisher().snapshot(), after);
+}
+
+#[test]
+fn checkpoint_grow_provenance_is_bound_to_one_state_version() {
+    let (_, anchor, metadata) = fixture();
+    let snapshot = metadata.snapshot();
+    let current = Frontier::new(
+        anchor
+            .height
+            .next()
+            .expect("the anchor has a successor height"),
+        block::Hash([0x95; 32]),
+    );
+    let event = TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+        full_state_transition_id: zakura_header_chain::checkpoint_finality_evidence(
+            snapshot.state_version,
+            current,
+        ),
+        old_tip: metadata.frontiers.verified_best,
+        new_path: vec![zakura_header_chain::VerifiedHeaderRef {
+            height: current.height,
+            hash: current.hash,
+            header: anchor.header.clone(),
+        }],
+        cause: VerifiedChangeCause::CheckpointFinalizedGrow,
+    });
+    assert!(validate_full_state_finality_provenance(&event, &snapshot).is_ok());
+
+    let mut advanced = snapshot.clone();
+    advanced.state_version = StateVersion::new(snapshot.state_version.get() + 1);
+    assert!(
+        matches!(
+            validate_full_state_finality_provenance(&event, &advanced),
+            Err(HeaderChainStoreError::Incoherent(
+                "full-state finality provenance does not match the authorized transition"
+            ))
+        ),
+        "checkpoint evidence must not validate against a version the state writer never read"
     );
 }

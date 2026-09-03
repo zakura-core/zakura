@@ -38,7 +38,6 @@ pub(crate) mod drop_header_root_auth_frontier;
 pub(crate) mod fix_tree_key_type;
 pub(crate) mod no_migration;
 pub(crate) mod prune_trees;
-pub(crate) mod tree_keys_and_caches_upgrade;
 pub(crate) mod unauthenticated_commitment_roots;
 
 #[cfg(not(feature = "indexer"))]
@@ -113,13 +112,6 @@ fn format_upgrades(
 
     // Note: Disk format upgrades must be run in order of database version.
     ([
-        Box::new(prune_trees::PruneTrees),
-        Box::new(add_subtrees::AddSubtrees),
-        Box::new(tree_keys_and_caches_upgrade::FixTreeKeyTypeAndCacheGenesisRoots),
-        Box::new(no_migration::NoMigration::new(
-            "add value balance upgrade",
-            Version::new(26, 0, 0),
-        )),
         Box::new(block_info_and_address_received::Upgrade),
         Box::new(no_migration::NoMigration::new(
             "add pruning metadata column family",
@@ -152,7 +144,7 @@ fn format_upgrades(
         )),
         Box::new(drop_header_root_auth_frontier::Upgrade),
         Box::new(unauthenticated_commitment_roots::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 14])
+    ] as [Box<dyn DiskFormatUpgrade>; 10])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -764,6 +756,10 @@ impl DbFormatChange {
         //
         // Do the quick checks first, so we don't have to do this in every detailed check.
         results.push(Self::format_validity_checks_quick(db));
+        results.push(prune_trees::detailed_check(db, cancel_receiver)?);
+        results.push(add_subtrees::detailed_check(db, cancel_receiver)?);
+        results.push(cache_genesis_roots::detailed_check(db, cancel_receiver)?);
+        results.push(fix_tree_key_type::detailed_check(db, cancel_receiver)?);
 
         for upgrade in format_upgrades(None) {
             results.push(upgrade.validate(db, cancel_receiver)?);

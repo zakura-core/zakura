@@ -46,13 +46,14 @@ use crate::{
 
 use InventoryResponse::*;
 
-/// Maximum time to wait for a network service request.
+/// How long the mock peer set waits for an expected request before panicking.
 ///
-/// The default [`MockService`] value can be too short for some of these tests that take a little
-/// longer than expected to actually send the network request.
-///
-/// Increasing this value causes the tests to take longer to complete, so it can't be too large.
-const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_millis(500);
+/// Must comfortably exceed [`PEER_GOSSIP_DELAY`]: after that sleep the gossip task still needs a tip
+/// change notification and a short submission delay before it advertises. A tight 500ms bound
+/// races under CI scheduling and fails with `timeout while waiting for a request` even though the
+/// advertise would arrive a moment later. The dedicated gossip tests use the same 30s budget;
+/// with a paused runtime the extra headroom does not slow the happy path.
+const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
 async fn wait_for_gossip() {
     // Let background gossip tasks arm their timers before this paused runtime
@@ -1153,7 +1154,9 @@ async fn caches_getaddr_response() {
 
         // UTXO verification doesn't matter for these tests.
         let (state, _read_only_state_service, latest_chain_tip, _chain_tip_change) =
-            zakura_state::init(state_config.clone(), &network, Height::MAX, 0).await;
+            zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
+                .await
+                .expect("ephemeral state initialization succeeds");
 
         let state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -1329,8 +1332,10 @@ async fn setup_with_misbehavior_receiver(
     let (sync_status, mut recent_syncs) = SyncStatus::new();
 
     // UTXO verification doesn't matter for these tests.
-    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change) =
-        zakura_state::init(state_config.clone(), &network, Height::MAX, 0).await;
+    let (state, read_only_state_service, latest_chain_tip, mut chain_tip_change) =
+        zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
     let mut state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -1409,6 +1414,7 @@ async fn setup_with_misbehavior_receiver(
         false,
         buffered_peer_set.clone(),
         state_service.clone(),
+        tower::util::BoxCloneService::new(read_only_state_service),
         buffered_tx_verifier.clone(),
         sync_status.clone(),
         latest_chain_tip.clone(),

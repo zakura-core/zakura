@@ -5,8 +5,9 @@ use proptest::{collection::size_range, prelude::*};
 use std::matches;
 
 use crate::serialization::{
-    arbitrary::max_allocation_is_big_enough, zcash_deserialize::MAX_U8_ALLOCATION,
-    SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashSerialize,
+    arbitrary::max_allocation_is_big_enough,
+    zcash_deserialize::{MAX_INITIAL_ALLOCATION, MAX_U8_ALLOCATION},
+    CompactSizeMessage, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashSerialize,
     MAX_PROTOCOL_MESSAGE_LEN,
 };
 
@@ -93,4 +94,82 @@ fn u8_max_allocation_is_correct() {
     assert_eq!(largest_allowed_vec_len, MAX_U8_ALLOCATION);
     // Check that our largest_allowed_vec is the size of a maximal protocol message
     assert_eq!(largest_allowed_serialized_len, MAX_PROTOCOL_MESSAGE_LEN);
+}
+
+/// A reader that supplies `remaining` zero bytes, then reports end of file,
+/// and records the largest buffer it was asked to fill.
+struct TruncatedReader {
+    /// The number of bytes left to supply.
+    remaining: usize,
+
+    /// The largest `read()` buffer seen so far.
+    max_read_len: usize,
+}
+
+impl std::io::Read for TruncatedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.max_read_len = self.max_read_len.max(buf.len());
+
+        let len = buf.len().min(self.remaining);
+        buf[..len].fill(0);
+        self.remaining -= len;
+
+        Ok(len)
+    }
+}
+
+#[test]
+/// Confirm that a short message declaring a near-maximal byte vector length does not
+/// make the deserializer allocate that length before the bytes arrive.
+///
+/// `read_exact()` is handed the tail of the output buffer that the deserializer has
+/// grown so far, so the largest buffer the reader sees tracks how much the deserializer
+/// allocates as it goes. A peer that declares `MAX_U8_ALLOCATION` bytes and then ends
+/// the message used to force a two megabyte allocation from a few hundred bytes of
+/// input, which is the byte vector case of GHSA-xr93-pcq3-pxf8.
+///
+/// This proxy has one blind spot: it can not see a `Vec::with_capacity(external_count)`
+/// that is followed by chunked reads, because that reserves the full length while still
+/// handing the reader small buffers. Safe Rust can not observe the capacity from the
+/// reader side, and a counting global allocator needs `unsafe`, which this workspace
+/// denies. So the deserializer carries a matching comment telling the reader never to
+/// pre-reserve the declared length.
+fn u8_deser_does_not_preallocate_declared_length() {
+    /// The number of body bytes the peer actually sends.
+    const SUPPLIED_LEN: usize = 512;
+
+    /// The largest buffer the deserializer may hand to the reader. The chunked read grows
+    /// the buffer in `MAX_INITIAL_ALLOCATION` steps, so one chunk is the exact maximum;
+    /// the factor of two leaves room to retune the chunk size without editing this test.
+    const MAX_ALLOWED_READ_LEN: usize = 2 * MAX_INITIAL_ALLOCATION;
+
+    // A CompactSize length prefix for `MAX_U8_ALLOCATION`, followed by a truncated body.
+    let mut serialized = Vec::new();
+    CompactSizeMessage::try_from(MAX_U8_ALLOCATION)
+        .expect("MAX_U8_ALLOCATION is a valid CompactSize")
+        .zcash_serialize(&mut serialized)
+        .expect("serialization to vec must succeed");
+
+    let mut reader = std::io::Read::chain(
+        std::io::Cursor::new(serialized),
+        TruncatedReader {
+            remaining: SUPPLIED_LEN,
+            max_read_len: 0,
+        },
+    );
+
+    let deserialized = <Vec<u8>>::zcash_deserialize(&mut reader);
+
+    // The message ends before the declared length, so it must be rejected.
+    assert!(
+        matches!(&deserialized, Err(SerializationError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof),
+        "truncated byte vector must be rejected with UnexpectedEof, got: {deserialized:?}"
+    );
+
+    let max_read_len = reader.into_inner().1.max_read_len;
+    assert!(
+        max_read_len <= MAX_ALLOWED_READ_LEN,
+        "a {SUPPLIED_LEN} byte message declaring {MAX_U8_ALLOCATION} bytes allocated a \
+         {max_read_len} byte buffer, which is above the {MAX_ALLOWED_READ_LEN} byte limit"
+    );
 }

@@ -28,7 +28,12 @@ use std::{
 
 use futures::{future::FutureExt, stream::Stream};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tower::{buffer::Buffer, timeout::Timeout, util::BoxService, Service};
+use tower::{
+    buffer::Buffer,
+    timeout::Timeout,
+    util::{BoxCloneService, BoxService},
+    Service,
+};
 
 use zakura_chain::{
     block::{self, Height},
@@ -110,11 +115,12 @@ fn transaction_error_peer_log_label(
 
 type Outbound = Buffer<BoxService<zn::Request, zn::Response, zn::BoxError>, zn::Request>;
 type State = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
+type ReadState = BoxCloneService<zs::ReadRequest, zs::ReadResponse, zs::BoxError>;
 type TxVerifier = Buffer<
     BoxService<transaction::Request, transaction::Response, TransactionError>,
     transaction::Request,
 >;
-type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, State>;
+type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, ReadState>;
 
 fn transaction_misbehavior(
     error: &TransactionDownloadVerifyError,
@@ -286,9 +292,13 @@ pub struct Mempool {
     /// Used to construct the transaction downloader.
     outbound: Outbound,
 
-    /// Handle to the state service.
+    /// Handle to the read state service.
     /// Used to construct the transaction downloader.
-    state: State,
+    read_state: ReadState,
+
+    /// Keeps the read-write state service alive for the mempool lifetime.
+    /// The transaction downloader does not send requests through this handle.
+    _state_guard: State,
 
     /// Handle to the transaction verifier service.
     /// Used to construct the transaction downloader.
@@ -331,6 +341,7 @@ impl Mempool {
         expose_peer_addresses: bool,
         outbound: Outbound,
         state: State,
+        read_state: ReadState,
         tx_verifier: TxVerifier,
         sync_status: SyncStatus,
         latest_chain_tip: zs::LatestChainTip,
@@ -350,7 +361,8 @@ impl Mempool {
             latest_chain_tip,
             chain_tip_change,
             outbound,
-            state,
+            read_state,
+            _state_guard: state,
             tx_verifier,
             transaction_sender,
             misbehavior_sender,
@@ -423,7 +435,7 @@ impl Mempool {
         let tx_downloads = Box::pin(TxDownloads::new(
             Timeout::new(self.outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
             Timeout::new(self.tx_verifier.clone(), TRANSACTION_VERIFY_TIMEOUT),
-            self.state.clone(),
+            self.read_state.clone(),
             self.expose_peer_addresses,
             self.config.max_transaction_bytes,
         ));

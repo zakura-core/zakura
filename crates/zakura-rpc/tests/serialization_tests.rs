@@ -1432,6 +1432,26 @@ fn test_get_peer_info() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_get_peer_info_metadata_serialization() -> Result<(), Box<dyn std::error::Error>> {
+    let json = r#"
+[
+  {
+    "addr": "192.168.0.1:8233",
+    "subver": "/Zakura:1.0.3/",
+    "version": 170160,
+    "inbound": false
+  }
+]
+"#;
+    let obj: GetPeerInfoResponse = serde_json::from_str(json)?;
+
+    assert_eq!(obj[0].subver().as_deref(), Some("/Zakura:1.0.3/"));
+    assert_eq!(*obj[0].version(), Some(170160));
+
+    Ok(())
+}
+
+#[test]
 fn test_get_peer_info_with_ping_values_serialization() -> Result<(), Box<dyn std::error::Error>> {
     let json = r#"
 [

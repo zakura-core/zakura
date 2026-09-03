@@ -248,7 +248,10 @@ fn verify_plan_against_graph<G: HeaderGraphView>(
     }
     if let Some(record) = plan.change_set.finality_append {
         let valid_source = match record.source {
-            FinalitySource::FullState { .. } => metadata.mode == EngineMode::Integrated,
+            FinalitySource::FullState { .. } => {
+                metadata.mode == EngineMode::Integrated
+                    && plan.change_set.finality_ancestry.is_empty()
+            }
             FinalitySource::HeadersOnlyDepth { selected_tip } => {
                 metadata.mode == EngineMode::HeadersOnly
                     && record.headers_only_depth_witness(plan.limits.local_finality_depth.get())
@@ -258,13 +261,19 @@ fn verify_plan_against_graph<G: HeaderGraphView>(
                         .ok()
                         .flatten()
                         == Some(record.current)
+                    && valid_headers_only_finality_ancestry(
+                        record,
+                        &plan.change_set.finality_ancestry,
+                    )
             }
-            FinalitySource::MigratedHeadersOnly => false,
+            FinalitySource::MigratedHeadersOnly | FinalitySource::DiskMigration { .. } => false,
         };
         if !valid_source {
             return Err(InvariantViolation::Protected(record.current.hash));
         }
-    } else if metadata.finality_epoch != source_metadata.finality_epoch {
+    } else if metadata.finality_epoch != source_metadata.finality_epoch
+        || !plan.change_set.finality_ancestry.is_empty()
+    {
         return Err(InvariantViolation::Generation);
     }
     for node in verification_nodes(engine_before_commit, graph, plan, mode) {
@@ -316,6 +325,45 @@ fn verify_plan_against_graph<G: HeaderGraphView>(
     verify_generations(engine_before_commit, plan, &selected, &verified)?;
     verify_aux(engine_before_commit, graph, plan, mode)?;
     Ok(())
+}
+
+fn valid_headers_only_finality_ancestry(
+    record: crate::FinalityRecord,
+    ancestry: &[crate::FinalityAncestryHeader],
+) -> bool {
+    let FinalitySource::HeadersOnlyDepth { selected_tip } = record.source else {
+        return false;
+    };
+    let Some(span) = selected_tip.height.0.checked_sub(record.previous.height.0) else {
+        return false;
+    };
+    if usize::try_from(span).ok() != Some(ancestry.len()) {
+        return false;
+    }
+    let mut expected_parent = record.previous.hash;
+    let Ok(mut expected_height) = record.previous.height.next() else {
+        return false;
+    };
+    let mut current_seen = false;
+    let mut last = record.previous;
+    for (index, entry) in ancestry.iter().enumerate() {
+        if entry.frontier.height != expected_height
+            || entry.header.previous_block_hash != expected_parent
+        {
+            return false;
+        }
+        let frontier = entry.frontier;
+        current_seen |= frontier == record.current;
+        last = frontier;
+        expected_parent = frontier.hash;
+        if index + 1 < ancestry.len() {
+            let Ok(next) = expected_height.next() else {
+                return false;
+            };
+            expected_height = next;
+        }
+    }
+    current_seen && last == selected_tip
 }
 
 fn verification_nodes<'a, G: HeaderGraphView>(

@@ -6,14 +6,69 @@ runs:
     - name: Install libclang, protoc, and librocksdb-dev on Ubuntu
       if: runner.os == 'Linux'
       shell: bash
+      env:
+        # Wall-clock budget for the whole package phase. A healthy runner needs
+        # about 20 seconds, and a degraded package mirror has needed 13 minutes.
+        # GitHub ignores `timeout-minutes` on composite action steps, so this
+        # step enforces its own bound. Without it, one stalled fetch consumes
+        # the entire job timeout and reports nothing.
+        APT_BUDGET_SECONDS: '1200'
       run: |
+        set -euo pipefail
+
+        packages=(clang libclang-dev protobuf-compiler librocksdb-dev)
+        apt_options=(
+          # Retry an individual transfer before the whole command fails.
+          -o Acquire::Retries=3
+          # Abandon a connection that stops sending data.
+          -o Acquire::http::Timeout=30
+          -o Acquire::https::Timeout=30
+          # Fail instead of waiting forever for another package manager.
+          -o DPkg::Lock::Timeout=120
+        )
+        deadline=$(( SECONDS + APT_BUDGET_SECONDS ))
+
+        # Run one apt-get command under the shared budget and retry a failure
+        # that leaves useful time. `timeout` signals the whole process group,
+        # so a killed attempt cannot keep downloading in the background.
+        run_apt() {
+          local label="$1"
+          shift
+          local attempt=1
+          local status remaining
+          while true; do
+            remaining=$(( deadline - SECONDS ))
+            if (( remaining < 60 )); then
+              echo "::error::apt ${label}: the ${APT_BUDGET_SECONDS}s package budget ran out after ${attempt} attempt(s)"
+              return 1
+            fi
+            echo "apt ${label}: attempt ${attempt}, ${remaining}s of budget left"
+            status=0
+            sudo timeout --kill-after=30 "${remaining}" "$@" || status=$?
+            if (( status == 0 )); then
+              echo "apt ${label}: attempt ${attempt} succeeded"
+              return 0
+            fi
+            if (( status == 124 || status == 137 )); then
+              echo "apt ${label}: attempt ${attempt} exhausted the remaining ${remaining}s and was killed"
+            else
+              echo "apt ${label}: attempt ${attempt} exited ${status}"
+            fi
+            attempt=$(( attempt + 1 ))
+            sleep 15
+          done
+        }
+
         sudo rm -f /etc/apt/sources.list.d/{microsoft-prod,azure-cli}.{list,sources}
-        sudo apt-get -qq update
+        run_apt update apt-get "${apt_options[@]}" update
+        # Download separately from install: interrupting a download is safe,
+        # and interrupting dpkg leaves a half-configured package set.
+        run_apt download apt-get "${apt_options[@]}" install -y --no-install-recommends --download-only "${packages[@]}"
         # libclang is needed at build time: librocksdb-sys always runs bindgen
         # (via clang-sys) to generate FFI bindings, even when linking the system
         # RocksDB via ROCKSDB_LIB_DIR.
-        sudo apt-get -qq install -y --no-install-recommends clang libclang-dev protobuf-compiler librocksdb-dev
-        echo "ROCKSDB_LIB_DIR=/usr/lib/" >> $GITHUB_ENV
+        run_apt install apt-get "${apt_options[@]}" install -y --no-install-recommends "${packages[@]}"
+        echo "ROCKSDB_LIB_DIR=/usr/lib/" >> "$GITHUB_ENV"
 
     - name: Install protoc and RocksDB on macOS
       if: runner.os == 'macOS'

@@ -45,8 +45,8 @@ pub use config::{
     StorageMode,
 };
 pub use constants::{
-    state_database_format_version_in_code, DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
-    MAX_BLOCK_REORG_HEIGHT,
+    state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT,
+    MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 pub use error::{
     BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
@@ -85,11 +85,25 @@ pub use service::{
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
 
+// Lets tests above this crate drive real RPC handlers over a fast-synced node's absent band.
+#[cfg(any(test, feature = "proptest-impl"))]
+pub use service::finalized_state::vct_fast_sync_fixture::{VctFastSyncedChain, VctFastSyncedNode};
+
+#[cfg(feature = "internal-bench")]
+pub use service::finalized_state::{
+    benchmark_finality_witness, FinalityWitnessBenchmarkReport, FinalityWitnessBenchmarkSample,
+};
 pub use service::finalized_state::{
     derived_roots_in_display_order, inventory as vct_treestate_inventory,
     inventory_with_scans as vct_treestate_inventory_with_scans, measure_derivations, replay_inputs,
     verify_subtrees_against_stored, DerivationSample, ReplayInputs, SubtreeVerification,
     VctTreestateInventory,
+};
+pub use service::finalized_state::{
+    export_frontier_grid_to, produce_release_treestate_artifacts, verify_subtree_artifact,
+    FrontierArtifact, FrontierEntry, FrontierGridExport, FrontierGridExportError, GridSpacing,
+    ReleaseTreestateArtifacts, ReleaseTreestateArtifactsError, SubtreeArtifact, SubtreeRecord,
+    TreestateArtifactError, VerifiedSubtreeCounts,
 };
 pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,
@@ -103,13 +117,9 @@ pub use service::finalized_state::{
     produce_final_frontiers_bytes, produce_settled_final_frontiers_bytes,
     validate_final_frontiers_bytes, FinalFrontiersGenerationError, FinalFrontiersValidationError,
 };
-pub use service::finalized_state::{
-    produce_release_treestate_artifacts, verify_subtree_artifact, ReleaseTreestateArtifacts,
-    ReleaseTreestateArtifactsError, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
-    VerifiedSubtreeCounts,
-};
 pub use service::read::{
-    derive_historical_frontiers, DerivedFrontiers, HistoricalTreeCache, MAX_MEMOIZED_FRONTIERS,
+    derive_historical_frontiers, ChainTipInfo, ChainTipStatus, DerivedFrontiers,
+    HistoricalTreeCache, MAX_CACHED_FRONTIERS,
 };
 pub use service::{
     finalized_state::{DiskWriteBatch, FallibleDiskValue, FromDisk, IntoDisk, WriteDisk, ZakuraDb},

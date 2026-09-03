@@ -1,6 +1,6 @@
 [package]
 name = "zakura-state"
-version = "7.0.0"
+version = "7.1.0"
 authors.workspace = true
 description = "State contextual verification and storage code for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -37,26 +37,24 @@ commit-metrics = []
 # Test-only features
 header-fuzz = []
 proptest-impl = [
+    "dep:halo2",
     "proptest",
     "proptest-derive",
-    "zakura-test",
     "zakura-chain/proptest-impl"
 ]
 
 [dependencies]
 bincode = { workspace = true }
 chrono = { workspace = true, features = ["clock", "std"] }
-dirs = { workspace = true }
 futures = { workspace = true }
+halo2 = { workspace = true, optional = true }
 hex = { workspace = true }
 hex-literal = { workspace = true }
 humantime-serde = { workspace = true }
-human_bytes = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 metrics = { workspace = true }
-mset = { workspace = true }
 regex = { workspace = true }
 rlimit = { workspace = true }
 rocksdb = { workspace = true, features = ["lz4"] }
@@ -75,22 +73,22 @@ tracing = { workspace = true }
 
 sapling-crypto = { workspace = true }
 
-zakura-node-services = { path = "../zakura-node-services", version = "3.2.0" }
+zakura-assets = { workspace = true }
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.1" }
 zakura-chain = { path = "../zakura-chain", version = "6.0.0", features = ["async-error"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0-rc0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0" }
 
 # prod feature progress-bar
 howudoin = { workspace = true, optional = true }
 
 # test feature proptest-impl
-zakura-test = { path = "../zakura-test/", version = "2.1.0", optional = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 derive-getters.workspace = true
 derive-new.workspace = true
 
 [dev-dependencies]
-zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0-rc0", features = ["test-support"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0", features = ["test-support"] }
 color-eyre = { workspace = true }
 
 once_cell = { workspace = true }
@@ -105,8 +103,7 @@ proptest = { workspace = true }
 proptest-derive = { workspace = true }
 rand = { workspace = true }
 
-halo2 = { package = "halo2_proofs", version = "0.3" }
-jubjub = { workspace = true }
+halo2 = { workspace = true }
 orchard = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
@@ -125,5 +122,15 @@ feature_missing = "warn"
 
 [[bench]]
 name = "transparent_spend_worst_case"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
+name = "chain_clone_worst_case"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
+name = "finality_witness"
 harness = false
 required-features = ["internal-bench"]

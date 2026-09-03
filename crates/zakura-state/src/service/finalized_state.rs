@@ -97,6 +97,9 @@ mod arbitrary;
 #[cfg(test)]
 mod tests;
 
+#[cfg(any(test, feature = "proptest-impl"))]
+pub mod vct_fast_sync_fixture;
+
 #[allow(unused_imports)]
 pub use column_family::{TypedColumnFamily, WriteTypedBatch};
 pub(crate) use commitment_aux::serve_block_roots;
@@ -111,15 +114,23 @@ pub use disk_format::{
     FallibleDiskValue, FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex,
     TransactionLocation, MAX_ON_DISK_HEIGHT,
 };
+#[cfg(feature = "internal-bench")]
+pub use header_chain::{
+    benchmark_finality_witness, FinalityWitnessBenchmarkReport, FinalityWitnessBenchmarkSample,
+};
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use header_chain::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
-pub(crate) use treestate_artifact::embedded_historical_subtrees;
+pub(crate) use treestate_artifact::{
+    embedded_historical_frontier_artifact, embedded_historical_subtrees,
+};
 pub use treestate_artifact::{
-    verify_subtree_artifact, SubtreeArtifact, SubtreeRecord, TreestateArtifactError,
-    VerifiedSubtreeCounts,
+    verify_subtree_artifact, FrontierArtifact, FrontierEntry, SubtreeArtifact, SubtreeRecord,
+    TreestateArtifactError, VerifiedSubtreeCounts,
 };
 pub use treestate_export::{
-    produce_release_treestate_artifacts, ReleaseTreestateArtifacts, ReleaseTreestateArtifactsError,
+    export_frontier_grid_to, produce_release_treestate_artifacts, FrontierGridExport,
+    FrontierGridExportError, GridSpacing, ReleaseTreestateArtifacts,
+    ReleaseTreestateArtifactsError,
 };
 pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, VctSuccessorWitness};
 pub(crate) use vct::{VctAuthenticationProof, VctAuxiliaryFailureAttribution, VctAuxiliaryWindow};
@@ -171,6 +182,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     HEADER_AUX_DELIVERY,
     HEADER_DEFERRED,
     HEADER_FINALITY_HISTORY,
+    HEADER_FINALITY_WITNESS,
     HEADER_VALIDATION_CONTEXT,
     HEADER_ENGINE_META,
     // Transactions
@@ -234,6 +246,8 @@ pub const HEADER_AUX_DELIVERY: &str = "header_aux_delivery_v1";
 pub const HEADER_DEFERRED: &str = "header_deferred_v1";
 /// Authoritative append-only finality history.
 pub const HEADER_FINALITY_HISTORY: &str = "header_finality_history_v1";
+/// Canonical hash-keyed headers that prove retained headers-only finality records.
+pub const HEADER_FINALITY_WITNESS: &str = "header_finality_witness_v1";
 /// Immutable validation-context rows.
 pub const HEADER_VALIDATION_CONTEXT: &str = "header_validation_context_v1";
 /// Singleton header-engine metadata root.
@@ -869,7 +883,7 @@ impl FinalizedState {
                             auxiliary_window.delivery_roots(height, block.hash())
                         });
                     let vct_roots = exact_vct_roots;
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "proptest-impl"))]
                     let vct_roots = match vct_auxiliary_window.as_ref() {
                         Some(_) => vct_roots,
                         None => self.vct.source().and_then(|v| {
@@ -1480,7 +1494,7 @@ impl FinalizedState {
     /// round-trip can be exercised in-process. `requires_verified_successor` marks
     /// whether the installed source is untrusted and must defer tip roots until their
     /// successor is buffered.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub(in crate::service::finalized_state) fn enable_vct_fast_source(
         &mut self,
         source: Box<dyn commitment_aux::CommitmentRootSource>,

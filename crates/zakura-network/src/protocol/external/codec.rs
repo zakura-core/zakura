@@ -1,7 +1,6 @@
 //! A Tokio codec mapping byte streams to Bitcoin message streams.
 
 use std::{
-    cmp::min,
     fmt,
     io::{Cursor, Read, Write},
     panic::{self, AssertUnwindSafe},
@@ -19,10 +18,10 @@ use zakura_chain::{
     block::{self, Block},
     parameters::{Magic, Network},
     serialization::{
-        sha256d, zcash_deserialize_bytes_external_count, zcash_deserialize_external_count,
-        zcash_deserialize_string_external_count, CompactSizeMessage, FakeWriter, ReadZcashExt,
-        SerializationError as Error, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
-        MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
+        sha256d, zcash_deserialize_external_count, zcash_deserialize_string_external_count,
+        CompactSizeMessage, FakeWriter, ReadZcashExt, SerializationError as Error,
+        ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize, MAX_HEADERS_PER_MESSAGE,
+        MAX_PROTOCOL_MESSAGE_LEN,
     },
     transaction::Transaction,
 };
@@ -43,6 +42,10 @@ mod tests;
 
 /// The length of a Bitcoin message header.
 const HEADER_LEN: usize = 24usize;
+
+/// Bloom filter commands accepted and discarded for peer compatibility.
+const BLOOM_FILTER_COMMANDS: [[u8; 12]; 3] =
+    [*b"filterload\0\0", *b"filteradd\0\0\0", *b"filterclear\0"];
 
 /// The maximum body length allowed before the handshake completes.
 ///
@@ -193,9 +196,6 @@ impl Encoder<Message> for Codec {
             NotFound { .. } => b"notfound\0\0\0\0",
             Tx { .. } => b"tx\0\0\0\0\0\0\0\0\0\0",
             Mempool => b"mempool\0\0\0\0\0",
-            FilterLoad { .. } => b"filterload\0\0",
-            FilterAdd { .. } => b"filteradd\0\0\0",
-            FilterClear => b"filterclear\0",
         };
         trace!(?item, len = body_length);
 
@@ -349,21 +349,6 @@ impl Codec {
             Message::NotFound(hashes) => hashes.zcash_serialize(&mut writer)?,
             Message::Tx(transaction) => transaction.transaction().zcash_serialize(&mut writer)?,
             Message::Mempool => { /* Empty payload -- no-op */ }
-            Message::FilterLoad {
-                filter,
-                hash_functions_count,
-                tweak,
-                flags,
-            } => {
-                writer.write_all(&filter.0)?;
-                writer.write_u32::<LittleEndian>(*hash_functions_count)?;
-                writer.write_u32::<LittleEndian>(tweak.0)?;
-                writer.write_u8(*flags)?;
-            }
-            Message::FilterAdd { data } => {
-                writer.write_all(data)?;
-            }
-            Message::FilterClear => { /* Empty payload -- no-op */ }
         }
         Ok(())
     }
@@ -405,145 +390,149 @@ impl Decoder for Codec {
     #[allow(clippy::unwrap_in_result)]
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         use Error::Parse;
-        match self.state {
-            DecodeState::Head => {
-                // First check that the src buffer contains an entire header.
-                if src.len() < HEADER_LEN {
-                    trace!(?self.state, "src buffer does not have an entire header, waiting");
-                    // Signal that decoding requires more data.
-                    return Ok(None);
+
+        'messages: loop {
+            match self.state {
+                DecodeState::Head => {
+                    // First check that the src buffer contains an entire header.
+                    if src.len() < HEADER_LEN {
+                        trace!(?self.state, "src buffer does not have an entire header, waiting");
+                        // Signal that decoding requires more data.
+                        return Ok(None);
+                    }
+
+                    // Now that we know that src contains a header, split off the header section.
+                    let header = src.split_to(HEADER_LEN);
+
+                    // Create a cursor over the header and parse its fields.
+                    let mut header_reader = Cursor::new(&header);
+                    let magic = Magic(header_reader.read_4_bytes()?);
+                    let command = header_reader.read_12_bytes()?;
+                    let body_len = header_reader.read_u32::<LittleEndian>()? as usize;
+                    let checksum = sha256d::Checksum(header_reader.read_4_bytes()?);
+                    trace!(
+                        ?self.state,
+                        ?magic,
+                        command = %escape_command(&command),
+                        body_len,
+                        ?checksum,
+                        "read header from src buffer"
+                    );
+
+                    if magic != self.builder.network.magic() {
+                        return Err(Parse("supplied magic did not meet expectations"));
+                    }
+                    if body_len > self.builder.max_len {
+                        return Err(Parse("body length exceeded maximum size"));
+                    }
+                    if command == *crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES
+                        && body_len > crate::zakura::MAX_PRELUDE_PAYLOAD_BYTES
+                    {
+                        return Err(Parse("Zakura p2pv2up payload exceeds the hard prelude cap"));
+                    }
+
+                    metrics::counter!("zcash.net.in.bytes.total")
+                        .increment((body_len + HEADER_LEN) as u64);
+
+                    // Reserve buffer space for the expected body and the following header.
+                    src.reserve(body_len + HEADER_LEN);
+
+                    self.state = DecodeState::Body {
+                        body_len,
+                        command,
+                        checksum,
+                    };
+
+                    // Now that the state is updated, attempt body decoding.
+                    continue 'messages;
                 }
-
-                // Now that we know that src contains a header, split off the header section.
-                let header = src.split_to(HEADER_LEN);
-
-                // Create a cursor over the header and parse its fields.
-                let mut header_reader = Cursor::new(&header);
-                let magic = Magic(header_reader.read_4_bytes()?);
-                let command = header_reader.read_12_bytes()?;
-                let body_len = header_reader.read_u32::<LittleEndian>()? as usize;
-                let checksum = sha256d::Checksum(header_reader.read_4_bytes()?);
-                trace!(
-                    ?self.state,
-                    ?magic,
-                    command = %escape_command(&command),
-                    body_len,
-                    ?checksum,
-                    "read header from src buffer"
-                );
-
-                if magic != self.builder.network.magic() {
-                    return Err(Parse("supplied magic did not meet expectations"));
-                }
-                if body_len > self.builder.max_len {
-                    return Err(Parse("body length exceeded maximum size"));
-                }
-                if command == *crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES
-                    && body_len > crate::zakura::MAX_PRELUDE_PAYLOAD_BYTES
-                {
-                    return Err(Parse("Zakura p2pv2up payload exceeds the hard prelude cap"));
-                }
-
-                metrics::counter!("zcash.net.in.bytes.total")
-                    .increment((body_len + HEADER_LEN) as u64);
-
-                // Reserve buffer space for the expected body and the following header.
-                src.reserve(body_len + HEADER_LEN);
-
-                self.state = DecodeState::Body {
+                DecodeState::Body {
                     body_len,
                     command,
                     checksum,
-                };
-
-                // Now that the state is updated, recurse to attempt body decoding.
-                self.decode(src)
-            }
-            DecodeState::Body {
-                body_len,
-                command,
-                checksum,
-            } => {
-                if src.len() < body_len {
-                    // Need to wait for the full body
-                    trace!(?self.state, len = src.len(), "src buffer does not have an entire body, waiting");
-                    return Ok(None);
-                }
-
-                // Now that we know we have the full body, split off the body,
-                // and reset the decoder state for the next message. Otherwise
-                // we will attempt to read the next header as the current body.
-                let body = src.split_to(body_len);
-                self.state = DecodeState::Head;
-
-                if checksum != sha256d::Checksum::from(&body[..]) {
-                    return Err(Parse(
-                        "supplied message checksum does not match computed checksum",
-                    ));
-                }
-
-                let mut body_reader = Cursor::new(&body);
-
-                // The body bytes are owned locally and the decoder state was
-                // reset above, before entering this unwind boundary. Body
-                // readers do not mutate shared services or connection state.
-                // A caught panic returns an error that the network treats as
-                // terminal, dropping this codec and its peer transport.
-                let decode_result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    #[cfg(test)]
-                    self.panic_at_body_decode_point(BodyDecodePanic::CommandDispatch);
-
-                    match &command {
-                        b"version\0\0\0\0\0" => self.read_version(&mut body_reader),
-                        b"verack\0\0\0\0\0\0" => self.read_verack(&mut body_reader),
-                        b"ping\0\0\0\0\0\0\0\0" => self.read_ping(&mut body_reader),
-                        b"pong\0\0\0\0\0\0\0\0" => self.read_pong(&mut body_reader),
-                        b"reject\0\0\0\0\0\0" => self.read_reject(&mut body_reader),
-                        crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES => {
-                            self.read_p2p_v2_upgrade(&mut body_reader, body_len)
-                        }
-                        b"addr\0\0\0\0\0\0\0\0" => self.read_addr(&mut body_reader),
-                        b"addrv2\0\0\0\0\0\0" => self.read_addrv2(&mut body_reader),
-                        b"getaddr\0\0\0\0\0" => self.read_getaddr(&mut body_reader),
-                        b"block\0\0\0\0\0\0\0" => self.read_block(&mut body_reader),
-                        b"getblocks\0\0\0" => self.read_getblocks(&mut body_reader),
-                        b"headers\0\0\0\0\0" => self.read_headers(&mut body_reader),
-                        b"getheaders\0\0" => self.read_getheaders(&mut body_reader),
-                        b"inv\0\0\0\0\0\0\0\0\0" => self.read_inv(&mut body_reader),
-                        b"getdata\0\0\0\0\0" => self.read_getdata(&mut body_reader),
-                        b"notfound\0\0\0\0" => self.read_notfound(&mut body_reader),
-                        b"tx\0\0\0\0\0\0\0\0\0\0" => self.read_tx(&mut body_reader),
-                        b"mempool\0\0\0\0\0" => self.read_mempool(&mut body_reader),
-                        b"filterload\0\0" => self.read_filterload(&mut body_reader, body_len),
-                        b"filteradd\0\0\0" => self.read_filteradd(&mut body_reader, body_len),
-                        b"filterclear\0" => self.read_filterclear(&mut body_reader),
-                        _ => {
-                            // # Security
-                            //
-                            // The command bytes are attacker-controlled, so they are
-                            // escaped before logging to stop peers injecting control
-                            // characters into log output.
-                            let command_string = escape_command(&command);
-
-                            // # Security
-                            //
-                            // Zcash connections are not authenticated, so malicious nodes can
-                            // send fake messages, with connected peers' IP addresses
-                            // in the IP header.
-                            //
-                            // Since we can't verify their source, Zebra needs to ignore
-                            // unexpected messages, because closing the connection could
-                            // cause a denial of service or eclipse attack.
-                            debug!(?command, %command_string, "unknown message command from peer");
-                            return Ok(None);
-                        }
+                } => {
+                    if src.len() < body_len {
+                        // Need to wait for the full body
+                        trace!(?self.state, len = src.len(), "src buffer does not have an entire body, waiting");
+                        return Ok(None);
                     }
-                    // We need Ok(Some(msg)) to signal that we're done decoding.
-                    // This is also convenient for tracing the parse result.
-                    .map(|msg| {
-                        // bitcoin allows extra data at the end of most messages,
-                        // so that old nodes can still read newer message formats,
-                        // and ignore any extra fields
+
+                    // Now that we know we have the full body, split off the body,
+                    // and reset the decoder state for the next message. Otherwise
+                    // we will attempt to read the next header as the current body.
+                    let body = src.split_to(body_len);
+                    self.state = DecodeState::Head;
+
+                    if checksum != sha256d::Checksum::from(&body[..]) {
+                        return Err(Parse(
+                            "supplied message checksum does not match computed checksum",
+                        ));
+                    }
+
+                    if BLOOM_FILTER_COMMANDS.contains(&command) {
+                        debug!(
+                            command = %escape_command(&command),
+                            "ignored unsupported bloom filter message"
+                        );
+                        continue 'messages;
+                    }
+
+                    let mut body_reader = Cursor::new(&body);
+
+                    // The body bytes are owned locally and the decoder state was
+                    // reset above, before entering this unwind boundary. Body
+                    // readers do not mutate shared services or connection state.
+                    // A caught panic returns an error that the network treats as
+                    // terminal, dropping this codec and its peer transport.
+                    let decode_result = panic::catch_unwind(AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        self.panic_at_body_decode_point(BodyDecodePanic::CommandDispatch);
+
+                        let msg = match &command {
+                            b"version\0\0\0\0\0" => self.read_version(&mut body_reader),
+                            b"verack\0\0\0\0\0\0" => self.read_verack(&mut body_reader),
+                            b"ping\0\0\0\0\0\0\0\0" => self.read_ping(&mut body_reader),
+                            b"pong\0\0\0\0\0\0\0\0" => self.read_pong(&mut body_reader),
+                            b"reject\0\0\0\0\0\0" => self.read_reject(&mut body_reader),
+                            crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES => {
+                                self.read_p2p_v2_upgrade(&mut body_reader, body_len)
+                            }
+                            b"addr\0\0\0\0\0\0\0\0" => self.read_addr(&mut body_reader),
+                            b"addrv2\0\0\0\0\0\0" => self.read_addrv2(&mut body_reader),
+                            b"getaddr\0\0\0\0\0" => self.read_getaddr(&mut body_reader),
+                            b"block\0\0\0\0\0\0\0" => self.read_block(&mut body_reader),
+                            b"getblocks\0\0\0" => self.read_getblocks(&mut body_reader),
+                            b"headers\0\0\0\0\0" => self.read_headers(&mut body_reader),
+                            b"getheaders\0\0" => self.read_getheaders(&mut body_reader),
+                            b"inv\0\0\0\0\0\0\0\0\0" => self.read_inv(&mut body_reader),
+                            b"getdata\0\0\0\0\0" => self.read_getdata(&mut body_reader),
+                            b"notfound\0\0\0\0" => self.read_notfound(&mut body_reader),
+                            b"tx\0\0\0\0\0\0\0\0\0\0" => self.read_tx(&mut body_reader),
+                            b"mempool\0\0\0\0\0" => self.read_mempool(&mut body_reader),
+                            _ => {
+                                // # Security
+                                //
+                                // The command bytes are attacker-controlled, so they are
+                                // escaped before logging to stop peers injecting control
+                                // characters into log output.
+                                let command_string = escape_command(&command);
+
+                                // # Security
+                                //
+                                // Zcash connections are not authenticated, so malicious nodes can
+                                // send fake messages, with connected peers' IP addresses
+                                // in the IP header.
+                                //
+                                // Since we can't verify their source, Zebra needs to ignore
+                                // unexpected messages, because closing the connection could
+                                // cause a denial of service or eclipse attack.
+                                debug!(?command, %command_string, "unknown message command from peer");
+                                return Ok(None);
+                            }
+                        }?;
+
+                        // Bitcoin allows extra data at the end of most messages,
+                        // so old nodes can read newer formats and ignore extra fields.
                         let extra_bytes = body.len() as u64 - body_reader.position();
                         if extra_bytes == 0 {
                             trace!(?extra_bytes, %msg, "finished message decoding");
@@ -552,30 +541,31 @@ impl Decoder for Codec {
                             // upgrade message formats
                             debug!(?extra_bytes, %msg, "extra data after decoding message");
                         }
-                        Some(msg)
-                    })
-                }));
 
-                match decode_result {
-                    Ok(result) => result,
-                    Err(_panic_payload) => {
-                        // Escaped for consistency with the other command logs:
-                        // reaching a body parser requires an exact known-command
-                        // match, so this is defense in depth, not a live risk.
-                        let command = escape_command(&command)
-                            .trim_end_matches(r"\x00")
-                            .to_owned();
-                        metrics::counter!(
-                            "peer.message.parse.panics",
-                            "parser" => "legacy_body"
-                        )
-                        .increment(1);
-                        tracing::error!(
-                            %command,
-                            "peer-controlled message parser panicked; disconnecting legacy peer"
-                        );
+                        Ok(Some(msg))
+                    }));
 
-                        Err(Parse(PANICKED_MESSAGE_BODY_PARSE_ERROR))
+                    match decode_result {
+                        Ok(result) => return result,
+                        Err(_panic_payload) => {
+                            // Escaped for consistency with the other command logs:
+                            // reaching a body parser requires an exact known-command
+                            // match, so this is defense in depth, not a live risk.
+                            let command = escape_command(&command)
+                                .trim_end_matches(r"\x00")
+                                .to_owned();
+                            metrics::counter!(
+                                "peer.message.parse.panics",
+                                "parser" => "legacy_body"
+                            )
+                            .increment(1);
+                            tracing::error!(
+                                %command,
+                                "peer-controlled message parser panicked; disconnecting legacy peer"
+                            );
+
+                            return Err(Parse(PANICKED_MESSAGE_BODY_PARSE_ERROR));
+                        }
                     }
                 }
             }
@@ -843,48 +833,6 @@ impl Codec {
 
     fn read_mempool<R: Read>(&self, mut _reader: R) -> Result<Message, Error> {
         Ok(Message::Mempool)
-    }
-
-    fn read_filterload<R: Read>(&self, mut reader: R, body_len: usize) -> Result<Message, Error> {
-        // The maximum length of a filter.
-        const MAX_FILTERLOAD_FILTER_LENGTH: usize = 36000;
-
-        // The data length of the fields:
-        // hash_functions_count + tweak + flags.
-        const FILTERLOAD_FIELDS_LENGTH: usize = 4 + 4 + 1;
-
-        // The maximum length of a filter message's data.
-        const MAX_FILTERLOAD_MESSAGE_LENGTH: usize =
-            MAX_FILTERLOAD_FILTER_LENGTH + FILTERLOAD_FIELDS_LENGTH;
-
-        if !(FILTERLOAD_FIELDS_LENGTH..=MAX_FILTERLOAD_MESSAGE_LENGTH).contains(&body_len) {
-            return Err(Error::Parse("Invalid filterload message body length."));
-        }
-
-        // Memory Denial of Service: we just checked the untrusted parsed length
-        let filter_length: usize = body_len - FILTERLOAD_FIELDS_LENGTH;
-        let filter_bytes = zcash_deserialize_bytes_external_count(filter_length, &mut reader)?;
-
-        Ok(Message::FilterLoad {
-            filter: Filter(filter_bytes),
-            hash_functions_count: reader.read_u32::<LittleEndian>()?,
-            tweak: Tweak(reader.read_u32::<LittleEndian>()?),
-            flags: reader.read_u8()?,
-        })
-    }
-
-    fn read_filteradd<R: Read>(&self, mut reader: R, body_len: usize) -> Result<Message, Error> {
-        const MAX_FILTERADD_LENGTH: usize = 520;
-
-        // Memory Denial of Service: limit the untrusted parsed length
-        let filter_length: usize = min(body_len, MAX_FILTERADD_LENGTH);
-        let filter_bytes = zcash_deserialize_bytes_external_count(filter_length, &mut reader)?;
-
-        Ok(Message::FilterAdd { data: filter_bytes })
-    }
-
-    fn read_filterclear<R: Read>(&self, mut _reader: R) -> Result<Message, Error> {
-        Ok(Message::FilterClear)
     }
 
     #[cfg(test)]

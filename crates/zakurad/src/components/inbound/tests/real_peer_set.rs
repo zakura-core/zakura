@@ -27,7 +27,7 @@ use zakura_chain::{
 };
 use zakura_consensus::{error::TransactionError, router::RouterError, transaction};
 use zakura_network::{
-    canonical_peer_addr, connect_isolated_tcp_direct_with_inbound,
+    canonical_peer_addr, connect_isolated_with_inbound,
     types::{InventoryHash, PeerServices},
     CacheDir, Config as NetworkConfig, InventoryResponse, P2pStack, PeerError, PeerSource, Request,
     Response, SharedPeerError,
@@ -962,8 +962,10 @@ async fn setup(
 
     // State
     // UTXO verification doesn't matter for these tests.
-    let (state_service, _read_only_state_service, latest_chain_tip, chain_tip_change) =
-        zakura_state::init(state_config, &network, Height::MAX, 0).await;
+    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
+        zakura_state::init(state_config, &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
     let state_service = ServiceBuilder::new().buffer(10).service(state_service);
 
     // Network
@@ -1028,6 +1030,7 @@ async fn setup(
         false,
         peer_set.clone(),
         state_service.clone(),
+        tower::util::BoxCloneService::new(read_only_state_service),
         buffered_tx_verifier.clone(),
         sync_status.clone(),
         latest_chain_tip.clone(),
@@ -1083,9 +1086,12 @@ async fn setup(
     let user_agent = "test".to_string();
 
     // Open a fake peer connection to the inbound listener, using the isolated connection API
-    let connected_peer_service = connect_isolated_tcp_direct_with_inbound(
+    let isolated_stream = tokio::net::TcpStream::connect(listen_addr)
+        .await
+        .expect("local listener connection succeeds");
+    let connected_peer_service = connect_isolated_with_inbound(
         &network,
-        listen_addr,
+        isolated_stream,
         user_agent,
         response_inbound_service,
     )
@@ -1153,7 +1159,9 @@ mod submitblock_test {
         // State
         let state_config = StateConfig::ephemeral();
         let (_state_service, _read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zakura_state::init(state_config, &Network::Mainnet, Height::MAX, 0).await;
+            zakura_state::init(state_config, &Network::Mainnet, Height::MAX, 0)
+                .await
+                .expect("ephemeral state initialization succeeds");
 
         let config_listen_addr = "127.0.0.1:0".parse().unwrap();
 

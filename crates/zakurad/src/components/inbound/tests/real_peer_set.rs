@@ -962,7 +962,7 @@ async fn setup(
 
     // State
     // UTXO verification doesn't matter for these tests.
-    let (state_service, _read_only_state_service, latest_chain_tip, chain_tip_change) =
+    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
         zakura_state::init(state_config, &network, Height::MAX, 0)
             .await
             .expect("ephemeral state initialization succeeds");
@@ -1030,6 +1030,7 @@ async fn setup(
         false,
         peer_set.clone(),
         state_service.clone(),
+        tower::util::BoxCloneService::new(read_only_state_service),
         buffered_tx_verifier.clone(),
         sync_status.clone(),
         latest_chain_tip.clone(),
@@ -1203,9 +1204,7 @@ mod submitblock_test {
             .send(MinedBlockEvent::Committed {
                 hash: block::Hash([1; 32]),
                 height: block::Height(1),
-                early_advertised: false,
             })
-            .await
             .unwrap();
         let gossip_task_handle = tokio::spawn(
             sync::gossip_best_tip_block_hashes(

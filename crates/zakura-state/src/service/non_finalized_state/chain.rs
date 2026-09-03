@@ -1771,8 +1771,8 @@ impl Chain {
             contextually_valid.block.as_ref(),
             contextually_valid.hash,
             contextually_valid.height,
-            &contextually_valid.new_outputs,
-            &contextually_valid.spent_outputs,
+            contextually_valid.new_outputs.as_ref(),
+            contextually_valid.spent_outputs.as_ref(),
             &contextually_valid.transaction_hashes,
             &contextually_valid.chain_value_pool_change,
         );
@@ -1990,8 +1990,8 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
             contextually_valid.block.as_ref(),
             contextually_valid.hash,
             contextually_valid.height,
-            &contextually_valid.new_outputs,
-            &contextually_valid.spent_outputs,
+            contextually_valid.new_outputs.as_ref(),
+            contextually_valid.spent_outputs.as_ref(),
             &contextually_valid.transaction_hashes,
             &contextually_valid.chain_value_pool_change,
         );

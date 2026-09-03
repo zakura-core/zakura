@@ -544,6 +544,8 @@ pub struct ZakuraEndpoint {
     header_sync: Option<super::HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
     header_sync_tasks: Option<Arc<HeaderSyncBackgroundTasks>>,
+    header_sync_fatal_events:
+        Option<Arc<Mutex<Option<mpsc::UnboundedReceiver<super::HeaderSyncFatalEvent>>>>>,
     #[cfg(any(test, feature = "zakura-testkit"))]
     header_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
     block_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
@@ -653,6 +655,14 @@ impl ZakuraEndpoint {
         self.header_sync_tasks
             .as_ref()
             .map(|tasks| tasks.shutdown.clone())
+    }
+
+    /// Take the private header-sync fatal event receiver for the node root.
+    pub async fn take_header_sync_fatal_events(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<super::HeaderSyncFatalEvent>> {
+        let events = self.header_sync_fatal_events.as_ref()?;
+        events.lock().await.take()
     }
 
     /// Cancels and waits for endpoint-owned sync/background tasks.
@@ -861,6 +871,7 @@ impl ZakuraEndpoint {
             header_sync: None,
             block_sync: None,
             header_sync_tasks: None,
+            header_sync_fatal_events: None,
             header_sync_actions: None,
             block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
@@ -888,6 +899,7 @@ impl ZakuraEndpoint {
                 shutdown,
                 tasks: Mutex::new(tasks),
             })),
+            header_sync_fatal_events: None,
             header_sync_actions: actions.map(|actions| Arc::new(Mutex::new(Some(actions)))),
             block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
@@ -917,6 +929,7 @@ impl ZakuraEndpoint {
                 shutdown,
                 tasks: Mutex::new(tasks),
             })),
+            header_sync_fatal_events: None,
             header_sync_actions: header_sync_actions
                 .map(|actions| Arc::new(Mutex::new(Some(actions)))),
             block_sync_actions: block_sync_actions
@@ -3589,6 +3602,8 @@ async fn spawn_zakura_endpoint_inner(
         config.zakura.header_sync.clone(),
         limits.max_frame_bytes,
     );
+    let (header_sync_fatal_tx, header_sync_fatal_rx) = mpsc::unbounded_channel();
+    startup.fatal_events = Some(header_sync_fatal_tx);
     startup.use_direct_port();
     startup.trace = trace.clone();
     startup.committed_snapshots = header_sync_driver_startup
@@ -3701,6 +3716,7 @@ async fn spawn_zakura_endpoint_inner(
         header_sync: Some(header_sync),
         block_sync,
         header_sync_tasks: Some(header_sync_tasks),
+        header_sync_fatal_events: Some(Arc::new(Mutex::new(Some(header_sync_fatal_rx)))),
         #[cfg(any(test, feature = "zakura-testkit"))]
         header_sync_actions,
         block_sync_actions,

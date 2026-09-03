@@ -402,6 +402,8 @@ VCT/tree-aux records are execution assistance. They can help reconstruct and aut
 
 **LC-AUX-04 [ZW] — Cryptographic metadata authentication.** Auxiliary roots MAY be marked authenticated only after the existing integrated verifier reconstructs the relevant ZIP 221 history-tree inputs and checks them against the appropriate checkpoint/header commitment, including the one-header-later authentication boundary. Proven bad metadata MAY score its supplier but MUST NOT invalidate the header.
 
+**LC-AUX-06 [LS] — Semantic auxiliary capacity.** The engine MUST retain no more than 32 distinct auxiliary payloads for one header. The semantic payload identity MUST include the header hash and every tree-aux field. It MUST exclude the delivery ID, supplier, session, request, work owner, and body-size hint. A duplicate semantic payload MUST NOT consume another slot or replace a distinct retained payload. One supplier MUST NOT consume more than one rooted semantic-payload slot for one header. Independent plan verification MUST enforce the same rules.
+
 ## 5. Native fork-discovery protocol
 
 ### 5.1 Stream version and codec
@@ -700,7 +702,7 @@ Every normative rule is mapped here. A range such as `LC-SCOPE-01..03` includes 
 | LC-AVAIL-01..03 | IN-03 |
 | LC-WORK-01..03 | IN-05, IN-07, AUD-04..09, AUD-INCIDENT |
 | LC-ERR-01..02 | IN-02, IN-05, IN-07, PW-04 |
-| LC-AUX-01..05 | IN-06 |
+| LC-AUX-01..06 | IN-06 |
 | LC-WIRE-01 | PW-01 |
 | LC-WIRE-02 | PW-01, PW-05, HV-07 |
 | LC-WIRE-03..04 | PW-02, PW-05 |
@@ -771,8 +773,8 @@ Non-normative provenance: the production failure evidence that motivated the aud
 | Protocol sections 7.7.3–7.7.4; ZIP 205; ZIP 208 | 17-block averaging, 11-block medians, compact-target conversion, Testnet minimum difficulty, and Blossom spacing | LC-VAL-06; HV-04, DF-01 |
 | Protocol section 7.7.5; ZIP 221 work metadata | exact per-block work and ecosystem 256-bit cumulative-work bound | LC-VAL-10, LC-WORKCALC-01, LC-SELECT-02, LC-WIRE-02; HV-07, PW-01, DF-01 |
 | ZIP 204 | bounded framing and contiguous-response discipline, adopted as design ancestry only; no `getheaders`/`headers` message path is implemented or served | LC-VAL-01, LC-SCOPE-09; HV-01, PW-08 |
-| ZIP 221 | Heartwood activation zero, history-tree commitment semantics, and one-header-later authentication boundary | LC-COMMIT-01, LC-AUX-01..05; HV-08, IN-06 |
-| ZIP 244 | NU5 `hashBlockCommitments` and `hashAuthDataRoot` semantics | LC-COMMIT-01, LC-AUX-01..05; HV-08, IN-02, IN-06 |
+| ZIP 221 | Heartwood activation zero, history-tree commitment semantics, and one-header-later authentication boundary | LC-COMMIT-01, LC-AUX-01..06; HV-08, IN-06 |
+| ZIP 244 | NU5 `hashBlockCommitments` and `hashAuthDataRoot` semantics | LC-COMMIT-01, LC-AUX-01..06; HV-08, IN-02, IN-06 |
 | ZIP 307 | wallet scanning and payment detection, explicitly outside this engine | LC-SCOPE-04; architecture dependency check |
 
 This table covers every part of the cited Zcash sources that this engine implements, strengthens, or explicitly excludes. Transaction, proof, script, note, nullifier, and state-transition rules remain full-state responsibilities under LC-SCOPE-03 and are not re-specified here.

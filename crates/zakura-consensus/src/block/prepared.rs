@@ -56,9 +56,14 @@ struct Entry {
     work_id: Option<String>,
     fingerprint: [u8; 32],
     immutable_bytes: Vec<u8>,
-    prepared: SemanticallyVerifiedBlock,
+    prepared: Arc<SemanticallyVerifiedBlock>,
     size: usize,
     expires_at: Instant,
+}
+
+pub(super) struct CachedPreparedCandidate {
+    pub source: PreparedCandidateSource,
+    pub prepared: Arc<SemanticallyVerifiedBlock>,
 }
 
 impl PreparedCandidateCache {
@@ -67,7 +72,7 @@ impl PreparedCandidateCache {
         block: &Block,
         work_id: Option<&str>,
         network: &Network,
-    ) -> Option<SemanticallyVerifiedBlock> {
+    ) -> Option<CachedPreparedCandidate> {
         // Deriving the candidate bytes costs a full block serialization, so skip it when the
         // cache holds no entry that could match.
         {
@@ -91,20 +96,24 @@ impl PreparedCandidateCache {
         inner.prune_expired();
 
         if let Some(work_id) = work_id {
-            if let Some(entry) = inner.find_work_id(work_id) {
-                if entry.immutable_bytes == immutable_bytes {
-                    metrics::counter!("mining.prepared_cache.hits").increment(1);
-                    return Some(entry.prepared.clone());
-                }
-
+            if let Some((source, entry)) =
+                inner.find_work_id_candidate(work_id, fingerprint, &immutable_bytes)
+            {
+                let prepared = Arc::clone(&entry.prepared);
+                drop(inner);
+                metrics::counter!("mining.prepared_cache.hits").increment(1);
+                return Some(CachedPreparedCandidate { source, prepared });
+            }
+            if inner.contains_work_id(work_id) {
                 metrics::counter!("mining.prepared_cache.mismatches").increment(1);
-                return None;
             }
         }
 
-        if let Some(entry) = inner.find_candidate(fingerprint, &immutable_bytes) {
+        if let Some((source, entry)) = inner.find_candidate(fingerprint, &immutable_bytes) {
+            let prepared = Arc::clone(&entry.prepared);
+            drop(inner);
             metrics::counter!("mining.prepared_cache.hits").increment(1);
-            return Some(entry.prepared.clone());
+            return Some(CachedPreparedCandidate { source, prepared });
         }
 
         metrics::counter!("mining.prepared_cache.misses").increment(1);
@@ -131,18 +140,27 @@ impl PreparedCandidateCache {
         if let Some(work_id) = work_id {
             if let Some((existing_source, entry)) = inner.find_work_id_with_source(work_id) {
                 if entry.immutable_bytes == immutable_bytes {
-                    return;
-                }
+                    if source != PreparedCandidateSource::ServerTemplate
+                        || existing_source == PreparedCandidateSource::ServerTemplate
+                    {
+                        return;
+                    }
 
-                metrics::counter!(
-                    "mining.prepared_cache.work_id_conflicts",
-                    "source" => source.metric_label()
-                )
-                .increment(1);
-                let server_reclaims_proposal = source == PreparedCandidateSource::ServerTemplate
-                    && existing_source == PreparedCandidateSource::ClientProposal;
-                if !server_reclaims_proposal {
-                    return;
+                    inner.proposals.remove_work_id(work_id);
+                } else {
+                    metrics::counter!(
+                        "mining.prepared_cache.work_id_conflicts",
+                        "source" => source.metric_label()
+                    )
+                    .increment(1);
+                    let server_reclaims_proposal = source
+                        == PreparedCandidateSource::ServerTemplate
+                        && existing_source == PreparedCandidateSource::ClientProposal;
+                    if server_reclaims_proposal {
+                        inner.proposals.remove_work_id(work_id);
+                    } else if source == PreparedCandidateSource::ServerTemplate {
+                        return;
+                    }
                 }
             }
         }
@@ -159,12 +177,13 @@ impl PreparedCandidateCache {
         } else {
             None
         };
-        // Count the canonical candidate, derived verification inputs, and caller-supplied work ID.
-        let size = immutable_bytes.len().saturating_mul(2).saturating_add(
+        let size = retained_size(
+            immutable_bytes.len(),
             work_id
                 .map(str::len)
                 .or_else(|| existing_work_id.as_ref().map(String::len))
                 .unwrap_or(0),
+            &prepared,
         );
         let (max_entries, max_bytes) = source.limits();
         if size > max_bytes {
@@ -185,7 +204,13 @@ impl PreparedCandidateCache {
         }
 
         let partition = inner.partition(source);
-        partition.remove_matching(work_id.as_deref(), fingerprint, &immutable_bytes);
+        partition.remove_matching(
+            (source == PreparedCandidateSource::ServerTemplate)
+                .then_some(work_id.as_deref())
+                .flatten(),
+            fingerprint,
+            &immutable_bytes,
+        );
 
         while partition.entries.len() >= max_entries
             || partition.bytes.saturating_add(size) > max_bytes
@@ -200,7 +225,7 @@ impl PreparedCandidateCache {
             work_id,
             fingerprint,
             immutable_bytes,
-            prepared,
+            prepared: Arc::new(prepared),
             size,
             expires_at: Instant::now() + ENTRY_TTL,
         });
@@ -226,12 +251,40 @@ impl CacheInner {
         }
     }
 
-    fn find_work_id(&self, work_id: &str) -> Option<&Entry> {
+    fn contains_work_id(&self, work_id: &str) -> bool {
         self.server
             .entries
             .iter()
             .chain(self.proposals.entries.iter())
-            .find(|entry| entry.work_id.as_deref() == Some(work_id))
+            .any(|entry| entry.work_id.as_deref() == Some(work_id))
+    }
+
+    fn find_work_id_candidate(
+        &self,
+        work_id: &str,
+        fingerprint: [u8; 32],
+        immutable_bytes: &[u8],
+    ) -> Option<(PreparedCandidateSource, &Entry)> {
+        self.server
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.work_id.as_deref() == Some(work_id)
+                    && entry.fingerprint == fingerprint
+                    && entry.immutable_bytes == immutable_bytes
+            })
+            .map(|entry| (PreparedCandidateSource::ServerTemplate, entry))
+            .or_else(|| {
+                self.proposals
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.work_id.as_deref() == Some(work_id)
+                            && entry.fingerprint == fingerprint
+                            && entry.immutable_bytes == immutable_bytes
+                    })
+                    .map(|entry| (PreparedCandidateSource::ClientProposal, entry))
+            })
     }
 
     fn find_work_id_with_source(&self, work_id: &str) -> Option<(PreparedCandidateSource, &Entry)> {
@@ -249,13 +302,26 @@ impl CacheInner {
             })
     }
 
-    fn find_candidate(&self, fingerprint: [u8; 32], immutable_bytes: &[u8]) -> Option<&Entry> {
+    fn find_candidate(
+        &self,
+        fingerprint: [u8; 32],
+        immutable_bytes: &[u8],
+    ) -> Option<(PreparedCandidateSource, &Entry)> {
         self.server
             .entries
             .iter()
-            .chain(self.proposals.entries.iter())
             .find(|entry| {
                 entry.fingerprint == fingerprint && entry.immutable_bytes == immutable_bytes
+            })
+            .map(|entry| (PreparedCandidateSource::ServerTemplate, entry))
+            .or_else(|| {
+                self.proposals
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.fingerprint == fingerprint && entry.immutable_bytes == immutable_bytes
+                    })
+                    .map(|entry| (PreparedCandidateSource::ClientProposal, entry))
             })
     }
 }
@@ -333,6 +399,33 @@ impl PreparedCandidateSource {
             Self::ClientProposal => "client_proposal",
         }
     }
+}
+
+fn retained_size(
+    immutable_bytes: usize,
+    work_id: usize,
+    prepared: &SemanticallyVerifiedBlock,
+) -> usize {
+    // Charge three serialized copies for the normalized bytes, the decoded block, and cloned
+    // output scripts. Add the derived map's allocated buckets and the transaction-hash array.
+    // This conservative cost prevents output-heavy proposals from bypassing the byte budget.
+    immutable_bytes
+        .saturating_mul(3)
+        .saturating_add(
+            prepared.new_outputs.capacity().saturating_mul(
+                std::mem::size_of::<zakura_chain::transparent::OutPoint>()
+                    .saturating_add(std::mem::size_of::<zakura_chain::transparent::OrderedUtxo>())
+                    .saturating_add(1),
+            ),
+        )
+        .saturating_add(
+            prepared
+                .transaction_hashes
+                .len()
+                .saturating_mul(std::mem::size_of::<zakura_chain::transaction::Hash>()),
+        )
+        .saturating_add(work_id)
+        .saturating_add(std::mem::size_of::<Entry>())
 }
 
 fn immutable_candidate_bytes(block: &Block, network: &Network) -> Vec<u8> {
@@ -470,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn inserting_a_reused_work_id_does_not_replace_the_old_candidate() {
+    fn proposal_work_id_conflict_falls_back_to_candidate_content() {
         let network = Network::Mainnet;
         let original = test_block();
         let mut replacement = original.clone();
@@ -492,18 +585,14 @@ mod tests {
             &network,
         );
 
-        assert!(cache.lookup(&replacement, Some("work"), &network).is_none());
+        assert!(cache.lookup(&replacement, Some("work"), &network).is_some());
         assert!(cache.lookup(&original, Some("work"), &network).is_some());
-        assert_eq!(
-            cache
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .server
-                .entries
-                .len(),
-            1
-        );
+        let inner = cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(inner.server.entries.len(), 1);
+        assert_eq!(inner.proposals.entries.len(), 1);
     }
 
     #[test]
@@ -597,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn proposal_cannot_replace_a_server_work_id() {
+    fn proposal_work_id_conflict_does_not_replace_server_candidate() {
         let network = Network::Mainnet;
         let cache = PreparedCandidateCache::default();
         let server = distinct_block(1);
@@ -618,13 +707,16 @@ mod tests {
         );
 
         assert!(cache.lookup(&server, Some("shared"), &network).is_some());
-        assert!(cache.lookup(&proposal, Some("shared"), &network).is_none());
+        let proposal_hit = cache
+            .lookup(&proposal, Some("shared"), &network)
+            .expect("content lookup finds the conflicting proposal");
+        assert_eq!(proposal_hit.source, PreparedCandidateSource::ClientProposal);
         let inner = cache
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(inner.server.entries.len(), 1);
-        assert!(inner.proposals.entries.is_empty());
+        assert_eq!(inner.proposals.entries.len(), 1);
     }
 
     #[test]
@@ -691,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_work_id_and_candidate_leave_the_existing_mapping_unchanged() {
+    fn identical_server_candidate_promotes_the_proposal_mapping() {
         let network = Network::Mainnet;
         let cache = PreparedCandidateCache::default();
         let candidate = test_block();
@@ -702,14 +794,6 @@ mod tests {
             PreparedCandidateSource::ClientProposal,
             &network,
         );
-        let original_expiration = cache
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .proposals
-            .entries[0]
-            .expires_at;
-
         insert(
             &cache,
             &candidate,
@@ -722,9 +806,8 @@ mod tests {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(inner.server.entries.is_empty());
-        assert_eq!(inner.proposals.entries.len(), 1);
-        assert_eq!(inner.proposals.entries[0].expires_at, original_expiration);
+        assert_eq!(inner.server.entries.len(), 1);
+        assert!(inner.proposals.entries.is_empty());
     }
 
     #[test]

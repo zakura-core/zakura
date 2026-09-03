@@ -16,6 +16,7 @@ use crate::service;
 
 pub mod address;
 pub mod block;
+pub mod chain_tips;
 pub mod difficulty;
 pub mod find;
 pub mod historical_tree;
@@ -37,6 +38,8 @@ pub use block::{
 
 #[cfg(feature = "indexer")]
 pub use block::spending_transaction_hash;
+
+pub use chain_tips::{chain_tips, ChainTipInfo, ChainTipStatus, SelectedHeaders};
 
 pub use find::{
     best_tip, block_locator, depth, finalized_state_contains_block_hash, find_chain_hashes,

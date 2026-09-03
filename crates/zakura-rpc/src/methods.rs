@@ -114,6 +114,7 @@ pub(crate) mod types;
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
 use types::{
+    chain_tips::{self, GetChainTipsResponse},
     get_block_template::{
         constants::{
             DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MEMPOOL_LONG_POLL_INTERVAL,
@@ -140,9 +141,6 @@ use types::{
     validate_address::ValidateAddressResponse,
     z_validate_address::ZValidateAddressResponse,
 };
-
-/// Bounds the final mined-block event send after the RPC lifecycle has detached.
-const MINED_BLOCK_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Calls a Tower service and maps readiness or call errors to
 /// [`server::error::LegacyCode::Misc`].
@@ -380,6 +378,38 @@ pub trait Rpc {
     /// tags: blockchain
     #[method(name = "getbestblockheightandhash")]
     fn get_best_block_height_and_hash(&self) -> Result<GetBlockHeightAndHashResponse>;
+
+    /// Returns information about every tip in the block tree that this node still
+    /// tracks, including the best chain and orphaned branches.
+    ///
+    /// zcashd reference: [`getchaintips`](https://zcash.github.io/rpc/getchaintips.html)
+    /// method: post
+    /// tags: blockchain
+    ///
+    /// # Notes
+    ///
+    /// zcashd answers this call by scanning its entire block index under `cs_main`,
+    /// which costs seconds once the index holds millions of entries and blocks every
+    /// other RPC for that whole time. Zakura reads only the chains it holds in
+    /// memory, so the cost is bounded by the number of tracked forks rather than by
+    /// the height of the chain.
+    ///
+    /// The two nodes therefore report different tips. zcashd's block index is never
+    /// pruned, so it lists every stale tip it has ever seen. Zakura drops a fork once
+    /// it falls below the finalized tip, so it lists the tips that are still live:
+    /// the best chain, the non-finalized forks, recently invalidated branches, and
+    /// the selected header chain when some block bodies are unavailable.
+    ///
+    /// Zakura never returns zcashd's `valid-headers` or `unknown` statuses. Every
+    /// block in its non-finalized state is contextually verified, so a tip is either
+    /// fully valid, invalidated, or known only by its header.
+    ///
+    /// `branchlen` can be short for an `invalid` tip. Zakura tracks a limited number
+    /// of forks, and it can drop the chain that an invalidated branch forked from.
+    /// The branch is still reported, but its length is then measured from the deepest
+    /// block the node still tracks.
+    #[method(name = "getchaintips")]
+    async fn get_chain_tips(&self) -> Result<GetChainTipsResponse>;
 
     /// Returns details on the active state of the TX memory pool.
     ///
@@ -948,7 +978,7 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::Sender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
     ) -> (Self, JoinHandle<()>)
     where
         VersionString: ToString + Clone + Send + 'static,
@@ -989,7 +1019,7 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::Sender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
         pending_blocks: PendingBlockRegistry,
     ) -> (Self, JoinHandle<()>)
     where
@@ -1047,26 +1077,35 @@ where
     }
 
     fn prepare_template_in_background(&self, template: &BlockTemplateResponse) {
-        let Some(preparation_permit) = self.gbt.try_acquire_template_preparation() else {
-            metrics::counter!("mining.template_preparation.saturated").increment(1);
+        let Some(template) = self.gbt.queue_template_preparation(template.clone()) else {
+            metrics::counter!("mining.template_preparation.coalesced").increment(1);
             return;
         };
-        let template = template.clone();
         let network = self.network.clone();
         let verifier = self.gbt.block_verifier_router();
+        let gbt = self.gbt.clone();
         tokio::spawn(
             async move {
-                let _preparation_permit = preparation_permit;
-                let Ok(block) = proposal_block_from_template(&template, None, &network) else {
-                    return;
-                };
-                let request = zakura_consensus::Request::Prepare {
-                    block: Arc::new(block),
-                    work_id: Some(template.work_id().clone()),
-                    source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
-                };
-                if let Err(error) = verifier.oneshot(request).await {
-                    tracing::debug!(?error, "background mining candidate preparation failed");
+                let mut template = template;
+                loop {
+                    if let Ok(block) = proposal_block_from_template(&template, None, &network) {
+                        let request = zakura_consensus::Request::Prepare {
+                            block: Arc::new(block),
+                            work_id: Some(template.work_id().clone()),
+                            source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
+                        };
+                        if let Err(error) = verifier.clone().oneshot(request).await {
+                            tracing::debug!(
+                                ?error,
+                                "background mining candidate preparation failed"
+                            );
+                        }
+                    }
+
+                    let Some(next) = gbt.next_template_preparation() else {
+                        break;
+                    };
+                    template = next;
                 }
             }
             .in_current_span(),
@@ -1816,6 +1855,20 @@ where
             .best_tip_height_and_hash()
             .map(|(height, hash)| GetBlockHeightAndHashResponse { height, hash })
             .ok_or_misc_error("No blocks in state")
+    }
+
+    async fn get_chain_tips(&self) -> Result<GetChainTipsResponse> {
+        let response: zakura_state::ReadResponse = call_service(
+            self.read_state.clone(),
+            zakura_state::ReadRequest::ChainTips,
+        )
+        .await?;
+
+        let zakura_state::ReadResponse::ChainTips(tips) = response else {
+            unreachable!("unmatched response to a ChainTips request")
+        };
+
+        Ok(tips.into_iter().map(chain_tips::ChainTip::from).collect())
     }
 
     async fn get_mempool_info(&self) -> Result<GetMempoolInfoResponse> {
@@ -2824,8 +2877,8 @@ where
             tokio::pin!(verification);
 
             let admission_start = std::time::Instant::now();
-            let mut early_result = None;
             let mut pending_registration = None;
+            let mut early_sent = false;
             let verification_result = tokio::select! {
                 biased;
 
@@ -2837,15 +2890,14 @@ where
                         && optimistic_block_inventory
                     {
                         if let Some(registration) = pending_blocks.insert(block.clone()) {
-                            let (advertised, receiver) = tokio::sync::oneshot::channel();
                             let event = MinedBlockEvent::Early {
                                 hash: block_hash,
                                 height,
                                 submitted_at,
-                                advertised,
+                                pending: registration.signal(),
                             };
-                            if mined_block_sender.try_send(event).is_ok() {
-                                early_result = Some(receiver);
+                            if mined_block_sender.send(event).is_ok() {
+                                early_sent = true;
                                 pending_registration = Some(registration);
                             }
                         }
@@ -2864,47 +2916,14 @@ where
                 );
             }
 
-            let committed = verification_result.is_ok();
-            tokio::spawn(async move {
-                let early_advertised = match early_result {
-                    Some(receiver) => tokio::time::timeout(Duration::from_secs(20), receiver)
-                        .await
-                        .ok()
-                        .and_then(|result| result.ok())
-                        .unwrap_or(false),
-                    None => false,
-                };
-                let event = if committed {
-                    if optimistic_block_inventory && !early_advertised {
-                        metrics::counter!("mining.optimistic_inventory.fallbacks").increment(1);
-                    }
-                    MinedBlockEvent::Committed {
+            if verification_result.is_ok() {
+                if mined_block_sender
+                    .send(MinedBlockEvent::Committed {
                         hash: block_hash,
                         height,
-                        early_advertised,
-                    }
-                } else {
-                    if early_advertised {
-                        metrics::counter!("mining.optimistic_inventory.post_commit_failures")
-                            .increment(1);
-                        tracing::warn!(
-                            ?block_hash,
-                            ?height,
-                            "mined block failed contextual commit after early inventory"
-                        );
-                    }
-                    MinedBlockEvent::Failed {
-                        hash: block_hash,
-                        height,
-                        early_advertised,
-                    }
-                };
-                let send_result = tokio::time::timeout(
-                    MINED_BLOCK_EVENT_SEND_TIMEOUT,
-                    mined_block_sender.send(event),
-                )
-                .await;
-                if !matches!(send_result, Ok(Ok(()))) {
+                    })
+                    .is_err()
+                {
                     metrics::counter!("mining.optimistic_inventory.final_send_failures")
                         .increment(1);
                     tracing::warn!(
@@ -2913,7 +2932,15 @@ where
                         "could not send the final mined-block event"
                     );
                 }
-            });
+            } else if early_sent {
+                metrics::counter!("mining.optimistic_inventory.post_admission_failures")
+                    .increment(1);
+                tracing::warn!(
+                    ?block_hash,
+                    ?height,
+                    "mined block failed contextual commit after state admission"
+                );
+            }
             verification_result
         });
 

@@ -275,6 +275,10 @@ pub enum CommitBlockError {
         error: String,
     },
 
+    /// The orphan queue reached its memory bound.
+    #[error("too many blocks are waiting for unavailable parents")]
+    QueueFull,
+
     /// The write task exited (likely during shutdown).
     #[error("block commit task exited. Is Zakura shutting down?")]
     #[non_exhaustive]
@@ -338,6 +342,9 @@ impl CommitBlockError {
             Self::ValidateContextError(error) => error.body_verification_class(),
             Self::HeaderChainError { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
+            }
+            Self::QueueFull => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
             Self::WriteTaskExited => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)

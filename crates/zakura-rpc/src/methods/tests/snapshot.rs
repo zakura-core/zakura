@@ -867,7 +867,14 @@ fn snapshot_rpc_getblocktemplate(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_block_template_{variant}"), block_template)
+        insta::assert_json_snapshot!(format!("get_block_template_{variant}"), block_template, {
+            ".workid" => dynamic_redaction(|value, _path| {
+                let work_id = value.as_str().expect("workid must be a string");
+                assert_eq!(work_id.len(), 32, "workid must encode 16 bytes");
+                assert!(work_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                "[WorkId]"
+            }),
+        })
     });
 
     if let Some(coinbase_tx) = coinbase_tx {
@@ -1020,6 +1027,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
         miner_memo: None,
         // TODO: Use default field values when optional features are enabled in tests #8183
         internal_miner: true,
+        optimistic_block_inventory: true,
     };
 
     // nu5 block height
@@ -1249,6 +1257,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .as_ref()
         .zcash_deserialize_into()
         .expect("coinbase bytes are valid");
+    let server_template = get_block_template.clone();
 
     snapshot_rpc_getblocktemplate(
         "basic",
@@ -1338,6 +1347,21 @@ pub async fn test_mining_rpcs<State, ReadState>(
         None,
     );
 
+    let mut server_preparation_verifier = mock_block_verifier_router.clone();
+    rpc_mock_state_verifier.prepare_template_in_background(&server_template);
+    server_preparation_verifier
+        .expect_request_that(|request| {
+            matches!(
+                request,
+                zakura_consensus::Request::Prepare {
+                    source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
+                    ..
+                }
+            )
+        })
+        .await
+        .respond(Hash::from([0; 32]));
+
     let get_block_template_fut =
         rpc_mock_state_verifier.get_block_template(Some(GetBlockTemplateParameters {
             mode: GetBlockTemplateRequestMode::Proposal,
@@ -1347,7 +1371,15 @@ pub async fn test_mining_rpcs<State, ReadState>(
 
     let mock_block_verifier_router_request_handler = async move {
         mock_block_verifier_router
-            .expect_request_that(|req| matches!(req, zakura_consensus::Request::CheckProposal(_)))
+            .expect_request_that(|request| {
+                matches!(
+                    request,
+                    zakura_consensus::Request::Prepare {
+                        source: zakura_consensus::PreparedCandidateSource::ClientProposal,
+                        ..
+                    }
+                )
+            })
             .await
             .respond(Hash::from([0; 32]));
     };

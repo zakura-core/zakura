@@ -131,7 +131,10 @@ use types::{
     long_poll::LongPollInput,
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
-    submit_block::{SubmitBlockErrorResponse, SubmitBlockParameters, SubmitBlockResponse},
+    submit_block::{
+        MinedBlockEvent, PendingBlockRegistry, SubmitBlockErrorResponse, SubmitBlockParameters,
+        SubmitBlockResponse,
+    },
     subsidy::GetBlockSubsidyResponse,
     transaction::TransactionObject,
     unified_address::ZListUnifiedReceiversResponse,
@@ -609,8 +612,7 @@ pub trait Rpc {
     ///
     /// # Notes
     ///
-    /// Arguments to this RPC are currently ignored.
-    /// Long polling, block proposals, server lists, and work IDs are not supported.
+    /// Server lists are not supported. Long polling, block proposals, and work IDs are supported.
     ///
     /// Miners can make arbitrary changes to blocks, as long as:
     /// - the data sent to `submitblock` is a valid Zcash block, and
@@ -634,7 +636,7 @@ pub trait Rpc {
     /// # Parameters
     ///
     /// - `hexdata`: (string, required)
-    /// - `jsonparametersobject`: (string, optional) - currently ignored
+    /// - `jsonparametersobject`: (string, optional)
     ///
     /// # Notes
     ///
@@ -976,7 +978,49 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::Sender<(block::Hash, block::Height)>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+    ) -> (Self, JoinHandle<()>)
+    where
+        VersionString: ToString + Clone + Send + 'static,
+        UserAgentString: ToString + Clone + Send + 'static,
+    {
+        Self::new_with_pending_blocks(
+            network,
+            mining_config,
+            debug_force_finished_sync,
+            build_version,
+            user_agent,
+            mempool,
+            state,
+            read_state,
+            block_verifier_router,
+            sync_status,
+            latest_chain_tip,
+            address_book,
+            last_warn_error_log_rx,
+            mined_block_sender,
+            PendingBlockRegistry::default(),
+        )
+    }
+
+    /// Creates an RPC handler with a pending-block registry shared with peer serving.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_pending_blocks<VersionString, UserAgentString>(
+        network: Network,
+        mining_config: config::mining::Config,
+        debug_force_finished_sync: bool,
+        build_version: VersionString,
+        user_agent: UserAgentString,
+        mempool: Mempool,
+        state: State,
+        read_state: ReadState,
+        block_verifier_router: BlockVerifierRouter,
+        sync_status: SyncStatus,
+        latest_chain_tip: Tip,
+        address_book: AddressBook,
+        last_warn_error_log_rx: LoggedLastEvent,
+        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+        pending_blocks: PendingBlockRegistry,
     ) -> (Self, JoinHandle<()>)
     where
         VersionString: ToString + Clone + Send + 'static,
@@ -992,12 +1036,13 @@ where
             build_version.insert(0, 'v');
         }
 
-        let gbt = GetBlockTemplateHandler::new(
+        let gbt = GetBlockTemplateHandler::new_with_pending_blocks(
             &network,
             mining_config.clone(),
             block_verifier_router,
             sync_status,
             mined_block_sender,
+            pending_blocks,
         );
 
         let rpc_impl = RpcImpl {
@@ -1029,6 +1074,42 @@ where
     /// Returns a reference to the configured network.
     pub fn network(&self) -> &Network {
         &self.network
+    }
+
+    fn prepare_template_in_background(&self, template: &BlockTemplateResponse) {
+        let Some(template) = self.gbt.queue_template_preparation(template.clone()) else {
+            metrics::counter!("mining.template_preparation.coalesced").increment(1);
+            return;
+        };
+        let network = self.network.clone();
+        let verifier = self.gbt.block_verifier_router();
+        let gbt = self.gbt.clone();
+        tokio::spawn(
+            async move {
+                let mut template = template;
+                loop {
+                    if let Ok(block) = proposal_block_from_template(&template, None, &network) {
+                        let request = zakura_consensus::Request::Prepare {
+                            block: Arc::new(block),
+                            work_id: Some(template.work_id().clone()),
+                            source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
+                        };
+                        if let Err(error) = verifier.clone().oneshot(request).await {
+                            tracing::debug!(
+                                ?error,
+                                "background mining candidate preparation failed"
+                            );
+                        }
+                    }
+
+                    let Some(next) = gbt.next_template_preparation() else {
+                        break;
+                    };
+                    template = next;
+                }
+            }
+            .in_current_span(),
+        );
     }
 
     /// Sets the end-of-support height reported by `getdeprecationinfo`.
@@ -2447,12 +2528,16 @@ where
             .as_ref()
             .and_then(GetBlockTemplateParameters::block_proposal_data)
         {
+            let work_id = parameters
+                .as_ref()
+                .and_then(|parameters| parameters.work_id.clone());
             return validate_block_proposal(
                 self.gbt.block_verifier_router(),
                 block_proposal_bytes,
                 &self.network,
                 latest_chain_tip,
                 sync_status,
+                work_id,
             )
             .await;
         }
@@ -2671,7 +2756,7 @@ where
                     // Respond instantly with an empty block upon a chain tip change so that
                     // the miner doesn't waste their effort trying to extend a shorter
                     // chain.
-                    return Ok(BlockTemplateResponse::new_internal(
+                    let template = BlockTemplateResponse::new_internal(
                         &self.network,
                         precomputed_coinbase,
                         miner_params,
@@ -2679,8 +2764,9 @@ where
                         server_long_poll_id,
                         vec![],
                         submit_old,
-                    )
-                    .into())
+                    );
+                    self.prepare_template_in_background(&template);
+                    return Ok(template.into())
                 }
 
                 // The max time does not elapse during normal operation on mainnet,
@@ -2735,7 +2821,7 @@ where
 
         // - After this point, the template only depends on the previously fetched data.
 
-        Ok(BlockTemplateResponse::new_internal(
+        let template = BlockTemplateResponse::new_internal(
             &self.network,
             None,
             miner_params,
@@ -2743,16 +2829,18 @@ where
             server_long_poll_id,
             mempool_txs,
             submit_old,
-        )
-        .into())
+        );
+        self.prepare_template_in_background(&template);
+        Ok(template.into())
     }
 
     async fn submit_block(
         &self,
         HexData(block_bytes): HexData,
-        _parameters: Option<SubmitBlockParameters>,
+        parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
         let mut block_verifier_router = self.gbt.block_verifier_router();
+        let submitted_at = std::time::Instant::now();
 
         let block: Block = match block_bytes.zcash_deserialize_into() {
             Ok(block_bytes) => block_bytes,
@@ -2770,13 +2858,99 @@ where
             .coinbase_height()
             .ok_or_error(0, "coinbase height not found")?;
         let block_hash = block.hash();
+        let block = Arc::new(block);
+        let work_id = parameters.and_then(|parameters| parameters.work_id);
+        let admission = zakura_state::BlockAdmission::pending();
+        let request = zakura_consensus::Request::CommitMined {
+            block: block.clone(),
+            work_id,
+            admission: admission.clone(),
+        };
+        let pending_blocks = self.gbt.pending_blocks();
+        let mined_block_sender = self.gbt.mined_block_sender();
+        let optimistic_block_inventory = self.gbt.optimistic_block_inventory();
 
-        let block_verifier_router_response = block_verifier_router
-            .ready()
-            .await
-            .map_error(0)?
-            .call(zakura_consensus::Request::Commit(Arc::new(block)))
-            .await;
+        // This task owns the commit and registry lifecycle. RPC cancellation only detaches it.
+        let lifecycle = tokio::spawn(async move {
+            let verification =
+                async move { block_verifier_router.ready().await?.call(request).await };
+            tokio::pin!(verification);
+
+            let admission_start = std::time::Instant::now();
+            let mut pending_registration = None;
+            let mut early_sent = false;
+            let verification_result = tokio::select! {
+                biased;
+
+                admitted = admission.wait() => {
+                    metrics::histogram!("mining.state_admission.duration_seconds")
+                        .record(admission_start.elapsed().as_secs_f64());
+                    if admitted
+                        && admission.optimistic_relay_authorized()
+                        && optimistic_block_inventory
+                    {
+                        if let Some(registration) = pending_blocks.insert(block.clone()) {
+                            let event = MinedBlockEvent::Early {
+                                hash: block_hash,
+                                height,
+                                submitted_at,
+                                pending: registration.signal(),
+                            };
+                            if mined_block_sender.send(event).is_ok() {
+                                early_sent = true;
+                                pending_registration = Some(registration);
+                            }
+                        }
+                    }
+                    verification.await
+                },
+                result = &mut verification => result,
+            };
+
+            if let Some(registration) = pending_registration {
+                registration.resolve(
+                    verification_result
+                        .as_ref()
+                        .map(|_| block.clone())
+                        .map_err(|_| ()),
+                );
+            }
+
+            if verification_result.is_ok() {
+                if mined_block_sender
+                    .send(MinedBlockEvent::Committed {
+                        hash: block_hash,
+                        height,
+                    })
+                    .is_err()
+                {
+                    metrics::counter!("mining.optimistic_inventory.final_send_failures")
+                        .increment(1);
+                    tracing::warn!(
+                        ?block_hash,
+                        ?height,
+                        "could not send the final mined-block event"
+                    );
+                }
+            } else if early_sent {
+                metrics::counter!("mining.optimistic_inventory.post_admission_failures")
+                    .increment(1);
+                tracing::warn!(
+                    ?block_hash,
+                    ?height,
+                    "mined block failed contextual commit after state admission"
+                );
+            }
+            verification_result
+        });
+
+        let block_verifier_router_response = lifecycle.await.map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InternalError.code(),
+                format!("mined block lifecycle task failed: {error}"),
+                None::<()>,
+            )
+        })?;
 
         let chain_error = match block_verifier_router_response {
             // Currently, this match arm returns `null` (Accepted) for blocks committed
@@ -2787,11 +2961,6 @@ where
             // The difference is important to miners, because they want to mine on the best chain.
             Ok(hash) => {
                 tracing::info!(?hash, ?height, "submit block accepted");
-
-                self.gbt
-                    .advertise_mined_block(hash, height)
-                    .map_error_with_prefix(0, "failed to send mined block to gossip task")?;
-
                 return Ok(SubmitBlockResponse::Accepted);
             }
 

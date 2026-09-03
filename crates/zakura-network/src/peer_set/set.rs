@@ -94,7 +94,7 @@
 //! [ZIP-201]: https://zips.z.cash/zip-0201
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     convert,
     fmt::Debug,
     marker::PhantomData,
@@ -236,7 +236,7 @@ where
     inventory_registry: InventoryRegistry,
 
     /// Stores requests that should be routed to peers once they are ready.
-    queued_broadcast_all: Option<(
+    queued_broadcast_all: VecDeque<(
         Request,
         tokio::sync::mpsc::UnboundedSender<ResponseFuture>,
         HashSet<D::Key>,
@@ -389,7 +389,7 @@ where
             ready_services: HashMap::new(),
             // Request Routing
             inventory_registry: InventoryRegistry::new(inv_stream, config.expose_peer_addresses),
-            queued_broadcast_all: None,
+            queued_broadcast_all: VecDeque::new(),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
             queued_sidecar_block_gossip: None,
@@ -1305,12 +1305,17 @@ where
 
         async move {
             let results = futs.collect::<Vec<Result<_, _>>>().await;
+            let succeeded = results.iter().any(Result::is_ok);
             tracing::debug!(
                 ok.len = results.iter().filter(|r| r.is_ok()).count(),
                 err.len = results.iter().filter(|r| r.is_err()).count(),
                 "sent peer request to multiple peers"
             );
-            Ok(Response::Nil)
+            if results.is_empty() || succeeded {
+                Ok(Response::Nil)
+            } else {
+                Err(std::io::Error::other("every selected peer request failed").into())
+            }
         }
         .boxed()
     }
@@ -1332,16 +1337,23 @@ where
         self.send_multiple(req, selected_peers)
     }
 
-    /// Broadcasts the same request to all ready peers, ignoring return values.
+    /// Broadcasts the same request and succeeds after at least one peer accepts it.
     fn broadcast_all(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        let ready_peers = self.ready_services.keys().copied().collect();
+        let ready_peers: Vec<_> = self.ready_services.keys().copied().collect();
+        let had_ready_peers = !ready_peers.is_empty();
         let send_multiple_fut = self.send_multiple(req.clone(), ready_peers);
         let Some(mut queued_broadcast_fut_receiver) = self.queue_broadcast_all_unready(&req) else {
+            if !had_ready_peers {
+                return async {
+                    Err(std::io::Error::other("block broadcast had no connected peers").into())
+                }
+                .boxed();
+            }
             return send_multiple_fut;
         };
 
         async move {
-            let _ = send_multiple_fut.await?;
+            let mut succeeded = had_ready_peers && send_multiple_fut.await.is_ok();
             // Each queued item is a `send_multiple` future whose response receivers
             // keep the enqueued peer requests from being treated as canceled (see the
             // `tx.is_canceled()` skip in `Connection::handle_client_request`).
@@ -1349,12 +1361,17 @@ where
             // connection task synchronously but holds the response receiver inside the
             // returned future. Dropping that future unpolled — as `.is_some() {}` did —
             // drops the receiver before the connection task drains the request, so it
-            // sees a canceled request and racily skips the block `inv`. Spawn each
-            // future so it is polled to completion and keeps its receivers alive.
+            // sees a canceled request and racily skips the block `inv`. Poll each future to
+            // completion so it keeps its receivers alive and contributes to the
+            // delivery result.
             while let Some(send_fut) = queued_broadcast_fut_receiver.recv().await {
-                tokio::spawn(send_fut);
+                succeeded |= send_fut.await.is_ok();
             }
-            Ok(Response::Nil)
+            if succeeded {
+                Ok(Response::Nil)
+            } else {
+                Err(std::io::Error::other("block broadcast reached no peers").into())
+            }
         }
         .boxed()
     }
@@ -1374,9 +1391,7 @@ where
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
             let unready_peers: HashSet<_> = self.cancel_handles.keys().cloned().collect();
             let queued = (req.clone(), sender, unready_peers);
-
-            // Drop the existing queued broadcast all request, if any.
-            self.queued_broadcast_all = Some(queued);
+            self.queued_broadcast_all.push_back(queued);
 
             Some(receiver)
         } else {
@@ -1387,49 +1402,43 @@ where
     /// Broadcasts the same requests to all ready peers which were unready when
     /// [`PeerSet::broadcast_all()`] was last called, ignoring return values.
     fn broadcast_all_queued(&mut self) {
-        let Some((req, sender, mut remaining_peers)) = self.queued_broadcast_all.take() else {
-            return;
-        };
+        let mut queued = std::mem::take(&mut self.queued_broadcast_all);
+        while let Some((req, sender, mut remaining_peers)) = queued.pop_front() {
+            if sender.is_closed() {
+                continue;
+            }
 
-        if sender.is_closed() {
-            return;
-        }
+            remaining_peers.retain(|addr| {
+                !self.bans.contains(canonical_ip(addr.ip()))
+                    && (self.ready_services.contains_key(addr)
+                        || self.cancel_handles.contains_key(addr))
+            });
+            if remaining_peers.is_empty() {
+                continue;
+            }
 
-        remaining_peers.retain(|addr| {
-            !self.bans.contains(canonical_ip(addr.ip()))
-                && (self.ready_services.contains_key(addr)
-                    || self.cancel_handles.contains_key(addr))
-        });
+            let peers: Vec<_> = self
+                .ready_services
+                .keys()
+                .filter(|ready_peer| remaining_peers.contains(ready_peer))
+                .copied()
+                .collect();
+            for peer in &peers {
+                remaining_peers.remove(peer);
+            }
 
-        if remaining_peers.is_empty() {
-            return;
-        }
+            if !peers.is_empty()
+                && sender
+                    .send(self.send_multiple(req.clone(), peers).boxed())
+                    .is_err()
+            {
+                continue;
+            }
 
-        let peers: Vec<_> = self
-            .ready_services
-            .keys()
-            .filter(|ready_peer| remaining_peers.contains(ready_peer))
-            .copied()
-            .collect();
-
-        if peers.is_empty() {
-            self.queued_broadcast_all = Some((req, sender, remaining_peers));
-            return;
-        }
-
-        for peer in &peers {
-            remaining_peers.remove(peer);
-        }
-
-        if sender
-            .send(self.send_multiple(req.clone(), peers).boxed())
-            .is_err()
-        {
-            return;
-        }
-
-        if !remaining_peers.is_empty() {
-            self.queued_broadcast_all = Some((req, sender, remaining_peers));
+            if !remaining_peers.is_empty() {
+                self.queued_broadcast_all
+                    .push_back((req, sender, remaining_peers));
+            }
         }
     }
 

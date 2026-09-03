@@ -24,7 +24,18 @@ use zakura_chain::{
 use crate::client::TransactionTemplate;
 use crate::config::mining::{default_miner_address, MinerAddressType};
 
-use super::MinerParams;
+use super::{MinerParams, TemplatePreparationQueue};
+
+#[test]
+fn template_preparation_queue_keeps_the_latest_pending_template() {
+    let queue = TemplatePreparationQueue::<u8>::default();
+
+    assert_eq!(queue.enqueue(1), Some(1));
+    assert_eq!(queue.enqueue(2), None);
+    assert_eq!(queue.enqueue(3), None);
+    assert_eq!(queue.next_or_finish(), Some(3));
+    assert_eq!(queue.next_or_finish(), None);
+}
 
 /// Tests transparent coinbase generation at every configured Sapling-and-later
 /// network upgrade activation.

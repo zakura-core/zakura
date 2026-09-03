@@ -5,10 +5,12 @@ use std::{
     ops::{Add, Deref, RangeInclusive},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
 };
+
+use tokio::sync::Notify;
 
 use tower::{BoxError, Service, ServiceExt};
 use zakura_chain::{
@@ -38,6 +40,122 @@ use crate::{
     constants::{MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS},
     ReadResponse, Response,
 };
+
+/// Notifies a mined-block submitter when state admits its block to the active write queue.
+#[derive(Clone)]
+pub struct BlockAdmission(Arc<BlockAdmissionInner>);
+
+#[derive(Debug)]
+struct BlockAdmissionInner {
+    state: AtomicU8,
+    optimistic_relay_authorized: AtomicBool,
+    changed: Notify,
+}
+
+impl BlockAdmission {
+    const PENDING: u8 = 0;
+    const ADMITTED: u8 = 1;
+    const REJECTED: u8 = 2;
+
+    /// Creates a pending admission notification.
+    pub fn pending() -> Self {
+        Self(Arc::new(BlockAdmissionInner {
+            state: AtomicU8::new(Self::PENDING),
+            optimistic_relay_authorized: AtomicBool::new(false),
+            changed: Notify::new(),
+        }))
+    }
+
+    /// Authorizes optimistic relay if state later admits the prepared mined block.
+    #[doc(hidden)]
+    pub fn authorize_optimistic_relay(&self) {
+        self.0
+            .optimistic_relay_authorized
+            .store(true, Ordering::Release);
+    }
+
+    /// Returns true when consensus authorized optimistic relay for this admission.
+    pub fn optimistic_relay_authorized(&self) -> bool {
+        self.0.optimistic_relay_authorized.load(Ordering::Acquire)
+    }
+
+    /// Marks the block as admitted to the active non-finalized write queue.
+    pub(crate) fn admit(&self, optimistic_relay_still_authorized: bool) {
+        if !optimistic_relay_still_authorized {
+            self.0
+                .optimistic_relay_authorized
+                .store(false, Ordering::Release);
+        }
+        if self
+            .0
+            .state
+            .compare_exchange(
+                Self::PENDING,
+                Self::ADMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.0.changed.notify_waiters();
+        }
+    }
+
+    /// Marks the block as rejected before admission.
+    pub(crate) fn reject(&self) {
+        if self
+            .0
+            .state
+            .compare_exchange(
+                Self::PENDING,
+                Self::REJECTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.0.changed.notify_waiters();
+        }
+    }
+
+    /// Waits until state admits or rejects the block.
+    ///
+    /// # Correctness
+    ///
+    /// This future never resolves when neither `admit` nor `reject` runs. The state rejects
+    /// duplicates, queue replacements, and expired blocks, but a verifier error before the state
+    /// receives the block leaves the admission pending. Callers must await this future under a
+    /// cancellation path, such as a `select!` arm that also awaits verification.
+    pub async fn wait(&self) -> bool {
+        loop {
+            let notified = self.0.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.0.state.load(Ordering::Acquire) {
+                Self::ADMITTED => return true,
+                Self::REJECTED => return false,
+                Self::PENDING => notified.as_mut().await,
+                _ => unreachable!("block admission state only uses declared constants"),
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for BlockAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BlockAdmission")
+            .field(&self.0.state.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl PartialEq for BlockAdmission {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for BlockAdmission {}
 use crate::{
     error::{CommitCheckpointVerifiedError, InvalidateError, LayeredStateError, ReconsiderError},
     CommitSemanticallyVerifiedError,
@@ -275,6 +393,24 @@ pub struct SemanticallyVerifiedBlock {
     /// finalized committer. `None` means the committer falls back to computing
     /// it from the block's transactions.
     pub auth_data_root: Option<AuthDataRoot>,
+}
+
+/// Data required to check a prepared mined block before optimistic relay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockCommitmentData {
+    /// The block whose header commits to the prepared body and parent history.
+    pub block: Arc<Block>,
+    /// The precomputed authorizing-data commitment root, when available.
+    pub auth_data_root: Option<AuthDataRoot>,
+}
+
+impl From<&SemanticallyVerifiedBlock> for BlockCommitmentData {
+    fn from(block: &SemanticallyVerifiedBlock) -> Self {
+        Self {
+            block: block.block.clone(),
+            auth_data_root: block.auth_data_root,
+        }
+    }
 }
 
 /// A block ready to be committed directly to the finalized state with
@@ -747,6 +883,28 @@ mod tests {
 
         assert_eq!(checkpoint.auth_data_root, Some(block.auth_data_root()));
     }
+
+    #[tokio::test]
+    async fn block_admission_keeps_its_first_terminal_state() {
+        let rejected = BlockAdmission::pending();
+        assert!(!rejected.optimistic_relay_authorized());
+        rejected.authorize_optimistic_relay();
+        assert!(rejected.optimistic_relay_authorized());
+        rejected.reject();
+        rejected.admit(true);
+        assert!(!rejected.wait().await);
+
+        let admitted = BlockAdmission::pending();
+        admitted.admit(true);
+        admitted.reject();
+        assert!(admitted.wait().await);
+
+        let stale = BlockAdmission::pending();
+        stale.authorize_optimistic_relay();
+        stale.admit(false);
+        assert!(stale.wait().await);
+        assert!(!stale.optimistic_relay_authorized());
+    }
 }
 
 impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
@@ -1142,6 +1300,14 @@ pub enum Request {
     /// [0]: (crate::error::CommitSemanticallyVerifiedError)
     CommitSemanticallyVerifiedBlock(SemanticallyVerifiedBlock),
 
+    /// Commits a mined block and reports when state admits it to the active write queue.
+    CommitSemanticallyVerifiedBlockWithAdmission {
+        /// The semantically verified mined block.
+        block: SemanticallyVerifiedBlock,
+        /// The admission notification.
+        admission: BlockAdmission,
+    },
+
     /// Commit a checkpointed block to the state, skipping most but not all
     /// contextual validation.
     ///
@@ -1338,6 +1504,9 @@ pub enum Request {
     /// Returns [`Response::ValidBestChainTipNullifiersAndAnchors`]
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
+    /// Checks the expected work, body commitment, parent history, and selected tip.
+    CheckPreparedMinedRelayEligibility(BlockCommitmentData),
+
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
     /// Returns [`Response::BestChainNextMedianTimePast`] when successful.
@@ -1400,6 +1569,9 @@ impl Request {
                 "retry_header_chain_body_availability"
             }
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
+            Request::CommitSemanticallyVerifiedBlockWithAdmission { .. } => {
+                "commit_semantically_verified_block_with_admission"
+            }
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
@@ -1414,6 +1586,9 @@ impl Request {
             Request::FindBlockHeaders { .. } => "find_block_headers",
             Request::CheckBestChainTipNullifiersAndAnchors(_) => {
                 "best_chain_tip_nullifiers_anchors"
+            }
+            Request::CheckPreparedMinedRelayEligibility(_) => {
+                "check_prepared_mined_relay_eligibility"
             }
             Request::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             Request::BestChainBlockHash(_) => "best_chain_block_hash",
@@ -1857,6 +2032,9 @@ pub enum ReadRequest {
     /// Returns [`ReadResponse::ValidBestChainTipNullifiersAndAnchors`].
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
+    /// Checks the expected work, body commitment, parent history, and selected tip.
+    CheckPreparedMinedRelayEligibility(BlockCommitmentData),
+
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
     /// Returns [`ReadResponse::BestChainNextMedianTimePast`] when successful.
@@ -1979,6 +2157,9 @@ impl ReadRequest {
             ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {
                 "best_chain_tip_nullifiers_anchors"
             }
+            ReadRequest::CheckPreparedMinedRelayEligibility(_) => {
+                "check_prepared_mined_relay_eligibility"
+            }
             ReadRequest::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             ReadRequest::BestChainBlockHash(_) => "best_chain_block_hash",
             #[cfg(feature = "indexer")]
@@ -2038,6 +2219,9 @@ impl TryFrom<Request> for ReadRequest {
             Request::CheckBestChainTipNullifiersAndAnchors(tx) => {
                 Ok(ReadRequest::CheckBestChainTipNullifiersAndAnchors(tx))
             }
+            Request::CheckPreparedMinedRelayEligibility(block) => {
+                Ok(ReadRequest::CheckPreparedMinedRelayEligibility(block))
+            }
 
             Request::ApplyHeaderChainInsert { .. }
             | Request::RecordHeaderChainBodyUnavailable { .. }
@@ -2045,6 +2229,7 @@ impl TryFrom<Request> for ReadRequest {
             | Request::RestartHeaderChainBodyAvailability { .. }
             | Request::RetryHeaderChainBodyAvailability { .. }
             | Request::CommitSemanticallyVerifiedBlock(_)
+            | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),

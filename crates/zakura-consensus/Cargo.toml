@@ -30,17 +30,17 @@ progress-bar = [
 ]
 
 # Test-only features
+internal-bench = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl", "zakura-state/proptest-impl"]
 
 [dependencies]
 blake2b_simd = { workspace = true }
 bellman = { workspace = true }
 bls12_381 = { workspace = true }
-halo2 = { package = "halo2_proofs", version = "0.3" }
-jubjub = { workspace = true }
+halo2 = { workspace = true }
 rand = { workspace = true }
+rand_10 = { workspace = true }
 rayon = { workspace = true }
-mset.workspace = true
 
 chrono = { workspace = true, features = ["clock", "std"] }
 lazy_static = { workspace = true }
@@ -53,7 +53,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "tracing", "rt-multi-thread"] }
 tower = { workspace = true, features = ["timeout", "util", "buffer"] }
 tracing = { workspace = true }
-tracing-futures = { workspace = true }
 derive-getters = { workspace = true, features = ["auto_copy_getters"] }
 
 sapling-crypto = { workspace = true, features = ["multicore"]}
@@ -66,13 +65,13 @@ zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
 
 tower-fallback = { package = "zakura-tower-fallback", path = "../tower-fallback/", version = "1.2.0" }
-tower-batch-control = { package = "zakura-tower-batch-control", path = "../tower-batch-control/", version = "1.2.0" }
+tower-batch-control = { package = "zakura-tower-batch-control", path = "../tower-batch-control/", version = "1.3.0" }
 
-zakura-script = { path = "../zakura-script", version = "3.2.0" }
+zakura-script = { path = "../zakura-script", version = "3.2.1" }
 zakura-state = { path = "../zakura-state", version = "7.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "3.2.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.1" }
 zakura-chain = { path = "../zakura-chain", version = "6.0.0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0-rc0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0" }
 
 zcash_protocol.workspace = true
 
@@ -87,15 +86,12 @@ proptest-derive = { workspace = true, optional = true }
 color-eyre = { workspace = true }
 
 hex = { workspace = true }
-num-integer = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 spandoc = { workspace = true }
 toml = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
-tracing-error = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 zakura-state = { path = "../zakura-state", version = "7.0.0", features = ["proptest-impl"] }
 zakura-chain = { path = "../zakura-chain", version = "6.0.0", features = ["proptest-impl"] }
@@ -118,6 +114,11 @@ harness = false
 [[bench]]
 name = "worst_case_tx_verification"
 harness = false
+
+[[bench]]
+name = "state_read_routing"
+harness = false
+required-features = ["internal-bench"]
 
 [lints]
 workspace = true

@@ -112,7 +112,6 @@ use futures::{
     task::noop_waker,
 };
 use itertools::Itertools;
-use num_integer::div_ceil;
 use tokio::{
     sync::{broadcast, mpsc as tokio_mpsc, watch},
     task::JoinHandle,
@@ -1524,7 +1523,9 @@ where
             const PEER_FRACTION_TO_BROADCAST: usize = 3;
 
             // Round up, so that if we have one ready peer, it gets the request.
-            div_ceil(self.ready_services.len(), PEER_FRACTION_TO_BROADCAST)
+            self.ready_services
+                .len()
+                .div_ceil(PEER_FRACTION_TO_BROADCAST)
         }
     }
 

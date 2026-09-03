@@ -2061,6 +2061,50 @@ impl ZakuraDiscoveryHandle {
         inner.book.dial_candidates(
             limit,
             &wanted_services,
+            &[],
+            DialCandidateExclusions {
+                connected_node_ids: &connected_node_ids,
+                in_flight_node_ids,
+            },
+            now,
+            (dial_backoff_base, dial_backoff_max),
+            &mut rng,
+        )
+    }
+
+    /// Returns service-matching candidates first, followed by general candidates.
+    pub(crate) async fn dial_candidates_preferring_any_service(
+        &self,
+        preferred_services: &[ZakuraServiceId],
+        in_flight_node_ids: &[NodeId],
+    ) -> Vec<ZakuraDiscoveryDialCandidate> {
+        let connected = self.connected.borrow().clone();
+        let (limit, dial_backoff_base, dial_backoff_max) = {
+            let inner = self.inner.lock().await;
+            (
+                discovery_dial_slot_limit(
+                    connected.len(),
+                    in_flight_node_ids.len(),
+                    inner.config.max_zakura_connections,
+                    inner.config.discovery_connection_headroom,
+                    inner.config.max_concurrent_discovery_dials,
+                ),
+                inner.config.dial_backoff_base,
+                inner.config.dial_backoff_max,
+            )
+        };
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let connected_node_ids = connected_peer_node_ids(&connected);
+        let now = current_unix_secs();
+        let inner = self.inner.lock().await;
+        let mut rng = rand::thread_rng();
+        inner.book.dial_candidates(
+            limit,
+            &[],
+            preferred_services,
             DialCandidateExclusions {
                 connected_node_ids: &connected_node_ids,
                 in_flight_node_ids,
@@ -2134,6 +2178,7 @@ impl ZakuraDiscoveryHandle {
         let mut discovered = inner.book.dial_candidates(
             limit,
             &wanted_services,
+            &[],
             DialCandidateExclusions {
                 connected_node_ids: &connected_node_ids,
                 in_flight_node_ids,
@@ -2146,6 +2191,7 @@ impl ZakuraDiscoveryHandle {
         if used_fallback {
             discovered = inner.book.dial_candidates(
                 limit,
+                &[],
                 &[],
                 DialCandidateExclusions {
                     connected_node_ids: &connected_node_ids,
@@ -2252,6 +2298,7 @@ impl ZakuraDiscoveryHandle {
         let mut discovered = inner.book.dial_candidates(
             limit,
             &wanted_services,
+            &[],
             DialCandidateExclusions {
                 connected_node_ids: &connected_node_ids,
                 in_flight_node_ids: &excluded_node_ids,
@@ -2264,6 +2311,7 @@ impl ZakuraDiscoveryHandle {
         if used_fallback {
             discovered = inner.book.dial_candidates(
                 limit,
+                &[],
                 &[],
                 DialCandidateExclusions {
                     connected_node_ids: &connected_node_ids,
@@ -2360,6 +2408,7 @@ impl ZakuraDiscoveryHandle {
         let mut discovered = inner.book.dial_candidates(
             limit,
             &wanted_services,
+            &[],
             DialCandidateExclusions {
                 connected_node_ids: &connected_node_ids,
                 in_flight_node_ids,
@@ -2372,6 +2421,7 @@ impl ZakuraDiscoveryHandle {
         if used_fallback {
             discovered = inner.book.dial_candidates(
                 limit,
+                &[],
                 &[],
                 DialCandidateExclusions {
                     connected_node_ids: &connected_node_ids,
@@ -2824,7 +2874,7 @@ impl ZakuraDiscoveryBook {
             .map(|(_, entry)| entry)
             .filter(|entry| {
                 !exclude_node_ids.contains(&entry.record.body.node_id)
-                    && has_wanted_services(&entry.record, wanted_services)
+                    && advertises_all_services(&entry.record, wanted_services)
             })
             .take(limit)
             .map(|entry| entry.record.clone())
@@ -2849,10 +2899,12 @@ impl ZakuraDiscoveryBook {
     }
 
     /// Returns bounded dial candidates for later dial-loop code.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dial_candidates<R: rand::Rng + ?Sized>(
         &self,
         limit: usize,
-        wanted_services: &[ZakuraServiceId],
+        required_services: &[ZakuraServiceId],
+        preferred_services: &[ZakuraServiceId],
         exclusions: DialCandidateExclusions<'_>,
         now: u64,
         dial_backoff: (Duration, Duration),
@@ -2877,12 +2929,12 @@ impl ZakuraDiscoveryBook {
                         dial_backoff.0,
                         dial_backoff.1,
                     )
-                    && has_wanted_services(&entry.record, wanted_services)
+                    && advertises_all_services(&entry.record, required_services)
                     && has_discovery_usable_direct_addrs(entry)
             })
             .map(DialCandidateRef::SignedRecord)
             .chain(self.static_candidates.values().filter_map(|candidate| {
-                if !wanted_services.is_empty()
+                if !required_services.is_empty()
                     || connected_node_ids.contains(&candidate.node_id)
                     || in_flight_node_ids.contains(&candidate.node_id)
                     || self.local_node_id == Some(candidate.node_id)
@@ -2912,11 +2964,22 @@ impl ZakuraDiscoveryBook {
         // per-second candidate-dialer path, yet only `limit` candidates are ever returned. Sorting
         // the whole candidate set (O(n log n)) just to `take(limit)` is replaced with an O(n)
         // partial select of the best `limit` candidates plus an O(limit log limit) sort of the
-        // survivors, keeping the order identical. See finding
+        // survivors, keeping the order identical within each preference group. See finding
         // `claude-discovery-expensive-work-under-global-mutex` (SR-2/SR-4).
-        let mut keyed: Vec<(DialCandidateSortKey, DialCandidateRef<'_>)> = candidates
+        let mut keyed: Vec<((bool, DialCandidateSortKey), DialCandidateRef<'_>)> = candidates
             .into_iter()
-            .map(|candidate| (dial_candidate_sort_key(&candidate, rng), candidate))
+            .map(|candidate| {
+                let is_general = match &candidate {
+                    DialCandidateRef::SignedRecord(entry) => {
+                        !advertises_any_service(&entry.record, preferred_services)
+                    }
+                    DialCandidateRef::StaticConfigured(_) => true,
+                };
+                (
+                    (is_general, dial_candidate_sort_key(&candidate, rng)),
+                    candidate,
+                )
+            })
             .collect();
 
         let take = limit.min(keyed.len());
@@ -3555,10 +3618,16 @@ fn discovery_dial_slot_limit(
     available_connection_slots.min(available_dial_slots)
 }
 
-fn has_wanted_services(record: &ZakuraNodeRecord, wanted_services: &[ZakuraServiceId]) -> bool {
+fn advertises_all_services(record: &ZakuraNodeRecord, wanted_services: &[ZakuraServiceId]) -> bool {
     wanted_services
         .iter()
-        .all(|wanted| record.body.services.iter().any(|service| service == wanted))
+        .all(|wanted| record.body.services.contains(wanted))
+}
+
+fn advertises_any_service(record: &ZakuraNodeRecord, wanted_services: &[ZakuraServiceId]) -> bool {
+    wanted_services
+        .iter()
+        .any(|wanted| record.body.services.contains(wanted))
 }
 
 /// Total sort key for ranked sample entries: hash rank, then node id for hash-collision ties.
@@ -6111,6 +6180,7 @@ mod tests {
             book.dial_candidates(
                 10,
                 &[service(1)],
+                &[],
                 DialCandidateExclusions {
                     connected_node_ids: &[],
                     in_flight_node_ids: &[],
@@ -6150,6 +6220,7 @@ mod tests {
             book.dial_candidates(
                 10,
                 &[service(1)],
+                &[],
                 DialCandidateExclusions {
                     connected_node_ids: &[],
                     in_flight_node_ids: &[],
@@ -6248,6 +6319,7 @@ mod tests {
         assert_eq!(
             book.dial_candidates(
                 10,
+                &[],
                 &[],
                 DialCandidateExclusions {
                     connected_node_ids: &[],
@@ -6524,6 +6596,7 @@ mod tests {
         let candidates = book.dial_candidates(
             10,
             &[service(1)],
+            &[],
             DialCandidateExclusions {
                 connected_node_ids: &[],
                 in_flight_node_ids: &[],
@@ -6541,6 +6614,7 @@ mod tests {
         let candidates = book.dial_candidates(
             10,
             &[service(1)],
+            &[],
             DialCandidateExclusions {
                 connected_node_ids: &[],
                 in_flight_node_ids: &[],
@@ -6582,6 +6656,7 @@ mod tests {
         let sampled = book.dial_candidates(
             records.len(),
             &[service(1)],
+            &[],
             DialCandidateExclusions {
                 connected_node_ids: &[],
                 in_flight_node_ids: &[],
@@ -6597,6 +6672,7 @@ mod tests {
         let other_sampled = book.dial_candidates(
             records.len(),
             &[service(1)],
+            &[],
             DialCandidateExclusions {
                 connected_node_ids: &[],
                 in_flight_node_ids: &[],
@@ -6636,6 +6712,7 @@ mod tests {
             .dial_candidates(
                 10,
                 &[service(1)],
+                &[],
                 DialCandidateExclusions {
                     connected_node_ids: &[],
                     in_flight_node_ids: &[],
@@ -6650,6 +6727,7 @@ mod tests {
             book.dial_candidates(
                 10,
                 &[service(1)],
+                &[],
                 DialCandidateExclusions {
                     connected_node_ids: &[],
                     in_flight_node_ids: &[],
@@ -6680,6 +6758,7 @@ mod tests {
             .dial_candidates(
                 10,
                 &[service(1)],
+                &[],
                 DialCandidateExclusions {
                     connected_node_ids: &[],
                     in_flight_node_ids: &[],
@@ -6693,6 +6772,7 @@ mod tests {
             book.dial_candidates(
                 10,
                 &[service(1)],
+                &[],
                 DialCandidateExclusions {
                     connected_node_ids: &[],
                     in_flight_node_ids: &[],
@@ -8265,6 +8345,7 @@ mod tests {
         let selected = book.dial_candidates(
             3,
             &[service(1)],
+            &[],
             DialCandidateExclusions {
                 connected_node_ids: &[],
                 in_flight_node_ids: &[],
@@ -8524,6 +8605,57 @@ mod tests {
             .dial_candidates(&[service(1)], &[candidate_id])
             .await
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn dial_candidates_prefer_any_matching_service() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let wanted_a = service(1);
+        let wanted_b = service(2);
+        let matching_a = runtime_record_with(1, wanted_a.clone(), test_addr(1));
+        let matching_b = runtime_record_with(2, wanted_b.clone(), test_addr(2));
+        let neither = runtime_record_with(3, service(3), test_addr(3));
+
+        for record in [&matching_a, &matching_b, &neither] {
+            handle
+                .import_peer_record(record.clone(), Some(record.body.node_id))
+                .await
+                .expect("candidate record imports");
+        }
+
+        assert!(handle
+            .dial_candidates(&[wanted_a, wanted_b], &[])
+            .await
+            .is_empty());
+
+        let prioritized = handle
+            .dial_candidates_preferring_any_service(&[service(1), service(2)], &[])
+            .await;
+        assert_eq!(prioritized.len(), 3);
+        assert_eq!(
+            prioritized[..2]
+                .iter()
+                .map(|candidate| candidate.node_id)
+                .collect::<HashSet<_>>(),
+            HashSet::from([matching_a.body.node_id, matching_b.body.node_id])
+        );
+        assert_eq!(prioritized[2].node_id, neither.body.node_id);
+
+        let general = handle
+            .dial_candidates_preferring_any_service(&[], &[])
+            .await;
+        assert_eq!(
+            general
+                .iter()
+                .map(|candidate| candidate.node_id)
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                matching_a.body.node_id,
+                matching_b.body.node_id,
+                neither.body.node_id,
+            ])
+        );
     }
 
     #[test]

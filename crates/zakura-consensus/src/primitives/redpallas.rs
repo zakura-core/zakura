@@ -9,7 +9,7 @@ use std::{
 
 use futures::{future::BoxFuture, FutureExt};
 use once_cell::sync::Lazy;
-use rand::thread_rng;
+use rand_10::rng as thread_rng;
 
 use tokio::sync::watch;
 use tower::{util::ServiceFn, Service};

@@ -12,13 +12,14 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+base64 = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
-reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-tls", "json"] }
-sentry = { workspace = true, features = ["backtrace", "contexts", "logs", "rustls", "tracing", "ureq"] }
+sentry = { workspace = true, features = ["backtrace", "logs", "rustls", "tracing", "ureq"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+ureq = { version = "3.0.11", default-features = false }
 
 [lints]
 workspace = true

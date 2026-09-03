@@ -27,7 +27,7 @@ use zakura_chain::{
     sprout,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex},
     transaction::{self, UnminedTx},
-    transparent::{self, utxos_from_ordered_utxos},
+    transparent,
     value_balance::{ValueBalance, ValueBalanceError},
 };
 
@@ -329,7 +329,7 @@ pub struct ContextuallyVerifiedBlock {
     /// earlier transaction.
     ///
     /// This field can also contain unrelated outputs, which are ignored.
-    pub(crate) new_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    pub(crate) new_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
 
     /// The outputs spent by this block, indexed by the [`transparent::Input`]'s
     /// [`OutPoint`](transparent::OutPoint).
@@ -338,7 +338,7 @@ pub struct ContextuallyVerifiedBlock {
     /// or earlier blocks in the chain.
     ///
     /// This field can also contain unrelated outputs, which are ignored.
-    pub(crate) spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    pub(crate) spent_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
 
     /// A precomputed list of the hashes of the transactions in this block,
     /// in the same order as `block.transactions`.
@@ -505,15 +505,19 @@ impl ContextuallyVerifiedBlock {
     /// Create a block that's ready for non-finalized `Chain` contextual validation,
     /// using a [`SemanticallyVerifiedBlock`] and the UTXOs it spends.
     ///
-    /// When combined, `semantically_verified.new_outputs` and `spent_utxos` must contain
-    /// the [`Utxo`](transparent::Utxo)s spent by every transparent input in this block,
-    /// including UTXOs created by earlier transactions in this block.
+    /// `spent_outputs` must contain the [`Utxo`](transparent::Utxo) spent by
+    /// every transparent input in this block. This includes UTXOs created by
+    /// earlier transactions in the same block.
     ///
     /// Note: a [`ContextuallyVerifiedBlock`] isn't actually contextually valid until
     /// [`Chain::push()`](crate::service::non_finalized_state::Chain::push) returns success.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if `spent_outputs` omits a transparent input's UTXO.
     pub fn with_block_and_spent_utxos(
         semantically_verified: SemanticallyVerifiedBlock,
-        mut spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+        spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     ) -> Result<Self, ValueBalanceError> {
         let SemanticallyVerifiedBlock {
             block,
@@ -525,23 +529,19 @@ impl ContextuallyVerifiedBlock {
             auth_data_root: _,
         } = semantically_verified;
 
-        // This is redundant for the non-finalized state,
-        // but useful to make some tests pass more easily.
-        //
-        // TODO: fix the tests, and stop adding unrelated outputs.
-        spent_outputs.extend(new_outputs.clone());
+        let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
+            &spent_outputs,
+            deferred_pool_balance_change,
+        )?;
 
         Ok(Self {
-            block: block.clone(),
+            block,
             hash,
             height,
-            new_outputs,
-            spent_outputs: spent_outputs.clone(),
+            new_outputs: Arc::new(new_outputs),
+            spent_outputs: Arc::new(spent_outputs),
             transaction_hashes,
-            chain_value_pool_change: block.chain_value_pool_change(
-                &utxos_from_ordered_utxos(spent_outputs),
-                deferred_pool_balance_change,
-            )?,
+            chain_value_pool_change,
         })
     }
 }
@@ -694,6 +694,43 @@ mod tests {
     }
 
     #[test]
+    fn contextual_block_clone_shares_immutable_utxo_maps() {
+        let _init_guard = zakura_test::init();
+
+        let block = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                .zcash_deserialize_into::<Block>()
+                .expect("the genesis block deserializes"),
+        );
+        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            SemanticallyVerifiedBlock::from(block),
+            HashMap::new(),
+        )
+        .expect("the test block's value balance can be calculated");
+        let cloned = contextual.clone();
+
+        assert!(Arc::ptr_eq(&contextual.new_outputs, &cloned.new_outputs));
+        assert!(Arc::ptr_eq(
+            &contextual.spent_outputs,
+            &cloned.spent_outputs
+        ));
+
+        let semantic = SemanticallyVerifiedBlock::from(cloned);
+        assert_eq!(&semantic.new_outputs, contextual.new_outputs.as_ref());
+
+        let unique = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            SemanticallyVerifiedBlock::from(contextual.block.clone()),
+            HashMap::new(),
+        )
+        .expect("the test block's value balance can be calculated");
+        assert_eq!(Arc::strong_count(&unique.new_outputs), 1);
+        let expected_outputs = unique.new_outputs.as_ref().clone();
+
+        let semantic = SemanticallyVerifiedBlock::from(unique);
+        assert_eq!(semantic.new_outputs, expected_outputs);
+    }
+
+    #[test]
     fn checkpoint_precomputed_auth_data_root_matches_its_block() {
         let _init_guard = zakura_test::init();
 
@@ -718,7 +755,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             block: valid.block,
             hash: valid.hash,
             height: valid.height,
-            new_outputs: valid.new_outputs,
+            new_outputs: Arc::unwrap_or_clone(valid.new_outputs),
             transaction_hashes: valid.transaction_hashes,
             deferred_pool_balance_change: Some(DeferredPoolBalanceChange::new(
                 valid.chain_value_pool_change.deferred_amount(),
@@ -1403,7 +1440,10 @@ impl Request {
 /// [`ReadStateService`](crate::service::ReadStateService).
 pub enum ReadRequest {
     /// Returns [`ReadResponse::UsageInfo(num_bytes: u64)`](ReadResponse::UsageInfo)
-    /// with the current disk space usage in bytes.
+    /// with a recent estimate of the disk space usage in bytes.
+    ///
+    /// The state service refreshes this estimate with its RocksDB metrics, normally every 30
+    /// seconds.
     UsageInfo,
 
     /// Returns [`ReadResponse::PruningInfo`] with
@@ -1861,6 +1901,18 @@ pub enum ReadRequest {
     /// with the current best chain tip block size in bytes.
     TipBlockSize,
 
+    /// Returns [`ReadResponse::ChainTips(Vec<ChainTipInfo>)`](ReadResponse::ChainTips)
+    /// with the tip of every chain this node currently tracks, in descending
+    /// height order.
+    ///
+    /// This covers the best chain, the non-finalized forks, recently invalidated
+    /// branches, and the selected header chain when some block bodies are
+    /// unavailable. Its cost is bounded by the number of tracked forks, not by the
+    /// height of the chain.
+    ///
+    /// Used by the `getchaintips` RPC.
+    ChainTips,
+
     /// Returns [`ReadResponse::NonFinalizedBlocksListener`] with a channel receiver
     /// allowing the caller to listen for new blocks in the non-finalized state.
     NonFinalizedBlocksListener {
@@ -1935,6 +1987,7 @@ impl ReadRequest {
             ReadRequest::SolutionRate { .. } => "solution_rate",
             ReadRequest::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
             ReadRequest::TipBlockSize => "tip_block_size",
+            ReadRequest::ChainTips => "chain_tips",
             ReadRequest::NonFinalizedBlocksListener { .. } => "non_finalized_blocks_listener",
             ReadRequest::IsTransparentOutputSpent(_) => "is_transparent_output_spent",
         }

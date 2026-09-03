@@ -2331,7 +2331,7 @@ fn assert_noncanonical_shielded_protocol_proof_size(error: SerializationError) {
 /// pattern.
 #[test]
 fn orchard_rk_identity_point_rejected_during_deserialization() {
-    use group::prime::PrimeCurveAffine;
+    use group::CurveAffine;
     use reddsa::Signature;
 
     use crate::{

@@ -411,7 +411,7 @@ async fn db_init_outside_future_executor() -> Result<()> {
         "futures executor was blocked longer than expected ({block_duration:?})",
     );
 
-    db_init_handle.await.map_err(|e| eyre!(e))?;
+    db_init_handle.await.map_err(|e| eyre!(e))??;
 
     Ok(())
 }

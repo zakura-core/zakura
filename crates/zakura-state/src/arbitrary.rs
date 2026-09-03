@@ -60,6 +60,7 @@ impl SemanticallyVerifiedBlock {
 impl ContextuallyVerifiedBlock {
     /// Create a block that's ready for non-finalized `Chain` contextual
     /// validation, using a [`SemanticallyVerifiedBlock`] and fake zero-valued spent UTXOs.
+    /// The helper assigns zero value to intra-block spends as well as chain spends.
     ///
     /// Only for use in tests.
     pub fn test_with_zero_spent_utxos(block: impl Into<SemanticallyVerifiedBlock>) -> Self {
@@ -105,11 +106,11 @@ impl ContextuallyVerifiedBlock {
             block,
             hash,
             height,
-            new_outputs: new_outputs.clone(),
+            new_outputs: Arc::new(new_outputs.clone()),
             // Just re-use the outputs we created in this block, even though that's incorrect.
             //
             // TODO: fix the tests, and stop adding unrelated inputs and outputs.
-            spent_outputs: new_outputs,
+            spent_outputs: Arc::new(new_outputs),
             transaction_hashes,
             chain_value_pool_change: ValueBalance::zero(),
         }

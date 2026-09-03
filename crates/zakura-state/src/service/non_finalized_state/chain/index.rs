@@ -5,8 +5,6 @@ use std::{
     ops::RangeInclusive,
 };
 
-use mset::MultiSet;
-
 use zakura_chain::{
     amount::{Amount, NegativeAllowed},
     block::Height,
@@ -15,7 +13,7 @@ use zakura_chain::{
 
 use crate::{OutputLocation, TransactionLocation, ValidateContextError};
 
-use super::{RevertPosition, UpdateWith};
+use super::{counted_set::CountedSet, RevertPosition, UpdateWith};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentTransfers {
@@ -30,7 +28,7 @@ pub struct TransparentTransfers {
     /// inconsistencies.
     ///
     /// The `getaddresstxids` RPC needs these transaction IDs to be sorted in chain order.
-    tx_ids: MultiSet<transaction::Hash>,
+    tx_ids: CountedSet<transaction::Hash>,
 
     /// The partial list of UTXOs received by a transparent address.
     ///
@@ -257,7 +255,7 @@ impl TransparentTransfers {
         query_height_range: RangeInclusive<Height>,
     ) -> BTreeMap<TransactionLocation, transaction::Hash> {
         self.tx_ids
-            .distinct_elements()
+            .distinct_values()
             .filter_map(|tx_hash| {
                 let tx_loc = *chain_tx_loc_by_hash
                     .get(tx_hash)

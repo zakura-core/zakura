@@ -330,7 +330,7 @@ fn load_tls_config(
         )
     })?;
 
-    let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = RustlsServerConfig::builder_with_provider(crypto_provider)
         .with_safe_default_protocol_versions()
         .map_err(|error| format!("could not configure RPC TLS protocol versions: {error}"))?

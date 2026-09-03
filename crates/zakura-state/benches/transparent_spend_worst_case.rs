@@ -23,7 +23,9 @@ use zakura_chain::{
     transaction::{self, LockTime, Transaction},
     transparent,
 };
-use zakura_state::{check::remaining_transaction_value, SemanticallyVerifiedBlock};
+use zakura_state::{
+    check::remaining_transaction_value, ContextuallyVerifiedBlock, SemanticallyVerifiedBlock,
+};
 use zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES;
 
 const MAX_SPEND_TRANSACTIONS: usize = 26_645;
@@ -46,14 +48,32 @@ fn main() {
         let block_bytes = block.zcash_serialized_size();
 
         let start = Instant::now();
+        black_box((prepared.clone(), spent_utxos.clone()));
+        let contextual_input_clone_elapsed = start.elapsed();
+
+        let start = Instant::now();
         black_box(remaining_transaction_value(
             black_box(&prepared),
             black_box(&spent_utxos),
         ))
         .expect("equal input and output values have nonnegative remaining value");
-        let elapsed = start.elapsed();
+        let remaining_value_elapsed = start.elapsed();
 
-        print_result(transaction_count, block_bytes, elapsed);
+        let start = Instant::now();
+        black_box(ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            black_box(prepared),
+            black_box(spent_utxos),
+        ))
+        .expect("equal input and output values have a valid chain value pool change");
+        let contextual_preparation_elapsed = start.elapsed();
+
+        print_result(
+            transaction_count,
+            block_bytes,
+            contextual_input_clone_elapsed,
+            remaining_value_elapsed,
+            contextual_preparation_elapsed,
+        );
     }
 }
 
@@ -81,6 +101,7 @@ fn benchmark_fixture(
     let coinbase = Arc::new(minimal_v5_coinbase());
     let mut transactions = Vec::with_capacity(transaction_count + 1);
     let mut spent_utxos = HashMap::with_capacity(transaction_count);
+    let mut new_outputs = HashMap::with_capacity(transaction_count);
 
     transactions.push(coinbase);
 
@@ -99,6 +120,13 @@ fn benchmark_fixture(
             transparent::OrderedUtxo::from_utxo(
                 transparent::Utxo::new(spendable_output(), Height(1), false),
                 0,
+            ),
+        );
+        new_outputs.insert(
+            synthetic_new_outpoint(index),
+            transparent::OrderedUtxo::from_utxo(
+                transparent::Utxo::new(unspendable_output(), BENCHMARK_HEIGHT, false),
+                index + 1,
             ),
         );
         transactions.push(Arc::new(transaction));
@@ -133,7 +161,7 @@ fn benchmark_fixture(
         block: block.clone(),
         hash: block.hash(),
         height: BENCHMARK_HEIGHT,
-        new_outputs: HashMap::new(),
+        new_outputs,
         transaction_hashes: vec![transaction::Hash([0; 32]); transaction_count + 1].into(),
         deferred_pool_balance_change: None,
         auth_data_root: None,
@@ -188,6 +216,12 @@ fn synthetic_outpoint(index: usize) -> transparent::OutPoint {
     }
 }
 
+fn synthetic_new_outpoint(index: usize) -> transparent::OutPoint {
+    let mut outpoint = synthetic_outpoint(index);
+    outpoint.hash.0[31] = 1;
+    outpoint
+}
+
 fn spendable_output() -> transparent::Output {
     transparent::Output::new(one_zatoshi(), transparent::Script::new(&[OP_TRUE]))
 }
@@ -201,16 +235,40 @@ fn one_zatoshi() -> Amount<NonNegative> {
 }
 
 #[allow(clippy::print_stdout)]
-fn print_result(transaction_count: usize, block_bytes: usize, elapsed: Duration) {
+fn print_result(
+    transaction_count: usize,
+    block_bytes: usize,
+    contextual_input_clone_elapsed: Duration,
+    remaining_value_elapsed: Duration,
+    contextual_preparation_elapsed: Duration,
+) {
     let transaction_count: u32 = transaction_count
         .try_into()
         .expect("benchmark transaction count fits in u32");
-    let transactions_per_second = f64::from(transaction_count) / elapsed.as_secs_f64();
+    let contextual_input_clone_tps =
+        f64::from(transaction_count) / contextual_input_clone_elapsed.as_secs_f64();
+    let remaining_value_tps = f64::from(transaction_count) / remaining_value_elapsed.as_secs_f64();
+    let contextual_preparation_tps =
+        f64::from(transaction_count) / contextual_preparation_elapsed.as_secs_f64();
 
     println!(
-        "transactions={transaction_count} block_bytes={block_bytes} \
+        "operation=contextual_input_clone transactions={transaction_count} \
+         block_bytes={block_bytes} input_lookups={transaction_count} elapsed_seconds={:.3} \
+         transactions_per_second={:.1}",
+        contextual_input_clone_elapsed.as_secs_f64(),
+        contextual_input_clone_tps,
+    );
+    println!(
+        "operation=remaining_value transactions={transaction_count} block_bytes={block_bytes} \
          input_lookups={transaction_count} elapsed_seconds={:.3} transactions_per_second={:.1}",
-        elapsed.as_secs_f64(),
-        transactions_per_second,
+        remaining_value_elapsed.as_secs_f64(),
+        remaining_value_tps,
+    );
+    println!(
+        "operation=contextual_preparation transactions={transaction_count} \
+         block_bytes={block_bytes} input_lookups={transaction_count} elapsed_seconds={:.3} \
+         transactions_per_second={:.1}",
+        contextual_preparation_elapsed.as_secs_f64(),
+        contextual_preparation_tps,
     );
 }

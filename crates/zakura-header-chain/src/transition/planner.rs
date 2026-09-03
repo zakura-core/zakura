@@ -153,6 +153,7 @@ fn derive_plan_candidate(
     }
     let event = bound_request.event;
     let domain = bound_request.domain;
+    let full_state_authorization_version = bound_request.full_state_authorization_version;
 
     // Phase 3: project event evidence
     let old_selected = engine.selected_projection();
@@ -181,6 +182,7 @@ fn derive_plan_candidate(
         context,
         old_selected,
         old_verified,
+        full_state_authorization_version,
     })?;
     let settled = match settlement {
         FinalityRetentionOutcome::ResourceStalled => {

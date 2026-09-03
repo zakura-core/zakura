@@ -87,10 +87,11 @@ use futures::FutureExt;
 use tokio::{
     pin, select,
     sync::{oneshot, watch},
+    task::{AbortHandle, JoinHandle},
 };
 use tokio_util::sync::CancellationToken;
 use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
-use tracing_futures::Instrument;
+use tracing::Instrument;
 
 use zakura_chain::block::{self, genesis::regtest_genesis_block};
 use zakura_consensus::router::BackgroundTaskHandles;
@@ -172,6 +173,22 @@ fn check_tcp_slow_start_after_idle() {
 
 fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
     config.v2_p2p()
+}
+
+#[derive(Default)]
+// Keeps track of `JoinHandle`s, and when `Drop`ped, `aborts` all of them.
+struct NodeTasks(Vec<AbortHandle>);
+
+impl NodeTasks {
+    fn track<T>(&mut self, task: &JoinHandle<T>) {
+        self.0.push(task.abort_handle());
+    }
+}
+
+impl Drop for NodeTasks {
+    fn drop(&mut self) {
+        self.0.iter().for_each(AbortHandle::abort);
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -283,14 +300,15 @@ impl StartCmd {
         )
     }
 
-    async fn start(
+    pub(crate) async fn start(
         &self,
+        config: Arc<ZakuradConfig>,
+        custom_services: Vec<zakura_network::zakura::CustomService>,
         shutdown: CancellationToken,
-        cleanup_ready: CancellationToken,
+        shutdown_cleanup_required: CancellationToken,
     ) -> Result<(), Report> {
         check_tcp_slow_start_after_idle();
 
-        let config = APPLICATION.config();
         let is_regtest = config.network.network.is_regtest();
 
         let config = if is_regtest {
@@ -383,7 +401,8 @@ impl StartCmd {
             config.sync.checkpoint_verify_concurrency_limit
                 * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
         )
-        .await;
+        .await
+        .map_err(|error| eyre!("state initialization failed: {error}"))?;
 
         state_service
             .ready()
@@ -419,7 +438,7 @@ impl StartCmd {
             };
 
         let state = ServiceBuilder::new()
-            .buffer(Self::state_buffer_bound())
+            .buffer(Self::state_buffer_bound(&config))
             .service(state_service);
 
         let zakura_bootstrap_snapshots = config
@@ -454,6 +473,10 @@ impl StartCmd {
             None
         };
 
+        let mut node_tasks = NodeTasks::default();
+        // Cancel detached tasks before dropping the state services, whose teardown blocks.
+        let _shutdown_on_drop = shutdown.clone().drop_guard();
+
         info!("initializing network");
         // The service that our node uses to respond to requests by peers. The
         // load_shed middleware ensures that we reduce the size of the peer set
@@ -487,7 +510,7 @@ impl StartCmd {
         let advertised_services = Self::advertised_services(&config);
 
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
-            zakura_network::init_with_zakura_header_sync(
+            zakura_network::init_with_zakura(
                 config.network.clone(),
                 inbound,
                 latest_chain_tip.clone(),
@@ -495,21 +518,44 @@ impl StartCmd {
                 advertised_services,
                 zcashd_compat_block_gossip_peer_ips,
                 zakura_header_sync_driver_startup,
+                custom_services,
             )
-            .await;
+            .await
+            .map_err(|error| eyre!(error))?;
+
+        let mut header_sync_fatal_events = match zakura_endpoint.as_ref() {
+            Some(endpoint) => endpoint.take_header_sync_fatal_events().await,
+            None => None,
+        };
+
+        // Not added to node_tasks, because it must outlive start() being dropped to shutdown the
+        // endpoint
+        let zakura_endpoint_shutdown_task = if let Some(endpoint) = zakura_endpoint.clone() {
+            shutdown_cleanup_required.cancel();
+
+            let shutdown = shutdown.clone();
+            Some(tokio::spawn(async move {
+                shutdown.cancelled().await;
+                endpoint.shutdown().await;
+            }))
+        } else {
+            None
+        };
 
         // Start health server if configured (after sync_status is available)
 
         info!("initializing verifiers");
         let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();
         let (block_verifier_router, tx_verifier, consensus_task_handles, max_checkpoint_height) =
-            zakura_consensus::router::init(
+            zakura_consensus::router::init_with_read_state(
                 config.consensus.clone(),
                 &config.network.network,
                 state.clone(),
+                read_only_state_service.clone(),
                 tx_verifier_setup_rx,
             )
             .await;
+        node_tasks.track(&consensus_task_handles.state_checkpoint_verify_handle);
 
         if let Some(endpoint) = zakura_endpoint.clone() {
             let trace = endpoint.trace();
@@ -562,6 +608,7 @@ impl StartCmd {
             config.network.expose_peer_addresses,
             peer_set.clone(),
             state.clone(),
+            tower::util::BoxCloneService::new(read_only_state_service.clone()),
             tx_verifier,
             sync_status.clone(),
             latest_chain_tip.clone(),
@@ -614,6 +661,7 @@ impl StartCmd {
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
         );
+        node_tasks.track(&rpc_tx_queue_handle);
         let rpc_impl = rpc_impl.with_end_of_support_height(
             sync::end_of_support::end_of_support_height(&config.network.network),
         );
@@ -625,6 +673,7 @@ impl StartCmd {
         } else {
             tokio::spawn(std::future::pending().in_current_span())
         };
+        node_tasks.track(&rpc_task_handle);
 
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
@@ -678,6 +727,7 @@ impl StartCmd {
                 tokio::spawn(std::future::pending().in_current_span())
             }
         };
+        node_tasks.track(&indexer_rpc_task_handle);
 
         // Start concurrent tasks which don't add load to other tasks
         info!("spawning block gossip task");
@@ -690,9 +740,11 @@ impl StartCmd {
             )
             .in_current_span(),
         );
+        node_tasks.track(&block_gossip_task_handle);
 
         info!("spawning mempool queue checker task");
         let mempool_queue_checker_task_handle = mempool::QueueChecker::spawn(mempool.clone());
+        node_tasks.track(&mempool_queue_checker_task_handle);
 
         info!("spawning mempool transaction gossip task");
         let tx_gossip_task_handle = tokio::spawn(
@@ -703,12 +755,14 @@ impl StartCmd {
             )
             .in_current_span(),
         );
+        node_tasks.track(&tx_gossip_task_handle);
 
         info!("spawning delete old databases task");
         let mut old_databases_task_handle = zakura_state::check_and_delete_old_state_databases(
             &config.state,
             &config.network.network,
         );
+        node_tasks.track(&old_databases_task_handle);
 
         info!("spawning progress logging task");
         let (chain_tip_metrics_sender, chain_tip_metrics_receiver) =
@@ -722,6 +776,7 @@ impl StartCmd {
             )
             .in_current_span(),
         );
+        node_tasks.track(&progress_task_handle);
 
         // Start health server if configured
         info!("initializing health endpoints");
@@ -733,6 +788,7 @@ impl StartCmd {
             address_book.clone(),
         )
         .await;
+        node_tasks.track(&health_task_handle);
 
         // Spawn never ending end of support task.
         info!("spawning end of support checking task");
@@ -740,6 +796,7 @@ impl StartCmd {
             sync::end_of_support::start(config.network.network.clone(), latest_chain_tip.clone())
                 .in_current_span(),
         );
+        node_tasks.track(&end_of_support_task_handle);
 
         // Give the inbound service more time to clear its queue,
         // then start concurrent tasks that can add load to the inbound service
@@ -755,6 +812,7 @@ impl StartCmd {
             sync_status.clone(),
             chain_tip_change.clone(),
         );
+        node_tasks.track(&mempool_crawler_task_handle);
 
         info!("spawning syncer task");
         // In regtest, commit the genesis block directly (bypassing the syncer's genesis
@@ -810,6 +868,7 @@ impl StartCmd {
         } else {
             tokio::spawn(syncer.sync().in_current_span())
         };
+        node_tasks.track(&syncer_task_handle);
 
         // And finally, spawn the internal Zcash miner, if it is enabled.
         //
@@ -826,6 +885,7 @@ impl StartCmd {
         // Spawn a dummy miner task which doesn't do anything and never finishes.
         let miner_task_handle: tokio::task::JoinHandle<Result<(), Report>> =
             tokio::spawn(std::future::pending().in_current_span());
+        node_tasks.track(&miner_task_handle);
 
         info!("spawned initial Zakura tasks");
 
@@ -841,7 +901,7 @@ impl StartCmd {
             };
         // The supervisor may own a child after this point, so shutdown must
         // await cleanup. Do not add a yield between the spawn and this marker.
-        cleanup_ready.cancel();
+        shutdown_cleanup_required.cancel();
 
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
 
@@ -879,6 +939,20 @@ impl StartCmd {
 
                 let result = select! {
                 _ = shutdown.cancelled() => Ok(()),
+
+                header_sync_fatal_event = async {
+                    match header_sync_fatal_events.as_mut() {
+                        Some(events) => events.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match header_sync_fatal_event {
+                    Some(event) => Self::handle_header_sync_fatal_event(event, &shutdown),
+                    None => {
+                        header_sync_fatal_events = None;
+                        exit_when_task_finishes = false;
+                        Ok(())
+                    }
+                },
 
                 rpc_join_result = &mut rpc_task_handle => {
                     let rpc_server_result = rpc_join_result
@@ -994,6 +1068,8 @@ impl StartCmd {
         };
 
         info!("exiting Zakura: asking other tasks to stop");
+        shutdown.cancel();
+        zakura_chain::shutdown::set_shutting_down();
 
         // ongoing tasks
         rpc_task_handle.abort();
@@ -1007,6 +1083,11 @@ impl StartCmd {
         progress_task_handle.abort();
         end_of_support_task_handle.abort();
         miner_task_handle.abort();
+        if let Some(zakura_endpoint_shutdown_task) = zakura_endpoint_shutdown_task {
+            zakura_endpoint_shutdown_task
+                .await
+                .expect("unexpected panic in the Zakura endpoint shutdown task");
+        }
         if zcashd_compat_task_finished {
             debug!("zcashd-compat supervisor task already exited before shutdown");
         } else if let Some(zcashd_compat_shutdown_timeout) = zcashd_compat_shutdown_timeout {
@@ -1079,12 +1160,19 @@ impl StartCmd {
         false
     }
 
+    fn handle_header_sync_fatal_event(
+        event: zakura_network::zakura::HeaderSyncFatalEvent,
+        shutdown: &CancellationToken,
+    ) -> Result<(), Report> {
+        shutdown.cancel();
+        Err(eyre!(event))
+    }
+
     /// Returns the bound for the state service buffer,
     /// based on the configurations of the services that use the state concurrently.
-    fn state_buffer_bound() -> usize {
-        let config = APPLICATION.config();
-
+    fn state_buffer_bound(config: &ZakuradConfig) -> usize {
         // Ignore the checkpoint verify limit, because it is very large.
+        // Mempool read traffic bypasses this buffer.
         //
         // TODO: do we also need to account for concurrent use across services?
         //       we could multiply the maximum by 3/2, or add a fixed constant
@@ -1092,7 +1180,6 @@ impl StartCmd {
             config.sync.download_concurrency_limit,
             config.sync.full_verify_concurrency_limit,
             inbound::downloads::MAX_INBOUND_CONCURRENCY,
-            mempool::downloads::MAX_INBOUND_CONCURRENCY,
         ]
         .into_iter()
         .max()
@@ -1113,8 +1200,13 @@ impl Runnable for StartCmd {
             .take();
 
         rt.expect("runtime should not already be taken")
-            .run_with_graceful_shutdown(|shutdown, cleanup_ready| {
-                self.start(shutdown, cleanup_ready)
+            .run_with_graceful_shutdown(|shutdown, shutdown_cleanup_required| {
+                self.start(
+                    APPLICATION.config(),
+                    Vec::new(),
+                    shutdown,
+                    shutdown_cleanup_required,
+                )
             });
 
         info!("stopping zakurad");
@@ -1191,6 +1283,8 @@ impl config::Override<ZakuradConfig> for StartCmd {
 mod tests {
     use abscissa_core::config::Override;
     use color_eyre::eyre::eyre;
+    use tokio_util::sync::CancellationToken;
+    use zakura_chain::block;
 
     use super::StartCmd;
     use crate::components::zcashd_compat;
@@ -1519,6 +1613,41 @@ mod tests {
             join_err
         )));
     }
+
+    #[test]
+    fn header_sync_fatal_event_returns_an_error_and_starts_shutdown() {
+        let authority = zakura_header_chain::BodyWorkAuthority {
+            header: zakura_header_chain::HeaderWorkAuthority {
+                header_generation: zakura_header_chain::HeaderGeneration::new(3),
+                branch: zakura_header_chain::BranchId::new(
+                    block::Hash([1; 32]),
+                    block::Hash([2; 32]),
+                ),
+            },
+            verified_generation: zakura_header_chain::VerifiedGeneration::new(4),
+            body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
+        };
+        let owner = authority
+            .bind(
+                5,
+                std::num::NonZeroU64::new(6).expect("the test request ID is nonzero"),
+            )
+            .into();
+        let event = zakura_network::zakura::HeaderSyncFatalEvent {
+            phase: "apply",
+            owner,
+            repair_generation: 7,
+            target: zakura_header_chain::Frontier::new(block::Height(8), block::Hash([2; 32])),
+            elapsed: std::time::Duration::from_secs(30 * 60),
+        };
+        let shutdown = CancellationToken::new();
+
+        let error = StartCmd::handle_header_sync_fatal_event(event, &shutdown)
+            .expect_err("a fatal VCT operation must stop the node");
+
+        assert!(shutdown.is_cancelled(), "the node starts normal shutdown");
+        assert!(error.to_string().contains("VCT local apply operation"));
+    }
 }
 
 #[cfg(test)]
@@ -1741,7 +1870,8 @@ mod zakura_header_sync_driver_tests {
                     block::Height(0),
                     2,
                 )
-                .await;
+                .await
+                .expect("persistent test state initialization succeeds");
             let committed = state_service
                 .ready()
                 .await
@@ -1832,7 +1962,8 @@ mod zakura_header_sync_driver_tests {
                     block::Height(0),
                     2,
                 )
-                .await;
+                .await
+                .expect("persistent test state reopens");
             state_service
                 .ready()
                 .await
@@ -4878,18 +5009,17 @@ mod zakura_header_sync_driver_tests {
         reactor_task.abort();
     }
 
-    /// Drives the block-sync apply loop against the *real* checkpoint verifier and a *real*
-    /// ephemeral state, reproducing the checkpoint-range batch-commit that Regtest (genesis
-    /// checkpoint only) cannot exercise.
+    /// Drives the block-sync apply loop against the real checkpoint verifier and an ephemeral
+    /// state. This test reproduces the checkpoint-range batch commit that Regtest cannot exercise.
     ///
     /// A checkpoint is placed at height 10 so an 11-block range covers a full checkpoint gap
     /// without 400 real blocks. The whole range is submitted except one mid-range body, which
     /// the verifier holds the entire range for (it commits nothing until the range is
-    /// contiguous to the next checkpoint). Delivering the withheld body must let the whole
-    /// range commit — i.e. a transiently-missing body recovers instead of wedging the floor,
-    /// which is the production "drop-through" failure mode.
+    /// contiguous to the next checkpoint). The fallback handoff must transfer the held requests
+    /// to the shared verifier. The legacy driver can then deliver the withheld body and commit the
+    /// range.
     #[tokio::test]
-    async fn block_sync_driver_recovers_checkpoint_range_after_withheld_body() {
+    async fn legacy_fallback_completes_transferred_checkpoint_range() {
         const CHECKPOINT_HEIGHT: u32 = 10;
         const WITHHELD: u32 = 5;
 
@@ -4918,7 +5048,7 @@ mod zakura_header_sync_driver_tests {
             zakura_state::init_test_services(&network).await;
 
         // A low checkpoint at height 10 turns the 11-block range into one checkpoint batch.
-        let checkpoint_verifier = zakura_consensus::CheckpointVerifier::from_list(
+        let mut checkpoint_verifier = zakura_consensus::CheckpointVerifier::from_list(
             [
                 (block::Height(0), genesis_hash),
                 (block::Height(CHECKPOINT_HEIGHT), checkpoint_hash),
@@ -4929,10 +5059,18 @@ mod zakura_header_sync_driver_tests {
         )
         .expect("a checkpoint list with genesis and one mid-chain checkpoint is valid");
 
+        let submitted_count = Arc::new(AtomicUsize::new(0));
+        let verifier_submitted_count = submitted_count.clone();
+        let checkpoint_verifier = service_fn(move |block| {
+            verifier_submitted_count.fetch_add(1, Ordering::SeqCst);
+            checkpoint_verifier.call(block)
+        });
+
         // Adapt the checkpoint verifier (`Service<Arc<Block>>`) to the driver's
         // `Service<zakura_consensus::Request, Response = block::Hash>` bound.
         let checkpoint_verifier =
             tower::buffer::Buffer::new(BoxService::new(checkpoint_verifier), 16);
+        let legacy_verifier = checkpoint_verifier.clone();
         let verifier = service_fn(move |request: zakura_consensus::Request| {
             let checkpoint_verifier = checkpoint_verifier.clone();
             async move {
@@ -4949,10 +5087,12 @@ mod zakura_header_sync_driver_tests {
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
+        let handoff = super::zakura::SyncCoordinator::new();
         let (driver, shutdown_tx) = DriverParams {
             // Every block 0..=10 is at or below the checkpoint, so all are Checkpoint-class
             // (indefinite-wait) commits — the path that wedges in production.
             max_checkpoint_height: block::Height(CHECKPOINT_HEIGHT),
+            handoff: handoff.clone(),
             ..DriverParams::default()
         }
         .spawn(
@@ -4995,30 +5135,44 @@ mod zakura_header_sync_driver_tests {
                 .expect("driver action channel stays open");
         }
 
-        // While the body is missing the range cannot commit, and the driver must keep the
-        // checkpoint-class commits pending (not time them out): the tip never reaches the
-        // checkpoint.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let expected_submissions = chain.len().saturating_sub(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while submitted_count.load(Ordering::SeqCst) != expected_submissions {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the driver must submit every available checkpoint body before fallback starts");
+
+        // While the body is missing, the range cannot commit. The driver must keep the
+        // checkpoint-class commits pending instead of timing them out.
         assert_ne!(
             finalized_tip().await,
             Some(block::Height(CHECKPOINT_HEIGHT)),
             "checkpoint range must not commit while a mid-range body is missing",
         );
 
-        // Deliver the withheld body; the verifier can now commit the whole range.
-        let (withheld_height, withheld_block) = chain
+        let fallback = tokio::spawn(async move {
+            handoff
+                .acquire_legacy_fallback(Duration::from_secs(1))
+                .await
+        });
+        let _fallback_lease = tokio::time::timeout(Duration::from_secs(1), fallback)
+            .await
+            .expect("fallback must not wait for an incomplete checkpoint range")
+            .expect("fallback acquisition task must finish")
+            .expect("fallback must acquire the transferred checkpoint range");
+
+        // The legacy driver uses the same verifier. Its missing body completes the transferred
+        // checkpoint range.
+        let (_withheld_height, withheld_block) = chain
             .iter()
             .find(|(height, _)| height.0 == WITHHELD)
             .expect("withheld block is part of the test chain");
-        action_tx
-            .send(BlockSyncAction::SubmitBlock {
-                owner: test_block_work_owner(),
-                source: test_block_source(),
-                token: u64::from(withheld_height.0),
-                block: withheld_block.clone(),
-            })
+        legacy_verifier
+            .oneshot(withheld_block.clone())
             .await
-            .expect("driver action channel stays open");
+            .expect("legacy verifier submission completes the checkpoint range");
 
         // Recovery: the entire range commits, so the finalized tip reaches the checkpoint.
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -5030,7 +5184,7 @@ mod zakura_header_sync_driver_tests {
             }
         })
         .await
-        .expect("delivering the withheld body must let the checkpoint range commit to the tip");
+        .expect("legacy fallback must let the checkpoint range commit to the tip");
 
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");

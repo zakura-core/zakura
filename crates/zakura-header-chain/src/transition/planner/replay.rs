@@ -16,6 +16,7 @@ pub(super) struct BoundRequest {
     pub(super) domain: TransitionDomain,
     pub(super) header_rebase: HeaderInsertionRebase,
     pub(super) no_change_effect: Option<TransitionEffect>,
+    pub(super) full_state_authorization_version: Option<crate::StateVersion>,
 }
 
 /// Check replay identity, async ownership, and version freshness for an admitted request.
@@ -33,6 +34,7 @@ pub(super) fn bind_replay_and_freshness(
     let AdmittedRequest {
         mut event,
         expected_version,
+        full_state_authorization_version,
     } = request;
     let domain = event.domain();
     let header_rebase =
@@ -62,6 +64,7 @@ pub(super) fn bind_replay_and_freshness(
             domain,
             header_rebase,
             no_change_effect: Some(TransitionEffect::header_work_already_applied()),
+            full_state_authorization_version,
         });
     }
     if fingerprint.is_some() && metadata.last_transition == fingerprint {
@@ -70,6 +73,7 @@ pub(super) fn bind_replay_and_freshness(
             domain,
             header_rebase,
             no_change_effect: Some(TransitionEffect::event()),
+            full_state_authorization_version,
         });
     }
     let has_async_authority = event.header_sync_owner().is_some() || event.body_owner().is_some();
@@ -90,5 +94,6 @@ pub(super) fn bind_replay_and_freshness(
         domain,
         header_rebase,
         no_change_effect: None,
+        full_state_authorization_version,
     })
 }

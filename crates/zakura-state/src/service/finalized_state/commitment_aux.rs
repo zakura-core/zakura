@@ -1,7 +1,7 @@
 //! Payload types and the producer/serving half of the verified-commitment-trees
 //! (`docs/design/verified-commitment-trees.md`).
 
-#[cfg(test)]
+#[cfg(any(test, feature = "proptest-impl"))]
 use std::collections::HashMap;
 use std::{
     fmt,
@@ -360,7 +360,7 @@ impl FinalFrontiers {
 /// Source for the VCT fast-sync's verified per-block roots and final frontier.
 pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// The supplied roots for `height`, if this source has them.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "proptest-impl"))]
     fn vct_root(
         &self,
         height: block::Height,
@@ -384,7 +384,7 @@ pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
 }
 
 /// Test-only local source over a height-keyed roots map.
-#[cfg(test)]
+#[cfg(any(test, feature = "proptest-impl"))]
 #[derive(Debug)]
 pub(super) struct FixtureSource {
     roots: HashMap<
@@ -398,7 +398,7 @@ pub(super) struct FixtureSource {
     frontiers: FinalFrontiers,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "proptest-impl"))]
 impl FixtureSource {
     pub(super) fn new(
         roots: HashMap<
@@ -415,7 +415,7 @@ impl FixtureSource {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "proptest-impl"))]
 impl CommitmentRootSource for FixtureSource {
     fn vct_root(
         &self,
@@ -449,7 +449,7 @@ impl EmbeddedFrontierSource {
 }
 
 impl CommitmentRootSource for EmbeddedFrontierSource {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "proptest-impl"))]
     fn vct_root(
         &self,
         _height: block::Height,

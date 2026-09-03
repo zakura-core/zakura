@@ -141,16 +141,65 @@ pub struct Args {
     /// Offline mode: write the completed-subtree artifact for the last emitted
     /// checkpoint height to this path.
     ///
-    /// Requires `--state-cache-dir` and `--mainnet-frontier-output`.
+    /// Requires `--state-cache-dir` and the other artifact output flags.
     #[arg(long)]
     pub mainnet_subtree_output: Option<PathBuf>,
+
+    /// Offline mode: write the historical note commitment frontier grid covering
+    /// everything below the last emitted checkpoint to this path.
+    ///
+    /// Serving nodes anchor on this grid to answer `z_gettreestate` across the
+    /// heights a fast sync skipped. Requires `--state-cache-dir` and the other
+    /// artifact output flags.
+    #[arg(long)]
+    pub mainnet_frontier_grid_output: Option<PathBuf>,
+
+    /// Offline mode: resume the frontier grid from a previously published one.
+    ///
+    /// Carries that grid's entries forward instead of recomputing them, so a run scans only the
+    /// blocks above its last entry rather than the whole chain. Every carried entry is re-checked
+    /// against this database's authenticated roots first, so the input is never trusted. Omit it
+    /// to build the grid from genesis, which is what the first run has to do.
+    ///
+    /// Requires `--mainnet-frontier-grid-output`.
+    #[arg(long)]
+    pub mainnet_frontier_grid_input: Option<PathBuf>,
+
+    /// Offline mode: generate only the frontier grid, for an already-committed checkpoint.
+    ///
+    /// The normal export selects a new checkpoint above the embedded list and pins every
+    /// artifact to it. This backfills a grid for a checkpoint the repository already ships,
+    /// so the artifact can be committed without advancing `main-checkpoints.txt`. The height
+    /// must be one of the embedded checkpoints.
+    ///
+    /// Requires `--state-cache-dir` and `--mainnet-frontier-grid-output`, and excludes the
+    /// other artifact outputs, which would be generated for a newly selected checkpoint.
+    #[arg(long)]
+    pub mainnet_frontier_grid_checkpoint: Option<Height>,
+
+    /// Offline mode: per-entry replay budget for the frontier grid, in milliseconds.
+    ///
+    /// Defaults to 2000 ms. The grid is spaced by estimated replay cost rather than
+    /// evenly, so it bounds the slowest cold request a consumer can make rather than
+    /// the average one. The estimate is a function of the chain, not of wall-clock
+    /// timing, so generator runs stay byte-identical.
+    #[arg(long, conflicts_with = "frontier_grid_spacing")]
+    pub frontier_grid_target_cost_ms: Option<u64>,
+
+    /// Offline mode: uniform height spacing for the frontier grid, in blocks.
+    ///
+    /// Not recommended. Replay cost varies by more than an order of magnitude across
+    /// Mainnet, so a uniform grid cannot bound the worst-case cold request at a sane
+    /// size. Prefer the default cost-weighted grid.
+    #[arg(long, conflicts_with = "frontier_grid_target_cost_ms")]
+    pub frontier_grid_spacing: Option<u32>,
 
     /// Offline mode: print the embedded Mainnet checkpoint list before the
     /// newly generated checkpoints, so stdout is a complete replacement
     /// `main-checkpoints.txt`.
     ///
-    /// Requires `--state-cache-dir`, `--mainnet-frontier-output`, and
-    /// `--mainnet-subtree-output`; incompatible with `--last-checkpoint`.
+    /// Requires `--state-cache-dir` and every artifact output flag; incompatible
+    /// with `--last-checkpoint`.
     #[arg(long)]
     pub full_list: bool,
 
@@ -166,6 +215,28 @@ impl Args {
     /// Offline and RPC modes are mutually exclusive, and the full-list output
     /// only makes sense when extending the embedded checkpoint list.
     pub fn validate_mode(&self) -> Result<(), String> {
+        if self.mainnet_frontier_grid_output.is_none()
+            && (self.frontier_grid_spacing.is_some() || self.frontier_grid_target_cost_ms.is_some())
+        {
+            return Err(
+                "--frontier-grid-spacing and --frontier-grid-target-cost-ms tune \
+                 --mainnet-frontier-grid-output: add it, or remove them"
+                    .to_string(),
+            );
+        }
+        if self.mainnet_frontier_grid_output.is_none() && self.mainnet_frontier_grid_input.is_some()
+        {
+            return Err(
+                "--mainnet-frontier-grid-input resumes a grid that has nowhere to go: add \
+                 --mainnet-frontier-grid-output"
+                    .to_string(),
+            );
+        }
+
+        if self.state_cache_dir.is_some() && self.mainnet_frontier_grid_checkpoint.is_some() {
+            return self.validate_grid_backfill_mode();
+        }
+
         if self.state_cache_dir.is_some() {
             if self.addr.is_some() {
                 return Err(
@@ -185,44 +256,123 @@ impl Args {
                         .to_string(),
                 );
             }
-            if self.mainnet_frontier_output.is_some() != self.mainnet_subtree_output.is_some() {
+            let supplied = self
+                .artifact_outputs()
+                .iter()
+                .filter(|(_, path)| path.is_some())
+                .count();
+            if supplied != 0 && supplied != self.artifact_outputs().len() {
                 return Err(
-                    "release-state frontiers and subtree roots are one pair: provide both \
-                     --mainnet-frontier-output and --mainnet-subtree-output"
+                    "release-state frontiers, subtree roots, and the frontier grid are one \
+                     artifact set: provide --mainnet-frontier-output, --mainnet-subtree-output, \
+                     and --mainnet-frontier-grid-output together"
                         .to_string(),
                 );
             }
-            let artifact_output_paths_match =
-                match (&self.mainnet_frontier_output, &self.mainnet_subtree_output) {
-                    (Some(frontier), Some(subtrees)) => {
-                        resolved_output_destination(frontier)?
-                            == resolved_output_destination(subtrees)?
-                    }
-                    _ => false,
-                };
-            if artifact_output_paths_match {
-                return Err(
-                    "--mainnet-frontier-output and --mainnet-subtree-output must use different paths"
-                        .to_string(),
-                );
-            }
-            if self.full_list && self.mainnet_frontier_output.is_none() {
+            self.reject_aliased_artifact_outputs()?;
+            if self.full_list && supplied == 0 {
                 return Err(
                     "--full-list emits a replacement main-checkpoints.txt, which must ship with \
-                     its coupled frontier and subtree roots: add both artifact output flags"
+                     its coupled release state: add every artifact output flag"
                         .to_string(),
                 );
             }
         } else {
-            if self.mainnet_frontier_output.is_some() {
-                return Err("--mainnet-frontier-output requires --state-cache-dir".to_string());
-            }
-            if self.mainnet_subtree_output.is_some() {
-                return Err("--mainnet-subtree-output requires --state-cache-dir".to_string());
+            for (flag, path) in self.artifact_outputs() {
+                if path.is_some() {
+                    return Err(format!("{flag} requires --state-cache-dir"));
+                }
             }
             if self.full_list {
                 return Err("--full-list requires --state-cache-dir".to_string());
             }
+            if self.mainnet_frontier_grid_checkpoint.is_some() {
+                return Err(
+                    "--mainnet-frontier-grid-checkpoint requires --state-cache-dir".to_string(),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check the flags of a grid-only backfill run.
+    ///
+    /// This mode exists to produce a grid for a checkpoint the repository already ships, so it
+    /// emits no checkpoints and writes no other artifact. Pairing it with the flags that do
+    /// either would silently pin those outputs to a different, newly selected checkpoint.
+    fn validate_grid_backfill_mode(&self) -> Result<(), String> {
+        if self.mainnet_frontier_grid_output.is_none() {
+            return Err(
+                "--mainnet-frontier-grid-checkpoint needs somewhere to write: add \
+                 --mainnet-frontier-grid-output"
+                    .to_string(),
+            );
+        }
+        if self.mainnet_frontier_output.is_some() || self.mainnet_subtree_output.is_some() {
+            return Err(
+                "--mainnet-frontier-grid-checkpoint backfills the grid alone: remove \
+                 --mainnet-frontier-output and --mainnet-subtree-output, which are only \
+                 produced for a newly selected checkpoint"
+                    .to_string(),
+            );
+        }
+        if self.full_list {
+            return Err(
+                "--mainnet-frontier-grid-checkpoint emits no checkpoints: remove --full-list"
+                    .to_string(),
+            );
+        }
+        if self.last_checkpoint.is_some() {
+            return Err(
+                "--mainnet-frontier-grid-checkpoint selects no checkpoints: remove \
+                 --last-checkpoint"
+                    .to_string(),
+            );
+        }
+        if self.addr.is_some() {
+            return Err("--state-cache-dir reads the database directly: remove --addr".to_string());
+        }
+        if !self.zcli_args.is_empty() {
+            return Err(
+                "--state-cache-dir reads the database directly: remove zcash-cli passthrough \
+                 arguments"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The artifact output flags and their paths, in the order errors report them.
+    fn artifact_outputs(&self) -> [(&'static str, &Option<PathBuf>); 3] {
+        [
+            ("--mainnet-frontier-output", &self.mainnet_frontier_output),
+            ("--mainnet-subtree-output", &self.mainnet_subtree_output),
+            (
+                "--mainnet-frontier-grid-output",
+                &self.mainnet_frontier_grid_output,
+            ),
+        ]
+    }
+
+    /// Rejects two artifact outputs that resolve to the same destination.
+    ///
+    /// The artifacts are written independently, so two flags naming one file — directly, or
+    /// through a symlinked or relative parent — would silently publish one artifact where the
+    /// bundle expects two.
+    fn reject_aliased_artifact_outputs(&self) -> Result<(), String> {
+        let mut resolved: Vec<(&'static str, PathBuf)> = Vec::new();
+        for (flag, path) in self.artifact_outputs() {
+            let Some(path) = path else { continue };
+            let destination = resolved_output_destination(path)?;
+            if let Some((earlier, _)) = resolved
+                .iter()
+                .find(|(_, existing)| existing == &destination)
+            {
+                return Err(format!("{earlier} and {flag} must use different paths"));
+            }
+            resolved.push((flag, destination));
         }
 
         Ok(())
@@ -286,9 +436,76 @@ mod tests {
             state_cache_dir: None,
             mainnet_frontier_output: None,
             mainnet_subtree_output: None,
+            mainnet_frontier_grid_output: None,
+            mainnet_frontier_grid_input: None,
+            mainnet_frontier_grid_checkpoint: None,
+            frontier_grid_target_cost_ms: None,
+            frontier_grid_spacing: None,
             full_list: false,
             zcli_args: Vec::new(),
         }
+    }
+
+    /// A baseline offline-mode `Args` value with the complete artifact output set.
+    fn offline_args() -> Args {
+        Args {
+            state_cache_dir: Some(PathBuf::from("state")),
+            mainnet_frontier_output: Some(PathBuf::from("frontier.bin")),
+            mainnet_subtree_output: Some(PathBuf::from("subtrees.bin")),
+            mainnet_frontier_grid_output: Some(PathBuf::from("grid.bin")),
+            full_list: true,
+            ..rpc_args()
+        }
+    }
+
+    /// A baseline grid-backfill `Args` value.
+    fn backfill_args() -> Args {
+        Args {
+            state_cache_dir: Some(PathBuf::from("state")),
+            mainnet_frontier_grid_output: Some(PathBuf::from("grid.bin")),
+            mainnet_frontier_grid_checkpoint: Some(Height(3_449_371)),
+            ..rpc_args()
+        }
+    }
+
+    #[test]
+    fn grid_backfill_flag_combinations() {
+        assert_eq!(backfill_args().validate_mode(), Ok(()));
+
+        let mut without_output = backfill_args();
+        without_output.mainnet_frontier_grid_output = None;
+        assert!(
+            without_output.validate_mode().is_err(),
+            "a backfill needs somewhere to write"
+        );
+
+        let mut with_frontier = backfill_args();
+        with_frontier.mainnet_frontier_output = Some(PathBuf::from("frontier.bin"));
+        assert!(
+            with_frontier.validate_mode().is_err(),
+            "the other artifacts belong to a newly selected checkpoint"
+        );
+
+        let mut with_full_list = backfill_args();
+        with_full_list.full_list = true;
+        assert!(
+            with_full_list.validate_mode().is_err(),
+            "a backfill emits no checkpoint list"
+        );
+
+        let mut with_last_checkpoint = backfill_args();
+        with_last_checkpoint.last_checkpoint = Some(Height(100));
+        assert!(
+            with_last_checkpoint.validate_mode().is_err(),
+            "a backfill selects no checkpoints"
+        );
+
+        let mut without_state = backfill_args();
+        without_state.state_cache_dir = None;
+        assert!(
+            without_state.validate_mode().is_err(),
+            "a backfill reads a state database"
+        );
     }
 
     #[test]
@@ -325,6 +542,10 @@ mod tests {
         subtrees_without_state.mainnet_subtree_output = Some(PathBuf::from("subtrees.bin"));
         assert!(subtrees_without_state.validate_mode().is_err());
 
+        let mut grid_without_state = rpc_args();
+        grid_without_state.mainnet_frontier_grid_output = Some(PathBuf::from("grid.bin"));
+        assert!(grid_without_state.validate_mode().is_err());
+
         let mut full_list_without_state = rpc_args();
         full_list_without_state.full_list = true;
         assert!(full_list_without_state.validate_mode().is_err());
@@ -332,11 +553,7 @@ mod tests {
 
     #[test]
     fn offline_mode_flag_combinations() {
-        let mut offline = rpc_args();
-        offline.state_cache_dir = Some(PathBuf::from("state"));
-        offline.mainnet_frontier_output = Some(PathBuf::from("frontier.bin"));
-        offline.mainnet_subtree_output = Some(PathBuf::from("subtrees.bin"));
-        offline.full_list = true;
+        let offline = offline_args();
         assert_eq!(offline.validate_mode(), Ok(()));
 
         let mut offline_with_addr = offline.clone();
@@ -355,14 +572,43 @@ mod tests {
         full_list_without_frontier.mainnet_frontier_output = None;
         assert!(
             full_list_without_frontier.validate_mode().is_err(),
-            "a replacement checkpoint list must ship with both coupled artifacts"
+            "a replacement checkpoint list must ship with every coupled artifact"
         );
 
         let mut full_list_without_subtrees = offline.clone();
         full_list_without_subtrees.mainnet_subtree_output = None;
         assert!(
             full_list_without_subtrees.validate_mode().is_err(),
-            "a replacement checkpoint list must ship with both coupled artifacts"
+            "a replacement checkpoint list must ship with every coupled artifact"
+        );
+
+        let mut full_list_without_grid = offline.clone();
+        full_list_without_grid.mainnet_frontier_grid_output = None;
+        assert!(
+            full_list_without_grid.validate_mode().is_err(),
+            "a replacement checkpoint list must ship with its frontier grid too"
+        );
+
+        let mut resume_without_grid_output = offline.clone();
+        resume_without_grid_output.mainnet_frontier_grid_output = None;
+        resume_without_grid_output.mainnet_frontier_output = None;
+        resume_without_grid_output.mainnet_subtree_output = None;
+        resume_without_grid_output.full_list = false;
+        resume_without_grid_output.mainnet_frontier_grid_input = Some(PathBuf::from("old.bin"));
+        assert!(
+            resume_without_grid_output.validate_mode().is_err(),
+            "resuming a grid needs somewhere to write the result"
+        );
+
+        let mut grid_tuning_without_grid_output = offline.clone();
+        grid_tuning_without_grid_output.mainnet_frontier_grid_output = None;
+        grid_tuning_without_grid_output.mainnet_frontier_output = None;
+        grid_tuning_without_grid_output.mainnet_subtree_output = None;
+        grid_tuning_without_grid_output.full_list = false;
+        grid_tuning_without_grid_output.frontier_grid_target_cost_ms = Some(1_500);
+        assert!(
+            grid_tuning_without_grid_output.validate_mode().is_err(),
+            "grid tuning flags without the grid output are a silent no-op"
         );
 
         let mut matching_artifact_paths = offline.clone();
@@ -384,9 +630,7 @@ mod tests {
 
     #[test]
     fn rejects_artifact_output_path_aliases() {
-        let mut offline = rpc_args();
-        offline.state_cache_dir = Some(PathBuf::from("state"));
-        offline.mainnet_frontier_output = Some(PathBuf::from("frontier.bin"));
+        let mut offline = offline_args();
         offline.mainnet_subtree_output = Some(
             env::current_dir()
                 .expect("current directory is available")
@@ -403,6 +647,17 @@ mod tests {
                 .join("frontier.bin"),
         );
         assert!(offline.validate_mode().is_err());
+
+        let mut aliased_grid = offline_args();
+        aliased_grid.mainnet_frontier_grid_output = aliased_grid.mainnet_subtree_output.clone();
+        assert_eq!(
+            aliased_grid.validate_mode(),
+            Err(
+                "--mainnet-subtree-output and --mainnet-frontier-grid-output must use different \
+                 paths"
+                    .to_string()
+            )
+        );
     }
 
     #[cfg(unix)]
@@ -416,8 +671,7 @@ mod tests {
         let alias_directory = temp.path().join("alias");
         symlink(&real_directory, &alias_directory).expect("directory symlink is created");
 
-        let mut offline = rpc_args();
-        offline.state_cache_dir = Some(PathBuf::from("state"));
+        let mut offline = offline_args();
         offline.mainnet_frontier_output = Some(real_directory.join("artifact.bin"));
         offline.mainnet_subtree_output = Some(alias_directory.join("artifact.bin"));
 

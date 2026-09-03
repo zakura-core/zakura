@@ -87,6 +87,15 @@ pub(crate) mod header_sync_trace {
     pub(crate) const REPAIR_GENERATION: &str = "repair_generation";
     pub(crate) const PHASE: &str = "phase";
     pub(crate) const SUPPLIER_COUNT: &str = "supplier_count";
+    pub(crate) const PREDECESSOR_HEIGHT: &str = "predecessor_height";
+    pub(crate) const PEERS_CONSIDERED: &str = "peers_considered";
+    pub(crate) const REJECTED_HEIGHT: &str = "rejected_height";
+    pub(crate) const REJECTED_CAPACITY: &str = "rejected_capacity";
+    pub(crate) const REJECTED_SCHEMA: &str = "rejected_schema";
+    pub(crate) const REJECTED_BUSY: &str = "rejected_busy";
+    pub(crate) const REJECTED_TRIED: &str = "rejected_tried";
+    pub(crate) const BEST_PEER_HEIGHT: &str = "best_peer_height";
+    pub(crate) const BEST_PEER_HASH: &str = "best_peer_hash";
 
     pub(crate) const HEADER_PEER_CONNECTED: &str = "header_peer_connected";
     pub(crate) const HEADER_PEER_DISCONNECTED: &str = "header_peer_disconnected";

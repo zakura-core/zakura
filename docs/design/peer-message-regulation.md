@@ -41,39 +41,72 @@ Message regulation controls traffic from connected peers; it does not choose
 those peers. A peer can follow the protocol without contributing useful work,
 which is handled separately by peer-selection policy.
 
-## Exchange ownership
+## How regulation applies in each direction
 
-Regulation follows protocol exchanges rather than treating every wire variant
-as an independent traffic source:
+Every node protects itself from messages it receives. A message has one of
+three roles:
 
-| Role | Regulation owner |
-| --- | --- |
-| Standalone announcement | The announcement's cadence and state bounds |
-| Request | The request and all response work it causes |
-| Response | The reservation created when Zakura sent the request |
+- An **announcement** is an update the peer sends without being asked, such as
+  `Status`. Zakura limits its size, cadence, and state effects.
+- A **request** asks Zakura to perform work and reply, such as `GetBlocks`.
+  Zakura limits the request and all work and response bytes it can cause.
+- A **response** answers a request Zakura previously sent, such as `Block`.
+  Zakura accepts it only when it is valid and matches the request.
 
-A request declaration names its possible response messages and reserves their
-worst-case cost. Each response frame spends bytes from that reservation. This
-prevents counting `GetBlocks`, `Block`, and `BlocksDone` as three unrelated
-load regulators when they are one serving exchange.
+### When a peer requests data from Zakura
 
-For a one-response exchange, Zakura creates the reservation before sending the
-request and keeps it live even if local work moves elsewhere:
+When a peer sends `GetBlocks`, Zakura is the responder. The request reserves
+peer and node capacity for the state query and every response frame before the
+work starts. Those frames spend the request's reserved capacity rather than
+being charged as separate exchanges.
+
+```mermaid
+sequenceDiagram
+    participant P as Peer requester
+    participant Z as Zakura responder
+    P->>Z: Send GetBlocks
+    Z->>Z: Validate and reserve peer and node capacity
+    Z->>Z: Query state
+    loop For each response frame
+        Z->>Z: Move reserved bytes into a frame lease
+        Z->>P: Send Block or terminal response
+    end
+    Z->>Z: Settle request accounting
+```
+
+This is the serving direction implemented by GetBlocks regulation. It protects
+Zakura from request floods and from response work accumulating in memory.
+
+### When Zakura requests data from a peer
+
+When Zakura sends `GetBlocks`, Zakura is the requester. Before sending it,
+Zakura records the expected range and response bounds. Every incoming response
+must match and consume that reservation. Wire and message validity checks still
+apply, so the peer cannot use a valid reservation to send an oversized or
+invalid payload.
 
 ```mermaid
 sequenceDiagram
     participant Z as Zakura requester
     participant P as Peer responder
-    Z->>Z: Create response reservation
-    Z->>P: Send request
-    Note over Z: Work may be reassigned<br/>Reservation remains live
-    P->>Z: Send response
-    Z->>Z: Match and consume reservation
-    Z->>Z: Validate and handle response
+    Z->>Z: Reserve expected range and response bounds
+    Z->>P: Send GetBlocks
+    Note over Z: Local work may move<br/>Reservation remains live
+    alt Blocks are available
+        loop For each expected block
+            P->>Z: Send Block
+            Z->>Z: Validate and consume expected range
+        end
+        P->>Z: Send BlocksDone
+    else Range is unavailable
+        P->>Z: Send RangeUnavailable
+    end
+    Z->>Z: Validate terminal response and close reservation
 ```
 
-Response messages still have independent wire and receiving-side contracts.
-Exchange ownership changes resource accounting, not the wire inventory.
+Charging serving work to the request does not remove the response contracts.
+`Block`, `BlocksDone`, and `RangeUnavailable` still need their own wire and
+receiving-side rules when Zakura receives them.
 
 ## Admission path
 

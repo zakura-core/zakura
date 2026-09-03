@@ -19,6 +19,9 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// Bounds semantically verified blocks retained while their parents are unavailable.
+pub(crate) const MAX_QUEUED_BLOCKS: usize = crate::MAX_BLOCK_REORG_HEIGHT as usize;
+
 /// A queued checkpoint verified block, and its corresponding [`Result`] channel.
 pub type QueuedCheckpointVerified = (
     CheckpointVerifiedBlock,
@@ -46,6 +49,11 @@ pub struct QueuedBlocks {
 }
 
 impl QueuedBlocks {
+    /// Returns true when the orphan queue cannot retain another distinct block.
+    pub fn is_full(&self) -> bool {
+        self.blocks.len() >= MAX_QUEUED_BLOCKS
+    }
+
     /// Queue a block for eventual verification and commit.
     ///
     /// # Panics
@@ -133,6 +141,39 @@ impl QueuedBlocks {
         queued_children
     }
 
+    /// Dequeue every queued descendant of a parent whose local write failed.
+    pub fn dequeue_descendants(
+        &mut self,
+        failed_parent: block::Hash,
+    ) -> Vec<QueuedSemanticallyVerified> {
+        let mut parents = vec![failed_parent];
+        let mut descendants = Vec::new();
+        while let Some(parent) = parents.pop() {
+            let children = self.dequeue_children(parent);
+            parents.extend(children.iter().map(|(block, _, _)| block.hash));
+            descendants.extend(children);
+        }
+        descendants
+    }
+
+    /// Complete every queued descendant after its parent fails locally.
+    pub fn fail_descendants(
+        &mut self,
+        failed_parent: block::Hash,
+        error: CommitSemanticallyVerifiedError,
+    ) -> Vec<block::Hash> {
+        let descendants = self.dequeue_descendants(failed_parent);
+        let mut failed_hashes = Vec::with_capacity(descendants.len());
+        for (block, response, admission) in descendants {
+            failed_hashes.push(block.hash);
+            if let Some(admission) = admission {
+                admission.reject();
+            }
+            let _ = response.send(Err(error.clone()));
+        }
+        failed_hashes
+    }
+
     /// Remove all queued blocks whose height is less than or equal to the given
     /// `finalized_tip_height`.
     #[instrument(skip(self))]
@@ -199,6 +240,36 @@ impl QueuedBlocks {
     /// Return the queued block if it has already been registered
     pub fn get_mut(&mut self, hash: &block::Hash) -> Option<&mut QueuedSemanticallyVerified> {
         self.blocks.get_mut(hash)
+    }
+
+    /// Replaces a same-hash queued request and its retained body.
+    pub fn replace(
+        &mut self,
+        hash: block::Hash,
+        new: QueuedSemanticallyVerified,
+    ) -> QueuedSemanticallyVerified {
+        let old = self
+            .blocks
+            .insert(hash, new)
+            .expect("replacement hash exists in the queue");
+        let replacement = self
+            .blocks
+            .get(&hash)
+            .expect("replacement was inserted under the same hash");
+        assert_eq!(old.0.height, replacement.0.height);
+        assert_eq!(
+            old.0.block.header.previous_block_hash,
+            replacement.0.block.header.previous_block_hash
+        );
+
+        for outpoint in old.0.new_outputs.keys() {
+            self.known_utxos.remove(outpoint);
+        }
+        for (outpoint, ordered_utxo) in &replacement.0.new_outputs {
+            self.known_utxos
+                .insert(*outpoint, ordered_utxo.utxo.clone());
+        }
+        old
     }
 
     /// Update metrics after the queue is modified

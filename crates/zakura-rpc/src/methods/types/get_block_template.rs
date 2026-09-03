@@ -10,7 +10,7 @@ mod tests;
 
 use std::{
     fmt::{self},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use derive_getters::Getters;
@@ -18,7 +18,7 @@ use derive_new::new;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::mpsc;
 use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
@@ -67,22 +67,49 @@ pub use parameters::{
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
 
-const MAX_BACKGROUND_TEMPLATE_PREPARATIONS: usize = 1;
-
 #[derive(Clone, Debug)]
-struct TemplatePreparationLimiter(Arc<Semaphore>);
+struct TemplatePreparationQueue<T>(Arc<Mutex<TemplatePreparationState<T>>>);
 
-impl Default for TemplatePreparationLimiter {
+#[derive(Debug)]
+struct TemplatePreparationState<T> {
+    running: bool,
+    pending: Option<T>,
+}
+
+impl<T> Default for TemplatePreparationQueue<T> {
     fn default() -> Self {
-        Self(Arc::new(Semaphore::new(
-            MAX_BACKGROUND_TEMPLATE_PREPARATIONS,
-        )))
+        Self(Arc::new(Mutex::new(TemplatePreparationState {
+            running: false,
+            pending: None,
+        })))
     }
 }
 
-impl TemplatePreparationLimiter {
-    fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
-        self.0.clone().try_acquire_owned().ok()
+impl<T> TemplatePreparationQueue<T> {
+    fn enqueue(&self, template: T) -> Option<T> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.running {
+            state.pending = Some(template);
+            None
+        } else {
+            state.running = true;
+            Some(template)
+        }
+    }
+
+    fn next_or_finish(&self) -> Option<T> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = state.pending.take();
+        if next.is_none() {
+            state.running = false;
+        }
+        next
     }
 }
 
@@ -594,7 +621,7 @@ where
 
     /// A channel to send successful block submissions to the block gossip task,
     /// so they can be advertised to peers.
-    mined_block_sender: mpsc::Sender<MinedBlockEvent>,
+    mined_block_sender: mpsc::UnboundedSender<MinedBlockEvent>,
 
     /// Blocks whose hashes were advertised before contextual commit completed.
     pending_blocks: PendingBlockRegistry,
@@ -602,8 +629,8 @@ where
     /// Whether state admission can trigger an early inventory.
     optimistic_block_inventory: bool,
 
-    /// Limits detached template preparation work.
-    template_preparation_limiter: TemplatePreparationLimiter,
+    /// Coalesces detached template preparation work to the newest template.
+    template_preparation_queue: TemplatePreparationQueue<BlockTemplateResponse>,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -618,7 +645,7 @@ where
         conf: config::mining::Config,
         block_verifier_router: BlockVerifierRouter,
         sync_status: SyncStatus,
-        mined_block_sender: Option<mpsc::Sender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
         pending_blocks: PendingBlockRegistry,
         prepared_candidates: PreparedCandidateResolver,
     ) -> Self {
@@ -632,7 +659,7 @@ where
                 .unwrap_or(SubmitBlockChannel::default().sender()),
             pending_blocks,
             optimistic_block_inventory,
-            template_preparation_limiter: TemplatePreparationLimiter::default(),
+            template_preparation_queue: TemplatePreparationQueue::default(),
         }
     }
 
@@ -657,7 +684,7 @@ where
     }
 
     /// Returns a sender for the owned mined-block lifecycle task.
-    pub fn mined_block_sender(&self) -> mpsc::Sender<MinedBlockEvent> {
+    pub fn mined_block_sender(&self) -> mpsc::UnboundedSender<MinedBlockEvent> {
         self.mined_block_sender.clone()
     }
 
@@ -671,9 +698,17 @@ where
         self.optimistic_block_inventory
     }
 
-    /// Reserves the background template preparation slot.
-    pub(crate) fn try_acquire_template_preparation(&self) -> Option<OwnedSemaphorePermit> {
-        self.template_preparation_limiter.try_acquire()
+    /// Queues a server template and returns the first item for a new worker.
+    pub(crate) fn queue_template_preparation(
+        &self,
+        template: BlockTemplateResponse,
+    ) -> Option<BlockTemplateResponse> {
+        self.template_preparation_queue.enqueue(template)
+    }
+
+    /// Returns the newest queued template or marks the worker idle.
+    pub(crate) fn next_template_preparation(&self) -> Option<BlockTemplateResponse> {
+        self.template_preparation_queue.next_or_finish()
     }
 
     /// Randomizes the coinbase data, if miner parameters are set.

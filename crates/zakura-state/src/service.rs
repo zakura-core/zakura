@@ -15,7 +15,7 @@
 //!   chain tip changes.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     ops::Bound,
     path::PathBuf,
@@ -26,6 +26,7 @@ use std::{
 };
 
 use futures::future::FutureExt;
+use indexmap::IndexMap;
 use tokio::sync::oneshot;
 use tower::{util::BoxService, Service, ServiceExt};
 use tracing::{instrument, Instrument, Span};
@@ -44,7 +45,7 @@ use zakura_chain::{
 
 use crate::{
     constants::{
-        MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS,
+        MAX_BLOCK_REORG_HEIGHT, MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS,
         MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MAX_LEGACY_CHAIN_BLOCKS,
     },
     error::{CommitBlockError, CommitCheckpointVerifiedError, InvalidateError, ReconsiderError},
@@ -66,7 +67,7 @@ use crate::{
     BlockAdmission, BlockCommitmentData, BoxError, CheckpointVerifiedBlock,
     CommitSemanticallyVerifiedError, Config, HashOrHeight, HistoricalTreeUnavailable, KnownBlock,
     PreparedMinedRelayEligibility, ReadRequest, ReadResponse, Request, Response,
-    SemanticallyVerifiedBlock, StateInitError,
+    SemanticallyVerifiedBlock, StateInitError, ValidateContextError,
 };
 
 pub mod block_iter;
@@ -179,6 +180,13 @@ pub(crate) struct StateService {
     /// Hashes of blocks below the finalized tip height are periodically pruned.
     non_finalized_block_write_sent_hashes: SentHashes,
 
+    /// Parents targeted by operator invalidation cannot authorize optimistic relay.
+    optimistic_relay_blocked_parents: HashSet<block::Hash>,
+
+    /// Recent local write failures used to complete descendants that arrive after the failure.
+    non_finalized_failed_ancestors:
+        IndexMap<block::Hash, (block::Hash, write::NonFinalizedWriteFailureKind)>,
+
     /// If an invalid block is sent on `finalized_block_write_sender`
     /// or `non_finalized_block_write_sender`,
     /// this channel gets the [`block::Hash`] of the valid tip.
@@ -193,7 +201,8 @@ pub(crate) struct StateService {
     /// Without this, a rejected same-hash block locks out a later honest
     /// re-delivery of a block at the same hash as a "duplicate" until restart
     /// or reorg.
-    non_finalized_rejected_receiver: tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
+    non_finalized_rejected_receiver:
+        tokio::sync::mpsc::UnboundedReceiver<write::NonFinalizedWriteFailure>,
 
     // Pending UTXO Request Tracking
     //
@@ -380,6 +389,8 @@ impl Drop for ReadStateService {
 
 impl StateService {
     const PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+    // The 1,000-block reorg bound fits every supported usize target.
+    const FAILED_ANCESTOR_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
 
     /// Creates a new state service for the state `config` and `network`.
     ///
@@ -562,6 +573,8 @@ impl StateService {
             block_write_sender,
             finalized_block_write_last_sent_hash,
             non_finalized_block_write_sent_hashes,
+            optimistic_relay_blocked_parents: HashSet::new(),
+            non_finalized_failed_ancestors: IndexMap::new(),
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
             pending_utxos,
@@ -760,8 +773,7 @@ impl StateService {
         }
     }
 
-    /// Drains every hash queued on `non_finalized_rejected_receiver` and
-    /// removes it from `non_finalized_block_write_sent_hashes`.
+    /// Drain failed writes, clear their sent hashes, and complete queued descendants.
     ///
     /// This closes the lockout window where a rejected block keeps its hash
     /// recorded as "sent", so a subsequent honest re-delivery of a block at
@@ -777,9 +789,7 @@ impl StateService {
 
         loop {
             match self.non_finalized_rejected_receiver.try_recv() {
-                Ok(hash) => {
-                    self.non_finalized_block_write_sent_hashes.remove(&hash);
-                }
+                Ok(failure) => self.handle_non_finalized_write_failure(failure),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     info!(
@@ -789,6 +799,57 @@ impl StateService {
                     break;
                 }
             }
+        }
+    }
+
+    fn poll_non_finalized_write_failures(&mut self, cx: &mut Context<'_>) {
+        while let Poll::Ready(Some(failure)) =
+            Pin::new(&mut self.non_finalized_rejected_receiver).poll_recv(cx)
+        {
+            self.handle_non_finalized_write_failure(failure);
+        }
+    }
+
+    fn handle_non_finalized_write_failure(&mut self, failure: write::NonFinalizedWriteFailure) {
+        self.non_finalized_block_write_sent_hashes
+            .remove(&failure.hash);
+        let error = Self::failed_ancestor_error(failure.hash, failure.kind);
+        let descendants = self
+            .non_finalized_state_queued_blocks
+            .fail_descendants(failure.hash, error.into());
+        for descendant in descendants {
+            self.remember_failed_ancestor(descendant, failure.hash, failure.kind);
+        }
+        self.remember_failed_ancestor(failure.hash, failure.hash, failure.kind);
+    }
+
+    fn failed_ancestor_error(
+        ancestor: block::Hash,
+        kind: write::NonFinalizedWriteFailureKind,
+    ) -> CommitBlockError {
+        match kind {
+            write::NonFinalizedWriteFailureKind::Invalid => CommitBlockError::ValidateContextError(
+                Box::new(ValidateContextError::InvalidAncestorBlock(ancestor)),
+            ),
+            write::NonFinalizedWriteFailureKind::Retryable => CommitBlockError::HeaderChainError {
+                error: format!(
+                    "ancestor {ancestor} did not commit because of a local state write failure"
+                ),
+            },
+        }
+    }
+
+    fn remember_failed_ancestor(
+        &mut self,
+        hash: block::Hash,
+        ancestor: block::Hash,
+        kind: write::NonFinalizedWriteFailureKind,
+    ) {
+        self.non_finalized_failed_ancestors.shift_remove(&hash);
+        self.non_finalized_failed_ancestors
+            .insert(hash, (ancestor, kind));
+        while self.non_finalized_failed_ancestors.len() > Self::FAILED_ANCESTOR_LIMIT {
+            self.non_finalized_failed_ancestors.shift_remove_index(0);
         }
     }
 
@@ -919,16 +980,34 @@ impl StateService {
     fn queue_and_commit_to_non_finalized_state(
         &mut self,
         semantically_verified: SemanticallyVerifiedBlock,
-        mut admission: Option<BlockAdmission>,
+        admission: Option<BlockAdmission>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
         let parent_hash = semantically_verified.block.header.previous_block_hash;
+        let hash = semantically_verified.hash;
 
         // Drop hashes of any blocks the write task has rejected before checking
         // the SentHashes membership below. Without this, a rejected same-hash
         // block would lock out a later honest re-delivery of a block at the
         // same hash as a false "duplicate".
         self.drain_non_finalized_rejected_hashes();
+
+        if let Some((ancestor, kind)) = self
+            .non_finalized_failed_ancestors
+            .get(&parent_hash)
+            .copied()
+        {
+            if self.can_fork_chain_at(&parent_hash) {
+                self.non_finalized_failed_ancestors
+                    .shift_remove(&parent_hash);
+            } else {
+                let child_hash = semantically_verified.hash;
+                self.remember_failed_ancestor(child_hash, ancestor, kind);
+                let (rsp_tx, rsp_rx) = oneshot::channel();
+                let _ = rsp_tx.send(Err(Self::failed_ancestor_error(ancestor, kind).into()));
+                return rsp_rx;
+            }
+        }
 
         if self
             .non_finalized_block_write_sent_hashes
@@ -966,22 +1045,32 @@ impl StateService {
         // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
         // has been queued but not yet committed to the state fails the older request and replaces
         // it with the newer request.
-        let rsp_rx = if let Some((_, old_rsp_tx, old_admission)) = self
+        let rsp_rx = if self
             .non_finalized_state_queued_blocks
             .get_mut(&semantically_verified.hash)
+            .is_some()
         {
             tracing::debug!("replacing older queued request with new request");
-            let (mut rsp_tx, rsp_rx) = oneshot::channel();
-            std::mem::swap(old_rsp_tx, &mut rsp_tx);
-            std::mem::swap(old_admission, &mut admission);
-            if let Some(admission) = admission {
-                admission.reject();
+            let (rsp_tx, rsp_rx) = oneshot::channel();
+            let (_, old_rsp_tx, old_admission) = self.non_finalized_state_queued_blocks.replace(
+                semantically_verified.hash,
+                (semantically_verified, rsp_tx, admission),
+            );
+            if let Some(old_admission) = old_admission {
+                old_admission.reject();
             }
-            let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
-                Some(semantically_verified.hash.into()),
+            let _ = old_rsp_tx.send(Err(CommitBlockError::new_duplicate(
+                Some(hash.into()),
                 KnownBlock::Queue,
             )
             .into()));
+            rsp_rx
+        } else if self.non_finalized_state_queued_blocks.is_full() {
+            if let Some(admission) = admission {
+                admission.reject();
+            }
+            let (rsp_tx, rsp_rx) = oneshot::channel();
+            let _ = rsp_tx.send(Err(CommitBlockError::QueueFull.into()));
             rsp_rx
         } else {
             let (rsp_tx, rsp_rx) = oneshot::channel();
@@ -1058,6 +1147,26 @@ impl StateService {
                     self.non_finalized_block_write_sent_hashes
                         .add(&queued_child.0);
                     let admission = queued_child.2.clone();
+                    let candidate_parent = queued_child.0.block.header.previous_block_hash;
+                    let optimistic_relay_still_authorized = admission
+                        .as_ref()
+                        .is_some_and(BlockAdmission::optimistic_relay_authorized)
+                        && self
+                            .best_tip()
+                            .is_some_and(|(_, tip_hash)| tip_hash == candidate_parent)
+                        && (self
+                            .non_finalized_block_write_sent_hashes
+                            .contains(&candidate_parent)
+                            || self.read_service.db.finalized_tip_hash() == candidate_parent)
+                        && !self
+                            .optimistic_relay_blocked_parents
+                            .contains(&candidate_parent);
+                    if optimistic_relay_still_authorized {
+                        // Only the first server candidate can reserve early relay for this parent.
+                        // Siblings receive the normal committed relay after contextual validation.
+                        self.optimistic_relay_blocked_parents
+                            .insert(candidate_parent);
+                    }
                     let send_result = non_finalized_block_write_sender.send(queued_child.into());
 
                     if let Err(SendError(NonFinalizedWriteMessage::Commit(queued))) = send_result {
@@ -1073,7 +1182,7 @@ impl StateService {
                     };
 
                     if let Some(admission) = admission {
-                        admission.admit();
+                        admission.admit(optimistic_relay_still_authorized);
                     }
 
                     new_parents.push(hash);
@@ -1090,7 +1199,7 @@ impl StateService {
     }
 
     fn send_invalidate_block(
-        &self,
+        &mut self,
         hash: block::Hash,
     ) -> oneshot::Receiver<Result<block::Hash, InvalidateError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
@@ -1099,6 +1208,10 @@ impl StateService {
             let _ = rsp_tx.send(Err(InvalidateError::ProcessingCheckpointedBlocks));
             return rsp_rx;
         };
+
+        // Block optimistic relay before the writer processes the invalidation. The write channel
+        // preserves request order, so a later candidate cannot advertise using this stale parent.
+        self.optimistic_relay_blocked_parents.insert(hash);
 
         if let Err(tokio::sync::mpsc::error::SendError(error)) =
             sender.send(NonFinalizedWriteMessage::Invalidate { hash, rsp_tx })
@@ -1413,6 +1526,8 @@ impl Service<Request> for StateService {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // Check for panics in the block write task
         let poll = self.read_service.poll_ready(cx);
+
+        self.poll_non_finalized_write_failures(cx);
 
         // Hand off from finalized to non-finalized writes as soon as the final checkpoint block is
         // durably written, without waiting for a semantically verified block to arrive.
@@ -2445,7 +2560,7 @@ impl Service<ReadRequest> for ReadStateService {
 
         let request_handler = move || match req {
             // Used by the `getblockchaininfo` RPC.
-            ReadRequest::UsageInfo => Ok(ReadResponse::UsageInfo(state.db.size())),
+            ReadRequest::UsageInfo => Ok(ReadResponse::UsageInfo(state.db.cached_size())),
 
             // Used by the `getblockchaininfo` RPC.
             ReadRequest::PruningInfo => Ok(ReadResponse::PruningInfo {
@@ -3159,6 +3274,38 @@ impl Service<ReadRequest> for ReadStateService {
                                 .map(|b| b.zcash_serialized_size())
                         }),
                 ))
+            }
+
+            // Used by the getchaintips RPC.
+            ReadRequest::ChainTips => {
+                // Capture the header tip and its overlap with the block chain from
+                // one transition generation, so the two agree. The overlap stops at
+                // the block tip: the fork is never above it, and headers-first sync
+                // leaves tens of thousands of headers above it that would be copied
+                // and searched for nothing.
+                let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
+                let (non_finalized_state, header_tip, overlap) = match header_chain_reader {
+                    Some(reader) => {
+                        let (non_finalized_state, header_tip, overlap) = reader
+                            .with_selected_overlap(
+                                || state.latest_non_finalized_state(),
+                                |non_finalized_state| {
+                                    read::tip_height(non_finalized_state.best_chain(), &state.db)
+                                },
+                            )?;
+                        (non_finalized_state, Some(header_tip), overlap)
+                    }
+                    None => (state.latest_non_finalized_state(), None, Vec::new()),
+                };
+
+                Ok(ReadResponse::ChainTips(read::chain_tips(
+                    &non_finalized_state,
+                    &state.db,
+                    header_tip.map(|tip| read::SelectedHeaders {
+                        tip,
+                        overlap: &overlap,
+                    }),
+                )))
             }
 
             ReadRequest::NonFinalizedBlocksListener { .. } => {

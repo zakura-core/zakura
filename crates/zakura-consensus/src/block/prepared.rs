@@ -108,6 +108,11 @@ struct WorkIdAlias {
     expires_at: Instant,
 }
 
+pub(super) struct CachedPreparedCandidate {
+    pub source: PreparedCandidateSource,
+    pub prepared: Arc<SemanticallyVerifiedBlock>,
+}
+
 impl PreparedCandidateResolver {
     /// Reconstructs a mined block from a cached candidate and a solved header.
     pub fn resolve(
@@ -164,7 +169,7 @@ impl PreparedCandidateCache {
         block: &Block,
         work_id: Option<&str>,
         network: &Network,
-    ) -> Option<SemanticallyVerifiedBlock> {
+    ) -> Option<CachedPreparedCandidate> {
         let mut inner = self
             .0
             .lock()
@@ -177,21 +182,26 @@ impl PreparedCandidateCache {
         }
 
         if let Some(work_id) = work_id {
-            if let Some(entry) = inner.find_work_id(work_id) {
+            if let Some((source, entry)) = inner.find_work_id_with_source(work_id) {
                 if candidates_match(&entry.prepared.block, block) {
                     metrics::counter!("mining.prepared_cache.hits").increment(1);
-                    return Some(entry.prepared.clone());
+                    return Some(CachedPreparedCandidate {
+                        source,
+                        prepared: Arc::new(entry.prepared.clone()),
+                    });
                 }
 
                 metrics::counter!("mining.prepared_cache.mismatches").increment(1);
-                return None;
             }
         }
 
         let fingerprint = candidate_fingerprint(block, network);
-        if let Some(entry) = inner.find_candidate(fingerprint, block) {
+        if let Some((source, entry)) = inner.find_candidate(fingerprint, block) {
             metrics::counter!("mining.prepared_cache.hits").increment(1);
-            return Some(entry.prepared.clone());
+            return Some(CachedPreparedCandidate {
+                source,
+                prepared: Arc::new(entry.prepared.clone()),
+            });
         }
 
         metrics::counter!("mining.prepared_cache.misses").increment(1);
@@ -225,18 +235,23 @@ impl PreparedCandidateCache {
         if let Some(work_id) = work_id {
             if let Some((existing_source, entry)) = inner.find_work_id_with_source(work_id) {
                 if candidates_match(&entry.prepared.block, block) {
-                    return;
-                }
-
-                metrics::counter!(
-                    "mining.prepared_cache.work_id_conflicts",
-                    "source" => source.metric_label()
-                )
-                .increment(1);
-                let server_reclaims_proposal = source == PreparedCandidateSource::ServerTemplate
-                    && existing_source == PreparedCandidateSource::ClientProposal;
-                if !server_reclaims_proposal {
-                    return;
+                    if source != PreparedCandidateSource::ServerTemplate
+                        || existing_source == PreparedCandidateSource::ServerTemplate
+                    {
+                        return;
+                    }
+                } else {
+                    metrics::counter!(
+                        "mining.prepared_cache.work_id_conflicts",
+                        "source" => source.metric_label()
+                    )
+                    .increment(1);
+                    let server_reclaims_proposal = source
+                        == PreparedCandidateSource::ServerTemplate
+                        && existing_source == PreparedCandidateSource::ClientProposal;
+                    if !server_reclaims_proposal {
+                        return;
+                    }
                 }
 
                 inner.partition(existing_source).remove_work_id(work_id);
@@ -299,10 +314,19 @@ impl CacheInner {
             })
     }
 
-    fn find_candidate(&self, fingerprint: [u8; 32], block: &Block) -> Option<&Entry> {
+    fn find_candidate(
+        &self,
+        fingerprint: [u8; 32],
+        block: &Block,
+    ) -> Option<(PreparedCandidateSource, &Entry)> {
         self.server
             .find_candidate(fingerprint, block)
-            .or_else(|| self.proposals.find_candidate(fingerprint, block))
+            .map(|entry| (PreparedCandidateSource::ServerTemplate, entry))
+            .or_else(|| {
+                self.proposals
+                    .find_candidate(fingerprint, block)
+                    .map(|entry| (PreparedCandidateSource::ClientProposal, entry))
+            })
     }
 }
 
@@ -1002,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_work_id_and_candidate_leave_the_existing_mapping_unchanged() {
+    fn server_template_promotes_an_identical_proposal_work_id() {
         let block = test_block();
         let cache = PreparedCandidateCache::default();
         insert(
@@ -1011,13 +1035,6 @@ mod tests {
             "shared",
             PreparedCandidateSource::ClientProposal,
         );
-        let expiration = cache
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .proposals
-            .work_ids["shared"]
-            .expires_at;
         insert(
             &cache,
             &block,
@@ -1029,8 +1046,8 @@ mod tests {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(inner.server.entries.is_empty());
-        assert_eq!(inner.proposals.work_ids["shared"].expires_at, expiration);
+        assert!(inner.server.work_ids.contains_key("shared"));
+        assert!(!inner.proposals.work_ids.contains_key("shared"));
     }
 
     #[test]

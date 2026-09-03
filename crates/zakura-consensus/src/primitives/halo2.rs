@@ -81,6 +81,26 @@ pub type ItemVerifyingKey = VerifyingKey;
 // against the fixed key; that is incorrect both for re-syncing pre-soft-fork Orchard blocks (whose
 // proofs only verify under the insecure key) and for NU6.3 Orchard Actions (whose cross-address
 // restriction the fixed key cannot enforce).
+/// Builds the verifying key for `version` and arms halo2's prepared
+/// fixed-base zero-check on its parameters.
+///
+/// The prepared state is cached inside the key's params for the lifetime of
+/// the process (shared with clones, never serialized), so every verification
+/// under the key evaluates through it. When halo2 is built without its
+/// opt-in `orbits` feature — currently the case — or its backend declines,
+/// arming is a no-op and verification keeps the plain multiexp, so calling
+/// it unconditionally is never a pessimization.
+fn build_verifying_key(version: OrchardCircuitVersion) -> ItemVerifyingKey {
+    let vk = ItemVerifyingKey::build(version);
+    let prepared = vk.prepare_batch_validation();
+    tracing::info!(
+        ?version,
+        prepared,
+        "built Orchard Action verifying key and armed its prepared zero-check",
+    );
+    vk
+}
+
 lazy_static::lazy_static! {
     /// The Orchard Action verifying key for the **pre-NU6.2** (insecure) circuit.
     ///
@@ -89,7 +109,7 @@ lazy_static::lazy_static! {
     /// MUST be retained to re-verify pre-NU6.2 history on resync. It must never be used to verify
     /// post-NU6.2 bundles.
     pub static ref VERIFYING_KEY_PRE_NU6_2: ItemVerifyingKey =
-        ItemVerifyingKey::build(OrchardCircuitVersion::InsecurePreNu6_2);
+        build_verifying_key(OrchardCircuitVersion::InsecurePreNu6_2);
 
     /// The Orchard Action verifying key for the **NU6.2-until-NU6.3** (fixed) circuit.
     ///
@@ -98,7 +118,7 @@ lazy_static::lazy_static! {
     /// circuit and only verify under this key. At NU6.3 the Orchard pool moves to
     /// [`VERIFYING_KEY_NU6_3_ONWARD`]. See [`VERIFYING_KEY_PRE_NU6_2`] for the era split.
     pub static ref VERIFYING_KEY_NU6_2: ItemVerifyingKey =
-        ItemVerifyingKey::build(OrchardCircuitVersion::FixedPostNu6_2);
+        build_verifying_key(OrchardCircuitVersion::FixedPostNu6_2);
 
     /// The Orchard Action verifying key for the **NU6.3-onward** circuit.
     ///
@@ -108,7 +128,7 @@ lazy_static::lazy_static! {
     /// which leaves `disableCrossAddress` unconstrained and so cannot enforce the cross-address
     /// restriction.
     pub static ref VERIFYING_KEY_NU6_3_ONWARD: ItemVerifyingKey =
-        ItemVerifyingKey::build(OrchardCircuitVersion::PostNu6_3);
+        build_verifying_key(OrchardCircuitVersion::PostNu6_3);
 }
 
 /// A Halo2 verification item, used as the request type of the service.

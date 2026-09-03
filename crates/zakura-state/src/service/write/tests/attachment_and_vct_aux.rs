@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn only_new_vct_failure_evidence_starts_a_repair_episode() {
+    assert_eq!(
+        vct_failure_repair_trigger(&ApplyResult::Committed),
+        Some(VctRepairTrigger::RejectedDelivery)
+    );
+    assert_eq!(
+        vct_failure_repair_trigger(&ApplyResult::NoChange(
+            zakura_header_chain::NoChangeReceipt {
+                state_version: StateVersion::new(1),
+                idempotency_key: None,
+            }
+        )),
+        Some(VctRepairTrigger::MissingRootObserved),
+        "replayed evidence must not retire an in-flight replacement"
+    );
+}
+
+#[test]
 fn attachment_failure_exits_with_a_typed_error_before_publication() {
     let _init_guard = zakura_test::init();
     let network = Network::new_regtest(Default::default());
@@ -156,20 +174,21 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
         successor: None,
     };
     assert_eq!(
-        missing_vct_successor_retry(&window, block::Height(1)),
+        missing_vct_successor_retry(window.successor_height, block::Height(1)),
         (block::Height(2), VctWriteRetryCause::MissingSuccessor),
         "an absent successor header waits for header admission"
     );
     window.successor_height = Some(block::Height(2));
     assert_eq!(
-        missing_vct_successor_retry(&window, block::Height(1)),
+        missing_vct_successor_retry(window.successor_height, block::Height(1)),
         (
             block::Height(2),
             VctWriteRetryCause::MissingRoot {
-                replacement_required: true
+                trigger: VctRepairTrigger::MissingRootObserved
             }
         ),
-        "a retained successor without usable auxiliary data requests replacement"
+        "a retained successor without usable auxiliary data polls the open repair episode; \
+         a new episode would retire the header-sync repair task twice a second"
     );
     window.successor_height = None;
     let expected_roots = authenticated
@@ -189,6 +208,27 @@ fn vct_aux_selection_prefers_authenticated_complete_nonrejected_provenance() {
         window.delivery_roots(block::Height(1), block::Hash([2; 32])),
         None,
         "hash-mismatched provenance fails closed"
+    );
+    let mut rejected_at_handoff = window.clone();
+    rejected_at_handoff.delivery = unauthenticated;
+    assert_eq!(
+        unrecorded_vct_failure_repair(
+            &rejected_at_handoff,
+            VctAuxiliaryFailureAttribution::CurrentDelivery,
+        ),
+        Some((
+            block::Height(1),
+            VctRepairTrigger::UnrecordedRejectedDelivery(unauthenticated.delivery_id),
+        )),
+        "a handoff rejection without a successor boundary starts a replacement episode"
+    );
+    assert_eq!(
+        unrecorded_vct_failure_repair(
+            &rejected_at_handoff,
+            VctAuxiliaryFailureAttribution::NoDelivery,
+        ),
+        None,
+        "failure without an attributable delivery cannot request a replacement"
     );
     assert!(
         HeaderChainWriter::vct_authentication_request(

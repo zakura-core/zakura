@@ -7,7 +7,7 @@ use std::{future::Future, time::Duration};
 use futures::TryFutureExt;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
-use tower::{timeout::Timeout, Service, ServiceExt};
+use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 use zakura_chain::block;
@@ -22,14 +22,6 @@ use crate::{
 
 use BlockGossipError::*;
 
-/// How many completed mined block broadcasts can wait to mark the chain tip.
-/// In normal operations, we expect at most 1 pending mark.
-/// The main loop can be busy for several seconds in the committed-tip path.
-/// During that window, multiple mined-block broadcasts could finish and
-/// try to send marks. A capacity of 16 with 25-75s block times
-/// is chosen arbitrarily high to be safe.
-const MINED_BLOCK_MARK_CHANNEL_CAPACITY: usize = 16;
-
 #[derive(Debug)]
 enum GossipEvent<T> {
     MinedBlockBroadcastCompleted(block::Hash),
@@ -38,8 +30,8 @@ enum GossipEvent<T> {
 }
 
 async fn next_gossip_event<T>(
-    mined_block_receiver: Option<&mut mpsc::Receiver<MinedBlockEvent>>,
-    mined_block_mark_receiver: &mut mpsc::Receiver<block::Hash>,
+    mined_block_receiver: Option<&mut mpsc::UnboundedReceiver<MinedBlockEvent>>,
+    mined_block_mark_receiver: &mut mpsc::UnboundedReceiver<block::Hash>,
     committed_tip_fut: impl Future<Output = T>,
 ) -> GossipEvent<T> {
     if let Some(mined_block_receiver) = mined_block_receiver {
@@ -81,9 +73,6 @@ pub enum BlockGossipError {
 
     #[error("sync status sender was dropped")]
     SyncStatus(watch::error::RecvError),
-
-    #[error("permanent peer set failure")]
-    PeerSetReadiness(zn::BoxError),
 }
 
 /// Run continuously, gossiping newly verified [`block::Hash`]es to peers.
@@ -103,7 +92,7 @@ pub async fn gossip_best_tip_block_hashes<ZN>(
     sync_status: SyncStatus,
     mut chain_state: ChainTipChange,
     broadcast_network: ZN,
-    mut mined_block_receiver: Option<mpsc::Receiver<MinedBlockEvent>>,
+    mut mined_block_receiver: Option<mpsc::UnboundedReceiver<MinedBlockEvent>>,
 ) -> Result<(), BlockGossipError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
@@ -111,12 +100,7 @@ where
 {
     info!("initializing block gossip task");
 
-    // use the same timeout as tips requests,
-    // so broadcasts don't delay the syncer too long
-    let mut broadcast_network = Timeout::new(broadcast_network, TIPS_RESPONSE_TIMEOUT);
-
-    let (mined_block_mark_sender, mut mined_block_mark_receiver) =
-        mpsc::channel(MINED_BLOCK_MARK_CHANNEL_CAPACITY);
+    let (mined_block_mark_sender, mut mined_block_mark_receiver) = mpsc::unbounded_channel();
 
     loop {
         // Drain local completion notifications from spawned mined-block
@@ -178,7 +162,7 @@ where
         // Prefer mined-block completions and submissions when multiple
         // branches are ready. The committed-tip path is a fallback, so
         // selecting it first can duplicate a mined-block broadcast.
-        let (((hash, height), log_msg, updated_chain_state), is_block_submission, early_ack) =
+        let (((hash, height), log_msg, updated_chain_state), is_block_submission, early) =
             match next_gossip_event(
                 mined_block_receiver.as_mut(),
                 &mut mined_block_mark_receiver,
@@ -257,39 +241,28 @@ where
         };
 
         info!(?height, ?request, log_msg);
-        let broadcast_fut = broadcast_network
-            .ready()
-            .await
-            .map_err(PeerSetReadiness)?
-            .call(request);
+        let network = broadcast_network.clone();
+        let mark_tx = mined_block_mark_sender.clone();
+        tokio::spawn(async move {
+            let succeeded = tokio::time::timeout(TIPS_RESPONSE_TIMEOUT, network.oneshot(request))
+                .await
+                .is_ok_and(|result| result.is_ok());
 
-        // Await the broadcast future in a spawned task to avoid waiting on
-        // `AdvertiseBlockToAll` requests when there are unready peers.
-        // Broadcast requests don't return errors, and we'd just want to ignore them anyway.
-        if is_block_submission {
-            let mark_tx = mined_block_mark_sender.clone();
-            let submission_hash = hash;
-            tokio::spawn(async move {
-                let succeeded = broadcast_fut.await.is_ok();
+            if succeeded && is_block_submission {
+                let _ = mark_tx.send(hash);
+            }
+            if let Some((advertised, submitted_at, submission)) = early {
                 if succeeded {
-                    let _ = mark_tx.send(submission_hash).await;
+                    metrics::counter!("mining.optimistic_inventory.early_inventories").increment(1);
+                    metrics::histogram!(
+                        "mining.submit_to_inventory.duration_seconds",
+                        "method" => submission.rpc_method()
+                    )
+                    .record(submitted_at.elapsed().as_secs_f64());
                 }
-                if let Some((advertised, submitted_at, submission)) = early_ack {
-                    if succeeded {
-                        metrics::counter!("mining.optimistic_inventory.early_inventories")
-                            .increment(1);
-                        metrics::histogram!(
-                            "mining.submit_to_inventory.duration_seconds",
-                            "method" => submission.rpc_method()
-                        )
-                        .record(submitted_at.elapsed().as_secs_f64());
-                    }
-                    let _ = advertised.send(succeeded);
-                }
-            });
-        } else {
-            tokio::spawn(broadcast_fut);
-        }
+                let _ = advertised.send(succeeded);
+            }
+        });
     }
 }
 
@@ -312,8 +285,8 @@ mod tests {
         let submitted_hash = block::Hash([1; 32]);
 
         for _ in 0..READY_EVENT_ATTEMPTS {
-            let (mined_block_sender, mut mined_block_receiver) = mpsc::channel(1);
-            let (mark_sender, mut mark_receiver) = mpsc::channel(1);
+            let (mined_block_sender, mut mined_block_receiver) = mpsc::unbounded_channel();
+            let (mark_sender, mut mark_receiver) = mpsc::unbounded_channel();
 
             mined_block_sender
                 .send(MinedBlockEvent::Committed {
@@ -321,9 +294,8 @@ mod tests {
                     height: block::Height(1),
                     early_advertised: false,
                 })
-                .await
                 .unwrap();
-            mark_sender.send(submitted_hash).await.unwrap();
+            mark_sender.send(submitted_hash).unwrap();
 
             let event = next_gossip_event(
                 Some(&mut mined_block_receiver),

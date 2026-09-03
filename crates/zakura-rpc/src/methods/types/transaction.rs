@@ -28,10 +28,15 @@ use zakura_script::Sigops;
 use zakura_state::IntoDisk;
 use zcash_keys::address::Address;
 use zcash_primitives::transaction::{
-    builder::{BuildConfig, Builder},
+    builder::{cached_orchard_proving_key, BuildConfig, Builder},
+    components::orchard::bundle_version_for_branch,
     fees::fixed::FeeRule,
 };
-use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis};
+use zcash_protocol::{
+    consensus::{BlockHeight, BranchId},
+    memo::MemoBytes,
+    value::Zatoshis,
+};
 
 use super::zec::Zec;
 use super::{super::opthex, get_block_template::MinerParams};
@@ -151,6 +156,31 @@ impl TransactionTemplate<NegativeOrZero> {
             };
         }
 
+        // Arms halo2's prepared commitment tables on the process-wide proving key
+        // that `Builder::build` below proves a shielded reward output with. The
+        // prepared state is cached inside the key's params for the process
+        // lifetime and repeat arming is free, so the first shielded coinbase pays
+        // it once; without halo2's opt-in `orbits` feature it is a documented
+        // no-op. Called only when a shielded reward output was actually added, so
+        // transparent- and Sapling-only miners never force the expensive
+        // proving-key build.
+        let arm_shielded_reward_proving_key = || {
+            let branch = BranchId::for_height(net, BlockHeight::from(height));
+            // Both pools share the circuit at every branch that supports them, so
+            // the Orchard-pool mapping covers Ironwood rewards too (this mirrors
+            // the derivation in `Builder::build`).
+            if let Some(version) = bundle_version_for_branch(branch, ::orchard::ValuePool::Orchard)
+            {
+                let prepared =
+                    cached_orchard_proving_key(version.circuit_version()).prepare_proving();
+                tracing::debug!(
+                    ?height,
+                    prepared,
+                    "armed the coinbase proving key's prepared commitment tables",
+                );
+            }
+        };
+
         let add_orchard_reward = |builder: &mut Builder<_, _>, addr: &_| {
             trace_err!(
                 builder.add_orchard_output::<String>(
@@ -161,6 +191,7 @@ impl TransactionTemplate<NegativeOrZero> {
                 ),
                 "Orchard"
             )
+            .inspect(|_| arm_shielded_reward_proving_key())
         };
 
         let add_ironwood_reward = |builder: &mut Builder<_, _>, addr: &_| {
@@ -173,6 +204,7 @@ impl TransactionTemplate<NegativeOrZero> {
                 ),
                 "Ironwood"
             )
+            .inspect(|_| arm_shielded_reward_proving_key())
         };
 
         let add_sapling_reward = |builder: &mut Builder<_, _>, addr: &_| {

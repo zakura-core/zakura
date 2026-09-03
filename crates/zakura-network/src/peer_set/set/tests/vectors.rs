@@ -330,11 +330,13 @@ fn broadcast_all_queued_removes_banned_peers() {
         remaining_peers.insert(banned_addr);
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        peer_set.queued_broadcast_all = Some((Request::Peers, sender, remaining_peers));
+        peer_set
+            .queued_broadcast_all
+            .push_back((Request::Peers, sender, remaining_peers));
 
         peer_set.broadcast_all_queued();
 
-        assert!(peer_set.queued_broadcast_all.is_none());
+        assert!(peer_set.queued_broadcast_all.is_empty());
         assert!(matches!(
             receiver.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
@@ -375,19 +377,19 @@ fn broadcast_all_queued_removes_disconnected_peers() {
 
         let broadcast_fut =
             peer_set.broadcast_all(Request::AdvertiseBlockToAll(block::Hash([9; 32])));
-        assert!(peer_set.queued_broadcast_all.is_some());
+        assert!(!peer_set.queued_broadcast_all.is_empty());
 
         peer_set.remove(&peer_addr);
 
         // Polling readiness processes the canceled service. Since this was the only
         // peer, readiness remains pending, but queue cleanup must still run.
         assert!(peer_set.ready().now_or_never().is_none());
-        assert!(peer_set.queued_broadcast_all.is_none());
+        assert!(peer_set.queued_broadcast_all.is_empty());
 
         timeout(Duration::from_secs(1), broadcast_fut)
             .await
             .expect("broadcast should not wait for a disconnected peer")
-            .expect("broadcast_all should succeed");
+            .expect_err("broadcast reports that no peer received the request");
     });
 }
 
@@ -423,12 +425,48 @@ fn broadcast_all_queued_removes_canceled_broadcasts() {
 
         let broadcast_fut =
             peer_set.broadcast_all(Request::AdvertiseBlockToAll(block::Hash([11; 32])));
-        assert!(peer_set.queued_broadcast_all.is_some());
+        assert!(!peer_set.queued_broadcast_all.is_empty());
 
         drop(broadcast_fut);
         peer_set.broadcast_all_queued();
 
-        assert!(peer_set.queued_broadcast_all.is_none());
+        assert!(peer_set.queued_broadcast_all.is_empty());
+    });
+}
+
+#[test]
+fn new_broadcast_keeps_previous_queued_delivery() {
+    let peer_versions = PeerVersions {
+        peer_versions: vec![Version::min_specified_for_upgrade(
+            &Network::Mainnet,
+            NetworkUpgrade::Nu6_2,
+        )],
+    };
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    let (discovered_peers, _handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+        let peer_addr: PeerSocketAddr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1).into();
+        let peer_set = peer_set.ready().await.expect("peer set is always ready");
+        let service = peer_set
+            .take_ready_service(&peer_addr)
+            .expect("mock peer is ready");
+        peer_set.push_unready(peer_addr, service);
+
+        let first = peer_set.broadcast_all(Request::AdvertiseBlockToAll(block::Hash([21; 32])));
+        let second = peer_set.broadcast_all(Request::AdvertiseBlockToAll(block::Hash([22; 32])));
+
+        assert_eq!(peer_set.queued_broadcast_all.len(), 2);
+        drop((first, second));
+        peer_set.broadcast_all_queued();
+        assert!(peer_set.queued_broadcast_all.is_empty());
     });
 }
 
@@ -480,7 +518,7 @@ fn broadcast_all_queued_does_not_wait_for_receiver_capacity() {
             peer_set.broadcast_all_queued();
         }
 
-        assert!(peer_set.queued_broadcast_all.is_none());
+        assert!(peer_set.queued_broadcast_all.is_empty());
 
         let mut queued_deliveries = 0;
         while receiver.try_recv().is_ok() {
@@ -559,53 +597,48 @@ fn mined_block_gossip_to_unready_peer_is_delivered_not_canceled() {
         let broadcast_handle =
             tokio::spawn(peer_set.broadcast_all(Request::AdvertiseBlockToAll(hash)));
 
-        // Drive the peer set so both peers re-ready and `broadcast_all_queued`
-        // delivers the queued gossip; yield so the spawned drain loop processes
-        // it. Once every queued peer has been delivered, the drain loop drains
-        // and the broadcast future completes — that completion is the point at
-        // which the delivery future has definitively been spawned (fixed) or
-        // dropped (buggy), so we can check the response channel deterministically.
-        let mut broadcast_finished = false;
+        // Drive the peer set until both peers receive the queued gossip. Answer each request so
+        // the broadcast can confirm that at least one peer accepted it.
+        let mut handles = [handle_1, handle_2];
+        let mut delivered = 0;
         for _ in 0..16 {
             {
                 let _ = peer_set.ready().await.expect("peer set is always ready");
             }
             tokio::task::yield_now().await;
-            if broadcast_handle.is_finished() {
-                broadcast_finished = true;
+
+            for handle in &mut handles {
+                let Some(client_request) =
+                    handle.try_to_receive_outbound_client_request().request()
+                else {
+                    continue;
+                };
+                assert!(
+                    matches!(client_request.request, Request::AdvertiseBlockToAll(h) if h == hash),
+                    "expected the mined-block advertisement, got {:?}",
+                    client_request.request,
+                );
+                assert!(
+                    !client_request.tx.is_canceled(),
+                    "the queued send future must remain alive until the peer responds",
+                );
+                client_request
+                    .tx
+                    .send(Ok(Response::Nil))
+                    .expect("the broadcast waits for the peer response");
+                delivered += 1;
+            }
+
+            tokio::task::yield_now().await;
+            if delivered == 2 && broadcast_handle.is_finished() {
                 break;
             }
         }
-        assert!(
-            broadcast_finished,
-            "the mined-block broadcast future should complete once queued deliveries drain",
-        );
+        assert_eq!(delivered, 2, "both peers receive the queued broadcast");
         broadcast_handle
             .await
             .expect("broadcast task should not panic")
             .expect("broadcast_all should succeed");
-
-        // Both originally-unready peers must have received the mined-block inv,
-        // and — crucially — the delivery future must have been kept alive rather
-        // than dropped. On the buggy code the future is dropped, cancelling the
-        // response channel, which the connection task treats as a canceled
-        // request and skips the block inv.
-        for mut handle in [handle_1, handle_2] {
-            let client_request = handle
-                .try_to_receive_outbound_client_request()
-                .request()
-                .expect("each once-unready peer should receive the queued mined-block gossip");
-            assert!(
-                matches!(client_request.request, Request::AdvertiseBlockToAll(h) if h == hash),
-                "expected the mined-block advertisement, got {:?}",
-                client_request.request,
-            );
-            assert!(
-                !client_request.tx.is_canceled(),
-                "the queued send future must be spawned, not dropped: a dropped future \
-                 cancels the response channel and the connection skips the block inv",
-            );
-        }
     });
 }
 
@@ -812,14 +845,16 @@ fn broadcast_all_queued_bans_mapped_ipv6_against_canonical_ban() {
         remaining_peers.insert(mapped_addr);
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        peer_set.queued_broadcast_all = Some((Request::Peers, sender, remaining_peers));
+        peer_set
+            .queued_broadcast_all
+            .push_back((Request::Peers, sender, remaining_peers));
 
         peer_set.broadcast_all_queued();
 
         // The mapped-form peer must be dropped by the (canonical) ban filter, so no peers
         // remain queued for the re-send and the response channel must close. On
         // un-canonicalized code the mapped peer would survive the filter.
-        assert!(peer_set.queued_broadcast_all.is_none());
+        assert!(peer_set.queued_broadcast_all.is_empty());
         assert!(matches!(
             receiver.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)

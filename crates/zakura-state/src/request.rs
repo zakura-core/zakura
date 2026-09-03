@@ -80,7 +80,12 @@ impl BlockAdmission {
     }
 
     /// Marks the block as admitted to the active non-finalized write queue.
-    pub(crate) fn admit(&self) {
+    pub(crate) fn admit(&self, optimistic_relay_still_authorized: bool) {
+        if !optimistic_relay_still_authorized {
+            self.0
+                .optimistic_relay_authorized
+                .store(false, Ordering::Release);
+        }
         if self
             .0
             .state
@@ -124,10 +129,12 @@ impl BlockAdmission {
     pub async fn wait(&self) -> bool {
         loop {
             let notified = self.0.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             match self.0.state.load(Ordering::Acquire) {
                 Self::ADMITTED => return true,
                 Self::REJECTED => return false,
-                Self::PENDING => notified.await,
+                Self::PENDING => notified.as_mut().await,
                 _ => unreachable!("block admission state only uses declared constants"),
             }
         }
@@ -137,7 +144,7 @@ impl BlockAdmission {
     #[cfg(any(test, feature = "proptest-impl"))]
     #[doc(hidden)]
     pub fn admit_for_test(&self) {
-        self.admit();
+        self.admit(true);
     }
 }
 
@@ -465,7 +472,7 @@ pub struct ContextuallyVerifiedBlock {
     /// earlier transaction.
     ///
     /// This field can also contain unrelated outputs, which are ignored.
-    pub(crate) new_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    pub(crate) new_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
 
     /// The outputs spent by this block, indexed by the [`transparent::Input`]'s
     /// [`OutPoint`](transparent::OutPoint).
@@ -474,7 +481,7 @@ pub struct ContextuallyVerifiedBlock {
     /// or earlier blocks in the chain.
     ///
     /// This field can also contain unrelated outputs, which are ignored.
-    pub(crate) spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    pub(crate) spent_outputs: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
 
     /// A precomputed list of the hashes of the transactions in this block,
     /// in the same order as `block.transactions`.
@@ -674,8 +681,8 @@ impl ContextuallyVerifiedBlock {
             block,
             hash,
             height,
-            new_outputs,
-            spent_outputs,
+            new_outputs: Arc::new(new_outputs),
+            spent_outputs: Arc::new(spent_outputs),
             transaction_hashes,
             chain_value_pool_change,
         })
@@ -830,6 +837,43 @@ mod tests {
     }
 
     #[test]
+    fn contextual_block_clone_shares_immutable_utxo_maps() {
+        let _init_guard = zakura_test::init();
+
+        let block = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                .zcash_deserialize_into::<Block>()
+                .expect("the genesis block deserializes"),
+        );
+        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            SemanticallyVerifiedBlock::from(block),
+            HashMap::new(),
+        )
+        .expect("the test block's value balance can be calculated");
+        let cloned = contextual.clone();
+
+        assert!(Arc::ptr_eq(&contextual.new_outputs, &cloned.new_outputs));
+        assert!(Arc::ptr_eq(
+            &contextual.spent_outputs,
+            &cloned.spent_outputs
+        ));
+
+        let semantic = SemanticallyVerifiedBlock::from(cloned);
+        assert_eq!(&semantic.new_outputs, contextual.new_outputs.as_ref());
+
+        let unique = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            SemanticallyVerifiedBlock::from(contextual.block.clone()),
+            HashMap::new(),
+        )
+        .expect("the test block's value balance can be calculated");
+        assert_eq!(Arc::strong_count(&unique.new_outputs), 1);
+        let expected_outputs = unique.new_outputs.as_ref().clone();
+
+        let semantic = SemanticallyVerifiedBlock::from(unique);
+        assert_eq!(semantic.new_outputs, expected_outputs);
+    }
+
+    #[test]
     fn checkpoint_precomputed_auth_data_root_matches_its_block() {
         let _init_guard = zakura_test::init();
 
@@ -854,13 +898,19 @@ mod tests {
         rejected.authorize_optimistic_relay();
         assert!(rejected.optimistic_relay_authorized());
         rejected.reject();
-        rejected.admit();
+        rejected.admit(true);
         assert!(!rejected.wait().await);
 
         let admitted = BlockAdmission::pending();
-        admitted.admit();
+        admitted.admit(true);
         admitted.reject();
         assert!(admitted.wait().await);
+
+        let stale = BlockAdmission::pending();
+        stale.authorize_optimistic_relay();
+        stale.admit(false);
+        assert!(stale.wait().await);
+        assert!(!stale.optimistic_relay_authorized());
     }
 }
 
@@ -870,7 +920,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             block: valid.block,
             hash: valid.hash,
             height: valid.height,
-            new_outputs: valid.new_outputs,
+            new_outputs: Arc::unwrap_or_clone(valid.new_outputs),
             transaction_hashes: valid.transaction_hashes,
             deferred_pool_balance_change: Some(DeferredPoolBalanceChange::new(
                 valid.chain_value_pool_change.deferred_amount(),
@@ -1572,7 +1622,10 @@ impl Request {
 /// [`ReadStateService`](crate::service::ReadStateService).
 pub enum ReadRequest {
     /// Returns [`ReadResponse::UsageInfo(num_bytes: u64)`](ReadResponse::UsageInfo)
-    /// with the current disk space usage in bytes.
+    /// with a recent estimate of the disk space usage in bytes.
+    ///
+    /// The state service refreshes this estimate with its RocksDB metrics, normally every 30
+    /// seconds.
     UsageInfo,
 
     /// Returns [`ReadResponse::PruningInfo`] with
@@ -2033,6 +2086,18 @@ pub enum ReadRequest {
     /// with the current best chain tip block size in bytes.
     TipBlockSize,
 
+    /// Returns [`ReadResponse::ChainTips(Vec<ChainTipInfo>)`](ReadResponse::ChainTips)
+    /// with the tip of every chain this node currently tracks, in descending
+    /// height order.
+    ///
+    /// This covers the best chain, the non-finalized forks, recently invalidated
+    /// branches, and the selected header chain when some block bodies are
+    /// unavailable. Its cost is bounded by the number of tracked forks, not by the
+    /// height of the chain.
+    ///
+    /// Used by the `getchaintips` RPC.
+    ChainTips,
+
     /// Returns [`ReadResponse::NonFinalizedBlocksListener`] with a channel receiver
     /// allowing the caller to listen for new blocks in the non-finalized state.
     NonFinalizedBlocksListener {
@@ -2110,6 +2175,7 @@ impl ReadRequest {
             ReadRequest::SolutionRate { .. } => "solution_rate",
             ReadRequest::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
             ReadRequest::TipBlockSize => "tip_block_size",
+            ReadRequest::ChainTips => "chain_tips",
             ReadRequest::NonFinalizedBlocksListener { .. } => "non_finalized_blocks_listener",
             ReadRequest::IsTransparentOutputSpent(_) => "is_transparent_output_spent",
         }

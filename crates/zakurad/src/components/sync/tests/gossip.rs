@@ -27,7 +27,7 @@ const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
 struct GossipTestSetup {
     peer_set: MockService<Request, Response, PanicAssertion>,
-    submitblock_sender: tokio::sync::mpsc::Sender<MinedBlockEvent>,
+    submitblock_sender: tokio::sync::mpsc::UnboundedSender<MinedBlockEvent>,
     state_service: BoxService<zakura_state::Request, zakura_state::Response, crate::BoxError>,
     gossip_task_handle: JoinHandle<Result<(), BlockGossipError>>,
 }
@@ -146,7 +146,6 @@ async fn mined_block_marks_tip_after_successful_broadcast() {
             height: block_two.coinbase_height().unwrap(),
             early_advertised: false,
         })
-        .await
         .expect("mined block notification should be accepted");
 
     peer_set
@@ -196,7 +195,6 @@ async fn mined_block_mark_survives_pending_submit_queue() {
             height,
             early_advertised: false,
         })
-        .await
         .expect("mined block notification should be accepted");
 
     let first_broadcast = peer_set
@@ -211,7 +209,6 @@ async fn mined_block_mark_survives_pending_submit_queue() {
             height,
             early_advertised: false,
         })
-        .await
         .expect("second mined block notification should be accepted");
 
     first_broadcast.respond(Response::Nil);
@@ -262,7 +259,6 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
             height: block_two.coinbase_height().unwrap(),
             early_advertised: false,
         })
-        .await
         .expect("mined block notification should be accepted");
 
     let slow_broadcast = peer_set

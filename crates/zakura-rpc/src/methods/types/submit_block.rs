@@ -260,33 +260,25 @@ impl From<SubmitBlockResponse> for SubmitSolutionResponse {
 /// A submit block channel, used to inform the gossip task about mined blocks.
 pub struct SubmitBlockChannel {
     /// The channel sender
-    sender: mpsc::Sender<MinedBlockEvent>,
+    sender: mpsc::UnboundedSender<MinedBlockEvent>,
     /// The channel receiver
-    receiver: mpsc::Receiver<MinedBlockEvent>,
+    receiver: mpsc::UnboundedReceiver<MinedBlockEvent>,
 }
 
 impl SubmitBlockChannel {
     /// Creates a new submit block channel
     pub fn new() -> Self {
-        /// How many unread messages the submit block channel should buffer before rejecting sends.
-        ///
-        /// This should be large enough to usually avoid rejecting sends. This channel is used by
-        /// the block hash gossip task, which waits for a ready peer in the peer set while
-        /// processing messages from this channel and could be much slower to gossip block hashes
-        /// than it is to commit blocks and produce new block templates.
-        const SUBMIT_BLOCK_CHANNEL_CAPACITY: usize = 10_000;
-
-        let (sender, receiver) = mpsc::channel(SUBMIT_BLOCK_CHANNEL_CAPACITY);
+        let (sender, receiver) = mpsc::unbounded_channel();
         Self { sender, receiver }
     }
 
     /// Get the channel sender
-    pub fn sender(&self) -> mpsc::Sender<MinedBlockEvent> {
+    pub fn sender(&self) -> mpsc::UnboundedSender<MinedBlockEvent> {
         self.sender.clone()
     }
 
     /// Get the channel receiver
-    pub fn receiver(self) -> mpsc::Receiver<MinedBlockEvent> {
+    pub fn receiver(self) -> mpsc::UnboundedReceiver<MinedBlockEvent> {
         self.receiver
     }
 }

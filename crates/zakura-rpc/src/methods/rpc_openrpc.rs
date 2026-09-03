@@ -71,6 +71,13 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     result: |g| g.result::<openrpsee::openrpc::ResultType>("getbestblockheightandhash_result"),
     deprecated: false,
 },
+"getchaintips" => openrpsee::openrpc::RpcMethod {
+    description: "Returns information about every tip in the block tree that this node still\ntracks, including the best chain and orphaned branches.\n\nzcashd reference: [`getchaintips`](https://zcash.github.io/rpc/getchaintips.html)\nmethod: post\ntags: blockchain\n\n# Notes\n\nzcashd answers this call by scanning its entire block index under `cs_main`,\nwhich costs seconds once the index holds millions of entries and blocks every\nother RPC for that whole time. Zakura reads only the chains it holds in\nmemory, so the cost is bounded by the number of tracked forks rather than by\nthe height of the chain.\n\nThe two nodes therefore report different tips. zcashd\'s block index is never\npruned, so it lists every stale tip it has ever seen. Zakura drops a fork once\nit falls below the finalized tip, so it lists the tips that are still live:\nthe best chain, the non-finalized forks, recently invalidated branches, and\nthe selected header chain when some block bodies are unavailable.\n\nZakura never returns zcashd\'s `valid-headers` or `unknown` statuses. Every\nblock in its non-finalized state is contextually verified, so a tip is either\nfully valid, invalidated, or known only by its header.\n\n`branchlen` can be short for an `invalid` tip. Zakura tracks a limited number\nof forks, and it can drop the chain that an invalidated branch forked from.\nThe branch is still reported, but its length is then measured from the deepest\nblock the node still tracks.\n",
+    params: |_g| vec![
+    ],
+    result: |g| g.result::<openrpsee::openrpc::ResultType>("getchaintips_result"),
+    deprecated: false,
+},
 "getmempoolinfo" => openrpsee::openrpc::RpcMethod {
     description: "Returns details on the active state of the TX memory pool.\n\nzcash reference: [`getmempoolinfo`](https://zcash.github.io/rpc/getmempoolinfo.html)\n",
     params: |_g| vec![

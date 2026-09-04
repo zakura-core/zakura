@@ -108,7 +108,7 @@ Input classes identify who can create each event:
 | GB-SM-03 | Peer | A peer without retained valid `Status` cannot start a request; the attempt is recorded as `GetBlocksSpam`. |
 | GB-SM-04 | All | Each peer has an independent committed-request ledger bounded by the configured local in-flight cap. |
 | GB-SM-05 | Peer | A request rejected by the full committed-request ledger emits no state query and receives `RangeUnavailable` echoing its original wire count while output capacity is available. |
-| GB-SM-06 | Peer | A request starting above the servable tip emits no state query and receives `RangeUnavailable` echoing its original wire count. |
+| GB-SM-06 | Peer | A request starting above the servable tip emits no state query. While output capacity is available, the peer receives `RangeUnavailable` echoing its original wire count. |
 | GB-SM-07 | Peer | An accepted query count is clamped by the wire count, local count limit, representable heights, and available range. |
 | GB-SM-08 | Driver | Request identities are nonzero and are not reused during one replay. |
 | GB-SM-09 | Driver | While the output path remains available, a matching ready response sends the largest contiguous prefix within the byte cap followed by exactly one appropriate terminal frame; output failure follows the regulated-load failure policy. |
@@ -120,7 +120,7 @@ Input classes identify who can create each event:
 | GB-SM-15 | Peer | A delayed older `PeerConnected` event cannot replace a newer reactor session for the same peer. |
 | GB-SM-16 | Peer | A peer routine does not process frames until the reactor admits or rejects its session. |
 | GB-SM-17 | Peer | A request decoded by a superseded routine produces no state query, reply, or misbehavior record for its replacement session. |
-| GB-SM-18 | Driver | A matching zero-result state completion sends `RangeUnavailable` echoing the original wire count, retires the request, and releases its slot. |
+| GB-SM-18 | Driver | A matching zero-result state completion retires the request and releases its slot. While output capacity is available, it also sends `RangeUnavailable` echoing the original wire count. |
 | GB-SM-19 | Peer | Inbound sessions serve `GetBlocks` through the same path and use the inbound peer cap independently of the outbound cap. |
 
 Serving `Status` survives an overlapping replacement for the same authenticated

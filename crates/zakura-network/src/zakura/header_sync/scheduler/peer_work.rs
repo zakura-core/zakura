@@ -304,7 +304,7 @@ pub struct ActiveHeaderRequest {
 pub enum HeaderTargetPurpose {
     /// Admit a complete parent-linked branch target.
     Normal,
-    /// Redeliver auxiliary metadata for one exact selected header.
+    /// Redeliver auxiliary metadata for an exact selected range.
     SelectedAuxiliaryRepair {
         /// Selected target fixed by the durable repair context.
         selected_target: Frontier,

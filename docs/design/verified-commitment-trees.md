@@ -65,7 +65,7 @@ Mainnet → the committer is built in peer mode.
 (2) Header sync requests the per-height roots in-band with the finalized header ranges it already fetches (`want_tree_aux_roots`); each root is stored as an auxiliary delivery on its header's DAG node and authenticated there as soon as the successor header that proves it arrives, far ahead of the committer (§4.2, §6.0). (3) Each checkpoint block: look up its root; verify it (own header now, successor header next block, plus
 the direct below-Heartwood/below-NU5/below-Nu6_3 checks); fold it in; freeze the frontier (§6, §7).
 (4) At the last checkpoint height, verify and write the embedded frontier and unfreeze.
-(5) Above the last checkpoint height, ordinary semantic verification resumes from the real frontier. A bad/missing root anywhere in the frozen window parks the block and retries in place; it never writes wrong state. Roots are not individually re-requested, so a hole that no in-flight re-delivery of the same header range fills is a fail-closed stall, surfaced loudly by the §8 metrics.
+(5) Above the last checkpoint height, ordinary semantic verification resumes from the real frontier. A bad or missing root anywhere in the frozen window parks the block in place. The writer publishes a bounded selected-range repair request. A header insertion retries the parked block. A repair that cannot fill the gap remains a fail-closed stall that the §8 metrics report.
 
 **Glossary.**
 

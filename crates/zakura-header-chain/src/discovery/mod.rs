@@ -236,19 +236,17 @@ impl VctRepairContext {
         })
     }
 
-    /// Extend an unconstrained exact repair across a contiguous selected suffix with no rows.
+    /// Convert an unconstrained exact repair into a selected range with no rows.
     ///
-    /// `suffix` begins with the selected successor of [`Self::target`]. The caller must prove
-    /// that every target in the resulting range has no durable auxiliary row.
+    /// `suffix` begins with the selected successor of [`Self::target`]. An empty suffix represents
+    /// a range context that negotiation shortened to one header. The caller must prove that every
+    /// target in the resulting range has no durable auxiliary row.
     pub fn extend_empty_selected_range(
         mut self,
         suffix: &[Frontier],
         terminal_boundary_hash: Option<block::Hash>,
     ) -> Result<Self, StoreError> {
-        if self.selected_range.has_durable_rows
-            || !self.admission_capacity_available
-            || suffix.is_empty()
-        {
+        if self.selected_range.has_durable_rows || !self.admission_capacity_available {
             return Err(StoreError::Incoherent(
                 "a constrained VCT repair context cannot become a range",
             ));
@@ -320,19 +318,11 @@ impl VctRepairContext {
             terminal_boundary_hash: Some(self.selected_range.frontiers[prefix_len].hash),
             has_durable_rows: false,
         });
-        prefix.episode = if prefix_len == 1 {
-            AuxiliaryRequirementEpisode::for_target(
-                prefix.target,
-                prefix.selected_range.terminal_boundary_hash,
-                &[],
-            )
-        } else {
-            AuxiliaryRequirementEpisode::for_empty_selected_range(
-                prefix.state_version,
-                &prefix.selected_range.frontiers,
-                prefix.selected_range.terminal_boundary_hash,
-            )
-        };
+        prefix.episode = AuxiliaryRequirementEpisode::for_empty_selected_range(
+            prefix.state_version,
+            &prefix.selected_range.frontiers,
+            prefix.selected_range.terminal_boundary_hash,
+        );
         Some(prefix)
     }
 
@@ -567,16 +557,26 @@ mod tests {
         let exact_prefix = full
             .bounded_prefix(1)
             .expect("a one-header repair prefix exists");
-        let exact = VctRepairContext::from_durable_rows(
-            target,
-            HeaderLocator::for_continuation(predecessor),
-            StateVersion::new(7),
-            Some(suffix[0].hash),
-            true,
-            &[],
-        )
-        .expect("an exact empty repair context is coherent");
-        assert_eq!(exact_prefix, exact);
+        assert_ne!(
+            exact_prefix.episode,
+            build(8)
+                .bounded_prefix(1)
+                .expect("the newer one-header range prefix exists")
+                .episode
+        );
+        assert_ne!(
+            exact_prefix.episode,
+            VctRepairContext::from_durable_rows(
+                target,
+                HeaderLocator::for_continuation(predecessor),
+                StateVersion::new(7),
+                Some(suffix[0].hash),
+                true,
+                &[],
+            )
+            .expect("an exact empty repair context is coherent")
+            .episode
+        );
         assert_ne!(build(8).episode, full.episode);
         assert!(full.bounded_prefix(0).is_none());
     }

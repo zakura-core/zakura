@@ -1929,12 +1929,12 @@ impl HeaderChainReader {
         reservation.commit(spec, Instant::now())
     }
 
-    /// Lease one canonical header that ends at a finalized target below the header frontier.
+    /// Lease one bounded canonical range that ends below the finalized frontier.
     ///
     /// Refusing a finalized target would strand any node whose VCT repair height every peer has
-    /// already finalized: the requester has no other way to obtain that exact header and its
-    /// authenticated roots. The fallback requires the target's canonical predecessor as a
-    /// locator. This bound makes every finalized fallback lease complete in one page.
+    /// already finalized: the requester has no other way to obtain those headers and their
+    /// authenticated roots. The fallback accepts a canonical locator within one protocol range
+    /// of the target.
     fn acquire_finalized_target_path(
         &self,
         reservation: RetainedPathReservation,
@@ -1953,13 +1953,13 @@ impl HeaderChainReader {
             // means the branch moved under the request, so the requester must re-derive it.
             return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
         }
-        let Ok(predecessor_height) = target.height.previous() else {
-            return Ok(RetainedPathLeaseOutcome::NoLocatorIntersection);
-        };
         let mut common_ancestor = None;
         for locator_hash in locator_hashes {
             if let Some(frontier) = self.finalized_frontier(*locator_hash)? {
-                if frontier.height == predecessor_height {
+                let distance = target.height.0.checked_sub(frontier.height.0);
+                if distance.is_some_and(|distance| {
+                    distance > 0 && distance <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE
+                }) {
                     common_ancestor = Some(frontier);
                     break;
                 }
@@ -1993,16 +1993,16 @@ impl HeaderChainReader {
     /// Lease a canonical header path from a locator intersection up to an exact target.
     ///
     /// The target resolves from the retained header graph, or, when it sits below the finalized
-    /// frontier, from the canonical finalized indexes. A VCT repair asks for one stalled height
-    /// that every peer past it has already finalized, so refusing the second band would strand
-    /// the requester.
+    /// frontier, from the canonical finalized indexes. A VCT repair can ask for a bounded range
+    /// that every peer past it has already finalized. Refusing the second band would strand the
+    /// requester.
     ///
     /// Returns `TargetNotRetained` when neither band holds the target, `NoLocatorIntersection`
     /// when no locator hash is a canonical ancestor of it, `HistoryPruned` when the retained
     /// path no longer reaches the finalized frontier, and `Busy` when the peer already holds a
     /// lease or the branch moved under the request. On success the peer owns one lease until it
-    /// releases the lease or the idle deadline expires. A finalized fallback requires the exact
-    /// canonical predecessor, so it cannot retain a multi-page historical path.
+    /// releases the lease or the idle deadline expires. The finalized fallback limits the
+    /// complete historical path to one protocol range.
     pub(crate) fn acquire_retained_path(
         &self,
         peer: SourceId,
@@ -2078,9 +2078,9 @@ impl HeaderChainReader {
             }
         };
         let Some((target, mut reverse_path)) = retained_target else {
-            // The header graph holds only the retained suffix. A VCT repair asks for the exact
-            // header at one stalled height, which every peer that moved past it has finalized,
-            // so the target is absent here but present and immutable in the finalized indexes.
+            // The header graph holds only the retained suffix. A VCT repair can ask for a bounded
+            // range that every peer past it has finalized. The target is absent here but present
+            // and immutable in the finalized indexes.
             return self.acquire_finalized_target_path(
                 reservation,
                 session_id,
@@ -3235,6 +3235,11 @@ impl HeaderChainRuntime {
                     }
                     current = current
                         .extend_empty_selected_range(&repair_range[1..], terminal_boundary_hash)?;
+                } else if durable_rows_by_target[0].is_empty()
+                    && current.admission_capacity_available
+                    && current.episode != episode
+                {
+                    current = current.extend_empty_selected_range(&[], terminal_boundary_hash)?;
                 }
                 if current.episode != episode {
                     return Ok(ApplyResult::Stale(StaleReceipt {

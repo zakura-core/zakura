@@ -3249,18 +3249,12 @@ impl HeaderSyncReactor {
                 rejections.already_tried += 1;
                 continue;
             }
-            let selected_context = context
-                .bounded_prefix(
-                    usize::try_from(supported_count)
-                        .expect("the negotiated repair count fits usize"),
-                )
-                .expect("a positive repair prefix exists");
             candidates.push((
                 peer.clone(),
                 source,
                 state.session.clone(),
                 status.clone(),
-                selected_context,
+                supported_count,
             ));
         }
         if candidates.is_empty() {
@@ -3273,17 +3267,9 @@ impl HeaderSyncReactor {
             );
             return;
         }
-        candidates.sort_by(|left, right| {
-            right
-                .4
-                .selected_header_count()
-                .cmp(&left.4.selected_header_count())
-        });
+        candidates.sort_by(|left, right| right.4.cmp(&left.4));
         let mut local_capacity_unavailable = false;
-        for (peer, source, session, mut status, selected_context) in candidates {
-            let request_count = u32::try_from(selected_context.selected_header_count())
-                .expect("the selected repair prefix fits u32");
-            let request_target = selected_context.request_target();
+        for (peer, source, session, mut status, request_count) in candidates {
             self.peer_work_queue.remove_unstarted(&peer);
             if self
                 .peer_work_queue
@@ -3296,6 +3282,12 @@ impl HeaderSyncReactor {
                 local_capacity_unavailable = true;
                 continue;
             }
+            let selected_context = context
+                .bounded_prefix(
+                    usize::try_from(request_count).expect("the negotiated repair count fits usize"),
+                )
+                .expect("a positive repair prefix exists");
+            let request_target = selected_context.request_target();
             let request_id = match session.try_send_get_headers(
                 &self.codec,
                 task.owner.header,

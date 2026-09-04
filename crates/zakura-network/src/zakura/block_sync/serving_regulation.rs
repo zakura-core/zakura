@@ -6,7 +6,9 @@
 //! response capacity is refunded, while bytes actually queued for a peer remain
 //! owned by transport frame leases until their writes finish or are dropped.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Weak;
 
 use super::{config::*, wire::MAX_BS_BLOCKS_PER_REQUEST, *};
 use crate::zakura::regulation::{
@@ -134,6 +136,7 @@ struct RegulatorInner {
     session_pending_capacity: usize,
     peer_rates: StdMutex<HashMap<ZakuraPeerId, Arc<PeerRateAccount>>>,
     inactive_peer_limit: usize,
+    #[cfg(test)]
     sessions: StdMutex<Vec<Weak<SessionResources>>>,
 }
 
@@ -176,6 +179,7 @@ impl GetBlocksServingRegulator {
                 config,
                 peer_rates: StdMutex::new(HashMap::new()),
                 inactive_peer_limit,
+                #[cfg(test)]
                 sessions: StdMutex::new(Vec::new()),
             }),
         }
@@ -221,6 +225,7 @@ impl GetBlocksServingRegulator {
             )
             .expect("the clamped GetBlocks in-flight limit fits Tokio's semaphore"),
         });
+        #[cfg(test)]
         self.inner
             .sessions
             .lock()

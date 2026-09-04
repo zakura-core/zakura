@@ -257,7 +257,7 @@ mod tests {
         Frame {
             message_type,
             flags: 0,
-            payload: vec![u8::try_from(message_type).unwrap_or(u8::MAX)],
+            payload: vec![u8::try_from(message_type).unwrap_or(u8::MAX); 10],
         }
     }
 

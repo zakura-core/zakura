@@ -74,6 +74,31 @@ sequenceDiagram
     Z->>Z: Settle request accounting
 ```
 
+#### Inside Zakura: admitting the request
+
+The checks depend on the request, but the serving path follows this order:
+
+```text
+frame header and per-message cap
+  → bounded decode and wire validation
+  → peer/session and protocol prerequisites
+  → provisional resource admission
+  → reactor or service handoff
+  → committed handler work
+  → leased response frames
+  → settlement
+```
+
+The frame header identifies the message before Zakura allocates its payload.
+The transport rejects a payload above that message's cap at that point. A
+stream-wide maximum remains a final ceiling, not a substitute for the
+message-specific cap.
+
+Validation that needs no shared state runs before expensive work. Local
+availability and lifecycle checks must distinguish peer behavior from races
+created by replacement, finality, or scheduling. Zakura disconnects only when a
+conformant sender could not have produced the input.
+
 This is the serving direction implemented by GetBlocks regulation. It protects
 Zakura from request floods and from response work accumulating in memory.
 
@@ -108,30 +133,8 @@ Charging serving work to the request does not remove the response contracts.
 `Block`, `BlocksDone`, and `RangeUnavailable` still need their own wire and
 receiving-side rules when Zakura receives them.
 
-## Admission path
-
-The exact checks depend on the role, but a serving request follows this shape:
-
-```text
-frame header and per-message cap
-  → bounded decode and wire validation
-  → peer/session and protocol prerequisites
-  → provisional resource admission
-  → reactor or service handoff
-  → committed handler work
-  → leased response frames
-  → settlement
-```
-
-The frame header identifies the message before Zakura allocates its payload.
-The transport rejects a payload above that message's cap at that point. A
-stream-wide maximum remains a final ceiling, not a substitute for the
-message-specific cap.
-
-Validation that needs no shared state runs before expensive work. Local
-availability and lifecycle checks must distinguish peer behavior from races
-created by replacement, finality, or scheduling. Zakura disconnects only when a
-conformant sender could not have produced the input.
+The remaining sections focus on controls for serving peer requests, which is
+the direction implemented first for GetBlocks.
 
 ## Separate resource controls
 

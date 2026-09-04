@@ -119,6 +119,10 @@ const GB_RL_TEST_MANIFEST: &[(&str, &[&str])] = &[
         "GB-RL-16",
         &["gb_rl_16_pending_requests_stay_within_session_and_node_bounds"],
     ),
+    (
+        "GB-RL-17",
+        &["gb_rl_17_state_query_receives_local_response_byte_limit"],
+    ),
 ];
 
 #[test]
@@ -142,6 +146,7 @@ fn gb_rl_contract_manifest_names_every_requirement() {
         "GB-RL-14",
         "GB-RL-15",
         "GB-RL-16",
+        "GB-RL-17",
     ];
     assert_contract_test_manifest(EXPECTED_IDS, GB_RL_TEST_MANIFEST);
 }
@@ -151,6 +156,7 @@ struct ServingQuery {
     request_id: BlockRangeRequestId,
     start: block::Height,
     count: u32,
+    max_response_bytes: u32,
 }
 
 struct ServingHarness {
@@ -337,12 +343,14 @@ fn query_from(action: BlockSyncAction, expected_peer: &ZakuraPeerId) -> ServingQ
             peer,
             start,
             count,
+            max_response_bytes,
         } => {
             assert_eq!(&peer, expected_peer);
             ServingQuery {
                 request_id,
                 start,
                 count,
+                max_response_bytes,
             }
         }
         action => panic!("expected a serving state query, got {action:?}"),
@@ -534,6 +542,25 @@ async fn gb_rl_16_pending_requests_stay_within_session_and_node_bounds() {
     let released = harness.handle.serving_regulation_snapshot();
     assert_eq!(released.aggregate_session_pending_inputs, 0);
     assert_eq!(released.max_session_pending_inputs, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn gb_rl_17_state_query_receives_local_response_byte_limit() {
+    let config = regulated_config(777);
+    let expected_limit = config.advertised_max_response_bytes();
+    let mut harness = ServingHarness::new(config, 4, 1);
+    let peer_id = peer(0x18);
+    let remote = harness.connect_ready(peer_id.clone(), 18).await;
+
+    remote
+        .try_send(BlockSyncMessage::GetBlocks {
+            start_height: block::Height(1),
+            count: 1,
+        })
+        .expect("the bounded request enters the production peer routine");
+    let query = query_from(next_contract_action(&mut harness.actions).await, &peer_id);
+
+    assert_eq!(query.max_response_bytes, expected_limit);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1326,6 +1353,7 @@ fn replay_regulated_load_history(case: GeneratedRegulatedLoadCase) -> Result<(),
                             peer,
                             start,
                             count,
+                            max_response_bytes,
                         } => {
                             let index = peer_ids
                                 .iter()
@@ -1335,6 +1363,7 @@ fn replay_regulated_load_history(case: GeneratedRegulatedLoadCase) -> Result<(),
                                 request_id,
                                 start,
                                 count,
+                                max_response_bytes,
                             });
                         }
                         BlockSyncAction::QueryNeededBlocks { .. }
@@ -1529,6 +1558,7 @@ async fn spawn_native_serving_rig(
                     peer,
                     start,
                     count,
+                    ..
                 } => {
                     let _ = query_tx.send(NativeServingQuery {
                         peer: peer.clone(),

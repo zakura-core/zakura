@@ -659,6 +659,7 @@ enum BlockActionDetail {
         peer: String,
         range_start: u64,
         range_count: u64,
+        max_response_bytes: u64,
     },
     SubmitBlock {
         apply_token: u64,
@@ -694,11 +695,13 @@ impl BlockActionDispatched {
                 peer,
                 start,
                 count,
+                max_response_bytes,
             } => BlockActionDetail::QueryBlocksByHeightRange {
                 request_id: request_id.get(),
                 peer: peer_label(peer),
                 range_start: height(*start),
                 range_count: u64::from(*count),
+                max_response_bytes: u64::from(*max_response_bytes),
             },
             BlockSyncAction::SubmitBlock { token, block, .. } => BlockActionDetail::SubmitBlock {
                 apply_token: *token,
@@ -1007,8 +1010,9 @@ mod tests {
                     peer: "p".into(),
                     range_start: 1,
                     range_count: 2,
+                    max_response_bytes: 3,
                 },
-                json!({"kind": "query_blocks_by_height_range", "request_id": 4, "peer": "p", "range_start": 1, "range_count": 2}),
+                json!({"kind": "query_blocks_by_height_range", "request_id": 4, "peer": "p", "range_start": 1, "range_count": 2, "max_response_bytes": 3}),
             ),
             (
                 BlockActionDetail::SubmitBlock {

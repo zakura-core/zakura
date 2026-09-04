@@ -619,6 +619,7 @@ async fn drive_mock_block_sync_actions(
                     peer,
                     start,
                     count,
+                    ..
                 } => {
                     let blocks = corpus.blocks_in_range(start, count, servable_high);
                     let response_bytes = blocks

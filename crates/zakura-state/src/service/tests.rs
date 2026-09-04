@@ -38,6 +38,62 @@ use crate::{
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+const DEFAULT_BLOCK_RANGE_BOUND_CASES: u32 = 64;
+
+proptest! {
+    #![proptest_config(
+        proptest::test_runner::Config::with_cases(env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_BLOCK_RANGE_BOUND_CASES))
+    )]
+
+    /// GB-RL-17: the state result itself stays inside the serving response-body limit.
+    #[test]
+    fn gb_rl_17_state_query_result_never_exceeds_response_byte_limit(
+        start in any::<u32>(),
+        sizes in proptest::collection::vec(
+            1usize..=usize::try_from(block::MAX_BLOCK_BYTES)
+                .expect("the consensus block-size limit fits usize"),
+            0..=128,
+        ),
+        max_response_bytes in any::<u32>(),
+    ) {
+        let count = u32::try_from(sizes.len()).expect("the generated count is at most 128");
+        let returned = super::collect_bounded_height_range(
+            Height(start),
+            count,
+            max_response_bytes,
+            |height| {
+                let offset = height.0.checked_sub(start)?;
+                let index = usize::try_from(offset).ok()?;
+                sizes.get(index).copied().map(|size| ((), size))
+            },
+        );
+
+        let returned_bytes = returned
+            .iter()
+            .map(|(_, (), size)| u64::try_from(*size).expect("generated sizes fit u64"))
+            .sum::<u64>();
+        prop_assert!(returned_bytes <= u64::from(max_response_bytes));
+
+        for (index, (height, (), size)) in returned.iter().enumerate() {
+            let offset = u32::try_from(index).expect("the generated index is at most 127");
+            prop_assert_eq!(height.0, start.checked_add(offset).expect("returned heights fit u32"));
+            prop_assert_eq!(*size, sizes[index]);
+        }
+
+        if returned.len() < sizes.len() {
+            let next_offset = u32::try_from(returned.len())
+                .expect("the generated prefix length is at most 128");
+            if start.checked_add(next_offset).is_some() {
+                let next_size = u64::try_from(sizes[returned.len()])
+                    .expect("generated sizes fit u64");
+                prop_assert!(returned_bytes + next_size > u64::from(max_response_bytes));
+            }
+        }
+    }
+}
 
 #[tokio::test]
 async fn descendant_arriving_after_a_local_parent_failure_completes_immediately() {

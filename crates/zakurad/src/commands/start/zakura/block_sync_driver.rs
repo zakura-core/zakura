@@ -480,6 +480,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 peer,
                 start,
                 count,
+                max_response_bytes,
             } => {
                 trace.trace_block_range_query_started(&peer, start, count);
                 let started = Instant::now();
@@ -487,7 +488,11 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
                     read_state
                         .clone()
-                        .oneshot(zakura_state::ReadRequest::BlocksByHeightRange { start, count }),
+                        .oneshot(zakura_state::ReadRequest::BlocksByHeightRange {
+                            start,
+                            count,
+                            max_response_bytes,
+                        }),
                 )
                 .await
                 {

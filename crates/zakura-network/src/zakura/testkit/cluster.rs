@@ -869,6 +869,7 @@ mod tests {
                         peer,
                         start,
                         count,
+                        ..
                     } => {
                         let _ = handle
                             .send(BlockSyncEvent::BlockRangeResponseFinished {

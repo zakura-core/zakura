@@ -11978,6 +11978,7 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
                 peer,
                 start,
                 count,
+                ..
             } => {
                 assert_eq!(peer, peer_id);
                 assert_eq!(start, block::Height(1));
@@ -14205,6 +14206,7 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
                 peer,
                 start,
                 count,
+                ..
             } => {
                 assert_eq!(peer, peer_id);
                 assert_eq!(start, block::Height(1));

@@ -1630,6 +1630,7 @@ impl BlockSyncReactor {
             peer: peer.clone(),
             start: start_height,
             count: requested_count,
+            max_response_bytes: self.startup.config.advertised_max_response_bytes(),
         }) {
             let mut request = self
                 .finish_serving_blocks(&peer, request_id, start_height)

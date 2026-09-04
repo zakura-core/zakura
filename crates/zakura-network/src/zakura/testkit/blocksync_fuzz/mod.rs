@@ -289,6 +289,7 @@ fn spawn_action_driver(
                     peer,
                     start,
                     count,
+                    ..
                 } => {
                     let blocks = corpus.blocks_in_range(start, count, target);
                     if handle

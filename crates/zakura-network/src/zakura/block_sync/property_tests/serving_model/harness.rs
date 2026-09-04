@@ -522,6 +522,7 @@ async fn observe(
                 peer,
                 start,
                 count,
+                ..
             } => observation.actions.push(ServingAction::Query {
                 request_id,
                 peer: peer_slot(&peer)?,

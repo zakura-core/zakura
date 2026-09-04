@@ -331,6 +331,8 @@ pub enum BlockSyncAction {
         start: block::Height,
         /// Maximum count.
         count: u32,
+        /// Maximum total encoded block-body bytes the state result may contain.
+        max_response_bytes: u32,
     },
     /// Parent-first body ready for B3's verifier/commit driver.
     SubmitBlock {

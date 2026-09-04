@@ -194,11 +194,20 @@ waits, provided it defines:
 #### GetBlocks choice
 
 `GetBlocks` uses bounded demultiplexing so block responses can pass a delayed
-serving request on the same stream. Its advertised in-flight limit bounds
-queued request tuples, and requests beyond that queue are dropped without a
-peer score. The GetBlocks contract must validate the resulting aggregate memory
-at the maximum connection count and confirm that required response traffic
-continues to make progress.
+serving request on the same stream. Its pending-input capacity allows one active
+admission plus the advertised in-flight count queued behind it; requests beyond
+that pre-reactor capacity are dropped without a peer score. The separate
+committed-request ledger rejects excess admitted requests with the response
+declared by the GetBlocks contract. That contract must validate aggregate
+pending-input memory at the maximum connection count and confirm that required
+response traffic continues to make progress.
+
+After a GetBlocks request commits, a full output queue drops the unsent frame,
+settles the request ownership, and keeps the session connected. A closed or
+otherwise failed output queue ends the session and settles the same ownership,
+cancelling it if it remains registered when the failure is observed. Neither
+local failure scores the peer or promises a terminal frame over the unavailable
+output path.
 
 ### 3. Carry ownership with the work
 

@@ -38,6 +38,9 @@ const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
 /// depending upward on `zakura-state`.
 const NEEDED_BLOCK_REFILL_LIMIT: u32 = 4_000;
 
+/// Delay before the reactor retries a failed body-missing metadata query.
+pub(super) const NEEDED_BLOCK_QUERY_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 /// Delay checkpoint body application until a far-ahead empty-state header bootstrap settles.
 /// Each selected-header page advances the body-work scope. Applying bodies between
 /// pages lets newer duplicate requests replace older requests before the node commits
@@ -140,6 +143,8 @@ pub fn spawn_block_sync_reactor(
         mpsc::channel(startup.config.peer_limits.inbound_queue_depth.max(1));
     let events_keepalive = events_tx.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+    let (needed_query_failure_tx, needed_query_failure_rx) = mpsc::unbounded_channel();
+    let needed_query_failure_keepalive = needed_query_failure_tx.clone();
     // Size the action channel so the Sequencer can dispatch a full checkpoint
     // window of `SubmitBlock`s (`submitted_apply_limit`) plus the query/misbehavior
     // spare pool. The resident look-ahead gate — not this channel — bounds body
@@ -245,6 +250,7 @@ pub fn spawn_block_sync_reactor(
     let handle = BlockSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
+        needed_query_failures: needed_query_failure_tx,
         peers: peers_rx,
         status: status_rx,
         candidates: candidates_rx,
@@ -254,6 +260,7 @@ pub fn spawn_block_sync_reactor(
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
+        needed_query_retry_at: None,
         pending_body_supplier_restart: None,
         pending_operator_body_retry: None,
         next_needed_query_id: NonZeroU64::new(1),
@@ -274,6 +281,8 @@ pub fn spawn_block_sync_reactor(
         events: events_rx,
         _events_keepalive: events_keepalive,
         lifecycle: lifecycle_rx,
+        needed_query_failures: needed_query_failure_rx,
+        _needed_query_failure_keepalive: needed_query_failure_keepalive,
         actions: actions_tx,
         routine_to_reactor: routine_to_reactor_rx,
         _routine_to_reactor_keepalive: routine_to_reactor_keepalive,
@@ -309,6 +318,9 @@ pub(super) struct BlockSyncReactor {
     /// as a consumer moved (not cloned) the handle. The reactor never sends on it.
     _events_keepalive: mpsc::Sender<BlockSyncEvent>,
     lifecycle: mpsc::UnboundedReceiver<BlockSyncEvent>,
+    needed_query_failures: mpsc::UnboundedReceiver<NeededBlocksQueryFailure>,
+    /// Keep the private driver-completion channel open while the reactor lives.
+    _needed_query_failure_keepalive: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
     actions: mpsc::Sender<BlockSyncAction>,
     /// Shared routine→reactor channel: serving (`ServeGetBlocks`), status
     /// advertisement (`StatusReceived`), the producer re-query ping
@@ -343,6 +355,8 @@ pub(super) struct BlockSyncReactor {
     request_floor: block::Height,
     /// Identity and scope of the state query awaiting a response.
     pending_needed_query: Option<PendingNeededQuery>,
+    /// Earliest time to retry the last failed body-missing metadata query.
+    needed_query_retry_at: Option<Instant>,
     /// Supplier-set restart submitted against the current durable version.
     pending_body_supplier_restart:
         Option<(zakura_header_chain::StateVersion, block::Hash, [u8; 32])>,
@@ -411,11 +425,17 @@ impl BlockSyncReactor {
             tokio::pin!(floor_watchdog);
             let empty_state_header_quiet = self.empty_state_header_quiet_sleep();
             tokio::pin!(empty_state_header_quiet);
+            let needed_query_retry = self.needed_query_retry_sleep();
+            tokio::pin!(needed_query_retry);
             tokio::select! {
                 _ = self.startup.shutdown.cancelled() => break,
                 event = self.lifecycle.recv() => {
                     let Some(event) = event else { break };
                     self.handle_event(event).await;
+                }
+                failure = self.needed_query_failures.recv() => {
+                    let Some(failure) = failure else { break };
+                    self.handle_needed_blocks_query_failed(failure.query_id, failure.scope);
                 }
                 event = self.events.recv() => {
                     let Some(event) = event else { break };
@@ -502,7 +522,18 @@ impl BlockSyncReactor {
                     self.empty_state_header_quiet_until = None;
                     self.query_needed_blocks_with_options(true).await;
                 }
+                _ = &mut needed_query_retry, if self.needed_query_retry_at.is_some() => {
+                    self.needed_query_retry_at = None;
+                    self.query_needed_blocks().await;
+                }
             }
+        }
+    }
+
+    fn needed_query_retry_sleep(&self) -> time::Sleep {
+        match self.needed_query_retry_at {
+            Some(deadline) => time::sleep_until(deadline.into()),
+            None => time::sleep(Duration::from_secs(3600)),
         }
     }
 
@@ -843,7 +874,7 @@ impl BlockSyncReactor {
                 ));
         }
         if current_scope != previous_scope {
-            self.pending_needed_query = None;
+            self.clear_pending_needed_query();
             let authority =
                 current_scope.expect("a committed view always constructs current body authority");
             if body_work_epoch_changed {
@@ -962,7 +993,7 @@ impl BlockSyncReactor {
         frontiers: BlockSyncFrontiers,
         preserve_active_successors: bool,
     ) {
-        self.pending_needed_query = None;
+        self.clear_pending_needed_query();
         // Reactor-owned prep: precompute the two peer-outstanding-derived halves
         // of the reset decision (the reactor owns peer state; the task ORs them
         // with its Sequencer-internal predicates). The `verified_tip()`/`floor()`
@@ -1064,7 +1095,7 @@ impl BlockSyncReactor {
             // Drop any in-flight producer query: its `(from, limit, tip)` was
             // computed against the pre-reset frontier and must not suppress the
             // post-reset refill via the pending-query dedupe.
-            self.pending_needed_query = None;
+            self.clear_pending_needed_query();
         } else if tip_advanced {
             // A non-destructive frontier advance does NOT respawn and does NOT
             // proactively drop outstanding through the tip: a still-open request
@@ -1091,7 +1122,7 @@ impl BlockSyncReactor {
         scope: zakura_header_chain::BodyWorkAuthority,
         blocks: Vec<BlockSyncBlockMeta>,
     ) {
-        self.pending_needed_query = None;
+        self.clear_pending_needed_query();
         // The state reports every header-known, body-missing height above the
         // download floor, but it has no visibility into our in-memory buffers.
         // Heights already at or below the body download floor, held in the
@@ -1187,7 +1218,7 @@ impl BlockSyncReactor {
                 .increment(1);
             return;
         }
-        self.pending_needed_query = None;
+        self.clear_pending_needed_query();
 
         if self.body_work_scope() != Some(scope) {
             metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks")
@@ -1211,6 +1242,25 @@ impl BlockSyncReactor {
             return;
         }
         self.handle_needed_blocks(scope, blocks).await;
+    }
+
+    fn handle_needed_blocks_query_failed(
+        &mut self,
+        query_id: NonZeroU64,
+        scope: zakura_header_chain::BodyWorkAuthority,
+    ) {
+        let completion = (query_id, scope);
+        let pending = self
+            .pending_needed_query
+            .map(|pending| (pending.query_id, pending.scope));
+        if pending != Some(completion) {
+            metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query_failed")
+                .increment(1);
+            return;
+        }
+
+        self.pending_needed_query = None;
+        self.schedule_needed_query_retry();
     }
 
     /// Header tip minus verified body tip, emitted as the `body_lag` trace field
@@ -1622,6 +1672,16 @@ impl BlockSyncReactor {
         self.query_needed_blocks_with_options(false).await
     }
 
+    fn clear_pending_needed_query(&mut self) {
+        self.pending_needed_query = None;
+        self.needed_query_retry_at = None;
+    }
+
+    fn schedule_needed_query_retry(&mut self) {
+        self.needed_query_retry_at = Some(Instant::now() + NEEDED_BLOCK_QUERY_RETRY_DELAY);
+        metrics::counter!("sync.block.needed_query.retry_scheduled").increment(1);
+    }
+
     /// Producer refill. When `force` is set (destructive reset), skip the
     /// low-water gate so a still-uncleared registry outstanding snapshot cannot
     /// suppress the post-`reset_above` re-query.
@@ -1629,11 +1689,16 @@ impl BlockSyncReactor {
         if !self.startup.state_queries_enabled {
             return false;
         }
+        if force {
+            self.needed_query_retry_at = None;
+        } else if self.needed_query_retry_at.is_some() {
+            return true;
+        }
         if self.empty_state_header_quiet_until.is_some() {
             return true;
         }
         if self.request_floor >= self.state.best_header_tip {
-            self.pending_needed_query = None;
+            self.clear_pending_needed_query();
             return true;
         }
         let Some(from) = self.next_needed_block_query_start() else {
@@ -1677,7 +1742,10 @@ impl BlockSyncReactor {
         });
         if dispatched {
             self.pending_needed_query = Some(query);
+            self.needed_query_retry_at = None;
             self.next_needed_query_id = query_id.get().checked_add(1).and_then(NonZeroU64::new);
+        } else {
+            self.schedule_needed_query_retry();
         }
         dispatched
     }

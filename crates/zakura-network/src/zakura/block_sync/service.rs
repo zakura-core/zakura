@@ -225,6 +225,7 @@ impl BlockSyncPeerSession {
     }
 
     /// Queue a regulated successful-response terminator.
+    #[cfg(test)]
     pub(super) fn try_send_regulated_blocks_done(
         &self,
         start_height: block::Height,
@@ -240,27 +241,46 @@ impl BlockSyncPeerSession {
         )
     }
 
-    /// Queue a regulated unavailable-range response.
-    pub(super) fn try_send_regulated_range_unavailable(
-        &self,
-        start_height: block::Height,
-        count: u32,
-        permit: &mut super::serving_regulation::GetBlocksServingPermit,
-    ) -> Result<(), OrderedSendError> {
-        self.try_send_regulated_message(
-            BlockSyncMessage::RangeUnavailable {
-                start_height,
-                count,
-            },
-            permit,
-        )
-    }
-
-    fn try_send_regulated_message(
+    /// Transfer response bytes only when a transport queue slot is available.
+    pub(super) fn try_send_regulated_message(
         &self,
         msg: BlockSyncMessage,
         permit: &mut super::serving_regulation::GetBlocksServingPermit,
     ) -> Result<(), OrderedSendError> {
+        let (frame, accounted_bytes) = Self::encode_regulated_message(msg, permit)?;
+        self.send
+            .try_send_leased(frame, || permit.transfer_frame(accounted_bytes))
+            .map_err(|error| {
+                let send_error = if error.is_full() {
+                    OrderedSendError::Full
+                } else if error.is_closed() {
+                    OrderedSendError::Closed
+                } else {
+                    // Compatibility senders do not support attaching leases.
+                    OrderedSendError::Closed
+                };
+                drop(error.into_frame());
+                send_error
+            })
+    }
+
+    /// Wait for transport capacity without releasing the request's reservations.
+    pub(super) async fn send_regulated_message(
+        &self,
+        msg: BlockSyncMessage,
+        permit: &mut super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(), OrderedSendError> {
+        let (frame, accounted_bytes) = Self::encode_regulated_message(msg, permit)?;
+        self.send
+            .send_leased(frame, || permit.transfer_frame(accounted_bytes))
+            .await
+            .map_err(|_| OrderedSendError::Closed)
+    }
+
+    fn encode_regulated_message(
+        msg: BlockSyncMessage,
+        permit: &super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(Frame, u64), OrderedSendError> {
         let frame = msg
             .encode_frame()
             .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
@@ -276,20 +296,7 @@ impl BlockSyncPeerSession {
                 "encoded GetBlocks response exceeded its admitted byte cap",
             ))));
         }
-        self.send
-            .try_send_leased(frame, || permit.transfer_frame(accounted_bytes))
-            .map_err(|error| {
-                let send_error = if error.is_full() {
-                    OrderedSendError::Full
-                } else if error.is_closed() {
-                    OrderedSendError::Closed
-                } else {
-                    // Compatibility senders do not support attaching leases.
-                    OrderedSendError::Closed
-                };
-                drop(error.into_frame());
-                send_error
-            })
+        Ok((frame, accounted_bytes))
     }
 
     fn try_send_message(&self, msg: BlockSyncMessage) -> Result<(), OrderedSendError> {

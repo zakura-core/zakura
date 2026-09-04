@@ -849,6 +849,10 @@ impl ServingBlockRequest {
     pub(super) fn permit_mut(&mut self) -> &mut super::serving_regulation::GetBlocksServingPermit {
         &mut self.permit
     }
+    /// Move request ownership into the terminal-response wait.
+    pub(super) fn into_permit(self) -> super::serving_regulation::GetBlocksServingPermit {
+        self.permit
+    }
 }
 
 impl PeerBlockState {

@@ -14746,18 +14746,9 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
     reactor_task.abort();
 }
 
-/// A full per-peer serving queue must drop the serving send, never disconnect
-/// the peer.
-///
-/// The reactor serves `Status`/`Block`/`BlocksDone`/`RangeUnavailable` with
-/// non-blocking `try_send_*`. On `Full` it drops the frame and bumps a
-/// `*.serve_queue_full` metric; only a genuine send *error* cancels the peer.
-/// A regression that collapsed those two arms (cancelling on `Full`) would
-/// disconnect honest-but-slow peers under serving load — a self-inflicted DoS.
-/// This guards the distinction: a saturated serving queue leaves the peer
-/// connected, and serving resumes once the queue drains.
+/// Queue pressure truncates the block prefix but must retain its terminator.
 #[tokio::test]
-async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
+async fn reactor_full_serving_queue_retains_partial_response_terminal() {
     let blocks = mainnet_blocks_1_to_3();
     let config = ZakuraBlockSyncConfig {
         max_blocks_per_response: 16,
@@ -14791,7 +14782,7 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
     let cancel = CancellationToken::new();
     let (inbound_tx, inbound_rx) = framed_channel(16);
     let (outbound_tx, mut outbound_rx) = framed_channel(2);
-    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx.clone()))]);
     service.add_peer(Peer::new_with_direction(
         peer_id.clone(),
         None,
@@ -14849,6 +14840,13 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
             action => panic!("unexpected action before block range query: {action:?}"),
         }
     };
+    // The status handshake can enqueue a refresh after the initial Status.
+    while outbound_tx.capacity() < outbound_tx.max_capacity() {
+        assert!(matches!(
+            next_outbound_message(&mut outbound_rx).await,
+            BlockSyncMessage::Status(_)
+        ));
+    }
     let served: Vec<_> = blocks
         .iter()
         .map(|block| {
@@ -14871,97 +14869,323 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         .await
         .expect("served block response queues");
 
-    // Let the reactor finish the serve, including the sends that hit `Full`.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        !cancel.is_cancelled(),
-        "a full serving queue must drop sends, not cancel the peer",
-    );
-    assert_eq!(handle.peer_snapshot().outbound_peers, 1);
-    let saturated = wiring.serving_regulator.snapshot();
-    assert_eq!(saturated.node_active, 0);
-    assert!(
-        saturated.node_outstanding > 0,
-        "only successfully queued frames keep response bytes outstanding",
-    );
-
-    // Self-heal: drain the queue, release the serving slot, and re-request. The
-    // earlier drop neither wedged nor scored the peer, so a fresh serve lands.
-    while tokio::time::timeout(
-        Duration::from_millis(100),
-        next_outbound_message(&mut outbound_rx),
-    )
-    .await
-    .is_ok()
-    {}
-    await_until(
-        "draining the response queue releases its frame leases",
-        Duration::from_secs(1),
-        || wiring.serving_regulator.snapshot().node_outstanding == 0,
-    )
-    .await
-    .expect("queued response bytes return after their frames leave the test transport");
+    // An event on the same channel is a barrier after the response handler.
+    let (barrier_send, _barrier_recv) = framed_channel(1);
     handle
-        .send(BlockSyncEvent::BlockRangeResponseFinished {
-            request_id: first_request_id,
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 3,
-            returned_count: 3,
-        })
+        .send(BlockSyncEvent::PeerConnected(
+            BlockSyncPeerSession::for_test(peer(0xfd), barrier_send, CancellationToken::new()),
+        ))
         .await
-        .expect("serving slot release queues");
-    inbound_tx
-        .send(
-            BlockSyncMessage::GetBlocks {
+        .expect("barrier queues");
+    await_until("reactor remains responsive", Duration::from_secs(1), || {
+        handle.peer_snapshot().outbound_peers == 2
+    })
+    .await
+    .expect("another peer connects while the terminal waits");
+    assert!(!cancel.is_cancelled());
+    let saturated = wiring.serving_regulator.snapshot();
+    assert_eq!(
+        saturated.node_active, 1,
+        "the pending terminal retains its active slot"
+    );
+    assert!(saturated.node_outstanding > 0);
+
+    for expected in &blocks[..2] {
+        assert_eq!(
+            wait_for_outbound_block(&mut outbound_rx).await.hash(),
+            expected.hash()
+        );
+    }
+    assert!(
+        matches!(
+            next_outbound_message(&mut outbound_rx).await,
+            BlockSyncMessage::BlocksDone {
                 start_height: block::Height(1),
-                count: 1,
+                returned: 2
             }
-            .encode_frame()
-            .expect("GetBlocks frame encodes"),
-        )
-        .await
-        .expect("re-request GetBlocks frame queues");
-    let (second_request_id, lease) = loop {
+        ),
+        "the original response finishes without a requester retry"
+    );
+    await_until("terminal ownership settles", Duration::from_secs(1), || {
+        let snapshot = wiring.serving_regulator.snapshot();
+        snapshot.node_active == 0 && snapshot.node_outstanding == 0
+    })
+    .await
+    .expect("all response ownership returns after the queue drains");
+    assert!(!cancel.is_cancelled());
+    reactor_task.abort();
+}
+
+#[derive(Clone, Copy)]
+enum TerminalWaitEnd {
+    Drain,
+    Timeout,
+    Reconnect,
+    Shutdown,
+    CloseQueue,
+}
+
+/// Fill the real service queue before an empty result reaches the reactor.
+/// The driver-failure case uses the same path as a timed-out state query.
+async fn check_empty_terminal_wait(end: TerminalWaitEnd, driver_failed: bool) {
+    let blocks = mainnet_blocks_1_to_3();
+    let config = ZakuraBlockSyncConfig::default();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(1), blocks[0].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config.clone(), handle.clone());
+    let wiring = handle.routine_wiring.as_ref().expect("test wiring exists");
+    let peer_id = peer(66);
+    let cancel = CancellationToken::new();
+    let (inbound_tx, inbound_rx) = framed_channel(8);
+    let (outbound_tx, mut outbound_rx) = framed_channel(1);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx.clone()))]);
+    let network_peer = Peer::new_with_direction(
+        peer_id.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        cancel,
+    );
+    let cancel = network_peer.service_cancel_token();
+    service.add_peer(network_peer);
+    wait_for_outbound_status(&mut outbound_rx).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::Status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(1),
+            tip_hash: blocks[0].hash(),
+            ..BlockSyncStatus::default()
+        }),
+    )
+    .await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::GetBlocks {
+            start_height: block::Height(1),
+            count: 1,
+        },
+    )
+    .await;
+    let (request_id, lease) = loop {
         match next_action(&mut actions).await {
             BlockSyncAction::QueryBlocksByHeightRange {
-                lease,
-                request_id,
-                start,
-                count,
-                ..
-            } => {
-                assert_eq!(start, block::Height(1));
-                assert_eq!(count, 1);
-                break (request_id, lease);
+                request_id, lease, ..
+            } => break (request_id, lease),
+            BlockSyncAction::Misbehavior { reason, .. } => {
+                panic!("unexpected misconduct: {reason:?}")
             }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before re-request query: {action:?}"),
+            _ => {}
         }
     };
+    while outbound_tx.capacity() < outbound_tx.max_capacity() {
+        assert!(matches!(
+            next_outbound_message(&mut outbound_rx).await,
+            BlockSyncMessage::Status(_)
+        ));
+    }
+    // This represents an earlier application frame still waiting for transport.
+    outbound_tx
+        .try_send(
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(99),
+                returned: 1,
+            }
+            .encode_frame()
+            .expect("filler encodes"),
+        )
+        .expect("queue has one free slot");
+    if driver_failed {
+        drop(lease);
+        handle
+            .send(BlockSyncEvent::BlockRangeResponseFinished {
+                request_id,
+                peer: peer_id.clone(),
+                start_height: block::Height(1),
+                requested_count: 1,
+                returned_count: 0,
+            })
+            .await
+            .expect("driver failure queues");
+    } else {
+        handle
+            .send(BlockSyncEvent::BlockRangeResponseReady {
+                lease,
+                request_id,
+                peer: peer_id.clone(),
+                start_height: block::Height(1),
+                requested_count: 1,
+                blocks: vec![],
+            })
+            .await
+            .expect("empty response queues");
+    }
+    let (barrier_send, _barrier_recv) = framed_channel(1);
     handle
-        .send(BlockSyncEvent::BlockRangeResponseReady {
-            lease,
-            request_id: second_request_id,
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 1,
-            blocks: vec![(
-                block::Height(1),
-                blocks[0].clone(),
-                usize::try_from(block_size(&blocks[0])).expect("block size fits usize"),
-            )],
-        })
+        .send(BlockSyncEvent::PeerConnected(
+            BlockSyncPeerSession::for_test(peer(0xfd), barrier_send, CancellationToken::new()),
+        ))
         .await
-        .expect("re-served block response queues");
-    assert_eq!(
-        wait_for_outbound_block(&mut outbound_rx).await.hash(),
-        blocks[0].hash(),
-        "serving resumes once the queue drains",
-    );
+        .expect("barrier queues");
+    await_until(
+        "terminal wait starts without blocking the reactor",
+        Duration::from_secs(1),
+        || handle.peer_snapshot().outbound_peers == 2,
+    )
+    .await
+    .expect("the following event was processed");
+    assert_eq!(wiring.serving_regulator.snapshot().node_active, 1);
     assert!(!cancel.is_cancelled());
 
+    match end {
+        TerminalWaitEnd::Drain => {
+            assert!(matches!(
+                next_outbound_message(&mut outbound_rx).await,
+                BlockSyncMessage::BlocksDone {
+                    start_height: block::Height(99),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                next_outbound_message(&mut outbound_rx).await,
+                BlockSyncMessage::RangeUnavailable {
+                    start_height: block::Height(1),
+                    count: 1
+                }
+            ));
+            assert!(!cancel.is_cancelled());
+        }
+        TerminalWaitEnd::Timeout => {
+            tokio::time::advance(config.request_timeout + Duration::from_millis(1)).await;
+            await_until("local terminal deadline", Duration::from_secs(1), || {
+                cancel.is_cancelled()
+            })
+            .await
+            .expect("the local deadline closes the session");
+            assert!(matches!(
+                next_outbound_message(&mut outbound_rx).await,
+                BlockSyncMessage::BlocksDone {
+                    start_height: block::Height(99),
+                    ..
+                }
+            ));
+        }
+        TerminalWaitEnd::Reconnect => {
+            let (_, _replacement_inbound, mut replacement_outbound) = connect_peer_with_status(
+                &service,
+                &mut actions,
+                66,
+                block::Height(1),
+                blocks[0].hash(),
+                1,
+                MAX_BS_RESPONSE_BYTES,
+            )
+            .await;
+            assert!(
+                cancel.is_cancelled(),
+                "replacement cancels the original session"
+            );
+            // Free the old queue too: a stale terminal must not be sent on either stream.
+            assert!(matches!(
+                next_outbound_message(&mut outbound_rx).await,
+                BlockSyncMessage::BlocksDone {
+                    start_height: block::Height(99),
+                    ..
+                }
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), async {
+                    loop {
+                        let frame = replacement_outbound
+                            .recv()
+                            .await
+                            .expect("replacement remains open");
+                        if !matches!(
+                            BlockSyncMessage::decode_frame(frame).expect("frame decodes"),
+                            BlockSyncMessage::Status(_)
+                        ) {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .is_err(),
+                "the replacement must not receive the old terminal"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), outbound_rx.recv())
+                    .await
+                    .is_err()
+            );
+        }
+        TerminalWaitEnd::Shutdown => {
+            reactor_task.abort();
+        }
+        TerminalWaitEnd::CloseQueue => {
+            drop(outbound_rx);
+            await_until(
+                "closed output cancels the session",
+                Duration::from_secs(1),
+                || cancel.is_cancelled(),
+            )
+            .await
+            .expect("closed output settles the wait");
+        }
+    }
+    await_until(
+        "terminal reservations return",
+        Duration::from_secs(1),
+        || {
+            let snapshot = wiring.serving_regulator.snapshot();
+            snapshot.node_active == 0 && snapshot.node_outstanding == 0
+        },
+    )
+    .await
+    .expect("terminal completion releases remaining ownership");
+    while let Ok(action) = actions.try_recv() {
+        assert!(
+            !matches!(action, BlockSyncAction::Misbehavior { .. }),
+            "local pressure is not misconduct"
+        );
+    }
     reactor_task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_serving_queue_eventually_sends_empty_response() {
+    check_empty_terminal_wait(TerminalWaitEnd::Drain, false).await;
+    check_empty_terminal_wait(TerminalWaitEnd::Drain, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_serving_queue_terminal_deadline_releases_ownership() {
+    check_empty_terminal_wait(TerminalWaitEnd::Timeout, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_serving_queue_terminal_cannot_cross_reconnect() {
+    check_empty_terminal_wait(TerminalWaitEnd::Reconnect, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_serving_queue_terminal_releases_ownership_on_shutdown() {
+    check_empty_terminal_wait(TerminalWaitEnd::Shutdown, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_serving_queue_terminal_releases_ownership_on_close() {
+    check_empty_terminal_wait(TerminalWaitEnd::CloseQueue, false).await;
 }
 
 #[tokio::test]

@@ -6,11 +6,21 @@ use crate::zakura::{
     OrderedSendError, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
     ZakuraBlockSyncCandidateState,
 };
+use futures::{stream::FuturesUnordered, StreamExt};
 use iroh::NodeId;
 use rand::{rngs::OsRng, RngCore};
-use std::num::NonZeroU64;
+use std::{future::Future, num::NonZeroU64, pin::Pin};
 
 mod trace;
+
+type ServingTerminalWait = Pin<Box<dyn Future<Output = ServingTerminalResult> + Send + Sync>>;
+
+struct ServingTerminalResult {
+    peer: ZakuraPeerId,
+    message: BlockSyncMessage,
+    outcome: &'static str,
+    elapsed: Duration,
+}
 
 /// Upper bound on how long the Sequencer task will wait to enqueue a verifier
 /// action before abandoning it. Reactor action sends are non-blocking.
@@ -265,6 +275,7 @@ pub fn spawn_block_sync_reactor(
     let reactor = BlockSyncReactor {
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
+        pending_serving_terminals: FuturesUnordered::new(),
         pending_needed_query: None,
         needed_query_retry_at: None,
         pending_body_supplier_restart: None,
@@ -312,6 +323,9 @@ pub fn spawn_block_sync_reactor(
 #[derive(Debug)]
 pub(super) struct BlockSyncReactor {
     startup: BlockSyncStartup,
+    /// Each wait retains an active request slot, bounding this set by admission.
+    /// Dropping the reactor also drops the waits and their remaining reservations.
+    pending_serving_terminals: FuturesUnordered<ServingTerminalWait>,
     state: BlockSyncState,
     /// Latest atomic header-engine view used to stamp body-work ownership.
     committed_view: Option<zakura_header_chain::CommittedHeaderChainView>,
@@ -446,6 +460,9 @@ impl BlockSyncReactor {
             tokio::pin!(needed_query_retry);
             tokio::select! {
                 _ = self.startup.shutdown.cancelled() => break,
+                Some(result) = self.pending_serving_terminals.next(), if !self.pending_serving_terminals.is_empty() => {
+                    self.trace_message_sent(&result.peer, &result.message, result.outcome, result.elapsed);
+                }
                 event = self.lifecycle.recv() => {
                     let Some(event) = event else { break };
                     self.handle_event(event).await;
@@ -1577,7 +1594,7 @@ impl BlockSyncReactor {
 
         let mut permit = attempt.commit();
         let Some(request_id) = self.next_serving_request_id else {
-            self.send_range_unavailable(&peer, start_height, count, &mut permit);
+            self.send_range_unavailable(&peer, start_height, count, permit);
             return;
         };
         self.next_serving_request_id = request_id
@@ -1601,20 +1618,20 @@ impl BlockSyncReactor {
                 requested_count,
                 permit,
             );
-        if let Err(mut permit) = started_serving {
-            self.send_range_unavailable(&peer, start_height, count, &mut permit);
+        if let Err(permit) = started_serving {
+            self.send_range_unavailable(&peer, start_height, count, permit);
             return;
         }
 
         if requested_count == 0 {
-            let mut request = self
+            let request = self
                 .finish_serving_blocks(&peer, request_id, start_height)
                 .expect("the request was just inserted into the serving ledger");
             self.send_range_unavailable(
                 &peer,
                 start_height,
                 request.original_count(),
-                request.permit_mut(),
+                request.into_permit(),
             );
             return;
         }
@@ -1628,14 +1645,14 @@ impl BlockSyncReactor {
             max_response_bytes: self.startup.config.advertised_max_response_bytes(),
             timeout: self.startup.config.get_blocks_regulation.query_timeout,
         }) {
-            let mut request = self
+            let request = self
                 .finish_serving_blocks(&peer, request_id, start_height)
                 .expect("the failed action belongs to the inserted serving request");
             self.send_range_unavailable(
                 &peer,
                 start_height,
                 request.original_count(),
-                request.permit_mut(),
+                request.into_permit(),
             );
         }
     }
@@ -1699,12 +1716,12 @@ impl BlockSyncReactor {
             sent_bytes = next_bytes;
         }
 
-        if sent_blocks == 0 {
-            self.send_range_unavailable(&peer, start_height, original_count, request.permit_mut());
-        } else {
-            self.send_blocks_done(&peer, start_height, sent_blocks, request.permit_mut());
-        }
         let total_elapsed = Some(request.elapsed());
+        if sent_blocks == 0 {
+            self.send_range_unavailable(&peer, start_height, original_count, request.into_permit());
+        } else {
+            self.send_blocks_done(&peer, start_height, sent_blocks, request.into_permit());
+        }
         self.trace_range_response_sent(
             &peer,
             RangeResponseTrace {
@@ -1728,7 +1745,7 @@ impl BlockSyncReactor {
         reported_requested_count: u32,
         returned_count: u32,
     ) {
-        let Some(mut request) = self.finish_serving_blocks(&peer, request_id, start_height) else {
+        let Some(request) = self.finish_serving_blocks(&peer, request_id, start_height) else {
             return;
         };
         let original_count = request.original_count();
@@ -1744,7 +1761,7 @@ impl BlockSyncReactor {
         }
         let elapsed = request.elapsed();
         if returned_count == 0 {
-            self.send_range_unavailable(&peer, start_height, original_count, request.permit_mut());
+            self.send_range_unavailable(&peer, start_height, original_count, request.into_permit());
         }
         self.trace_range_response_sent(
             &peer,
@@ -2171,113 +2188,114 @@ impl BlockSyncReactor {
     }
 
     fn send_blocks_done(
-        &self,
+        &mut self,
         peer: &ZakuraPeerId,
         start_height: block::Height,
         returned: u32,
-        permit: &mut GetBlocksServingPermit,
+        permit: GetBlocksServingPermit,
     ) {
-        if returned == 0 {
-            return;
-        }
+        self.send_serving_terminal(
+            peer,
+            BlockSyncMessage::BlocksDone {
+                start_height,
+                returned,
+            },
+            permit,
+        );
+    }
+
+    fn send_range_unavailable(
+        &mut self,
+        peer: &ZakuraPeerId,
+        start_height: block::Height,
+        count: u32,
+        permit: GetBlocksServingPermit,
+    ) {
+        self.send_serving_terminal(
+            peer,
+            BlockSyncMessage::RangeUnavailable {
+                start_height,
+                count: count.max(1),
+            },
+            permit,
+        );
+    }
+
+    fn send_serving_terminal(
+        &mut self,
+        peer: &ZakuraPeerId,
+        message: BlockSyncMessage,
+        mut permit: GetBlocksServingPermit,
+    ) {
         let Some(session) = self
             .state
             .peers
             .get(peer)
-            .map(|peer_state| peer_state.session.clone())
+            .map(|state| state.session.clone())
         else {
             return;
         };
-        let msg = BlockSyncMessage::BlocksDone {
-            start_height,
-            returned,
-        };
         let started = Instant::now();
-        match session.try_send_regulated_blocks_done(start_height, returned, permit) {
-            Ok(()) => self.trace_message_sent(peer, &msg, "queued", started.elapsed()),
+        match session.try_send_regulated_message(message.clone(), &mut permit) {
+            Ok(()) => self.trace_message_sent(peer, &message, "queued", started.elapsed()),
             Err(OrderedSendError::Full) => {
-                metrics::counter!("sync.block.done.serve_queue_full").increment(1);
-                tracing::debug!(?peer, "Zakura block-sync BlocksDone queue is full");
-                self.trace_message_sent(peer, &msg, "full", started.elapsed());
-                self.trace_queue_send_failed(
-                    peer,
-                    &msg,
-                    &OrderedSendError::Full,
-                    session.outbound_capacity(),
-                    session.outbound_max_capacity(),
-                    None,
-                );
+                match &message {
+                    BlockSyncMessage::BlocksDone { .. } => {
+                        metrics::counter!("sync.block.done.serve_queue_full").increment(1)
+                    }
+                    _ => metrics::counter!("sync.block.unavailable.serve_queue_full").increment(1),
+                }
+                self.trace_message_sent(peer, &message, "waiting", started.elapsed());
+                // A terminal message is required even after a partial response.
+                // Keep the permit until queue admission, cancellation, or the
+                // local deadline; never resolve this wait through a newer session.
+                let peer = peer.clone();
+                let cancelled = session.cancel_token();
+                let deadline = time::Instant::now() + self.startup.config.request_timeout;
+                self.pending_serving_terminals.push(Box::pin(async move {
+                    let outcome = tokio::select! {
+                        biased;
+                        _ = cancelled.cancelled() => "cancelled",
+                        _ = time::sleep_until(deadline) => {
+                            cancelled.cancel();
+                            "timeout"
+                        }
+                        result = session.send_regulated_message(message.clone(), &mut permit) => {
+                            match result {
+                                Ok(()) => "queued",
+                                Err(_) => {
+                                    cancelled.cancel();
+                                    "error"
+                                }
+                            }
+                        }
+                    };
+                    if outcome == "timeout" {
+                        metrics::counter!("sync.block.terminal.queue_timeout").increment(1);
+                        tracing::debug!(
+                            ?peer,
+                            "timed out waiting to queue a GetBlocks terminal response"
+                        );
+                    }
+                    ServingTerminalResult {
+                        peer,
+                        message,
+                        outcome,
+                        elapsed: started.elapsed(),
+                    }
+                }));
             }
             Err(error) => {
-                tracing::debug!(
-                    ?peer,
-                    ?error,
-                    "failed to queue Zakura block-sync BlocksDone"
-                );
-                self.trace_message_sent(peer, &msg, "error", started.elapsed());
+                self.trace_message_sent(peer, &message, "error", started.elapsed());
                 self.trace_queue_send_failed(
                     peer,
-                    &msg,
+                    &message,
                     &error,
                     session.outbound_capacity(),
                     session.outbound_max_capacity(),
                     None,
                 );
                 session.cancel_token().cancel();
-            }
-        }
-    }
-
-    fn send_range_unavailable(
-        &self,
-        peer: &ZakuraPeerId,
-        start_height: block::Height,
-        count: u32,
-        permit: &mut GetBlocksServingPermit,
-    ) {
-        let count = count.max(1);
-        let Some(peer_state) = self.state.peers.get(peer) else {
-            return;
-        };
-        let msg = BlockSyncMessage::RangeUnavailable {
-            start_height,
-            count,
-        };
-        let started = Instant::now();
-        match peer_state
-            .session
-            .try_send_regulated_range_unavailable(start_height, count, permit)
-        {
-            Ok(()) => self.trace_message_sent(peer, &msg, "queued", started.elapsed()),
-            Err(OrderedSendError::Full) => {
-                metrics::counter!("sync.block.unavailable.serve_queue_full").increment(1);
-                tracing::debug!(?peer, "Zakura block-sync RangeUnavailable queue is full");
-                self.trace_message_sent(peer, &msg, "full", started.elapsed());
-                self.trace_queue_send_failed(
-                    peer,
-                    &msg,
-                    &OrderedSendError::Full,
-                    peer_state.session.outbound_capacity(),
-                    peer_state.session.outbound_max_capacity(),
-                    None,
-                );
-            }
-            Err(error) => {
-                tracing::debug!(
-                    ?peer,
-                    ?error,
-                    "failed to queue Zakura block-sync RangeUnavailable"
-                );
-                self.trace_message_sent(peer, &msg, "error", started.elapsed());
-                self.trace_queue_send_failed(
-                    peer,
-                    &msg,
-                    &error,
-                    peer_state.session.outbound_capacity(),
-                    peer_state.session.outbound_max_capacity(),
-                    None,
-                );
-                peer_state.session.cancel_token().cancel();
             }
         }
     }

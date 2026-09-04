@@ -9,12 +9,13 @@ families do not yet share these accounts.
 | Resource | Default | Owner and release point |
 | --- | --- | --- |
 | Pending requests | 64 per session, 1,024 per node | Queue entry or admission task; released on admission or cancellation |
-| Active requests | 64 per node; per-session ceiling follows advertised inflight requests | Ledger, state worker, and returned result share ownership; released when their last owner drops |
+| Active requests | 64 per node; per-session ceiling follows advertised inflight requests | Ledger, state worker, returned result, and pending terminal share ownership; released when their last owner drops |
 | Outstanding response payload | 64 MiB per session, 256 MiB per node | Reserved before the query; actual queued bytes transfer into frame leases, released after the application write completes or drops |
 | Peer work rate | 16 MiB/s; burst 32 MiB + 128 bytes + 9 bytes + 64 KiB | Identity account survives reconnects while retained; fixed work and queued payload consume tokens, unused response allowance is refunded |
 | Node work rate | 64 MiB/s; burst 128 MiB | Shared GetBlocks account with the same settlement rules |
 | Fixed request work | 64 KiB of byte-equivalent work | Committed when the reactor accepts the request, even for an empty response |
 | Query response deadline | 8 seconds | Ends response delivery; underlying state work keeps its charge until completion |
+| Terminal queue deadline | `request_timeout`, 8 seconds by default | Retains the terminal and request ownership while waiting; expiry closes the original session without a misconduct score |
 | Full pending queue deadline | `request_timeout`, 8 seconds by default | Closes the locally backpressured session without a peer misconduct score |
 
 For a request clamped to `count` blocks, the reserved payload is
@@ -37,11 +38,20 @@ queue entries; there can also be one blocked input per live session. That input
 may own a session slot while waiting for a node slot.
 
 The query lease follows the dispatched action, the underlying state future, and
-the returned blocks. Removing the ledger cancels delivery and prevents queued
-work from starting. A running read drains even after timeout or disconnect,
+the returned blocks. Dropping request ownership cancels delivery and prevents
+queued work from starting. A running read drains even after timeout or disconnect,
 because dropping its awaiter would not stop blocking state work. Each lease
 authorizes at most one query. A read that never completes keeps its capacity;
 the timeout cannot promise to terminate the underlying storage operation.
+
+A full outbound queue can truncate a block response to the prefix already
+queued, but its `BlocksDone` or `RangeUnavailable` is retained until queue space
+is available. Each terminal wait owns the request's active slot and remaining
+reservations, so at most the configured active-request limit can wait. These
+waits run independently of other reactor work and stay tied to the original
+session. Cancellation, queue closure, reactor shutdown, or the local deadline
+ends the wait. Successful enqueue transfers terminal bytes to the transport;
+those bytes remain charged until the application write completes or drops.
 
 ## Memory boundary
 

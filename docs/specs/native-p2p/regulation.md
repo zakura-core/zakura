@@ -147,6 +147,11 @@ including a terminal response. Multiplication and addition MUST use checked
 arithmetic. Peer-provided configuration MUST NOT increase the local charge
 limit.
 
+An internal query that can produce several response items MUST receive the
+applicable local byte limit and enforce it while constructing its result.
+Charging only the outbound prefix does not bound a larger intermediate result
+that is materialized and discarded later.
+
 Each regulated serving exchange MUST use the controls that apply:
 
 | Control | Required behavior |

@@ -10,6 +10,14 @@ name: PR node image bake
 # PR-node runs sync the remaining gap during their hour.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - .github/actions/do-droplet/**
+      - .github/workflows/zakura-pr-node-bake.yml
+      - .github/workflows/scripts/do_provision.py
+      - .github/workflows/scripts/do_seed_approach.py
+      - .github/workflows/scripts/pr-node-bake.sh
   workflow_dispatch:
     inputs:
       notify:

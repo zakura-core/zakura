@@ -566,6 +566,7 @@ impl PeerRoutine {
                     .routine_to_reactor
                     .try_send(RoutineToReactor::ServeGetBlocks {
                         peer: self.peer.clone(),
+                        session_generation: self.generation,
                         start_height,
                         count,
                     });

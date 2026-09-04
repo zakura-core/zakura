@@ -29,9 +29,20 @@ pub const MAX_BS_BLOCKS_PER_REQUEST: u32 = 128;
 pub const MAX_BS_MESSAGE_BYTES: usize = 3 * 1024 * 1024;
 
 pub(super) const BLOCK_SYNC_MESSAGE_TYPE_BYTES: usize = 1;
+const GET_BLOCKS_PAYLOAD_BYTES: usize = BLOCK_SYNC_MESSAGE_TYPE_BYTES + 4 + 4;
 
 const _: () = assert!(MAX_BS_MESSAGE_BYTES < 4 * 1024 * 1024);
 const _: () = assert!(MAX_BS_MESSAGE_BYTES > block::MAX_BLOCK_BYTES as usize);
+
+/// Return the payload cap that must be enforced before allocating a buffer for
+/// a fixed-size inbound message.
+///
+/// Variable-size messages return `None` and remain bounded by the stream cap.
+/// Keeping this table beside the codec makes each future fixed-size message's
+/// allocation boundary part of its wire definition.
+pub(crate) fn preallocation_payload_cap(message_type: u16) -> Option<usize> {
+    (message_type == u16::from(MSG_BS_GET_BLOCKS)).then_some(GET_BLOCKS_PAYLOAD_BYTES)
+}
 
 /// Native stream-6 block-sync message.
 #[derive(Clone, Debug, Eq, PartialEq)]

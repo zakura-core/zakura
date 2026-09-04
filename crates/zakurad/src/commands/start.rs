@@ -1674,9 +1674,9 @@ mod zakura_header_sync_driver_tests {
     use zakura_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
     use zakura_network::zakura::testkit::{TraceCapture, TraceValue};
     use zakura_network::zakura::{
-        commit_state_trace as cs_trace, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
-        BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMisbehavior,
-        BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, DEFAULT_HS_RANGE,
+        commit_state_trace as cs_trace, BlockApplyResult, BlockRangeRequestId, BlockSizeEstimate,
+        BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers,
+        BlockSyncMisbehavior, BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, DEFAULT_HS_RANGE,
     };
     use zakura_network::P2pStack;
     use zakura_test::vectors::{
@@ -3880,6 +3880,8 @@ mod zakura_header_sync_driver_tests {
             .expect("driver action channel stays open");
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                request_id: BlockRangeRequestId::new(1)
+                    .expect("test serving request ID is nonzero"),
                 peer: test_zakura_peer(77),
                 start: block::Height(1),
                 count: 1,
@@ -4003,6 +4005,8 @@ mod zakura_header_sync_driver_tests {
             .expect("fallback acquires the lease after the apply drains");
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                request_id: BlockRangeRequestId::new(1)
+                    .expect("test serving request ID is nonzero"),
                 peer: test_zakura_peer(78),
                 start: block::Height(1),
                 count: 1,
@@ -4077,6 +4081,8 @@ mod zakura_header_sync_driver_tests {
         // Send a serving query to Zakura.
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                request_id: BlockRangeRequestId::new(1)
+                    .expect("test serving request ID is nonzero"),
                 peer: test_zakura_peer(79),
                 start: block::Height(1),
                 count: 1,
@@ -4166,6 +4172,8 @@ mod zakura_header_sync_driver_tests {
         }
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                request_id: BlockRangeRequestId::new(1)
+                    .expect("test serving request ID is nonzero"),
                 peer: test_zakura_peer(80),
                 start: block::Height(1),
                 count: 2,

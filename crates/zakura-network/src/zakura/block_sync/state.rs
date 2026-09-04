@@ -115,6 +115,9 @@ impl BlockSyncStartup {
 pub struct BlockSyncHandle {
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
+    /// Internal peer-session lifecycle path. This stays separate from the
+    /// public driver events so generation ownership is crate-private.
+    pub(super) peer_lifecycle: mpsc::UnboundedSender<BlockSyncPeerLifecycleEvent>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) status: watch::Receiver<BlockSyncStatus>,
     pub(super) candidates: watch::Receiver<ZakuraBlockSyncCandidateState>,
@@ -788,8 +791,28 @@ pub(super) struct PeerBlockState {
     /// `status_reply_meter`; this half stays reactor-side because the reactor owns
     /// serving-tip advertisement.
     pub(super) refresh_meter: RateMeter,
-    pub(super) served_blocks_inflight: u32,
-    pub(super) served_block_requests: VecDeque<(block::Height, Instant)>,
+    served_block_requests: VecDeque<ServingBlockRequest>,
+}
+
+/// Ledger entry for one accepted inbound `GetBlocks` request.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct ServingBlockRequest {
+    id: BlockRangeRequestId,
+    start_height: block::Height,
+    requested_count: u32,
+    started: Instant,
+}
+
+impl ServingBlockRequest {
+    /// Count accepted after the wire, configuration, and servable-range clamps.
+    pub(super) fn requested_count(self) -> u32 {
+        self.requested_count
+    }
+
+    /// Time elapsed since this request acquired its serving slot.
+    pub(super) fn elapsed(self) -> Duration {
+        self.started.elapsed()
+    }
 }
 
 impl PeerBlockState {
@@ -798,7 +821,6 @@ impl PeerBlockState {
             direction: session.direction(),
             session,
             refresh_meter: RateMeter::new(config.status_refresh_interval),
-            served_blocks_inflight: 0,
             served_block_requests: VecDeque::new(),
         }
     }
@@ -806,33 +828,45 @@ impl PeerBlockState {
     pub(super) fn try_start_serving_blocks(
         &mut self,
         local_inflight_cap: u32,
+        request_id: BlockRangeRequestId,
         start_height: block::Height,
+        requested_count: u32,
     ) -> bool {
-        if self.served_blocks_inflight >= local_inflight_cap {
+        if self.served_block_requests.len()
+            >= usize::try_from(local_inflight_cap)
+                .expect("u32 serving limit fits in usize on supported targets")
+        {
             return false;
         }
-        self.served_blocks_inflight = self.served_blocks_inflight.saturating_add(1);
-        self.served_block_requests
-            .push_back((start_height, Instant::now()));
+        self.served_block_requests.push_back(ServingBlockRequest {
+            id: request_id,
+            start_height,
+            requested_count,
+            started: Instant::now(),
+        });
         true
     }
 
-    pub(super) fn serving_blocks_elapsed(&self, start_height: block::Height) -> Option<Duration> {
+    pub(super) fn serving_block_request(
+        &self,
+        request_id: BlockRangeRequestId,
+        start_height: block::Height,
+    ) -> Option<ServingBlockRequest> {
         self.served_block_requests
             .iter()
-            .find_map(|(start, started)| (*start == start_height).then(|| started.elapsed()))
+            .find(|request| request.id == request_id && request.start_height == start_height)
+            .copied()
     }
 
     pub(super) fn finish_serving_blocks(
         &mut self,
+        request_id: BlockRangeRequestId,
         start_height: block::Height,
-    ) -> Option<Duration> {
-        self.served_blocks_inflight = self.served_blocks_inflight.saturating_sub(1);
+    ) -> Option<ServingBlockRequest> {
         self.served_block_requests
             .iter()
-            .position(|(start, _)| *start == start_height)
+            .position(|request| request.id == request_id && request.start_height == start_height)
             .and_then(|index| self.served_block_requests.remove(index))
-            .map(|(_, started)| started.elapsed())
     }
 }
 

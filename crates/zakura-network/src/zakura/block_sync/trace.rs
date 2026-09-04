@@ -524,12 +524,14 @@ enum BlockEventDetail {
         verified_block_tip: Option<u64>,
     },
     BlockRangeResponseFinished {
+        request_id: u64,
         peer: String,
         range_start: u64,
         range_count: u64,
         expected_count: u64,
     },
     BlockRangeResponseReady {
+        request_id: u64,
         peer: String,
         range_start: u64,
         range_count: u64,
@@ -598,22 +600,26 @@ impl BlockEventReceived {
                 verified_block_tip: None,
             },
             BlockSyncEvent::BlockRangeResponseFinished {
+                request_id,
                 peer,
                 start_height,
                 requested_count,
                 returned_count,
             } => BlockEventDetail::BlockRangeResponseFinished {
+                request_id: request_id.get(),
                 peer: peer_label(peer),
                 range_start: height(*start_height),
                 range_count: u64::from(*returned_count),
                 expected_count: u64::from(*requested_count),
             },
             BlockSyncEvent::BlockRangeResponseReady {
+                request_id,
                 peer,
                 start_height,
                 requested_count,
                 blocks,
             } => BlockEventDetail::BlockRangeResponseReady {
+                request_id: request_id.get(),
                 peer: peer_label(peer),
                 range_start: height(*start_height),
                 range_count: saturating_usize(blocks.len()),
@@ -647,6 +653,7 @@ enum BlockActionDetail {
         best_header_tip: u64,
     },
     QueryBlocksByHeightRange {
+        request_id: u64,
         peer: String,
         range_start: u64,
         range_count: u64,
@@ -680,13 +687,17 @@ impl BlockActionDispatched {
                 range_count: u64::from(*limit),
                 best_header_tip: height(*best_header_tip),
             },
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                BlockActionDetail::QueryBlocksByHeightRange {
-                    peer: peer_label(peer),
-                    range_start: height(*start),
-                    range_count: u64::from(*count),
-                }
-            }
+            BlockSyncAction::QueryBlocksByHeightRange {
+                request_id,
+                peer,
+                start,
+                count,
+            } => BlockActionDetail::QueryBlocksByHeightRange {
+                request_id: request_id.get(),
+                peer: peer_label(peer),
+                range_start: height(*start),
+                range_count: u64::from(*count),
+            },
             BlockSyncAction::SubmitBlock { token, block, .. } => BlockActionDetail::SubmitBlock {
                 apply_token: *token,
                 hash: hash(block.hash()),
@@ -947,21 +958,23 @@ mod tests {
             ),
             (
                 BlockEventDetail::BlockRangeResponseFinished {
+                    request_id: 4,
                     peer: "p".into(),
                     range_start: 1,
                     range_count: 2,
                     expected_count: 3,
                 },
-                json!({"kind": "block_range_response_finished", "peer": "p", "range_start": 1, "range_count": 2, "expected_count": 3}),
+                json!({"kind": "block_range_response_finished", "request_id": 4, "peer": "p", "range_start": 1, "range_count": 2, "expected_count": 3}),
             ),
             (
                 BlockEventDetail::BlockRangeResponseReady {
+                    request_id: 4,
                     peer: "p".into(),
                     range_start: 1,
                     range_count: 2,
                     expected_count: 3,
                 },
-                json!({"kind": "block_range_response_ready", "peer": "p", "range_start": 1, "range_count": 2, "expected_count": 3}),
+                json!({"kind": "block_range_response_ready", "request_id": 4, "peer": "p", "range_start": 1, "range_count": 2, "expected_count": 3}),
             ),
         ];
 
@@ -988,11 +1001,12 @@ mod tests {
             ),
             (
                 BlockActionDetail::QueryBlocksByHeightRange {
+                    request_id: 4,
                     peer: "p".into(),
                     range_start: 1,
                     range_count: 2,
                 },
-                json!({"kind": "query_blocks_by_height_range", "peer": "p", "range_start": 1, "range_count": 2}),
+                json!({"kind": "query_blocks_by_height_range", "request_id": 4, "peer": "p", "range_start": 1, "range_count": 2}),
             ),
             (
                 BlockActionDetail::SubmitBlock {

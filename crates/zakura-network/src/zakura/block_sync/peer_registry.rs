@@ -598,9 +598,27 @@ impl PeerRegistry {
         }
     }
 
-    /// Remove a peer's entry entirely (disconnect/teardown/admission-reject).
+    /// Remove a peer only when the disconnect still owns its current session.
+    pub(super) fn remove_session(&self, peer: &ZakuraPeerId, session_id: u64) {
+        let mut peers = self.lock();
+        if peers
+            .get(peer)
+            .is_some_and(|entry| entry.generation == session_id)
+        {
+            peers.remove(peer);
+        }
+    }
+
+    /// Remove the current peer entry for a public, ownerless teardown event.
     pub(super) fn remove(&self, peer: &ZakuraPeerId) {
         self.lock().remove(peer);
+    }
+
+    /// Return whether `generation` still owns this peer's live routine session.
+    pub(super) fn owns_generation(&self, peer: &ZakuraPeerId, generation: u64) -> bool {
+        self.lock()
+            .get(peer)
+            .is_some_and(|entry| entry.generation == generation)
     }
 
     /// Publish a freshly-applied `Status` (routine-side, inverted inbound flow): grow

@@ -66,9 +66,10 @@ pub use bench::{
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
 pub use config::{BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
 pub use error::BlockSyncWireError;
+use events::BlockSyncPeerLifecycleEvent;
 pub use events::{
-    BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
-    BlockSyncEvent, BlockSyncMisbehavior,
+    BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockRangeRequestId, BlockSyncAction,
+    BlockSyncBlockMeta, BlockSyncEvent, BlockSyncMisbehavior,
 };
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;
@@ -79,6 +80,7 @@ pub(crate) use service::BlockSyncService;
 #[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;
 pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
+pub(crate) use wire::preallocation_payload_cap;
 pub use wire::{
     BlockSyncMessage, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_MESSAGE_BYTES, MSG_BS_BLOCK,
     MSG_BS_BLOCKS_DONE, MSG_BS_GET_BLOCKS, MSG_BS_RANGE_UNAVAILABLE, MSG_BS_STATUS,

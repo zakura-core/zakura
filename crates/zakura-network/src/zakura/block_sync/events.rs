@@ -1,7 +1,7 @@
 #[cfg(any(test, feature = "proptest-impl"))]
 use super::state::BlockSyncFrontiers;
 use super::{request::*, *};
-use std::num::NonZeroU64;
+use std::{fmt, num::NonZeroU64};
 
 /// Committed header metadata used by block sync to schedule and validate a body.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -80,25 +80,49 @@ pub enum BlockSyncEvent {
     },
     /// Node wiring finished or abandoned a `Block` response to an inbound `GetBlocks`.
     BlockRangeResponseFinished {
+        /// Exact inbound request being completed.
+        request_id: BlockRangeRequestId,
         /// Peer whose served-response slot can be released.
         peer: ZakuraPeerId,
         /// First requested height.
         start_height: block::Height,
-        /// Requested block count.
+        /// Driver echo retained for diagnostics. The reactor uses the count in
+        /// its serving ledger when it processes this completion.
         requested_count: u32,
         /// Number of blocks read from state and sent in the response.
         returned_count: u32,
     },
     /// State returned committed bodies requested by a peer and the reactor should send them.
     BlockRangeResponseReady {
+        /// Exact inbound request being completed.
+        request_id: BlockRangeRequestId,
         /// Peer whose inbound request is being served.
         peer: ZakuraPeerId,
         /// First requested height.
         start_height: block::Height,
-        /// Requested block count.
+        /// Driver echo retained for diagnostics. The reactor uses the count in
+        /// its serving ledger when it processes this completion.
         requested_count: u32,
         /// Bounded committed blocks returned by state.
         blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
+    },
+}
+
+/// Session lifecycle facts sent from [`BlockSyncService`] to the reactor.
+///
+/// This internal channel carries the session generation needed to reject stale
+/// connect and disconnect events. Keeping it separate from [`BlockSyncEvent`]
+/// prevents transport bookkeeping from becoming part of the public driver API.
+#[derive(Clone, Debug)]
+pub(super) enum BlockSyncPeerLifecycleEvent {
+    /// A newly admitted stream session is ready for reactor bookkeeping.
+    Connected(BlockSyncPeerSession),
+    /// One exact stream session has ended.
+    Disconnected {
+        /// Peer whose stream session ended.
+        peer: ZakuraPeerId,
+        /// Generation assigned when the session was admitted.
+        session_id: u64,
     },
 }
 
@@ -253,6 +277,34 @@ impl BlockApplyOutcome {
 /// ignore those stale completions instead of releasing a newer in-flight body.
 pub type BlockApplyToken = u64;
 
+/// Monotonic identity assigned to each inbound `GetBlocks` request.
+///
+/// The state driver echoes this identity so a delayed completion cannot release
+/// a newer serving slot or send blocks through a replacement peer session.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BlockRangeRequestId(NonZeroU64);
+
+impl BlockRangeRequestId {
+    /// Construct an ID, returning `None` for the reserved zero value.
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Return the nonzero integer carried by this request identity.
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for BlockRangeRequestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// Actions emitted by the future block-sync reactor for the service seam.
 #[derive(Clone, Debug)]
 pub enum BlockSyncAction {
@@ -271,6 +323,8 @@ pub enum BlockSyncAction {
     },
     /// Ask node wiring to read committed bodies for an inbound `GetBlocks`.
     QueryBlocksByHeightRange {
+        /// Exact inbound request identity to echo in the response event.
+        request_id: BlockRangeRequestId,
         /// Peer that requested the range.
         peer: ZakuraPeerId,
         /// First height.
@@ -396,6 +450,8 @@ pub(super) enum RoutineToReactor {
     ServeGetBlocks {
         /// Peer that requested the range.
         peer: ZakuraPeerId,
+        /// Registry generation of the session routine that decoded the request.
+        session_generation: u64,
         /// First requested height.
         start_height: block::Height,
         /// Requested block count.

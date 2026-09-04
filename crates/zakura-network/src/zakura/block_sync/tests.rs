@@ -16,6 +16,7 @@ use super::{
         DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
         MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
+    events::RoutineToReactor,
     peer_registry::{OutstandingMeta, PeerRegistry},
     reactor::{
         node_id_from_block_peer_id, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
@@ -6421,13 +6422,15 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
             hash: block::Hash([1; 32]),
         })
         .expect("test fills bounded wire queue");
-    let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+    let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (peer_lifecycle, mut peer_lifecycle_rx) = mpsc::unbounded_channel();
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
         events,
         lifecycle,
+        peer_lifecycle,
         peers,
         status,
         candidates,
@@ -6452,21 +6455,126 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let _inbound_tx = inbound_tx;
 
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), lifecycle_rx.recv())
+        tokio::time::timeout(Duration::from_secs(1), peer_lifecycle_rx.recv())
             .await
             .expect("lifecycle event arrives")
             .expect("lifecycle channel stays open"),
-        BlockSyncEvent::PeerConnected(session) if session.peer_id() == &peer
+        BlockSyncPeerLifecycleEvent::Connected(session) if session.peer_id() == &peer
     ));
 
     service.remove_peer(&peer, 0);
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), lifecycle_rx.recv())
+        tokio::time::timeout(Duration::from_secs(1), peer_lifecycle_rx.recv())
             .await
             .expect("lifecycle event arrives")
             .expect("lifecycle channel stays open"),
-        BlockSyncEvent::PeerDisconnected(disconnected) if disconnected == peer
+        BlockSyncPeerLifecycleEvent::Disconnected {
+            peer: disconnected,
+            ..
+        } if disconnected == peer
     ));
+}
+
+/// Moving the public handle into the service must not close the now-unused
+/// public control channel and terminate the reactor before peer admission.
+#[tokio::test]
+async fn service_owned_handle_keeps_public_control_channel_alive() {
+    let config = ZakuraBlockSyncConfig::default();
+    let startup = BlockSyncStartup::inert(config.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle);
+
+    let _peer = connect_peer_with_status(
+        &service,
+        &mut actions,
+        92,
+        block::Height(1),
+        block::Hash([1; 32]),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    reactor_task.abort();
+    let _ = reactor_task.await;
+}
+
+/// A delayed connect for an older session must not replace the newer session
+/// already installed for the same peer. Its later disconnect must be stale too.
+#[tokio::test]
+async fn older_peer_connected_event_cannot_replace_newer_session() {
+    let startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    let shutdown = startup.shutdown.clone();
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let target_peer = peer(93);
+    let barrier_peer = peer(94);
+    let old_cancel = CancellationToken::new();
+    let new_cancel = CancellationToken::new();
+    let barrier_cancel = CancellationToken::new();
+    let (old_send, _old_recv) = framed_channel(4);
+    let (new_send, _new_recv) = framed_channel(4);
+    let (barrier_send, _barrier_recv) = framed_channel(4);
+    let old_session = BlockSyncPeerSession::for_test_with_session_id(
+        target_peer.clone(),
+        1,
+        old_send,
+        old_cancel.clone(),
+    );
+    let new_session = BlockSyncPeerSession::for_test_with_session_id(
+        target_peer.clone(),
+        2,
+        new_send,
+        new_cancel.clone(),
+    );
+    let barrier_session = BlockSyncPeerSession::for_test_with_session_id(
+        barrier_peer,
+        3,
+        barrier_send,
+        barrier_cancel,
+    );
+    let mut snapshots = handle.subscribe_peer_snapshot();
+
+    // These events intentionally form one uninterrupted lifecycle step. The
+    // final peer is a FIFO barrier proving the preceding stale events ran.
+    handle
+        .peer_lifecycle
+        .send(BlockSyncPeerLifecycleEvent::Connected(new_session))
+        .expect("reactor keeps the peer lifecycle channel open");
+    handle
+        .peer_lifecycle
+        .send(BlockSyncPeerLifecycleEvent::Connected(old_session))
+        .expect("reactor keeps the peer lifecycle channel open");
+    handle
+        .peer_lifecycle
+        .send(BlockSyncPeerLifecycleEvent::Disconnected {
+            peer: target_peer,
+            session_id: 1,
+        })
+        .expect("reactor keeps the peer lifecycle channel open");
+    handle
+        .peer_lifecycle
+        .send(BlockSyncPeerLifecycleEvent::Connected(barrier_session))
+        .expect("reactor keeps the peer lifecycle channel open");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while snapshots.borrow_and_update().outbound_peers != 2 {
+            snapshots
+                .changed()
+                .await
+                .expect("reactor keeps the peer snapshot channel open");
+        }
+    })
+    .await
+    .expect("reactor processes the lifecycle step");
+
+    assert!(old_cancel.is_cancelled());
+    assert!(!new_cancel.is_cancelled());
+    assert_eq!(handle.peer_snapshot().outbound_peers, 2);
+
+    shutdown.cancel();
+    reactor_task
+        .await
+        .expect("block-sync reactor exits cleanly");
 }
 
 #[tokio::test]
@@ -11859,21 +11967,27 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
         .await
         .expect("GetBlocks frame queues");
 
-    loop {
+    let request_id = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+            BlockSyncAction::QueryBlocksByHeightRange {
+                request_id,
+                peer,
+                start,
+                count,
+            } => {
                 assert_eq!(peer, peer_id);
                 assert_eq!(start, block::Height(1));
                 assert_eq!(count, 2);
-                break;
+                break request_id;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before block range query: {action:?}"),
         }
-    }
+    };
 
     handle
         .send(BlockSyncEvent::BlockRangeResponseReady {
+            request_id,
             peer: peer_id.clone(),
             start_height: block::Height(1),
             requested_count: 2,
@@ -11918,6 +12032,103 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
     assert_eq!(
         wait_for_outbound_range_unavailable(&mut outbound_rx).await,
         (block::Height(4), 1)
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_ignores_get_blocks_from_superseded_routine_generation() {
+    let config = ZakuraBlockSyncConfig::default();
+    let mut startup = BlockSyncStartup::inert(config.clone());
+    startup.frontiers.finalized_height = block::Height(3);
+    startup.frontiers.verified_block_tip = block::Height(3);
+    startup.best_header_tip = (block::Height(3), block::Hash([3; 32]));
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let wiring = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes routine wiring");
+    let peer_id = peer(0x6f);
+    let old_generation = wiring
+        .registry
+        .admit_session(
+            &peer_id,
+            ServicePeerDirection::Outbound,
+            &config,
+            1,
+            Instant::now(),
+        )
+        .generation();
+    let current_generation = wiring
+        .registry
+        .admit_session(
+            &peer_id,
+            ServicePeerDirection::Outbound,
+            &config,
+            2,
+            Instant::now(),
+        )
+        .generation();
+    wiring.registry.upsert_status(
+        &peer_id,
+        current_generation,
+        BlockSyncStatus {
+            servable_low: block::Height::MIN,
+            servable_high: block::Height(3),
+            ..BlockSyncStatus::default()
+        },
+    );
+
+    let (outbound, mut outbound_recv) = framed_channel(4);
+    handle
+        .send(BlockSyncEvent::PeerConnected(
+            BlockSyncPeerSession::for_test(peer_id.clone(), outbound, CancellationToken::new()),
+        ))
+        .await
+        .expect("the peer connection queues");
+    wait_for_outbound_status(&mut outbound_recv).await;
+
+    wiring
+        .routine_to_reactor
+        .send(RoutineToReactor::ServeGetBlocks {
+            peer: peer_id.clone(),
+            session_generation: old_generation,
+            start_height: block::Height(1),
+            count: 1,
+        })
+        .await
+        .expect("the stale serving request queues");
+    wiring
+        .routine_to_reactor
+        .send(RoutineToReactor::ServeGetBlocks {
+            peer: peer_id.clone(),
+            session_generation: current_generation,
+            start_height: block::Height(2),
+            count: 1,
+        })
+        .await
+        .expect("the current serving request queues");
+
+    match next_action(&mut actions).await {
+        BlockSyncAction::QueryBlocksByHeightRange {
+            peer, start, count, ..
+        } => {
+            assert_eq!(peer, peer_id);
+            assert_eq!(start, block::Height(2));
+            assert_eq!(count, 1);
+        }
+        action => panic!("stale serving request produced an observable action: {action:?}"),
+    }
+    assert!(
+        actions.try_recv().is_err(),
+        "the stale serving request must not produce a second action"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), outbound_recv.recv())
+            .await
+            .is_err(),
+        "the stale serving request must not send a frame"
     );
 
     reactor_task.abort();
@@ -13853,10 +14064,13 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
             .await
             .expect("GetBlocks frame queues");
     }
-    while !matches!(
-        next_action(&mut actions).await,
-        BlockSyncAction::QueryBlocksByHeightRange { .. }
-    ) {}
+    let request_id = loop {
+        if let BlockSyncAction::QueryBlocksByHeightRange { request_id, .. } =
+            next_action(&mut actions).await
+        {
+            break request_id;
+        }
+    };
 
     assert_eq!(
         wait_for_outbound_range_unavailable(&mut outbound_rx).await,
@@ -13867,13 +14081,19 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
 
     handle
         .send(BlockSyncEvent::BlockRangeResponseFinished {
+            request_id,
             peer: peer_id.clone(),
             start_height: block::Height(1),
-            requested_count: 1,
-            returned_count: 1,
+            requested_count: u32::MAX,
+            returned_count: 0,
         })
         .await
         .expect("serving slot release queues");
+    assert_eq!(
+        wait_for_outbound_range_unavailable(&mut outbound_rx).await,
+        (block::Height(1), 1),
+        "the serving ledger, not the driver's echoed count, owns the response",
+    );
 
     reactor_task.abort();
 }
@@ -13958,18 +14178,23 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         )
         .await
         .expect("GetBlocks frame queues");
-    loop {
+    let first_request_id = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+            BlockSyncAction::QueryBlocksByHeightRange {
+                request_id,
+                peer,
+                start,
+                count,
+            } => {
                 assert_eq!(peer, peer_id);
                 assert_eq!(start, block::Height(1));
                 assert_eq!(count, 3);
-                break;
+                break request_id;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before block range query: {action:?}"),
         }
-    }
+    };
     let served: Vec<_> = blocks
         .iter()
         .map(|block| {
@@ -13982,6 +14207,7 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         .collect();
     handle
         .send(BlockSyncEvent::BlockRangeResponseReady {
+            request_id: first_request_id,
             peer: peer_id.clone(),
             start_height: block::Height(1),
             requested_count: 3,
@@ -13998,8 +14224,9 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
     );
     assert_eq!(handle.peer_snapshot().outbound_peers, 1);
 
-    // Self-heal: drain the queue, release the serving slot, and re-request. The
-    // earlier drop neither wedged nor scored the peer, so a fresh serve lands.
+    // Self-heal: drain the queue and re-request. The earlier response already
+    // released its serving slot, and the dropped sends neither wedged nor scored
+    // the peer, so a fresh serve lands.
     while tokio::time::timeout(
         Duration::from_millis(100),
         next_outbound_message(&mut outbound_rx),
@@ -14007,15 +14234,6 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
     .await
     .is_ok()
     {}
-    handle
-        .send(BlockSyncEvent::BlockRangeResponseFinished {
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 3,
-            returned_count: 3,
-        })
-        .await
-        .expect("serving slot release queues");
     inbound_tx
         .send(
             BlockSyncMessage::GetBlocks {
@@ -14027,19 +14245,25 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         )
         .await
         .expect("re-request GetBlocks frame queues");
-    loop {
+    let second_request_id = loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { start, count, .. } => {
+            BlockSyncAction::QueryBlocksByHeightRange {
+                request_id,
+                start,
+                count,
+                ..
+            } => {
                 assert_eq!(start, block::Height(1));
                 assert_eq!(count, 1);
-                break;
+                break request_id;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before re-request query: {action:?}"),
         }
-    }
+    };
     handle
         .send(BlockSyncEvent::BlockRangeResponseReady {
+            request_id: second_request_id,
             peer: peer_id.clone(),
             start_height: block::Height(1),
             requested_count: 1,

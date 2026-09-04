@@ -14119,8 +14119,7 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
     reactor_task.abort();
 }
 
-/// A full per-peer serving queue must drop the serving send, never disconnect
-/// the peer.
+/// Full and closed serving queues have distinct local-failure outcomes.
 ///
 /// The reactor serves `Status`/`Block`/`BlocksDone`/`RangeUnavailable` with
 /// non-blocking `try_send_*`. On `Full` it drops the frame and bumps a
@@ -14128,9 +14127,10 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
 /// A regression that collapsed those two arms (cancelling on `Full`) would
 /// disconnect honest-but-slow peers under serving load — a self-inflicted DoS.
 /// This guards the distinction: a saturated serving queue leaves the peer
-/// connected, and serving resumes once the queue drains.
+/// connected and serving resumes once it drains, while a closed queue ends the
+/// session. Neither outcome scores the peer, and both release request permits.
 #[tokio::test]
-async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
+async fn gb_rl_08_output_queue_full_drops_but_closed_ends_session() {
     let blocks = mainnet_blocks_1_to_3();
     let config = ZakuraBlockSyncConfig {
         max_blocks_per_response: 16,
@@ -14302,7 +14302,82 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         blocks[0].hash(),
         "serving resumes once the queue drains",
     );
+    assert_eq!(
+        wait_for_outbound_blocks_done(&mut outbound_rx).await,
+        (block::Height(1), 1),
+    );
     assert!(!cancel.is_cancelled());
+
+    // Admit one more request, then close its output before the response arrives.
+    // This is a post-commit output failure, not a pre-commit handoff failure.
+    inbound_tx
+        .send(
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1,
+            }
+            .encode_frame()
+            .expect("GetBlocks frame encodes"),
+        )
+        .await
+        .expect("closed-path GetBlocks frame queues");
+    let third_request_id = loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::QueryBlocksByHeightRange {
+                request_id,
+                start,
+                count,
+                ..
+            } => {
+                assert_eq!(start, block::Height(1));
+                assert_eq!(count, 1);
+                break request_id;
+            }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before closed-path query: {action:?}"),
+        }
+    };
+    assert!(
+        handle.serving_regulation_snapshot().node_outstanding > 0,
+        "the request must own its serving reservation before output fails",
+    );
+
+    drop(outbound_rx);
+    handle
+        .send(BlockSyncEvent::BlockRangeResponseReady {
+            request_id: third_request_id,
+            peer: peer_id.clone(),
+            start_height: block::Height(1),
+            requested_count: 1,
+            blocks: vec![(
+                block::Height(1),
+                blocks[0].clone(),
+                usize::try_from(block_size(&blocks[0])).expect("block size fits usize"),
+            )],
+        })
+        .await
+        .expect("closed-path block response queues");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while handle.peer_snapshot().outbound_peers != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a closed serving queue ends the affected session");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while handle.serving_regulation_snapshot().node_outstanding != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the closed output path releases its serving permit");
+    while let Ok(action) = actions.try_recv() {
+        assert!(
+            !matches!(action, BlockSyncAction::Misbehavior { .. }),
+            "a local output failure must not score the remote peer",
+        );
+    }
 
     reactor_task.abort();
 }

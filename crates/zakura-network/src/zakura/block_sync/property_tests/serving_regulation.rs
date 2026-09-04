@@ -74,7 +74,10 @@ const GB_RL_TEST_MANIFEST: &[(&str, &[&str])] = &[
     ),
     (
         "GB-RL-08",
-        &["gb_rl_08_handoff_failures_hold_rollback_or_settle_exactly_once"],
+        &[
+            "gb_rl_08_handoff_failures_hold_rollback_or_settle_exactly_once",
+            "gb_rl_08_output_queue_full_drops_but_closed_ends_session",
+        ],
     ),
     (
         "GB-RL-09",

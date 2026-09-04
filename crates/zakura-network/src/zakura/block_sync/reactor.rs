@@ -2289,22 +2289,32 @@ impl BlockSyncReactor {
     /// accepted.
     fn dispatch_action(&self, action: BlockSyncAction) -> bool {
         let action_label = action.metric_label();
-        if matches!(
-            action,
-            BlockSyncAction::QueryBlocksByHeightRange { .. } | BlockSyncAction::Misbehavior { .. }
-        ) && self.actions.capacity() <= BS_ACTION_CONTROL_RESERVE
-        {
-            metrics::counter!(
-                "sync.block.action.control_capacity_reserved",
-                "action" => action_label
-            )
-            .increment(1);
-            return false;
-        }
         let queue_depth = self
             .actions
             .max_capacity()
             .saturating_sub(self.actions.capacity());
+        let peer_action_permits = if matches!(
+            action,
+            BlockSyncAction::QueryBlocksByHeightRange { .. } | BlockSyncAction::Misbehavior { .. }
+        ) {
+            // Acquire the peer-action slot and protected control capacity in one
+            // semaphore operation. The Sequencer sends concurrently, so a
+            // separate capacity check followed by `try_send` has a race.
+            match self.actions.try_reserve_many(BS_ACTION_CONTROL_RESERVE + 1) {
+                Ok(permits) => Some(permits),
+                Err(mpsc::error::TrySendError::Full(())) => {
+                    metrics::counter!(
+                        "sync.block.action.control_capacity_reserved",
+                        "action" => action_label
+                    )
+                    .increment(1);
+                    return false;
+                }
+                Err(mpsc::error::TrySendError::Closed(())) => return false,
+            }
+        } else {
+            None
+        };
         // Metrics accepts f64 samples; this lossy conversion is observability-only.
         metrics::histogram!(
             "sync.block.action.queue.depth",
@@ -2314,6 +2324,13 @@ impl BlockSyncReactor {
         self.startup
             .trace
             .emit_event(|| BlockActionDispatched::new(&action));
+        if let Some(mut permits) = peer_action_permits {
+            permits
+                .next()
+                .expect("the atomic reservation includes one peer-action permit")
+                .send(action);
+            return true;
+        }
         match self.actions.try_send(action) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {

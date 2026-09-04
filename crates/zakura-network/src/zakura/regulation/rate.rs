@@ -343,6 +343,7 @@ impl<C: Clock> CommittedRateReservation<C> {
     }
 
     /// Finish this reservation and return its unused units now.
+    #[allow(dead_code)] // Kept for exchanges that settle before owner drop.
     pub(crate) fn finish(self) {
         drop(self);
     }

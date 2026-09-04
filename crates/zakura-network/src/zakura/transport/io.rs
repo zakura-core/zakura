@@ -99,7 +99,6 @@ impl FramedSend {
     /// `make_lease` is called only after the transport owns a queue slot. This
     /// prevents accounting from moving to the transport when the queue is full
     /// or closed.
-    #[allow(dead_code)] // consumed by the GetBlocks policy in the stacked PR
     pub(crate) fn try_send_leased(
         &self,
         frame: Frame,
@@ -138,7 +137,6 @@ impl FramedSend {
 
 /// Failure to queue a leased frame.
 #[derive(Debug)]
-#[allow(dead_code)] // consumed by the GetBlocks policy in the stacked PR
 pub(crate) enum LeasedSendError {
     /// The bounded transport queue has no free slot.
     Full(Frame),
@@ -148,7 +146,6 @@ pub(crate) enum LeasedSendError {
     Unsupported(Frame),
 }
 
-#[allow(dead_code)] // consumed by the GetBlocks policy in the stacked PR
 impl LeasedSendError {
     /// Recover the frame that was not queued.
     pub(crate) fn into_frame(self) -> Frame {
@@ -180,8 +177,12 @@ impl QueuedFrame {
         Self { frame, lease: None }
     }
 
-    #[allow(dead_code)] // consumed through `try_send_leased` in the stacked PR
     fn leased(frame: Frame, lease: FrameLease) -> Self {
+        debug_assert_eq!(
+            u64::try_from(frame.payload.len()).ok(),
+            Some(lease.accounted_bytes()),
+            "a frame lease accounts for its exact payload bytes"
+        );
         Self {
             frame,
             lease: Some(lease),

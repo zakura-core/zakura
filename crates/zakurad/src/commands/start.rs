@@ -1818,9 +1818,9 @@ mod zakura_header_sync_driver_tests {
     use zakura_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
     use zakura_network::zakura::testkit::{TraceCapture, TraceValue};
     use zakura_network::zakura::{
-        commit_state_trace as cs_trace, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
-        BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMisbehavior,
-        BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, DEFAULT_HS_RANGE,
+        commit_state_trace as cs_trace, BlockApplyResult, BlockRangeRequestId, BlockSizeEstimate,
+        BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers,
+        BlockSyncMisbehavior, BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, DEFAULT_HS_RANGE,
     };
     use zakura_network::P2pStack;
     use zakura_test::vectors::{
@@ -2308,7 +2308,7 @@ mod zakura_header_sync_driver_tests {
             let query_seen = query_seen.clone();
             async move {
                 match request {
-                    zakura_state::ReadRequest::BlocksByHeightRange { start, count } => {
+                    zakura_state::ReadRequest::BlocksByHeightRange { start, count, .. } => {
                         if let Some(query_seen) = query_seen {
                             if let Some(query_seen) = query_seen
                                 .lock()
@@ -2596,6 +2596,88 @@ mod zakura_header_sync_driver_tests {
             .await
             .expect("driver handles the serving query")
             .expect("query signal sender remains live");
+    }
+
+    #[tokio::test]
+    async fn block_range_query_uses_its_owned_timeout() {
+        let (action_tx, action_rx) = mpsc::channel(1);
+        let mut capture = TraceCapture::for_test("block_range_query_uses_its_owned_timeout")
+            .expect("test trace capture starts");
+        let trace = zakura_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+        let mut startup = block_sync_startup_for_test();
+        startup.trace = trace.clone();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zakura_network::zakura::spawn_block_sync_reactor(startup);
+        let (query_seen_tx, query_seen_rx) = oneshot::channel();
+        let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
+        let read_state = BoxCloneService::new(service_fn(move |request| {
+            let query_seen = query_seen.clone();
+            async move {
+                match request {
+                    zakura_state::ReadRequest::BlocksByHeightRange { .. } => {
+                        if let Some(query_seen) = query_seen
+                            .lock()
+                            .expect("query signal mutex is not poisoned")
+                            .take()
+                        {
+                            let _ = query_seen.send(());
+                        }
+                        future::pending::<
+                            Result<zakura_state::ReadResponse, zakura_state::BoxError>,
+                        >()
+                        .await
+                    }
+                    request => panic!("unexpected read request while timing out: {request:?}"),
+                }
+            }
+        }));
+        let (driver, shutdown_tx) = DriverParams {
+            trace,
+            ..DriverParams::default()
+        }
+        .spawn(
+            action_rx,
+            block_sync,
+            zakura_chain::chain_tip::NoChainTip,
+            read_state,
+            panicking_verifier("timing out a serving state read"),
+        );
+
+        action_tx
+            .send(BlockSyncAction::QueryBlocksByHeightRange {
+                request_id: BlockRangeRequestId::new(99).expect("99 is nonzero"),
+                peer: test_zakura_peer(99),
+                start: block::Height(7),
+                count: 1,
+                max_response_bytes: 1024,
+                timeout: Duration::from_millis(10),
+            })
+            .await
+            .expect("serving query enters the driver");
+        wait_for_query_seen(query_seen_rx).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        capture.flush().await;
+        capture
+            .reader()
+            .expect("trace is readable")
+            .table(COMMIT_STATE_TABLE.table())
+            .assert_row(
+                cs_trace::REACTOR_EVENT_SENT,
+                &[
+                    (
+                        cs_trace::ACTION,
+                        TraceValue::Str("block_range_response_finished"),
+                    ),
+                    (cs_trace::RANGE_START, TraceValue::U64(7)),
+                    (cs_trace::RANGE_COUNT, TraceValue::U64(0)),
+                    (cs_trace::REQUESTED_COUNT, TraceValue::U64(1)),
+                ],
+            );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver exits after the query timeout");
+        reactor_task.abort();
     }
 
     fn assert_abandoned_apply_trace_rows(
@@ -4148,9 +4230,12 @@ mod zakura_header_sync_driver_tests {
             .expect("driver action channel stays open");
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                request_id: BlockRangeRequestId::new(1).expect("one is nonzero"),
                 peer: test_zakura_peer(77),
                 start: block::Height(1),
                 count: 1,
+                max_response_bytes: u32::MAX,
+                timeout: ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
             })
             .await
             .expect("driver action channel stays open");
@@ -4271,9 +4356,12 @@ mod zakura_header_sync_driver_tests {
             .expect("fallback acquires the lease after the apply drains");
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                request_id: BlockRangeRequestId::new(2).expect("two is nonzero"),
                 peer: test_zakura_peer(78),
                 start: block::Height(1),
                 count: 1,
+                max_response_bytes: u32::MAX,
+                timeout: ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
             })
             .await
             .expect("driver action channel stays open");
@@ -4345,9 +4433,12 @@ mod zakura_header_sync_driver_tests {
         // Send a serving query to Zakura.
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                request_id: BlockRangeRequestId::new(3).expect("three is nonzero"),
                 peer: test_zakura_peer(79),
                 start: block::Height(1),
                 count: 1,
+                max_response_bytes: u32::MAX,
+                timeout: ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
             })
             .await
             .expect("driver action channel stays open");
@@ -4434,9 +4525,12 @@ mod zakura_header_sync_driver_tests {
         }
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                request_id: BlockRangeRequestId::new(4).expect("four is nonzero"),
                 peer: test_zakura_peer(80),
                 start: block::Height(1),
                 count: 2,
+                max_response_bytes: u32::MAX,
+                timeout: ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
             })
             .await
             .expect("driver action channel handles serving work after submit storm");

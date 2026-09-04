@@ -19,9 +19,13 @@
 //! routine receives inbound traffic from its own `FramedRecv`. Its fill loop,
 //! matched-body path, and unmatched-body paths run in the same task.
 
-use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    num::NonZeroU64,
+    ops::Range,
+};
 
-use tokio::sync::{futures::Notified, mpsc, watch};
+use tokio::sync::{futures::Notified, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::events::RoutineToReactor;
@@ -37,6 +41,7 @@ use super::{
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerView},
+    serving_regulation::{GetBlocksServingSession, PendingGetBlocksRequest, PendingInputBlocked},
     state::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
         ThroughputMeter,
@@ -320,6 +325,16 @@ pub(super) struct PeerRoutine {
     /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
     /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
+    /// Completion of the one serving admission task currently waiting to hand
+    /// a request to the reactor.
+    pending_serving: Option<oneshot::Receiver<ServingAdmissionOutcome>>,
+    /// Decoded serving requests held behind `pending_serving`.
+    ///
+    /// Each entry owns its session and node pending-input slots. Once those
+    /// hard bounds fill, the routine holds one decoded request and stops reading
+    /// until capacity returns rather than dropping it or growing this queue.
+    queued_serving: VecDeque<PendingGetBlocksRequest>,
+    serving: GetBlocksServingSession,
     sequencer_view: watch::Receiver<SequencerView>,
     /// Last `reset_epoch` that this routine processed.
     /// A `view.changed()` event uses the epoch to distinguish a reset from an advance.
@@ -357,6 +372,7 @@ impl PeerRoutine {
         sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
         sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
+        serving: GetBlocksServingSession,
         sequencer_view: watch::Receiver<SequencerView>,
         cancel: CancellationToken,
         trace: ZakuraTrace,
@@ -401,6 +417,9 @@ impl PeerRoutine {
             sequencer_input_bytes,
             sequencer_input_decoded_attributed_memory_bytes,
             routine_to_reactor,
+            pending_serving: None,
+            queued_serving: VecDeque::new(),
+            serving,
             sequencer_view,
             last_reset_epoch,
             outbound_full_since: None,
@@ -445,6 +464,7 @@ impl PeerRoutine {
                 None
             };
             let outbound_queue_has_capacity = self.session.outbound_capacity() > 0;
+            let serving_pending = self.pending_serving.is_some();
             // Track the start of the current continuous outbound-full stretch so the
             // liveness check can bound the write-congestion grace: a peer that stopped
             // reading holds this full until `outbound_full_since` ages past
@@ -464,6 +484,25 @@ impl PeerRoutine {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
+                // Advance ready serving work before another inbound frame so a
+                // continuous request stream cannot starve the bounded queue.
+                outcome = async {
+                    self.pending_serving
+                        .as_mut()
+                        .expect("serving completion is polled only while pending")
+                        .await
+                }, if serving_pending => {
+                    self.pending_serving = None;
+                    match outcome {
+                        Ok(ServingAdmissionOutcome::Sent) => {
+                            if let Some(request) = self.queued_serving.pop_front() {
+                                self.start_serving_admission(request);
+                            }
+                        }
+                        Ok(ServingAdmissionOutcome::ChannelClosed) => return Ok(()),
+                        Ok(ServingAdmissionOutcome::Cancelled) | Err(_) => return Ok(()),
+                    }
+                }
                 frame = self.recv.recv(), if outbound_queue_has_capacity => {
                     match frame {
                         // Decode the frame and run the download/serving dispatch
@@ -559,15 +598,12 @@ impl PeerRoutine {
                 start_height,
                 count,
             } => {
-                // Serving is reactor-owned (state query + driver). Forward the
-                // request; the reactor serves via the session clone it holds.
-                let _ = self
-                    .routine_to_reactor
-                    .try_send(RoutineToReactor::ServeGetBlocks {
-                        peer: self.peer.clone(),
-                        start_height,
-                        count,
-                    });
+                if self.received_status {
+                    self.retain_serving_request(start_height, count).await?;
+                } else {
+                    self.report_misbehavior(BlockSyncMisbehavior::GetBlocksSpam)
+                        .await;
+                }
             }
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");
@@ -584,6 +620,77 @@ impl PeerRoutine {
             } => self.handle_range_unavailable(start_height).await,
         }
         Ok(())
+    }
+
+    /// Start the one admission task that owns this request until the reactor
+    /// channel accepts it or the session ends.
+    fn start_serving_admission(&mut self, request: PendingGetBlocksRequest) {
+        assert!(
+            self.pending_serving.is_none(),
+            "only one GetBlocks admission task may be active per peer routine"
+        );
+        let (done, completion) = oneshot::channel();
+        self.pending_serving = Some(completion);
+        tokio::spawn(admit_and_forward_get_blocks(
+            self.serving.clone(),
+            self.routine_to_reactor.clone(),
+            self.peer.clone(),
+            request,
+            self.cancel.clone(),
+            done,
+        ));
+    }
+
+    /// Retain a request within the peer and node pending-input bounds.
+    ///
+    /// The routine can continue decoding download responses while a bounded
+    /// backlog waits for serving resources. At the hard backlog limit, it holds
+    /// this one already-decoded request and applies transport backpressure until
+    /// the exact blocking bound releases capacity.
+    async fn retain_serving_request(
+        &mut self,
+        start_height: block::Height,
+        count: u32,
+    ) -> Result<(), SinkReject> {
+        let request = loop {
+            match self.serving.try_retain_input(start_height, count) {
+                Ok(request) => break request,
+                Err(blocked) => {
+                    self.record_pending_input_delay(&blocked);
+                    let wait = blocked.wait();
+                    tokio::pin!(wait);
+                    tokio::select! {
+                        biased;
+                        () = self.cancel.cancelled() => return Ok(()),
+                        () = &mut wait => {}
+                    }
+                }
+            }
+        };
+
+        if self.pending_serving.is_some() {
+            self.queued_serving.push_back(request);
+        } else {
+            debug_assert!(
+                self.queued_serving.is_empty(),
+                "queued serving requests always have one active admission owner"
+            );
+            self.start_serving_admission(request);
+        }
+        Ok(())
+    }
+
+    fn record_pending_input_delay(&self, blocked: &PendingInputBlocked) {
+        metrics::counter!(
+            "sync.block.serving.delayed",
+            "bound" => blocked.label()
+        )
+        .increment(1);
+        tracing::trace!(
+            peer = ?self.peer,
+            bound = blocked.label(),
+            "delaying GetBlocks at the pending-input bound"
+        );
     }
 
     async fn reserve_body_decode_permit(
@@ -2210,6 +2317,89 @@ fn outstanding_unreceived_through(
         .map(|expected| expected.height)
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ServingAdmissionOutcome {
+    /// The reactor channel now owns the request and provisional admission.
+    Sent,
+    /// The reactor channel closed and the admission rolled back.
+    ChannelClosed,
+    /// The peer session ended and the admission rolled back.
+    Cancelled,
+}
+
+/// Wait only on the resource that blocked the preceding admission attempt.
+///
+/// Once every bound is reserved, the attempt remains owned while this waits for
+/// routine-channel capacity. Cancellation or channel closure drops the attempt
+/// and rolls back all provisional resources.
+async fn admit_and_forward_get_blocks(
+    serving: GetBlocksServingSession,
+    routine_to_reactor: mpsc::Sender<RoutineToReactor>,
+    peer: ZakuraPeerId,
+    request: PendingGetBlocksRequest,
+    cancel: CancellationToken,
+    mut done: oneshot::Sender<ServingAdmissionOutcome>,
+) {
+    loop {
+        let attempt = match serving.try_admit(request.count()) {
+            Ok(attempt) => attempt,
+            Err(blocked) => {
+                metrics::counter!(
+                    "sync.block.serving.delayed",
+                    "bound" => blocked.kind().label()
+                )
+                .increment(1);
+                tracing::trace!(
+                    peer = ?peer,
+                    bound = blocked.kind().label(),
+                    "delaying GetBlocks at the work-admission bound"
+                );
+                let wait = blocked.wait();
+                tokio::pin!(wait);
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        let _ = done.send(ServingAdmissionOutcome::Cancelled);
+                        return;
+                    }
+                    () = done.closed() => return,
+                    () = &mut wait => continue,
+                }
+            }
+        };
+
+        let channel_slot = routine_to_reactor.clone().reserve_owned();
+        tokio::pin!(channel_slot);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                drop(attempt);
+                let _ = done.send(ServingAdmissionOutcome::Cancelled);
+                return;
+            }
+            () = done.closed() => {
+                drop(attempt);
+                return;
+            }
+            slot = &mut channel_slot => {
+                let Ok(slot) = slot else {
+                    drop(attempt);
+                    let _ = done.send(ServingAdmissionOutcome::ChannelClosed);
+                    return;
+                };
+                debug_assert_eq!(attempt.peer(), &peer);
+                slot.send(RoutineToReactor::ServeGetBlocks {
+                    peer,
+                    request,
+                    attempt,
+                });
+                let _ = done.send(ServingAdmissionOutcome::Sent);
+                return;
+            }
+        }
+    }
+}
+
 impl Drop for PeerRoutine {
     /// disconnect-mid-fetch correctness: on every exit path
     /// (cancel/panic/normal) return this routine's unreceived outstanding heights
@@ -2261,6 +2451,7 @@ mod tests {
     use super::super::peer_registry::PeerRegistry;
     use super::super::request::BlockSizeEstimate;
     use super::super::sequencer_task::initial_view;
+    use super::super::serving_regulation::{GetBlocksServingRegulator, GetBlocksServingSession};
     use super::super::state::{ByteBudget, ThroughputMeter};
     use super::super::work_queue::WorkQueue;
     use super::super::{BlockSyncFrontiers, BlockSyncPeerSession, ZakuraBlockSyncConfig};
@@ -2268,6 +2459,13 @@ mod tests {
     use crate::zakura::framed_channel;
     use crate::zakura::trace::ZakuraTrace;
     use crate::zakura::ZakuraPeerId;
+
+    fn test_serving(
+        config: &ZakuraBlockSyncConfig,
+        peer: &ZakuraPeerId,
+    ) -> GetBlocksServingSession {
+        GetBlocksServingRegulator::new(config.clone()).session(peer.clone(), 0)
+    }
 
     fn reference_first_allowed_run(allowed: &[bool]) -> Option<std::ops::Range<usize>> {
         let start = allowed.iter().position(|allowed| *allowed)?;
@@ -2375,6 +2573,7 @@ mod tests {
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         }));
+        let serving = test_serving(&config, &peer);
         let mut routine = PeerRoutine::new(
             peer,
             0,
@@ -2391,6 +2590,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             routine_to_reactor_tx,
+            serving,
             view_rx,
             cancel,
             ZakuraTrace::noop(),
@@ -2464,6 +2664,7 @@ mod tests {
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         }));
+        let serving = test_serving(&config, &peer);
 
         let mut routine = PeerRoutine::new(
             peer,
@@ -2481,6 +2682,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             routine_to_reactor_tx,
+            serving,
             view_rx,
             cancel,
             ZakuraTrace::noop(),
@@ -2558,6 +2760,7 @@ mod tests {
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         }));
+        let serving = test_serving(&config, &peer);
 
         let mut routine = PeerRoutine::new(
             peer,
@@ -2575,6 +2778,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             routine_to_reactor_tx,
+            serving,
             view_rx,
             cancel,
             ZakuraTrace::noop(),

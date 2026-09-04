@@ -103,6 +103,30 @@ pub const DEFAULT_BS_SIZE_DEVIATION_TOLERANCE: u32 = 200;
 /// only controls how many bounded body frames a server sends before `BlocksDone`.
 pub const MAX_BS_RESPONSE_BYTES: u32 = DEFAULT_BS_MAX_RESPONSE_BYTES;
 
+/// Fixed byte-equivalent work charged for each admitted `GetBlocks` request.
+///
+/// This follows the initial peer-message regulation design. The response-byte
+/// portion is refunded when unused, but this request-processing cost is not.
+pub const GET_BLOCKS_REQUEST_OVERHEAD_BYTES: u64 = 64 * 1024;
+/// Encoded payload bytes in either terminal GetBlocks response message.
+pub const GET_BLOCKS_TERMINAL_PAYLOAD_BYTES: u64 = 9;
+
+const MIB: u64 = 1024 * 1024;
+const DEFAULT_GET_BLOCKS_PEER_RATE_BYTES_PER_SECOND: u64 = 16 * MIB;
+// These wire caps are `u32`, so widening them to `u64` is lossless.
+const DEFAULT_GET_BLOCKS_PEER_RATE_CAPACITY_BYTES: u64 = MAX_BS_RESPONSE_BYTES as u64
+    + MAX_BS_BLOCKS_PER_REQUEST as u64
+    + GET_BLOCKS_TERMINAL_PAYLOAD_BYTES
+    + GET_BLOCKS_REQUEST_OVERHEAD_BYTES;
+const DEFAULT_GET_BLOCKS_PEER_OUTSTANDING_BYTES: u64 = 64 * MIB;
+const DEFAULT_GET_BLOCKS_NODE_RATE_BYTES_PER_SECOND: u64 = 64 * MIB;
+const DEFAULT_GET_BLOCKS_NODE_RATE_CAPACITY_BYTES: u64 = 128 * MIB;
+const DEFAULT_GET_BLOCKS_NODE_OUTSTANDING_BYTES: u64 = 256 * MIB;
+const DEFAULT_GET_BLOCKS_PEER_PENDING_REQUESTS: usize = 64;
+const DEFAULT_GET_BLOCKS_NODE_PENDING_REQUESTS: usize = 1024;
+const DEFAULT_GET_BLOCKS_NODE_ACTIVE_REQUESTS: usize = 64;
+const DEFAULT_GET_BLOCKS_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Default steady-state cwnd gain, percent of the bandwidth-delay product. 300% ramps a
 /// proven peer up as `1 → 3 → 9 …`; the reliability discount and delay-gradient ceiling
 /// pull it back if the extra concurrency costs drops or standing queue.
@@ -316,6 +340,59 @@ pub struct ZakuraBlockSyncConfig {
     pub floor_bypass_slots: u32,
     /// Block-sync peer caps and queue limits owned by this service.
     pub peer_limits: ServicePeerLimits,
+    /// Resource policy for serving inbound `GetBlocks` requests.
+    pub get_blocks_regulation: GetBlocksRegulationConfig,
+}
+
+/// Node and peer bounds applied before GetBlocks state work starts.
+///
+/// Rate budgets bound bursts and sustained work. Outstanding-byte budgets do
+/// not refill; capacity returns only when a request settles or its queued frame
+/// leaves the application-owned transport path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GetBlocksRegulationConfig {
+    /// Byte-equivalent work retained for each admitted request regardless of response size.
+    pub request_overhead_bytes: u64,
+    /// Sustained byte-equivalent serving allowance for one authenticated peer.
+    pub peer_rate_bytes_per_second: u64,
+    /// Burst allowance retained across reconnects for one authenticated peer.
+    pub peer_rate_capacity_bytes: u64,
+    /// Reserved and queued response bytes allowed for one live peer session.
+    pub peer_outstanding_bytes: u64,
+    /// Sustained aggregate byte-equivalent serving allowance for GetBlocks.
+    pub node_rate_bytes_per_second: u64,
+    /// Aggregate GetBlocks burst allowance for this node.
+    pub node_rate_capacity_bytes: u64,
+    /// Admitted GetBlocks response bytes not yet handed off by the transport.
+    pub node_outstanding_bytes: u64,
+    /// Decoded GetBlocks requests retained while one peer waits for admission.
+    pub peer_pending_requests: usize,
+    /// Decoded GetBlocks requests retained while admission waits across all peers.
+    pub node_pending_requests: usize,
+    /// State queries and responses that may remain active across all peers.
+    pub node_active_requests: usize,
+    /// Maximum time state may retain an admitted request before responding.
+    #[serde(with = "humantime_serde")]
+    pub query_timeout: Duration,
+}
+
+impl Default for GetBlocksRegulationConfig {
+    fn default() -> Self {
+        Self {
+            request_overhead_bytes: GET_BLOCKS_REQUEST_OVERHEAD_BYTES,
+            peer_rate_bytes_per_second: DEFAULT_GET_BLOCKS_PEER_RATE_BYTES_PER_SECOND,
+            peer_rate_capacity_bytes: DEFAULT_GET_BLOCKS_PEER_RATE_CAPACITY_BYTES,
+            peer_outstanding_bytes: DEFAULT_GET_BLOCKS_PEER_OUTSTANDING_BYTES,
+            node_rate_bytes_per_second: DEFAULT_GET_BLOCKS_NODE_RATE_BYTES_PER_SECOND,
+            node_rate_capacity_bytes: DEFAULT_GET_BLOCKS_NODE_RATE_CAPACITY_BYTES,
+            node_outstanding_bytes: DEFAULT_GET_BLOCKS_NODE_OUTSTANDING_BYTES,
+            peer_pending_requests: DEFAULT_GET_BLOCKS_PEER_PENDING_REQUESTS,
+            node_pending_requests: DEFAULT_GET_BLOCKS_NODE_PENDING_REQUESTS,
+            node_active_requests: DEFAULT_GET_BLOCKS_NODE_ACTIVE_REQUESTS,
+            query_timeout: DEFAULT_GET_BLOCKS_QUERY_TIMEOUT,
+        }
+    }
 }
 
 fn deserialize_ignored_replace_legacy_syncer<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -359,6 +436,7 @@ impl Default for ZakuraBlockSyncConfig {
             bbr_cwnd_unit: CwndUnit::Bytes,
             floor_bypass_slots: DEFAULT_BS_FLOOR_BYPASS_SLOTS,
             peer_limits: ServicePeerLimits::default(),
+            get_blocks_regulation: GetBlocksRegulationConfig::default(),
         }
     }
 }
@@ -465,6 +543,7 @@ impl ZakuraBlockSyncConfig {
         if self.bbr_probe_rtt_interval <= self.bbr_probe_rtt_duration {
             return Err("bbr_probe_rtt_interval must exceed bbr_probe_rtt_duration");
         }
+        super::serving_regulation::validate_config(self)?;
         Ok(())
     }
 

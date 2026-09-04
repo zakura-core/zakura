@@ -1,6 +1,6 @@
 use super::{
-    config::*, events::*, peer_registry::*, sequencer::*, sequencer_task::*, state::*, trace::*,
-    wire::*, *,
+    config::*, events::*, peer_registry::*, sequencer::*, sequencer_task::*, serving_regulation::*,
+    state::*, trace::*, wire::*, *,
 };
 use crate::zakura::{
     OrderedSendError, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
@@ -143,6 +143,8 @@ pub fn spawn_block_sync_reactor(
         mpsc::channel(startup.config.peer_limits.inbound_queue_depth.max(1));
     let events_keepalive = events_tx.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+    let lifecycle_keepalive = lifecycle_tx.clone();
+    let (peer_lifecycle_tx, peer_lifecycle_rx) = mpsc::unbounded_channel();
     let (needed_query_failure_tx, needed_query_failure_rx) = mpsc::unbounded_channel();
     let needed_query_failure_keepalive = needed_query_failure_tx.clone();
     // Size the action channel so the Sequencer can dispatch a full checkpoint
@@ -227,6 +229,8 @@ pub fn spawn_block_sync_reactor(
     // serving / status-advertise / re-query / serving-misbehavior concerns here.
     let (routine_to_reactor_tx, routine_to_reactor_rx) = mpsc::channel(ROUTINE_TO_REACTOR_DEPTH);
     let routine_to_reactor_keepalive = routine_to_reactor_tx.clone();
+    let serving_regulator =
+        super::serving_regulation::GetBlocksServingRegulator::new(startup.config.clone());
 
     // The shared download primitives every pipe-routine is wired with at spawn
     // (`service::add_peer`), carried through the handle.
@@ -243,6 +247,7 @@ pub fn spawn_block_sync_reactor(
         #[cfg(test)]
         actions: actions_tx.clone(),
         routine_to_reactor: routine_to_reactor_tx,
+        serving_regulator,
         view: sequencer_view_rx.clone(),
         trace: startup.trace.clone(),
     };
@@ -250,6 +255,7 @@ pub fn spawn_block_sync_reactor(
     let handle = BlockSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
+        peer_lifecycle: peer_lifecycle_tx,
         needed_query_failures: needed_query_failure_tx,
         peers: peers_rx,
         status: status_rx,
@@ -264,6 +270,7 @@ pub fn spawn_block_sync_reactor(
         pending_body_supplier_restart: None,
         pending_operator_body_retry: None,
         next_needed_query_id: NonZeroU64::new(1),
+        next_serving_request_id: BlockRangeRequestId::new(1),
         last_reset_epoch: 0,
         last_reaction_epoch: 0,
         last_view: initial_view(startup.frontiers),
@@ -281,6 +288,8 @@ pub fn spawn_block_sync_reactor(
         events: events_rx,
         _events_keepalive: events_keepalive,
         lifecycle: lifecycle_rx,
+        _lifecycle_keepalive: lifecycle_keepalive,
+        peer_lifecycle: peer_lifecycle_rx,
         needed_query_failures: needed_query_failure_rx,
         _needed_query_failure_keepalive: needed_query_failure_keepalive,
         actions: actions_tx,
@@ -318,6 +327,11 @@ pub(super) struct BlockSyncReactor {
     /// as a consumer moved (not cloned) the handle. The reactor never sends on it.
     _events_keepalive: mpsc::Sender<BlockSyncEvent>,
     lifecycle: mpsc::UnboundedReceiver<BlockSyncEvent>,
+    /// Keeps the public control path alive after the service retains only the
+    /// private peer lifecycle sender.
+    _lifecycle_keepalive: mpsc::UnboundedSender<BlockSyncEvent>,
+    /// Service-owned lifecycle facts with exact session identity.
+    peer_lifecycle: mpsc::UnboundedReceiver<BlockSyncPeerLifecycleEvent>,
     needed_query_failures: mpsc::UnboundedReceiver<NeededBlocksQueryFailure>,
     /// Keep the private driver-completion channel open while the reactor lives.
     _needed_query_failure_keepalive: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
@@ -365,6 +379,9 @@ pub(super) struct BlockSyncReactor {
     /// Next reactor-local identity for a body-work state query.
     /// `None` means the reactor exhausted the identifier space and stops scheduling.
     next_needed_query_id: Option<NonZeroU64>,
+    /// Next identity for an admitted inbound `GetBlocks` request.
+    /// `None` means the identifier space is exhausted and serving fails closed.
+    next_serving_request_id: Option<BlockRangeRequestId>,
     /// Last `reset_epoch` the reactor reacted to, so it can tell an advance from
     /// a destructive reset.
     last_reset_epoch: u64,
@@ -432,6 +449,10 @@ impl BlockSyncReactor {
                 event = self.lifecycle.recv() => {
                     let Some(event) = event else { break };
                     self.handle_event(event).await;
+                }
+                event = self.peer_lifecycle.recv() => {
+                    let Some(event) = event else { break };
+                    self.handle_peer_lifecycle_event(event).await;
                 }
                 failure = self.needed_query_failures.recv() => {
                     let Some(failure) = failure else { break };
@@ -608,7 +629,18 @@ impl BlockSyncReactor {
             .emit_event(|| BlockEventReceived::new(&event));
         match event {
             BlockSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
-            BlockSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),
+            BlockSyncEvent::PeerDisconnected(peer) => {
+                if let Some(session_id) = self
+                    .state
+                    .peers
+                    .get(&peer)
+                    .map(|peer_state| peer_state.session.session_id())
+                {
+                    self.handle_peer_disconnected(peer, session_id);
+                } else {
+                    self.registry.remove(&peer);
+                }
+            }
             BlockSyncEvent::RetryBodyAvailability { hash } => self.retry_body_availability(hash),
             #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::HeaderTipChanged { height, hash } => {
@@ -663,27 +695,66 @@ impl BlockSyncReactor {
                 .await
             }
             BlockSyncEvent::BlockRangeResponseReady {
+                request_id,
                 peer,
                 start_height,
                 requested_count,
                 blocks,
             } => {
-                self.handle_block_range_response_ready(peer, start_height, requested_count, blocks)
-                    .await;
+                self.handle_block_range_response_ready(
+                    request_id,
+                    peer,
+                    start_height,
+                    requested_count,
+                    blocks,
+                )
+                .await;
             }
             BlockSyncEvent::BlockRangeResponseFinished {
+                request_id,
                 peer,
                 start_height,
                 requested_count,
                 returned_count,
             } => {
                 self.handle_block_range_response_finished(
+                    request_id,
                     peer,
                     start_height,
                     requested_count,
                     returned_count,
                 )
                 .await;
+            }
+        }
+        self.publish_metrics();
+    }
+
+    /// Apply service-owned lifecycle events only when their exact registry
+    /// generation is still current.
+    async fn handle_peer_lifecycle_event(&mut self, event: BlockSyncPeerLifecycleEvent) {
+        match event {
+            BlockSyncPeerLifecycleEvent::Connected(session) => {
+                let trace_event = BlockSyncEvent::PeerConnected(session.clone());
+                self.startup
+                    .trace
+                    .emit_event(|| BlockEventReceived::new(&trace_event));
+                let peer = session.peer_id().clone();
+                let session_id = session.session_id();
+                if !self.registry.owns_generation(&peer, session_id) {
+                    session.cancel_token().cancel();
+                    session.mark_reactor_ready();
+                    self.registry.remove_session(&peer, session_id);
+                } else {
+                    self.handle_peer_connected(session).await;
+                }
+            }
+            BlockSyncPeerLifecycleEvent::Disconnected { peer, session_id } => {
+                let trace_event = BlockSyncEvent::PeerDisconnected(peer.clone());
+                self.startup
+                    .trace
+                    .emit_event(|| BlockEventReceived::new(&trace_event));
+                self.handle_peer_disconnected(peer, session_id);
             }
         }
         self.publish_metrics();
@@ -757,7 +828,26 @@ impl BlockSyncReactor {
 
     async fn handle_peer_connected(&mut self, session: BlockSyncPeerSession) {
         let peer = session.peer_id().clone();
+        let session_id = session.session_id();
         let direction = session.direction();
+        let reactor_ready = session.clone();
+        if let Some(current_id) = self
+            .state
+            .peers
+            .get(&peer)
+            .map(|peer_state| peer_state.session.session_id())
+        {
+            if current_id == session_id {
+                reactor_ready.mark_reactor_ready();
+                return;
+            }
+            if current_id > session_id {
+                session.cancel_token().cancel();
+                self.registry.remove_session(&peer, session_id);
+                reactor_ready.mark_reactor_ready();
+                return;
+            }
+        }
         let decision = self.admission_decision_for(&peer, direction);
         if decision != ServiceAdmissionDecision::Admit {
             // Reject: cancel the session (which also cancels the already-spawned
@@ -772,9 +862,10 @@ impl BlockSyncReactor {
             );
             self.state.parked_peers.insert(peer.clone());
             session.cancel_token().cancel();
-            self.registry.remove(&peer);
+            self.registry.remove_session(&peer, session_id);
             self.publish_peer_snapshot();
             self.publish_candidate_state();
+            reactor_ready.mark_reactor_ready();
             return;
         }
 
@@ -792,24 +883,31 @@ impl BlockSyncReactor {
         self.publish_peer_snapshot();
         self.publish_candidate_state();
         self.send_status_and_mark_refresh(&peer, "peer_connected", Instant::now());
+        reactor_ready.mark_reactor_ready();
         // The routine fills its own slots; it begins want-work as soon as it has
         // a status and work.
     }
 
-    fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId) {
+    fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId, session_id: u64) {
         // The pipe-routine cancels on the session token (transport disconnect);
         // its `Drop` guard returns its unreceived outstanding heights to
         // `work.pending` and releases their budget. The reactor only drops its
         // thin serving handle and the registry entry.
+        let owns_session = self
+            .state
+            .peers
+            .get(&peer)
+            .is_some_and(|peer_state| peer_state.session.session_id() == session_id);
+        if !owns_session {
+            self.registry.remove_session(&peer, session_id);
+            return;
+        }
+        let received_status = self.registry_received_status(&peer);
         if self.state.peers.remove(&peer).is_some() {
             set_block_reactor_active_connection_gauge(self.state.peers.len());
-            self.trace_peer_disconnected(
-                &peer,
-                self.registry_received_status(&peer),
-                self.state.peers.len(),
-            );
+            self.trace_peer_disconnected(&peer, received_status, self.state.peers.len());
         }
-        self.registry.remove(&peer);
+        self.registry.remove_session(&peer, session_id);
         self.state.parked_peers.remove(&peer);
         self.publish_peer_snapshot();
         self.publish_candidate_state();
@@ -1284,13 +1382,15 @@ impl BlockSyncReactor {
             }
             RoutineToReactor::ServeGetBlocks {
                 peer,
-                start_height,
-                count,
+                request,
+                attempt,
             } => {
                 if self.state.parked_peers.contains(&peer) {
                     return;
                 }
-                self.handle_get_blocks(peer, start_height, count).await;
+                let (start_height, count) = request.into_parts();
+                self.handle_get_blocks(peer, start_height, count, attempt)
+                    .await;
             }
             RoutineToReactor::RequeryNeeded => {
                 self.query_needed_blocks().await;
@@ -1449,62 +1549,117 @@ impl BlockSyncReactor {
         peer: ZakuraPeerId,
         start_height: block::Height,
         count: u32,
+        attempt: AdmissionAttempt,
     ) {
+        // A routine can be superseded after reserving resources but before the
+        // reactor receives its message. Dropping the stale attempt rolls back
+        // every reservation without running state work or emitting a frame.
+        debug_assert_eq!(attempt.peer(), &peer);
+        let session_id = attempt.session_id();
+        if !self.registry.owns_generation(&peer, session_id)
+            || !self
+                .state
+                .peers
+                .get(&peer)
+                .is_some_and(|peer_state| peer_state.session.session_id() == session_id)
+        {
+            return;
+        }
+
         let local_inflight_cap = self.startup.config.advertised_max_inflight_requests();
-        if !self.state.peers.contains_key(&peer) {
-            self.report_misbehavior(peer, BlockSyncMisbehavior::GetBlocksSpam)
-                .await;
-            return;
-        }
-
-        // `received_status` is now a registry fact (written reactor-side on
-        // `Status`); the serving slots stay on the reactor's thin peer handle.
+        // The routine performs this cheap protocol check before regulation.
+        // Rechecking here protects against a superseded or removed registry
+        // entry without treating local scheduling races as peer misbehavior.
         if !self.registry_received_status(&peer) {
-            self.report_misbehavior(peer, BlockSyncMisbehavior::GetBlocksSpam)
-                .await;
             return;
         }
 
-        if count == 0 {
-            self.report_misbehavior(peer, BlockSyncMisbehavior::GetBlocksTooLong)
-                .await;
+        let mut permit = attempt.commit();
+        let Some(request_id) = self.next_serving_request_id else {
+            self.send_range_unavailable(&peer, start_height, count, &mut permit);
             return;
-        }
-
-        let started_serving = self.state.peers.get_mut(&peer).is_some_and(|peer_state| {
-            peer_state.try_start_serving_blocks(local_inflight_cap, start_height)
-        });
-        if !started_serving {
-            let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
-            self.send_range_unavailable(&peer, start_height, unavailable_count);
-            return;
-        }
+        };
+        self.next_serving_request_id = request_id
+            .get()
+            .checked_add(1)
+            .and_then(BlockRangeRequestId::new);
 
         let requested_count = self.clamp_served_block_count(start_height, count);
+        permit.bind_request_id(request_id);
+        let started_serving = self
+            .state
+            .peers
+            .get_mut(&peer)
+            .expect("the peer was checked before this non-awaiting admission path")
+            .try_start_serving_blocks(
+                local_inflight_cap,
+                request_id,
+                start_height,
+                count,
+                requested_count,
+                permit,
+            );
+        if let Err(mut permit) = started_serving {
+            self.send_range_unavailable(&peer, start_height, count, &mut permit);
+            return;
+        }
+
         if requested_count == 0 {
-            let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
-            self.send_range_unavailable(&peer, start_height, unavailable_count);
-            self.finish_serving_blocks(&peer, start_height);
+            let mut request = self
+                .finish_serving_blocks(&peer, request_id, start_height)
+                .expect("the request was just inserted into the serving ledger");
+            self.send_range_unavailable(
+                &peer,
+                start_height,
+                request.original_count(),
+                request.permit_mut(),
+            );
             return;
         }
 
         if !self.dispatch_action(BlockSyncAction::QueryBlocksByHeightRange {
+            request_id,
             peer: peer.clone(),
             start: start_height,
             count: requested_count,
+            max_response_bytes: self.startup.config.advertised_max_response_bytes(),
+            timeout: self.startup.config.get_blocks_regulation.query_timeout,
         }) {
-            self.finish_serving_blocks(&peer, start_height);
+            let mut request = self
+                .finish_serving_blocks(&peer, request_id, start_height)
+                .expect("the failed action belongs to the inserted serving request");
+            self.send_range_unavailable(
+                &peer,
+                start_height,
+                request.original_count(),
+                request.permit_mut(),
+            );
         }
     }
 
     async fn handle_block_range_response_ready(
         &mut self,
+        request_id: BlockRangeRequestId,
         peer: ZakuraPeerId,
         start_height: block::Height,
-        requested_count: u32,
+        reported_requested_count: u32,
         blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
     ) {
-        let prepare_elapsed = self.serving_blocks_elapsed(&peer, start_height);
+        let Some(mut request) = self.finish_serving_blocks(&peer, request_id, start_height) else {
+            return;
+        };
+        let original_count = request.original_count();
+        let requested_count = request.requested_count();
+        if reported_requested_count != requested_count {
+            tracing::warn!(
+                ?peer,
+                %request_id,
+                reported_requested_count,
+                requested_count,
+                "block-range ready count did not match the serving ledger"
+            );
+        }
+        let prepare_elapsed = request.elapsed();
         let send_started = Instant::now();
         let max_response_bytes = u64::from(self.startup.config.advertised_max_response_bytes());
         let mut sent_blocks = 0u32;
@@ -1512,6 +1667,10 @@ impl BlockSyncReactor {
         let mut reason = "complete";
 
         for (height, block, size) in blocks {
+            if sent_blocks >= requested_count {
+                reason = "count_cap";
+                break;
+            }
             let Ok(size) = u64::try_from(size) else {
                 reason = "size_overflow";
                 break;
@@ -1529,7 +1688,7 @@ impl BlockSyncReactor {
                 break;
             }
 
-            if !self.send_block(&peer, block) {
+            if !self.send_block(&peer, block, request.permit_mut()) {
                 reason = "send_failed";
                 break;
             }
@@ -1538,11 +1697,11 @@ impl BlockSyncReactor {
         }
 
         if sent_blocks == 0 {
-            self.send_range_unavailable(&peer, start_height, requested_count);
+            self.send_range_unavailable(&peer, start_height, original_count, request.permit_mut());
         } else {
-            self.send_blocks_done(&peer, start_height, sent_blocks);
+            self.send_blocks_done(&peer, start_height, sent_blocks, request.permit_mut());
         }
-        let total_elapsed = self.finish_serving_blocks(&peer, start_height);
+        let total_elapsed = Some(request.elapsed());
         self.trace_range_response_sent(
             &peer,
             RangeResponseTrace {
@@ -1551,7 +1710,7 @@ impl BlockSyncReactor {
                 sent_count: sent_blocks,
                 sent_bytes,
                 reason,
-                prepare_elapsed,
+                prepare_elapsed: Some(prepare_elapsed),
                 send_elapsed: send_started.elapsed(),
                 total_elapsed,
             },
@@ -1560,15 +1719,30 @@ impl BlockSyncReactor {
 
     async fn handle_block_range_response_finished(
         &mut self,
+        request_id: BlockRangeRequestId,
         peer: ZakuraPeerId,
         start_height: block::Height,
-        requested_count: u32,
+        reported_requested_count: u32,
         returned_count: u32,
     ) {
-        if returned_count == 0 {
-            self.send_range_unavailable(&peer, start_height, requested_count);
+        let Some(mut request) = self.finish_serving_blocks(&peer, request_id, start_height) else {
+            return;
+        };
+        let original_count = request.original_count();
+        let requested_count = request.requested_count();
+        if reported_requested_count != requested_count {
+            tracing::warn!(
+                ?peer,
+                %request_id,
+                reported_requested_count,
+                requested_count,
+                "block-range finished count did not match the serving ledger"
+            );
         }
-        let elapsed = self.finish_serving_blocks(&peer, start_height);
+        let elapsed = request.elapsed();
+        if returned_count == 0 {
+            self.send_range_unavailable(&peer, start_height, original_count, request.permit_mut());
+        }
         self.trace_range_response_sent(
             &peer,
             RangeResponseTrace {
@@ -1577,9 +1751,9 @@ impl BlockSyncReactor {
                 sent_count: returned_count,
                 sent_bytes: 0,
                 reason: "driver_finished",
-                prepare_elapsed: elapsed,
+                prepare_elapsed: Some(elapsed),
                 send_elapsed: Duration::ZERO,
-                total_elapsed: elapsed,
+                total_elapsed: Some(elapsed),
             },
         );
     }
@@ -1645,24 +1819,14 @@ impl BlockSyncReactor {
         );
     }
 
-    fn serving_blocks_elapsed(
-        &self,
-        peer: &ZakuraPeerId,
-        start_height: block::Height,
-    ) -> Option<Duration> {
-        self.state
-            .peers
-            .get(peer)
-            .and_then(|peer_state| peer_state.serving_blocks_elapsed(start_height))
-    }
-
     fn finish_serving_blocks(
         &mut self,
         peer: &ZakuraPeerId,
+        request_id: BlockRangeRequestId,
         start_height: block::Height,
-    ) -> Option<Duration> {
+    ) -> Option<ServingBlockRequest> {
         if let Some(peer_state) = self.state.peers.get_mut(peer) {
-            peer_state.finish_serving_blocks(start_height)
+            peer_state.finish_serving_blocks(request_id, start_height)
         } else {
             None
         }
@@ -1950,7 +2114,12 @@ impl BlockSyncReactor {
         true
     }
 
-    fn send_block(&self, peer: &ZakuraPeerId, block: Arc<block::Block>) -> bool {
+    fn send_block(
+        &self,
+        peer: &ZakuraPeerId,
+        block: Arc<block::Block>,
+        permit: &mut GetBlocksServingPermit,
+    ) -> bool {
         let Some(session) = self
             .state
             .peers
@@ -1961,7 +2130,7 @@ impl BlockSyncReactor {
         };
         let msg = BlockSyncMessage::Block(block.clone());
         let started = Instant::now();
-        match session.try_send_block(block) {
+        match session.try_send_regulated_block(block, permit) {
             Ok(()) => {
                 metrics::counter!("sync.block.body.served").increment(1);
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
@@ -1998,7 +2167,13 @@ impl BlockSyncReactor {
         }
     }
 
-    fn send_blocks_done(&self, peer: &ZakuraPeerId, start_height: block::Height, returned: u32) {
+    fn send_blocks_done(
+        &self,
+        peer: &ZakuraPeerId,
+        start_height: block::Height,
+        returned: u32,
+        permit: &mut GetBlocksServingPermit,
+    ) {
         if returned == 0 {
             return;
         }
@@ -2015,7 +2190,7 @@ impl BlockSyncReactor {
             returned,
         };
         let started = Instant::now();
-        match session.try_send_blocks_done(start_height, returned) {
+        match session.try_send_regulated_blocks_done(start_height, returned, permit) {
             Ok(()) => self.trace_message_sent(peer, &msg, "queued", started.elapsed()),
             Err(OrderedSendError::Full) => {
                 metrics::counter!("sync.block.done.serve_queue_full").increment(1);
@@ -2050,7 +2225,13 @@ impl BlockSyncReactor {
         }
     }
 
-    fn send_range_unavailable(&self, peer: &ZakuraPeerId, start_height: block::Height, count: u32) {
+    fn send_range_unavailable(
+        &self,
+        peer: &ZakuraPeerId,
+        start_height: block::Height,
+        count: u32,
+        permit: &mut GetBlocksServingPermit,
+    ) {
         let count = count.max(1);
         let Some(peer_state) = self.state.peers.get(peer) else {
             return;
@@ -2062,7 +2243,7 @@ impl BlockSyncReactor {
         let started = Instant::now();
         match peer_state
             .session
-            .try_send_range_unavailable(start_height, count)
+            .try_send_regulated_range_unavailable(start_height, count, permit)
         {
             Ok(()) => self.trace_message_sent(peer, &msg, "queued", started.elapsed()),
             Err(OrderedSendError::Full) => {

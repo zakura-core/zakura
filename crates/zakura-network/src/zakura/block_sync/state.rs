@@ -1,6 +1,7 @@
 use super::{
     bbr::{rounded_usize, BbrState},
     config::*,
+    events::BlockSyncPeerLifecycleEvent,
     request::*,
     work_queue::WorkQueue,
     *,
@@ -123,6 +124,8 @@ impl BlockSyncStartup {
 pub struct BlockSyncHandle {
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
+    /// Internal peer-session lifecycle path with exact generation ownership.
+    pub(super) peer_lifecycle: mpsc::UnboundedSender<BlockSyncPeerLifecycleEvent>,
     pub(super) needed_query_failures: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) status: watch::Receiver<BlockSyncStatus>,
@@ -149,6 +152,8 @@ pub(super) struct RoutineWiring {
     #[cfg(test)]
     pub(super) actions: mpsc::Sender<BlockSyncAction>,
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
+    /// Node-wide GetBlocks resources shared by every peer session.
+    pub(super) serving_regulator: super::serving_regulation::GetBlocksServingRegulator,
     pub(super) view: watch::Receiver<super::sequencer_task::SequencerView>,
     pub(super) trace: ZakuraTrace,
 }
@@ -809,8 +814,41 @@ pub(super) struct PeerBlockState {
     /// `status_reply_meter`; this half stays reactor-side because the reactor owns
     /// serving-tip advertisement.
     pub(super) refresh_meter: RateMeter,
-    pub(super) served_blocks_inflight: u32,
-    pub(super) served_block_requests: VecDeque<(block::Height, Instant)>,
+    served_block_requests: VecDeque<ServingBlockRequest>,
+}
+
+/// Ledger entry for one admitted inbound `GetBlocks` request.
+#[derive(Debug)]
+pub(super) struct ServingBlockRequest {
+    id: BlockRangeRequestId,
+    start_height: block::Height,
+    original_count: u32,
+    requested_count: u32,
+    started: Instant,
+    /// Linear ownership of this request's rate and outstanding-byte charges.
+    permit: super::serving_regulation::GetBlocksServingPermit,
+}
+
+impl ServingBlockRequest {
+    /// Count received in the validated wire request and echoed by `RangeUnavailable`.
+    pub(super) fn original_count(&self) -> u32 {
+        self.original_count
+    }
+
+    /// Count accepted after the wire, configuration, and servable-range clamps.
+    pub(super) fn requested_count(&self) -> u32 {
+        self.requested_count
+    }
+
+    /// Time elapsed since this request entered the serving ledger.
+    pub(super) fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// Borrow the request's serving ownership while queueing response frames.
+    pub(super) fn permit_mut(&mut self) -> &mut super::serving_regulation::GetBlocksServingPermit {
+        &mut self.permit
+    }
 }
 
 impl PeerBlockState {
@@ -819,41 +857,46 @@ impl PeerBlockState {
             direction: session.direction(),
             session,
             refresh_meter: RateMeter::new(config.status_refresh_interval),
-            served_blocks_inflight: 0,
             served_block_requests: VecDeque::new(),
         }
     }
 
+    /// Insert a request and its permit, or return the permit if the peer cap is full.
     pub(super) fn try_start_serving_blocks(
         &mut self,
         local_inflight_cap: u32,
+        request_id: BlockRangeRequestId,
         start_height: block::Height,
-    ) -> bool {
-        if self.served_blocks_inflight >= local_inflight_cap {
-            return false;
+        original_count: u32,
+        requested_count: u32,
+        permit: super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(), super::serving_regulation::GetBlocksServingPermit> {
+        if self.served_block_requests.len()
+            >= usize::try_from(local_inflight_cap).unwrap_or(usize::MAX)
+        {
+            return Err(permit);
         }
-        self.served_blocks_inflight = self.served_blocks_inflight.saturating_add(1);
-        self.served_block_requests
-            .push_back((start_height, Instant::now()));
-        true
+        self.served_block_requests.push_back(ServingBlockRequest {
+            id: request_id,
+            start_height,
+            original_count,
+            requested_count,
+            started: Instant::now(),
+            permit,
+        });
+        Ok(())
     }
 
-    pub(super) fn serving_blocks_elapsed(&self, start_height: block::Height) -> Option<Duration> {
-        self.served_block_requests
-            .iter()
-            .find_map(|(start, started)| (*start == start_height).then(|| started.elapsed()))
-    }
-
+    /// Remove only the ledger entry matching both its ID and starting height.
     pub(super) fn finish_serving_blocks(
         &mut self,
+        request_id: BlockRangeRequestId,
         start_height: block::Height,
-    ) -> Option<Duration> {
-        self.served_blocks_inflight = self.served_blocks_inflight.saturating_sub(1);
+    ) -> Option<ServingBlockRequest> {
         self.served_block_requests
             .iter()
-            .position(|(start, _)| *start == start_height)
+            .position(|request| request.id == request_id && request.start_height == start_height)
             .and_then(|index| self.served_block_requests.remove(index))
-            .map(|(_, started)| started.elapsed())
     }
 }
 

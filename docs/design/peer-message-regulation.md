@@ -133,20 +133,24 @@ Charging serving work to the request does not remove the response contracts.
 `Block`, `BlocksDone`, and `RangeUnavailable` still need their own wire and
 receiving-side rules when Zakura receives them.
 
+## Life of a regulated request
+
 The design covers both directions, but each requires different controls. The
-sections below develop the shared resource accounting through the first
-implementation, where Zakura serves `GetBlocks`. Responses Zakura receives
+rest of this document follows the first regulated request path, where Zakura
+serves `GetBlocks`. Zakura reserves capacity for the whole exchange, follows a
+declared overload outcome when capacity is unavailable, carries ownership with
+the work, and releases the capacity on every exit. Responses Zakura receives
 remain governed by their own message contracts.
 
-## Separate resource controls
+### 1. Reserve capacity for the whole exchange
 
-Rate and outstanding work are different resources:
+A request can consume several resources over its lifetime:
 
 | Control | What releases it | Purpose |
 | --- | --- | --- |
 | Rate bucket | Time and permitted refunds | Bounds bursts and sustained throughput |
 | Outstanding budget | Work completion or cancellation | Bounds admitted work that remains resident |
-| Response backlog | Frame handoff or drop | Bounds response bytes owned by one session |
+| Response backlog | Transport write or frame drop | Bounds response bytes owned by one session |
 | Concurrency ledger | Terminal request settlement | Bounds active request count |
 | Pending-input bound | Admission progress or session end | Bounds decoded requests waiting to be admitted |
 
@@ -164,7 +168,39 @@ The node controls are the security boundary. Peer controls provide isolation
 and fairness within it. Every configured per-peer collection must also have an
 aggregate bound at the maximum connection count.
 
-## Linear ownership
+### 2. Follow the declared overload outcome
+
+If capacity is unavailable, the message contract decides whether the request
+waits, is rejected, or is dropped. A waiting request must not reach the handler
+or be charged twice when retried. It waits only on the resource that blocked
+it.
+
+Waiting for one peer must not hold shared locks, writers, or handler permits.
+Other peer routines remain independently runnable. Without an explicit
+scheduler policy, regulation promises isolation rather than a fixed fairness or
+latency bound. Native tests may report observed latency under a named topology,
+but that measurement is not a protocol guarantee.
+
+Stopping all reads is the smallest backpressure mechanism on a one-way stream.
+On a bidirectional ordered stream it can also trap responses to requests Zakura
+sent. A contract may therefore use bounded demultiplexing while one admission
+waits, provided it defines:
+
+- which message classes may continue;
+- the per-session and aggregate pending-input bound;
+- the outcome when that bound is full; and
+- a full-duplex progress property.
+
+#### GetBlocks choice
+
+`GetBlocks` uses bounded demultiplexing so block responses can pass a delayed
+serving request on the same stream. Its advertised in-flight limit bounds
+queued request tuples, and requests beyond that queue are dropped without a
+peer score. The GetBlocks contract must validate the resulting aggregate memory
+at the maximum connection count and confirm that required response traffic
+continues to make progress.
+
+### 3. Carry ownership with the work
 
 Resource ownership follows the work instead of relying on matching refund calls:
 
@@ -178,8 +214,6 @@ service confirms that the originating session still owns the peer.
 
 The committed permit is bound to the service's request identity. Its fixed
 request overhead remains spent. Unused response capacity is refundable.
-Completion, rejection, channel failure, cancellation, disconnect, and
-replacement all settle the same owned permit exactly once.
 
 When the handler queues a response, capacity transfers from the permit into a
 lease carried with that frame. Reserving the queue slot happens before the
@@ -190,52 +224,35 @@ QUIC may retain bytes after the application write completes. Its send-window
 envelope is a separate transport bound and must be included in slow-reader
 tests.
 
-## Waiting and full-duplex streams
+### 4. Release capacity on every exit
 
-When a limit blocks a request, that request must not reach the handler and must
-not be charged twice when retried. The peer routine waits only on the resource
-that blocked it.
-
-Stopping all reads is the smallest backpressure mechanism on a one-way stream.
-On a bidirectional ordered stream it can also trap responses to requests Zakura
-sent. A contract may therefore use bounded demultiplexing while one admission
-waits, provided it defines:
-
-- which message classes may continue;
-- the per-session and aggregate pending-input bound;
-- the outcome when that bound is full; and
-- a full-duplex progress property.
-
-The GetBlocks contract uses this option so block responses can pass delayed
-serving requests. Its advertised in-flight limit bounds queued request tuples,
-and requests beyond that queue are dropped without a peer score. The aggregate
-memory implied by that choice must be validated at the maximum connection
-count before the regulated-load layer is marked complete.
-
-Waiting for one peer must not hold shared locks, writers, or handler permits.
-Other peer routines remain independently runnable. Strong fairness or latency
-claims require an explicit scheduler policy; otherwise native tests report the
-observed bound under a named topology.
-
-## Identity and reconnects
+Completion, rejection, channel failure, cancellation, disconnect, and
+replacement all settle the same owned permit exactly once. A stale or
+mismatched completion must not release another request's resources.
 
 Session-owned resources, including response backlog and queued frames, end with
-the session. A rate bucket may instead follow an authenticated identity across
-reconnects so reconnecting does not grant a fresh burst.
+the session rather than transferring to its replacement. A rate bucket may
+instead follow an authenticated identity across reconnects so reconnecting does
+not grant a fresh burst.
 
 Any inactive identity cache must be bounded. It may discard a fully refilled
 entry because recreating it grants no additional work. An eviction policy must
 state the maximum allowance a prematurely evicted identity can regain, and it
 must not evict an active or permit-referenced account.
 
-## Configuration and observability
+## Operating the controls
+
+### Validate configuration
 
 All charge arithmetic uses checked operations and local configuration. Startup
 validation ensures that the largest legal request fits every applicable burst,
 outstanding, and backlog capacity, so a valid request cannot wait forever
 because it can never fit.
 
-Regulation records:
+### Make decisions observable
+
+Operators need to distinguish peer behavior, expected overload, and local
+failure. Regulation records:
 
 - the exchange and peer;
 - the bound that delayed or rejected work;
@@ -246,7 +263,7 @@ Metrics use bounded labels. Peer identities belong in trace rows, not metric
 labels. A shared regulation log is unnecessary until more than one service
 needs it.
 
-## Adoption
+## Extending regulation to other messages
 
 The first exchange should validate generic primitives without forcing every
 message through a speculative framework:

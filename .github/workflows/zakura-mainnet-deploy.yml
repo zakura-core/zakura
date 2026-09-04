@@ -715,7 +715,9 @@ jobs:
             : > "$tmp_env"
           fi
           if ! grep -qE '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)=' "$tmp_env"; then
-            echo "::warning::SLACK_WEB_HOOK is not set; fleet watchdog cannot post to Slack"
+            echo "::error::SLACK_WEB_HOOK is not set; fork alerts cannot reach #zakura-alerts" >&2
+            rm -f "$tmp_env"
+            exit 1
           fi
           sudo install -m 600 "$tmp_env" /etc/zakura-fleet-watchdog/env
           rm -f "$tmp_env"

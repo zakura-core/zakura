@@ -123,6 +123,14 @@ RECENT_REORG_LIMIT = 40
 ANCESTOR_DEPTHS = (1, 2, 5, 10, 32)
 DEFAULT_FORK_CONFIRMATIONS = 2
 MAX_RPC_RESPONSE_BYTES = 2 * 1024 * 1024
+# The explorer follows only the recent edge of each observed branch. Once a
+# block is cached, ordinary advancement fetches just the new tip instead of
+# walking the whole window again.
+CHAIN_EXPLORER_BLOCK_LIMIT = 7
+CHAIN_BLOCK_CACHE_LIMIT = 512
+BLOCK_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+ZAKURA_COINBASE_MARKER = "🌸".encode("utf-8")
+ZEBRA_COINBASE_TAG_RE = re.compile(r"(?:^|[^a-z0-9])zebra(?:[^a-z0-9]|$)", re.I)
 
 SSH_COMMON_OPTS = [
     "-o", "BatchMode=yes",
@@ -1007,6 +1015,134 @@ print(json.dumps(out, separators=(",", ":")))
 """
 
 
+CHAIN_WINDOW_PROBE = r"""
+import base64
+import json
+import sys
+import urllib.request
+
+(
+    rpc_url,
+    rpc_auth,
+    rpc_user,
+    rpc_password,
+    rpc_config_path,
+    tip_hash,
+    known_hashes_raw,
+    block_limit_raw,
+) = sys.argv[1:9]
+
+MAX_RPC_RESPONSE_BYTES = 2 * 1024 * 1024
+
+def parse_zcash_conf(path):
+    values = {}
+    if not path:
+        return values
+    with open(path, encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    return values
+
+def rpc_headers():
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    user = rpc_user
+    password = rpc_password
+    if rpc_auth == "zcash_conf":
+        config = parse_zcash_conf(rpc_config_path)
+        user = config.get("rpcuser", user)
+        password = config.get("rpcpassword", password)
+    elif rpc_auth == "cookie":
+        with open(rpc_config_path, encoding="utf-8") as fh:
+            token = fh.read().strip()
+        if ":" in token:
+            user, password = token.split(":", 1)
+        else:
+            user, password = token, ""
+    if rpc_auth in ("basic", "zcash_conf", "cookie") and user and password:
+        token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        headers["Authorization"] = f"Basic {token}"
+    return headers
+
+def rpc_call(method, params=None):
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": "zakura-chain-window",
+        "method": method,
+        "params": list(params or []),
+    }).encode()
+    request = urllib.request.Request(
+        rpc_url,
+        data=body,
+        headers=rpc_headers(),
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=6) as response:
+        payload = json.loads(response.read(MAX_RPC_RESPONSE_BYTES).decode())
+    if not isinstance(payload, dict):
+        raise RuntimeError("RPC returned a non-object response")
+    if payload.get("error"):
+        raise RuntimeError(str(payload["error"]))
+    return payload.get("result")
+
+def coinbase_script(block_hash, transactions):
+    if not transactions:
+        return "", "block has no transactions"
+    first = transactions[0]
+    txid = first.get("txid") if isinstance(first, dict) else first
+    if not isinstance(txid, str) or not txid:
+        return "", "coinbase transaction id is unavailable"
+    try:
+        transaction = rpc_call("getrawtransaction", [txid, 1, block_hash])
+    except Exception as error:
+        return "", str(error)
+    if not isinstance(transaction, dict):
+        return "", "getrawtransaction returned a non-object response"
+    inputs = transaction.get("vin")
+    if not isinstance(inputs, list) or not inputs or not isinstance(inputs[0], dict):
+        return "", "coinbase input is unavailable"
+    value = inputs[0].get("coinbase")
+    return (str(value), "") if value else ("", "coinbase script is unavailable")
+
+known_hashes = set(filter(None, known_hashes_raw.split(",")))
+block_limit = max(1, min(16, int(block_limit_raw)))
+current_hash = tip_hash
+blocks = []
+error = ""
+for _ in range(block_limit):
+    if current_hash in known_hashes:
+        break
+    try:
+        block = rpc_call("getblock", [current_hash, 1])
+        if not isinstance(block, dict):
+            raise RuntimeError("getblock returned a non-object response")
+        coinbase, attribution_error = coinbase_script(
+            current_hash,
+            block.get("tx") if isinstance(block.get("tx"), list) else [],
+        )
+        blocks.append({
+            "height": block.get("height"),
+            "hash": block.get("hash") or current_hash,
+            "previous_hash": block.get("previousblockhash") or "",
+            "time": block.get("time"),
+            "coinbase": coinbase,
+            "attribution_error": attribution_error,
+        })
+        previous_hash = block.get("previousblockhash")
+        if not isinstance(previous_hash, str) or not previous_hash:
+            break
+        current_hash = previous_hash
+    except Exception as caught:
+        error = str(caught)
+        break
+
+print(json.dumps({"blocks": blocks, "error": error}, separators=(",", ":")))
+"""
+
+
 def ssh_capture_script(node: Node, script: str) -> subprocess.CompletedProcess:
     return subprocess.run(node.ssh_cmd("bash", "-s"), input=script, text=True, capture_output=True)
 
@@ -1035,6 +1171,217 @@ def direct_rpc_call(url: str, method: str, params: list | None = None):
     if payload.get("error"):
         raise RuntimeError(str(payload["error"]))
     return payload.get("result")
+
+
+def safe_coinbase_tag(value: bytes, limit: int = 48) -> str:
+    """Return a short printable miner tag without exposing raw script bytes."""
+    text = value.decode("utf-8", "ignore")
+    text = "".join(character for character in text if character.isprintable())
+    return text.strip(" \t\r\n\x00:/|_-")[:limit]
+
+
+def classify_mining_software(
+    coinbase_hex: object,
+    attribution_error: object = "",
+) -> dict[str, str]:
+    """Classify a block from coinbase evidence, never from its observer."""
+    unknown = {
+        "software": "unknown",
+        "mark": "?",
+        "operator": "unknown",
+        "evidence": (
+            "coinbase data unavailable"
+            if attribution_error
+            else "no recognized coinbase marker"
+        ),
+    }
+    if not isinstance(coinbase_hex, str) or not coinbase_hex:
+        return unknown
+    try:
+        raw = bytes.fromhex(coinbase_hex)
+    except ValueError:
+        return {**unknown, "evidence": "invalid coinbase data"}
+
+    marker_at = raw.find(ZAKURA_COINBASE_MARKER)
+    if marker_at >= 0:
+        # Zakura's marker is the start of a dedicated script push. Bound the
+        # operator tag to that push so bytes a pool appends later cannot be
+        # misreported as the configured operator.
+        marker_end = marker_at + len(ZAKURA_COINBASE_MARKER)
+        push_end = marker_end
+        if marker_at >= 1 and raw[marker_at - 1] <= 75:
+            push_end = marker_at + raw[marker_at - 1]
+        elif marker_at >= 2 and raw[marker_at - 2] == 0x4C:
+            push_end = marker_at + raw[marker_at - 1]
+        push_end = min(max(marker_end, push_end), len(raw))
+        tail = raw[marker_end:push_end]
+        operator = (
+            safe_coinbase_tag(tail[2:])
+            if tail.startswith(b": ")
+            else "unknown"
+        ) or "unknown"
+        return {
+            "software": "zakura",
+            "mark": "ZA",
+            "operator": operator,
+            "evidence": "Zakura flower coinbase marker",
+        }
+
+    printable = safe_coinbase_tag(raw, limit=100)
+    zebra_match = ZEBRA_COINBASE_TAG_RE.search(printable)
+    if zebra_match:
+        return {
+            "software": "zebra",
+            "mark": "ZE",
+            "operator": "unknown",
+            "evidence": "explicit Zebra coinbase tag",
+        }
+    return unknown
+
+
+def normalize_chain_block(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    block_hash = str(value.get("hash") or "")
+    previous_hash = str(value.get("previous_hash") or "")
+    height = coerce_int(value.get("height"))
+    if height is None or height < 0 or BLOCK_HASH_RE.fullmatch(block_hash) is None:
+        return None
+    if previous_hash and BLOCK_HASH_RE.fullmatch(previous_hash) is None:
+        previous_hash = ""
+    mined = classify_mining_software(
+        value.get("coinbase"),
+        value.get("attribution_error"),
+    )
+    timestamp = finite_number(value.get("time"))
+    return {
+        "height": height,
+        "hash": block_hash.lower(),
+        "previous_hash": previous_hash.lower(),
+        "time": timestamp,
+        "miner_software": mined["software"],
+        "miner_mark": mined["mark"],
+        "miner_operator": mined["operator"],
+        "miner_evidence": mined["evidence"],
+    }
+
+
+def collect_chain_segment(
+    rpc,
+    tip_hash: str,
+    known_hashes: set[str],
+    block_limit: int = CHAIN_EXPLORER_BLOCK_LIMIT,
+) -> dict:
+    """Fetch a bounded, uncached best-chain segment through an RPC callback."""
+    if BLOCK_HASH_RE.fullmatch(tip_hash) is None:
+        return {"blocks": [], "error": "tip hash is invalid"}
+    current_hash = tip_hash.lower()
+    blocks = []
+    error = ""
+    for _ in range(max(1, min(16, block_limit))):
+        if current_hash in known_hashes:
+            break
+        try:
+            block = rpc("getblock", [current_hash, 1])
+            if not isinstance(block, dict):
+                raise RuntimeError("getblock returned a non-object response")
+            transactions = block.get("tx")
+            transactions = transactions if isinstance(transactions, list) else []
+            coinbase = ""
+            attribution_error = ""
+            if transactions:
+                first = transactions[0]
+                txid = first.get("txid") if isinstance(first, dict) else first
+                if isinstance(txid, str) and txid:
+                    try:
+                        transaction = rpc(
+                            "getrawtransaction", [txid, 1, current_hash]
+                        )
+                        inputs = (
+                            transaction.get("vin")
+                            if isinstance(transaction, dict)
+                            else None
+                        )
+                        if (
+                            isinstance(inputs, list)
+                            and inputs
+                            and isinstance(inputs[0], dict)
+                        ):
+                            coinbase = str(inputs[0].get("coinbase") or "")
+                        if not coinbase:
+                            attribution_error = "coinbase script is unavailable"
+                    except Exception as caught:
+                        attribution_error = str(caught)
+                else:
+                    attribution_error = "coinbase transaction id is unavailable"
+            else:
+                attribution_error = "block has no transactions"
+            normalized = normalize_chain_block({
+                "height": block.get("height"),
+                "hash": block.get("hash") or current_hash,
+                "previous_hash": block.get("previousblockhash") or "",
+                "time": block.get("time"),
+                "coinbase": coinbase,
+                "attribution_error": attribution_error,
+            })
+            if normalized is None:
+                raise RuntimeError("getblock returned invalid chain metadata")
+            blocks.append(normalized)
+            current_hash = normalized["previous_hash"]
+            if not current_hash:
+                break
+        except Exception as caught:
+            error = str(caught)
+            break
+    return {"blocks": blocks, "error": error}
+
+
+def probe_chain_window(
+    node: Node,
+    tip_hash: str,
+    known_hashes: set[str],
+) -> dict:
+    """Fetch only the unknown edge of one observed branch."""
+    if node.source_type == "observer":
+        return collect_chain_segment(
+            lambda method, params: direct_rpc_call(
+                node.observer_rpc_url, method, params
+            ),
+            tip_hash,
+            known_hashes,
+        )
+
+    rpc_url = rpc_url_for(node.rpc_listen_addr)
+    if not rpc_url:
+        return {"blocks": [], "error": "RPC disabled in deployer config"}
+    known = ",".join(sorted(known_hashes))
+    script = (
+        "python3 - "
+        f"{shlex.quote(rpc_url)} "
+        f"{shlex.quote(node.rpc_auth)} "
+        f"{shlex.quote(node.rpc_user)} "
+        f"{shlex.quote(node.rpc_password)} "
+        f"{shlex.quote(node.rpc_config_path)} "
+        f"{shlex.quote(tip_hash)} "
+        f"{shlex.quote(known)} "
+        f"{CHAIN_EXPLORER_BLOCK_LIMIT} <<'PY'\n"
+        f"{CHAIN_WINDOW_PROBE}\n"
+        "PY\n"
+    )
+    proc = ssh_capture_script(node, script)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return {"blocks": [], "error": detail or f"ssh exited {proc.returncode}"}
+    try:
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as error:
+        return {"blocks": [], "error": f"invalid chain probe output: {error}"}
+    blocks = []
+    for value in payload.get("blocks", []):
+        normalized = normalize_chain_block(value)
+        if normalized is not None:
+            blocks.append(normalized)
+    return {"blocks": blocks, "error": str(payload.get("error") or "")}
 
 
 def probe_chain_observer(node: Node, comparison_height: int | None) -> dict:
@@ -1215,6 +1562,8 @@ class ClusterCollector:
         self.history: dict[str, deque[dict]] = {node.name: deque() for node in nodes}
         # Last successful scrape per node, reused on the polls that skip it.
         self.last_metrics: dict[str, dict] = {}
+        self.block_cache: dict[str, dict] = {}
+        self.fork_first_seen: dict[str, float] = {}
         self.ironwood_activation_height = IRONWOOD_ACTIVATION_HEIGHTS[network]
         self.lock = threading.Lock()
         restored_progress = load_progress(state_file)
@@ -1279,10 +1628,11 @@ class ClusterCollector:
 
         rows.sort(key=lambda row: row["name"])
         now = time.time()
+        recent_reorgs = list(self.recent_reorgs)
+        chain = compute_chain_summary(rows, recent_reorgs)
+        enrich_chain_roles(rows, chain)
+        self.populate_chain_explorer(rows, chain, now)
         with self.lock:
-            recent_reorgs = list(self.recent_reorgs)
-            chain = compute_chain_summary(rows, recent_reorgs)
-            enrich_chain_roles(rows, chain)
             self.rows = rows
             self.chain = chain
             self.last_poll = now
@@ -1310,8 +1660,190 @@ class ClusterCollector:
         )
 
     def record_orphan_pair(self, event: dict) -> None:
+        discarded_hash = str(
+            event.get("discarded_hash") or event.get("from_hash") or ""
+        ).lower()
+        cached = self.block_cache.get(discarded_hash)
+        if cached is not None:
+            event["orphan_block"] = dict(cached)
         self.recent_reorgs.appendleft(event)
         self.persist_state()
+
+    def cached_branch(self, tip_hash: str) -> list[dict]:
+        current_hash = str(tip_hash or "").lower()
+        blocks = []
+        seen = set()
+        while (
+            current_hash
+            and current_hash not in seen
+            and len(blocks) < CHAIN_EXPLORER_BLOCK_LIMIT
+        ):
+            seen.add(current_hash)
+            block = self.block_cache.get(current_hash)
+            if block is None:
+                break
+            blocks.append(dict(block))
+            current_hash = str(block.get("previous_hash") or "").lower()
+        blocks.reverse()
+        return blocks
+
+    def uncached_branch_edge(self, tip_hash: str) -> str:
+        """Return the first missing hash needed to complete the explorer window."""
+        current_hash = str(tip_hash or "").lower()
+        seen = set()
+        for _ in range(CHAIN_EXPLORER_BLOCK_LIMIT):
+            if not current_hash or current_hash in seen:
+                return ""
+            seen.add(current_hash)
+            block = self.block_cache.get(current_hash)
+            if block is None:
+                return current_hash
+            current_hash = str(block.get("previous_hash") or "").lower()
+        return ""
+
+    def cache_chain_blocks(self, blocks: list[dict]) -> None:
+        for block in blocks:
+            block_hash = str(block.get("hash") or "").lower()
+            if BLOCK_HASH_RE.fullmatch(block_hash) is None:
+                continue
+            # Refresh insertion order when a source supplies better metadata.
+            self.block_cache.pop(block_hash, None)
+            self.block_cache[block_hash] = dict(block)
+        while len(self.block_cache) > CHAIN_BLOCK_CACHE_LIMIT:
+            oldest = next(iter(self.block_cache))
+            self.block_cache.pop(oldest, None)
+
+    def populate_chain_explorer(
+        self,
+        rows: list[dict],
+        chain: dict,
+        now: float,
+    ) -> None:
+        """Attach recent block paths and honest miner attribution to a snapshot."""
+        rows_by_tip: dict[tuple[int, str], list[dict]] = defaultdict(list)
+        for row in rows:
+            height = coerce_int(row.get("height"))
+            block_hash = str(row.get("block_hash") or "").lower()
+            if height is None or BLOCK_HASH_RE.fullmatch(block_hash) is None:
+                continue
+            rows_by_tip[(height, block_hash)].append(row)
+
+        errors = []
+        for group in chain.get("tip_groups", []):
+            height = coerce_int(group.get("height"))
+            tip_hash = str(group.get("block_hash") or "").lower()
+            if height is None or BLOCK_HASH_RE.fullmatch(tip_hash) is None:
+                continue
+            fetch_hash = self.uncached_branch_edge(tip_hash)
+            if not fetch_hash:
+                continue
+            candidates = sorted(
+                rows_by_tip.get((height, tip_hash), []),
+                key=lambda row: (
+                    row.get("source_type") == "observer",
+                    str(row.get("name") or ""),
+                ),
+            )
+            result = {"blocks": [], "error": "no source can serve this tip"}
+            for row in candidates:
+                source = self.nodes_by_name.get(str(row.get("name") or ""))
+                if source is None or row.get("rpc_ok") is False:
+                    continue
+                result = probe_chain_window(
+                    source,
+                    fetch_hash,
+                    set(self.block_cache),
+                )
+                self.cache_chain_blocks(result.get("blocks") or [])
+                if not self.uncached_branch_edge(tip_hash):
+                    break
+            if result.get("error"):
+                errors.append({
+                    "tip_hash": tip_hash,
+                    "source": str(candidates[0].get("name") or "") if candidates else "",
+                    "error": str(result["error"])[:200],
+                })
+
+        majority_height = coerce_int(chain.get("majority_height"))
+        majority_hash = str(chain.get("majority_hash") or "").lower()
+        canonical_hashes = {
+            block["hash"] for block in self.cached_branch(majority_hash)
+        }
+        live_hashes = set()
+        branches = []
+        for group in chain.get("tip_groups", []):
+            height = coerce_int(group.get("height"))
+            tip_hash = str(group.get("block_hash") or "").lower()
+            if height is None or BLOCK_HASH_RE.fullmatch(tip_hash) is None:
+                continue
+            canonical = height == majority_height and tip_hash == majority_hash
+            blocks = self.cached_branch(tip_hash)
+            branch_hashes = {block["hash"] for block in blocks}
+            if canonical:
+                role = "canonical"
+            elif tip_hash in canonical_hashes:
+                role = "lagging"
+            elif majority_hash and majority_hash in branch_hashes:
+                role = "extension"
+            else:
+                role = "competitor"
+            if role == "competitor":
+                live_hashes.add(tip_hash)
+                self.fork_first_seen.setdefault(tip_hash, now)
+            if not blocks:
+                blocks = [{
+                    "height": height,
+                    "hash": tip_hash,
+                    "previous_hash": "",
+                    "time": None,
+                    "miner_software": "unknown",
+                    "miner_mark": "?",
+                    "miner_operator": "unknown",
+                    "miner_evidence": "coinbase data unavailable",
+                }]
+            branches.append({
+                "role": role,
+                "tip_height": height,
+                "tip_hash": tip_hash,
+                "sources": list(group.get("nodes") or []),
+                "fork_depth": group.get("fork_depth"),
+                "fork_depth_label": group.get("fork_depth_label") or "",
+                "first_seen_at": (
+                    self.fork_first_seen[tip_hash]
+                    if role == "competitor"
+                    else None
+                ),
+                "blocks": blocks,
+            })
+        self.fork_first_seen = {
+            tip_hash: first_seen
+            for tip_hash, first_seen in self.fork_first_seen.items()
+            if tip_hash in live_hashes
+        }
+
+        hydrated_reorgs = []
+        for event in chain.get("recent_reorgs", []):
+            hydrated = dict(event)
+            discarded_hash = str(
+                hydrated.get("discarded_hash")
+                or hydrated.get("from_hash")
+                or ""
+            ).lower()
+            block = hydrated.get("orphan_block") or self.block_cache.get(discarded_hash)
+            if isinstance(block, dict):
+                hydrated["orphan_block"] = dict(block)
+            hydrated_reorgs.append(hydrated)
+
+        canonical_branch = next(
+            (branch for branch in branches if branch["role"] == "canonical"),
+            None,
+        )
+        chain["branches"] = branches
+        chain["current_tip"] = (
+            dict(canonical_branch["blocks"][-1]) if canonical_branch else None
+        )
+        chain["recent_reorgs"] = hydrated_reorgs
+        chain["explorer_errors"] = errors
 
     def should_scrape_metrics(self, name: str, now: float) -> bool:
         """Decide per node, from what its last scrape cost."""
@@ -1608,8 +2140,25 @@ class ClusterCollector:
             chain["comparison_groups"] = [
                 dict(group) for group in chain.get("comparison_groups", [])
             ]
+            chain["branches"] = [
+                {
+                    **dict(branch),
+                    "blocks": [
+                        dict(block) for block in branch.get("blocks", [])
+                    ],
+                }
+                for branch in chain.get("branches", [])
+            ]
             chain["recent_reorgs"] = [
-                dict(event) for event in chain.get("recent_reorgs", [])
+                {
+                    **dict(event),
+                    **(
+                        {"orphan_block": dict(event["orphan_block"])}
+                        if isinstance(event.get("orphan_block"), dict)
+                        else {}
+                    ),
+                }
+                for event in chain.get("recent_reorgs", [])
             ]
         healthy = sum(1 for row in rows if row.get("healthy"))
         return {
@@ -1821,6 +2370,9 @@ def empty_chain_summary() -> dict:
         "forked_sources": [],
         "unavailable_sources": [],
         "recent_reorgs": [],
+        "branches": [],
+        "current_tip": None,
+        "explorer_errors": [],
     }
 
 
@@ -2255,8 +2807,8 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Zakura Ironwood cluster status">
-<title>Zakura cluster status</title>
+<meta name="description" content="Zakura chain fork and miner monitor">
+<title>Zakura chain monitor</title>
 <link rel="icon" href="https://avatars.githubusercontent.com/u/272444516?s=200&v=4" type="image/png">
 <style>
 :root {
@@ -2442,6 +2994,21 @@ button { font: inherit; }
 .ghost-button.is-on { border-color: var(--warn-line); background: var(--warn-soft); color: var(--warn); }
 .freshness { font-size: 0.76rem; color: var(--muted); white-space: nowrap; }
 .freshness b { color: var(--ink-2); font-weight: 600; }
+.tip-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 38px;
+  padding: 6px 12px;
+  border: 1px solid var(--line-hi);
+  border-radius: var(--r-sm);
+  background: var(--base);
+  color: var(--ink-2);
+  font-size: 0.72rem;
+  text-decoration: none;
+}
+.tip-link:hover { border-color: var(--pink); color: var(--ink); }
+.tip-link code { color: var(--pink-hi); font-family: var(--mono); font-size: 0.72rem; }
 
 /* ---------- fleet health card ---------- */
 .card-head {
@@ -2676,6 +3243,187 @@ button { font: inherit; }
   font-size: 0.84rem;
   text-align: center;
 }
+
+/* ---------- chain explorer ---------- */
+.chain-explorer { overflow: hidden; }
+.chain-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  min-height: 42px;
+  padding: 9px 22px;
+  border-bottom: 1px solid var(--line);
+  background: var(--ok-soft);
+  color: var(--ok);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.chain-alert.is-warn { background: var(--warn-soft); color: var(--warn); }
+.chain-alert.is-bad { background: var(--bad-soft); color: var(--bad); }
+.chain-alert-copy { display: inline-flex; align-items: center; gap: 9px; }
+.chain-alert-copy i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 9px currentColor;
+}
+.chain-alert > span:last-child { color: var(--ink-2); font-weight: 500; }
+.chain-explorer-main { padding: 20px 22px 18px; }
+.chain-explorer-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.chain-explorer-head h2 {
+  margin-top: 3px;
+  font-size: clamp(1.05rem, 2vw, 1.3rem);
+  font-weight: 650;
+  letter-spacing: -0.018em;
+}
+.range-switch {
+  display: inline-flex;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--line-hi);
+  border-radius: 999px;
+  background: var(--base);
+}
+.range-switch button {
+  min-height: 30px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.73rem;
+  cursor: pointer;
+}
+.range-switch button:hover { color: var(--ink); }
+.range-switch button[aria-pressed="true"] { background: var(--raised); color: var(--ink); }
+.chain-canvas {
+  position: relative;
+  min-height: 390px;
+  margin-top: 12px;
+  overflow: hidden;
+}
+.chain-canvas svg { display: block; width: 100%; height: 390px; overflow: visible; }
+.chain-spine,
+.chain-branch-path { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.chain-spine { stroke: var(--ok); stroke-width: 3; }
+.chain-branch-path { stroke: var(--bad); stroke-width: 2.5; }
+.chain-branch-path.is-historical { stroke: var(--warn); stroke-dasharray: 5 7; }
+.chain-node { color: var(--ink); text-decoration: none; outline: none; }
+.chain-node rect {
+  width: 38px;
+  height: 38px;
+  rx: 10px;
+  fill: var(--raised);
+  stroke: var(--line-hi);
+  stroke-width: 1.5;
+}
+.chain-node:hover rect,
+.chain-node:focus rect,
+.chain-node.is-selected rect { stroke: var(--pink-hi); stroke-width: 2.5; }
+.chain-node.is-zakura rect { fill: var(--pink-soft); stroke: rgba(232, 112, 159, 0.58); }
+.chain-node.is-zebra rect { fill: url(#zebra-pattern); }
+.chain-node.is-unknown rect { rx: 19px; }
+.chain-node text {
+  fill: currentColor;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  text-anchor: middle;
+  dominant-baseline: central;
+  pointer-events: none;
+}
+.chain-height-label { fill: var(--muted); font-family: var(--mono); font-size: 10px; text-anchor: middle; }
+.chain-branch-label rect { fill: var(--base); stroke: var(--line-hi); rx: 7px; }
+.chain-branch-label text { fill: var(--ink-2); font-size: 11px; font-weight: 600; }
+.chain-empty { color: var(--muted); font-size: 0.84rem; }
+.chain-tooltip {
+  position: absolute;
+  z-index: 5;
+  width: min(292px, calc(100% - 20px));
+  padding: 11px 12px;
+  border: 1px solid var(--line-hi);
+  border-radius: 10px;
+  background: var(--raised);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.35);
+  color: var(--ink);
+  pointer-events: none;
+}
+.chain-tooltip[hidden] { display: none; }
+.chain-tooltip strong { display: block; margin-bottom: 5px; }
+.chain-tooltip-grid { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 9px; font-size: 0.75rem; }
+.chain-tooltip-grid span:nth-child(odd) { color: var(--muted); }
+.chain-tooltip-grid span:nth-child(even) { overflow-wrap: anywhere; }
+.chain-legend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 18px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+.chain-line-legend,
+.miner-legend,
+.miner-legend > span,
+.miner-value { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.chain-line-legend { gap: 8px 16px; }
+.chain-line-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.chain-line-legend i { width: 18px; height: 3px; border-radius: 3px; background: var(--line-hi); }
+.chain-line-legend i.canonical { background: var(--ok); }
+.chain-line-legend i.competitor { background: var(--bad); }
+.chain-line-legend i.historical { background: var(--warn); }
+.miner-legend { gap: 8px 12px; color: var(--ink-2); }
+.miner-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 25px;
+  height: 25px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line-hi);
+  border-radius: 7px;
+  background: var(--raised);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  font-style: normal;
+  font-weight: 700;
+}
+.miner-mark.is-zakura { border-color: rgba(232, 112, 159, 0.58); background: var(--pink-soft); color: var(--pink-hi); }
+.miner-mark.is-zebra {
+  background: repeating-linear-gradient(135deg, var(--raised) 0, var(--raised) 4px, var(--line-hi) 4px, var(--line-hi) 7px);
+}
+.miner-mark.is-unknown { border-radius: 50%; }
+.chain-selection {
+  display: grid;
+  grid-template-columns: minmax(230px, 1.4fr) repeat(3, minmax(140px, 1fr));
+  gap: 16px 22px;
+  margin-top: 16px;
+  padding: 14px 15px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--base);
+}
+.chain-selection > div { min-width: 0; }
+.chain-selection-primary strong { display: block; font-size: 0.96rem; }
+.chain-selection-top { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; font-size: 0.72rem; }
+.chain-selection-status { padding: 1px 7px; border-radius: 999px; background: var(--ok-soft); color: var(--ok); font-weight: 650; }
+.chain-selection-status.is-competitor { background: var(--bad-soft); color: var(--bad); }
+.chain-selection-status.is-historical { background: var(--warn-soft); color: var(--warn); }
+.selected-hash { display: block; margin-top: 4px; color: var(--pink-hi); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.miner-value { margin-top: 5px; flex-wrap: nowrap; }
+.miner-value strong,
+.chain-selection-value { display: block; margin-top: 5px; font-size: 0.86rem; font-weight: 620; overflow-wrap: anywhere; }
+.chain-selection small { display: block; margin-top: 3px; font-size: 0.7rem; }
+.attribution-note { margin-top: 8px; color: var(--dim); font-size: 0.72rem; }
 
 /* ---------- toolbar ---------- */
 .toolbar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
@@ -2920,6 +3668,22 @@ footer {
   .pad { padding: 16px; }
   .topbar { align-items: flex-start; }
   .search input { width: 130px; }
+  .tip-link { width: 100%; justify-content: space-between; order: 3; }
+  .chain-alert,
+  .chain-explorer-head,
+  .chain-legend { align-items: flex-start; flex-direction: column; }
+  .chain-alert { padding: 10px 16px; }
+  .chain-explorer-main { padding: 16px; }
+  .chain-selection { grid-template-columns: 1fr 1fr; }
+  .chain-selection-primary { grid-column: 1 / -1; }
+}
+@media (max-width: 460px) {
+  .range-switch { width: 100%; }
+  .range-switch button { flex: 1; padding-inline: 7px; }
+  .chain-canvas { min-height: 430px; }
+  .chain-canvas svg { height: 430px; }
+  .chain-selection { grid-template-columns: 1fr; }
+  .chain-selection-primary { grid-column: auto; }
 }
 </style>
 </head>
@@ -2929,17 +3693,92 @@ footer {
     <div class="brand">
       <img src="https://avatars.githubusercontent.com/u/272444516?s=200&v=4" alt="Valar Group" width="40" height="40">
       <div>
-        <p class="eyebrow"><span id="network-chip" class="chip">mainnet</span> Ironwood observability</p>
-        <h1>Zakura Cluster Status</h1>
+        <p class="eyebrow"><span id="network-chip" class="chip">mainnet</span> Fork history and miner attribution</p>
+        <h1>Zakura chain monitor</h1>
       </div>
     </div>
     <div class="header-right">
+      <a class="tip-link" id="current-tip-link" href="#chain-tip">
+        <span>Canonical tip</span>
+        <code id="current-tip-value">waiting for first poll</code>
+        <span aria-hidden="true">&#8594;</span>
+      </a>
       <span class="freshness" id="freshness">connecting...</span>
       <span class="state-pill" id="state-pill">Connecting</span>
     </div>
   </header>
 
   <div class="banner" id="banner" hidden></div>
+
+  <section class="panel chain-explorer" data-view="fleet" aria-labelledby="chain-explorer-title">
+    <div class="chain-alert" id="chain-alert">
+      <span class="chain-alert-copy"><i aria-hidden="true"></i><span id="chain-alert-text">Waiting for chain observations...</span></span>
+      <span id="slack-policy">Slack policy · alert after 3 minutes · #zakura-alerts</span>
+    </div>
+    <div class="chain-explorer-main">
+      <div class="chain-explorer-head">
+        <div>
+          <p class="eyebrow" id="chain-network-label">mainnet · live</p>
+          <h2 id="chain-explorer-title">Canonical chain and competing forks</h2>
+        </div>
+        <div class="range-switch" role="group" aria-label="Fork history range">
+          <button type="button" data-chain-range="live" aria-pressed="true">Live</button>
+          <button type="button" data-chain-range="24h" aria-pressed="false">24 hours</button>
+          <button type="button" data-chain-range="7d" aria-pressed="false">7 days</button>
+        </div>
+      </div>
+
+      <div class="chain-canvas" id="chain-canvas">
+        <svg id="chain-svg" role="img" aria-labelledby="chain-svg-title chain-svg-desc">
+          <title id="chain-svg-title">Canonical chain and competing fork history</title>
+          <desc id="chain-svg-desc">Recent canonical blocks and current or historical competing blocks. Each block shows ZA for Zakura, ZE for Zebra, or a question mark when its mining software is unknown.</desc>
+        </svg>
+        <div class="chain-tooltip" id="chain-tooltip" role="tooltip" hidden></div>
+      </div>
+
+      <div class="chain-legend">
+        <div class="chain-line-legend">
+          <span><i class="canonical"></i>Canonical majority</span>
+          <span><i class="competitor"></i>Live competitor</span>
+          <span><i class="historical"></i>Historical orphan</span>
+        </div>
+        <div class="miner-legend" aria-label="Mining software symbols">
+          <span class="label">Mining software</span>
+          <span><i class="miner-mark is-zakura" aria-hidden="true">ZA</i>Zakura</span>
+          <span><i class="miner-mark is-zebra" aria-hidden="true">ZE</i>Zebra</span>
+          <span><i class="miner-mark is-unknown" aria-hidden="true">?</i>Unknown</span>
+        </div>
+        <span class="chain-help">Hover for evidence · click to pin</span>
+      </div>
+
+      <section class="chain-selection" id="chain-selection" aria-live="polite" aria-label="Selected block details">
+        <div class="chain-selection-primary">
+          <div class="chain-selection-top">
+            <span class="chain-selection-status" id="selected-status">canonical</span>
+            <span class="muted" id="selected-time">waiting for first poll</span>
+          </div>
+          <strong id="selected-height">Block height —</strong>
+          <span class="mono selected-hash" id="selected-hash">—</span>
+        </div>
+        <div>
+          <span class="label">Mining software</span>
+          <div class="miner-value"><i class="miner-mark is-unknown" id="selected-miner-mark" aria-hidden="true">?</i><strong id="selected-miner">Unknown</strong></div>
+          <small class="muted" id="selected-evidence">No coinbase evidence yet</small>
+        </div>
+        <div>
+          <span class="label">Operator</span>
+          <strong class="chain-selection-value" id="selected-operator">Unknown</strong>
+          <small class="muted" id="selected-sources">No source yet</small>
+        </div>
+        <div>
+          <span class="label">Branch</span>
+          <strong class="chain-selection-value" id="selected-branch">Canonical best chain</strong>
+          <small class="muted" id="selected-seen">—</small>
+        </div>
+      </section>
+      <p class="attribution-note">Software and operator are separate signals. A ? means the block did not expose enough coinbase evidence to identify Zakura or Zebra.</p>
+    </div>
+  </section>
 
   <section class="panel pad" data-view="fleet">
     <div class="card-head">
@@ -3003,24 +3842,6 @@ footer {
       <div class="stat-value" id="last-poll">...</div>
       <small id="stale-window">...</small>
     </div>
-  </section>
-
-  <section class="panel pad" data-view="fleet">
-    <div class="section-head">
-      <div>
-        <p class="eyebrow">Fork / uncle studio</p>
-        <h2>Settled chain agreement</h2>
-      </div>
-      <p class="section-note" id="fork-summary">Waiting for first comparison...</p>
-    </div>
-    <p class="fork-explainer" id="fork-explainer">The studio compares every source at one shared block height behind the live tips, avoiding alerts for ordinary propagation races.</p>
-    <div class="branch-studio" id="comparison-groups"></div>
-    <div class="fork-missing" id="comparison-missing"></div>
-    <div class="subhead"><p class="eyebrow">Live tip lanes</p></div>
-    <p class="section-note" id="chain-summary">Waiting for first poll...</p>
-    <div class="tip-groups" id="tip-groups"></div>
-    <div class="subhead"><p class="eyebrow">Reorg / orphan events</p></div>
-    <div class="reorg-list" id="reorg-list"></div>
   </section>
 
   <section class="panel pad" data-view="fleet">
@@ -3140,6 +3961,9 @@ const state = {
   sortDir: 1,
   expanded: new Set(),
   expandAll: false,
+  chainRange: 'live',
+  selectedBlockKey: '',
+  chainBlockIndex: new Map(),
   fetchedAt: null,
   error: '',
 };
@@ -3314,7 +4138,17 @@ function renderHeader(data) {
   const chain = data.chain || {};
   const network = data.network || 'mainnet';
   el('network-chip').textContent = network;
-  document.title = 'Zakura ' + network + ' cluster status';
+  document.title = 'Zakura ' + network + ' chain monitor';
+  const currentTip = chain.current_tip || {
+    height: chain.majority_height,
+    hash: chain.majority_hash,
+  };
+  el('current-tip-value').textContent = currentTip.height == null
+    ? 'waiting for first poll'
+    : num(currentTip.height) + ' · ' + tinyHash(currentTip.hash);
+  el('current-tip-link').setAttribute('aria-label', currentTip.height == null
+    ? 'Canonical tip is not available yet'
+    : 'Select canonical tip at height ' + num(currentTip.height));
 
   let label = 'Healthy';
   let toneName = 'ok';
@@ -3451,102 +4285,289 @@ function renderStats(data) {
   el('stale-window').textContent =
     'stale after ' + Math.round(data.stale_after) + 's without a new block';
 }
+function miningSoftwareName(value) {
+  return { zakura: 'Zakura', zebra: 'Zebra' }[value] || 'Unknown';
+}
+function miningSoftwareClass(value) {
+  return { zakura: 'is-zakura', zebra: 'is-zebra' }[value] || 'is-unknown';
+}
+function chainBlockKey(role, block, index) {
+  return role + ':' + (block.hash || ('unknown-' + index));
+}
+function chainBlockEntry(block, details) {
+  return {
+    block: block || {},
+    role: details.role,
+    status: details.status,
+    branch: details.branch,
+    sources: details.sources || [],
+    firstSeenAt: details.firstSeenAt || null,
+    eventAt: details.eventAt || null,
+  };
+}
+function chainNodeMarkup(entry, key, x, y, options) {
+  const block = entry.block || {};
+  const software = block.miner_software || 'unknown';
+  const mark = block.miner_mark || (software === 'zakura' ? 'ZA' : (software === 'zebra' ? 'ZE' : '?'));
+  const selected = state.selectedBlockKey === key ? ' is-selected' : '';
+  const tipId = options && options.tip ? ' id="chain-tip"' : '';
+  const label = 'Block ' + num(block.height) + ', ' + miningSoftwareName(software)
+    + ' mining software, ' + entry.status;
+  const heightLabel = options && options.compact
+    ? '…' + String(block.height == null ? '?' : block.height).slice(-3)
+    : num(block.height);
+  return '<g transform="translate(' + (x - 19).toFixed(1) + ' ' + (y - 19).toFixed(1) + ')">'
+    + '<a href="#chain-selection" class="chain-node ' + miningSoftwareClass(software) + selected + '"'
+    + tipId + ' data-chain-block="' + esc(key) + '" aria-label="' + esc(label) + '">'
+    + '<rect width="38" height="38"></rect><text x="19" y="19">' + esc(mark) + '</text></a>'
+    + '<text class="chain-height-label" x="19" y="57">' + esc(heightLabel) + '</text></g>';
+}
+function chainBranchLabel(text, x, y, width) {
+  const boxWidth = Math.max(92, Math.min(width || 210, 10 + text.length * 6.1));
+  return '<g class="chain-branch-label" transform="translate(' + x.toFixed(1) + ' ' + y.toFixed(1) + ')">'
+    + '<rect width="' + boxWidth.toFixed(1) + '" height="25"></rect>'
+    + '<text x="8" y="17">' + esc(text) + '</text></g>';
+}
+function renderSelectedChainBlock(entry, key) {
+  if (!entry) return;
+  const block = entry.block || {};
+  const software = block.miner_software || 'unknown';
+  state.selectedBlockKey = key;
+  el('selected-status').textContent = entry.status;
+  el('selected-status').className = 'chain-selection-status'
+    + (entry.role === 'competitor' ? ' is-competitor' : '')
+    + (entry.role === 'historical' ? ' is-historical' : '');
+  el('selected-time').textContent = block.time
+    ? new Date(block.time * 1000).toLocaleString()
+    : (entry.eventAt ? 'recorded ' + clockTime(entry.eventAt) : 'time unavailable');
+  el('selected-height').textContent = 'Block height ' + num(block.height);
+  el('selected-hash').textContent = block.hash || 'hash unavailable';
+  const mark = el('selected-miner-mark');
+  mark.textContent = block.miner_mark || (software === 'zakura' ? 'ZA' : (software === 'zebra' ? 'ZE' : '?'));
+  mark.className = 'miner-mark ' + miningSoftwareClass(software);
+  el('selected-miner').textContent = miningSoftwareName(software);
+  el('selected-evidence').textContent = block.miner_evidence || 'no recognized coinbase marker';
+  el('selected-operator').textContent = block.miner_operator && block.miner_operator !== 'unknown'
+    ? block.miner_operator
+    : 'Unknown';
+  el('selected-sources').textContent = entry.sources.length
+    ? 'Observed by ' + entry.sources.join(', ')
+    : 'Observer unavailable';
+  el('selected-branch').textContent = entry.branch;
+  el('selected-seen').textContent = entry.firstSeenAt
+    ? 'first seen ' + age(Math.max(0, (Date.now() / 1000) - entry.firstSeenAt)) + ' ago'
+    : (entry.role === 'historical' ? 'left the observed best chain' : 'current best chain');
+}
+function showChainTooltip(trigger, clientX, clientY) {
+  const entry = state.chainBlockIndex.get(trigger.dataset.chainBlock);
+  if (!entry) return;
+  const block = entry.block || {};
+  const tooltip = el('chain-tooltip');
+  tooltip.innerHTML = '<strong>Block ' + esc(num(block.height)) + ' · ' + esc(entry.status) + '</strong>'
+    + '<div class="chain-tooltip-grid">'
+    + '<span>Hash</span><span class="mono">' + esc(tinyHash(block.hash)) + '</span>'
+    + '<span>Software</span><span>' + esc(miningSoftwareName(block.miner_software)) + '</span>'
+    + '<span>Operator</span><span>' + esc(block.miner_operator || 'unknown') + '</span>'
+    + '<span>Evidence</span><span>' + esc(block.miner_evidence || 'no recognized coinbase marker') + '</span>'
+    + '<span>Observed by</span><span>' + esc(entry.sources.join(', ') || 'unknown') + '</span>'
+    + '</div>';
+  tooltip.hidden = false;
+  const canvas = el('chain-canvas').getBoundingClientRect();
+  const triggerBox = trigger.getBoundingClientRect();
+  let left = clientX == null ? triggerBox.left + triggerBox.width / 2 : clientX;
+  let top = clientY == null ? triggerBox.top : clientY;
+  left = Math.max(canvas.left + 10, Math.min(left + 12, canvas.right - tooltip.offsetWidth - 10));
+  top = Math.max(canvas.top + 8, Math.min(top + 12, canvas.bottom - tooltip.offsetHeight - 8));
+  tooltip.style.left = (left - canvas.left) + 'px';
+  tooltip.style.top = (top - canvas.top) + 'px';
+}
 function renderChain(data) {
   const chain = data.chain || {};
-  const status = chain.status || 'unknown';
   const forkStatus = chain.fork_status || 'warming';
   const tipGroups = chain.tip_groups || [];
-  const comparisonGroups = chain.comparison_groups || [];
-  const reorgs = chain.recent_reorgs || [];
+  let branches = chain.branches || [];
+  if (!branches.length) {
+    branches = tipGroups.map((group) => ({
+      role: group.height === chain.majority_height && group.block_hash === chain.majority_hash
+        ? 'canonical' : 'competitor',
+      tip_height: group.height,
+      tip_hash: group.block_hash,
+      sources: group.nodes || [],
+      fork_depth_label: group.fork_depth_label || '',
+      blocks: [{
+        height: group.height,
+        hash: group.block_hash,
+        miner_software: 'unknown',
+        miner_mark: '?',
+        miner_operator: 'unknown',
+        miner_evidence: 'coinbase data unavailable',
+      }],
+    }));
+  }
+  const canonical = branches.find((branch) => branch.role === 'canonical') || null;
+  const competitors = branches.filter((branch) => branch.role === 'competitor');
+  const generatedAt = data.generated_at || Date.now() / 1000;
+  const cutoff = state.chainRange === '7d'
+    ? generatedAt - 7 * 86400
+    : generatedAt - 86400;
+  const historical = state.chainRange === 'live'
+    ? []
+    : (chain.recent_reorgs || []).filter((event) => Number(event.at || 0) >= cutoff).slice(0, 6);
 
-  el('fork-summary').textContent = {
-    agreed: 'All configured sources agree at the settled comparison height.',
-    diverged: 'Sources return different block hashes at the same settled height.',
-    partial: 'Available sources agree, but one or more sources could not be compared.',
-    insufficient: 'Fewer than two sources returned a hash at the comparison height.',
-    warming: 'The first poll establishes tip heights; the next poll compares chains.',
-  }[forkStatus] || 'Waiting for settled chain observations.';
-  el('fork-explainer').textContent = chain.comparison_height == null
-    ? 'The studio compares every source at one shared block height behind the live tips, avoiding alerts for ordinary propagation races.'
-    : 'Height ' + num(chain.comparison_height) + ' is ' + num(data.fork_confirmations || 0)
-      + ' block' + ((data.fork_confirmations || 0) === 1 ? '' : 's')
-      + ' behind the slowest healthy source observed on the prior poll.';
+  el('chain-network-label').textContent = (data.network || 'mainnet') + ' · '
+    + ({ live: 'live', '24h': 'last 24 hours', '7d': 'last 7 days' }[state.chainRange]);
+  const alert = el('chain-alert');
+  alert.className = 'chain-alert';
+  if (forkStatus === 'diverged') {
+    alert.classList.add('is-bad');
+    el('chain-alert-text').textContent = 'Competing fork active at settled height '
+      + num(chain.comparison_height) + ' · ' + (chain.comparison_groups || []).length + ' branches';
+  } else if (forkStatus === 'partial' || forkStatus === 'insufficient') {
+    alert.classList.add('is-warn');
+    el('chain-alert-text').textContent = 'Fork comparison incomplete · '
+      + (chain.comparison_observed || 0) + ' of ' + (chain.comparison_expected || data.total || 0) + ' sources';
+  } else if (forkStatus === 'warming') {
+    alert.classList.add('is-warn');
+    el('chain-alert-text').textContent = 'Establishing the settled comparison height';
+  } else {
+    el('chain-alert-text').textContent = 'No competing settled fork detected';
+  }
 
-  el('comparison-groups').innerHTML = comparisonGroups.length
-    ? comparisonGroups.map((group) => {
-      const role = group.role || 'candidate';
-      const cls = role === 'quorum' ? 'is-majority' : (role === 'fork' ? 'is-fork' : 'is-candidate');
-      const observers = new Set(group.observers || []);
-      const labels = (group.nodes || []).map((name) =>
-        name + (observers.has(name) ? ' (observer)' : ''));
-      return '<div class="tip-group branch-group ' + cls + '">'
-        + '<div class="tip-group-top">'
-        + badge(role, tone(CHAIN_TONE, role))
-        + '<span class="height num">height ' + num(chain.comparison_height) + '</span>'
-        + '<span class="mono muted" style="font-size:0.78rem">'
-        + copyCell(group.block_hash, shortHash(group.block_hash), 'Copy comparison hash') + '</span>'
-        + '</div>'
-        + '<div class="tip-group-count">' + group.count
-        + ' source' + (group.count === 1 ? '' : 's') + '</div>'
-        + '<div class="tip-group-nodes">' + esc(labels.join(', ')) + '</div>'
-        + '</div>';
-    }).join('')
-    : '<div class="empty">No settled hashes observed yet.</div>';
-  const unavailable = chain.unavailable_sources || [];
-  el('comparison-missing').textContent = unavailable.length
-    ? 'Not compared: ' + unavailable.join(', ')
-    : '';
+  const canvas = el('chain-canvas');
+  const svg = el('chain-svg');
+  const width = Math.max(300, canvas.clientWidth || 900);
+  const compact = width < 560;
+  const height = historical.length ? (compact ? 500 : 455) : (compact ? 430 : 390);
+  canvas.style.minHeight = height + 'px';
+  svg.style.height = height + 'px';
+  svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+  const left = compact ? 34 : 54;
+  const right = compact ? width - 34 : width - 54;
+  const canonicalY = historical.length ? 180 : (compact ? 205 : 195);
+  const visibleCanonical = canonical
+    ? (canonical.blocks || []).slice(compact ? -4 : -7)
+    : [];
+  state.chainBlockIndex = new Map();
 
-  el('chain-summary').textContent = {
-    split: 'Sources disagree on the tip hash at the leading height.',
-    lagging: 'One tip hash leads; some sources are behind.',
-    agreed: 'All observed sources share the same tip.',
-  }[status] || 'Waiting for tip observations.';
+  const defs = '<defs><pattern id="zebra-pattern" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(135)">'
+    + '<rect width="7" height="7" fill="var(--raised)"></rect>'
+    + '<rect width="3" height="7" fill="var(--line-hi)"></rect></pattern></defs>';
+  if (!visibleCanonical.length) {
+    svg.innerHTML = defs + '<text class="chain-empty" x="' + left + '" y="90">Waiting for recent block data...</text>';
+    return;
+  }
 
-  el('tip-groups').innerHTML = tipGroups.length
-    ? tipGroups.map((group) => {
-      const isMajority = group.height === chain.majority_height
-        && group.block_hash === chain.majority_hash;
-      const depth = group.fork_depth_label && !isMajority
-        ? badge(group.fork_depth_label, 'warn')
-        : '';
-      return '<div class="tip-group ' + (isMajority ? 'is-majority' : 'is-fork') + '">'
-        + '<div class="tip-group-top">'
-        + badge(isMajority ? 'majority' : 'fork', isMajority ? 'ok' : 'bad')
-        + '<span class="height num">height ' + num(group.height) + '</span>'
-        + '<span class="mono muted" style="font-size:0.78rem">'
-        + copyCell(group.block_hash, shortHash(group.block_hash), 'Copy tip hash') + '</span>'
-        + depth
-        + '</div>'
-        + '<div class="tip-group-count">' + group.count
-        + ' source' + (group.count === 1 ? '' : 's') + '</div>'
-        + '<div class="tip-group-nodes">' + esc((group.nodes || []).join(', ')) + '</div>'
-        + '</div>';
-    }).join('')
-    : '<div class="empty">No tip hashes observed yet.</div>';
+  const allLiveBlocks = branches.flatMap((branch) => branch.blocks || []);
+  const heights = allLiveBlocks.map((block) => Number(block.height)).filter(Number.isFinite);
+  let minHeight = Math.min(...visibleCanonical.map((block) => Number(block.height)));
+  let maxHeight = Math.max(...visibleCanonical.map((block) => Number(block.height)));
+  if (heights.length) {
+    minHeight = Math.min(minHeight, ...heights);
+    maxHeight = Math.max(maxHeight, ...heights);
+  }
+  const heightSpan = Math.max(1, maxHeight - minHeight);
+  const xForHeight = (blockHeight) => left + ((Number(blockHeight) - minHeight) / heightSpan) * (right - left);
+  const canonicalPoints = visibleCanonical.map((block, index) => ({
+    block,
+    x: xForHeight(block.height),
+    y: canonicalY,
+    index,
+  }));
+  const canonicalByHash = new Map(canonicalPoints.map((point) => [point.block.hash, point]));
+  let markup = defs;
+  markup += '<path class="chain-spine" d="M ' + canonicalPoints.map((point) =>
+    point.x.toFixed(1) + ' ' + point.y.toFixed(1)).join(' L ') + '"></path>';
 
-  el('reorg-list').innerHTML = reorgs.length
-    ? reorgs.slice(0, 12).map((event) => {
-      const discarded = event.discarded_hash || event.from_hash || '';
-      const canonical = event.canonical_hash || event.to_hash || '';
-      const depth = event.depth_label
-        || (event.depth != null ? 'depth ' + event.depth : 'depth unknown');
-      return '<div class="reorg-item">'
-        + '<div class="reorg-top">'
-        + '<strong>' + esc(event.node) + '</strong>'
-        + badge(tipEventLabel(event.kind) || event.kind, 'warn')
-        + badge(depth, 'neutral')
-        + (event.demo ? badge('demo', 'info') : '')
-        + '<span class="muted num" style="font-size:0.78rem">' + num(event.from_height)
-        + ' → ' + num(event.to_height) + '</span>'
-        + '</div>'
-        + '<div class="reorg-detail mono">orphan ' + esc(tinyHash(discarded))
-        + ' → tip ' + esc(tinyHash(canonical))
-        + '<span class="dim"> · ' + esc(clockTime(event.at)) + '</span></div>'
-        + '</div>';
-    }).join('')
-    : '<div class="empty">No orphan pairs yet. Height drops and tip switches are'
-      + ' recorded here and survive dashboard restarts.</div>';
+  canonicalPoints.forEach((point, index) => {
+    const key = chainBlockKey('canonical', point.block, index);
+    const entry = chainBlockEntry(point.block, {
+      role: 'canonical',
+      status: index === canonicalPoints.length - 1 ? 'canonical tip' : 'canonical',
+      branch: 'Canonical best chain',
+      sources: canonical.sources || [],
+    });
+    state.chainBlockIndex.set(key, entry);
+    markup += chainNodeMarkup(entry, key, point.x, point.y, {
+      tip: index === canonicalPoints.length - 1,
+      compact,
+    });
+  });
+
+  const laneYs = compact ? [92, 318, 52, 366] : [82, 304, 48, 342];
+  competitors.slice(0, 4).forEach((branch, branchIndex) => {
+    const blocks = (branch.blocks || []).filter((block) => !canonicalByHash.has(block.hash));
+    if (!blocks.length) return;
+    const first = blocks[0];
+    const parent = (branch.blocks || []).find((block) => block.hash === first.previous_hash);
+    const join = parent ? canonicalByHash.get(parent.hash) : null;
+    const forkX = join ? join.x : Math.max(left, xForHeight(first.height) - 44);
+    const laneY = laneYs[branchIndex % laneYs.length];
+    const points = blocks.slice(compact ? -3 : -6).map((block) => ({
+      block,
+      x: Math.max(forkX + 42, Math.min(right, xForHeight(block.height))),
+      y: laneY,
+    }));
+    const firstPoint = points[0];
+    let path = 'M ' + forkX.toFixed(1) + ' ' + canonicalY.toFixed(1)
+      + ' C ' + (forkX + 24).toFixed(1) + ' ' + canonicalY.toFixed(1)
+      + ', ' + (firstPoint.x - 24).toFixed(1) + ' ' + laneY.toFixed(1)
+      + ', ' + firstPoint.x.toFixed(1) + ' ' + laneY.toFixed(1);
+    for (const point of points.slice(1)) path += ' L ' + point.x.toFixed(1) + ' ' + point.y.toFixed(1);
+    markup += '<path class="chain-branch-path" d="' + path + '"></path>';
+    points.forEach((point, index) => {
+      const key = chainBlockKey('competitor-' + branchIndex, point.block, index);
+      const entry = chainBlockEntry(point.block, {
+        role: 'competitor',
+        status: 'live fork',
+        branch: branch.fork_depth_label || 'Competing branch',
+        sources: branch.sources || [],
+        firstSeenAt: branch.first_seen_at,
+      });
+      state.chainBlockIndex.set(key, entry);
+      markup += chainNodeMarkup(entry, key, point.x, point.y, { compact });
+    });
+    const branchLabel = 'LIVE · ' + (branch.fork_depth_label || blocks.length + ' competing blocks');
+    markup += chainBranchLabel(branchLabel, Math.min(firstPoint.x, right - 160), laneY - 54, 210);
+  });
+
+  if (historical.length) {
+    const historyY = compact ? 425 : 390;
+    markup += '<path class="chain-branch-path is-historical" d="M ' + left + ' ' + historyY
+      + ' L ' + right + ' ' + historyY + '"></path>';
+    historical.forEach((event, index) => {
+      const block = event.orphan_block || {
+        height: event.from_height,
+        hash: event.discarded_hash || event.from_hash || '',
+        miner_software: 'unknown',
+        miner_mark: '?',
+        miner_operator: 'unknown',
+        miner_evidence: 'coinbase data was not captured',
+      };
+      const x = historical.length === 1
+        ? (left + right) / 2
+        : left + (index / (historical.length - 1)) * (right - left);
+      const key = chainBlockKey('historical', block, index);
+      const entry = chainBlockEntry(block, {
+        role: 'historical',
+        status: 'historical orphan',
+        branch: event.depth_label || 'Recorded reorg',
+        sources: event.node ? [event.node] : [],
+        eventAt: event.at,
+      });
+      state.chainBlockIndex.set(key, entry);
+      markup += chainNodeMarkup(entry, key, x, historyY, { compact });
+    });
+    markup += chainBranchLabel('HISTORY · ' + historical.length + ' orphan event'
+      + (historical.length === 1 ? '' : 's'), left, historyY - 55, 220);
+  }
+
+  svg.innerHTML = markup;
+  let selectedKey = state.selectedBlockKey;
+  if (!state.chainBlockIndex.has(selectedKey)) {
+    const tipBlock = canonicalPoints[canonicalPoints.length - 1].block;
+    selectedKey = chainBlockKey('canonical', tipBlock, canonicalPoints.length - 1);
+  }
+  renderSelectedChainBlock(state.chainBlockIndex.get(selectedKey), selectedKey);
 }
 
 function matchesQuery(row, query) {
@@ -4126,6 +5147,35 @@ async function tick() {
 
 /* ---------- interaction ---------- */
 document.addEventListener('click', (event) => {
+  const range = event.target.closest('[data-chain-range]');
+  if (range) {
+    state.chainRange = range.dataset.chainRange;
+    for (const button of document.querySelectorAll('[data-chain-range]')) {
+      button.setAttribute('aria-pressed', String(button === range));
+    }
+    if (state.data) renderChain(state.data);
+    return;
+  }
+  const chainBlock = event.target.closest('[data-chain-block]');
+  if (chainBlock) {
+    event.preventDefault();
+    const key = chainBlock.dataset.chainBlock;
+    renderSelectedChainBlock(state.chainBlockIndex.get(key), key);
+    if (state.data) renderChain(state.data);
+    return;
+  }
+  const tipLink = event.target.closest('#current-tip-link');
+  if (tipLink) {
+    const tip = Array.from(state.chainBlockIndex.entries()).find((entry) =>
+      entry[1].status === 'canonical tip');
+    if (tip) {
+      event.preventDefault();
+      renderSelectedChainBlock(tip[1], tip[0]);
+      if (state.data) renderChain(state.data);
+      el('chain-selection').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+    return;
+  }
   const copy = event.target.closest('[data-copy]');
   if (copy) {
     event.stopPropagation();
@@ -4164,6 +5214,21 @@ document.addEventListener('click', (event) => {
     if (state.data) renderTable(state.data);
   }
 });
+document.addEventListener('pointermove', (event) => {
+  const trigger = event.target.closest('[data-chain-block]');
+  if (trigger) showChainTooltip(trigger, event.clientX, event.clientY);
+});
+document.addEventListener('pointerout', (event) => {
+  const trigger = event.target.closest('[data-chain-block]');
+  if (trigger && !trigger.contains(event.relatedTarget)) el('chain-tooltip').hidden = true;
+});
+document.addEventListener('focusin', (event) => {
+  const trigger = event.target.closest('[data-chain-block]');
+  if (trigger) showChainTooltip(trigger, null, null);
+});
+document.addEventListener('focusout', (event) => {
+  if (event.target.closest('[data-chain-block]')) el('chain-tooltip').hidden = true;
+});
 el('filter-input').addEventListener('input', (event) => {
   state.query = event.target.value.trim().toLowerCase();
   if (state.data) renderTable(state.data);
@@ -4179,6 +5244,13 @@ el('expand-toggle').addEventListener('click', (event) => {
   event.currentTarget.classList.toggle('is-on', state.expandAll);
   event.currentTarget.textContent = state.expandAll ? 'Collapse all' : 'Expand all';
   if (state.data) renderTable(state.data);
+});
+let chainResizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(chainResizeTimer);
+  chainResizeTimer = setTimeout(() => {
+    if (state.data && !NODE_NAME) renderChain(state.data);
+  }, 100);
 });
 tick();
 setInterval(tick, REFRESH_MS);

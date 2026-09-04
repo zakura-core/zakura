@@ -65,10 +65,22 @@ height prove chain divergence even when both branches keep advancing at
 different heights. An unavailable source produces `partial` or `insufficient`,
 not a false recovery.
 
-The studio shows each settled branch, its source membership, the strict quorum
-candidate when one exists, and sources that could not be compared. Managed
-nodes are polled over SSH as before. Independent read-only RPC sources can be
-added without deployment access:
+The chain explorer links directly to the current canonical tip and draws the
+recent canonical block spine beside any live competing branch. Select or hover
+a block to see its full hash, observing sources, mining software evidence, and
+operator tag. The `Live`, `24 hours`, and `7 days` ranges add persisted reorg or
+orphan events to the same view.
+
+Each displayed block carries one mining software symbol. `ZA` means its
+coinbase contains Zakura's built-in flower marker, `ZE` means it contains an
+explicit Zebra tag, and `?` means the coinbase did not prove either. The source
+that reported a block is never treated as its miner. An operator is shown only
+when Zakura's marker includes a printable configured tag; otherwise it remains
+unknown. Recent block metadata is fetched once per distinct observed branch and
+cached by hash, so an advancing chain normally adds only the new tip.
+
+Managed nodes are polled over SSH as before. Independent read-only RPC sources
+can be added without deployment access:
 
 ```toml
 [[chain_observers]]
@@ -81,7 +93,7 @@ gap where fresh block templates could look healthy while the miner followed a
 minority fork. Mainnet already includes the separately operated
 `zcashd-compat` source in its dashboard cohort.
 
-The live tip view still labels each source `majority`, `fork`, `ahead`, or
+The source table still labels each source `majority`, `fork`, `ahead`, or
 `behind`. Fork depth between two tips at the same height is estimated from
 best-chain ancestor hashes sampled at 1, 2, 5, 10, and 32 blocks back, so an
 unresolved fork reports `> 32 or unknown` rather than a wrong number.
@@ -154,7 +166,8 @@ Slack delivery to `#zakura-alerts` is **webhook-only**. Set:
 Do not commit real Slack credentials. Install them on the runner in
 `/etc/zakura-fleet-watchdog/env` with mode `600`, or provide the
 `SLACK_WEB_HOOK` GitHub Actions environment secret so the deploy workflow
-writes the env file.
+writes the env file. The deployment fails rather than install a watchdog that
+cannot deliver to `#zakura-alerts` when neither source contains a webhook.
 
 Manual checks on `us-east-0`:
 

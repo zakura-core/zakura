@@ -504,15 +504,92 @@ class ChainObserverTests(unittest.TestCase):
         self.assertEqual(probe["rpc_chain"], "test")
         self.assertNotIn("rpc_error", probe)
 
+    def test_chain_segment_stops_at_cached_parent_and_reads_coinbase_markers(self):
+        hashes = {height: f"{height:064x}" for height in (100, 101, 102)}
+        zakura_data = status.ZAKURA_COINBASE_MARKER + b": valargroup"
+        zakura_coinbase = (
+            b"\x03abc" + bytes([len(zakura_data)]) + zakura_data
+        ).hex()
+        zebra_coinbase = b"\x03abc/Zebra/".hex()
+
+        def rpc(method, params):
+            if method == "getblock":
+                block_hash = params[0]
+                height = next(
+                    height for height, value in hashes.items() if value == block_hash
+                )
+                return {
+                    "height": height,
+                    "hash": block_hash,
+                    "previousblockhash": hashes[height - 1],
+                    "time": 1_000 + height,
+                    "tx": [f"tx-{height}"],
+                }
+            if method == "getrawtransaction":
+                return {
+                    "vin": [{
+                        "coinbase": zakura_coinbase
+                        if params[0] == "tx-102"
+                        else zebra_coinbase
+                    }]
+                }
+            raise AssertionError(method)
+
+        result = status.collect_chain_segment(
+            rpc,
+            hashes[102],
+            {hashes[100]},
+        )
+
+        self.assertEqual(result["error"], "")
+        self.assertEqual([block["height"] for block in result["blocks"]], [102, 101])
+        self.assertEqual(result["blocks"][0]["miner_mark"], "ZA")
+        self.assertEqual(result["blocks"][0]["miner_operator"], "valargroup")
+        self.assertEqual(result["blocks"][1]["miner_mark"], "ZE")
+
+    def test_mining_software_classification_never_uses_observer_identity(self):
+        zakura_data = status.ZAKURA_COINBASE_MARKER + b": pool-a"
+        zakura = status.classify_mining_software(
+            (b"height" + bytes([len(zakura_data)]) + zakura_data).hex()
+        )
+        untagged_data = status.ZAKURA_COINBASE_MARKER
+        untagged = status.classify_mining_software(
+            (
+                b"height"
+                + bytes([len(untagged_data)])
+                + untagged_data
+                + b"/unrelated-pool-data/"
+            ).hex()
+        )
+        zebra = status.classify_mining_software(b"height/Zebra:5.2.0/".hex())
+        unknown = status.classify_mining_software(b"height/pool-a/".hex())
+
+        self.assertEqual(
+            (zakura["software"], zakura["mark"], zakura["operator"]),
+            ("zakura", "ZA", "pool-a"),
+        )
+        self.assertEqual(
+            (untagged["software"], untagged["mark"], untagged["operator"]),
+            ("zakura", "ZA", "unknown"),
+        )
+        self.assertEqual((zebra["software"], zebra["mark"]), ("zebra", "ZE"))
+        self.assertEqual(
+            (unknown["software"], unknown["mark"]),
+            ("unknown", "?"),
+        )
+
 
 class IronwoodStatusTests(unittest.TestCase):
     def test_remote_probe_is_valid_python_and_uses_required_rpcs(self):
         compile(status.REMOTE_PROBE, "<remote-probe>", "exec")
+        compile(status.CHAIN_WINDOW_PROBE, "<chain-window-probe>", "exec")
         self.assertIn('rpc_call("getblockchaininfo")', status.REMOTE_PROBE)
         self.assertIn('rpc_call("getinfo")', status.REMOTE_PROBE)
         self.assertIn('blockchain_info.get("headers")', status.REMOTE_PROBE)
         self.assertIn('"getblockhash"', status.REMOTE_PROBE)
         self.assertIn('rpc_call("getblockheader"', status.REMOTE_PROBE)
+        self.assertIn('rpc_call("getblock"', status.CHAIN_WINDOW_PROBE)
+        self.assertIn('rpc_call("getrawtransaction"', status.CHAIN_WINDOW_PROBE)
 
     def test_peer_version_panel_prefers_rpc_subver(self):
         # When getpeerinfo.subver is present, the live RPC mix wins over the
@@ -835,6 +912,114 @@ class TipAgreementTests(unittest.TestCase):
         self.assertEqual(split["status"], "split")
         self.assertTrue(split["split"])
 
+    def test_explorer_builds_block_marked_canonical_and_competing_branches(self):
+        subject = status.ClusterCollector(
+            [node("a"), node("b")],
+            interval=10,
+            stale_after=300,
+            network="testnet",
+        )
+        canonical_hash = "f" * 64
+        fork_hash = "b" * 64
+        parent_hash = "c" * 64
+        rows = [
+            {
+                "name": "a",
+                "height": 101,
+                "block_hash": canonical_hash,
+                "rpc_ok": True,
+                "source_type": "node",
+            },
+            {
+                "name": "b",
+                "height": 101,
+                "block_hash": fork_hash,
+                "rpc_ok": True,
+                "source_type": "node",
+            },
+        ]
+        chain = status.compute_chain_summary(rows)
+
+        def blocks(_source, tip_hash, _known):
+            software = "zakura" if tip_hash == canonical_hash else "zebra"
+            return {
+                "error": "",
+                "blocks": [{
+                    "height": 101,
+                    "hash": tip_hash,
+                    "previous_hash": parent_hash,
+                    "time": 1_000,
+                    "miner_software": software,
+                    "miner_mark": "ZA" if software == "zakura" else "ZE",
+                    "miner_operator": "unknown",
+                    "miner_evidence": "test marker",
+                }],
+            }
+
+        with mock.patch.object(status, "probe_chain_window", side_effect=blocks):
+            subject.populate_chain_explorer(rows, chain, now=2_000.0)
+
+        self.assertEqual(len(chain["branches"]), 2)
+        canonical = next(
+            branch for branch in chain["branches"] if branch["role"] == "canonical"
+        )
+        competitor = next(
+            branch for branch in chain["branches"] if branch["role"] == "competitor"
+        )
+        self.assertEqual(canonical["blocks"][-1]["miner_mark"], "ZA")
+        self.assertEqual(competitor["blocks"][-1]["miner_mark"], "ZE")
+        self.assertEqual(competitor["first_seen_at"], 2_000.0)
+        self.assertEqual(chain["current_tip"]["hash"], canonical["tip_hash"])
+
+    def test_explorer_does_not_present_a_lagging_canonical_source_as_a_fork(self):
+        subject = status.ClusterCollector(
+            [node("a"), node("b")],
+            interval=10,
+            stale_after=300,
+            network="testnet",
+        )
+        tip_hash = "f" * 64
+        parent_hash = "e" * 64
+        rows = [
+            {"name": "a", "height": 101, "block_hash": tip_hash, "rpc_ok": True},
+            {"name": "b", "height": 100, "block_hash": parent_hash, "rpc_ok": True},
+        ]
+        chain = status.compute_chain_summary(rows)
+        subject.cache_chain_blocks([
+            {
+                "height": 100,
+                "hash": parent_hash,
+                "previous_hash": "d" * 64,
+                "time": 1_000,
+                "miner_software": "unknown",
+                "miner_mark": "?",
+                "miner_operator": "unknown",
+                "miner_evidence": "no recognized coinbase marker",
+            },
+            {
+                "height": 101,
+                "hash": tip_hash,
+                "previous_hash": parent_hash,
+                "time": 1_100,
+                "miner_software": "zakura",
+                "miner_mark": "ZA",
+                "miner_operator": "unknown",
+                "miner_evidence": "Zakura flower coinbase marker",
+            },
+        ])
+
+        with mock.patch.object(
+            status,
+            "probe_chain_window",
+            return_value={"blocks": [], "error": ""},
+        ):
+            subject.populate_chain_explorer(rows, chain, now=2_000.0)
+
+        roles = {branch["tip_hash"]: branch["role"] for branch in chain["branches"]}
+        self.assertEqual(roles[tip_hash], "canonical")
+        self.assertEqual(roles[parent_hash], "lagging")
+        self.assertFalse(subject.fork_first_seen)
+
     def test_enrich_chain_roles(self):
         rows = [
             {"name": "a", "height": 100, "block_hash": "aa"},
@@ -1054,10 +1239,14 @@ class ViewSwitchingTests(unittest.TestCase):
     def test_page_forces_hidden_elements_to_stay_hidden(self):
         self.assertIn("[hidden] { display: none !important; }", self.page)
 
-    def test_fork_studio_renders_settled_branches_and_orphan_events(self):
-        self.assertIn("Fork / uncle studio", self.page)
-        self.assertIn('id="comparison-groups"', self.page)
-        self.assertIn('id="reorg-list"', self.page)
+    def test_chain_explorer_renders_blocks_and_miner_symbols(self):
+        self.assertIn("Canonical chain and competing forks", self.page)
+        self.assertIn('id="current-tip-link"', self.page)
+        self.assertIn('id="chain-svg"', self.page)
+        self.assertIn('data-chain-range="24h"', self.page)
+        self.assertIn('class="miner-mark is-zakura" aria-hidden="true">ZA', self.page)
+        self.assertIn('class="miner-mark is-zebra" aria-hidden="true">ZE', self.page)
+        self.assertIn('class="miner-mark is-unknown" aria-hidden="true">?', self.page)
         self.assertIn("chain.fork_status", self.page)
 
     def test_every_toggled_section_is_covered_by_the_override(self):

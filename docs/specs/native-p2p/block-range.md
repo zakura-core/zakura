@@ -290,6 +290,7 @@ use the bounded reason and resource enums.
 | GB-RL-19 | Every decoded request that reaches pending-input admission first reserves the fixed request overhead from both rate buckets. A pending-cap drop spends that overhead, and an unavailable ingress charge leaves at most one decoded request waiting, so repeated drops cannot bypass peer or node rate limits. |
 | GB-RL-20 | A state query that has not completed by the configured block-sync `request_timeout`, measured from ledger commit, is retired at that deadline, releases its slot and permit, and queues `RangeUnavailable` with the original wire count when output remains available. |
 | GB-RL-21 | Delays, pending-cap drops, rejections, disconnect cleanup, and local-fault settlements expose the service, exchange, peer and session when known, responsible bound or terminal reason, and applicable reserved, transferred, used, and refunded units. Metrics use only closed-set labels and never peer or session identity. |
+| GB-RL-22 | Frame and canonical-value validation plus the valid-Status prerequisite complete before any peer or node regulation ownership is acquired. A malformed request or request without retained Status leaves every regulation balance unchanged. |
 
 The fast lane uses small capacities to reach every boundary deterministically.
 The native lane uses real stream-6 frames, the production peer routine and
@@ -405,7 +406,7 @@ can be marked implemented.
 | --- | --- |
 | P2P-RG-01 | The catalog plus GB-WF-01 through GB-WF-19, GB-SM-09, and GB-RL-01 close the serving request and its response kinds. |
 | P2P-RG-02 | GB-WF-01 through GB-WF-06, GB-SM-03, GB-SM-05, GB-SM-06, GB-RL-02, and GB-RL-08 cover declared outcomes and sender obligations. |
-| P2P-RG-03 | GB-WF-01 through GB-WF-10, GB-SM-03, and GB-RL-15 enforce the processing order. |
+| P2P-RG-03 | GB-WF-01 through GB-WF-10, GB-SM-03, GB-RL-15, and GB-RL-22 enforce the processing order. |
 | P2P-RG-04 | GB-SM-03, GB-SM-06, GB-SM-10, GB-SM-12, GB-SM-17, and GB-SM-18 distinguish invalid, stale, and unavailable work. |
 | P2P-RG-05 | GB-WF-01, GB-WF-02, GB-WF-09, GB-WF-10, GB-WF-15, GB-WF-17, and GB-WF-19 cover allocation caps. |
 | P2P-RG-06 | GB-WF-11 covers partial-frame state and the read deadline. |

@@ -476,6 +476,114 @@ fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
 }
 
 #[test]
+fn selected_auxiliary_range_rejects_atomically_and_then_admits_every_root() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let anchor = store.metadata.frontiers.finalized;
+    let initial = insertion(&store, 2, EvidenceId::from_digest([0x70; 32]));
+    let TransitionEvent::InsertHeaders(initial_insert) = &initial.event else {
+        panic!("the fixture constructs a header insertion");
+    };
+    let headers = initial_insert.batch.headers().to_vec();
+    let selected: Vec<_> = headers
+        .iter()
+        .map(|header| Frontier::new(header.height, header.hash))
+        .collect();
+    let inserted = apply_transition(&store, initial, &context(&config, &clock, None))
+        .expect("the selected two-header branch inserts");
+    store.commit(&inserted);
+
+    store.lease.parent = anchor;
+    store.lease.context_digest = [0x71; 32];
+    let owner = body_owner(&store.snapshot(), 8, 9);
+    let source = SourceId::from_digest([0x72; 32]);
+    let make_delivery = |index: usize, height: block::Height| {
+        let marker = u8::try_from(index).expect("the fixture index fits u8");
+        crate::AuxDelivery::new(
+            EvidenceId::from_digest([0x73_u8.saturating_add(marker); 32]),
+            selected[index].hash,
+            source,
+            owner.into(),
+            crate::BodySizeHint::Unknown,
+            Some(crate::TreeAuxRecordV1 {
+                height,
+                sapling_root: Default::default(),
+                orchard_root: Default::default(),
+                ironwood_root: Default::default(),
+                sapling_tx_count: u64::try_from(index).expect("the fixture index fits u64"),
+                orchard_tx_count: 0,
+                ironwood_tx_count: 0,
+                auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from(
+                    [0x80_u8.saturating_add(marker); 32],
+                ),
+            }),
+        )
+    };
+    let repair_context = crate::VctRepairContext::from_durable_rows(
+        selected[0],
+        crate::HeaderLocator::for_continuation(anchor),
+        store.metadata.state_version,
+        Some(selected[1].hash),
+        true,
+        &[],
+    )
+    .expect("the first target has no durable evidence")
+    .extend_empty_selected_range(&selected[1..], None)
+    .expect("the selected repair range is contiguous");
+    let make_repair = |aux| TransitionRequest {
+        expected_version: store.metadata.state_version,
+        event: TransitionEvent::InsertHeaders(Box::new(crate::InsertHeaders {
+            owner: owner.into(),
+            source,
+            parent_hash: anchor.hash,
+            target_tip_hash: selected[1].hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: anchor,
+                selected_target: selected[1],
+                episode: repair_context.episode,
+            },
+            batch: PreparedHeaderBatch::new(
+                headers.clone(),
+                anchor,
+                store.lease.network().clone(),
+                store.lease.trust_anchor_digest,
+                EvidenceId::from_digest([0x75; 32]),
+            )
+            .expect("the range repair batch is nonempty"),
+            aux,
+        })),
+    };
+
+    let malformed = make_repair(vec![
+        make_delivery(0, selected[0].height),
+        make_delivery(1, selected[0].height),
+    ]);
+    assert!(matches!(
+        apply_transition(&store, malformed, &context(&config, &clock, None)),
+        Err(TransitionFailure::InvalidEvidence(
+            InvalidTransitionEvidence::Auxiliary(AuxiliaryViolation::AdmittedTargetMismatch)
+        ))
+    ));
+    assert!(
+        store.aux.is_empty(),
+        "a rejected range changes no auxiliary state"
+    );
+
+    let admitted = apply_transition(
+        &store,
+        make_repair(vec![
+            make_delivery(0, selected[0].height),
+            make_delivery(1, selected[1].height),
+        ]),
+        &context(&config, &clock, None),
+    )
+    .expect("the rooted selected range is admitted atomically");
+    assert_eq!(admitted.change_set.aux_changes.len(), 2);
+    assert_eq!(admitted.change_set.put_nodes.len(), 2);
+    assert!(admitted.change_set.delete_nodes.is_empty());
+}
+
+#[test]
 fn auxiliary_admission_preserves_semantic_diversity_under_duplicate_delivery_pressure() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());

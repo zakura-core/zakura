@@ -243,6 +243,9 @@ pub struct ReadStateService {
     /// The configured Zcash network.
     network: Network,
 
+    /// Highest height where checkpoint sync can require VCT repair.
+    max_checkpoint_height: block::Height,
+
     // Shared Concurrently Readable State
     //
     /// A watch channel with a cached copy of the [`NonFinalizedState`].
@@ -545,7 +548,8 @@ impl StateService {
                 reader: header_chain_reader_receiver,
             },
             historical_trees,
-        );
+        )
+        .with_max_checkpoint_height(max_checkpoint_height);
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
             - HeightDiff::try_from(checkpoint_verify_concurrency_limit)
@@ -1329,6 +1333,7 @@ impl ReadStateService {
 
         let read_service = Self {
             network: finalized_state.network(),
+            max_checkpoint_height: block::Height::MAX,
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
@@ -1345,6 +1350,12 @@ impl ReadStateService {
         tracing::debug!("created new read-only state service");
 
         read_service
+    }
+
+    /// Bound VCT repair reads at the final checkpoint.
+    fn with_max_checkpoint_height(mut self, max_checkpoint_height: block::Height) -> Self {
+        self.max_checkpoint_height = max_checkpoint_height;
+        self
     }
 
     /// Return the tip of the current best chain.
@@ -2665,7 +2676,13 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::VctRepairContext { owner, height } => {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
                 let context = reader
-                    .map(|reader| reader.vct_repair_context(owner, height))
+                    .map(|reader| {
+                        reader.vct_repair_context_bounded(
+                            owner,
+                            height,
+                            state.max_checkpoint_height,
+                        )
+                    })
                     .transpose()?
                     .flatten();
                 Ok(ReadResponse::VctRepairContext(context))

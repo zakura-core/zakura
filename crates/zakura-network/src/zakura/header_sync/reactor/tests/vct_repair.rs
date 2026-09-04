@@ -1,6 +1,125 @@
 use super::*;
 use crate::zakura::testkit::{TraceCapture, TraceValue};
 
+#[tokio::test]
+async fn vct_repair_selects_the_peer_with_the_largest_supported_prefix() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let selected = [
+        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
+        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([2; 32])),
+        zakura_header_chain::Frontier::new(block::Height(3), block::Hash([3; 32])),
+    ];
+    let mut snapshot = committed_snapshot(anchor);
+    snapshot.frontiers.header_best = selected[2];
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_repairs_tx, repairs_rx) = watch::channel(zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: selected[0].height,
+        },
+        generation: 7,
+    });
+    startup.vct_root_repairs = Some(repairs_rx);
+    let (handle, mut actions, reactor) =
+        spawn_header_sync_reactor(startup).expect("the range repair fixture starts");
+    let HeaderPortOperation::QueryVctRepairContext { owner, .. } = next_action(&mut actions).await
+    else {
+        panic!("the range repair requests its context");
+    };
+
+    let small_peer = ZakuraPeerId::new(vec![0x61; 32]).expect("the peer ID length is valid");
+    let large_peer = ZakuraPeerId::new(vec![0x62; 32]).expect("the peer ID length is valid");
+    let (small_send, mut small_outbound) = framed_channel(8);
+    let (large_send, mut large_outbound) = framed_channel(8);
+    for (peer, send) in [
+        (small_peer.clone(), small_send),
+        (large_peer.clone(), large_send),
+    ] {
+        handle
+            .send(Event::PeerConnected(PeerSession::from_parts(
+                peer,
+                send,
+                CancellationToken::new(),
+            )))
+            .await
+            .expect("the repair supplier connects");
+    }
+    let _ = small_outbound
+        .recv()
+        .await
+        .expect("the local status is sent");
+    let _ = large_outbound
+        .recv()
+        .await
+        .expect("the local status is sent");
+    for (peer, max_headers_per_response) in [(small_peer.clone(), 1), (large_peer.clone(), 2)] {
+        handle
+            .send(Event::WireMessage {
+                peer,
+                session_id: 0,
+                msg: HeaderSyncMessage::Status(Status {
+                    work_anchor_height: anchor.height,
+                    work_anchor_hash: anchor.hash,
+                    selected_tip_height: selected[2].height,
+                    selected_tip_hash: selected[2].hash,
+                    suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(3_u8),
+                    oldest_retained_height: anchor.height,
+                    max_headers_per_response,
+                    max_inflight_requests: 1,
+                    max_message_bytes: 2_000_000,
+                    tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+                }),
+            })
+            .await
+            .expect("the repair supplier status reaches the reactor");
+    }
+    let context = zakura_header_chain::VctRepairContext::from_durable_rows(
+        selected[0],
+        zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        snapshot.state_version,
+        Some(selected[1].hash),
+        true,
+        &[],
+    )
+    .expect("the blocking target has no durable evidence")
+    .extend_empty_selected_range(&selected[1..], None)
+    .expect("the selected repair range is contiguous");
+    handle
+        .send(Event::VctRepairContextReady {
+            owner,
+            result: VctRepairContextResult::Resolved(context),
+        })
+        .await
+        .expect("the selected repair range reaches the reactor");
+
+    assert!(
+        time::timeout(std::time::Duration::from_millis(20), small_outbound.recv())
+            .await
+            .is_err(),
+        "the smaller prefix supplier remains unused"
+    );
+    let frame = large_outbound
+        .recv()
+        .await
+        .expect("the largest prefix supplier receives the request");
+    let HeaderSyncMessage::GetHeaders(request) = handle
+        .codec()
+        .decode_frame(frame, None)
+        .expect("the selected repair request decodes")
+    else {
+        panic!("the range repair uses GetHeaders");
+    };
+    assert_eq!(request.target_tip_hash, selected[1].hash);
+    assert_eq!(request.max_header_count, 2);
+    assert_eq!(request.locator_hashes, vec![anchor.hash]);
+    assert_eq!(request.tree_aux_schema, AuxSchema::V1);
+
+    shutdown.cancel();
+    reactor.await.expect("the reactor task joins");
+}
+
 #[test]
 fn vct_repair_signal_schedules_one_exact_current_height() {
     let anchor = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([1; 32]));

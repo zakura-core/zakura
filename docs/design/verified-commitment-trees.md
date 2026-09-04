@@ -563,10 +563,15 @@ So the committer **fails closed** rather than falling back to recompute (commit 
 
 Outside the frozen window (legacy), a missing root is
 simply the ordinary legacy recompute — bit-identical to today. Inside the frozen window, a
-missing root parks the current checkpoint block and retries the same commit **in place** —
-**without resetting the block queue**. The write loop also publishes a bounded repair request
-(`VctRootRepairRequested`) back to header sync, which re-fetches the covered range and runs it
-through the root-authentication lane; the retry is satisfied once a verifiable row is stored.
+missing root parks the current checkpoint block **in place** — **without resetting the block
+queue**. The writer continues to process header-chain control messages while it remains parked.
+An `ApplyHeaderChainInsert` completion retries the parked block immediately. The writer defers
+unrelated block-write messages in their original order. The write loop also publishes a bounded
+repair request (`VctRootRepairRequested`) back to header sync. Header sync fetches a contiguous
+selected prefix through the root-authentication lane. Durable evidence at the blocking height
+keeps the existing one-height repair. An empty gap can use one atomic range up to the selected
+tip, checkpoint handoff, 4,000-header transition limit, aggregate capacity, or first durable row.
+The retry is satisfied once a verifiable row is stored.
 If no repair delivery fills the hole, the node stays parked
 fail-closed at that height (§8.1). A peer-supplied root that has no buffered successor to
 confirm it against the header
@@ -587,6 +592,9 @@ window is never entered without its roots in hand. Counters:
 `state.vct.root.retry.count` (park-and-retry attempts),
 `state.vct.root.repair.requested` (bounded repair requests published to header sync), and the
 `state.vct.root.stalled.height` gauge (raised once a height is stuck past the warn threshold).
+`state.vct.root.wait.seconds` records the time a block waits for VCT metadata.
+`sync.header.vct.repair.requested.headers` and
+`sync.header.vct.repair.admitted.headers` count range volume.
 
 ### 8.1 Adversarial peer handling
 

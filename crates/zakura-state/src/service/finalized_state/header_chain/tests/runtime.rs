@@ -186,6 +186,19 @@ fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
             .last()
             .map(|header| Frontier::new(header.height, header.hash))
     );
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(5, NonZeroU64::new(6).expect("six is nonzero"));
+    let repair = runtime
+        .reader()
+        .vct_repair_context(owner, block::Height(1))
+        .expect("the long selected repair context is coherent")
+        .expect("the empty selected range needs repair");
+    assert_eq!(repair.selected_header_count(), 4_000);
+    assert_eq!(
+        repair.request_target(),
+        Frontier::new(restored[3_999].height, restored[3_999].hash)
+    );
 }
 
 /// A reconciled store over a genesis and `path_len` descendant headers.
@@ -519,6 +532,123 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
     ));
 }
 
+#[test]
+fn selected_range_repair_rejects_atomically_then_commits_every_delivery() {
+    let (runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let targets = [
+        Frontier::new(path[3].height, path[3].hash),
+        Frontier::new(path[4].height, path[4].hash),
+    ];
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(17, NonZeroU64::new(18).expect("eighteen is nonzero"));
+    let repair = runtime
+        .reader()
+        .vct_repair_context(owner, targets[0].height)
+        .expect("the range repair context is coherent")
+        .expect("the selected empty range needs repair");
+    assert_eq!(repair.selected_header_count(), targets.len());
+    assert_eq!(repair.request_target(), targets[1]);
+
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules =
+        HeaderRules::for_validation_lease(&lease).expect("the repair parent produces header rules");
+    let headers = [path[3].header.clone(), path[4].header.clone()];
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&headers),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected range passes deterministic preparation");
+    let source = SourceId::from_digest([0xa1; 32]);
+    let delivery = |index: usize, height| {
+        let marker = u8::try_from(index).expect("the delivery index fits u8");
+        AuxDelivery::new(
+            EvidenceId::from_digest([0xa2_u8.saturating_add(marker); 32]),
+            targets[index].hash,
+            source,
+            owner.into(),
+            zakura_header_chain::BodySizeHint::Unknown,
+            Some(zakura_header_chain::TreeAuxRecordV1 {
+                height,
+                sapling_root: Default::default(),
+                orchard_root: Default::default(),
+                ironwood_root: Default::default(),
+                sapling_tx_count: u64::try_from(index).expect("the delivery index fits u64"),
+                orchard_tx_count: 0,
+                ironwood_tx_count: 0,
+                auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from(
+                    [0xa4_u8.saturating_add(marker); 32],
+                ),
+            }),
+        )
+    };
+    let request = |aux| TransitionRequest {
+        expected_version: StateVersion::default(),
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: owner.into(),
+            source,
+            parent_hash: parent.hash,
+            target_tip_hash: targets[1].hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: parent,
+                selected_target: targets[1],
+                episode: repair.episode,
+            },
+            batch: batch.clone(),
+            aux,
+        })),
+    };
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+
+    let malformed = request(vec![
+        delivery(0, targets[0].height),
+        delivery(1, targets[0].height),
+    ]);
+    assert!(runtime.apply(malformed, &context).is_err());
+    for target in targets {
+        assert!(runtime
+            .store
+            .aux_deliveries(target.hash)
+            .expect("the target auxiliary rows remain readable")
+            .is_empty());
+    }
+
+    assert!(matches!(
+        runtime
+            .apply(
+                request(vec![
+                    delivery(0, targets[0].height),
+                    delivery(1, targets[1].height),
+                ]),
+                &context,
+            )
+            .expect("the complete repair range applies"),
+        ApplyResult::Committed
+    ));
+    for target in targets {
+        assert_eq!(
+            runtime
+                .store
+                .aux_deliveries(target.hash)
+                .expect("the committed target auxiliary rows are readable")
+                .len(),
+            1
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn retained_path_serves_a_locator_before_the_header_retention_window() {
     let (runtime, db, genesis, path) = reconciled_store_with_finalized_prefix(4);
@@ -784,6 +914,23 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         .expect("the current owner resolves its selected header");
     assert_eq!(repair.target, Frontier::new(child.height, child.hash));
     assert_eq!(repair.locator.entries(), &[anchor_frontier]);
+    assert_eq!(repair.selected_header_count(), 2);
+    assert_eq!(
+        repair.request_target(),
+        Frontier::new(grandchild.height, grandchild.hash)
+    );
+    let checkpoint_bounded = reader
+        .vct_repair_context_bounded(owner, child.height, child.height)
+        .expect("the checkpoint-bounded repair context is coherent")
+        .expect("the checkpoint permits the blocking target");
+    assert_eq!(checkpoint_bounded.selected_header_count(), 1);
+    assert_eq!(checkpoint_bounded.request_target(), repair.target);
+    assert_eq!(
+        reader
+            .vct_repair_context_bounded(owner, child.height, anchor.height)
+            .expect("a repair above the checkpoint is a normal stale outcome"),
+        None
+    );
 
     let mut stale_owner = owner;
     stale_owner.authority.verified_generation = VerifiedGeneration::new(
@@ -864,6 +1011,12 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         .expect("the transition engine mutex is not poisoned") =
         load_transition_engine(&runtime.store)
             .expect("the direct durable test fixture refreshes the runtime mirror");
+    let evidence_constrained = reader
+        .vct_repair_context(owner, child.height)
+        .expect("the evidence-constrained repair context is coherent")
+        .expect("the selected target remains repairable");
+    assert_eq!(evidence_constrained.selected_header_count(), 1);
+    assert_eq!(evidence_constrained.request_target(), repair.target);
     let roots = reader
         .selected_block_roots(child.height, 2)
         .expect("selected auxiliary roots are coherent");

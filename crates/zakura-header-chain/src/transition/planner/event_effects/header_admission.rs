@@ -158,9 +158,16 @@ pub(super) fn admit_prepared_headers(
                 )
                 .into());
             }
-            if event.batch.headers().len() != 1
-                || event.aux.len() != 1
-                || event.aux[0].tree_aux.is_none()
+            let selected_range_matches = event.batch.headers().iter().all(|header| {
+                event_context
+                    .old_selected
+                    .iter()
+                    .find(|frontier| frontier.height == header.height)
+                    .is_some_and(|frontier| frontier.hash == header.hash)
+            });
+            if event.batch.headers().is_empty()
+                || event.aux.len() != event.batch.headers().len()
+                || event.aux.iter().any(|delivery| delivery.tree_aux.is_none())
                 || selected_target != parent
                 || event.owner.header_authority().branch.target_tip_hash
                     != event_context
@@ -168,12 +175,7 @@ pub(super) fn admit_prepared_headers(
                         .frontiers
                         .header_best
                         .hash
-                || event_context
-                    .old_selected
-                    .iter()
-                    .find(|frontier| frontier.height == selected_target.height)
-                    .map(|frontier| frontier.hash)
-                    != Some(selected_target.hash)
+                || !selected_range_matches
                 || projected.graph().view_header_ancestor(
                     event.owner.header_authority().branch.target_tip_hash,
                     selected_target.height,

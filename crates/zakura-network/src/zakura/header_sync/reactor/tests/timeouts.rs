@@ -167,6 +167,17 @@ fn seed_vct_active_request(
         active.target.status.selected_tip_height,
         active.target.status.selected_tip_hash,
     );
+    active.entries[0].tree_aux = Some(TreeAuxRecordV1 {
+        height: target.height,
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: 0,
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
+    });
+    active.tree_aux_schema = AuxSchema::V1;
     let context = zakura_header_chain::VctRepairContext::unconstrained(
         target,
         zakura_header_chain::HeaderLocator::for_continuation(snapshot.frontiers.finalized),
@@ -262,7 +273,7 @@ fn prepared_vct_target(
         source,
         owner,
         zakura_header_chain::BodySizeHint::Unknown,
-        None,
+        active.entries[0].tree_aux,
     );
     let adapter_key = port::AdapterKey::new();
     port::PreparedHeaderTarget::from_insert(

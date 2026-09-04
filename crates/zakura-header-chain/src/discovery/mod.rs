@@ -82,12 +82,51 @@ impl AuxiliaryRequirementEpisode {
         Self(hasher.finalize().into())
     }
 
+    /// Derive one episode for a contiguous selected range with no durable auxiliary rows.
+    fn for_empty_selected_range(
+        state_version: crate::StateVersion,
+        selected_range: &[Frontier],
+        terminal_boundary_hash: Option<block::Hash>,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-vct-auxiliary-range-requirement-episode-v1");
+        hasher.update(state_version.get().to_le_bytes());
+        for (index, target) in selected_range.iter().enumerate() {
+            hasher.update(target.height.0.to_le_bytes());
+            hasher.update(target.hash.0);
+            let boundary_hash = selected_range
+                .get(index.saturating_add(1))
+                .map(|successor| successor.hash)
+                .or(terminal_boundary_hash);
+            match boundary_hash {
+                Some(boundary_hash) => {
+                    hasher.update([1]);
+                    hasher.update(boundary_hash.0);
+                }
+                None => hasher.update([0]),
+            }
+            // The range builder admits a target only after it proves that no durable row exists.
+            hasher.update([0]);
+        }
+        Self(hasher.finalize().into())
+    }
+
     pub(crate) const fn digest(self) -> [u8; 32] {
         self.0
     }
 }
 
-/// Exact selected-header request context for one auxiliary VCT repair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SelectedRepairRange {
+    /// Contiguous selected targets covered by this repair, beginning at the blocking target.
+    frontiers: Box<[Frontier]>,
+    /// Selected successor after the range, when one exists.
+    terminal_boundary_hash: Option<block::Hash>,
+    /// Whether the blocking target has any durable auxiliary row.
+    has_durable_rows: bool,
+}
+
+/// Selected-header request context for one auxiliary VCT repair.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VctRepairContext {
     /// Selected header whose auxiliary metadata a peer must redeliver.
@@ -108,6 +147,8 @@ pub struct VctRepairContext {
     retained_payloads: Box<[[u8; 32]]>,
     /// Sources that already supplied one retained rooted payload for this target.
     retained_sources: Box<[SourceId]>,
+    /// Private selected-range state keeps the public context and port shapes stable.
+    selected_range: Box<SelectedRepairRange>,
 }
 
 impl VctRepairContext {
@@ -127,6 +168,11 @@ impl VctRepairContext {
             excluded_inputs: Box::new([]),
             retained_payloads: Box::new([]),
             retained_sources: Box::new([]),
+            selected_range: Box::new(SelectedRepairRange {
+                frontiers: Box::new([target]),
+                terminal_boundary_hash: boundary_hash,
+                has_durable_rows: false,
+            }),
         }
     }
 
@@ -182,7 +228,112 @@ impl VctRepairContext {
             excluded_inputs: excluded_inputs.into_boxed_slice(),
             retained_payloads: retained_payloads.into_boxed_slice(),
             retained_sources: retained_sources.into_boxed_slice(),
+            selected_range: Box::new(SelectedRepairRange {
+                frontiers: Box::new([target]),
+                terminal_boundary_hash: boundary_hash,
+                has_durable_rows: !rows.is_empty(),
+            }),
         })
+    }
+
+    /// Extend an unconstrained exact repair across a contiguous selected suffix with no rows.
+    ///
+    /// `suffix` begins with the selected successor of [`Self::target`]. The caller must prove
+    /// that every target in the resulting range has no durable auxiliary row.
+    pub fn extend_empty_selected_range(
+        mut self,
+        suffix: &[Frontier],
+        terminal_boundary_hash: Option<block::Hash>,
+    ) -> Result<Self, StoreError> {
+        if self.selected_range.has_durable_rows
+            || !self.admission_capacity_available
+            || suffix.is_empty()
+        {
+            return Err(StoreError::Incoherent(
+                "a constrained VCT repair context cannot become a range",
+            ));
+        }
+        let mut previous = self.target;
+        for target in suffix {
+            let expected_height = previous
+                .height
+                .next()
+                .map_err(|_| StoreError::Incoherent("VCT repair range height overflowed"))?;
+            if target.height != expected_height {
+                return Err(StoreError::Incoherent(
+                    "VCT repair range is not height-contiguous",
+                ));
+            }
+            previous = *target;
+        }
+        let mut selected_range = Vec::with_capacity(suffix.len().saturating_add(1));
+        selected_range.push(self.target);
+        selected_range.extend_from_slice(suffix);
+        self.episode = AuxiliaryRequirementEpisode::for_empty_selected_range(
+            self.state_version,
+            &selected_range,
+            terminal_boundary_hash,
+        );
+        self.selected_range = Box::new(SelectedRepairRange {
+            frontiers: selected_range.into_boxed_slice(),
+            terminal_boundary_hash,
+            has_durable_rows: false,
+        });
+        Ok(self)
+    }
+
+    /// Return the number of selected headers covered by this repair context.
+    pub fn selected_header_count(&self) -> usize {
+        self.selected_range.frontiers.len()
+    }
+
+    /// Return the last selected target that a peer must serve for this context.
+    pub fn request_target(&self) -> Frontier {
+        *self
+            .selected_range
+            .frontiers
+            .last()
+            .expect("every VCT repair context contains its blocking target")
+    }
+
+    /// Return whether `headers` names the complete selected range in order.
+    pub fn matches_selected_range(&self, headers: &[Frontier]) -> bool {
+        self.selected_range.frontiers.as_ref() == headers
+    }
+
+    /// Shorten this context to at most `max_headers` selected headers.
+    ///
+    /// The returned episode binds the selected prefix, its authentication boundaries, the state
+    /// version, and the absence of durable auxiliary rows. Exact constrained repairs can only
+    /// return their one-header context.
+    pub fn bounded_prefix(&self, max_headers: usize) -> Option<Self> {
+        let prefix_len = max_headers.min(self.selected_range.frontiers.len());
+        if prefix_len == 0 {
+            return None;
+        }
+        if prefix_len == self.selected_range.frontiers.len() {
+            return Some(self.clone());
+        }
+        let mut prefix = self.clone();
+        prefix.selected_range = Box::new(SelectedRepairRange {
+            frontiers: self.selected_range.frontiers[..prefix_len].into(),
+            terminal_boundary_hash: Some(self.selected_range.frontiers[prefix_len].hash),
+            has_durable_rows: false,
+        });
+        prefix.episode = if prefix_len == 1 {
+            AuxiliaryRequirementEpisode::for_target(
+                prefix.target,
+                prefix.selected_range.terminal_boundary_hash,
+                &[],
+            )
+        } else {
+            AuxiliaryRequirementEpisode::for_empty_selected_range(
+                prefix.state_version,
+                &prefix.selected_range.frontiers,
+                prefix.selected_range.terminal_boundary_hash,
+            )
+        };
+        Some(prefix)
     }
 
     /// Check one input against durable rejection or dispute evidence without transport identity.
@@ -380,6 +531,57 @@ mod tests {
     }
 
     #[test]
+    fn repair_range_prefixes_bind_selection_boundaries_and_state_version() {
+        let target = Frontier::new(block::Height(1), hash_at(block::Height(1)));
+        let predecessor = Frontier::new(block::Height(0), hash_at(block::Height(0)));
+        let suffix = [
+            Frontier::new(block::Height(2), hash_at(block::Height(2))),
+            Frontier::new(block::Height(3), hash_at(block::Height(3))),
+        ];
+        let build = |state_version| {
+            VctRepairContext::from_durable_rows(
+                target,
+                HeaderLocator::for_continuation(predecessor),
+                StateVersion::new(state_version),
+                Some(suffix[0].hash),
+                true,
+                &[],
+            )
+            .expect("an empty exact repair context is coherent")
+            .extend_empty_selected_range(&suffix, Some(hash_at(block::Height(4))))
+            .expect("the selected empty suffix is contiguous")
+        };
+
+        let full = build(7);
+        assert_eq!(full.selected_header_count(), 3);
+        assert_eq!(full.request_target(), suffix[1]);
+        assert!(full.matches_selected_range(&[target, suffix[0], suffix[1]]));
+
+        let prefix = full
+            .bounded_prefix(2)
+            .expect("a positive repair prefix exists");
+        assert_eq!(prefix.selected_header_count(), 2);
+        assert_eq!(prefix.request_target(), suffix[0]);
+        assert!(prefix.matches_selected_range(&[target, suffix[0]]));
+        assert_ne!(prefix.episode, full.episode);
+        let exact_prefix = full
+            .bounded_prefix(1)
+            .expect("a one-header repair prefix exists");
+        let exact = VctRepairContext::from_durable_rows(
+            target,
+            HeaderLocator::for_continuation(predecessor),
+            StateVersion::new(7),
+            Some(suffix[0].hash),
+            true,
+            &[],
+        )
+        .expect("an exact empty repair context is coherent");
+        assert_eq!(exact_prefix, exact);
+        assert_ne!(build(8).episode, full.episode);
+        assert!(full.bounded_prefix(0).is_none());
+    }
+
+    #[test]
     fn selected_path_locators_match_every_offset_and_cap_boundary() {
         for tip_height in 0..=2_000 {
             let snapshot = snapshot(tip_height, 0);
@@ -510,6 +712,7 @@ mod tests {
         assert!(first.excludes(record));
         assert!(first.retains_payload(record));
         assert!(first.retains_source(rejected.delivery().source));
+        assert_eq!(first.selected_header_count(), 1);
         assert!(second.excludes(record));
         assert!(second.retains_payload(record));
         assert!(second.retains_source(same_input_new_transport.delivery().source));
@@ -525,6 +728,19 @@ mod tests {
         )
         .expect("duplicate semantic evidence under distinct transport is coherent");
         assert_eq!(first.episode, duplicate_semantic_evidence.episode);
+
+        let authenticated =
+            UntrustedAuxDeliveryRow::new(delivery(17), 1, [Some([18; 32]), None], boundary_hash);
+        let authenticated = VctRepairContext::from_durable_rows(
+            target,
+            locator.clone(),
+            StateVersion::new(1),
+            boundary_hash,
+            true,
+            &[authenticated],
+        )
+        .expect("the authenticated row is coherent");
+        assert_eq!(authenticated.selected_header_count(), 1);
 
         let changed_boundary = VctRepairContext::from_durable_rows(
             target,
@@ -554,6 +770,7 @@ mod tests {
         )
         .expect("the disputed row is coherent");
         assert!(disputed.excludes(record));
+        assert_eq!(disputed.selected_header_count(), 1);
         let mut independent = record;
         independent.sapling_tx_count = independent.sapling_tx_count.saturating_add(1);
         assert!(!disputed.excludes(independent));

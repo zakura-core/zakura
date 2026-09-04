@@ -64,7 +64,9 @@ mod vct_authentication_sweep;
 mod vct_write_retry;
 
 use vct_authentication_sweep::VctAuthenticationSweeper;
-use vct_write_retry::{VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager};
+use vct_write_retry::{
+    VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager, VctWriteRetryWait,
+};
 pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
 
 /// Classifies durable failure evidence as a new repair episode or an idempotent observation.
@@ -1943,6 +1945,79 @@ fn handle_header_chain_control_message(
     }
 }
 
+/// Wait for a header insertion that can fill metadata for one parked checkpoint block.
+///
+/// The writer continues to apply header-chain control messages. It defers block-write messages
+/// in receive order. The diagnostic deadline remains active while no insertion arrives.
+fn wait_for_vct_root_insert(
+    receiver: &mut UnboundedReceiver<NonFinalizedWriteMessage>,
+    header_chain: Option<&HeaderChainWriter>,
+    deferred_messages: &mut VecDeque<NonFinalizedWriteMessage>,
+    deadline_runtime: &tokio::runtime::Runtime,
+    retry_manager: &mut VctWriteRetryManager,
+) -> Result<bool, HeaderChainStoreError> {
+    loop {
+        let message = if let Some(wait) = retry_manager.stall_warning_remaining() {
+            match deadline_runtime
+                .block_on(async { tokio::time::timeout(wait, receiver.recv()).await })
+            {
+                Ok(message) => message,
+                Err(_) => {
+                    retry_manager.report_stall_if_due(VctWriteRetryCause::MissingRoot {
+                        trigger: VctRepairTrigger::MissingRootObserved,
+                    });
+                    continue;
+                }
+            }
+        } else {
+            receiver.blocking_recv()
+        };
+        let Some(message) = message else {
+            return Ok(false);
+        };
+        let insertion = matches!(
+            &message,
+            NonFinalizedWriteMessage::ApplyHeaderChainInsert { .. }
+        );
+        match handle_header_chain_control_message(header_chain, message) {
+            Ok(()) if insertion => return Ok(true),
+            Ok(()) => {}
+            Err(message) => deferred_messages.push_back(message),
+        }
+    }
+}
+
+/// Wait until one retry condition can change, or return the writer exit caused by the wait.
+fn wait_for_vct_retry(
+    wait: VctWriteRetryWait,
+    receiver: &mut UnboundedReceiver<NonFinalizedWriteMessage>,
+    header_chain: Option<&HeaderChainWriter>,
+    deferred_messages: &mut VecDeque<NonFinalizedWriteMessage>,
+    deadline_runtime: &tokio::runtime::Runtime,
+    retry_manager: &mut VctWriteRetryManager,
+) -> Option<BlockWriteTaskExit> {
+    let result = match wait {
+        VctWriteRetryWait::HeaderChainInsert => wait_for_vct_root_insert(
+            receiver,
+            header_chain,
+            deferred_messages,
+            deadline_runtime,
+            retry_manager,
+        ),
+        VctWriteRetryWait::Delay(wait) => {
+            std::thread::park_timeout(wait);
+            Ok(true)
+        }
+    };
+    match result {
+        Ok(true) => None,
+        Ok(false) => Some(BlockWriteTaskExit::Completed),
+        Err(error) => Some(BlockWriteTaskExit::HeaderChainRuntimeFailed(
+            BlockWriteTaskFailure::runtime("VCT repair wait stopped the finalized writer", error),
+        )),
+    }
+}
+
 fn attach_header_chain_if_genesis_is_committed(
     header_chain: &mut Option<HeaderChainWriter>,
     attach_header_chain: bool,
@@ -2138,7 +2213,16 @@ impl WriteBlockWorkerTask {
                             },
                             ordered_block,
                         );
-                        std::thread::park_timeout(wait);
+                        if let Some(exit) = wait_for_vct_retry(
+                            wait,
+                            non_finalized_block_write_receiver,
+                            header_chain.as_ref(),
+                            &mut deferred_non_finalized_messages,
+                            &deadline_runtime,
+                            &mut vct_write_retry_manager,
+                        ) {
+                            return exit;
+                        }
                         continue;
                     }
                     Err(error) => {
@@ -2203,7 +2287,16 @@ impl WriteBlockWorkerTask {
                 );
                 let wait =
                     vct_write_retry_manager.on_retryable_error(height, retry_cause, ordered_block);
-                std::thread::park_timeout(wait);
+                if let Some(exit) = wait_for_vct_retry(
+                    wait,
+                    non_finalized_block_write_receiver,
+                    header_chain.as_ref(),
+                    &mut deferred_non_finalized_messages,
+                    &deadline_runtime,
+                    &mut vct_write_retry_manager,
+                ) {
+                    return exit;
+                }
                 continue;
             }
 
@@ -2370,7 +2463,16 @@ impl WriteBlockWorkerTask {
                             retry_cause,
                             ordered_block,
                         );
-                        std::thread::park_timeout(wait);
+                        if let Some(exit) = wait_for_vct_retry(
+                            wait,
+                            non_finalized_block_write_receiver,
+                            header_chain.as_ref(),
+                            &mut deferred_non_finalized_messages,
+                            &deadline_runtime,
+                            &mut vct_write_retry_manager,
+                        ) {
+                            return exit;
+                        }
                         continue;
                     }
 

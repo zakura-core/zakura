@@ -775,6 +775,16 @@ impl PeerWorkQueue {
         .expect("the header budget capacity fits u32")
     }
 
+    /// Bound one VCT repair request by all currently unowned aggregate capacity.
+    pub(in crate::zakura::header_sync) fn reservable_repair_header_count(
+        &self,
+        desired: u32,
+    ) -> u32 {
+        let desired = usize::try_from(desired).unwrap_or(usize::MAX);
+        u32::try_from(desired.min(self.budget.remaining()))
+            .expect("the header budget capacity fits u32")
+    }
+
     /// Reserve capacity before publishing one wire request.
     pub(in crate::zakura::header_sync) fn reserve_request(
         &mut self,
@@ -788,6 +798,23 @@ impl PeerWorkQueue {
         if count > MAX_HEADER_CHUNK_RESERVATION_V1 {
             return false;
         }
+        let Some(reservation) = self.budget.reserve(count) else {
+            return false;
+        };
+        self.request_reservations.insert(peer.clone(), reservation);
+        true
+    }
+
+    /// Reserve aggregate capacity for one selected auxiliary repair range.
+    pub(in crate::zakura::header_sync) fn reserve_repair_request(
+        &mut self,
+        peer: &ZakuraPeerId,
+        count: u32,
+    ) -> bool {
+        if self.request_reservations.contains_key(peer) {
+            return false;
+        }
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
         let Some(reservation) = self.budget.reserve(count) else {
             return false;
         };

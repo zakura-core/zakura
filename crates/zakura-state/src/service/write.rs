@@ -45,7 +45,7 @@ use crate::{
             DiskWriteBatch, FinalizedState, VctAuthenticationProof, VctAuxiliaryFailureAttribution,
             VctAuxiliaryWindow, VctSuccessorWitness, ZakuraDb,
         },
-        non_finalized_state::NonFinalizedState,
+        non_finalized_state::{ContextualMetrics, NonFinalizedState},
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
@@ -1316,7 +1316,21 @@ const REJECTED_ANCESTOR_MAP_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
 
 /// Run contextual validation on the prepared block and add it to the
 /// non-finalized state if it is contextually valid.
+pub(crate) fn validate_and_commit_non_finalized(
+    finalized_state: &ZakuraDb,
+    non_finalized_state: &mut NonFinalizedState,
+    prepared: SemanticallyVerifiedBlock,
+) -> Result<(), ValidateContextError> {
+    validate_and_commit_non_finalized_with_metrics(
+        finalized_state,
+        non_finalized_state,
+        prepared,
+        ContextualMetrics::Disabled,
+    )
+}
+
 #[tracing::instrument(
+    name = "validate_and_commit_non_finalized",
     level = "debug",
     skip(finalized_state, non_finalized_state, prepared),
     fields(
@@ -1325,21 +1339,45 @@ const REJECTED_ANCESTOR_MAP_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
         chains = non_finalized_state.chain_count()
     )
 )]
-pub(crate) fn validate_and_commit_non_finalized(
+fn validate_and_commit_non_finalized_with_metrics(
     finalized_state: &ZakuraDb,
     non_finalized_state: &mut NonFinalizedState,
     prepared: SemanticallyVerifiedBlock,
+    contextual_metrics: ContextualMetrics,
 ) -> Result<(), ValidateContextError> {
-    check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared)?;
-    let parent_hash = prepared.block.header.previous_block_hash;
+    let total_start = Instant::now();
+    let initial_checks_start = Instant::now();
+    let initial_checks =
+        check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared);
+    contextual_metrics.record_duration(
+        "state.contextual.initial_checks.duration_seconds",
+        "state.contextual.mined.initial_checks.duration_seconds",
+        initial_checks_start.elapsed(),
+    );
+    let result = initial_checks.and_then(|()| {
+        let parent_hash = prepared.block.header.previous_block_hash;
 
-    if finalized_state.finalized_tip_hash() == parent_hash {
-        non_finalized_state.commit_new_chain(prepared, finalized_state)?;
-    } else {
-        non_finalized_state.commit_block(prepared, finalized_state)?;
-    }
+        if finalized_state.finalized_tip_hash() == parent_hash {
+            non_finalized_state.commit_new_chain_with_metrics(
+                prepared,
+                finalized_state,
+                contextual_metrics,
+            )
+        } else {
+            non_finalized_state.commit_block_with_metrics(
+                prepared,
+                finalized_state,
+                contextual_metrics,
+            )
+        }
+    });
+    contextual_metrics.record_duration(
+        "state.contextual.total.duration_seconds",
+        "state.contextual.mined.total.duration_seconds",
+        total_start.elapsed(),
+    );
 
-    Ok(())
+    result
 }
 
 /// Update the [`LatestChainTip`], [`ChainTipChange`], and `non_finalized_state_sender`
@@ -2619,7 +2657,9 @@ impl WriteBlockWorkerTask {
             let writer_queue_duration = queued_at.elapsed().as_secs_f64();
             metrics::histogram!("state.block_writer.queue.duration_seconds")
                 .record(writer_queue_duration);
-            if admission.is_some() {
+            let is_mined = admission.is_some();
+            let contextual_metrics = ContextualMetrics::for_commit(is_mined);
+            if is_mined {
                 metrics::histogram!("state.block_writer.queue.mined.duration_seconds")
                     .record(writer_queue_duration);
             }
@@ -2639,49 +2679,75 @@ impl WriteBlockWorkerTask {
                 } else {
                     tracing::trace!(?child_hash, "validating queued child");
                     if let Some(writer) = header_chain.as_ref() {
+                        let snapshot_clone_start = Instant::now();
                         let mut staged = non_finalized_state.clone();
-                        validate_and_commit_non_finalized(
+                        contextual_metrics.record_duration(
+                            "state.contextual.snapshot_clone.duration_seconds",
+                            "state.contextual.mined.snapshot_clone.duration_seconds",
+                            snapshot_clone_start.elapsed(),
+                        );
+                        validate_and_commit_non_finalized_with_metrics(
                             &finalized_state.db,
                             &mut staged,
                             queued_child,
+                            contextual_metrics,
                         )
                         .map_err(|error| CommitBlockError::from(Box::new(error)))
                         .and_then(|()| {
                             let accepted = Frontier::new(child_height, child_hash);
-                            let (evidence, event_path, request) =
+                            let transition_prepare_start = Instant::now();
+                            let transition =
                                 verified_request(writer, non_finalized_state, &staged, accepted)
                                     .map_err(|error| CommitBlockError::HeaderChainError {
                                         error: error.to_string(),
-                                    })?;
-                            PreparedFullStateTransition::new(
-                                evidence,
-                                writer
-                                    .runtime
-                                    .publisher()
-                                    .snapshot()
-                                    .frontiers
-                                    .verified_best,
-                                event_path,
-                                staged,
-                                None,
-                                request,
-                            )
-                            .map_err(|error| CommitBlockError::HeaderChainError {
-                                error: error.to_string(),
-                            })?
-                            .commit(&writer.runtime, non_finalized_state, &writer.context())
-                            .map(|_| ())
-                            .map_err(|error| {
-                                CommitBlockError::HeaderChainError {
+                                    })
+                                    .and_then(|(evidence, event_path, request)| {
+                                        PreparedFullStateTransition::new(
+                                            evidence,
+                                            writer
+                                                .runtime
+                                                .publisher()
+                                                .snapshot()
+                                                .frontiers
+                                                .verified_best,
+                                            event_path,
+                                            staged,
+                                            None,
+                                            request,
+                                        )
+                                        .map_err(|error| {
+                                            CommitBlockError::HeaderChainError {
+                                                error: error.to_string(),
+                                            }
+                                        })
+                                    });
+                            contextual_metrics.record_duration(
+                                "state.contextual.header_transition_prepare.duration_seconds",
+                                "state.contextual.mined.header_transition_prepare.duration_seconds",
+                                transition_prepare_start.elapsed(),
+                            );
+                            let transition = transition?;
+
+                            let transition_commit_start = Instant::now();
+                            let result = transition
+                                .commit(&writer.runtime, non_finalized_state, &writer.context())
+                                .map(|_| ())
+                                .map_err(|error| CommitBlockError::HeaderChainError {
                                     error: error.to_string(),
-                                }
-                            })
+                                });
+                            contextual_metrics.record_duration(
+                                "state.contextual.header_transition_commit.duration_seconds",
+                                "state.contextual.mined.header_transition_commit.duration_seconds",
+                                transition_commit_start.elapsed(),
+                            );
+                            result
                         })
                     } else {
-                        validate_and_commit_non_finalized(
+                        validate_and_commit_non_finalized_with_metrics(
                             &finalized_state.db,
                             non_finalized_state,
                             queued_child,
+                            contextual_metrics,
                         )
                         .map_err(|error| CommitBlockError::from(Box::new(error)))
                     }

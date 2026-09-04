@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import concurrent.futures
+import hashlib
 import json
 import os
 import shlex
@@ -423,16 +424,40 @@ class Problem(NamedTuple):
 
     kind: str
     detail: str
+    incident_id: str = ""
+    delivered_at: int | None = None
 
 
-def audit_problem(data: dict[str, Any], max_completion_age: int) -> Problem | None:
+def audit_problem(
+    data: dict[str, Any], max_completion_age: int, destination: str | None = None
+) -> Problem | None:
+    """Classify a node, accepting only a matching delivery receipt to this destination."""
     state = data.get("controller_state") or {}
     sample = data.get("sample") or {}
     if state.get("failed"):
         # The halt reason is latched by the controller, so it is stable while the
         # halt lasts and a genuinely different halt should page again.
         failure = state.get("failure")
-        return Problem(f"controller-halted:{failure}", f"controller halted: {failure}")
+        run_id, failed_at = state.get("last_failed_run"), state.get("failed_at")
+        incident_id = json.dumps([run_id, failed_at]) if run_id and failed_at else ""
+        receipt = state.get("failure_notification")
+        delivered_at = None
+        if (
+            incident_id
+            and destination
+            and isinstance(receipt, dict)
+            and receipt.get("run_id") == run_id
+            and receipt.get("failed_at") == failed_at
+            and receipt.get("reason") == failure
+            and receipt.get("destination") == destination
+            and type(receipt.get("sent_at")) is int
+            and 0 < receipt["sent_at"] <= now()
+        ):
+            delivered_at = receipt["sent_at"]
+        return Problem(
+            f"controller-halted:{failure}", f"controller halted: {failure}",
+            incident_id, delivered_at,
+        )
     if not data.get("service_active") and state.get("phase") == "syncing":
         return Problem(
             "service-inactive", "node service inactive while controller says syncing"
@@ -479,12 +504,16 @@ def format_duration(seconds: int) -> str:
     return f"{hours}h{remainder // 60}m"
 
 
-def post_slack(text: str) -> bool:
-    webhook = (
+def slack_webhook_url() -> str:
+    return (
         os.environ.get("SLACK_WEB_HOOK", "")
         or os.environ.get("SLACK_WEBHOOK_URL", "")
         or os.environ.get("SLACK_WEBHOOK", "")
     )
+
+
+def post_slack(text: str) -> bool:
+    webhook = slack_webhook_url()
     if not webhook:
         print(f"SLACK_WEB_HOOK missing; would post:\n{text}", file=sys.stderr)
         return False
@@ -524,7 +553,17 @@ def load_audit_state(path: Path | None) -> dict[str, Any]:
     problems = data.get("problems")
     if not isinstance(problems, dict):
         return fresh
-    return {"version": AUDIT_STATE_VERSION, "problems": problems}
+    if type(data.get("last_digest_at")) is not int or not 0 <= data["last_digest_at"] <= now():
+        data.pop("last_digest_at", None)
+    completions = data.get("completions", {})
+    if not isinstance(completions, dict) or any(
+        not isinstance(record, dict)
+        or any(type(record.get(key)) is not int or record[key] < 0 for key in ("total", "pending"))
+        or any(key not in record for key in ("run_id", "sha", "duration"))
+        for record in completions.values()
+    ):
+        data.pop("completions", None)
+    return {**data, "version": AUDIT_STATE_VERSION, "problems": problems}
 
 
 def save_audit_state(path: Path | None, state: dict[str, Any]) -> None:
@@ -541,6 +580,8 @@ def audit_transitions(
     previous: dict[str, Any],
     reminder_interval: int,
     timestamp: int,
+    *,
+    reminders_due: bool = True,
 ) -> tuple[list[str], list[str], list[str], dict[str, Any]]:
     """Split current problems into new/reminder/recovered lines.
 
@@ -557,19 +598,29 @@ def audit_transitions(
     for name in sorted(problems):
         problem = problems[name]
         record = prior.get(name)
-        if not isinstance(record, dict) or record.get("kind") != problem.kind:
+        had_prior_problem = isinstance(record, dict)
+        if (
+            not isinstance(record, dict)
+            or record.get("kind") != problem.kind
+            or record.get("incident_id", "") != problem.incident_id
+        ):
             # First sighting, or the failure changed to a different one.
-            new_lines.append(f"{name}: {problem.detail}")
-            current[name] = {
+            record = {
                 "kind": problem.kind,
                 "detail": problem.detail,
-                "first_seen": timestamp,
-                "last_sent": timestamp,
+                "incident_id": problem.incident_id,
+                "first_seen": problem.delivered_at or timestamp,
+                "last_sent": problem.delivered_at or timestamp,
             }
-            continue
+            if problem.delivered_at is None or had_prior_problem:
+                record["first_seen"] = timestamp
+                record["last_sent"] = timestamp
+                new_lines.append(f"{name}: {problem.detail}")
+                current[name] = record
+                continue
         first_seen = int(record.get("first_seen", timestamp))
         last_sent = int(record.get("last_sent", timestamp))
-        if timestamp - last_sent >= reminder_interval:
+        if reminders_due and timestamp - last_sent >= reminder_interval:
             reminder_lines.append(
                 f"{name}: {problem.detail} "
                 f"(unresolved for {format_duration(timestamp - first_seen)})"
@@ -578,6 +629,7 @@ def audit_transitions(
         current[name] = {
             "kind": problem.kind,
             "detail": problem.detail,
+            "incident_id": problem.incident_id,
             "first_seen": first_seen,
             "last_sent": last_sent,
         }
@@ -600,15 +652,57 @@ def audit_message(
     if new_lines:
         sections.append(":rotating_light: Zakura continuous sync audit failed\n" + "\n".join(new_lines))
     if reminder_lines:
-        sections.append(":alarm_clock: Zakura continuous sync still failing\n" + "\n".join(reminder_lines))
+        sections.append(":memo: Zakura continuous sync digest — unresolved\n" + "\n".join(reminder_lines))
     if recovered_lines:
         sections.append(":white_check_mark: Zakura continuous sync recovered\n" + "\n".join(recovered_lines))
     return "\n\n".join(sections)
 
 
+def completion_updates(
+    statuses: dict[str, dict[str, Any]], previous: dict[str, Any], digest_due: bool
+) -> tuple[list[str], dict[str, Any]]:
+    """Accumulate completed runs until a digest is successfully delivered.
+
+    A new cache counts from when the controller enabled digests. Missing hosts
+    retain pending counts; a counter reset counts the new success once.
+    """
+    records = dict(previous.get("completions", {}))
+    for name, data in statuses.items():
+        controller = data.get("controller_state") or {}
+        run_id = controller.get("last_success_run")
+        total = controller.get("runs")
+        if not controller.get("completion_digest") or not run_id or type(total) is not int:
+            continue
+        old = records.get(name, {})
+        if old.get("run_id") == run_id:
+            continue
+        baseline = old.get("total", controller.get("completion_digest_start_runs", total - 1))
+        delta = max(1, total - baseline) if type(baseline) is int else 1
+        records[name] = {
+            "run_id": run_id, "total": total,
+            "pending": old.get("pending", 0) + delta,
+            "sha": controller.get("last_success_sha", "unknown"),
+            "duration": controller.get("last_success_duration_seconds"),
+        }
+    lines = []
+    if digest_due:
+        for name, record in sorted(records.items()):
+            if record.get("pending", 0):
+                lines.append(
+                    f"{name}: {record['pending']} completed run(s); "
+                    f"latest={record['run_id']} | sha={record['sha']} | "
+                    f"sync time={record['duration']}s"
+                )
+                records[name] = {**record, "pending": 0}
+    return lines, records
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     nodes = load_nodes(args.config, args.node)
     problems: dict[str, Problem] = {}
+    statuses: dict[str, dict[str, Any]] = {}
+    webhook = slack_webhook_url()
+    destination = hashlib.sha256(webhook.encode()).hexdigest() if webhook else None
     for node in nodes:
         ok, data = remote_json(node, "/usr/local/sbin/zakura-continuous-sync.py status")
         if not ok:
@@ -619,17 +713,32 @@ def cmd_audit(args: argparse.Namespace) -> int:
             )
             continue
         assert isinstance(data, dict)
-        problem = audit_problem(data, args.max_completion_age)
+        statuses[node.name] = data
+        problem = audit_problem(data, args.max_completion_age, destination)
         if problem:
             problems[node.name] = problem
 
     state_file = Path(args.state_file) if args.state_file else None
     previous = load_audit_state(state_file)
     timestamp = now()
+    last_digest = previous.get("last_digest_at", timestamp)
+    digest_due = not args.node and timestamp - last_digest >= args.reminder_interval
+    # A targeted audit cannot recover nodes it did not inspect.
+    selected = {node.name for node in nodes}
+    prior_problems = previous.get("problems", {})
+    scoped_previous = {"problems": {k: v for k, v in prior_problems.items() if k in selected}}
     new_lines, reminder_lines, recovered_lines, state = audit_transitions(
-        problems, previous, args.reminder_interval, timestamp
+        problems, scoped_previous, 0 if digest_due else args.reminder_interval, timestamp,
+        reminders_due=digest_due,
     )
+    state["problems"].update({k: v for k, v in prior_problems.items() if k not in selected})
+    completion_lines, state["completions"] = completion_updates(statuses, previous, digest_due)
+    state["last_digest_at"] = timestamp if digest_due else last_digest
     text = audit_message(new_lines, reminder_lines, recovered_lines)
+    if completion_lines:
+        text += ("\n\n" if text else "") + (
+            ":memo: Zakura continuous sync digest — completions\n" + "\n".join(completion_lines)
+        )
 
     posted = True
     if text:
@@ -706,8 +815,8 @@ def parse_args() -> argparse.Namespace:
     audit.add_argument(
         "--reminder-interval",
         type=int,
-        default=21600,
-        help="re-send an unresolved failure at most this often, in seconds (default 6h)",
+        default=86400,
+        help="digest interval for unresolved failures and completions (default 24h)",
     )
     return parser.parse_args()
 

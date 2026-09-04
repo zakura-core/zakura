@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -31,6 +32,8 @@ def load_module(name: str, path: Path):
 
 sync = load_module("continuous_sync", SYNC_PATH)
 deploy = load_module("continuous_sync_deploy", DEPLOY_PATH)
+with patch.dict(sys.modules, {"deploy": deploy}):
+    canary = load_module("canary_notify", DEPLOY_PATH.with_name("canary-notify.py"))
 alert = load_module("continuous_sync_alert", ALERT_PATH)
 alert_status = load_module("continuous_sync_alert_status", ALERT_STATUS_PATH)
 
@@ -995,24 +998,6 @@ p2p_stack = "zakura"
         self.assertLessEqual(len(reason), 96)
         self.assertTrue(reason.endswith("..."))
 
-    def test_completion_slack_text_includes_sync_duration(self):
-        config = make_config(
-            Path("/tmp"),
-            policy=sync.Policy(
-                hostname="temp-zakura-sync-test-2",
-                p2p_stack="zakura",
-                public_ip="138.197.218.91",
-            ),
-        )
-
-        text = sync.completion_text(config, {"sync_duration_seconds": 90061})
-
-        self.assertEqual(
-            text,
-            ":white_check_mark: Zakura sync complete: temp-zakura-sync-test-2 | v2p2p | "
-            "root@138.197.218.91 | sync time: 1d 1h 1m 1s",
-        )
-
     def test_halt_records_time_to_failure_at_failure_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1088,6 +1073,247 @@ p2p_stack = "zakura"
             # resume` reads stdout to tell the operator about it.
             self.assertNotIn("failed", sync.load_state(state_path))
             self.assertIn("slack notification failed", stdout.getvalue())
+
+
+class NotificationTests(unittest.TestCase):
+    WEBHOOK = "https://slack.invalid/test"
+
+    def halted_status(self):
+        destination = hashlib.sha256(self.WEBHOOK.encode()).hexdigest()
+        return {
+            "controller_state": {
+                "failed": True, "failure": "boom", "last_failed_run": "run-1",
+                "failed_at": "19700101T001500Z",
+                "failure_notification": {
+                    "run_id": "run-1", "failed_at": "19700101T001500Z",
+                    "reason": "boom", "sent_at": 900, "destination": destination,
+                },
+            },
+            "disk_free_bytes": 20 * 1024**3,
+        }
+
+    def audit(self, path, data, timestamp, *, posted=True, selected=None):
+        args = argparse.Namespace(
+            config=Path("unused"), node=selected, dry_run=False,
+            max_completion_age=0, reminder_interval=86400, state_file=path,
+        )
+        node = deploy.Node({"name": "node", "ssh_string": "root@host"})
+        with (
+            patch.object(deploy, "load_nodes", return_value=[node]),
+            patch.object(deploy, "remote_json", return_value=(True, data)),
+            patch.object(deploy, "now", return_value=timestamp),
+            patch.object(deploy, "post_slack", return_value=posted) as post,
+            patch.dict(os.environ, {"SLACK_WEB_HOOK": self.WEBHOOK}),
+        ):
+            result = deploy.cmd_audit(args)
+        return result, post
+
+    def test_halt_receipt_requires_successful_delivery(self):
+        for delivered in (False, True):
+            with self.subTest(delivered=delivered), tempfile.TemporaryDirectory() as tmp:
+                config = make_config(Path(tmp))
+                path = config.paths.state_dir / "state.json"
+                with (
+                    patch.object(sync, "post_slack", return_value=delivered),
+                    patch.object(sync, "now", return_value=900),
+                    patch.dict(os.environ, {"SLACK_WEB_HOOK": self.WEBHOOK}),
+                ):
+                    sync.halt(config, path, {}, {"run_id": "run-1"}, "boom")
+                state = sync.load_state(path)
+                self.assertTrue(state["failed"])
+                self.assertEqual("failure_notification" in state, delivered)
+                with patch.object(deploy, "now", return_value=1000):
+                    problem = deploy.audit_problem(
+                        {"controller_state": state}, 0,
+                        hashlib.sha256(self.WEBHOOK.encode()).hexdigest(),
+                    )
+                self.assertEqual(problem.delivered_at, 900 if delivered else None)
+
+    def test_receipt_must_match_incident_destination_and_valid_delivery_time(self):
+        destination = hashlib.sha256(self.WEBHOOK.encode()).hexdigest()
+        for key, value in (
+            ("run_id", "different"), ("failed_at", "different"),
+            ("reason", "different"), ("destination", "other-channel"),
+            ("sent_at", 2000), ("sent_at", -1), ("sent_at", True), ("sent_at", "900"),
+        ):
+            with self.subTest(key=key, value=value):
+                data = self.halted_status()
+                data["controller_state"]["failure_notification"][key] = value
+                with patch.object(deploy, "now", return_value=1000):
+                    self.assertIsNone(deploy.audit_problem(data, 0, destination).delivered_at)
+
+    def test_audit_adopts_confirmed_failure_then_reports_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            result, post = self.audit(path, self.halted_status(), 1000)
+            self.assertEqual(result, 1)
+            post.assert_not_called()
+            self.assertIn("node", deploy.load_audit_state(path)["problems"])
+            healthy = {"controller_state": {"phase": "complete"}, "disk_free_bytes": 20 * 1024**3}
+            result, post = self.audit(path, healthy, 1100)
+            self.assertEqual(result, 0)
+            self.assertIn("recovered", post.call_args.args[0])
+            _, post = self.audit(path, healthy, 1200)
+            post.assert_not_called()
+
+    def test_changed_problem_and_new_run_are_not_hidden_by_old_delivery(self):
+        for old in (
+            deploy.Problem("unreachable", "unreachable"),
+            deploy.Problem("controller-halted:boom", "boom", "old-run"),
+        ):
+            with self.subTest(old=old):
+                _, _, _, previous = deploy.audit_transitions({"node": old}, {}, 86400, 1000)
+                with patch.object(deploy, "now", return_value=1100):
+                    problem = deploy.audit_problem(
+                        self.halted_status(), 0,
+                        hashlib.sha256(self.WEBHOOK.encode()).hexdigest(),
+                    )
+                new, _, _, _ = deploy.audit_transitions({"node": problem}, previous, 86400, 1100)
+                self.assertEqual(len(new), 1)
+
+    def test_missing_receipt_preserves_audit_fallback_and_failed_delivery_retry(self):
+        data = self.halted_status()
+        del data["controller_state"]["failure_notification"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            _, post = self.audit(path, data, 1000, posted=False)
+            post.assert_called_once()
+            self.assertFalse(path.exists())
+            _, post = self.audit(path, data, 1100)
+            post.assert_called_once()
+
+    def test_daily_digest_combines_pending_successes_and_unresolved_failure(self):
+        data = self.halted_status()
+        data["controller_state"].update({
+            "completion_digest": True, "completion_digest_start_runs": 0,
+            "last_success_run": "success-3", "last_success_sha": "abc",
+            "last_success_duration_seconds": 3600, "runs": 3,
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            _, post = self.audit(path, data, 1000)
+            post.assert_not_called()
+            _, post = self.audit(path, data, 22600)
+            post.assert_not_called()  # The former six-hour reminder is now in the digest.
+            old = path.read_text()
+            _, post = self.audit(path, data, 87400, posted=False)
+            text = post.call_args.args[0]
+            self.assertIn("unresolved", text)
+            self.assertIn("3 completed run(s)", text)
+            self.assertEqual(path.read_text(), old)
+            _, post = self.audit(path, data, 87460)
+            self.assertIn("3 completed run(s)", post.call_args.args[0])
+            _, post = self.audit(path, data, 88000)
+            post.assert_not_called()
+
+    def test_completion_counter_reset_and_missing_host_preserve_pending_digest(self):
+        previous = {"completions": {"node": {
+            "run_id": "old", "total": 10, "pending": 2, "sha": "old", "duration": 30,
+        }}}
+        data = {"node": {"controller_state": {
+            "completion_digest": True, "last_success_run": "new", "runs": 1,
+            "last_success_sha": "new", "last_success_duration_seconds": 40,
+        }}}
+        lines, records = deploy.completion_updates(data, previous, False)
+        self.assertEqual(lines, [])
+        self.assertEqual(records["node"]["pending"], 3)
+        lines, records = deploy.completion_updates({}, {"completions": records}, True)
+        self.assertIn("3 completed run(s)", lines[0])
+        self.assertEqual(records["node"]["pending"], 0)
+        self.assertEqual(previous["completions"]["node"]["pending"], 2)
+
+    def test_targeted_audit_cannot_recover_unobserved_nodes_or_consume_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            _, _, _, state = deploy.audit_transitions(
+                {"other": deploy.Problem("unreachable", "unreachable")}, {}, 86400, 1
+            )
+            state["last_digest_at"] = 1
+            deploy.save_audit_state(path, state)
+            healthy = {"controller_state": {}, "disk_free_bytes": 20 * 1024**3}
+            _, post = self.audit(path, healthy, 100000, selected="node")
+            post.assert_not_called()
+            loaded = deploy.load_audit_state(path)
+            self.assertIn("other", loaded["problems"])
+            self.assertEqual(loaded["last_digest_at"], 1)
+
+    def test_successful_cycle_records_digest_without_sending_routine_message(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+            config = make_config(Path(tmp))
+            for name in (
+                "build_binary", "sha256_file", "install_binary", "stop_service",
+                "safe_wipe_state", "render_config", "start_service", "wait_for_completion",
+                "archive_run_log", "cleanup_retention",
+            ):
+                stack.enter_context(patch.object(sync, name, return_value="test"))
+            stack.enter_context(patch.object(sync, "resolve_sha", return_value="a" * 40))
+            stack.enter_context(patch.object(sync, "now", return_value=1000))
+            post = stack.enter_context(patch.object(sync, "post_slack"))
+            path = config.paths.state_dir / "state.json"
+            state = sync.one_cycle(config, path, {"runs": 4})
+            post.assert_not_called()
+            self.assertEqual(state["runs"], 5)
+            self.assertEqual(state["completion_digest_start_runs"], 4)
+            self.assertEqual(sync.load_state(path)["last_success_run"], state["current_run"])
+
+
+class CanaryNotificationTests(unittest.TestCase):
+    def event(self, **updates):
+        return {
+            "RUN_ID": "123", "RUN_ATTEMPT": "1", "EXECUTION_ATTEMPT": "1",
+            "RESULT": "failure", "TARGET_SHA": "a" * 40, "FAILURE_PHASE": "node-execution",
+            "MAX_CHECKPOINT": "100", "START_HEIGHT": "90", "END_HEIGHT": "99",
+            "RUN_URL": "https://github.invalid/actions/runs/123", **updates,
+        }
+
+    def test_only_duplicate_notification_of_same_execution_is_suppressed(self):
+        event = self.event()
+        text, state = canary.transition(event, {}, 1000)
+        self.assertIn("canary failed", text)
+        text, _ = canary.transition(self.event(RUN_ATTEMPT="2"), state, 1100)
+        self.assertEqual(text, "")
+        for key, value in (
+            ("RUN_ID", "124"), ("EXECUTION_ATTEMPT", "2"), ("TARGET_SHA", "b" * 40),
+            ("FAILURE_PHASE", "node-startup"), ("END_HEIGHT", "98"),
+        ):
+            with self.subTest(key=key):
+                text, _ = canary.transition(self.event(**{key: value}), state, 1100)
+                self.assertIn("canary failed", text)
+
+    def test_incomplete_diagnostics_always_alert(self):
+        for key in ("TARGET_SHA", "FAILURE_PHASE", "MAX_CHECKPOINT", "START_HEIGHT", "END_HEIGHT", "EXECUTION_ATTEMPT"):
+            with self.subTest(key=key):
+                event = self.event(**{key: ""})
+                _, state = canary.transition(event, {}, 1000)
+                text, _ = canary.transition(event, state, 1100)
+                self.assertIn("canary failed", text)
+
+    def test_recovery_is_once_and_cancelled_run_does_not_clear_failure(self):
+        _, state = canary.transition(self.event(), {}, 1000)
+        for result in ("cancelled", "skipped"):
+            text, unchanged = canary.transition(self.event(RESULT=result), state, 1100)
+            self.assertEqual((text, unchanged), ("", state))
+        text, cleared = canary.transition(self.event(RESULT="success"), state, 1200)
+        self.assertIn("recovered", text)
+        text, _ = canary.transition(self.event(RESULT="success"), cleared, 1300)
+        self.assertEqual(text, "")
+
+    def test_failed_delivery_does_not_commit_failure_or_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            for result, delivered in (("failure", False), ("failure", True), ("success", False), ("success", True)):
+                with self.subTest(result=result, delivered=delivered):
+                    before = path.read_text() if path.exists() else None
+                    with (
+                        patch.object(sys, "argv", ["canary-notify.py", "--state-file", str(path)]),
+                        patch.dict(os.environ, self.event(RESULT=result)),
+                        patch.object(canary, "slack_webhook_url", return_value="https://slack.invalid/test"),
+                        patch.object(canary, "post_slack", return_value=delivered),
+                        patch.object(canary.time, "time", return_value=1000),
+                    ):
+                        self.assertEqual(canary.main(), 0 if delivered else 1)
+                    if not delivered:
+                        self.assertEqual(path.read_text() if path.exists() else None, before)
 
 
 def alert_status_fixture(

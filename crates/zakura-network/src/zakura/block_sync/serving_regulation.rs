@@ -1211,6 +1211,93 @@ mod tests {
         assert_reconnect_during_drop_cannot_detach_live_bucket();
     }
 
+    #[tokio::test]
+    async fn gb_rl_18_panics_release_owned_resources_and_preserve_other_peers() {
+        #[derive(Copy, Clone, Debug)]
+        enum OwnershipStage {
+            ProvisionalAttempt,
+            CommittedPermit,
+            FrameLease,
+        }
+
+        for stage in [
+            OwnershipStage::ProvisionalAttempt,
+            OwnershipStage::CommittedPermit,
+            OwnershipStage::FrameLease,
+        ] {
+            let mut config = ZakuraBlockSyncConfig::default();
+            config
+                .get_blocks_serving_regulation
+                .peer_rate_bytes_per_second = 1;
+            config
+                .get_blocks_serving_regulation
+                .node_rate_bytes_per_second = 1;
+            let regulator = GetBlocksServingRegulator::new(config, 2);
+            let failed_session = regulator.session(peer(0xe1), 1);
+            let node_rate_before = regulator.snapshot().node_rate_balance;
+            let peer_rate_before = failed_session.peer_rate_balance();
+            let panicking_session = failed_session.clone();
+            let join_error = tokio::spawn(async move {
+                let attempt = panicking_session
+                    .try_admit(1)
+                    .expect("the panic-path request fits");
+                match stage {
+                    OwnershipStage::ProvisionalAttempt => {
+                        let _attempt = attempt;
+                        panic!("panic while holding a provisional attempt");
+                    }
+                    OwnershipStage::CommittedPermit => {
+                        let _permit = attempt.commit();
+                        panic!("panic while holding a committed permit");
+                    }
+                    OwnershipStage::FrameLease => {
+                        let mut permit = attempt.commit();
+                        let _lease = permit.transfer_frame(GET_BLOCKS_TERMINAL_PAYLOAD_BYTES);
+                        panic!("panic while holding a frame lease");
+                    }
+                }
+            })
+            .await
+            .expect_err("the ownership task must panic");
+            assert!(join_error.is_panic(), "{stage:?} must unwind its task");
+
+            let snapshot = regulator.snapshot();
+            let expected_spent = match stage {
+                OwnershipStage::ProvisionalAttempt => 0,
+                OwnershipStage::CommittedPermit => GET_BLOCKS_REQUEST_OVERHEAD_BYTES,
+                OwnershipStage::FrameLease => {
+                    GET_BLOCKS_REQUEST_OVERHEAD_BYTES + GET_BLOCKS_TERMINAL_PAYLOAD_BYTES
+                }
+            };
+            assert_eq!(
+                snapshot.node_rate_balance,
+                node_rate_before - expected_spent,
+                "{stage:?} must refund unused node-rate ownership"
+            );
+            assert_eq!(
+                failed_session.peer_rate_balance(),
+                peer_rate_before - expected_spent,
+                "{stage:?} must refund unused peer-rate ownership"
+            );
+            assert_eq!(
+                snapshot.node_outstanding, 0,
+                "{stage:?} must release node ownership"
+            );
+            assert_eq!(
+                failed_session.backlog_reserved(),
+                0,
+                "{stage:?} must release peer ownership"
+            );
+
+            let healthy_session = regulator.session(peer(0xe2), 2);
+            let healthy_permit = healthy_session
+                .try_admit(1)
+                .unwrap_or_else(|_| panic!("{stage:?} must not block an unrelated peer"))
+                .commit();
+            drop(healthy_permit);
+        }
+    }
+
     fn assert_reconnect_during_drop_cannot_detach_live_bucket() {
         // Pause the old reference immediately before it locks the cache. A
         // replacement can then clone the cached account before Drop decides

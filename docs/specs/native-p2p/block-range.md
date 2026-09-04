@@ -274,7 +274,7 @@ These are reproducible experiments, not network-wide proofs. CPU, RSS, UDP
 traffic, and throughput are diagnostics. The request timeout, write timeout,
 application budgets, and configured QUIC envelope are contract gates.
 
-The manifest maps `GB-RL-01` through `GB-RL-17` to one or more test names and
+The manifest maps `GB-RL-01` through `GB-RL-18` to one or more test names and
 checks those names against Rust's registered test inventory. A missing ID or
 test fails explicitly.
 

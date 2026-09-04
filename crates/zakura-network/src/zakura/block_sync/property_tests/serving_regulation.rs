@@ -126,6 +126,10 @@ const GB_RL_TEST_MANIFEST: &[(&str, &[&str])] = &[
         "GB-RL-17",
         &["gb_rl_17_state_query_receives_local_response_byte_limit"],
     ),
+    (
+        "GB-RL-18",
+        &["gb_rl_18_panics_release_owned_resources_and_preserve_other_peers"],
+    ),
 ];
 
 #[test]
@@ -150,6 +154,7 @@ fn gb_rl_contract_manifest_names_every_requirement() {
         "GB-RL-15",
         "GB-RL-16",
         "GB-RL-17",
+        "GB-RL-18",
     ];
     assert_contract_test_manifest(EXPECTED_IDS, GB_RL_TEST_MANIFEST);
 }

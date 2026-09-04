@@ -99,6 +99,7 @@ impl FramedSend {
     /// `make_lease` is called only after the transport owns a queue slot. This
     /// prevents accounting from moving to the transport when the queue is full
     /// or closed.
+    #[allow(dead_code)] // consumed by the GetBlocks policy in the stacked PR
     pub(crate) fn try_send_leased(
         &self,
         frame: Frame,
@@ -179,6 +180,7 @@ impl QueuedFrame {
         Self { frame, lease: None }
     }
 
+    #[allow(dead_code)] // consumed through `try_send_leased` in the stacked PR
     fn leased(frame: Frame, lease: FrameLease) -> Self {
         Self {
             frame,

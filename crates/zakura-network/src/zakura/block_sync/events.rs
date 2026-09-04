@@ -433,7 +433,7 @@ pub enum BlockSyncMisbehavior {
 /// misbehavior aggregation) over this channel. The sender is `try_send`/bounded
 /// so a busy reactor never backpressures a routine's decode loop into stalling
 /// its transport (the only blocking routine send is the Sequencer `AcceptBody`).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) enum RoutineToReactor {
     /// A routine received a `Status` and updated its own servable/caps + the
     /// registry. The reactor advertises our `Status` reply and republishes the
@@ -450,12 +450,10 @@ pub(super) enum RoutineToReactor {
     ServeGetBlocks {
         /// Peer that requested the range.
         peer: ZakuraPeerId,
-        /// Registry generation of the session routine that decoded the request.
-        session_generation: u64,
-        /// First requested height.
-        start_height: block::Height,
-        /// Requested block count.
-        count: u32,
+        /// Decoded fields and their pre-reactor capacity ownership.
+        request: super::serving_regulation::PendingGetBlocksRequest,
+        /// Provisional resource ownership from the decoding routine's session.
+        attempt: super::serving_regulation::AdmissionAttempt,
     },
     /// A routine drained its pending work; the producer should re-query (it
     /// self-gates on low-water, so the ping is idempotent/cheap).

@@ -857,7 +857,7 @@ fn gb_sm_19_inbound_sessions_serve_and_use_inbound_cap() {
 /// then search longer generated histories for unexpected interactions.
 #[test]
 #[allow(clippy::print_stdout)]
-fn get_blocks_generated_histories_match_reference_model() {
+fn gb_rl_13_under_budget_histories_match_pre_regulation_reference_model() {
     let generated = GeneratedTestConfig::from_env(CASES_VARIABLE, SEED_VARIABLE, DEFAULT_CASES)
         .unwrap_or_else(|error| panic!("invalid serving-model configuration: {error}"));
     generated.announce("GetBlocks serving model", CASES_VARIABLE, SEED_VARIABLE);

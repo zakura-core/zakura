@@ -1,6 +1,6 @@
 use super::{
-    config::*, events::*, peer_registry::*, sequencer::*, sequencer_task::*, state::*, trace::*,
-    wire::*, *,
+    config::*, events::*, peer_registry::*, sequencer::*, sequencer_task::*, serving_regulation::*,
+    state::*, trace::*, wire::*, *,
 };
 use crate::zakura::{
     OrderedSendError, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
@@ -189,6 +189,11 @@ pub fn spawn_block_sync_reactor(
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
     // Shared peer facts are also the exact per-supplier body-retry admission gate.
     let registry = Arc::new(PeerRegistry::new());
+    let serving_regulator = GetBlocksServingRegulator::with_trace(
+        startup.config.clone(),
+        startup.max_connections,
+        startup.trace.clone(),
+    );
     synchronize_persisted_body_alarm(&registry, committed_view.as_ref());
     let mut retry_jitter_seed = [0u8; 32];
     OsRng.fill_bytes(&mut retry_jitter_seed);
@@ -238,6 +243,7 @@ pub fn spawn_block_sync_reactor(
         routine_to_reactor: routine_to_reactor_tx,
         view: sequencer_view_rx.clone(),
         trace: startup.trace.clone(),
+        serving_regulator: serving_regulator.clone(),
     };
 
     let handle = BlockSyncHandle {
@@ -273,6 +279,7 @@ pub fn spawn_block_sync_reactor(
         startup,
         state,
         registry,
+        serving_regulator,
         events: events_rx,
         _events_keepalive: events_keepalive,
         lifecycle: lifecycle_rx,
@@ -309,6 +316,8 @@ pub(super) struct BlockSyncReactor {
     /// per-peer pipe-routines; read by producer/candidate/trace. The reactor owns
     /// only entry insert (admission) / remove (teardown).
     registry: Arc<PeerRegistry>,
+    /// Node-wide serving limits and reconnect-persistent peer rate buckets.
+    serving_regulator: GetBlocksServingRegulator,
     events: mpsc::Receiver<BlockSyncEvent>,
     /// A keep-alive sender clone for the bounded driver-event channel so the
     /// receiver never resolves to `None` while the reactor lives. The service no
@@ -1373,14 +1382,16 @@ impl BlockSyncReactor {
             }
             RoutineToReactor::ServeGetBlocks {
                 peer,
-                session_generation,
-                start_height,
-                count,
+                request,
+                attempt,
             } => {
+                // Dequeueing into the reactor ends pre-processing ownership.
+                // The attempt or serving ledger owns all later work.
+                let (start_height, count) = request.into_parts();
                 if self.state.parked_peers.contains(&peer) {
                     return;
                 }
-                self.handle_get_blocks(peer, session_generation, start_height, count)
+                self.handle_get_blocks(peer, start_height, count, attempt)
                     .await;
             }
             RoutineToReactor::RequeryNeeded => {
@@ -1538,15 +1549,17 @@ impl BlockSyncReactor {
     async fn handle_get_blocks(
         &mut self,
         peer: ZakuraPeerId,
-        session_generation: u64,
         start_height: block::Height,
         count: u32,
+        attempt: AdmissionAttempt,
     ) {
         // The routine can be superseded after decoding this request but before
         // the reactor receives it. Never apply that request to the replacement.
-        if !self.registry.owns_generation(&peer, session_generation) {
+        debug_assert_eq!(attempt.peer(), &peer);
+        if !self.registry.owns_generation(&peer, attempt.session_id()) {
             return;
         }
+        let mut permit = attempt.commit();
 
         let local_inflight_cap = self.startup.config.advertised_max_inflight_requests();
         if !self.state.peers.contains_key(&peer) {
@@ -1571,7 +1584,7 @@ impl BlockSyncReactor {
 
         let Some(request_id) = self.next_serving_request_id else {
             let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
-            self.send_range_unavailable(&peer, start_height, unavailable_count);
+            self.send_range_unavailable(&peer, start_height, unavailable_count, &mut permit);
             return;
         };
         self.next_serving_request_id = request_id
@@ -1579,24 +1592,36 @@ impl BlockSyncReactor {
             .checked_add(1)
             .and_then(BlockRangeRequestId::new);
         let requested_count = self.clamp_served_block_count(start_height, count);
-        let started_serving = self.state.peers.get_mut(&peer).is_some_and(|peer_state| {
-            peer_state.try_start_serving_blocks(
+        permit.bind_request_id(request_id);
+        let started_serving = self
+            .state
+            .peers
+            .get_mut(&peer)
+            .expect("the peer was checked before this non-awaiting admission path")
+            .try_start_serving_blocks(
                 local_inflight_cap,
                 request_id,
                 start_height,
                 requested_count,
-            )
-        });
-        if !started_serving {
+                permit,
+            );
+        if let Err(mut permit) = started_serving {
             let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
-            self.send_range_unavailable(&peer, start_height, unavailable_count);
+            self.send_range_unavailable(&peer, start_height, unavailable_count, &mut permit);
             return;
         }
 
         if requested_count == 0 {
+            let mut request = self
+                .finish_serving_blocks(&peer, request_id, start_height)
+                .expect("the request was just inserted into the serving ledger");
             let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
-            self.send_range_unavailable(&peer, start_height, unavailable_count);
-            self.finish_serving_blocks(&peer, request_id, start_height);
+            self.send_range_unavailable(
+                &peer,
+                start_height,
+                unavailable_count,
+                request.permit_mut(),
+            );
             return;
         }
 
@@ -1606,7 +1631,10 @@ impl BlockSyncReactor {
             start: start_height,
             count: requested_count,
         }) {
-            self.finish_serving_blocks(&peer, request_id, start_height);
+            let mut request = self
+                .finish_serving_blocks(&peer, request_id, start_height)
+                .expect("the failed action belongs to the inserted serving request");
+            self.send_range_unavailable(&peer, start_height, requested_count, request.permit_mut());
         }
     }
 
@@ -1618,7 +1646,7 @@ impl BlockSyncReactor {
         reported_requested_count: u32,
         blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
     ) {
-        let Some(request) = self.serving_block_request(&peer, request_id, start_height) else {
+        let Some(mut request) = self.finish_serving_blocks(&peer, request_id, start_height) else {
             return;
         };
         let requested_count = request.requested_count();
@@ -1660,7 +1688,7 @@ impl BlockSyncReactor {
                 break;
             }
 
-            if !self.send_block(&peer, block) {
+            if !self.send_block(&peer, block, request.permit_mut()) {
                 reason = "send_failed";
                 break;
             }
@@ -1669,13 +1697,11 @@ impl BlockSyncReactor {
         }
 
         if sent_blocks == 0 {
-            self.send_range_unavailable(&peer, start_height, requested_count);
+            self.send_range_unavailable(&peer, start_height, requested_count, request.permit_mut());
         } else {
-            self.send_blocks_done(&peer, start_height, sent_blocks);
+            self.send_blocks_done(&peer, start_height, sent_blocks, request.permit_mut());
         }
-        let total_elapsed = self
-            .finish_serving_blocks(&peer, request_id, start_height)
-            .map(ServingBlockRequest::elapsed);
+        let total_elapsed = Some(request.elapsed());
         self.trace_range_response_sent(
             &peer,
             RangeResponseTrace {
@@ -1699,7 +1725,7 @@ impl BlockSyncReactor {
         reported_requested_count: u32,
         returned_count: u32,
     ) {
-        let Some(request) = self.finish_serving_blocks(&peer, request_id, start_height) else {
+        let Some(mut request) = self.finish_serving_blocks(&peer, request_id, start_height) else {
             return;
         };
         let requested_count = request.requested_count();
@@ -1714,7 +1740,7 @@ impl BlockSyncReactor {
         }
         let elapsed = request.elapsed();
         if returned_count == 0 {
-            self.send_range_unavailable(&peer, start_height, requested_count);
+            self.send_range_unavailable(&peer, start_height, requested_count, request.permit_mut());
         }
         self.trace_range_response_sent(
             &peer,
@@ -1790,18 +1816,6 @@ impl BlockSyncReactor {
             capacity,
             max_capacity,
         );
-    }
-
-    fn serving_block_request(
-        &self,
-        peer: &ZakuraPeerId,
-        request_id: BlockRangeRequestId,
-        start_height: block::Height,
-    ) -> Option<ServingBlockRequest> {
-        self.state
-            .peers
-            .get(peer)
-            .and_then(|peer_state| peer_state.serving_block_request(request_id, start_height))
     }
 
     fn finish_serving_blocks(
@@ -2081,7 +2095,12 @@ impl BlockSyncReactor {
         true
     }
 
-    fn send_block(&self, peer: &ZakuraPeerId, block: Arc<block::Block>) -> bool {
+    fn send_block(
+        &self,
+        peer: &ZakuraPeerId,
+        block: Arc<block::Block>,
+        permit: &mut GetBlocksServingPermit,
+    ) -> bool {
         let Some(session) = self
             .state
             .peers
@@ -2092,7 +2111,7 @@ impl BlockSyncReactor {
         };
         let msg = BlockSyncMessage::Block(block.clone());
         let started = Instant::now();
-        match session.try_send_block(block) {
+        match session.try_send_regulated_block(block, permit) {
             Ok(()) => {
                 metrics::counter!("sync.block.body.served").increment(1);
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
@@ -2129,7 +2148,13 @@ impl BlockSyncReactor {
         }
     }
 
-    fn send_blocks_done(&self, peer: &ZakuraPeerId, start_height: block::Height, returned: u32) {
+    fn send_blocks_done(
+        &self,
+        peer: &ZakuraPeerId,
+        start_height: block::Height,
+        returned: u32,
+        permit: &mut GetBlocksServingPermit,
+    ) {
         if returned == 0 {
             return;
         }
@@ -2146,7 +2171,7 @@ impl BlockSyncReactor {
             returned,
         };
         let started = Instant::now();
-        match session.try_send_blocks_done(start_height, returned) {
+        match session.try_send_regulated_blocks_done(start_height, returned, permit) {
             Ok(()) => self.trace_message_sent(peer, &msg, "queued", started.elapsed()),
             Err(OrderedSendError::Full) => {
                 metrics::counter!("sync.block.done.serve_queue_full").increment(1);
@@ -2181,7 +2206,13 @@ impl BlockSyncReactor {
         }
     }
 
-    fn send_range_unavailable(&self, peer: &ZakuraPeerId, start_height: block::Height, count: u32) {
+    fn send_range_unavailable(
+        &self,
+        peer: &ZakuraPeerId,
+        start_height: block::Height,
+        count: u32,
+        permit: &mut GetBlocksServingPermit,
+    ) {
         let count = count.max(1);
         let Some(peer_state) = self.state.peers.get(peer) else {
             return;
@@ -2193,7 +2224,7 @@ impl BlockSyncReactor {
         let started = Instant::now();
         match peer_state
             .session
-            .try_send_range_unavailable(start_height, count)
+            .try_send_regulated_range_unavailable(start_height, count, permit)
         {
             Ok(()) => self.trace_message_sent(peer, &msg, "queued", started.elapsed()),
             Err(OrderedSendError::Full) => {
@@ -2384,6 +2415,28 @@ impl BlockSyncReactor {
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).
         metrics::gauge!("sync.block.outstanding").set(self.registry.total_unreceived() as f64);
+        let serving = self.serving_regulator.snapshot();
+        // Metrics stores gauges as `f64`; these lossy conversions affect
+        // observability only and never feed admission decisions.
+        metrics::gauge!("sync.block.serving.node_rate.balance_bytes")
+            .set(serving.node_rate_balance as f64);
+        metrics::gauge!("sync.block.serving.node_rate.capacity_bytes")
+            .set(serving.node_rate_capacity as f64);
+        metrics::gauge!("sync.block.serving.node_outstanding.bytes")
+            .set(serving.node_outstanding as f64);
+        metrics::gauge!("sync.block.serving.node_outstanding.capacity_bytes")
+            .set(serving.node_outstanding_capacity as f64);
+        metrics::gauge!("sync.block.serving.pending_inputs").set(serving.pending_inputs as f64);
+        metrics::gauge!("sync.block.serving.pending_inputs.capacity")
+            .set(serving.pending_input_capacity as f64);
+        metrics::gauge!("sync.block.serving.pending_inputs.max_per_session")
+            .set(serving.max_session_pending_inputs as f64);
+        metrics::gauge!("sync.block.serving.peer_backlog.aggregate_bytes")
+            .set(serving.aggregate_peer_backlog as f64);
+        metrics::gauge!("sync.block.serving.peer_backlog.max_bytes")
+            .set(serving.max_peer_backlog as f64);
+        metrics::gauge!("sync.block.serving.peer_rate.cached_identities")
+            .set(serving.cached_peer_identities as f64);
         self.publish_body_unavailable_metrics();
     }
 

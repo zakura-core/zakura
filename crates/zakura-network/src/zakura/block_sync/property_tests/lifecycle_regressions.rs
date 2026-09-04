@@ -270,6 +270,17 @@ fn gb_sm_15_delayed_older_connect_cannot_replace_newer_session() {
 /// the reactor does not apply it to that replacement.
 #[test]
 fn gb_sm_17_superseded_routine_request_cannot_reach_replacement_session() {
+    run_superseded_routine_request_regression();
+}
+
+/// The same forced ordering also proves a stale provisional admission rolls
+/// back its peer and node regulation ownership instead of committing it.
+#[test]
+fn gb_rl_15_stale_session_gate_rolls_back_regulation_ownership() {
+    run_superseded_routine_request_regression();
+}
+
+fn run_superseded_routine_request_regression() {
     Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
@@ -277,7 +288,13 @@ fn gb_sm_17_superseded_routine_request_cannot_reach_replacement_session() {
         .expect("the serving ownership regression runtime builds")
         .block_on(async {
             let tip = (block::Height(3), block::Hash([3; 32]));
-            let config = ZakuraBlockSyncConfig::default();
+            let mut config = ZakuraBlockSyncConfig::default();
+            config
+                .get_blocks_serving_regulation
+                .peer_rate_bytes_per_second = 1;
+            config
+                .get_blocks_serving_regulation
+                .node_rate_bytes_per_second = 1;
             let (_tip_tx, tip_rx) = watch::channel(tip);
             let startup = BlockSyncStartup::new(
                 BlockSyncFrontiers {
@@ -306,6 +323,9 @@ fn gb_sm_17_superseded_routine_request_cannot_reach_replacement_session() {
                 .as_mut()
                 .expect("the intercepted handle exposes routine wiring")
                 .routine_to_reactor = intercepted_sender;
+            let serving_cost = super::super::super::serving_regulation::serving_cost(&config, 1)
+                .expect("the regression request has a valid serving cost");
+            let initial_regulation = handle.serving_regulation_snapshot();
             let peers = SyntheticBlockSyncPeers::new(config, intercepted_handle, 8);
             let peer_id = peer(0xa3);
 
@@ -376,6 +396,13 @@ fn gb_sm_17_superseded_routine_request_cannot_reach_replacement_session() {
                     .is_none(),
                 "the superseded request must not send a frame to the replacement"
             );
+            let after_gate = handle.serving_regulation_snapshot();
+            assert_eq!(after_gate.node_outstanding, serving_cost.response_cap);
+            assert_eq!(
+                after_gate.node_rate_balance,
+                initial_regulation.node_rate_balance - serving_cost.charge,
+                "only the replacement session's request may remain charged"
+            );
 
             reactor_task.abort();
             let _ = reactor_task.await;
@@ -427,9 +454,7 @@ async fn next_serving_request(messages: &mut mpsc::Receiver<RoutineToReactor>) -
 /// Extract the session generation attached by the peer routine.
 fn serving_request_generation(message: &RoutineToReactor) -> u64 {
     match message {
-        RoutineToReactor::ServeGetBlocks {
-            session_generation, ..
-        } => *session_generation,
+        RoutineToReactor::ServeGetBlocks { attempt, .. } => attempt.session_id(),
         message => panic!("expected ServeGetBlocks, got {message:?}"),
     }
 }

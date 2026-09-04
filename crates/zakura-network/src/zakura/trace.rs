@@ -337,6 +337,10 @@ pub mod block_sync_trace {
     pub const BLOCK_RANGE_UNAVAILABLE: &str = "block_range_unavailable";
     /// Local node queued a block range response for transport.
     pub const BLOCK_RANGE_RESPONSE_SENT: &str = "block_range_response_sent";
+    /// An inbound `GetBlocks` is waiting for one serving resource bound.
+    pub const BLOCK_SERVING_DELAYED: &str = "block_serving_delayed";
+    /// A committed inbound `GetBlocks` released its unused response capacity.
+    pub const BLOCK_SERVING_SETTLED: &str = "block_serving_settled";
     /// Work-queue producer added needed heights to the pending set.
     pub const BLOCK_WORK_EXTENDED: &str = "block_work_extended";
     /// A peer claimed a contiguous chunk of pending work for issuance.

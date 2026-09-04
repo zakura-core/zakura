@@ -46,6 +46,7 @@ mod request;
 mod sequencer;
 mod sequencer_task;
 mod service;
+mod serving_regulation;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -64,7 +65,10 @@ pub use bench::{
 };
 #[cfg(test)]
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
-pub use config::{BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
+pub use config::{
+    BlockSyncStatus, CwndUnit, GetBlocksServingRegulationConfig, ZakuraBlockSyncConfig,
+    MAX_BS_RESPONSE_BYTES,
+};
 pub use error::BlockSyncWireError;
 use events::BlockSyncPeerLifecycleEvent;
 pub use events::{

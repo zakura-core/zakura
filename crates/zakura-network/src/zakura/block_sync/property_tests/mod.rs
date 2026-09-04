@@ -9,3 +9,4 @@ mod get_blocks;
 mod lifecycle_regressions;
 mod runner;
 mod serving_model;
+mod serving_regulation;

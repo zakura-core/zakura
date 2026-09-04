@@ -12093,23 +12093,39 @@ async fn reactor_ignores_get_blocks_from_superseded_routine_generation() {
         .expect("the peer connection queues");
     wait_for_outbound_status(&mut outbound_recv).await;
 
+    let old_session = wiring
+        .serving_regulator
+        .session(peer_id.clone(), old_generation);
+    let old_request = old_session
+        .try_retain_input(block::Height(1), 1)
+        .expect("the stale decoded request fits pending-input regulation");
+    let old_attempt = old_session
+        .try_admit(1)
+        .expect("the stale test request fits serving regulation");
     wiring
         .routine_to_reactor
         .send(RoutineToReactor::ServeGetBlocks {
             peer: peer_id.clone(),
-            session_generation: old_generation,
-            start_height: block::Height(1),
-            count: 1,
+            request: old_request,
+            attempt: old_attempt,
         })
         .await
         .expect("the stale serving request queues");
+    let current_session = wiring
+        .serving_regulator
+        .session(peer_id.clone(), current_generation);
+    let current_request = current_session
+        .try_retain_input(block::Height(2), 1)
+        .expect("the current decoded request fits pending-input regulation");
+    let current_attempt = current_session
+        .try_admit(1)
+        .expect("the current test request fits serving regulation");
     wiring
         .routine_to_reactor
         .send(RoutineToReactor::ServeGetBlocks {
             peer: peer_id.clone(),
-            session_generation: current_generation,
-            start_height: block::Height(2),
-            count: 1,
+            request: current_request,
+            attempt: current_attempt,
         })
         .await
         .expect("the current serving request queues");

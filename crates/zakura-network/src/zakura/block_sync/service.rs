@@ -215,6 +215,81 @@ impl BlockSyncPeerSession {
         .await
     }
 
+    /// Queue one block response while transferring its accounted bytes into a
+    /// transport-held lease only after an outbound queue slot is reserved.
+    pub(super) fn try_send_regulated_block(
+        &self,
+        block: Arc<block::Block>,
+        permit: &mut super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(), OrderedSendError> {
+        self.try_send_regulated_message(BlockSyncMessage::Block(block), permit)
+    }
+
+    /// Queue a regulated successful-response terminator.
+    pub(super) fn try_send_regulated_blocks_done(
+        &self,
+        start_height: block::Height,
+        returned: u32,
+        permit: &mut super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(), OrderedSendError> {
+        self.try_send_regulated_message(
+            BlockSyncMessage::BlocksDone {
+                start_height,
+                returned,
+            },
+            permit,
+        )
+    }
+
+    /// Queue a regulated unavailable response.
+    pub(super) fn try_send_regulated_range_unavailable(
+        &self,
+        start_height: block::Height,
+        count: u32,
+        permit: &mut super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(), OrderedSendError> {
+        self.try_send_regulated_message(
+            BlockSyncMessage::RangeUnavailable {
+                start_height,
+                count,
+            },
+            permit,
+        )
+    }
+
+    fn try_send_regulated_message(
+        &self,
+        msg: BlockSyncMessage,
+        permit: &mut super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(), OrderedSendError> {
+        let frame = msg
+            .encode_frame()
+            .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+        let accounted_bytes = u64::try_from(frame.payload.len()).map_err(|_| {
+            OrderedSendError::Encode(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "block-sync frame payload length does not fit in u64",
+            )))
+        })?;
+        if !permit.can_transfer_frame(accounted_bytes) {
+            return Err(OrderedSendError::Encode(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded GetBlocks response exceeded its admitted byte cap",
+            ))));
+        }
+        self.send
+            .try_send_leased(frame, || permit.transfer_frame(accounted_bytes))
+            .map_err(|error| {
+                let send_error = if error.is_full() {
+                    OrderedSendError::Full
+                } else {
+                    OrderedSendError::Closed
+                };
+                drop(error.into_frame());
+                send_error
+            })
+    }
+
     fn try_send_message(&self, msg: BlockSyncMessage) -> Result<(), OrderedSendError> {
         let frame = msg
             .encode_frame()
@@ -317,8 +392,20 @@ impl BlockSyncServiceInner {
 }
 
 impl BlockSyncService {
+    #[cfg(test)]
+    /// Construct an inert service with the default handler connection limit.
     pub(crate) fn new(config: ZakuraBlockSyncConfig) -> Self {
         Self::new_with_startup(BlockSyncStartup::inert(config))
+    }
+
+    /// Construct an inert service using the owning handler's connection limit.
+    pub(crate) fn new_with_connection_limit(
+        config: ZakuraBlockSyncConfig,
+        max_connections: usize,
+    ) -> Self {
+        Self::new_with_startup(
+            BlockSyncStartup::inert(config).with_max_connections(max_connections),
+        )
     }
 
     pub(crate) fn new_with_handle(config: ZakuraBlockSyncConfig, handle: BlockSyncHandle) -> Self {
@@ -339,9 +426,11 @@ impl BlockSyncService {
         }
     }
 
-    pub(crate) fn new_with_header_tip(
+    /// Construct a service backed by a live header tip and exact handler limit.
+    pub(crate) fn new_with_header_tip_and_connection_limit(
         config: ZakuraBlockSyncConfig,
         header_tip: watch::Receiver<(block::Height, block::Hash)>,
+        max_connections: usize,
     ) -> Self {
         let best_header_tip = *header_tip.borrow();
         let startup = BlockSyncStartup::new(
@@ -353,7 +442,8 @@ impl BlockSyncService {
             best_header_tip,
             header_tip,
             config,
-        );
+        )
+        .with_max_connections(max_connections);
         Self::new_with_startup(startup)
     }
 
@@ -752,6 +842,9 @@ impl Service for BlockSyncService {
                     let generation = routine_generation.expect(
                         "production block-sync wiring allocates a routine generation before spawn",
                     );
+                    let serving = wiring
+                        .serving_regulator
+                        .session(peer_id.clone(), generation);
                     let routine = super::peer_routine::PeerRoutine::new(
                         peer_id,
                         conn_id,
@@ -769,6 +862,7 @@ impl Service for BlockSyncService {
                         wiring.sequencer_input_decoded_attributed_memory_bytes,
                         wiring.actions,
                         wiring.routine_to_reactor,
+                        serving,
                         wiring.view,
                         run_cancel,
                         wiring.trace,

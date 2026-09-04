@@ -17,7 +17,7 @@ use zakura_chain::block;
 use super::super::super::super::{
     spawn_block_sync_reactor, BlockRangeRequestId, BlockSyncAction, BlockSyncEvent,
     BlockSyncFrontiers, BlockSyncHandle, BlockSyncMessage, BlockSyncStartup, BlockSyncStatus,
-    ZakuraBlockSyncConfig,
+    GetBlocksServingRegulationConfig, ZakuraBlockSyncConfig,
 };
 use super::{
     model::{ReadyBlock, ReferenceModel},
@@ -73,12 +73,23 @@ async fn replay_serving_case_inner(case: &ServingCase) -> Result<ServingCoverage
         max_outbound_peers,
         ..ServicePeerLimits::default()
     };
-    let config = ZakuraBlockSyncConfig {
+    let mut config = ZakuraBlockSyncConfig {
         max_blocks_per_response: case.max_blocks,
         max_inflight_requests: case.max_inflight,
         max_response_bytes: response_byte_cap,
         peer_limits,
         ..ZakuraBlockSyncConfig::default()
+    };
+    // This lane compares pre-regulation serving semantics. Give every generated
+    // history non-binding regulation resources so a mismatch can only come from
+    // queries, frames, lifecycle, or ownership rather than intended throttling.
+    config.get_blocks_serving_regulation = GetBlocksServingRegulationConfig {
+        peer_rate_bytes_per_second: 1,
+        peer_rate_capacity_bytes: u64::MAX,
+        peer_backlog_bytes: u64::MAX,
+        node_rate_bytes_per_second: 1,
+        node_rate_capacity_bytes: u64::MAX,
+        node_outstanding_bytes: u64::MAX,
     };
     let tip = (corpus.target_height(), corpus.tip_hash());
     let (_tip_tx, tip_rx) = watch::channel(tip);

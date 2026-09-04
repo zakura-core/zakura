@@ -1,8 +1,7 @@
 # Block-range exchange (`GetBlocks`)
 
-> **Status: partially implemented.** The wire-format and serving-model layers
-> are implemented. Regulated load is specified here and gains implementation
-> evidence in the regulation layer of the stack.
+> **Status: implemented.** Every wire-format, serving-model, and regulated-load
+> requirement below names passing evidence.
 
 This contract covers the stream-6 block-range serving exchange initiated by
 `GetBlocks`. It specifies the request wire format, the server's state and
@@ -151,11 +150,12 @@ after commit. Unused response capacity is refunded. Response bytes remain
 reserved until their frames are accepted by QUIC or dropped; QUIC's
 unacknowledged send window is bounded separately.
 
-### Initial parameters
+### Default parameters
 
-These are implementation candidates until native load evidence validates them:
+The native load evidence below validates these implementation defaults in the
+named local topology:
 
-| Bound | Initial value | Scope |
+| Bound | Default | Scope |
 | --- | --- | --- |
 | Peer rate | 16 MiB/s | One authenticated identity |
 | Peer rate capacity | 32 MiB response cap + 128 discriminators + 9 terminal bytes + 64 KiB overhead | One authenticated identity, retained while depleted |
@@ -163,40 +163,43 @@ These are implementation candidates until native load evidence validates them:
 | Node rate | 64 MiB/s | All inbound `GetBlocks` serving |
 | Node rate capacity | 128 MiB | All inbound `GetBlocks` serving |
 | Node outstanding | 256 MiB | Admitted response bytes not yet handed to QUIC |
+| Session pending inputs | advertised in-flight limit + 1 | Decoded requests waiting before reactor processing in one session |
+| Node pending inputs | session pending-input cap × maximum connections | Decoded requests waiting before reactor processing across live and draining sessions |
 
 Startup validation requires the largest legal request to fit every applicable
 capacity. Rate balances refill with time; outstanding and backlog capacity
 return only when ownership is released.
 
 One admission may wait while the routine continues decoding the bidirectional
-stream so responses to Zakura's own block requests can pass. Later serving
-requests are bounded by the advertised in-flight limit. Requests beyond that
-bound are dropped without a query, response, or peer score. The implementation
-must also account for the aggregate pending-request memory implied by that
-limit across the maximum connection count.
+stream so responses to Zakura's own block requests can pass. A retained request
+owns both a session and node pending-input slot until the reactor processes it.
+Each session can own one active admission plus the advertised in-flight limit
+behind it; the node cap is that total multiplied by the maximum connection
+count. Requests beyond either cap are dropped without a query, response, or
+peer score.
 
 ### Requirements
 
-| ID | Requirement |
-| --- | --- |
-| GB-RL-01 | The admission charge matches the declared formula for generated request counts and local limits. |
-| GB-RL-02 | A blocked request emits no work or frame, pending requests stay within the declared queue bound, excess is handled as specified, and each queued request is admitted at most once after capacity returns. |
-| GB-RL-03 | A pre-commit drop refunds everything; post-commit settlement keeps overhead and refunds only unused response capacity. |
-| GB-RL-04 | Every rejection settles once and accounts for its terminal frame only when that frame queues. |
-| GB-RL-05 | One peer cannot consume another peer's rate bucket, backlog, or request ledger. |
-| GB-RL-06 | Reserved and application-owned unwritten response bytes never exceed the peer backlog; draining resumes admission. |
-| GB-RL-07 | Time refills rate tokens but never outstanding-byte capacity. |
-| GB-RL-08 | A full handoff channel retains its attempt; closure rolls it back; action, driver, and output failures settle through the declared outcome. |
-| GB-RL-09 | Session end settles permits without moving them to a replacement; frame leases survive until their frames leave the application transport. |
-| GB-RL-10a | Generated hostile histories vary peer count and every configured bound without exceeding peer or node accounting. |
-| GB-RL-10b | Fifteen reading flood peers do not push an honest tiny- or full-block response beyond the existing eight-second request timeout in the named native topology. |
-| GB-RL-10c | Stopped readers remain within application and QUIC envelopes, their writes release all leases after failure or timeout, and honest service recovers within the write timeout plus stated slack. |
-| GB-RL-11 | Responses to Zakura's downloads continue within the request timeout behind admission-delayed serving requests on the same stream. |
-| GB-RL-12 | Supported configurations use checked arithmetic, fit the largest legal request, and reject insufficient capacities. |
-| GB-RL-13 | Under-budget histories produce the same queries, frames, and ownership state as the unregulated serving reference model. |
-| GB-RL-14 | Reconnects retain a depleted identity bucket; inactive retention is bounded and early eviction restores no more than the evicted deficit. |
-| GB-RL-15 | Rejecting a superseded routine at the session gate rolls back all provisional regulation ownership. |
-| GB-RL-16 | Pending serving-request state stays within its per-session bound and its derived aggregate bound at the configured maximum connection count. |
+| ID | Test | Requirement |
+| --- | --- | --- |
+| GB-RL-01 | `gb_rl_01_charge_matches_declared_formula` | The admission charge matches the declared formula for generated request counts and local limits. |
+| GB-RL-02 | `gb_rl_02_blocked_request_bounds_queue_and_is_admitted_once_after_release` | A blocked request emits no work or frame, pending requests stay within the declared queue bound, excess is handled as specified, and each queued request is admitted at most once after capacity returns. |
+| GB-RL-03 | `gb_rl_03_attempt_rolls_back_and_commit_keeps_overhead` | A pre-commit drop refunds everything; post-commit settlement keeps overhead and refunds only unused response capacity. |
+| GB-RL-04 | `gb_rl_04_rejections_settle_once_and_account_their_terminal_frame` | Every rejection settles once and accounts for its terminal frame only when that frame queues. |
+| GB-RL-05 | `gb_rl_05_peer_rate_backlog_and_ledger_are_isolated` | One peer cannot consume another peer's rate bucket, backlog, or request ledger. |
+| GB-RL-06 | `gb_rl_06_backlog_never_overshoots_and_draining_resumes_work` | Reserved and application-owned unwritten response bytes never exceed the peer backlog; draining resumes admission. |
+| GB-RL-07 | `gb_rl_07_stalled_outstanding_bytes_do_not_refill_with_time` | Time refills rate tokens but never outstanding-byte capacity. |
+| GB-RL-08 | `gb_rl_08_handoff_failures_hold_rollback_or_settle_exactly_once` | A full handoff channel retains its attempt; closure rolls it back; action, driver, and output failures settle through the declared outcome. |
+| GB-RL-09 | `gb_rl_09_session_end_settles_permit_but_frame_leases_survive_until_drop` | Session end settles permits without moving them to a replacement; frame leases survive until their frames leave the application transport. |
+| GB-RL-10a | `gb_rl_10a_generated_hostile_flood_stays_within_all_declared_bounds` | Generated hostile histories vary peer count and every configured bound without exceeding peer or node accounting. |
+| GB-RL-10b | `gb_rl_10b_native_reading_flood_preserves_honest_tiny_and_full_service` | Fifteen reading flood peers do not push an honest tiny- or full-block response beyond the existing eight-second request timeout in the named native topology. |
+| GB-RL-10c | `gb_rl_10c_native_stopped_readers_stay_bounded_reclaim_and_restore_service`<br>`gb_rl_10c_quic_send_windows_fit_node_transport_envelope` | Stopped readers remain within application and QUIC envelopes, their writes release all leases after failure or timeout, and honest service recovers within the write timeout plus stated slack. |
+| GB-RL-11 | `gb_rl_11_pipelined_serving_requests_keep_same_stream_download_live` | Responses to Zakura's downloads continue within the request timeout behind admission-delayed serving requests on the same stream. |
+| GB-RL-12 | `gb_rl_12_supported_configuration_covers_largest_request` | Supported configurations use checked arithmetic, fit the largest legal request, and reject insufficient capacities. |
+| GB-RL-13 | `gb_rl_13_under_budget_histories_match_pre_regulation_reference_model` | Under-budget histories produce the same queries, frames, and ownership state as the unregulated serving reference model. |
+| GB-RL-14 | `gb_rl_14_reconnect_retains_rate_bucket_and_bounds_inactive_cache` | Reconnects retain a depleted identity bucket; inactive retention is bounded and early eviction restores no more than the evicted deficit. |
+| GB-RL-15 | `gb_rl_15_stale_session_gate_rolls_back_regulation_ownership` | Rejecting a superseded routine at the session gate rolls back all provisional regulation ownership. |
+| GB-RL-16 | `gb_rl_16_pending_requests_stay_within_session_and_node_bounds` | Pending serving-request state stays within its per-session bound and its derived aggregate bound at the configured maximum connection count. |
 
 The fast lane uses small capacities to reach every boundary deterministically.
 The native lane uses real stream-6 frames, the production peer routine and
@@ -212,6 +215,37 @@ The first native topology uses:
 These are reproducible experiments, not network-wide proofs. CPU, RSS, UDP
 traffic, and throughput are diagnostics. The request timeout, write timeout,
 application budgets, and configured QUIC envelope are contract gates.
+
+The manifest maps `GB-RL-01` through `GB-RL-16` to one or more test names and
+checks those names against Rust's registered test inventory. A missing ID or
+test fails explicitly.
+
+The current local measurements support the defaults in this topology; they are
+not portable performance promises:
+
+- Across two optimized runs with fifteen reading flood peers, the honest tiny
+  response completed within 11 ms and the honest full response within 5.14 s,
+  both below 8 s.
+- Nine stopped readers held 264,781,497 application bytes, below 256 MiB, and
+  honest service resumed in 5.86 s.
+- In the same-stream case, three downloaded blocks progressed in about 45 ms
+  behind two admission-delayed requests, which later served 60,135,213 payload
+  bytes.
+
+After a lease ends, QUIC may still own unacknowledged bytes. Zakura caps this
+with a 512 MiB node send-window envelope divided across configured connections,
+up to 32 MiB each. The default 256-connection limit therefore uses 2 MiB per
+connection, enough for one maximum-size block frame and therefore for the
+default one-block response. A static test checks both facts and the aggregate
+bound. The stopped-reader lane records UDP traffic and RSS as diagnostics
+rather than treating either as QUIC memory occupancy. Operators that increase
+`max_blocks_per_response` should validate WAN throughput with their connection
+limit; larger multi-block responses can require additional flow-control turns.
+
+Cancelling a partially written ordered stream uses a dedicated QUIC reset code
+so an upgraded peer closes only that stream. Older peers treat the reset as a
+connection error, so during a mixed-version rollout they may reconnect instead
+of preserving sibling streams; message framing remains compatible.
 
 ## Draft response-receiving contract
 
@@ -361,11 +395,24 @@ the evidence required by each label.
 
 ## Running and replaying
 
-Run the current wire-format and serving-model evidence:
+Run the fast contract. The native pressure tests are registered but ignored:
 
 ```sh
-cargo test -p zakura-network --lib message_contracts -- --nocapture --test-threads=1
-cargo test -p zakura-network --lib gb_wf_09 -- --nocapture
+cargo test -p zakura-network --lib gb_ -- --nocapture --test-threads=1
+```
+
+Run only the fast regulated-load contract:
+
+```sh
+cargo test -p zakura-network --lib gb_rl_ -- --nocapture --test-threads=1
+```
+
+Complete the contract by running the fast command above, then the three native
+QUIC pressure cases serially in an optimized build:
+
+```sh
+cargo test --release -p zakura-network --lib gb_rl_ \
+  -- --ignored --nocapture --test-threads=1
 ```
 
 Run more generated serving scenarios before changing block-sync lifecycle or
@@ -387,3 +434,15 @@ ZAKURA_SERVING_MODEL_SEED=<printed-seed> \
   cargo test -p zakura-network --lib message_contracts::serving_model \
   -- --nocapture --test-threads=1
 ```
+
+For `GB-RL-10a`, every run prints the effective case count, seed, and exact
+replay environment. Increase or reproduce it with:
+
+```sh
+ZAKURA_REGULATED_LOAD_CASES=1000 \
+ZAKURA_REGULATED_LOAD_SEED=<printed-seed> \
+  cargo test -p zakura-network --lib gb_rl_10a_ \
+  -- --nocapture --test-threads=1
+```
+
+Invalid, non-UTF-8, or zero overrides fail instead of silently using defaults.

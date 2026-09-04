@@ -534,6 +534,7 @@ impl ZakuraTestNodeBuilder {
                 .expect("header sync actions were just initialized")
                 .0
                 .clone();
+            startup = startup.with_max_connections(self.limits.max_connections);
             startup.shutdown = shutdown;
             startup.trace = ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed));
             let (block_handle, actions, task) = spawn_block_sync_reactor(startup);
@@ -561,6 +562,7 @@ impl ZakuraTestNodeBuilder {
             header_sync,
             block_sync_handle.clone(),
             self.block_sync_config.clone(),
+            self.limits.max_connections,
             base_service,
             discovery_service,
             None,

@@ -152,8 +152,15 @@ pub const ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs
 pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 /// QUIC connection receive window used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
-/// QUIC send window used by Zakura endpoints.
+/// Largest per-connection QUIC send window used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
+/// Node-wide envelope divided across every configured Zakura connection.
+///
+/// QUIC retains unacknowledged bytes after an application write completes, so
+/// bounding only application queues does not bound transport memory. Dividing
+/// this envelope by the connection cap prevents stopped readers from each
+/// acquiring the full per-connection maximum.
+pub const DEFAULT_ZAKURA_AGGREGATE_SEND_WINDOW_BYTES: u64 = 512 * 1024 * 1024;
 /// Initial backoff before re-dialing a configured Zakura bootstrap peer.
 pub const DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Maximum backoff between re-dials of a configured Zakura bootstrap peer.
@@ -421,8 +428,9 @@ impl ZakuraLocalLimits {
     /// Build local handler limits from network configuration and handshake policy.
     pub fn from_config(config: &Config) -> Self {
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
+        let max_connections = config.zakura.max_connections.max(1);
         Self {
-            max_connections: config.zakura.max_connections.max(1),
+            max_connections,
             max_pending_handshakes: config.zakura.max_pending_handshakes.max(1),
             quic_idle_timeout: DEFAULT_ZAKURA_QUIC_IDLE_TIMEOUT,
             keep_alive_interval: DEFAULT_ZAKURA_KEEP_ALIVE_INTERVAL,
@@ -435,6 +443,17 @@ impl ZakuraLocalLimits {
             max_open_streams: handshake.max_open_streams,
             max_inbound_queue_depth: handshake.max_inbound_queue_depth,
         }
+    }
+
+    /// Return the per-connection share of the node's QUIC send-window envelope.
+    pub(crate) fn send_window(&self) -> u64 {
+        let connection_count = u64::try_from(self.max_connections).unwrap_or(u64::MAX);
+        DEFAULT_ZAKURA_SEND_WINDOW.min(
+            DEFAULT_ZAKURA_AGGREGATE_SEND_WINDOW_BYTES
+                .checked_div(connection_count)
+                .unwrap_or(0)
+                .max(1),
+        )
     }
 
     /// Clamp peer-negotiated limits to local hard ceilings.
@@ -487,7 +506,7 @@ impl ZakuraLocalLimits {
             .max_concurrent_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW))
             .receive_window(VarInt::from_u32(DEFAULT_ZAKURA_RECEIVE_WINDOW))
-            .send_window(DEFAULT_ZAKURA_SEND_WINDOW)
+            .send_window(self.send_window())
             .max_idle_timeout(Some(
                 self.quic_idle_timeout
                     .try_into()
@@ -1892,6 +1911,7 @@ pub(crate) fn service_registry(
     header_sync: Option<super::HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
     block_sync_config: ZakuraBlockSyncConfig,
+    max_connections: usize,
     legacy_service: Arc<dyn Service>,
     discovery_service: Arc<super::DiscoveryService>,
     service_demand: Option<
@@ -1911,11 +1931,12 @@ pub(crate) fn service_registry(
     let block_sync = match block_sync {
         Some(block_sync) => BlockSyncService::new_with_handle(block_sync_config, block_sync),
         None => match header_sync.as_ref() {
-            Some(header_sync) => BlockSyncService::new_with_header_tip(
+            Some(header_sync) => BlockSyncService::new_with_header_tip_and_connection_limit(
                 block_sync_config,
                 header_sync.subscribe_tip(),
+                max_connections,
             ),
-            None => BlockSyncService::new(block_sync_config),
+            None => BlockSyncService::new_with_connection_limit(block_sync_config, max_connections),
         },
     };
     let block_sync = Arc::new(block_sync.with_service_demand(service_demand)) as Arc<dyn Service>;
@@ -3639,6 +3660,7 @@ async fn spawn_zakura_endpoint_inner(
                 driver_startup.committed_views.clone(),
                 config.zakura.block_sync.clone(),
             );
+            startup = startup.with_max_connections(config.zakura.max_connections);
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
             let (handle, actions, task) = spawn_block_sync_reactor(startup);
@@ -3660,6 +3682,7 @@ async fn spawn_zakura_endpoint_inner(
         Some(header_sync.clone()),
         block_sync.clone(),
         config.zakura.block_sync.clone(),
+        config.zakura.max_connections,
         legacy_service,
         discovery_service,
         service_demand.clone(),
@@ -9280,6 +9303,51 @@ mod tests {
 
         assert!(limits.max_frame_bytes >= default_header_sync_frame_bytes);
         assert!(limits.initial_limits().max_frame_bytes >= default_header_sync_frame_bytes);
+    }
+
+    #[test]
+    fn gb_rl_10c_quic_send_windows_fit_node_transport_envelope() {
+        let default_limits = ZakuraLocalLimits::from_config(&Config::default());
+        assert_eq!(
+            default_limits.max_connections,
+            DEFAULT_ZAKURA_MAX_CONNECTIONS
+        );
+        assert_eq!(
+            default_limits.send_window(),
+            DEFAULT_ZAKURA_AGGREGATE_SEND_WINDOW_BYTES
+                / u64::try_from(DEFAULT_ZAKURA_MAX_CONNECTIONS)
+                    .expect("the default connection cap fits u64")
+        );
+        let largest_default_block_frame = block::MAX_BLOCK_BYTES
+            .checked_add(1)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(FRAME_HEADER_BYTES).expect("the frame header size fits u64"),
+                )
+            })
+            .expect("the largest default block frame fits u64");
+        assert!(
+            default_limits.send_window() >= largest_default_block_frame,
+            "the default window must hold one maximum-size block frame"
+        );
+        assert!(
+            default_limits
+                .send_window()
+                .checked_mul(
+                    u64::try_from(default_limits.max_connections)
+                        .expect("the configured connection cap fits u64")
+                )
+                .expect("the default aggregate send window fits u64")
+                <= DEFAULT_ZAKURA_AGGREGATE_SEND_WINDOW_BYTES
+        );
+
+        let mut small = Config::default();
+        small.zakura.max_connections = 1;
+        assert_eq!(
+            ZakuraLocalLimits::from_config(&small).send_window(),
+            DEFAULT_ZAKURA_SEND_WINDOW,
+            "small deployments retain the existing per-connection maximum"
+        );
     }
 
     #[test]

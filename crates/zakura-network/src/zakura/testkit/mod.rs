@@ -29,7 +29,7 @@ pub use matrix::{
     ExpectedOutcome, MatrixCell, MatrixExpectation, ProfileId,
 };
 #[cfg(test)]
-pub(crate) use mock_blocksync::{SyntheticBlockCorpus, SyntheticBlockShape};
+pub(crate) use mock_blocksync::{MockApplyFrontier, SyntheticBlockCorpus, SyntheticBlockShape};
 pub use node::{ZakuraTestNode, ZakuraTestNodeBuilder};
 pub use pinned::{
     PeerProfile, PinnedNegotiation, PinnedPeer, PinnedProfileError, PinnedZakuraProfile,

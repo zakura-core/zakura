@@ -75,6 +75,12 @@ impl HostilePeer {
         )?)
     }
 
+    /// UDP bytes received by this raw peer, for native transport envelope tests.
+    #[cfg(test)]
+    pub(crate) fn received_udp_bytes(&self) -> u64 {
+        self.connection.stats().udp_rx.bytes
+    }
+
     /// Encode and send one canonical protocol-v8 header-sync message.
     pub async fn send_header_sync_message(
         &self,

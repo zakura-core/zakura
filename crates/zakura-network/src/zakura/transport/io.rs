@@ -136,7 +136,6 @@ impl FramedSend {
     /// `make_lease` is never called for a full, closed, or plain compatibility
     /// channel, so accounting ownership cannot move unless a transport-owned
     /// queue slot already belongs to this operation.
-    #[allow(dead_code)] // the GetBlocks policy follow-up is the first leased sender
     pub(crate) fn try_send_leased(
         &self,
         frame: Frame,
@@ -205,7 +204,6 @@ pub(crate) enum LeasedSendError {
 
 impl LeasedSendError {
     /// Recover the frame that was not queued.
-    #[allow(dead_code)] // consumed by the GetBlocks policy follow-up
     pub(crate) fn into_frame(self) -> Frame {
         match self {
             Self::Full(frame) | Self::Closed(frame) | Self::Unsupported(frame) => frame,
@@ -213,15 +211,8 @@ impl LeasedSendError {
     }
 
     /// Return whether the queue was temporarily full.
-    #[allow(dead_code)] // consumed by the GetBlocks policy follow-up
     pub(crate) fn is_full(&self) -> bool {
         matches!(self, Self::Full(_))
-    }
-
-    /// Return whether the worker permanently closed the queue.
-    #[allow(dead_code)] // consumed by the GetBlocks policy follow-up
-    pub(crate) fn is_closed(&self) -> bool {
-        matches!(self, Self::Closed(_))
     }
 }
 

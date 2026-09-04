@@ -47,6 +47,12 @@ impl SyntheticBlockSyncPeer {
         self.cancel.clone()
     }
 
+    /// Free slots in the peer-to-routine queue, used to prove read backpressure.
+    #[cfg(test)]
+    pub(crate) fn inbound_capacity(&self) -> usize {
+        self.inbound.capacity()
+    }
+
     /// Queue a real stream-6 message as inbound peer traffic to the node.
     pub async fn send(&self, msg: BlockSyncMessage) -> Result<(), crate::BoxError> {
         let frame = msg.encode_frame()?;

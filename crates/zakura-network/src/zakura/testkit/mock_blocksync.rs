@@ -782,9 +782,14 @@ fn synthetic_block_at_height(
 }
 
 fn target_tx_count(template: &Arc<block::Block>, target_bytes: usize) -> usize {
+    // Size with the largest coinbase-height encoding. Repeating a transaction
+    // count chosen at height 1 can cross the target when ScriptNum grows at a
+    // later height (height 17 is the first boundary exercised by the native
+    // regulation lane).
+    let sizing_height = block::Height::MAX;
     let one_tx = synthetic_block_at_height(
         template,
-        block::Height(1),
+        sizing_height,
         mainnet_genesis_hash(),
         splitmix64(SYNTHETIC_CORPUS_SEED),
         1,
@@ -800,42 +805,37 @@ fn target_tx_count(template: &Arc<block::Block>, target_bytes: usize) -> usize {
         .expect("template transaction serializes")
         .len()
         .max(1);
-    let mut tx_count = target_bytes
-        .saturating_sub(one_tx_size)
-        .checked_div(coinbase_size)
-        .and_then(|extra| extra.checked_add(1))
-        .unwrap_or(usize::MAX)
-        .max(1);
-
-    while tx_count > 1 {
-        let candidate = synthetic_block_at_height(
+    let candidate_size = |tx_count| {
+        block_size(&synthetic_block_at_height(
             template,
-            block::Height(1),
+            sizing_height,
             mainnet_genesis_hash(),
             splitmix64(SYNTHETIC_CORPUS_SEED),
             tx_count,
-        );
-        if block_size(&candidate) <= target_bytes {
-            break;
-        }
-        tx_count = tx_count.saturating_sub(1);
+        ))
+    };
+    let mut lower = 1usize;
+    let mut upper = target_bytes
+        .checked_div(coinbase_size)
+        .and_then(|estimate| estimate.checked_add(2))
+        .unwrap_or(usize::MAX)
+        .max(2);
+    while candidate_size(upper) <= target_bytes {
+        lower = upper;
+        let Some(doubled) = upper.checked_mul(2) else {
+            return upper;
+        };
+        upper = doubled;
     }
-
-    while let Some(next_tx_count) = tx_count.checked_add(1) {
-        let candidate = synthetic_block_at_height(
-            template,
-            block::Height(1),
-            mainnet_genesis_hash(),
-            splitmix64(SYNTHETIC_CORPUS_SEED),
-            next_tx_count,
-        );
-        if block_size(&candidate) > target_bytes {
-            break;
+    while lower.saturating_add(1) < upper {
+        let middle = lower.saturating_add((upper - lower) / 2);
+        if candidate_size(middle) <= target_bytes {
+            lower = middle;
+        } else {
+            upper = middle;
         }
-        tx_count = next_tx_count;
     }
-
-    tx_count
+    lower
 }
 
 fn synthetic_tx_count(random: u64) -> usize {
@@ -1016,6 +1016,27 @@ fn synthetic_block_generation_honors_target_size() {
                 .expect("repeat height exists")
                 .hash(),
             block.hash()
+        );
+    }
+}
+
+#[test]
+fn maximum_target_stays_valid_across_coinbase_height_encoding_boundaries() {
+    let target_bytes =
+        usize::try_from(block::MAX_BLOCK_BYTES).expect("maximum block bytes fit usize");
+    let corpus = SyntheticBlockCorpus::generate(
+        17,
+        SYNTHETIC_CORPUS_SEED,
+        SyntheticBlockShape {
+            target_block_bytes: Some(target_bytes),
+        },
+    );
+
+    for height in [block::Height(16), block::Height(17)] {
+        assert!(
+            corpus.size_at(height).expect("boundary block exists") <= target_bytes,
+            "synthetic full block at height {} exceeded the consensus limit",
+            height.0,
         );
     }
 }

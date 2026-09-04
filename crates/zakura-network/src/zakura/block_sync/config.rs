@@ -103,6 +103,25 @@ pub const DEFAULT_BS_SIZE_DEVIATION_TOLERANCE: u32 = 200;
 /// only controls how many bounded body frames a server sends before `BlocksDone`.
 pub const MAX_BS_RESPONSE_BYTES: u32 = DEFAULT_BS_MAX_RESPONSE_BYTES;
 
+/// Fixed work charge retained after an admitted `GetBlocks` request settles.
+pub const GET_BLOCKS_REQUEST_OVERHEAD_BYTES: u64 = 64 * 1024;
+/// Accounted payload bytes in `BlocksDone` and `RangeUnavailable`.
+pub const GET_BLOCKS_TERMINAL_PAYLOAD_BYTES: u64 = 9;
+
+const MIB: u64 = 1024 * 1024;
+const DEFAULT_GET_BLOCKS_PEER_RATE_BYTES_PER_SECOND: u64 = 16 * MIB;
+// This covers the largest request supported by the wire format, even when an
+// operator raises `max_blocks_per_response` after deserializing the defaults.
+// Both wire caps are `u32`, so widening them to `u64` is lossless.
+const DEFAULT_GET_BLOCKS_PEER_RATE_CAPACITY_BYTES: u64 = MAX_BS_RESPONSE_BYTES as u64
+    + MAX_BS_BLOCKS_PER_REQUEST as u64
+    + GET_BLOCKS_TERMINAL_PAYLOAD_BYTES
+    + GET_BLOCKS_REQUEST_OVERHEAD_BYTES;
+const DEFAULT_GET_BLOCKS_PEER_BACKLOG_BYTES: u64 = 64 * MIB;
+const DEFAULT_GET_BLOCKS_NODE_RATE_BYTES_PER_SECOND: u64 = 64 * MIB;
+const DEFAULT_GET_BLOCKS_NODE_RATE_CAPACITY_BYTES: u64 = 128 * MIB;
+const DEFAULT_GET_BLOCKS_NODE_OUTSTANDING_BYTES: u64 = 256 * MIB;
+
 /// Default steady-state cwnd gain, percent of the bandwidth-delay product. 300% ramps a
 /// proven peer up as `1 → 3 → 9 …`; the reliability discount and delay-gradient ceiling
 /// pull it back if the extra concurrency costs drops or standing queue.
@@ -316,6 +335,43 @@ pub struct ZakuraBlockSyncConfig {
     pub floor_bypass_slots: u32,
     /// Block-sync peer caps and queue limits owned by this service.
     pub peer_limits: ServicePeerLimits,
+    /// Admission and response-byte bounds for serving inbound `GetBlocks`.
+    pub get_blocks_serving_regulation: GetBlocksServingRegulationConfig,
+}
+
+/// Resource bounds applied before an inbound `GetBlocks` reaches state.
+///
+/// Rate capacities bound bursts and refill over time. Outstanding capacities
+/// are returned only when a request settles or its queued frames leave the
+/// application-owned transport queue.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GetBlocksServingRegulationConfig {
+    /// Sustained serving allowance for one authenticated peer identity.
+    pub peer_rate_bytes_per_second: u64,
+    /// Burst allowance retained across reconnects for one peer identity.
+    pub peer_rate_capacity_bytes: u64,
+    /// Reserved, queued, and unwritten response bytes allowed per session.
+    pub peer_backlog_bytes: u64,
+    /// Sustained aggregate serving allowance for this node.
+    pub node_rate_bytes_per_second: u64,
+    /// Aggregate node burst allowance.
+    pub node_rate_capacity_bytes: u64,
+    /// Aggregate admitted response bytes not yet handed to QUIC.
+    pub node_outstanding_bytes: u64,
+}
+
+impl Default for GetBlocksServingRegulationConfig {
+    fn default() -> Self {
+        Self {
+            peer_rate_bytes_per_second: DEFAULT_GET_BLOCKS_PEER_RATE_BYTES_PER_SECOND,
+            peer_rate_capacity_bytes: DEFAULT_GET_BLOCKS_PEER_RATE_CAPACITY_BYTES,
+            peer_backlog_bytes: DEFAULT_GET_BLOCKS_PEER_BACKLOG_BYTES,
+            node_rate_bytes_per_second: DEFAULT_GET_BLOCKS_NODE_RATE_BYTES_PER_SECOND,
+            node_rate_capacity_bytes: DEFAULT_GET_BLOCKS_NODE_RATE_CAPACITY_BYTES,
+            node_outstanding_bytes: DEFAULT_GET_BLOCKS_NODE_OUTSTANDING_BYTES,
+        }
+    }
 }
 
 fn deserialize_ignored_replace_legacy_syncer<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -359,6 +415,7 @@ impl Default for ZakuraBlockSyncConfig {
             bbr_cwnd_unit: CwndUnit::Bytes,
             floor_bypass_slots: DEFAULT_BS_FLOOR_BYPASS_SLOTS,
             peer_limits: ServicePeerLimits::default(),
+            get_blocks_serving_regulation: GetBlocksServingRegulationConfig::default(),
         }
     }
 }
@@ -465,6 +522,7 @@ impl ZakuraBlockSyncConfig {
         if self.bbr_probe_rtt_interval <= self.bbr_probe_rtt_duration {
             return Err("bbr_probe_rtt_interval must exceed bbr_probe_rtt_duration");
         }
+        super::serving_regulation::validate_config(self)?;
         Ok(())
     }
 

@@ -70,6 +70,8 @@ pub(super) struct BlockTraceFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apply_token: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_floor: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_download_floor: Option<u64>,

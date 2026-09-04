@@ -49,6 +49,8 @@ pub struct BlockSyncStartup {
     pub state_queries_enabled: bool,
     /// JSONL trace emitter for block-sync scheduling, download, and commit rows.
     pub trace: ZakuraTrace,
+    /// Exact handler connection cap used to bound retained peer-rate identities.
+    pub(crate) max_connections: usize,
 }
 
 impl BlockSyncStartup {
@@ -68,6 +70,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
+            max_connections: crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         }
     }
 
@@ -87,6 +90,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
+            max_connections: crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         }
     }
 
@@ -104,7 +108,14 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
+            max_connections: crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         }
+    }
+
+    /// Use the same connection cap enforced by the owning native P2P handler.
+    pub(crate) fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections.max(1);
+        self
     }
 }
 
@@ -150,6 +161,7 @@ pub(super) struct RoutineWiring {
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
     pub(super) view: watch::Receiver<super::sequencer_task::SequencerView>,
     pub(super) trace: ZakuraTrace,
+    pub(super) serving_regulator: super::serving_regulation::GetBlocksServingRegulator,
 }
 
 impl BlockSyncHandle {
@@ -212,6 +224,27 @@ impl BlockSyncHandle {
     /// Return the currently cached peer slot snapshot.
     pub fn peer_snapshot(&self) -> ServicePeerSnapshot {
         *self.peers.borrow()
+    }
+
+    /// Return GetBlocks serving resource ownership for contract tests.
+    #[cfg(test)]
+    pub(super) fn serving_regulation_snapshot(
+        &self,
+    ) -> super::serving_regulation::ServingRegulationSnapshot {
+        self.routine_wiring
+            .as_ref()
+            .expect("a handle from spawn_block_sync_reactor carries serving regulation")
+            .serving_regulator
+            .snapshot()
+    }
+
+    /// Return one authenticated identity's retained serving-rate balance.
+    #[cfg(test)]
+    pub(super) fn serving_peer_rate_balance(&self, peer: &ZakuraPeerId) -> Option<u64> {
+        self.routine_wiring
+            .as_ref()?
+            .serving_regulator
+            .peer_rate_balance(peer)
     }
 
     /// Subscribe to block-sync peer slot snapshots.
@@ -815,23 +848,30 @@ pub(super) struct PeerBlockState {
 }
 
 /// Ledger entry for one accepted inbound `GetBlocks` request.
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct ServingBlockRequest {
     id: BlockRangeRequestId,
     start_height: block::Height,
     requested_count: u32,
     started: Instant,
+    /// Linear ownership of the request's rate and outstanding-byte charges.
+    permit: super::serving_regulation::GetBlocksServingPermit,
 }
 
 impl ServingBlockRequest {
     /// Count accepted after the wire, configuration, and servable-range clamps.
-    pub(super) fn requested_count(self) -> u32 {
+    pub(super) fn requested_count(&self) -> u32 {
         self.requested_count
     }
 
     /// Time elapsed since this request acquired its serving slot.
-    pub(super) fn elapsed(self) -> Duration {
+    pub(super) fn elapsed(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    /// Borrow the request's linear serving ownership while queueing its frames.
+    pub(super) fn permit_mut(&mut self) -> &mut super::serving_regulation::GetBlocksServingPermit {
+        &mut self.permit
     }
 }
 
@@ -845,39 +885,32 @@ impl PeerBlockState {
         }
     }
 
+    /// Insert a request and move its permit into the ledger, or return the
+    /// untouched permit when this peer's serving concurrency cap is full.
     pub(super) fn try_start_serving_blocks(
         &mut self,
         local_inflight_cap: u32,
         request_id: BlockRangeRequestId,
         start_height: block::Height,
         requested_count: u32,
-    ) -> bool {
+        permit: super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(), super::serving_regulation::GetBlocksServingPermit> {
         if self.served_block_requests.len()
-            >= usize::try_from(local_inflight_cap)
-                .expect("u32 serving limit fits in usize on supported targets")
+            >= usize::try_from(local_inflight_cap).unwrap_or(usize::MAX)
         {
-            return false;
+            return Err(permit);
         }
         self.served_block_requests.push_back(ServingBlockRequest {
             id: request_id,
             start_height,
             requested_count,
             started: Instant::now(),
+            permit,
         });
-        true
+        Ok(())
     }
 
-    pub(super) fn serving_block_request(
-        &self,
-        request_id: BlockRangeRequestId,
-        start_height: block::Height,
-    ) -> Option<ServingBlockRequest> {
-        self.served_block_requests
-            .iter()
-            .find(|request| request.id == request_id && request.start_height == start_height)
-            .copied()
-    }
-
+    /// Remove and return only the request matching both identity fields.
     pub(super) fn finish_serving_blocks(
         &mut self,
         request_id: BlockRangeRequestId,

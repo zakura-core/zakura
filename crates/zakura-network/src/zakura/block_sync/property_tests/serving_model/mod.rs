@@ -269,6 +269,7 @@ struct CompletionTarget {
     session: SessionKey,
     peer: u8,
     start: block::Height,
+    original_count: u32,
     requested: u32,
     query_index: Option<usize>,
 }

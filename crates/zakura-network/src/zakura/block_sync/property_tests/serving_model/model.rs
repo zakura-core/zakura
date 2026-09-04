@@ -59,6 +59,7 @@ struct QueryModel {
     session: SessionKey,
     peer: u8,
     start: block::Height,
+    original_count: u32,
     requested: u32,
     state: QueryState,
     finished_unavailable: bool,
@@ -340,10 +341,7 @@ impl ReferenceModel {
             Self::push_frame(
                 &mut expected,
                 session,
-                ServingFrame::RangeUnavailable {
-                    start,
-                    count: count.min(self.max_blocks).max(1),
-                },
+                ServingFrame::RangeUnavailable { start, count },
             );
             self.coverage.cap_rejections = self.coverage.cap_rejections.saturating_add(1);
             self.mark_evidence(ServingEvidence::SaturatedLedgerRejected);
@@ -361,10 +359,7 @@ impl ReferenceModel {
             Self::push_frame(
                 &mut expected,
                 session,
-                ServingFrame::RangeUnavailable {
-                    start,
-                    count: count.min(self.max_blocks).max(1),
-                },
+                ServingFrame::RangeUnavailable { start, count },
             );
             self.coverage.above_tip_rejections =
                 self.coverage.above_tip_rejections.saturating_add(1);
@@ -400,6 +395,7 @@ impl ReferenceModel {
             session,
             peer,
             start,
+            original_count: count,
             requested,
             state: QueryState::Live,
             finished_unavailable: false,
@@ -515,6 +511,7 @@ impl ReferenceModel {
                 session: query.session,
                 peer: query.peer,
                 start: query.start,
+                original_count: query.original_count,
                 requested: query.requested,
                 query_index: Some(*query_index),
             });
@@ -528,6 +525,7 @@ impl ReferenceModel {
                 session: query.session,
                 peer: query.peer,
                 start: query.start,
+                original_count: query.original_count,
                 requested: query.requested,
                 query_index: None,
             })
@@ -538,6 +536,7 @@ impl ReferenceModel {
                 session: query.session,
                 peer: query.peer,
                 start: block::Height(query.start.0.saturating_add(1)),
+                original_count: query.original_count,
                 requested: query.requested,
                 query_index: None,
             })
@@ -561,6 +560,7 @@ impl ReferenceModel {
                 session,
                 peer,
                 start: query.start,
+                original_count: query.original_count,
                 requested: query.requested,
                 query_index: None,
             })
@@ -662,7 +662,7 @@ impl ReferenceModel {
                     target.session,
                     ServingFrame::RangeUnavailable {
                         start: target.start,
-                        count: target.requested.max(1),
+                        count: target.original_count,
                     },
                 );
             }
@@ -730,7 +730,7 @@ impl ReferenceModel {
                         target.session,
                         ServingFrame::RangeUnavailable {
                             start: target.start,
-                            count: target.requested.max(1),
+                            count: target.original_count,
                         },
                     );
                 } else {

@@ -339,7 +339,12 @@ A regulation layer is implemented only when:
 2. Fast properties check charge arithmetic, conservation, rollback,
    settlement, session ownership, and configured bounds.
 3. Generated histories vary peers and every applicable resource boundary.
-4. Under-budget histories preserve the pre-regulation behavior.
+4. Under-budget histories preserve pre-regulation behavior. This may use a
+   direct differential run, captured observations, or a frozen reference model
+   and focused scenarios that first passed against the unregulated production
+   path. A regulation change may adapt only the harness needed to make the new
+   limits nonbinding; it must not change that model's transitions or expected
+   observations.
 5. Native traffic checks reading floods, stopped readers, transport buffering,
    cleanup, and useful peer progress under a named topology.
 6. Transport tests bound partial-frame state and expire incomplete frames under

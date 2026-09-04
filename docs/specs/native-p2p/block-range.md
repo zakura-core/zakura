@@ -77,12 +77,12 @@ Input classes identify who can create each event:
 | GB-SM-01 | `gb_sm_01_replacement_cancels_previous_session` | Peer | A replacement connection cancels the preceding session for the same peer. |
 | GB-SM-02 | `gb_sm_02_stale_disconnect_preserves_current_session` | Peer | A stale disconnect does not close or mutate the current session. |
 | GB-SM-03 | `gb_sm_03_missing_status_is_rejected_as_spam` | Peer | A peer without retained valid `Status` cannot start a request; the attempt is recorded as `GetBlocksSpam`. |
-| GB-SM-04 | `gb_sm_04_peer_ledgers_are_independent_and_bounded` | All | Each peer has an independent request ledger bounded by the configured local in-flight cap. |
-| GB-SM-05 | `gb_sm_05_saturated_ledger_rejects_without_state_query` | Peer | A cap-rejected request emits no state query and receives `RangeUnavailable` while output capacity is available. |
+| GB-SM-04 | `gb_sm_04_peer_ledgers_are_independent_and_bounded` | All | Each peer has an independent committed-request ledger bounded by the configured local in-flight cap. |
+| GB-SM-05 | `gb_sm_05_saturated_ledger_rejects_without_state_query` | Peer | A request rejected by the full committed-request ledger emits no state query and receives `RangeUnavailable` while output capacity is available. |
 | GB-SM-06 | `gb_sm_06_above_tip_request_is_unavailable_without_state_query` | Peer | A request starting above the servable tip emits no state query and receives `RangeUnavailable`. |
 | GB-SM-07 | `gb_sm_07_accepted_query_count_respects_all_bounds` | Peer | An accepted query count is clamped by the wire count, local count limit, representable heights, and available range. |
 | GB-SM-08 | `gb_sm_08_request_ids_are_nonzero_and_unique` | Driver | Request identities are nonzero and are not reused during one replay. |
-| GB-SM-09 | `gb_sm_09_ready_response_sends_largest_valid_prefix_and_one_terminal` | Driver | A matching ready response sends the largest contiguous prefix within the requested count and byte cap, followed by exactly one appropriate terminal frame. |
+| GB-SM-09 | `gb_sm_09_ready_response_sends_largest_valid_prefix_and_one_terminal` | Driver | While the output path remains available, a matching ready response sends the largest contiguous prefix within the byte cap followed by exactly one appropriate terminal frame; output failure follows the regulated-load failure policy. |
 | GB-SM-10 | `gb_sm_10_invalid_completion_has_no_serving_effect` | Internal | Unknown, retired, mismatched, repeated, or orphaned completion identities have no serving effect. |
 | GB-SM-11 | `gb_sm_11_repeated_completion_does_not_release_live_slot` | Internal | Repeating a completed response does not release another live request slot. |
 | GB-SM-12 | `gb_sm_12_ended_session_responses_do_not_reach_replacement` | Peer | Disconnecting or replacing a session orphans its queries; later results never reach the replacement. |
@@ -145,6 +145,13 @@ charge       = response_cap + 64 KiB
 The nine bytes cover the terminal response. `N` covers one discriminator byte
 per `Block` payload. The remaining term covers encoded block bodies.
 
+The state query receives the local response-body byte limit and returns only
+the largest contiguous prefix whose encoded block sizes fit that limit. It must
+enforce the limit while constructing the result; materializing all `N` blocks
+and truncating them afterward does not satisfy this contract. Inspecting the
+next candidate may temporarily materialize one additional block, bounded by
+`MAX_BLOCK_BYTES`, but that block must not remain in the returned result.
+
 Admission reserves the worst case. The 64 KiB request overhead remains spent
 after commit. Unused response capacity is refunded. Response bytes remain
 reserved until their frames are accepted by QUIC or dropped; QUIC's
@@ -176,7 +183,19 @@ owns both a session and node pending-input slot until the reactor processes it.
 Each session can own one active admission plus the advertised in-flight limit
 behind it; the node cap is that total multiplied by the maximum connection
 count. Requests beyond either cap are dropped without a query, response, or
-peer score.
+peer score. This pre-reactor capacity is separate from the committed-request
+ledger: once admitted, a request rejected by that full ledger follows GB-SM-05.
+
+### Failure outcomes
+
+| Failure point | Required outcome |
+| --- | --- |
+| Routine-to-reactor handoff is full | Keep the provisional attempt and wait for that channel only. |
+| Handoff closes or the session ends before commit | Roll back the attempt and end that admission with no query, response, or peer score. |
+| State-action channel is full or closed after commit | Retire the ledger entry and queue `RangeUnavailable` if output remains available, with no peer score. |
+| State driver fails, times out, or returns the wrong response | Retire the ledger entry and queue `RangeUnavailable` if output remains available, with no peer score. |
+| Output queue is full after commit | Drop the unsent response or terminal frame, settle its permit exactly once, keep the session connected, and assign no peer score. Existing frame leases remain until transport releases them. No terminal frame is required while the queue is full. |
+| Output queue is closed or otherwise fails after commit | End the affected session without a peer score and settle its permit exactly once. If the session remains registered when the failure is observed, cancel it. Existing frame leases remain until transport releases them. No terminal frame is required when its output path is unavailable. |
 
 ### Requirements
 
@@ -189,7 +208,7 @@ peer score.
 | GB-RL-05 | `gb_rl_05_peer_rate_backlog_and_ledger_are_isolated` | One peer cannot consume another peer's rate bucket, backlog, or request ledger. |
 | GB-RL-06 | `gb_rl_06_backlog_never_overshoots_and_draining_resumes_work` | Reserved and application-owned unwritten response bytes never exceed the peer backlog; draining resumes admission. |
 | GB-RL-07 | `gb_rl_07_stalled_outstanding_bytes_do_not_refill_with_time` | Time refills rate tokens but never outstanding-byte capacity. |
-| GB-RL-08 | `gb_rl_08_handoff_failures_hold_rollback_or_settle_exactly_once` | A full handoff channel retains its attempt; closure rolls it back; action, driver, and output failures settle through the declared outcome. |
+| GB-RL-08 | `gb_rl_08_handoff_failures_hold_rollback_or_settle_exactly_once`<br>`gb_rl_08_output_queue_full_drops_but_closed_ends_session` | Handoff, action, driver, and output failures follow the failure-outcome table and settle each attempt or permit exactly once. |
 | GB-RL-09 | `gb_rl_09_session_end_settles_permit_but_frame_leases_survive_until_drop` | Session end settles permits without moving them to a replacement; frame leases survive until their frames leave the application transport. |
 | GB-RL-10a | `gb_rl_10a_generated_hostile_flood_stays_within_all_declared_bounds` | Generated hostile histories vary peer count and every configured bound without exceeding peer or node accounting. |
 | GB-RL-10b | `gb_rl_10b_native_reading_flood_preserves_honest_tiny_and_full_service` | Fifteen reading flood peers do not push an honest tiny- or full-block response beyond the existing eight-second request timeout in the named native topology. |
@@ -200,6 +219,7 @@ peer score.
 | GB-RL-14 | `gb_rl_14_reconnect_retains_rate_bucket_and_bounds_inactive_cache` | Reconnects retain a depleted identity bucket; inactive retention is bounded and early eviction restores no more than the evicted deficit. |
 | GB-RL-15 | `gb_rl_15_stale_session_gate_rolls_back_regulation_ownership` | Rejecting a superseded routine at the session gate rolls back all provisional regulation ownership. |
 | GB-RL-16 | `gb_rl_16_pending_requests_stay_within_session_and_node_bounds` | Pending serving-request state stays within its per-session bound and its derived aggregate bound at the configured maximum connection count. |
+| GB-RL-17 | `gb_rl_17_state_query_receives_local_response_byte_limit`<br>`gb_rl_17_state_query_result_never_exceeds_response_byte_limit` | The state query receives the local response-body byte limit and never returns block bodies whose total encoded size exceeds it. |
 
 The fast lane uses small capacities to reach every boundary deterministically.
 The native lane uses real stream-6 frames, the production peer routine and
@@ -216,7 +236,7 @@ These are reproducible experiments, not network-wide proofs. CPU, RSS, UDP
 traffic, and throughput are diagnostics. The request timeout, write timeout,
 application budgets, and configured QUIC envelope are contract gates.
 
-The manifest maps `GB-RL-01` through `GB-RL-16` to one or more test names and
+The manifest maps `GB-RL-01` through `GB-RL-17` to one or more test names and
 checks those names against Rust's registered test inventory. A missing ID or
 test fails explicitly.
 

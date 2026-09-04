@@ -337,7 +337,7 @@ fn focused_scenario(scenario: u8, tip: u32, max_inflight: u32) -> Vec<ServingSte
                 ServingStep::single(ServingOp::GetBlocks {
                     peer: 0,
                     start: 1 + (offset % tip),
-                    count: 1,
+                    count: if offset == max_inflight { 8 } else { 1 },
                 })
             }));
             steps
@@ -408,7 +408,7 @@ fn focused_scenario(scenario: u8, tip: u32, max_inflight: u32) -> Vec<ServingSte
         SCENARIO_ABOVE_TIP => vec![ServingStep::single(ServingOp::GetBlocks {
             peer: 0,
             start: tip.saturating_add(1),
-            count: 1,
+            count: 8,
         })],
         SCENARIO_UNKNOWN_COMPLETION => vec![
             ServingStep::single(ServingOp::GetBlocks {
@@ -610,7 +610,7 @@ fn focused_scenario(scenario: u8, tip: u32, max_inflight: u32) -> Vec<ServingSte
             ServingStep::single(ServingOp::GetBlocks {
                 peer: 0,
                 start: 1,
-                count: 1,
+                count: 8,
             }),
             ServingStep::single(ServingOp::Complete {
                 query: QuerySelector::Live(0),

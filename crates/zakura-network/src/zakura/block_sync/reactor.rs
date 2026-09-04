@@ -1583,8 +1583,7 @@ impl BlockSyncReactor {
         }
 
         let Some(request_id) = self.next_serving_request_id else {
-            let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
-            self.send_range_unavailable(&peer, start_height, unavailable_count, &mut permit);
+            self.send_range_unavailable(&peer, start_height, count, &mut permit);
             return;
         };
         self.next_serving_request_id = request_id
@@ -1602,12 +1601,12 @@ impl BlockSyncReactor {
                 local_inflight_cap,
                 request_id,
                 start_height,
+                count,
                 requested_count,
                 permit,
             );
         if let Err(mut permit) = started_serving {
-            let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
-            self.send_range_unavailable(&peer, start_height, unavailable_count, &mut permit);
+            self.send_range_unavailable(&peer, start_height, count, &mut permit);
             return;
         }
 
@@ -1615,11 +1614,10 @@ impl BlockSyncReactor {
             let mut request = self
                 .finish_serving_blocks(&peer, request_id, start_height)
                 .expect("the request was just inserted into the serving ledger");
-            let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
             self.send_range_unavailable(
                 &peer,
                 start_height,
-                unavailable_count,
+                request.original_count(),
                 request.permit_mut(),
             );
             return;
@@ -1635,7 +1633,12 @@ impl BlockSyncReactor {
             let mut request = self
                 .finish_serving_blocks(&peer, request_id, start_height)
                 .expect("the failed action belongs to the inserted serving request");
-            self.send_range_unavailable(&peer, start_height, requested_count, request.permit_mut());
+            self.send_range_unavailable(
+                &peer,
+                start_height,
+                request.original_count(),
+                request.permit_mut(),
+            );
         }
     }
 
@@ -1650,6 +1653,7 @@ impl BlockSyncReactor {
         let Some(mut request) = self.finish_serving_blocks(&peer, request_id, start_height) else {
             return;
         };
+        let original_count = request.original_count();
         let requested_count = request.requested_count();
         if reported_requested_count != requested_count {
             tracing::warn!(
@@ -1698,7 +1702,7 @@ impl BlockSyncReactor {
         }
 
         if sent_blocks == 0 {
-            self.send_range_unavailable(&peer, start_height, requested_count, request.permit_mut());
+            self.send_range_unavailable(&peer, start_height, original_count, request.permit_mut());
         } else {
             self.send_blocks_done(&peer, start_height, sent_blocks, request.permit_mut());
         }
@@ -1729,6 +1733,7 @@ impl BlockSyncReactor {
         let Some(mut request) = self.finish_serving_blocks(&peer, request_id, start_height) else {
             return;
         };
+        let original_count = request.original_count();
         let requested_count = request.requested_count();
         if reported_requested_count != requested_count {
             tracing::warn!(
@@ -1741,7 +1746,7 @@ impl BlockSyncReactor {
         }
         let elapsed = request.elapsed();
         if returned_count == 0 {
-            self.send_range_unavailable(&peer, start_height, requested_count, request.permit_mut());
+            self.send_range_unavailable(&peer, start_height, original_count, request.permit_mut());
         }
         self.trace_range_response_sent(
             &peer,

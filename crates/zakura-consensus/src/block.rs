@@ -585,20 +585,26 @@ where
 {
     let hash = prepared_block.hash;
     let is_mined_commit = admission.is_some();
+    let commit_start = std::time::Instant::now();
+    let ready_start = std::time::Instant::now();
+    let ready_state_service = state_service
+        .ready()
+        .await
+        .map_err(|source| VerifyBlockError::StateService { source, hash })?;
+    if is_mined_commit {
+        metrics::histogram!("state.semantic_commit.ready_wait.duration_seconds")
+            .record(ready_start.elapsed().as_secs_f64());
+    }
+
     let request = match admission {
         Some(admission) => zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
             block: prepared_block,
             admission,
+            requested_at: std::time::Instant::now(),
         },
         None => zs::Request::CommitSemanticallyVerifiedBlock(prepared_block),
     };
-    let commit_start = std::time::Instant::now();
-    let response = state_service
-        .ready()
-        .await
-        .map_err(|source| VerifyBlockError::StateService { source, hash })?
-        .call(request)
-        .await;
+    let response = ready_state_service.call(request).await;
     if is_mined_commit {
         metrics::histogram!("mining.contextual_commit.duration_seconds")
             .record(commit_start.elapsed().as_secs_f64());

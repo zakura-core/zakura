@@ -82,7 +82,7 @@ Input classes identify who can create each event:
 | GB-SM-06 | Peer | A request starting above the servable tip emits no state query and receives `RangeUnavailable`. |
 | GB-SM-07 | Peer | An accepted query count is clamped by the wire count, local count limit, representable heights, and available range. |
 | GB-SM-08 | Driver | Request identities are nonzero and are not reused during one replay. |
-| GB-SM-09 | Driver | A matching ready response sends the largest contiguous prefix within the byte cap followed by exactly one appropriate terminal frame. |
+| GB-SM-09 | Driver | While the output path remains available, a matching ready response sends the largest contiguous prefix within the byte cap followed by exactly one appropriate terminal frame; output failure follows the regulated-load failure policy. |
 | GB-SM-10 | Internal | Unknown, retired, mismatched, repeated, or orphaned completion identities have no serving effect. |
 | GB-SM-11 | Internal | Repeating a completed response does not release another live request slot. |
 | GB-SM-12 | Peer | Disconnecting or replacing a session orphans its queries; later results never reach the replacement. |
@@ -181,6 +181,17 @@ once admitted, a request rejected by that full ledger follows GB-SM-05. The
 implementation must also account for aggregate pending-input memory across the
 maximum connection count.
 
+### Failure outcomes
+
+| Failure point | Required outcome |
+| --- | --- |
+| Routine-to-reactor handoff is full | Keep the provisional attempt and wait for that channel only. |
+| Handoff closes or the session ends before commit | Roll back the attempt and end that admission with no query, response, or peer score. |
+| State-action channel is full or closed after commit | Retire the ledger entry and queue `RangeUnavailable` if output remains available, with no peer score. |
+| State driver fails, times out, or returns the wrong response | Retire the ledger entry and queue `RangeUnavailable` if output remains available, with no peer score. |
+| Output queue is full after commit | Drop the unsent response or terminal frame, settle its permit exactly once, keep the session connected, and assign no peer score. Existing frame leases remain until transport releases them. No terminal frame is required while the queue is full. |
+| Output queue is closed or otherwise fails after commit | End the affected session without a peer score and settle its permit exactly once. If the session remains registered when the failure is observed, cancel it. Existing frame leases remain until transport releases them. No terminal frame is required when its output path is unavailable. |
+
 ### Requirements
 
 | ID | Requirement |
@@ -192,7 +203,7 @@ maximum connection count.
 | GB-RL-05 | One peer cannot consume another peer's rate bucket, backlog, or request ledger. |
 | GB-RL-06 | Reserved and application-owned unwritten response bytes never exceed the peer backlog; draining resumes admission. |
 | GB-RL-07 | Time refills rate tokens but never outstanding-byte capacity. |
-| GB-RL-08 | A full handoff channel retains its attempt; closure rolls it back; action, driver, and output failures settle through the declared outcome. |
+| GB-RL-08 | Handoff, action, driver, and output failures follow the failure-outcome table and settle each attempt or permit exactly once. |
 | GB-RL-09 | Session end settles permits without moving them to a replacement; frame leases survive until their frames leave the application transport. |
 | GB-RL-10a | Generated hostile histories vary peer count and every configured bound without exceeding peer or node accounting. |
 | GB-RL-10b | Fifteen reading flood peers do not push an honest tiny- or full-block response beyond the existing eight-second request timeout in the named native topology. |

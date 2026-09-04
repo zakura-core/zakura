@@ -202,6 +202,13 @@ declared by the GetBlocks contract. That contract must validate aggregate
 pending-input memory at the maximum connection count and confirm that required
 response traffic continues to make progress.
 
+After a GetBlocks request commits, a full output queue drops the unsent frame,
+settles the request ownership, and keeps the session connected. A closed or
+otherwise failed output queue ends the session and settles the same ownership,
+cancelling it if it remains registered when the failure is observed. Neither
+local failure scores the peer or promises a terminal frame over the unavailable
+output path.
+
 ### 3. Carry ownership with the work
 
 Resource ownership follows the work instead of relying on matching refund calls:

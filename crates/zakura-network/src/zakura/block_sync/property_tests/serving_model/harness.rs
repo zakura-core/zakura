@@ -21,9 +21,9 @@ use super::super::super::super::{
 };
 use super::{
     model::{ReadyBlock, ReferenceModel},
-    CompletionKind, ExpectedAction, ExpectedObservation, PendingQuery, ServingAction, ServingCase,
-    ServingCoverage, ServingFrame, ServingObservation, ServingOp, ServingStep, SessionKey,
-    StatusValidity,
+    ByteCap, CompletionKind, ExpectedAction, ExpectedObservation, PendingQuery, ServingAction,
+    ServingCase, ServingCoverage, ServingFrame, ServingObservation, ServingOp, ServingStep,
+    SessionKey, StatusValidity,
 };
 use crate::zakura::{
     testkit::{
@@ -52,8 +52,18 @@ pub(super) fn replay_serving_case(case: &ServingCase) -> Result<ServingCoverage,
 /// Assemble the real service, peer harness, corpus, and reference model, then
 /// compare their behavior until every step has settled.
 async fn replay_serving_case_inner(case: &ServingCase) -> Result<ServingCoverage, String> {
-    let corpus =
-        SyntheticBlockCorpus::generate(case.tip, case.corpus_seed, SyntheticBlockShape::default());
+    let target_block_bytes = match case.byte_cap {
+        ByteCap::All => None,
+        ByteCap::ExactlyFirst | ByteCap::ExactlyFirstTwo => Some(
+            usize::try_from(block::MAX_BLOCK_BYTES / 2 + 64 * 1024)
+                .expect("the synthetic block target fits usize"),
+        ),
+    };
+    let corpus = SyntheticBlockCorpus::generate(
+        case.tip,
+        case.corpus_seed,
+        SyntheticBlockShape { target_block_bytes },
+    );
     let first_size = corpus
         .size_at(block::Height(1))
         .and_then(|size| u32::try_from(size).ok())
@@ -62,6 +72,11 @@ async fn replay_serving_case_inner(case: &ServingCase) -> Result<ServingCoverage
         .size_at(block::Height(2))
         .and_then(|size| u32::try_from(size).ok())
         .ok_or_else(|| "synthetic block 2 size must fit u32".to_string())?;
+    if !matches!(case.byte_cap, ByteCap::All)
+        && u64::from(first_size).saturating_add(u64::from(second_size)) <= block::MAX_BLOCK_BYTES
+    {
+        return Err("byte-boundary corpus must exceed one maximum block across two bodies".into());
+    }
     let response_byte_cap = case.byte_cap.resolve(first_size, second_size);
 
     let (max_inbound_peers, max_outbound_peers) = match case.direction {

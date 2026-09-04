@@ -706,9 +706,6 @@ impl ReferenceModel {
                         self.coverage.byte_cap_stops =
                             self.coverage.byte_cap_stops.saturating_add(1);
                         self.mark_evidence(ServingEvidence::ByteCapStoppedPrefix);
-                        if sent == 0 {
-                            self.mark_evidence(ServingEvidence::ByteCapStoppedBeforeFirstBlock);
-                        }
                         break;
                     }
                     Self::push_frame(
@@ -871,11 +868,12 @@ impl ReferenceModel {
 impl ByteCap {
     /// Resolve a symbolic boundary against actual generated block sizes.
     pub(super) fn resolve(self, first: u32, second: u32) -> u32 {
+        let minimum = u32::try_from(block::MAX_BLOCK_BYTES)
+            .expect("maximum block bytes fit the response-limit wire field");
         match self {
             Self::All => MAX_BS_RESPONSE_BYTES,
-            Self::BeforeFirst => first.saturating_sub(1).max(1),
-            Self::ExactlyFirst => first.max(1),
-            Self::ExactlyFirstTwo => first.saturating_add(second).max(1),
+            Self::ExactlyFirst => first.max(minimum),
+            Self::ExactlyFirstTwo => first.saturating_add(second).max(minimum),
         }
     }
 }

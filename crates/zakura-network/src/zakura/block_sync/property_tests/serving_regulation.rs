@@ -130,6 +130,10 @@ const GB_RL_TEST_MANIFEST: &[(&str, &[&str])] = &[
         "GB-RL-18",
         &["gb_rl_18_panics_release_owned_resources_and_preserve_other_peers"],
     ),
+    (
+        "GB-RL-22",
+        &["gb_rl_22_validation_and_status_precede_regulation_ownership"],
+    ),
 ];
 
 #[test]
@@ -155,6 +159,7 @@ fn gb_rl_contract_manifest_names_every_requirement() {
         "GB-RL-16",
         "GB-RL-17",
         "GB-RL-18",
+        "GB-RL-22",
     ];
     assert_contract_test_manifest(EXPECTED_IDS, GB_RL_TEST_MANIFEST);
 }
@@ -592,49 +597,7 @@ async fn gb_rl_17_state_query_receives_local_response_byte_limit() {
 async fn gb_rl_04_rejections_settle_once_and_account_their_terminal_frame() {
     let config = regulated_config(minimum_response_bytes());
     let cost = serving_cost(&config, 1).expect("test request cost is valid");
-    let mut harness = ServingHarness::new(config, 4, 2);
-
-    let no_status_id = peer(0x40);
-    let mut no_status = harness
-        .peers
-        .connect_peer(no_status_id.clone(), 40, ServicePeerDirection::Outbound)
-        .expect("the no-Status peer connects");
-    wait_until("the no-Status peer is admitted", || {
-        harness.handle.peer_snapshot().outbound_peers == 1
-    })
-    .await;
-    expect_initial_status(&mut no_status).await;
-    let no_status_balance = harness
-        .handle
-        .serving_peer_rate_balance(&no_status_id)
-        .expect("the admitted peer owns a rate bucket");
-    no_status
-        .try_send(BlockSyncMessage::GetBlocks {
-            start_height: block::Height(1),
-            count: 1,
-        })
-        .expect("the no-Status request queues");
-    match next_contract_action(&mut harness.actions).await {
-        BlockSyncAction::Misbehavior { peer, reason } => {
-            assert_eq!(peer, no_status_id);
-            assert_eq!(reason, BlockSyncMisbehavior::GetBlocksSpam);
-        }
-        action => panic!("expected GetBlocksSpam, got {action:?}"),
-    }
-    assert_eq!(
-        harness
-            .handle
-            .serving_regulation_snapshot()
-            .node_outstanding,
-        0
-    );
-    assert_eq!(
-        harness
-            .handle
-            .serving_peer_rate_balance(&no_status_id)
-            .expect("the peer bucket is retained"),
-        no_status_balance - GET_BLOCKS_REQUEST_OVERHEAD_BYTES
-    );
+    let harness = ServingHarness::new(config, 4, 2);
 
     let above_tip_id = peer(0x41);
     let mut above_tip = harness.connect_ready(above_tip_id.clone(), 41).await;
@@ -692,6 +655,50 @@ async fn gb_rl_04_rejections_settle_once_and_account_their_terminal_frame() {
         "settlement must not run twice"
     );
     assert!(cost.charge > GET_BLOCKS_REQUEST_OVERHEAD_BYTES);
+}
+
+#[tokio::test(start_paused = true)]
+async fn gb_rl_22_validation_and_status_precede_regulation_ownership() {
+    let config = regulated_config(minimum_response_bytes());
+    let mut harness = ServingHarness::new(config, 4, 1);
+    let peer_id = peer(0x40);
+    let mut remote = harness
+        .peers
+        .connect_peer(peer_id.clone(), 40, ServicePeerDirection::Outbound)
+        .expect("the no-Status peer connects");
+    wait_until("the no-Status peer is admitted", || {
+        harness.handle.peer_snapshot().outbound_peers == 1
+    })
+    .await;
+    expect_initial_status(&mut remote).await;
+    let before = harness.handle.serving_regulation_snapshot();
+    let peer_rate_before = harness
+        .handle
+        .serving_peer_rate_balance(&peer_id)
+        .expect("the admitted peer owns a rate bucket");
+
+    remote
+        .try_send(BlockSyncMessage::GetBlocks {
+            start_height: block::Height(1),
+            count: 1,
+        })
+        .expect("the no-Status request queues");
+    match next_contract_action(&mut harness.actions).await {
+        BlockSyncAction::Misbehavior { peer, reason } => {
+            assert_eq!(peer, peer_id);
+            assert_eq!(reason, BlockSyncMisbehavior::GetBlocksSpam);
+        }
+        action => panic!("expected GetBlocksSpam, got {action:?}"),
+    }
+
+    assert_eq!(harness.handle.serving_regulation_snapshot(), before);
+    assert_eq!(
+        harness
+            .handle
+            .serving_peer_rate_balance(&peer_id)
+            .expect("the unchanged peer bucket remains available"),
+        peer_rate_before
+    );
 }
 
 #[tokio::test(start_paused = true)]

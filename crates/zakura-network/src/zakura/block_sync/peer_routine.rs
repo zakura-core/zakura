@@ -599,7 +599,14 @@ impl PeerRoutine {
             BlockSyncMessage::GetBlocks {
                 start_height,
                 count,
-            } => self.retain_serving_request(start_height, count),
+            } => {
+                if self.received_status {
+                    self.retain_serving_request(start_height, count);
+                } else {
+                    self.report_misbehavior(BlockSyncMisbehavior::GetBlocksSpam)
+                        .await;
+                }
+            }
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");
                 self.handle_body(block, body_wire_bytes, body_permit, raw_block_payload)

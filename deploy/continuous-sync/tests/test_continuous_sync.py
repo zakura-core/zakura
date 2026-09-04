@@ -147,6 +147,27 @@ class ContinuousSyncTests(unittest.TestCase):
             self.assertTrue((network / "marker").exists())
         os.environ.pop("ZAKURA_CONTINUOUS_SYNC_TESTING", None)
 
+    def test_stop_service_requires_a_completed_stop(self):
+        config = make_config(Path.cwd())
+
+        with (
+            patch.object(sync, "run") as run,
+            patch.object(sync, "service_active", return_value=False),
+        ):
+            sync.stop_service(config)
+
+        run.assert_called_once_with(["systemctl", "stop", config.policy.service_name])
+
+    def test_stop_service_rejects_an_active_service(self):
+        config = make_config(Path.cwd())
+
+        with (
+            patch.object(sync, "run"),
+            patch.object(sync, "service_active", return_value=True),
+            self.assertRaisesRegex(sync.ControllerError, "service remained active after stop"),
+        ):
+            sync.stop_service(config)
+
     def test_cleanup_retention_keeps_active_and_two_newest_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

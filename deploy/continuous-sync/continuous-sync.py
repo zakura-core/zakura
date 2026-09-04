@@ -412,7 +412,11 @@ def start_service(config: Config) -> None:
 
 
 def stop_service(config: Config) -> None:
-    run(["systemctl", "stop", config.policy.service_name], check=False)
+    run(["systemctl", "stop", config.policy.service_name])
+    if service_active(config):
+        raise ControllerError(
+            f"service remained active after stop: {config.policy.service_name}"
+        )
 
 
 def service_active(config: Config) -> bool:

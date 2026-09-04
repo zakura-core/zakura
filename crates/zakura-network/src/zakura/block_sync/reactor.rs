@@ -695,6 +695,7 @@ impl BlockSyncReactor {
                 .await
             }
             BlockSyncEvent::BlockRangeResponseReady {
+                lease: _lease,
                 request_id,
                 peer,
                 start_height,
@@ -1586,6 +1587,7 @@ impl BlockSyncReactor {
 
         let requested_count = self.clamp_served_block_count(start_height, count);
         permit.bind_request_id(request_id);
+        let query_lease = permit.query_lease();
         let started_serving = self
             .state
             .peers
@@ -1618,6 +1620,7 @@ impl BlockSyncReactor {
         }
 
         if !self.dispatch_action(BlockSyncAction::QueryBlocksByHeightRange {
+            lease: query_lease,
             request_id,
             peer: peer.clone(),
             start: start_height,

@@ -149,3 +149,7 @@ pub(crate) fn test_block_apply_outcome(result: BlockApplyResult) -> BlockApplyOu
         }
     }
 }
+
+#[cfg(any(test, feature = "zakura-testkit"))]
+pub(crate) use serving_regulation::query_lease_for_test;
+pub use serving_regulation::BlockRangeQueryLease;

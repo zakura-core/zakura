@@ -38,3 +38,11 @@ pub use trace_capture::TraceCapture;
 pub use trace_reader::{TraceQuery, TraceReader, TraceValue};
 pub use wait::{await_until, WaitError, TEST_NET_TIMEOUT};
 pub use zakura_jsonl_trace::JsonlTracer;
+
+/// Create a charged standalone serving query for driver fixtures without a reactor.
+pub fn block_range_query_lease() -> super::BlockRangeQueryLease {
+    super::block_sync::query_lease_for_test()
+}
+
+#[cfg(test)]
+pub(crate) use mock_blocksync::{SyntheticBlockCorpus, SyntheticBlockShape};

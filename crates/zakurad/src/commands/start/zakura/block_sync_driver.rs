@@ -33,6 +33,108 @@ use super::{
 pub(crate) const ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW: u32 =
     zakura_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE;
 
+/// Keep capacity attached to the real state future, including after delivery expires.
+async fn serve_block_range<ReadState>(
+    action: BlockSyncAction,
+    read_state: ReadState,
+    block_sync: BlockSyncHandle,
+    trace: ZakuraTrace,
+) where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send,
+{
+    let BlockSyncAction::QueryBlocksByHeightRange {
+        lease,
+        request_id,
+        peer,
+        start,
+        count,
+        max_response_bytes,
+        timeout,
+    } = action
+    else {
+        unreachable!("only serving range actions are dispatched to the serving worker");
+    };
+    if !lease.try_start() {
+        return;
+    }
+    trace.trace_block_range_query_started(&peer, start, count);
+    let started = Instant::now();
+    let query = std::panic::AssertUnwindSafe(read_state.oneshot(
+        zakura_state::ReadRequest::BlocksByHeightRange {
+            start,
+            count,
+            max_response_bytes,
+        },
+    ))
+    .catch_unwind();
+    tokio::pin!(query);
+    let result = tokio::select! {
+        biased;
+        () = lease.cancelled() => {
+            // Awaiting the retained future drains any blocking work before releasing its charge.
+            drop(query.await);
+            return;
+        }
+        result = tokio::time::timeout(timeout, &mut query) => result,
+    };
+    match result {
+        Ok(Ok(Ok(zakura_state::ReadResponse::Blocks(blocks)))) => {
+            if lease.is_cancelled() {
+                return;
+            }
+            trace.trace_block_range_query_succeeded(&peer, start, blocks.len(), started);
+            trace.trace_block_range_event("block_range_response_ready", &peer, start, count);
+            let _ = block_sync.send_control(BlockSyncEvent::BlockRangeResponseReady {
+                lease,
+                request_id,
+                peer,
+                start_height: start,
+                requested_count: count,
+                blocks,
+            });
+        }
+        Err(_) => {
+            trace.trace_block_range_query_timed_out(&peer, start, count, started);
+            warn!(?peer, "timed out reading Zakura block-sync serving range");
+            trace.trace_block_range_finished(&peer, start, count, 0);
+            let _ = block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
+                request_id,
+                peer,
+                start_height: start,
+                requested_count: count,
+                returned_count: 0,
+            });
+            drop(query.await);
+            // `lease` remains owned until the underlying read actually completes.
+        }
+        Ok(result) => {
+            let error = match result {
+                Ok(Ok(response)) => {
+                    format!("unexpected BlocksByHeightRange response: {response:?}")
+                }
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "state range query panicked".to_owned(),
+            };
+            trace.trace_block_range_query_failed(&peer, start, count, &error, started);
+            warn!(?peer, %error, "failed to read Zakura block-sync serving range");
+            trace.trace_block_range_finished(&peer, start, count, 0);
+            let _ = block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
+                request_id,
+                peer,
+                start_height: start,
+                requested_count: count,
+                returned_count: 0,
+            });
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BlockApplyClass {
     Checkpoint,
@@ -489,105 +591,15 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     }
                 }
             }
-            BlockSyncAction::QueryBlocksByHeightRange {
-                request_id,
-                peer,
-                start,
-                count,
-                max_response_bytes,
-                timeout,
-            } => {
-                trace.trace_block_range_query_started(&peer, start, count);
-                let started = Instant::now();
-                match tokio::time::timeout(
-                    timeout,
-                    read_state
-                        .clone()
-                        .oneshot(zakura_state::ReadRequest::BlocksByHeightRange {
-                            start,
-                            count,
-                            max_response_bytes,
-                        }),
-                )
-                .await
-                {
-                    Ok(Ok(zakura_state::ReadResponse::Blocks(blocks))) => {
-                        trace.trace_block_range_query_succeeded(
-                            &peer,
-                            start,
-                            blocks.len(),
-                            started,
-                        );
-                        trace.trace_block_range_event(
-                            "block_range_response_ready",
-                            &peer,
-                            start,
-                            count,
-                        );
-                        let _ = block_sync.send_control(BlockSyncEvent::BlockRangeResponseReady {
-                            request_id,
-                            peer,
-                            start_height: start,
-                            requested_count: count,
-                            blocks,
-                        });
-                    }
-                    Ok(Ok(response)) => {
-                        trace.trace_block_range_query_failed(
-                            &peer,
-                            start,
-                            count,
-                            "unexpected_response",
-                            started,
-                        );
-                        warn!(?peer, ?response, "unexpected BlocksByHeightRange response");
-                        trace.trace_block_range_finished(&peer, start, count, 0);
-                        let _ =
-                            block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
-                                request_id,
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            });
-                    }
-                    Ok(Err(error)) => {
-                        trace.trace_block_range_query_failed(
-                            &peer,
-                            start,
-                            count,
-                            &format!("{error}"),
-                            started,
-                        );
-                        warn!(
-                            ?peer,
-                            ?error,
-                            "failed to read Zakura Blocks response from state"
-                        );
-                        trace.trace_block_range_finished(&peer, start, count, 0);
-                        let _ =
-                            block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
-                                request_id,
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            });
-                    }
-                    Err(_elapsed) => {
-                        trace.trace_block_range_query_timed_out(&peer, start, count, started);
-                        warn!(?peer, "timed out reading Zakura block-sync serving range");
-                        trace.trace_block_range_finished(&peer, start, count, 0);
-                        let _ =
-                            block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
-                                request_id,
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            });
-                    }
-                }
+            query @ BlockSyncAction::QueryBlocksByHeightRange { .. } => {
+                // Each task owns an admitted query slot. Do not abort it on response
+                // timeout: the state service may still be running blocking work.
+                tokio::spawn(serve_block_range(
+                    query,
+                    read_state.clone(),
+                    block_sync.clone(),
+                    trace.clone(),
+                ));
             }
             BlockSyncAction::SubmitBlock {
                 owner,

@@ -334,6 +334,12 @@ pub(super) struct PeerRoutine {
     /// hard bounds fill, the routine holds one decoded request and stops reading
     /// until capacity returns rather than dropping it or growing this queue.
     queued_serving: VecDeque<PendingGetBlocksRequest>,
+    /// One decoded request waiting for queue ownership. Further reads pause while
+    /// completions, cancellation, and the local backpressure deadline stay live.
+    pending_input: Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = PendingGetBlocksRequest> + Send + Sync>>,
+    >,
+    pending_input_deadline: Option<time::Instant>,
     serving: GetBlocksServingSession,
     sequencer_view: watch::Receiver<SequencerView>,
     /// Last `reset_epoch` that this routine processed.
@@ -419,6 +425,8 @@ impl PeerRoutine {
             routine_to_reactor,
             pending_serving: None,
             queued_serving: VecDeque::new(),
+            pending_input: None,
+            pending_input_deadline: None,
             serving,
             sequencer_view,
             last_reset_epoch,
@@ -458,13 +466,16 @@ impl PeerRoutine {
             Notified::enable(capacity.as_mut());
             Notified::enable(available.as_mut());
 
-            let retry_filter_deadline = if self.session.outbound_capacity() > 0 {
-                self.try_fill().await
-            } else {
-                None
-            };
+            let retry_filter_deadline =
+                if self.session.outbound_capacity() > 0 && self.pending_input.is_none() {
+                    self.try_fill().await
+                } else {
+                    None
+                };
             let outbound_queue_has_capacity = self.session.outbound_capacity() > 0;
             let serving_pending = self.pending_serving.is_some();
+            let input_pending = self.pending_input.is_some();
+            let input_deadline = self.pending_input_deadline;
             // Track the start of the current continuous outbound-full stretch so the
             // liveness check can bound the write-congestion grace: a peer that stopped
             // reading holds this full until `outbound_full_since` ages past
@@ -503,7 +514,21 @@ impl PeerRoutine {
                         Ok(ServingAdmissionOutcome::Cancelled) | Err(_) => return Ok(()),
                     }
                 }
-                frame = self.recv.recv(), if outbound_queue_has_capacity => {
+                request = async {
+                    self.pending_input.as_mut().expect("the input wait is enabled only while pending").await
+                }, if input_pending => {
+                    self.pending_input = None;
+                    self.pending_input_deadline = None;
+                    self.enqueue_serving_request(request);
+                }
+                () = async {
+                    time::sleep_until(input_deadline.expect("a pending input has a local deadline")).await;
+                }, if input_pending => {
+                    metrics::counter!("sync.block.serving.backpressure_timeout").increment(1);
+                    tracing::debug!(peer = ?self.peer, "closing locally backpressured block-sync session");
+                    return Ok(());
+                }
+                frame = self.recv.recv(), if outbound_queue_has_capacity && !input_pending => {
                     match frame {
                         // Decode the frame and run the download/serving dispatch
                         // in this same task. A protocol reject propagates out so
@@ -524,7 +549,7 @@ impl PeerRoutine {
                         Err(_) => return Ok(()),
                     }
                 }
-                _ = &mut timeout => self.handle_deadlines(Instant::now()).await?,
+                _ = &mut timeout, if !input_pending => self.handle_deadlines(Instant::now()).await?,
                 _ = &mut capacity => {
                     self.trace_wake("budget_capacity");
                 }
@@ -599,7 +624,7 @@ impl PeerRoutine {
                 count,
             } => {
                 if self.received_status {
-                    self.retain_serving_request(start_height, count).await?;
+                    self.retain_serving_request(start_height, count);
                 } else {
                     self.report_misbehavior(BlockSyncMisbehavior::GetBlocksSpam)
                         .await;
@@ -641,43 +666,32 @@ impl PeerRoutine {
         ));
     }
 
-    /// Retain a request within the peer and node pending-input bounds.
-    ///
-    /// The routine can continue decoding download responses while a bounded
-    /// backlog waits for serving resources. At the hard backlog limit, it holds
-    /// this one already-decoded request and applies transport backpressure until
-    /// the exact blocking bound releases capacity.
-    async fn retain_serving_request(
-        &mut self,
-        start_height: block::Height,
-        count: u32,
-    ) -> Result<(), SinkReject> {
-        let request = loop {
-            match self.serving.try_retain_input(start_height, count) {
-                Ok(request) => break request,
-                Err(blocked) => {
-                    self.record_pending_input_delay(&blocked);
-                    let wait = blocked.wait();
-                    tokio::pin!(wait);
-                    tokio::select! {
-                        biased;
-                        () = self.cancel.cancelled() => return Ok(()),
-                        () = &mut wait => {}
-                    }
-                }
+    /// Queue a request or install a bounded wait without suspending the routine.
+    fn retain_serving_request(&mut self, start_height: block::Height, count: u32) {
+        match self.serving.try_retain_input(start_height, count) {
+            Ok(request) => self.enqueue_serving_request(request),
+            Err(blocked) => {
+                self.record_pending_input_delay(&blocked);
+                let serving = self.serving.clone();
+                self.pending_input = Some(Box::pin(async move {
+                    serving.retain_input(start_height, count).await
+                }));
+                self.pending_input_deadline =
+                    Some(time::Instant::now() + self.config.request_timeout);
             }
-        };
+        }
+    }
 
+    fn enqueue_serving_request(&mut self, request: PendingGetBlocksRequest) {
         if self.pending_serving.is_some() {
             self.queued_serving.push_back(request);
         } else {
             debug_assert!(
                 self.queued_serving.is_empty(),
-                "queued serving requests always have one active admission owner"
+                "queued requests have an admission owner"
             );
             self.start_serving_admission(request);
         }
-        Ok(())
     }
 
     fn record_pending_input_delay(&self, blocked: &PendingInputBlocked) {
@@ -2340,8 +2354,13 @@ async fn admit_and_forward_get_blocks(
     cancel: CancellationToken,
     mut done: oneshot::Sender<ServingAdmissionOutcome>,
 ) {
+    let mut acquired_slot = None;
     loop {
-        let attempt = match serving.try_admit(request.count()) {
+        let admission = match acquired_slot.take() {
+            Some(slot) => serving.try_admit_with_slot(request.count(), Some(slot)),
+            None => serving.try_admit(request.count()),
+        };
+        let attempt = match admission {
             Ok(attempt) => attempt,
             Err(blocked) => {
                 metrics::counter!(
@@ -2363,7 +2382,10 @@ async fn admit_and_forward_get_blocks(
                         return;
                     }
                     () = done.closed() => return,
-                    () = &mut wait => continue,
+                    slot = &mut wait => {
+                        acquired_slot = slot;
+                        continue;
+                    }
                 }
             }
         };

@@ -11980,9 +11980,10 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
         .await
         .expect("GetBlocks frame queues");
 
-    let request_id = loop {
+    let (request_id, lease) = loop {
         match next_action(&mut actions).await {
             BlockSyncAction::QueryBlocksByHeightRange {
+                lease,
                 request_id,
                 peer,
                 start,
@@ -11992,7 +11993,7 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
                 assert_eq!(peer, peer_id);
                 assert_eq!(start, block::Height(1));
                 assert_eq!(count, 2);
-                break request_id;
+                break (request_id, lease);
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before block range query: {action:?}"),
@@ -12001,6 +12002,7 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
 
     handle
         .send(BlockSyncEvent::BlockRangeResponseReady {
+            lease,
             request_id,
             peer: peer_id.clone(),
             start_height: block::Height(1),
@@ -14070,6 +14072,7 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
         ..ZakuraBlockSyncConfig::default()
     };
     config.peer_limits.outbound_queue_depth = 16;
+    config.get_blocks_regulation.peer_pending_requests = 1;
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
@@ -14094,9 +14097,8 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
         MAX_BS_RESPONSE_BYTES,
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
 
-    for _ in 0..2 {
+    for _ in 0..4 {
         inbound_tx
             .send(
                 BlockSyncMessage::GetBlocks {
@@ -14162,6 +14164,33 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
         "local serving pressure must not produce a protocol rejection",
     );
 
+    let mut previous = second_request_id;
+    for _ in 0..2 {
+        handle
+            .send(BlockSyncEvent::BlockRangeResponseFinished {
+                request_id: previous,
+                peer: peer_id.clone(),
+                start_height: block::Height(1),
+                requested_count: 1,
+                returned_count: 1,
+            })
+            .await
+            .expect("completion releases admission for the next queued request");
+        let next = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let BlockSyncAction::QueryBlocksByHeightRange { request_id, .. } =
+                    next_action(&mut actions).await
+                {
+                    break request_id;
+                }
+            }
+        })
+        .await
+        .expect("a full pending queue continues processing completions");
+        assert_ne!(previous, next);
+        previous = next;
+    }
+    assert_eq!(handle.peer_snapshot().outbound_peers, 1);
     reactor_task.abort();
 }
 
@@ -14415,11 +14444,12 @@ async fn stale_state_completion_cannot_serve_through_a_replacement_session() {
         },
     )
     .await;
-    let old_request_id = loop {
-        if let BlockSyncAction::QueryBlocksByHeightRange { request_id, .. } =
-            next_action(&mut actions).await
+    let (old_request_id, lease) = loop {
+        if let BlockSyncAction::QueryBlocksByHeightRange {
+            lease, request_id, ..
+        } = next_action(&mut actions).await
         {
-            break request_id;
+            break (request_id, lease);
         }
     };
 
@@ -14441,18 +14471,21 @@ async fn stale_state_completion_cannot_serve_through_a_replacement_session() {
         )
         .await;
     await_until(
-        "the replaced serving ledger releases its permit",
+        "the replacement cancels old query delivery",
         Duration::from_secs(1),
-        || {
-            let snapshot = wiring.serving_regulator.snapshot();
-            snapshot.node_active == 0 && snapshot.node_outstanding == 0
-        },
+        || lease.is_cancelled(),
     )
     .await
-    .expect("replacement settles the old session's serving request");
+    .expect("replacement closes the old ledger");
+    assert_eq!(
+        wiring.serving_regulator.snapshot().node_active,
+        1,
+        "the outstanding state result still owns its query capacity"
+    );
 
     handle
         .send(BlockSyncEvent::BlockRangeResponseReady {
+            lease,
             request_id: old_request_id,
             peer: peer_id,
             start_height: block::Height(1),
@@ -14797,9 +14830,10 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         )
         .await
         .expect("GetBlocks frame queues");
-    let first_request_id = loop {
+    let (first_request_id, lease) = loop {
         match next_action(&mut actions).await {
             BlockSyncAction::QueryBlocksByHeightRange {
+                lease,
                 request_id,
                 peer,
                 start,
@@ -14809,7 +14843,7 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
                 assert_eq!(peer, peer_id);
                 assert_eq!(start, block::Height(1));
                 assert_eq!(count, 3);
-                break request_id;
+                break (request_id, lease);
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before block range query: {action:?}"),
@@ -14827,6 +14861,7 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         .collect();
     handle
         .send(BlockSyncEvent::BlockRangeResponseReady {
+            lease,
             request_id: first_request_id,
             peer: peer_id.clone(),
             start_height: block::Height(1),
@@ -14887,9 +14922,10 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         )
         .await
         .expect("re-request GetBlocks frame queues");
-    let second_request_id = loop {
+    let (second_request_id, lease) = loop {
         match next_action(&mut actions).await {
             BlockSyncAction::QueryBlocksByHeightRange {
+                lease,
                 request_id,
                 start,
                 count,
@@ -14897,7 +14933,7 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
             } => {
                 assert_eq!(start, block::Height(1));
                 assert_eq!(count, 1);
-                break request_id;
+                break (request_id, lease);
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before re-request query: {action:?}"),
@@ -14905,6 +14941,7 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
     };
     handle
         .send(BlockSyncEvent::BlockRangeResponseReady {
+            lease,
             request_id: second_request_id,
             peer: peer_id.clone(),
             start_height: block::Height(1),
@@ -14981,11 +15018,12 @@ async fn closed_serving_queue_releases_request_ownership() {
         },
     )
     .await;
-    let request_id = loop {
-        if let BlockSyncAction::QueryBlocksByHeightRange { request_id, .. } =
-            next_action(&mut actions).await
+    let (request_id, lease) = loop {
+        if let BlockSyncAction::QueryBlocksByHeightRange {
+            lease, request_id, ..
+        } = next_action(&mut actions).await
         {
-            break request_id;
+            break (request_id, lease);
         }
     };
     assert_eq!(wiring.serving_regulator.snapshot().node_active, 1);
@@ -14993,6 +15031,7 @@ async fn closed_serving_queue_releases_request_ownership() {
     drop(outbound_rx);
     handle
         .send(BlockSyncEvent::BlockRangeResponseReady {
+            lease,
             request_id,
             peer: peer_id,
             start_height: block::Height(1),

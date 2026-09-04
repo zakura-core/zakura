@@ -93,6 +93,8 @@ pub enum BlockSyncEvent {
     },
     /// State returned committed bodies requested by a peer and the reactor should send them.
     BlockRangeResponseReady {
+        /// Keep the returned blocks charged until the reactor consumes or drops them.
+        lease: BlockRangeQueryLease,
         /// Exact inbound request being completed.
         request_id: BlockRangeRequestId,
         /// Peer whose inbound request is being served.
@@ -321,6 +323,8 @@ pub enum BlockSyncAction {
     },
     /// Ask node wiring to read committed bodies for an inbound `GetBlocks`.
     QueryBlocksByHeightRange {
+        /// Resource ownership to retain through the actual state read and response.
+        lease: BlockRangeQueryLease,
         /// Exact inbound request identity to echo in the response event.
         request_id: BlockRangeRequestId,
         /// Peer that requested the range.
@@ -331,7 +335,8 @@ pub enum BlockSyncAction {
         count: u32,
         /// Maximum total encoded block-body bytes the state result may contain.
         max_response_bytes: u32,
-        /// Maximum time the state query may retain this request.
+        /// Response deadline. The driver retains capacity until the underlying
+        /// state future completes, including after this timeout.
         timeout: Duration,
     },
     /// Parent-first body ready for B3's verifier/commit driver.

@@ -603,12 +603,16 @@ async fn drive_mock_block_sync_actions(
                         .await;
                 }
                 BlockSyncAction::QueryBlocksByHeightRange {
+                    lease,
                     request_id,
                     peer,
                     start,
                     count,
                     ..
                 } => {
+                    if !lease.try_start() {
+                        continue;
+                    }
                     let blocks = corpus.blocks_in_range(start, count, servable_high);
                     let response_bytes = blocks
                         .iter()
@@ -616,6 +620,7 @@ async fn drive_mock_block_sync_actions(
                     stats.record_request(blocks.len(), response_bytes);
                     let _ = handle
                         .send(BlockSyncEvent::BlockRangeResponseReady {
+                            lease,
                             request_id,
                             peer,
                             start_height: start,

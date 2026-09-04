@@ -6,9 +6,12 @@
 //! response capacity is refunded, while bytes actually queued for a peer remain
 //! owned by transport frame leases until their writes finish or are dropped.
 
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Weak;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use super::{config::*, wire::MAX_BS_BLOCKS_PER_REQUEST, *};
 use crate::zakura::regulation::{
@@ -329,13 +332,13 @@ impl GetBlocksServingSession {
             .resources
             .pending
             .try_reserve()
-            .ok_or_else(|| PendingInputBlocked::session(self.resources.pending.clone()))?;
+            .ok_or_else(PendingInputBlocked::session)?;
         let node = self
             .regulator
             .inner
             .node_pending
             .try_reserve()
-            .ok_or_else(|| PendingInputBlocked::node(self.regulator.inner.node_pending.clone()))?;
+            .ok_or_else(PendingInputBlocked::node)?;
         Ok(PendingGetBlocksRequest {
             start_height,
             count,
@@ -345,10 +348,36 @@ impl GetBlocksServingSession {
         })
     }
 
+    /// Wait for pending ownership while the routine continues processing completions.
+    pub(super) async fn retain_input(
+        &self,
+        start_height: block::Height,
+        count: u32,
+    ) -> PendingGetBlocksRequest {
+        let session = self.resources.pending.reserve().await;
+        let node = self.regulator.inner.node_pending.reserve().await;
+        PendingGetBlocksRequest {
+            start_height,
+            count,
+            _session: session,
+            _node: node,
+            _resources: self.resources.clone(),
+        }
+    }
+
     /// Try every work bound once, rolling back earlier reservations on a block.
     pub(super) fn try_admit(
         &self,
         requested_count: u32,
+    ) -> Result<AdmissionAttempt, AdmissionBlocked> {
+        self.try_admit_with_slot(requested_count, None)
+    }
+
+    /// Reuse a slot delivered by a fair waiter in the next complete admission attempt.
+    pub(super) fn try_admit_with_slot(
+        &self,
+        requested_count: u32,
+        mut acquired: Option<AcquiredAdmissionSlot>,
     ) -> Result<AdmissionAttempt, AdmissionBlocked> {
         let cost = match serving_cost(&self.regulator.inner.config, requested_count) {
             Ok(cost) => cost,
@@ -362,20 +391,13 @@ impl GetBlocksServingSession {
             &self.regulator.inner.node_rate,
             cost.charge,
         )?;
-        let peer_active = self.resources.active.try_reserve().ok_or_else(|| {
-            AdmissionBlocked::slot(BoundKind::PeerActive, self.resources.active.clone())
-        })?;
-        let node_active = self
-            .regulator
-            .inner
-            .node_active
-            .try_reserve()
-            .ok_or_else(|| {
-                AdmissionBlocked::slot(
-                    BoundKind::NodeActive,
-                    self.regulator.inner.node_active.clone(),
-                )
-            })?;
+        let peer_active =
+            reserve_slot(BoundKind::PeerActive, &self.resources.active, &mut acquired)?;
+        let node_active = reserve_slot(
+            BoundKind::NodeActive,
+            &self.regulator.inner.node_active,
+            &mut acquired,
+        )?;
         let node_outstanding = reserve_outstanding(
             BoundKind::NodeOutstanding,
             &self.regulator.inner.node_outstanding,
@@ -414,6 +436,29 @@ impl GetBlocksServingSession {
     }
 }
 
+/// A slot assigned to this session's pending admission, retained until its retry.
+#[derive(Debug)]
+pub(super) struct AcquiredAdmissionSlot {
+    kind: BoundKind,
+    permit: SlotPermit,
+}
+
+fn reserve_slot(
+    kind: BoundKind,
+    budget: &SlotBudget,
+    acquired: &mut Option<AcquiredAdmissionSlot>,
+) -> Result<SlotPermit, AdmissionBlocked> {
+    if acquired.as_ref().is_some_and(|slot| slot.kind == kind) {
+        return Ok(acquired
+            .take()
+            .expect("the matching slot was just checked")
+            .permit);
+    }
+    budget
+        .try_reserve()
+        .ok_or_else(|| AdmissionBlocked::slot(kind, budget.clone()))
+}
+
 fn reserve_rate(
     kind: BoundKind,
     budget: &RateBudget,
@@ -441,7 +486,6 @@ fn reserve_outstanding(
 #[derive(Clone, Debug)]
 pub(super) struct PendingInputBlocked {
     kind: PendingBoundKind,
-    budget: SlotBudget,
 }
 
 /// Scope of a retained-request capacity delay.
@@ -454,17 +498,15 @@ pub(super) enum PendingBoundKind {
 }
 
 impl PendingInputBlocked {
-    fn session(budget: SlotBudget) -> Self {
+    fn session() -> Self {
         Self {
             kind: PendingBoundKind::Session,
-            budget,
         }
     }
 
-    fn node(budget: SlotBudget) -> Self {
+    fn node() -> Self {
         Self {
             kind: PendingBoundKind::Node,
-            budget,
         }
     }
 
@@ -474,11 +516,6 @@ impl PendingInputBlocked {
             PendingBoundKind::Session => "session_pending",
             PendingBoundKind::Node => "node_pending",
         }
-    }
-
-    /// Wait for the exact capacity bound that rejected the preceding attempt.
-    pub(super) async fn wait(self) {
-        self.budget.wait_for().await;
     }
 }
 
@@ -576,7 +613,7 @@ impl AdmissionBlocked {
     }
 
     /// Wait only for the bound that blocked the previous atomic attempt.
-    pub(super) async fn wait(self) {
+    pub(super) async fn wait(self) -> Option<AcquiredAdmissionSlot> {
         match self.wait {
             AdmissionWait::Rate { budget, bytes } => budget
                 .wait_for(bytes)
@@ -586,8 +623,14 @@ impl AdmissionBlocked {
                 .wait_for(bytes)
                 .await
                 .expect("validated GetBlocks response fits the outstanding budget"),
-            AdmissionWait::Slot(budget) => budget.wait_for().await,
+            AdmissionWait::Slot(budget) => {
+                return Some(AcquiredAdmissionSlot {
+                    kind: self.kind,
+                    permit: budget.reserve().await,
+                })
+            }
         }
+        None
     }
 }
 
@@ -635,20 +678,23 @@ impl AdmissionAttempt {
             .expect("validated GetBlocks charge contains its request overhead");
         metrics::counter!("sync.block.serving.admitted").increment(1);
         GetBlocksServingPermit {
-            peer: self.peer,
-            session_id: self.session_id,
-            request_id: None,
-            request_overhead: self.request_overhead,
-            response_cap: self.response_cap,
-            transferred: 0,
-            peer_rate,
-            node_rate,
-            node_outstanding: self.node_outstanding,
-            peer_outstanding: self.peer_outstanding,
-            _peer_active: self._peer_active,
-            _node_active: self._node_active,
-            _peer_rate_account: self._peer_rate_account,
-            _session_resources: self._session_resources,
+            cancelled: CancellationToken::new(),
+            resources: Arc::new(StdMutex::new(ServingResources {
+                peer: self.peer,
+                session_id: self.session_id,
+                request_id: None,
+                request_overhead: self.request_overhead,
+                response_cap: self.response_cap,
+                transferred: 0,
+                peer_rate,
+                node_rate,
+                node_outstanding: self.node_outstanding,
+                peer_outstanding: self.peer_outstanding,
+                _peer_active: self._peer_active,
+                _node_active: self._node_active,
+                _peer_rate_account: self._peer_rate_account,
+                _session_resources: self._session_resources,
+            })),
         }
     }
 }
@@ -657,6 +703,12 @@ impl AdmissionAttempt {
 #[derive(Debug)]
 #[must_use = "the serving ledger must retain this permit until request settlement"]
 pub(super) struct GetBlocksServingPermit {
+    cancelled: CancellationToken,
+    resources: Arc<StdMutex<ServingResources>>,
+}
+
+#[derive(Debug)]
+struct ServingResources {
     peer: ZakuraPeerId,
     session_id: u64,
     request_id: Option<BlockRangeRequestId>,
@@ -673,7 +725,7 @@ pub(super) struct GetBlocksServingPermit {
     _session_resources: Arc<SessionResources>,
 }
 
-impl GetBlocksServingPermit {
+impl ServingResources {
     /// Bind the reactor request identity exactly once for diagnostics.
     pub(super) fn bind_request_id(&mut self, request_id: BlockRangeRequestId) {
         assert!(
@@ -720,7 +772,7 @@ impl GetBlocksServingPermit {
     }
 }
 
-impl Drop for GetBlocksServingPermit {
+impl Drop for ServingResources {
     fn drop(&mut self) {
         let refunded = self.response_cap.saturating_sub(self.transferred);
         metrics::counter!("sync.block.serving.refunded_bytes").increment(refunded);
@@ -734,6 +786,104 @@ impl Drop for GetBlocksServingPermit {
             "settled regulated GetBlocks request"
         );
     }
+}
+
+impl GetBlocksServingPermit {
+    pub(super) fn bind_request_id(&mut self, request_id: BlockRangeRequestId) {
+        self.resources
+            .lock()
+            .expect("a panic in serving accounting invalidates its balances")
+            .bind_request_id(request_id);
+    }
+
+    pub(super) fn can_transfer_frame(&self, bytes: u64) -> bool {
+        self.resources
+            .lock()
+            .expect("a panic in serving accounting invalidates its balances")
+            .can_transfer_frame(bytes)
+    }
+
+    pub(super) fn transfer_frame(&mut self, bytes: u64) -> FrameLease {
+        self.resources
+            .lock()
+            .expect("a panic in serving accounting invalidates its balances")
+            .transfer_frame(bytes)
+    }
+
+    /// Share capacity with the dispatched query and its response, without charging twice.
+    pub(super) fn query_lease(&self) -> BlockRangeQueryLease {
+        BlockRangeQueryLease {
+            _resources: self.resources.clone(),
+            cancelled: self.cancelled.clone(),
+            started: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn refunded_response_bytes(&self) -> u64 {
+        self.resources
+            .lock()
+            .expect("test accounting is not poisoned")
+            .refunded_response_bytes()
+    }
+}
+
+impl Drop for GetBlocksServingPermit {
+    fn drop(&mut self) {
+        self.cancelled.cancel();
+    }
+}
+
+/// Capacity retained by a serving query and its completed response.
+///
+/// The driver must claim a query once, retain this lease until its underlying
+/// state future completes (even after a response timeout), and transfer it to
+/// `BlockRangeResponseReady` with the returned blocks. Clones share the same
+/// charge and cannot start additional queries. Ledger removal cancels delivery,
+/// but resources return only after the last ledger, worker, and result owner drops.
+#[derive(Clone, Debug)]
+pub struct BlockRangeQueryLease {
+    _resources: Arc<StdMutex<ServingResources>>,
+    cancelled: CancellationToken,
+    started: Arc<AtomicBool>,
+}
+
+impl BlockRangeQueryLease {
+    /// Claim the only execution of this query, unless its ledger already closed.
+    pub fn try_start(&self) -> bool {
+        !self.cancelled.is_cancelled()
+            && self
+                .started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    /// Whether the request no longer has a live delivery owner.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.is_cancelled()
+    }
+
+    /// Wait for the ledger to close. This does not cancel an active state read.
+    pub async fn cancelled(&self) {
+        self.cancelled.cancelled().await;
+    }
+}
+
+#[cfg(any(test, feature = "zakura-testkit"))]
+pub(crate) fn query_lease_for_test() -> BlockRangeQueryLease {
+    let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
+    let session = regulator.session(
+        ZakuraPeerId::new(vec![0; 32]).expect("a 32-byte test identity fits"),
+        0,
+    );
+    let permit = session
+        .try_admit(1)
+        .expect("the test budget is initially full")
+        .commit();
+    let mut lease = permit.query_lease();
+    // Standalone driver fixtures have no reactor ledger to signal cancellation.
+    lease.cancelled = CancellationToken::new();
+    lease
 }
 
 #[cfg(test)]
@@ -754,6 +904,174 @@ mod tests {
 
     fn peer(byte: u8) -> ZakuraPeerId {
         ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds")
+    }
+
+    #[test]
+    fn query_and_result_keep_capacity_after_the_ledger_closes() {
+        let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
+        let session = regulator.session(peer(8), 8);
+        let permit = session
+            .try_admit(1)
+            .expect("the initial request fits")
+            .commit();
+        let query = permit.query_lease();
+        assert!(query.try_start());
+        assert!(
+            !query.clone().try_start(),
+            "cloning a query never authorizes another read"
+        );
+        let result = query.clone();
+        let charged = regulator.snapshot().node_outstanding;
+        drop(permit);
+        assert!(query.is_cancelled());
+        assert_eq!(regulator.snapshot().node_active, 1);
+        assert_eq!(regulator.snapshot().node_outstanding, charged);
+        drop(query);
+        assert_eq!(regulator.snapshot().node_outstanding, charged);
+        drop(result);
+        assert_eq!(regulator.snapshot().node_active, 0);
+        assert_eq!(regulator.snapshot().node_outstanding, 0);
+    }
+
+    #[test]
+    fn closed_ledger_prevents_queued_query_execution() {
+        let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
+        let session = regulator.session(peer(9), 9);
+        let permit = session
+            .try_admit(1)
+            .expect("the initial request fits")
+            .commit();
+        let query = permit.query_lease();
+        drop(permit);
+        assert!(!query.try_start());
+        drop(query);
+        assert_eq!(regulator.snapshot().node_active, 0);
+    }
+
+    #[tokio::test]
+    async fn admission_consumes_the_slot_delivered_to_its_waiter() {
+        use futures::poll;
+
+        let mut config = ZakuraBlockSyncConfig::default();
+        config.get_blocks_regulation.node_active_requests = 1;
+        let regulator = GetBlocksServingRegulator::new(config);
+        let session = regulator.session(peer(10), 10);
+        let owner = session.try_admit(1).expect("one request fits").commit();
+        let blocked = session.try_admit(1).expect_err("the active slot is owned");
+        assert_eq!(blocked.kind(), BoundKind::NodeActive);
+        let wait = blocked.wait();
+        tokio::pin!(wait);
+        assert!(poll!(&mut wait).is_pending());
+        drop(owner);
+        let acquired = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("released capacity reaches its waiter");
+        let admitted = session
+            .try_admit_with_slot(1, acquired)
+            .expect("the retry retains its assigned slot")
+            .commit();
+        assert_eq!(regulator.snapshot().node_active, 1);
+        drop(admitted);
+        assert_eq!(regulator.snapshot().node_active, 0);
+    }
+
+    /// A fixed application-path measurement, intentionally outside the fast test lane.
+    /// It uses real serialized blocks and a promptly draining in-memory transport.
+    #[tokio::test]
+    #[ignore = "local measurement; run explicitly with --ignored --nocapture"]
+    #[allow(clippy::print_stderr)] // explicit measurement output for the local operator
+    async fn serving_fixed_workload_measurement() {
+        let vectors = &*zakura_test::vectors::MAINNET_BLOCKS;
+        let smallest = vectors
+            .iter()
+            .filter(|(height, _)| **height > 0)
+            .min_by_key(|(_, bytes)| bytes.len())
+            .unwrap();
+        let largest = vectors.iter().max_by_key(|(_, bytes)| bytes.len()).unwrap();
+        let mut cases = Vec::new();
+        for (label, (height, bytes)) in [("small", smallest), ("large", largest)] {
+            cases.push((
+                label,
+                block::Height(*height),
+                Arc::new(
+                    block::Block::zcash_deserialize(*bytes)
+                        .expect("committed block fixture decodes"),
+                ),
+                bytes.len(),
+            ));
+        }
+        // Reuse the existing fixed-shape serialization fixture. It is not a
+        // consensus-validation fixture and contributes no generated event histories.
+        let corpus = crate::zakura::testkit::SyntheticBlockCorpus::generate(
+            1,
+            1,
+            crate::zakura::testkit::SyntheticBlockShape {
+                target_block_bytes: Some(1_999_000),
+            },
+        );
+        cases.push((
+            "near_limit",
+            block::Height(1),
+            corpus.block_at(block::Height(1)).unwrap(),
+            corpus.size_at(block::Height(1)).unwrap(),
+        ));
+        for (label, height, body, body_bytes) in cases {
+            for peers in [1u8, 4] {
+                for regulated in [false, true] {
+                    let regulator =
+                        GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
+                    let mut sessions = Vec::new();
+                    for index in 0..peers {
+                        let identity = peer(index);
+                        let (send, recv) = crate::zakura::transport::framed_channel(2);
+                        sessions.push((
+                            regulator.session(identity.clone(), u64::from(index)),
+                            BlockSyncPeerSession::for_test(
+                                identity,
+                                send,
+                                CancellationToken::new(),
+                            ),
+                            recv,
+                        ));
+                    }
+                    let started = Instant::now();
+                    for _ in 0..32 {
+                        for (policy, session, receiver) in &mut sessions {
+                            if regulated {
+                                let mut acquired = None;
+                                let attempt = loop {
+                                    match policy.try_admit_with_slot(1, acquired.take()) {
+                                        Ok(attempt) => break attempt,
+                                        Err(blocked) => acquired = blocked.wait().await,
+                                    }
+                                };
+                                let mut permit = attempt.commit();
+                                session
+                                    .try_send_regulated_block(body.clone(), &mut permit)
+                                    .expect("the reader drained its previous response");
+                                session
+                                    .try_send_regulated_blocks_done(height, 1, &mut permit)
+                                    .expect("the terminal frame fits");
+                            } else {
+                                session
+                                    .try_send_block(body.clone())
+                                    .expect("the reader drained its previous response");
+                                session
+                                    .try_send_blocks_done(height, 1)
+                                    .expect("the terminal frame fits");
+                            }
+                            let received = receiver.recv().await.expect("the block was queued");
+                            assert_eq!(received.payload.len(), body_bytes + 1);
+                            assert!(receiver.recv().await.is_some());
+                        }
+                    }
+                    let elapsed = started.elapsed();
+                    assert_eq!(regulator.snapshot().node_outstanding, 0);
+                    assert_eq!(regulator.snapshot().node_active, 0);
+                    eprintln!("serving_measurement block={label} body_bytes={} peers={peers} responses={} regulated={regulated} elapsed_ms={:.3}", body_bytes, u32::from(peers) * 32, elapsed.as_secs_f64() * 1000.0);
+                }
+            }
+        }
     }
 
     #[test]

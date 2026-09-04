@@ -285,15 +285,20 @@ fn spawn_action_driver(
                     }
                 }
                 BlockSyncAction::QueryBlocksByHeightRange {
+                    lease,
                     request_id,
                     peer,
                     start,
                     count,
                     ..
                 } => {
+                    if !lease.try_start() {
+                        continue;
+                    }
                     let blocks = corpus.blocks_in_range(start, count, target);
                     if handle
                         .send(BlockSyncEvent::BlockRangeResponseReady {
+                            lease,
                             request_id,
                             peer,
                             start_height: start,

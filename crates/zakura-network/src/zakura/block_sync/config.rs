@@ -347,8 +347,8 @@ pub struct ZakuraBlockSyncConfig {
 /// Node and peer bounds applied before GetBlocks state work starts.
 ///
 /// Rate budgets bound bursts and sustained work. Outstanding-byte budgets do
-/// not refill; capacity returns only when a request settles or its queued frame
-/// leaves the application-owned transport path.
+/// not refill; capacity returns when the last ledger, query, or result owner
+/// drops, or when its queued frame leaves the application-owned transport path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetBlocksRegulationConfig {
@@ -368,11 +368,13 @@ pub struct GetBlocksRegulationConfig {
     pub node_outstanding_bytes: u64,
     /// Decoded GetBlocks requests retained while one peer waits for admission.
     pub peer_pending_requests: usize,
-    /// Decoded GetBlocks requests retained while admission waits across all peers.
+    /// Fully retained GetBlocks queue entries across all peers. A full queue
+    /// additionally permits one blocked decoded input per live session.
     pub node_pending_requests: usize,
     /// State queries and responses that may remain active across all peers.
     pub node_active_requests: usize,
-    /// Maximum time state may retain an admitted request before responding.
+    /// Response deadline for a state query. Timed-out reads keep their resource
+    /// charges until the underlying state work finishes.
     #[serde(with = "humantime_serde")]
     pub query_timeout: Duration,
 }

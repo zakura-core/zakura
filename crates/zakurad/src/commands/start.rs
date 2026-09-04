@@ -2610,8 +2610,22 @@ mod zakura_header_sync_driver_tests {
             zakura_network::zakura::spawn_block_sync_reactor(startup);
         let (query_seen_tx, query_seen_rx) = oneshot::channel();
         let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let finish = Arc::new(Mutex::new(Some(finish_rx)));
+        let (read_dropped_tx, mut read_dropped_rx) = oneshot::channel();
+        let read_dropped = Arc::new(Mutex::new(Some(read_dropped_tx)));
+        struct ReadLifetime(Option<oneshot::Sender<()>>);
+        impl Drop for ReadLifetime {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
         let read_state = BoxCloneService::new(service_fn(move |request| {
             let query_seen = query_seen.clone();
+            let finish = finish.clone();
+            let read_dropped = read_dropped.clone();
             async move {
                 match request {
                     zakura_state::ReadRequest::BlocksByHeightRange { .. } => {
@@ -2622,10 +2636,21 @@ mod zakura_header_sync_driver_tests {
                         {
                             let _ = query_seen.send(());
                         }
-                        future::pending::<
-                            Result<zakura_state::ReadResponse, zakura_state::BoxError>,
-                        >()
-                        .await
+                        let _lifetime = ReadLifetime(
+                            read_dropped
+                                .lock()
+                                .expect("test signal mutex is not poisoned")
+                                .take(),
+                        );
+                        let finish = finish
+                            .lock()
+                            .expect("test gate mutex is not poisoned")
+                            .take()
+                            .expect("one state read owns the gate");
+                        finish
+                            .await
+                            .expect("the test completes the underlying read");
+                        Ok(zakura_state::ReadResponse::Blocks(Vec::new()))
                     }
                     request => panic!("unexpected read request while timing out: {request:?}"),
                 }
@@ -2645,6 +2670,7 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                lease: zakura_network::zakura::testkit::block_range_query_lease(),
                 request_id: BlockRangeRequestId::new(99).expect("99 is nonzero"),
                 peer: test_zakura_peer(99),
                 start: block::Height(7),
@@ -2674,6 +2700,21 @@ mod zakura_header_sync_driver_tests {
                     (cs_trace::REQUESTED_COUNT, TraceValue::U64(1)),
                 ],
             );
+
+        assert!(
+            matches!(
+                read_dropped_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "the response timeout must retain the underlying state future"
+        );
+        finish_tx
+            .send(())
+            .expect("the state future still owns its completion gate");
+        tokio::time::timeout(Duration::from_secs(1), read_dropped_rx)
+            .await
+            .expect("the completed state future releases ownership")
+            .expect("the read lifetime guard reports completion");
 
         let _ = shutdown_tx.send(());
         driver.await.expect("driver exits after the query timeout");
@@ -4230,6 +4271,7 @@ mod zakura_header_sync_driver_tests {
             .expect("driver action channel stays open");
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                lease: zakura_network::zakura::testkit::block_range_query_lease(),
                 request_id: BlockRangeRequestId::new(1).expect("one is nonzero"),
                 peer: test_zakura_peer(77),
                 start: block::Height(1),
@@ -4356,6 +4398,7 @@ mod zakura_header_sync_driver_tests {
             .expect("fallback acquires the lease after the apply drains");
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                lease: zakura_network::zakura::testkit::block_range_query_lease(),
                 request_id: BlockRangeRequestId::new(2).expect("two is nonzero"),
                 peer: test_zakura_peer(78),
                 start: block::Height(1),
@@ -4433,6 +4476,7 @@ mod zakura_header_sync_driver_tests {
         // Send a serving query to Zakura.
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                lease: zakura_network::zakura::testkit::block_range_query_lease(),
                 request_id: BlockRangeRequestId::new(3).expect("three is nonzero"),
                 peer: test_zakura_peer(79),
                 start: block::Height(1),
@@ -4525,6 +4569,7 @@ mod zakura_header_sync_driver_tests {
         }
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
+                lease: zakura_network::zakura::testkit::block_range_query_lease(),
                 request_id: BlockRangeRequestId::new(4).expect("four is nonzero"),
                 peer: test_zakura_peer(80),
                 start: block::Height(1),

@@ -1570,8 +1570,7 @@ impl BlockSyncReactor {
         }
 
         let Some(request_id) = self.next_serving_request_id else {
-            let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
-            self.send_range_unavailable(&peer, start_height, unavailable_count);
+            self.send_range_unavailable(&peer, start_height, count);
             return;
         };
         self.next_serving_request_id = request_id
@@ -1584,18 +1583,17 @@ impl BlockSyncReactor {
                 local_inflight_cap,
                 request_id,
                 start_height,
+                count,
                 requested_count,
             )
         });
         if !started_serving {
-            let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
-            self.send_range_unavailable(&peer, start_height, unavailable_count);
+            self.send_range_unavailable(&peer, start_height, count);
             return;
         }
 
         if requested_count == 0 {
-            let unavailable_count = count.min(inbound_get_blocks_count_limit(&self.startup.config));
-            self.send_range_unavailable(&peer, start_height, unavailable_count);
+            self.send_range_unavailable(&peer, start_height, count);
             self.finish_serving_blocks(&peer, request_id, start_height);
             return;
         }
@@ -1621,6 +1619,7 @@ impl BlockSyncReactor {
         let Some(request) = self.serving_block_request(&peer, request_id, start_height) else {
             return;
         };
+        let original_count = request.original_count();
         let requested_count = request.requested_count();
         if reported_requested_count != requested_count {
             tracing::warn!(
@@ -1669,7 +1668,7 @@ impl BlockSyncReactor {
         }
 
         if sent_blocks == 0 {
-            self.send_range_unavailable(&peer, start_height, requested_count);
+            self.send_range_unavailable(&peer, start_height, original_count);
         } else {
             self.send_blocks_done(&peer, start_height, sent_blocks);
         }
@@ -1702,6 +1701,7 @@ impl BlockSyncReactor {
         let Some(request) = self.finish_serving_blocks(&peer, request_id, start_height) else {
             return;
         };
+        let original_count = request.original_count();
         let requested_count = request.requested_count();
         if reported_requested_count != requested_count {
             tracing::warn!(
@@ -1714,7 +1714,7 @@ impl BlockSyncReactor {
         }
         let elapsed = request.elapsed();
         if returned_count == 0 {
-            self.send_range_unavailable(&peer, start_height, requested_count);
+            self.send_range_unavailable(&peer, start_height, original_count);
         }
         self.trace_range_response_sent(
             &peer,

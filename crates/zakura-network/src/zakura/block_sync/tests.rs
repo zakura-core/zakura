@@ -12024,8 +12024,54 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
     inbound_tx
         .send(
             BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 10,
+            }
+            .encode_frame()
+            .expect("GetBlocks frame encodes"),
+        )
+        .await
+        .expect("GetBlocks frame queues");
+
+    let request_id = loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::QueryBlocksByHeightRange {
+                request_id,
+                peer,
+                start,
+                count,
+            } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(start, block::Height(1));
+                assert_eq!(count, 2);
+                break request_id;
+            }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before empty block range result: {action:?}"),
+        }
+    };
+
+    handle
+        .send(BlockSyncEvent::BlockRangeResponseFinished {
+            request_id,
+            peer: peer_id.clone(),
+            start_height: block::Height(1),
+            requested_count: 2,
+            returned_count: 0,
+        })
+        .await
+        .expect("empty block response queues");
+    assert_eq!(
+        wait_for_outbound_range_unavailable(&mut outbound_rx).await,
+        (block::Height(1), 10),
+        "RangeUnavailable echoes the wire count rather than the clamped state-query count"
+    );
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::GetBlocks {
                 start_height: block::Height(4),
-                count: 1,
+                count: 10,
             }
             .encode_frame()
             .expect("GetBlocks frame encodes"),
@@ -12035,7 +12081,8 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
 
     assert_eq!(
         wait_for_outbound_range_unavailable(&mut outbound_rx).await,
-        (block::Height(4), 1)
+        (block::Height(4), 10),
+        "RangeUnavailable echoes the original wire count after the servable-range clamp"
     );
 
     reactor_task.abort();

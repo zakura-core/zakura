@@ -585,7 +585,7 @@ async fn gb_wf_08_maximum_start_and_count_are_safe_to_serve() {
             .recv_timeout(Duration::from_secs(1))
             .await
             .expect("initial Status decodes"),
-        Some(BlockSyncMessage::Status(_))
+        crate::zakura::testkit::SyntheticBlockSyncReceive::Message(BlockSyncMessage::Status(_))
     ));
     synthetic_peer
         .try_send(BlockSyncMessage::Status(BlockSyncStatus {

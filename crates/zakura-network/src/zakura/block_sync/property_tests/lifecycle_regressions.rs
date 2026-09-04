@@ -19,7 +19,7 @@ use super::super::events::RoutineToReactor;
 use super::super::peer;
 use crate::zakura::{
     framed_channel,
-    testkit::{SyntheticBlockSyncPeer, SyntheticBlockSyncPeers},
+    testkit::{SyntheticBlockSyncPeer, SyntheticBlockSyncPeers, SyntheticBlockSyncReceive},
     Peer, Service, ServicePeerDirection, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
 };
 use zakura_chain::block;
@@ -369,13 +369,41 @@ fn gb_sm_17_superseded_routine_request_cannot_reach_replacement_session() {
                 "the superseded request must not produce another action"
             );
             assert!(
-                replacement_peer
-                    .recv_timeout(Duration::from_millis(1))
-                    .await
-                    .expect("the replacement outbound remains decodable")
-                    .is_none(),
+                matches!(
+                    replacement_peer
+                        .recv_timeout(Duration::from_millis(1))
+                        .await
+                        .expect("the replacement outbound remains decodable"),
+                    SyntheticBlockSyncReceive::TimedOut,
+                ),
                 "the superseded request must not send a frame to the replacement"
             );
+            assert!(
+                !replacement_peer.cancel_token().is_cancelled(),
+                "the superseded request must not cancel the replacement"
+            );
+
+            replacement_peer
+                .try_send(BlockSyncMessage::GetBlocks {
+                    start_height: block::Height(4),
+                    count: 1,
+                })
+                .expect("the replacement remains able to send GetBlocks");
+            let later_request = next_serving_request(&mut intercepted_messages).await;
+            live_routine_sender
+                .send(later_request)
+                .await
+                .expect("the replacement's later request reaches the reactor");
+            assert!(matches!(
+                replacement_peer
+                    .recv_timeout(Duration::from_secs(1))
+                    .await
+                    .expect("the replacement receives a later response"),
+                SyntheticBlockSyncReceive::Message(BlockSyncMessage::RangeUnavailable {
+                    start_height: block::Height(4),
+                    count: 1,
+                }),
+            ));
 
             reactor_task.abort();
             let _ = reactor_task.await;
@@ -388,7 +416,7 @@ async fn expect_initial_status(peer: &mut SyntheticBlockSyncPeer) {
         peer.recv_timeout(Duration::from_secs(1))
             .await
             .expect("the initial outbound frame decodes"),
-        Some(BlockSyncMessage::Status(_)),
+        SyntheticBlockSyncReceive::Message(BlockSyncMessage::Status(_)),
     ));
 }
 

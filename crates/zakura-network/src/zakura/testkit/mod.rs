@@ -18,7 +18,9 @@ mod trace_capture;
 mod trace_reader;
 mod wait;
 
-pub use block_sync_peer::{SyntheticBlockSyncPeer, SyntheticBlockSyncPeers};
+pub use block_sync_peer::{
+    SyntheticBlockSyncPeer, SyntheticBlockSyncPeers, SyntheticBlockSyncReceive,
+};
 pub use clock::{Clock, RealClock, TestClock};
 pub use cluster::{ClusterTopology, ZakuraTestCluster};
 pub use endpoint::LocalEndpointFactory;

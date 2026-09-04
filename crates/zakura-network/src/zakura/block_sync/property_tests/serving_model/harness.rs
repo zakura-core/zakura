@@ -28,6 +28,7 @@ use super::{
 use crate::zakura::{
     testkit::{
         SyntheticBlockCorpus, SyntheticBlockShape, SyntheticBlockSyncPeer, SyntheticBlockSyncPeers,
+        SyntheticBlockSyncReceive,
     },
     ServicePeerDirection, ServicePeerLimits, ServicePeerSnapshot, ZakuraPeerId,
 };
@@ -547,12 +548,19 @@ async fn observe(
 
     for (session, peer) in sessions.iter_mut() {
         loop {
-            let message = peer
+            let received = peer
                 .recv_timeout(Duration::from_nanos(1))
                 .await
                 .map_err(|error| format!("outbound frame decode failed: {error}"))?;
-            let Some(message) = message else {
-                break;
+            let message = match received {
+                SyntheticBlockSyncReceive::Message(message) => message,
+                SyntheticBlockSyncReceive::TimedOut => break,
+                SyntheticBlockSyncReceive::Closed if peer.cancel_token().is_cancelled() => break,
+                SyntheticBlockSyncReceive::Closed => {
+                    return Err(format!(
+                        "outbound stream closed for live synthetic session {session:?}"
+                    ));
+                }
             };
             match message {
                 BlockSyncMessage::Status(_) => {

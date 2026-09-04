@@ -15,6 +15,17 @@ use crate::zakura::{
     ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
 };
 
+/// Result of waiting for one node-to-peer block-sync message.
+#[derive(Debug)]
+pub enum SyntheticBlockSyncReceive {
+    /// A complete frame was received and decoded.
+    Message(BlockSyncMessage),
+    /// No frame arrived before the requested deadline.
+    TimedOut,
+    /// The node closed its outbound stream.
+    Closed,
+}
+
 /// A connected synthetic block-sync peer backed by in-memory stream channels.
 #[derive(Debug)]
 pub struct SyntheticBlockSyncPeer {
@@ -80,10 +91,13 @@ impl SyntheticBlockSyncPeer {
     pub async fn recv_timeout(
         &mut self,
         duration: Duration,
-    ) -> Result<Option<BlockSyncMessage>, crate::BoxError> {
-        match timeout(duration, self.recv()).await {
-            Ok(result) => result,
-            Err(_) => Ok(None),
+    ) -> Result<SyntheticBlockSyncReceive, crate::BoxError> {
+        match timeout(duration, self.outbound.recv()).await {
+            Ok(Some(frame)) => Ok(SyntheticBlockSyncReceive::Message(
+                BlockSyncMessage::decode_frame(frame)?,
+            )),
+            Ok(None) => Ok(SyntheticBlockSyncReceive::Closed),
+            Err(_) => Ok(SyntheticBlockSyncReceive::TimedOut),
         }
     }
 

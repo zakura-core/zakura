@@ -2,6 +2,7 @@
 """Capacity, artifact compatibility, and partial provisioning regressions."""
 
 import argparse
+import json
 import subprocess
 import unittest
 from datetime import datetime, timezone
@@ -174,6 +175,28 @@ class Selection(unittest.TestCase):
 
 
 class Lifecycle(unittest.TestCase):
+    @patch.object(p.subprocess, "run")
+    def test_json_stdout_capacity_error_is_classified(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            ["doctl"],
+            1,
+            stdout=json.dumps(
+                {
+                    "errors": [
+                        {
+                            "detail": "POST https://api.digitalocean.com/v2/droplets: "
+                            "422 Size is not available in this region"
+                        }
+                    ]
+                }
+            ),
+            stderr="",
+        )
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            p.doctl("droplet", "create", "zakura-pr-test")
+        self.assertTrue(p.capacity_rejection(caught.exception))
+        self.assertEqual(run.call_args.args[0][-1], "0")
+
     def plans(self):
         request = args(
             "--network", "mainnet", "--policy", "correctness", "--regions", "nyc1,sfo3"

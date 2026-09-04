@@ -35,8 +35,21 @@ def doctl(*args):
         capture_output=True,
         text=True,
         timeout=180,
-        check=True,
+        check=False,
     )
+    if result.returncode:
+        # doctl's JSON mode puts API errors on stdout, unlike text mode.
+        message = result.stderr
+        try:
+            errors = json.loads(result.stdout).get("errors", [])
+            message += "\n".join(error["detail"] for error in errors)
+        except (ValueError, AttributeError, KeyError, TypeError):
+            pass
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            result.args,
+            stderr=message or "doctl failed without a structured error",
+        )
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 

@@ -9,8 +9,9 @@ The public `sendrawtransaction` broadcast gateway lives under
 
 ## Cluster Status and Public Ironwood API
 
-`zakura-cluster-status.py` polls authenticated node RPC endpoints over SSH and
-serves both the existing fleet dashboard and a narrow public API:
+`zakura-cluster-status.py` polls managed node RPC endpoints over SSH plus any
+configured read-only chain observers, and serves both the fleet dashboard and a
+narrow public API:
 
 - `GET /ironwood-status.json` returns a fresh, verified website response.
 - `OPTIONS /ironwood-status.json` handles the allow-listed CORS preflight.
@@ -53,20 +54,47 @@ the page does not serve it unless the dashboard runs with `--expose-logs`. These
 dashboards are public and unauthenticated, so log text stays off by default even
 though peer addresses are already redacted on the node.
 
-### Tip Agreement and Orphan Pairs
+### Fork / Uncle Studio
 
-Each poll groups the fleet by `(height, tip hash)`. A single group means the
-nodes agree; several groups at the leading height mean a split, and the
-dashboard labels each node `majority`, `fork`, `ahead`, or `behind`. Fork depth
-between two tips at the same height is estimated from best-chain ancestor
-hashes sampled at 1, 2, 5, 10, and 32 blocks back, so an unresolved fork reports
-`> 32 or unknown` rather than a wrong number.
+The fleet page includes a fork / uncle studio for both mainnet and testnet. It
+keeps the live `(height, tip hash)` lanes for propagation and lag diagnosis, but
+fork alerting uses a stronger comparison. On every poll after warmup, each
+source returns the block hash at one shared absolute height two blocks behind
+the slowest healthy source from the prior poll. Different hashes at that settled
+height prove chain divergence even when both branches keep advancing at
+different heights. An unavailable source produces `partial` or `insufficient`,
+not a false recovery.
+
+The studio shows each settled branch, its source membership, the strict quorum
+candidate when one exists, and sources that could not be compared. Managed
+nodes are polled over SSH as before. Independent read-only RPC sources can be
+added without deployment access:
+
+```toml
+[[chain_observers]]
+name = "testnet-mining-pool"
+rpc_url = "http://38.190.136.75:18232/"
+```
+
+The testnet deploy installs that mining-pool backend as an observer, closing the
+gap where fresh block templates could look healthy while the miner followed a
+minority fork. Mainnet already includes the separately operated
+`zcashd-compat` source in its dashboard cohort.
+
+The live tip view still labels each source `majority`, `fork`, `ahead`, or
+`behind`. Fork depth between two tips at the same height is estimated from
+best-chain ancestor hashes sampled at 1, 2, 5, 10, and 32 blocks back, so an
+unresolved fork reports `> 32 or unknown` rather than a wrong number.
 
 A node whose height drops or whose tip hash changes at the same height records
 an orphan pair: the discarded hash, the new canonical hash, and the depth. Pass
 `--state-file` to persist that history across restarts; the deploy workflows
 point it at `/var/lib/zakura-<network>-dashboard/orphan-pairs.json`. Without the
 flag the history is in-memory only and is lost on every restart.
+
+“Uncle” in the studio is operational shorthand for a block or branch that left
+the observed best chain. Zcash does not reward uncles as Ethereum historically
+did.
 
 ## Fleet Slack Watchdog
 
@@ -90,6 +118,10 @@ The default config in `fleet-watchdog.toml` watches:
 
 Alerts fire only after a sustained condition:
 
+- two or more sources return different hashes at the shared settled height for
+  at least 3 minutes
+- a newly recorded reorg/orphan event is at least 2 blocks deep; one-block tip
+  races remain visible in the studio but do not page
 - `health` is `down` or `rpc_error` for at least 10 minutes
 - one node's height has not advanced for at least 10 minutes
 - every observable node shares one height and block hash for at least 30 minutes,
@@ -103,13 +135,19 @@ watchdog therefore uses the same collector snapshot for the stall condition and
 its diagnostics. The diagnostic object contains no per-node history, logs, or
 addresses.
 
+Fork alerts include the comparison height, every branch hash, source membership,
+and the quorum candidate. They remain latched if a source disappears and clear
+only after a complete comparison agrees again. Identical reorg notifications
+are deduped across sources and limited to events first observed in the prior 10
+minutes, so a watchdog restart does not replay old dashboard history.
+
 The watchdog coalesces a verifiable shared tip into one fleet alert. A missing
 or different block hash keeps the individual node alerts. Down alerts take
 precedence over stalled alerts, so each node has at most one active alert. The
 watchdog posts only on transitions: first failure after the threshold, then
 recovery. Persistent failures do not post every poll.
 
-Slack delivery is **webhook-only**. Set:
+Slack delivery to `#zakura-alerts` is **webhook-only**. Set:
 
 - `SLACK_WEB_HOOK`
 

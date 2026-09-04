@@ -109,6 +109,35 @@ class NodeConfigTests(unittest.TestCase):
 
         self.assertEqual(configured.metrics_endpoint, "127.0.0.1:9999")
 
+    def test_chain_observer_is_loaded_as_a_direct_rpc_source(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+            config.write(
+                '[[nodes]]\nname = "node-a"\nssh_string = "root@node-a"\n'
+                '[[chain_observers]]\nname = "pool"\n'
+                'rpc_url = "https://observer.example/rpc"\n'
+            )
+            config.flush()
+
+            configured = status.load_nodes(Path(config.name))
+
+        observer = configured[1]
+        self.assertEqual(observer.name, "pool")
+        self.assertEqual(observer.source_type, "observer")
+        self.assertEqual(observer.observer_rpc_url, "https://observer.example/rpc")
+        self.assertEqual(observer.ssh_string, "")
+
+    def test_chain_observer_rejects_credentials_in_the_url(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+            config.write(
+                '[[nodes]]\nname = "node-a"\nssh_string = "root@node-a"\n'
+                '[[chain_observers]]\nname = "pool"\n'
+                'rpc_url = "https://user:secret@observer.example/rpc"\n'
+            )
+            config.flush()
+
+            with self.assertRaises(SystemExit):
+                status.load_nodes(Path(config.name))
+
 
 class RemoteProbeTests(unittest.TestCase):
     """Run the probe the way a node does: as a standalone script over stdin.
@@ -214,6 +243,7 @@ zcash_net_peers_connected{user_agent="/Gone:1.0/",remote_version="170160"} 0
             "health_listen_addr": "",
             "state_cache_dir": tempfile.gettempdir(),
             "want_metrics": "1",
+            "comparison_height": "",
         }
         args.update(overrides)
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as handle:
@@ -344,6 +374,25 @@ zcash_net_in_bytes_total 12345
         )
         self.assertNotIn("peer_user_agents", probe)
 
+    def test_settled_comparison_hash_is_read_at_the_requested_height(self):
+        self.rpc_results = {
+            "getblockchaininfo": {
+                "blocks": 100,
+                "headers": 100,
+                "bestblockhash": "a" * 64,
+                "chain": "test",
+            },
+            "getblockhash": "b" * 64,
+        }
+
+        probe = self.run_probe(
+            rpc_url=f"http://{self.endpoint}/",
+            comparison_height="98",
+        )
+
+        self.assertEqual(probe["comparison_height"], 98)
+        self.assertEqual(probe["comparison_hash"], "b" * 64)
+
     def test_metrics_scrape_can_be_skipped(self):
         probe = self.run_probe(metrics_endpoint=self.endpoint, want_metrics="")
 
@@ -423,6 +472,37 @@ zcash_net_in_bytes_total 12345
         self.assertIn("metrics_error", probe)
         self.assertNotIn("metrics", probe)
         self.assertIn("host", probe)
+
+
+class ChainObserverTests(unittest.TestCase):
+    def test_direct_observer_returns_tip_and_settled_hash(self):
+        source = node("pool")
+        source.source_type = "observer"
+        source.probe_kind = "rpc_observer"
+        source.observer_rpc_url = "https://observer.invalid/"
+
+        def rpc(_url, method, params=None):
+            if method == "getblockchaininfo":
+                return {
+                    "blocks": 110,
+                    "headers": 111,
+                    "bestblockhash": "f" * 64,
+                    "chain": "test",
+                }
+            if method == "getblockhash":
+                return f"{params[0]:064x}"
+            if method == "getnetworkinfo":
+                return {"subversion": "/MagicBean:6.2.0/", "version": 6020050}
+            raise AssertionError(method)
+
+        with mock.patch.object(status, "direct_rpc_call", side_effect=rpc):
+            probe = status.probe_node(source, comparison_height=104)
+
+        self.assertEqual(probe["height"], 110)
+        self.assertEqual(probe["comparison_height"], 104)
+        self.assertEqual(probe["comparison_hash"], f"{104:064x}")
+        self.assertEqual(probe["rpc_chain"], "test")
+        self.assertNotIn("rpc_error", probe)
 
 
 class IronwoodStatusTests(unittest.TestCase):
@@ -549,6 +629,161 @@ class IronwoodStatusTests(unittest.TestCase):
 
 
 class TipAgreementTests(unittest.TestCase):
+    def test_comparison_height_uses_the_slowest_healthy_source(self):
+        rows = [
+            {"name": "fast", "height": 110, "health": "healthy"},
+            {"name": "slow", "height": 106, "health": "healthy"},
+            {"name": "stalled", "height": 50, "health": "stale"},
+        ]
+
+        self.assertEqual(status.select_comparison_height(rows, 2), 104)
+
+    def test_settled_hashes_detect_an_advancing_fork_at_different_tips(self):
+        rows = [
+            {
+                "name": "node-a",
+                "source_type": "node",
+                "height": 110,
+                "block_hash": "1" * 64,
+                "comparison_height": 104,
+                "comparison_hash": "a" * 64,
+            },
+            {
+                "name": "node-b",
+                "source_type": "node",
+                "height": 108,
+                "block_hash": "2" * 64,
+                "comparison_height": 104,
+                "comparison_hash": "a" * 64,
+            },
+            {
+                "name": "testnet-mining-pool",
+                "source_type": "observer",
+                "height": 109,
+                "block_hash": "3" * 64,
+                "comparison_height": 104,
+                "comparison_hash": "b" * 64,
+            },
+        ]
+
+        chain = status.compute_chain_summary(rows)
+        status.enrich_chain_roles(rows, chain)
+
+        self.assertEqual(chain["status"], "lagging")
+        self.assertEqual(chain["fork_status"], "diverged")
+        self.assertEqual(chain["comparison_height"], 104)
+        self.assertEqual(chain["quorum_hash"], "a" * 64)
+        self.assertEqual(chain["forked_sources"], ["testnet-mining-pool"])
+        self.assertEqual(
+            {row["name"]: row["settled_role"] for row in rows},
+            {
+                "node-a": "quorum",
+                "node-b": "quorum",
+                "testnet-mining-pool": "fork",
+            },
+        )
+
+    def test_missing_comparison_source_is_partial_not_recovered(self):
+        chain = status.compute_chain_summary(
+            [
+                {
+                    "name": "node-a",
+                    "height": 100,
+                    "block_hash": "1" * 64,
+                    "comparison_height": 98,
+                    "comparison_hash": "a" * 64,
+                },
+                {
+                    "name": "node-b",
+                    "height": 100,
+                    "block_hash": "1" * 64,
+                    "comparison_height": 98,
+                    "comparison_hash": "a" * 64,
+                },
+                {
+                    "name": "pool",
+                    "height": 100,
+                    "block_hash": "1" * 64,
+                    "comparison_height": 98,
+                    "comparison_hash": "",
+                },
+            ]
+        )
+
+        self.assertEqual(chain["fork_status"], "partial")
+        self.assertEqual(chain["unavailable_sources"], ["pool"])
+
+    def test_tied_branches_do_not_claim_a_quorum(self):
+        rows = [
+            {
+                "name": name,
+                "height": 100,
+                "block_hash": "f" * 64,
+                "comparison_height": 98,
+                "comparison_hash": branch * 64,
+            }
+            for name, branch in (
+                ("a", "1"), ("b", "1"), ("c", "2"), ("d", "2")
+            )
+        ]
+
+        chain = status.compute_chain_summary(rows)
+        status.enrich_chain_roles(rows, chain)
+
+        self.assertEqual(chain["fork_status"], "diverged")
+        self.assertEqual(chain["quorum_hash"], "")
+        self.assertEqual({row["settled_role"] for row in rows}, {"candidate"})
+
+    def test_partial_observation_does_not_claim_a_configured_quorum(self):
+        rows = [
+            {
+                "name": name,
+                "height": 100,
+                "block_hash": "f" * 64,
+                "comparison_height": 98,
+                "comparison_hash": branch * 64,
+            }
+            for name, branch in (("a", "1"), ("b", "1"), ("c", "2"))
+        ]
+        rows.append({"name": "unavailable", "rpc_ok": False})
+
+        chain = status.compute_chain_summary(rows)
+        status.enrich_chain_roles(rows, chain)
+
+        self.assertEqual(chain["fork_status"], "diverged")
+        self.assertEqual(chain["comparison_observed"], 3)
+        self.assertEqual(chain["quorum_hash"], "")
+        self.assertEqual(
+            {row["settled_role"] for row in rows if row["name"] != "unavailable"},
+            {"candidate"},
+        )
+
+    def test_invalid_rpc_source_is_not_used_for_settled_agreement(self):
+        chain = status.compute_chain_summary(
+            [
+                {
+                    "name": "node-a",
+                    "height": 100,
+                    "block_hash": "1" * 64,
+                    "comparison_height": 98,
+                    "comparison_hash": "a" * 64,
+                    "rpc_ok": True,
+                },
+                {
+                    "name": "wrong-network",
+                    "height": 100,
+                    "block_hash": "2" * 64,
+                    "comparison_height": 98,
+                    "comparison_hash": "b" * 64,
+                    "rpc_ok": False,
+                },
+            ]
+        )
+
+        self.assertEqual(chain["fork_status"], "insufficient")
+        self.assertEqual(chain["comparison_observed"], 1)
+        self.assertEqual(chain["unavailable_sources"], ["wrong-network"])
+
     def test_classify_tip_event_detects_reorg_signals(self):
         self.assertEqual(
             status.classify_tip_event(None, None, 10, "a" * 64),
@@ -818,6 +1053,12 @@ class ViewSwitchingTests(unittest.TestCase):
 
     def test_page_forces_hidden_elements_to_stay_hidden(self):
         self.assertIn("[hidden] { display: none !important; }", self.page)
+
+    def test_fork_studio_renders_settled_branches_and_orphan_events(self):
+        self.assertIn("Fork / uncle studio", self.page)
+        self.assertIn('id="comparison-groups"', self.page)
+        self.assertIn('id="reorg-list"', self.page)
+        self.assertIn("chain.fork_status", self.page)
 
     def test_every_toggled_section_is_covered_by_the_override(self):
         toggled = re.findall(

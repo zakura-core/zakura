@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Zakura fleet dashboard and narrow public Ironwood status API.
 
-Reads a deploy/deployer nodes TOML, polls each node over SSH, and serves a small
-HTML dashboard showing the running commit, Zakura node ID, restart time, current
-height, latest block hash, tip agreement across the fleet, per-node reorg
-candidates, and whether the node has advanced recently. It also serves a
-deliberately small public Ironwood status response for zakura.com.
+Reads a deploy/deployer nodes TOML, polls managed nodes over SSH and optional
+read-only RPC observers, and serves an HTML dashboard showing process health,
+live tips, settled-height fork agreement, and reorg/orphan candidates. It also
+serves a deliberately small public Ironwood status response for zakura.com.
 
 Only the Python stdlib is used.
 """
@@ -24,6 +23,7 @@ import threading
 import time
 import tomllib
 import urllib.parse
+import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -121,6 +121,8 @@ ALERT_DIAGNOSTIC_METRICS = (
 RECENT_REORG_LIMIT = 40
 # Sampled best-chain ancestor offsets used to estimate fork depth between tips.
 ANCESTOR_DEPTHS = (1, 2, 5, 10, 32)
+DEFAULT_FORK_CONFIRMATIONS = 2
+MAX_RPC_RESPONSE_BYTES = 2 * 1024 * 1024
 
 SSH_COMMON_OPTS = [
     "-o", "BatchMode=yes",
@@ -173,6 +175,8 @@ class Node:
     health_listen_addr: str = ""
     state_cache_dir: str = ""
     port: object = None
+    source_type: str = "node"
+    observer_rpc_url: str = ""
 
     def ssh_cmd(self, *remote: str) -> list[str]:
         cmd = ["ssh", *SSH_COMMON_OPTS]
@@ -225,9 +229,50 @@ def load_nodes(config_path: Path) -> list[Node]:
             )
         )
 
+    for raw in data.get("chain_observers", []):
+        for required in ("name", "rpc_url"):
+            if required not in raw:
+                raise SystemExit(
+                    f"chain observer missing required field '{required}': {raw}"
+                )
+        name = str(raw["name"])
+        if name in seen:
+            raise SystemExit(f"duplicate node or chain observer name: {name}")
+        seen.add(name)
+        observer_rpc_url = validate_observer_rpc_url(str(raw["rpc_url"]))
+        nodes.append(
+            Node(
+                name=name,
+                ssh_string="",
+                probe_kind="rpc_observer",
+                service_name="",
+                bin_path="",
+                log_file="",
+                rpc_listen_addr="",
+                rpc_auth="",
+                rpc_config_path="",
+                rpc_user="",
+                rpc_password="",
+                process_pattern="",
+                container_name="",
+                node_id="",
+                source_type="observer",
+                observer_rpc_url=observer_rpc_url,
+            )
+        )
+
     if not nodes:
         raise SystemExit(f"no [[nodes]] defined in {config_path}")
     return nodes
+
+
+def validate_observer_rpc_url(value: str) -> str:
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise SystemExit(f"chain observer rpc_url must be an http(s) URL: {value}")
+    if parsed.username is not None or parsed.password is not None:
+        raise SystemExit("chain observer rpc_url must not contain credentials")
+    return value
 
 
 def ssh_host(ssh_string: str) -> str:
@@ -301,6 +346,7 @@ import urllib.request
     state_cache_dir,
     want_metrics,
 ) = sys.argv[1:16]
+comparison_height = sys.argv[16] if len(sys.argv) > 16 else ""
 
 out = {
     "service": service,
@@ -851,6 +897,20 @@ if rpc_url:
                         pass
         out["ancestor_hashes"] = ancestor_hashes
 
+        if comparison_height:
+            try:
+                requested_height = int(comparison_height)
+                out["comparison_height"] = requested_height
+                if requested_height < 0 or requested_height > tip_height:
+                    raise ValueError(
+                        "comparison height is outside this source's best chain"
+                    )
+                out["comparison_hash"] = rpc_call(
+                    "getblockhash", [requested_height]
+                )
+            except Exception as error:
+                out["comparison_error"] = str(error)
+
         best_hash = out.get("block_hash")
         if best_hash:
             try:
@@ -951,7 +1011,101 @@ def ssh_capture_script(node: Node, script: str) -> subprocess.CompletedProcess:
     return subprocess.run(node.ssh_cmd("bash", "-s"), input=script, text=True, capture_output=True)
 
 
-def probe_node(node: Node, want_metrics: bool = True) -> dict:
+def direct_rpc_call(url: str, method: str, params: list | None = None):
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": "zakura-chain-observer",
+        "method": method,
+        "params": list(params or []),
+    }).encode()
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "zakura-cluster-status",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=6) as response:
+        payload = json.loads(response.read(MAX_RPC_RESPONSE_BYTES).decode())
+    if not isinstance(payload, dict):
+        raise RuntimeError("RPC returned a non-object response")
+    if payload.get("error"):
+        raise RuntimeError(str(payload["error"]))
+    return payload.get("result")
+
+
+def probe_chain_observer(node: Node, comparison_height: int | None) -> dict:
+    """Read the chain identity from a direct, read-only JSON-RPC observer."""
+    out = {
+        "active_state": "active",
+        "process_running": True,
+        "probe_kind": node.probe_kind,
+        "metrics_error": "metrics are not collected for RPC observers",
+        "health_error": "health endpoint is not collected for RPC observers",
+    }
+    try:
+        info = direct_rpc_call(node.observer_rpc_url, "getblockchaininfo")
+        if not isinstance(info, dict):
+            raise RuntimeError("getblockchaininfo returned a non-object result")
+        out.update({
+            "height": info.get("blocks"),
+            "headers": info.get("headers"),
+            "block_hash": info.get("bestblockhash"),
+            "rpc_chain": info.get("chain"),
+            "rpc_testnet": info.get("chain") == "test",
+        })
+        try:
+            tip_height = int(info.get("blocks"))
+        except (TypeError, ValueError):
+            tip_height = None
+
+        if comparison_height is not None:
+            if (
+                comparison_height < 0
+                or tip_height is None
+                or comparison_height > tip_height
+            ):
+                out["comparison_error"] = (
+                    "comparison height is outside this source's best chain"
+                )
+            else:
+                out["comparison_height"] = comparison_height
+                out["comparison_hash"] = direct_rpc_call(
+                    node.observer_rpc_url,
+                    "getblockhash",
+                    [comparison_height],
+                )
+
+    except Exception as error:
+        out["rpc_error"] = str(error)
+        return out
+
+    try:
+        network_info = direct_rpc_call(node.observer_rpc_url, "getnetworkinfo")
+        if isinstance(network_info, dict):
+            out["client_name"] = str(
+                network_info.get("subversion") or "RPC observer"
+            ).strip("/")
+            out["client_version"] = str(network_info.get("version") or "")
+    except Exception as error:
+        out["rpc_metadata_error"] = str(error)
+    return out
+
+
+def probe_node(
+    node: Node,
+    want_metrics: bool = True,
+    comparison_height: int | None = None,
+) -> dict:
+    if node.source_type == "observer":
+        result = probe_chain_observer(node, comparison_height)
+        if comparison_height is not None:
+            result.setdefault("comparison_height", comparison_height)
+        return result
+
     rpc_url = rpc_url_for(node.rpc_listen_addr)
     script = (
         "python3 - "
@@ -969,18 +1123,31 @@ def probe_node(node: Node, want_metrics: bool = True) -> dict:
         f"{shlex.quote(node.metrics_endpoint)} "
         f"{shlex.quote(node.health_listen_addr)} "
         f"{shlex.quote(node.state_cache_dir)} "
-        f"{shlex.quote('1' if want_metrics else '')} <<'PY'\n"
+        f"{shlex.quote('1' if want_metrics else '')} "
+        f"{shlex.quote(str(comparison_height) if comparison_height is not None else '')} <<'PY'\n"
         f"{REMOTE_PROBE}\n"
         "PY\n"
     )
     proc = ssh_capture_script(node, script)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
-        return {"error": detail or f"ssh exited {proc.returncode}"}
+        result = {"error": detail or f"ssh exited {proc.returncode}"}
+        if comparison_height is not None:
+            result["comparison_height"] = comparison_height
+        return result
     try:
-        return json.loads(proc.stdout.strip().splitlines()[-1])
+        result = json.loads(proc.stdout.strip().splitlines()[-1])
+        if comparison_height is not None:
+            result.setdefault("comparison_height", comparison_height)
+        return result
     except (IndexError, json.JSONDecodeError) as error:
-        return {"error": f"invalid probe output: {error}", "raw": proc.stdout.strip()}
+        result = {
+            "error": f"invalid probe output: {error}",
+            "raw": proc.stdout.strip(),
+        }
+        if comparison_height is not None:
+            result["comparison_height"] = comparison_height
+        return result
 
 
 class RateLimiter:
@@ -1032,6 +1199,7 @@ class ClusterCollector:
         history_window: float = DEFAULT_NODE_HISTORY_WINDOW,
         expose_logs: bool = False,
         metrics_min_interval: float | None = None,
+        fork_confirmations: int = DEFAULT_FORK_CONFIRMATIONS,
     ):
         self.nodes = nodes
         self.interval = interval
@@ -1042,6 +1210,7 @@ class ClusterCollector:
         self.expose_logs = expose_logs
         # None selects the adaptive interval; a number pins it.
         self.metrics_min_interval = metrics_min_interval
+        self.fork_confirmations = fork_confirmations
         self.nodes_by_name = {node.name: node for node in nodes}
         self.history: dict[str, deque[dict]] = {node.name: deque() for node in nodes}
         # Last successful scrape per node, reused on the polls that skip it.
@@ -1070,6 +1239,7 @@ class ClusterCollector:
                 "name": node.name,
                 "ssh": node.ssh_string,
                 "node_id": node.node_id,
+                "source_type": node.source_type,
                 "health": "starting",
                 "healthy": False,
             }
@@ -1085,9 +1255,18 @@ class ClusterCollector:
     def poll_once(self) -> None:
         rows = []
         started = time.time()
+        with self.lock:
+            comparison_height = select_comparison_height(
+                self.rows, self.fork_confirmations
+            )
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(self.nodes))) as pool:
             futures = {
-                pool.submit(probe_node, node, self.should_scrape_metrics(node.name, started)): node
+                pool.submit(
+                    probe_node,
+                    node,
+                    self.should_scrape_metrics(node.name, started),
+                    comparison_height,
+                ): node
                 for node in self.nodes
             }
             for future in concurrent.futures.as_completed(futures):
@@ -1216,6 +1395,8 @@ class ClusterCollector:
         block_hash = str(probe.get("block_hash") or "")
         ancestor_hashes = normalize_ancestor_hashes(probe.get("ancestor_hashes"))
         previous_block_hash = str(probe.get("previous_hash") or "")
+        comparison_height = coerce_int(probe.get("comparison_height"))
+        comparison_hash = str(probe.get("comparison_hash") or "")
 
         advanced = False
         tip_event = None
@@ -1269,7 +1450,11 @@ class ClusterCollector:
         active_state = probe.get("active_state") or "unknown"
         process_running = probe.get("process_running")
         service_active = active_state == "active" and process_running is not False
-        rpc_ok = height is not None and not probe.get("rpc_error")
+        rpc_chain_ok = (
+            node.source_type != "observer"
+            or probe.get("rpc_chain") == RPC_CHAIN_NAMES[self.network]
+        )
+        rpc_ok = height is not None and not probe.get("rpc_error") and rpc_chain_ok
         recent = (
             seconds_since_advanced is not None
             and seconds_since_advanced <= self.stale_after
@@ -1287,7 +1472,13 @@ class ClusterCollector:
             detail = f"systemd state: {active_state}"
         elif not rpc_ok:
             health = "rpc_error"
-            detail = str(probe.get("rpc_error") or "RPC height unavailable")
+            if not rpc_chain_ok:
+                detail = (
+                    f"RPC chain {probe.get('rpc_chain')!r} does not match "
+                    f"{RPC_CHAIN_NAMES[self.network]!r}"
+                )
+            else:
+                detail = str(probe.get("rpc_error") or "RPC height unavailable")
         elif not recent:
             health = "stale"
             detail = "height has not advanced within stale window"
@@ -1340,6 +1531,7 @@ class ClusterCollector:
         return {
             "name": node.name,
             "ssh": node.ssh_string,
+            "source_type": node.source_type,
             "healthy": healthy,
             "health": health,
             "detail": detail,
@@ -1347,6 +1539,9 @@ class ClusterCollector:
             "block_hash": block_hash,
             "previous_hash": previous_block_hash,
             "ancestor_hashes": ancestor_hashes,
+            "comparison_height": comparison_height,
+            "comparison_hash": comparison_hash,
+            "comparison_error": probe.get("comparison_error"),
             "node_id": node.node_id or probe.get("node_id") or "",
             "version": probe.get("version") or "",
             "last_restarted": probe.get("last_restarted") or "",
@@ -1355,6 +1550,7 @@ class ClusterCollector:
             "header_lag": header_lag,
             "tip_event": tip_event,
             "chain_role": "unknown",
+            "settled_role": "unknown",
             "active_state": active_state,
             "rpc_ok": rpc_ok,
             "last_seen_at": now,
@@ -1409,6 +1605,9 @@ class ClusterCollector:
             last_poll = self.last_poll
             chain = dict(self.chain)
             chain["tip_groups"] = [dict(group) for group in chain.get("tip_groups", [])]
+            chain["comparison_groups"] = [
+                dict(group) for group in chain.get("comparison_groups", [])
+            ]
             chain["recent_reorgs"] = [
                 dict(event) for event in chain.get("recent_reorgs", [])
             ]
@@ -1418,6 +1617,7 @@ class ClusterCollector:
             "last_poll": last_poll,
             "stale_after": self.stale_after,
             "network": self.network,
+            "fork_confirmations": self.fork_confirmations,
             "healthy": healthy,
             "total": len(rows),
             "chain": chain,
@@ -1611,6 +1811,15 @@ def empty_chain_summary() -> dict:
         "max_height": None,
         "observed_tips": 0,
         "tip_groups": [],
+        "fork_status": "warming",
+        "comparison_height": None,
+        "comparison_observed": 0,
+        "comparison_expected": 0,
+        "comparison_groups": [],
+        "quorum_hash": "",
+        "quorum_count": 0,
+        "forked_sources": [],
+        "unavailable_sources": [],
         "recent_reorgs": [],
     }
 
@@ -1786,6 +1995,126 @@ def tipped_rows(rows: list[dict]) -> list[dict]:
     ]
 
 
+def select_comparison_height(rows: list[dict], confirmations: int) -> int | None:
+    """Choose one settled height that every advancing source should have."""
+    heights = [
+        height
+        for row in rows
+        if row.get("health") == "healthy"
+        if (height := coerce_int(row.get("height"))) is not None
+    ]
+    if not heights:
+        return None
+    return max(0, min(heights) - max(0, confirmations))
+
+
+def settled_chain_summary(rows: list[dict]) -> dict:
+    expected_names = sorted(str(row.get("name") or "unknown") for row in rows)
+    heights = [
+        height
+        for row in rows
+        if (height := coerce_int(row.get("comparison_height"))) is not None
+    ]
+    if not heights:
+        return {
+            "fork_status": "warming",
+            "comparison_height": None,
+            "comparison_observed": 0,
+            "comparison_expected": len(rows),
+            "comparison_groups": [],
+            "quorum_hash": "",
+            "quorum_count": 0,
+            "forked_sources": [],
+            "unavailable_sources": expected_names,
+        }
+
+    # A collector poll requests one absolute height from every source. Choosing
+    # the most common value keeps hand-built/test snapshots deterministic and
+    # treats a mismatched response as unavailable instead of comparing unlike
+    # blocks.
+    counts: dict[int, int] = defaultdict(int)
+    for height in heights:
+        counts[height] += 1
+    comparison_height = max(counts, key=lambda height: (counts[height], height))
+
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        if row.get("rpc_ok") is False:
+            continue
+        if coerce_int(row.get("comparison_height")) != comparison_height:
+            continue
+        block_hash = str(row.get("comparison_hash") or "")
+        if not block_hash:
+            continue
+        groups[block_hash].append(row)
+
+    comparison_groups = []
+    for block_hash, group_rows in groups.items():
+        names = sorted(str(row.get("name") or "unknown") for row in group_rows)
+        observers = sorted(
+            str(row.get("name") or "unknown")
+            for row in group_rows
+            if row.get("source_type") == "observer"
+        )
+        comparison_groups.append({
+            "block_hash": block_hash,
+            "nodes": names,
+            "observers": observers,
+            "count": len(names),
+            "role": "candidate",
+        })
+    comparison_groups.sort(
+        key=lambda group: (group["count"], group["block_hash"]),
+        reverse=True,
+    )
+
+    observed = sum(group["count"] for group in comparison_groups)
+    available = {
+        name for group in comparison_groups for name in group.get("nodes", [])
+    }
+    unavailable = sorted(set(expected_names) - available)
+    quorum = (
+        comparison_groups[0]
+        if comparison_groups and comparison_groups[0]["count"] > len(rows) / 2
+        else None
+    )
+    if quorum is not None:
+        quorum["role"] = "quorum"
+        for group in comparison_groups[1:]:
+            group["role"] = "fork"
+
+    if len(comparison_groups) > 1:
+        fork_status = "diverged"
+    elif observed < 2:
+        fork_status = "insufficient"
+    elif unavailable:
+        fork_status = "partial"
+    else:
+        fork_status = "agreed"
+
+    forked_sources = (
+        sorted(
+            name
+            for group in comparison_groups
+            if group.get("role") == "fork"
+            for name in group.get("nodes", [])
+        )
+        if quorum is not None
+        else []
+    )
+    return {
+        "fork_status": fork_status,
+        "comparison_height": comparison_height,
+        "comparison_observed": observed,
+        "comparison_expected": len(rows),
+        "comparison_groups": comparison_groups,
+        "quorum_hash": quorum["block_hash"] if quorum else "",
+        "quorum_count": quorum["count"] if quorum else 0,
+        "forked_sources": forked_sources,
+        "unavailable_sources": unavailable,
+    }
+
+
 def compute_chain_summary(
     rows: list[dict],
     recent_reorgs: list[dict] | None = None,
@@ -1852,7 +2181,7 @@ def compute_chain_summary(
                 group["fork_depth"] = behind
                 group["fork_depth_label"] = f"{behind} behind"
 
-    return {
+    summary = {
         "status": status,
         "split": split,
         "majority_height": majority["height"] if majority else None,
@@ -1862,6 +2191,8 @@ def compute_chain_summary(
         "tip_groups": tip_groups,
         "recent_reorgs": list(recent_reorgs or []),
     }
+    summary.update(settled_chain_summary(rows))
+    return summary
 
 
 def enrich_chain_roles(rows: list[dict], chain: dict) -> None:
@@ -1882,6 +2213,22 @@ def enrich_chain_roles(rows: list[dict], chain: dict) -> None:
             row["chain_role"] = "ahead"
         else:
             row["chain_role"] = "behind"
+
+        comparison_height = chain.get("comparison_height")
+        comparison_hash = row.get("comparison_hash") or ""
+        quorum_hash = chain.get("quorum_hash") or ""
+        if (
+            comparison_height is None
+            or row.get("comparison_height") != comparison_height
+            or not comparison_hash
+        ):
+            row["settled_role"] = "unavailable"
+        elif not quorum_hash:
+            row["settled_role"] = "candidate"
+        elif comparison_hash == quorum_hash:
+            row["settled_role"] = "quorum"
+        else:
+            row["settled_role"] = "fork"
 
 
 def public_error(network: str, code: str) -> dict:
@@ -2255,6 +2602,53 @@ button { font: inherit; }
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
+.fork-explainer {
+  margin: -4px 0 14px;
+  color: var(--muted);
+  font-size: 0.79rem;
+  line-height: 1.5;
+}
+.branch-studio {
+  position: relative;
+  display: grid;
+  gap: 10px;
+  padding-left: 28px;
+}
+.branch-studio::before {
+  content: '';
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--line-hi);
+}
+.branch-group { position: relative; }
+.branch-group::before {
+  content: '';
+  position: absolute;
+  left: -20px;
+  top: 24px;
+  width: 20px;
+  height: 2px;
+  background: var(--line-hi);
+}
+.branch-group::after {
+  content: '';
+  position: absolute;
+  left: -24px;
+  top: 20px;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--dim);
+  border-radius: 50%;
+  background: var(--surface);
+}
+.branch-group.is-majority::after { border-color: var(--ok); }
+.branch-group.is-fork::after { border-color: var(--bad); }
+.branch-group.is-candidate::after { border-color: var(--warn); }
+.fork-missing { margin-top: 10px; color: var(--warn); font-size: 0.78rem; }
 .subhead {
   display: flex;
   align-items: center;
@@ -2551,7 +2945,7 @@ footer {
     <div class="card-head">
       <div>
         <p class="eyebrow">Fleet health</p>
-        <h2>Nodes reporting</h2>
+        <h2>Sources reporting</h2>
       </div>
       <span class="badge" id="client-mix">...</span>
     </div>
@@ -2580,6 +2974,16 @@ footer {
 
   <section class="stats" data-view="fleet">
     <div class="stat">
+      <span class="label">Settled agreement</span>
+      <div class="stat-value" id="fork-agreement">...</div>
+      <small id="fork-agreement-detail">...</small>
+    </div>
+    <div class="stat">
+      <span class="label">Comparison block</span>
+      <div class="stat-value mono" id="comparison-height">...</div>
+      <small id="comparison-hash">...</small>
+    </div>
+    <div class="stat">
       <span class="label">Tip agreement</span>
       <div class="stat-value" id="tip-agreement">...</div>
       <small id="tip-agreement-detail">...</small>
@@ -2604,26 +3008,31 @@ footer {
   <section class="panel pad" data-view="fleet">
     <div class="section-head">
       <div>
-        <p class="eyebrow">Chain tips</p>
-        <h2>Tip agreement across the fleet</h2>
+        <p class="eyebrow">Fork / uncle studio</p>
+        <h2>Settled chain agreement</h2>
       </div>
-      <p class="section-note" id="chain-summary">Waiting for first poll...</p>
+      <p class="section-note" id="fork-summary">Waiting for first comparison...</p>
     </div>
+    <p class="fork-explainer" id="fork-explainer">The studio compares every source at one shared block height behind the live tips, avoiding alerts for ordinary propagation races.</p>
+    <div class="branch-studio" id="comparison-groups"></div>
+    <div class="fork-missing" id="comparison-missing"></div>
+    <div class="subhead"><p class="eyebrow">Live tip lanes</p></div>
+    <p class="section-note" id="chain-summary">Waiting for first poll...</p>
     <div class="tip-groups" id="tip-groups"></div>
-    <div class="subhead"><p class="eyebrow">Orphan pairs</p></div>
+    <div class="subhead"><p class="eyebrow">Reorg / orphan events</p></div>
     <div class="reorg-list" id="reorg-list"></div>
   </section>
 
   <section class="panel pad" data-view="fleet">
     <div class="section-head">
       <div>
-        <p class="eyebrow">Live node status</p>
-        <h2 id="table-title">Fleet</h2>
+        <p class="eyebrow">Live source status</p>
+        <h2 id="table-title">Sources</h2>
       </div>
       <div class="toolbar">
         <label class="search">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.6-3.6"></path></svg>
-          <input id="filter-input" type="search" placeholder="Filter node, commit, hash, detail" autocomplete="off" spellcheck="false">
+          <input id="filter-input" type="search" placeholder="Filter source, commit, hash, detail" autocomplete="off" spellcheck="false">
         </label>
         <button class="ghost-button" id="issues-toggle" type="button">Issues only</button>
         <button class="ghost-button" id="expand-toggle" type="button">Expand all</button>
@@ -2633,7 +3042,7 @@ footer {
       <table>
         <thead>
           <tr>
-            <th class="col-node sortable" data-sort="name">Node<span class="arrow"></span></th>
+            <th class="col-node sortable" data-sort="name">Source<span class="arrow"></span></th>
             <th class="col-health sortable" data-sort="health">Health<span class="arrow"></span></th>
             <th class="col-chain sortable" data-sort="chain_role">Chain<span class="arrow"></span></th>
             <th class="col-height col-num sortable" data-sort="height">Height<span class="arrow"></span></th>
@@ -2833,9 +3242,13 @@ const HEALTH_TONE = {
   healthy: 'ok', stale: 'warn', rpc_error: 'bad', down: 'bad', starting: 'neutral',
 };
 const CHAIN_TONE = {
-  majority: 'ok', behind: 'warn', ahead: 'warn', fork: 'bad', unknown: 'neutral',
+  majority: 'ok', quorum: 'ok', behind: 'warn', ahead: 'warn', candidate: 'warn',
+  unavailable: 'warn', fork: 'bad', unknown: 'neutral',
 };
 const STATUS_TONE = { agreed: 'ok', lagging: 'warn', split: 'bad', unknown: 'neutral' };
+const FORK_STATUS_TONE = {
+  agreed: 'ok', diverged: 'bad', partial: 'warn', insufficient: 'warn', warming: 'neutral',
+};
 const HEALTH_LABEL = { rpc_error: 'rpc error' };
 function tone(map, value) { return map[value] || 'neutral'; }
 function badge(text, toneName) {
@@ -2849,6 +3262,12 @@ function tipEventLabel(event) {
 }
 function chainStatusLabel(status) {
   return { agreed: 'Agreed', lagging: 'Lagging', split: 'Split' }[status] || 'Unknown';
+}
+function forkStatusLabel(status) {
+  return {
+    agreed: 'Agreed', diverged: 'Fork detected', partial: 'Partial',
+    insufficient: 'Insufficient', warming: 'Warming up',
+  }[status] || 'Unknown';
 }
 
 /* ---------- copy to clipboard ---------- */
@@ -2899,7 +3318,10 @@ function renderHeader(data) {
 
   let label = 'Healthy';
   let toneName = 'ok';
-  if (chain.status === 'split') {
+  if (chain.fork_status === 'diverged') {
+    label = 'Fork detected';
+    toneName = 'bad';
+  } else if (chain.status === 'split') {
     label = 'Tip split';
     toneName = 'bad';
   } else if (data.healthy !== data.total) {
@@ -2937,8 +3359,8 @@ function renderFleet(data) {
   el('healthy-count').textContent = data.healthy + ' / ' + data.total;
   const unhealthy = data.total - data.healthy;
   el('healthy-sub').textContent = unhealthy === 0
-    ? 'every node is active, serving RPC, and advancing'
-    : unhealthy + ' node' + (unhealthy === 1 ? '' : 's') + ' need attention';
+    ? 'every source is serving RPC and advancing'
+    : unhealthy + ' source' + (unhealthy === 1 ? '' : 's') + ' need attention';
 
   const order = ['healthy', 'stale', 'rpc_error', 'down', 'starting'];
   const present = order.filter((key) => counts[key]);
@@ -2990,13 +3412,27 @@ function pickWorst(rows, pick) {
 function renderStats(data) {
   const chain = data.chain || {};
   const status = chain.status || 'unknown';
+  const forkStatus = chain.fork_status || 'warming';
   const tipGroups = chain.tip_groups || [];
   const reorgs = chain.recent_reorgs || [];
+
+  el('fork-agreement').innerHTML = badge(
+    forkStatusLabel(forkStatus), tone(FORK_STATUS_TONE, forkStatus));
+  el('fork-agreement-detail').textContent =
+    (chain.comparison_observed || 0) + ' of ' + (chain.comparison_expected || data.total || 0)
+    + ' sources compared';
+  el('comparison-height').textContent = chain.comparison_height == null
+    ? '—'
+    : num(chain.comparison_height);
+  el('comparison-hash').innerHTML = chain.quorum_hash
+    ? copyCell(chain.quorum_hash, tinyHash(chain.quorum_hash), 'Copy settled quorum hash')
+    : 'no strict quorum';
 
   el('tip-agreement').innerHTML = badge(chainStatusLabel(status), tone(STATUS_TONE, status));
   el('tip-agreement-detail').textContent =
     tipGroups.length + ' tip group' + (tipGroups.length === 1 ? '' : 's')
-    + ' · ' + (chain.observed_tips || 0) + ' node' + (chain.observed_tips === 1 ? '' : 's') + ' observed';
+    + ' · ' + (chain.observed_tips || 0) + ' source'
+    + (chain.observed_tips === 1 ? '' : 's') + ' observed';
 
   el('majority-tip').innerHTML = copyCell(
     chain.majority_hash, shortHash(chain.majority_hash), 'Copy majority tip hash');
@@ -3018,13 +3454,53 @@ function renderStats(data) {
 function renderChain(data) {
   const chain = data.chain || {};
   const status = chain.status || 'unknown';
+  const forkStatus = chain.fork_status || 'warming';
   const tipGroups = chain.tip_groups || [];
+  const comparisonGroups = chain.comparison_groups || [];
   const reorgs = chain.recent_reorgs || [];
 
+  el('fork-summary').textContent = {
+    agreed: 'All configured sources agree at the settled comparison height.',
+    diverged: 'Sources return different block hashes at the same settled height.',
+    partial: 'Available sources agree, but one or more sources could not be compared.',
+    insufficient: 'Fewer than two sources returned a hash at the comparison height.',
+    warming: 'The first poll establishes tip heights; the next poll compares chains.',
+  }[forkStatus] || 'Waiting for settled chain observations.';
+  el('fork-explainer').textContent = chain.comparison_height == null
+    ? 'The studio compares every source at one shared block height behind the live tips, avoiding alerts for ordinary propagation races.'
+    : 'Height ' + num(chain.comparison_height) + ' is ' + num(data.fork_confirmations || 0)
+      + ' block' + ((data.fork_confirmations || 0) === 1 ? '' : 's')
+      + ' behind the slowest healthy source observed on the prior poll.';
+
+  el('comparison-groups').innerHTML = comparisonGroups.length
+    ? comparisonGroups.map((group) => {
+      const role = group.role || 'candidate';
+      const cls = role === 'quorum' ? 'is-majority' : (role === 'fork' ? 'is-fork' : 'is-candidate');
+      const observers = new Set(group.observers || []);
+      const labels = (group.nodes || []).map((name) =>
+        name + (observers.has(name) ? ' (observer)' : ''));
+      return '<div class="tip-group branch-group ' + cls + '">'
+        + '<div class="tip-group-top">'
+        + badge(role, tone(CHAIN_TONE, role))
+        + '<span class="height num">height ' + num(chain.comparison_height) + '</span>'
+        + '<span class="mono muted" style="font-size:0.78rem">'
+        + copyCell(group.block_hash, shortHash(group.block_hash), 'Copy comparison hash') + '</span>'
+        + '</div>'
+        + '<div class="tip-group-count">' + group.count
+        + ' source' + (group.count === 1 ? '' : 's') + '</div>'
+        + '<div class="tip-group-nodes">' + esc(labels.join(', ')) + '</div>'
+        + '</div>';
+    }).join('')
+    : '<div class="empty">No settled hashes observed yet.</div>';
+  const unavailable = chain.unavailable_sources || [];
+  el('comparison-missing').textContent = unavailable.length
+    ? 'Not compared: ' + unavailable.join(', ')
+    : '';
+
   el('chain-summary').textContent = {
-    split: 'Nodes disagree on the tip hash at the leading height.',
-    lagging: 'One tip hash leads; some nodes are behind.',
-    agreed: 'All observed nodes share the same tip.',
+    split: 'Sources disagree on the tip hash at the leading height.',
+    lagging: 'One tip hash leads; some sources are behind.',
+    agreed: 'All observed sources share the same tip.',
   }[status] || 'Waiting for tip observations.';
 
   el('tip-groups').innerHTML = tipGroups.length
@@ -3043,7 +3519,7 @@ function renderChain(data) {
         + depth
         + '</div>'
         + '<div class="tip-group-count">' + group.count
-        + ' node' + (group.count === 1 ? '' : 's') + '</div>'
+        + ' source' + (group.count === 1 ? '' : 's') + '</div>'
         + '<div class="tip-group-nodes">' + esc((group.nodes || []).join(', ')) + '</div>'
         + '</div>';
     }).join('')
@@ -3077,7 +3553,8 @@ function matchesQuery(row, query) {
   if (!query) return true;
   return [
     row.name, row.commit, row.node_id, row.block_hash, row.detail,
-    row.ssh, row.version, row.health, row.chain_role, row.client_name,
+    row.ssh, row.version, row.health, row.chain_role, row.settled_role,
+    row.comparison_hash, row.client_name, row.source_type,
   ].some((value) => String(value || '').toLowerCase().includes(query));
 }
 function sortRows(rows) {
@@ -3160,11 +3637,12 @@ function renderTable(data) {
   const majorityHeight = chain.majority_height;
   const all = data.rows || [];
   const visible = sortRows(all.filter((row) =>
-    (!state.issuesOnly || !row.healthy) && matchesQuery(row, state.query)));
+    (!state.issuesOnly || !row.healthy || row.settled_role === 'fork')
+    && matchesQuery(row, state.query)));
 
   el('table-title').textContent = visible.length === all.length
-    ? all.length + ' nodes'
-    : visible.length + ' of ' + all.length + ' nodes';
+    ? all.length + ' sources'
+    : visible.length + ' of ' + all.length + ' sources';
 
   for (const th of document.querySelectorAll('thead th[data-sort]')) {
     const active = th.dataset.sort === state.sortKey;
@@ -3182,6 +3660,7 @@ function renderTable(data) {
   el('rows').innerHTML = visible.map((row) => {
     const healthTone = tone(HEALTH_TONE, row.health);
     const chainTone = tone(CHAIN_TONE, row.chain_role);
+    const settledTone = tone(CHAIN_TONE, row.settled_role);
     const open = state.expandAll || state.expanded.has(row.name);
     const tipLabel = tipEventLabel(row.tip_event);
     const behind = (majorityHeight != null && row.height != null)
@@ -3190,9 +3669,10 @@ function renderTable(data) {
     const deltaHtml = behind
       ? '<span class="delta">' + (behind > 0 ? '+' : '') + behind + ' vs majority</span>'
       : '';
-    const rowTone = healthTone === 'bad' || chainTone === 'bad'
+    const rowTone = healthTone === 'bad' || chainTone === 'bad' || settledTone === 'bad'
       ? 'row-bad'
-      : (healthTone === 'warn' || chainTone === 'warn' ? 'row-warn' : '');
+      : (healthTone === 'warn' || chainTone === 'warn' || settledTone === 'warn'
+        ? 'row-warn' : '');
     const lag = row.header_lag;
     const lagHtml = lag == null
       ? '<span class="dim">—</span>'
@@ -3202,13 +3682,16 @@ function renderTable(data) {
       + ' data-node="' + esc(row.name) + '">'
       + '<td class="col-node"><div class="node-cell"><span class="twisty">&#9654;</span>'
       + '<div class="stack"><a class="node-link node-name" href="/node/'
-      + encodeURIComponent(row.name) + '" title="Open node detail">' + esc(row.name) + '</a>'
+      + encodeURIComponent(row.name) + '" title="Open source detail">' + esc(row.name) + '</a>'
       + '<span class="node-sub" title="' + esc(row.node_id || '') + '">'
-      + esc(row.node_id ? tinyHash(row.node_id) : 'node id unknown') + '</span></div></div></td>'
+      + esc(row.source_type === 'observer'
+        ? 'external RPC observer'
+        : (row.node_id ? tinyHash(row.node_id) : 'node id unknown')) + '</span></div></div></td>'
       + '<td class="col-health"><div class="stack">'
       + badge(HEALTH_LABEL[row.health] || row.health, healthTone) + vitalBadges(row) + '</div></td>'
       + '<td class="col-chain"><div class="stack">'
-      + badge(row.chain_role || 'unknown', chainTone)
+      + badge(row.settled_role || 'unknown', settledTone)
+      + badge('tip ' + (row.chain_role || 'unknown'), chainTone)
       + (tipLabel ? badge(tipLabel, 'bad') : '') + '</div></td>'
       + '<td class="col-height col-num mono"><div class="stack">'
       + '<span>' + num(row.height) + '</span>' + deltaHtml + '</div></td>'
@@ -3295,7 +3778,7 @@ function renderNodeHeader(data) {
   const network = data.network || 'mainnet';
   const name = row.name || NODE_NAME;
   el('node-network-chip').textContent = network;
-  document.title = name + ' - Zakura ' + network + ' node';
+  document.title = name + ' - Zakura ' + network + ' source';
   el('node-title').textContent = name;
   const polledAge = data.last_poll == null ? null : (Date.now() / 1000) - data.last_poll;
   el('node-subtitle').textContent = [
@@ -3307,9 +3790,12 @@ function renderNodeHeader(data) {
 
   const healthTone = tone(HEALTH_TONE, row.health);
   el('node-badges').innerHTML = badge(HEALTH_LABEL[row.health] || row.health || 'unknown', healthTone)
+    + badge(row.settled_role || 'unknown', tone(CHAIN_TONE, row.settled_role))
     + badge(row.chain_role || 'unknown', tone(CHAIN_TONE, row.chain_role))
-    + badge('service ' + (row.active_state || 'unknown'),
-      row.active_state === 'active' ? 'ok' : 'bad')
+    + (row.source_type === 'observer'
+      ? badge('RPC observer', 'info')
+      : badge('service ' + (row.active_state || 'unknown'),
+        row.active_state === 'active' ? 'ok' : 'bad'))
     + (row.tip_event ? badge(tipEventLabel(row.tip_event) || row.tip_event, 'bad') : '');
 
   const pill = el('state-pill');
@@ -3417,6 +3903,11 @@ function renderNodeChain(data) {
       delta ? 'warn' : null),
     kvRow('Advance rate', rate == null ? '—' : decimal(rate, 1) + ' blocks/min'),
     kvRow('Tip last advanced', age(row.seconds_since_advanced) + ' ago'),
+    kvRow('Settled role', String(row.settled_role || 'unknown'),
+      row.settled_role === 'fork' ? 'bad' : null),
+    kvRow('Comparison height', num(row.comparison_height)),
+    kvRowHtml('Comparison hash', copyCell(
+      row.comparison_hash, shortHash(row.comparison_hash), 'Copy comparison hash')),
     kvRowHtml('Tip hash', copyCell(row.block_hash, shortHash(row.block_hash), 'Copy tip hash')),
     kvRowHtml('Parent hash', copyCell(row.previous_hash, shortHash(row.previous_hash), 'Copy parent hash')),
     kvRow('RPC chain', String(row.rpc_chain || 'unknown')),
@@ -3907,7 +4398,16 @@ def main() -> None:
         default=None,
         help="seconds between metric scrapes; omit to adapt to the last scrape's cost",
     )
+    parser.add_argument(
+        "--fork-confirmations",
+        type=int,
+        default=DEFAULT_FORK_CONFIRMATIONS,
+        help="compare source hashes this many blocks behind the slowest healthy tip",
+    )
     args = parser.parse_args()
+
+    if args.fork_confirmations < 0:
+        parser.error("--fork-confirmations must be non-negative")
 
     nodes = load_nodes(Path(args.config))
     state_file = Path(args.state_file) if args.state_file else None
@@ -3920,6 +4420,7 @@ def main() -> None:
         history_window=args.history_window,
         expose_logs=args.expose_logs,
         metrics_min_interval=args.metrics_min_interval,
+        fork_confirmations=args.fork_confirmations,
     )
     threading.Thread(target=COLLECTOR.loop, daemon=True).start()
 

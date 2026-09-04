@@ -24,6 +24,9 @@ def make_args(**overrides):
         "down_after": 600.0,
         "stalled_after": 600.0,
         "shared_stalled_after": 1800.0,
+        "fork_after": 180.0,
+        "reorg_depth": 2,
+        "reorg_lookback": 600.0,
         "starting_grace": 120.0,
         "dashboard_down_after": 600.0,
         "request_timeout": 20.0,
@@ -599,6 +602,219 @@ class FleetSnapshotTests(unittest.TestCase):
 
         self.assertEqual(state["fleets"]["testnet"]["condition"], "ok")
         self.assertEqual(state["nodes"]["testnet/node-a"]["condition"], "ok")
+
+
+class ForkAndReorgAlertTests(unittest.TestCase):
+    NOW = 2_000.0
+
+    def setUp(self):
+        self.posted: list[str] = []
+        self.fleet = watchdog.Fleet(
+            name="testnet",
+            url="http://dashboard.invalid/data",
+            dashboard_url="http://dashboard.invalid/",
+        )
+        self.instance = watchdog.Watchdog([self.fleet], make_args())
+        self.state = {
+            "version": watchdog.STATE_VERSION,
+            "nodes": {},
+            "fleets": {},
+            "shared_stalls": {},
+            "forks": {},
+            "reorg_events": {},
+        }
+
+    @staticmethod
+    def row(name, height):
+        return {
+            "name": name,
+            "health": "healthy",
+            "height": height,
+            "block_hash": ("1" if name != "pool" else "2") * 64,
+            "seconds_since_advanced": 1.0,
+        }
+
+    @classmethod
+    def snapshot(cls, groups, *, events=None, expected=3, height=104):
+        names = [name for _block_hash, sources in groups for name in sources]
+        heights = {"node-a": 110, "node-b": 108, "pool": 112}
+        return {
+            "last_poll": cls.NOW,
+            "rows": [cls.row(name, heights.get(name, 110)) for name in names],
+            "chain": {
+                "comparison_height": height,
+                "comparison_observed": len(names),
+                "comparison_expected": expected,
+                "comparison_groups": [
+                    {"block_hash": block_hash, "nodes": sources}
+                    for block_hash, sources in groups
+                ],
+                "recent_reorgs": events or [],
+            },
+        }
+
+    def run_snapshot(self, snapshot, now=None):
+        with (
+            patch.object(watchdog, "fetch_json", return_value=snapshot),
+            patch.object(watchdog.time, "time", return_value=now or self.NOW),
+            patch.object(
+                watchdog,
+                "post_slack",
+                side_effect=lambda text, _args: (self.posted.append(text), True)[1],
+            ),
+        ):
+            self.instance.run_once(self.state)
+
+    def test_advancing_sources_alert_when_settled_hashes_stay_divergent(self):
+        first = self.snapshot(
+            [("a" * 64, ["node-a", "node-b"]), ("b" * 64, ["pool"])]
+        )
+        self.run_snapshot(first)
+        self.assertEqual(self.posted, [])
+
+        second = self.snapshot(
+            [("c" * 64, ["node-a", "node-b"]), ("d" * 64, ["pool"])],
+            height=106,
+        )
+        second["last_poll"] = self.NOW + 180
+        self.run_snapshot(second, now=self.NOW + 180)
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("fork detected", self.posted[0])
+        self.assertIn("settled height: 106", self.posted[0])
+        self.assertIn("fork (1): pool", self.posted[0])
+        self.assertTrue(self.state["forks"]["testnet"]["alerting"])
+
+    def test_changing_membership_does_not_reset_continuous_divergence(self):
+        first = self.snapshot(
+            [("a" * 64, ["node-a", "node-b"]), ("b" * 64, ["pool"])]
+        )
+        self.run_snapshot(first)
+
+        second = self.snapshot(
+            [("c" * 64, ["node-a"]), ("d" * 64, ["node-b", "pool"])],
+            height=106,
+        )
+        second["last_poll"] = self.NOW + 180
+        self.run_snapshot(second, now=self.NOW + 180)
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("fork detected", self.posted[0])
+
+    def test_transient_divergence_does_not_alert(self):
+        self.run_snapshot(
+            self.snapshot(
+                [("a" * 64, ["node-a", "node-b"]), ("b" * 64, ["pool"])]
+            )
+        )
+        agreed = self.snapshot(
+            [("c" * 64, ["node-a", "node-b", "pool"])], height=105
+        )
+        agreed["last_poll"] = self.NOW + 60
+        self.run_snapshot(agreed, now=self.NOW + 60)
+
+        self.assertEqual(self.posted, [])
+        self.assertEqual(self.state["forks"]["testnet"]["condition"], "ok")
+
+    def test_missing_source_cannot_clear_a_latched_fork(self):
+        self.instance.args.fork_after = 0
+        self.run_snapshot(
+            self.snapshot(
+                [("a" * 64, ["node-a", "node-b"]), ("b" * 64, ["pool"])]
+            )
+        )
+        self.posted.clear()
+
+        partial = self.snapshot(
+            [("c" * 64, ["node-a", "node-b"])], expected=3, height=105
+        )
+        partial["last_poll"] = self.NOW + 60
+        self.run_snapshot(partial, now=self.NOW + 60)
+        self.assertEqual(self.posted, [])
+        self.assertTrue(self.state["forks"]["testnet"]["alerting"])
+
+        agreed = self.snapshot(
+            [("d" * 64, ["node-a", "node-b", "pool"])], height=106
+        )
+        agreed["last_poll"] = self.NOW + 120
+        self.run_snapshot(agreed, now=self.NOW + 120)
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("fork cleared", self.posted[0])
+
+    def test_reported_source_count_cannot_hide_a_missing_observer(self):
+        self.instance.args.fork_after = 0
+        self.run_snapshot(
+            self.snapshot(
+                [("a" * 64, ["node-a", "node-b"]), ("b" * 64, ["pool"])]
+            )
+        )
+        self.posted.clear()
+
+        malformed = self.snapshot(
+            [("c" * 64, ["node-a", "node-b"])], expected=2, height=105
+        )
+        malformed["rows"].append(self.row("pool", 112))
+        malformed["last_poll"] = self.NOW + 60
+        self.run_snapshot(malformed, now=self.NOW + 60)
+
+        self.assertEqual(self.posted, [])
+        self.assertTrue(self.state["forks"]["testnet"]["alerting"])
+        self.assertEqual(self.state["fleets"]["testnet"]["condition"], "unreachable")
+
+    def test_deep_reorg_alerts_once_and_deduplicates_across_sources(self):
+        event = {
+            "node": "node-a",
+            "kind": "reorg_height_drop",
+            "from_height": 110,
+            "from_hash": "a" * 64,
+            "to_height": 105,
+            "to_hash": "b" * 64,
+            "depth": 5,
+            "at": self.NOW - 10,
+        }
+        duplicate = {**event, "node": "node-b", "at": self.NOW - 9}
+        snapshot = self.snapshot(
+            [("c" * 64, ["node-a", "node-b", "pool"])],
+            events=[event, duplicate],
+        )
+
+        self.run_snapshot(snapshot)
+        self.run_snapshot(snapshot, now=self.NOW + 60)
+
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("deep reorg / orphan event", self.posted[0])
+        self.assertIn("depth: 5", self.posted[0])
+
+    def test_one_block_and_old_reorgs_do_not_page(self):
+        events = [
+            {
+                "node": "node-a",
+                "kind": "tip_switch",
+                "from_height": 100,
+                "from_hash": "a" * 64,
+                "to_height": 100,
+                "to_hash": "b" * 64,
+                "depth": 1,
+                "at": self.NOW - 10,
+            },
+            {
+                "node": "node-a",
+                "kind": "reorg_height_drop",
+                "from_height": 100,
+                "from_hash": "c" * 64,
+                "to_height": 90,
+                "to_hash": "d" * 64,
+                "depth": 10,
+                "at": self.NOW - 700,
+            },
+        ]
+        self.run_snapshot(
+            self.snapshot(
+                [("e" * 64, ["node-a", "node-b", "pool"])], events=events
+            )
+        )
+
+        self.assertEqual(self.posted, [])
 
 
 class SharedStallTests(unittest.TestCase):

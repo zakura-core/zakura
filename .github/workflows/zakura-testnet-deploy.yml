@@ -278,7 +278,16 @@ jobs:
           dashboard_dir="/opt/zakura-testnet-dashboard"
           sudo install -d -m 755 "$dashboard_dir"
           sudo install -m 755 deploy/runner/zakura-cluster-status.py "$dashboard_dir/zakura-cluster-status.py"
-          sudo install -m 644 deploy/deployer/nodes.ci.toml "$dashboard_dir/nodes.toml"
+          cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
+          cat >> "$RUNNER_TEMP/dashboard.nodes.toml" <<'EOF'
+
+          # Independent chain observer used by the mining pool. It is dashboard
+          # only and is never passed to deploy.py.
+          [[chain_observers]]
+          name = "testnet-mining-pool"
+          rpc_url = "http://38.190.136.75:18232/"
+          EOF
+          sudo install -m 644 "$RUNNER_TEMP/dashboard.nodes.toml" "$dashboard_dir/nodes.toml"
 
           sudo tee /etc/systemd/system/zakura-testnet-dashboard.service >/dev/null <<'EOF'
           [Unit]
@@ -289,7 +298,7 @@ jobs:
           [Service]
           Type=simple
           WorkingDirectory=/opt/zakura-testnet-dashboard
-          ExecStart=/usr/bin/python3 /opt/zakura-testnet-dashboard/zakura-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --network testnet --interval 10 --stale-after 300 --state-file /var/lib/zakura-testnet-dashboard/orphan-pairs.json
+          ExecStart=/usr/bin/python3 /opt/zakura-testnet-dashboard/zakura-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --network testnet --interval 10 --stale-after 300 --fork-confirmations 2 --state-file /var/lib/zakura-testnet-dashboard/orphan-pairs.json
           Restart=always
           RestartSec=5
 

@@ -2,7 +2,8 @@
 """Slack watchdog for Zakura fleet status dashboards.
 
 Polls one or more `zakura-cluster-status.py` `/data` endpoints, tracks sustained
-node failures in a small JSON state file, and posts transition alerts to Slack.
+node failures and settled chain forks in a small JSON state file, and posts
+transition plus deep reorg/orphan alerts to Slack.
 
 Only the Python stdlib is used.
 """
@@ -10,6 +11,7 @@ Only the Python stdlib is used.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -35,6 +37,9 @@ MAX_BLOCK_HASH_CHARS = 64
 MAX_DASHBOARD_URL_CHARS = 2_048
 MAX_ALERT_ERROR_CHARS = 2_048
 MAX_SLACK_MESSAGE_CHARS = 35_000
+MAX_FORK_GROUPS = 32
+MAX_FORK_SOURCES = 128
+MAX_REORG_EVENTS = 512
 SLACK_ESSENTIAL_PREFIX_LINES = 3
 SLACK_TRUNCATION_MARKER = "[alert truncated]"
 SLACK_PLAIN_TEXT_TRANSLATION = str.maketrans(
@@ -114,6 +119,25 @@ class NodeObservation:
     threshold: float
     height: int | None
     block_hash: str
+
+
+@dataclass(frozen=True)
+class ForkGroup:
+    block_hash: str
+    source_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ForkObservation:
+    status: str
+    height: int | None
+    observed: int
+    expected: int
+    groups: tuple[ForkGroup, ...]
+
+    @property
+    def partition(self) -> tuple[tuple[str, ...], ...]:
+        return tuple(sorted(group.source_names for group in self.groups))
 
 
 @dataclass(frozen=True)
@@ -209,6 +233,8 @@ def load_state(state_path: Path) -> dict[str, Any]:
             "nodes": {},
             "fleets": {},
             "shared_stalls": {},
+            "forks": {},
+            "reorg_events": {},
         }
 
     with state_path.open(encoding="utf-8") as state_file:
@@ -220,12 +246,16 @@ def load_state(state_path: Path) -> dict[str, Any]:
             "nodes": {},
             "fleets": {},
             "shared_stalls": {},
+            "forks": {},
+            "reorg_events": {},
         }
 
     state.setdefault("nodes", {})
     state.setdefault("fleets", {})
     state.setdefault("shared_stalls", {})
     state.setdefault("release_state", {})
+    state.setdefault("forks", {})
+    state.setdefault("reorg_events", {})
     return state
 
 
@@ -891,6 +921,184 @@ def validated_fleet_rows(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def settled_fork_observation(
+    snapshot: dict[str, Any], rows: list[dict[str, Any]]
+) -> ForkObservation | None:
+    """Validate and independently classify the dashboard's settled hash groups."""
+    chain = snapshot.get("chain")
+    if not isinstance(chain, dict) or "comparison_groups" not in chain:
+        # Rolling-upgrade compatibility with dashboards that predate fork probes.
+        return None
+
+    raw_groups = chain.get("comparison_groups")
+    if not isinstance(raw_groups, list) or len(raw_groups) > MAX_FORK_GROUPS:
+        raise ValueError("dashboard comparison_groups is invalid")
+
+    groups = []
+    seen_sources = set()
+    seen_hashes = set()
+    for raw_group in raw_groups:
+        if not isinstance(raw_group, dict):
+            raise ValueError("dashboard comparison group is not an object")
+        block_hash = validated_block_hash(raw_group.get("block_hash"))
+        names = raw_group.get("nodes")
+        if (
+            block_hash is None
+            or len(block_hash) != MAX_BLOCK_HASH_CHARS
+            or not isinstance(names, list)
+            or not names
+        ):
+            raise ValueError("dashboard comparison group has invalid hash or sources")
+        if len(names) > MAX_FORK_SOURCES:
+            raise ValueError("dashboard comparison group has too many sources")
+        normalized_names = []
+        for name in names:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("dashboard comparison group has an invalid source")
+            normalized = name.strip()
+            if normalized in seen_sources:
+                raise ValueError("dashboard comparison source appears in multiple groups")
+            seen_sources.add(normalized)
+            normalized_names.append(normalized)
+        if block_hash in seen_hashes:
+            raise ValueError("dashboard comparison hash appears in multiple groups")
+        seen_hashes.add(block_hash)
+        groups.append(ForkGroup(block_hash, tuple(sorted(normalized_names))))
+
+    groups.sort(key=lambda group: (-len(group.source_names), group.block_hash))
+    observed = sum(len(group.source_names) for group in groups)
+    expected = coerce_height(chain.get("comparison_expected"))
+    configured_sources = {
+        str(row.get("name") or "").strip()
+        for row in rows
+    }
+    if (
+        expected is None
+        or expected != len(configured_sources)
+        or expected < observed
+        or expected > MAX_FORK_SOURCES
+    ):
+        raise ValueError("dashboard comparison_expected is invalid")
+    if not seen_sources.issubset(configured_sources):
+        raise ValueError("dashboard comparison group contains an unknown source")
+    reported_observed = coerce_height(chain.get("comparison_observed"))
+    if reported_observed != observed:
+        raise ValueError("dashboard comparison_observed does not match its groups")
+
+    height = coerce_height(chain.get("comparison_height"))
+    if groups and height is None:
+        raise ValueError("dashboard comparison groups have no valid height")
+
+    if len(groups) > 1:
+        status = "diverged"
+    elif observed < 2:
+        status = "insufficient"
+    elif observed < expected:
+        status = "partial"
+    else:
+        status = "agreed"
+    return ForkObservation(status, height, observed, expected, tuple(groups))
+
+
+def snapshot_reorg_events(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    chain = snapshot.get("chain")
+    if not isinstance(chain, dict):
+        return []
+    events = chain.get("recent_reorgs", [])
+    if not isinstance(events, list) or any(
+        not isinstance(event, dict) for event in events
+    ):
+        raise ValueError("dashboard recent_reorgs is invalid")
+    return events
+
+
+def fork_quorum_group(observation: ForkObservation) -> ForkGroup | None:
+    if not observation.groups:
+        return None
+    candidate = observation.groups[0]
+    return (
+        candidate
+        if len(candidate.source_names) > observation.expected / 2
+        else None
+    )
+
+
+def fork_alert_text(
+    fleet: Fleet,
+    observation: ForkObservation,
+    age: float,
+) -> str:
+    fleet_name = slack_identity(fleet.name, MAX_ALERT_NAME_CHARS, "unknown")
+    height = observation.height if observation.height is not None else "-"
+    quorum = fork_quorum_group(observation)
+    lines = [
+        f":rotating_light: *Zakura {fleet_name} fork detected* for "
+        f"{format_duration(age)}",
+        f"settled height: {height} - {len(observation.groups)} competing branches - "
+        f"{observation.observed}/{observation.expected} sources compared",
+    ]
+    for group in observation.groups:
+        if quorum is None:
+            role = "candidate"
+        elif group == quorum:
+            role = "quorum"
+        else:
+            role = "fork"
+        names = ", ".join(
+            slack_identity(name, MAX_ALERT_NAME_CHARS, "unknown")
+            for name in group.source_names
+        )
+        lines.append(
+            f"- {role} ({len(group.source_names)}): {names} - "
+            f"{slack_block_hash(group.block_hash)}"
+        )
+    lines.append(f"dashboard: {slack_dashboard_url(fleet.dashboard_url)}")
+    return "\n".join(lines)
+
+
+def fork_recovery_text(fleet: Fleet, observation: ForkObservation) -> str:
+    fleet_name = slack_identity(fleet.name, MAX_ALERT_NAME_CHARS, "unknown")
+    height = observation.height if observation.height is not None else "-"
+    block_hash = observation.groups[0].block_hash if observation.groups else ""
+    return (
+        f":white_check_mark: *Zakura {fleet_name} fork cleared*\n"
+        f"all {observation.observed} sources agree at settled height {height}\n"
+        f"block hash: {slack_block_hash(block_hash)}\n"
+        f"dashboard: {slack_dashboard_url(fleet.dashboard_url)}"
+    )
+
+
+def reorg_event_id(event: dict[str, Any]) -> str:
+    identity = [
+        event.get("kind"),
+        event.get("from_height"),
+        normalized_block_hash(event.get("from_hash") or event.get("discarded_hash")),
+        event.get("to_height"),
+        normalized_block_hash(event.get("to_hash") or event.get("canonical_hash")),
+    ]
+    return hashlib.sha256(
+        json.dumps(identity, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def reorg_alert_text(fleet: Fleet, event: dict[str, Any]) -> str:
+    fleet_name = slack_identity(fleet.name, MAX_ALERT_NAME_CHARS, "unknown")
+    source = slack_identity(event.get("node"), MAX_ALERT_NAME_CHARS, "unknown")
+    kind = slack_identity(event.get("kind"), MAX_ALERT_STATUS_CHARS, "reorg")
+    depth = coerce_height(event.get("depth"))
+    from_height = coerce_height(event.get("from_height"))
+    to_height = coerce_height(event.get("to_height"))
+    return (
+        f":warning: *Zakura {fleet_name} deep reorg / orphan event*\n"
+        f"source: {source} - kind: {kind} - depth: {depth if depth is not None else '-'}\n"
+        f"height: {from_height if from_height is not None else '-'} -> "
+        f"{to_height if to_height is not None else '-'}\n"
+        f"discarded: {slack_block_hash(event.get('from_hash') or event.get('discarded_hash'))}\n"
+        f"adopted: {slack_block_hash(event.get('to_hash') or event.get('canonical_hash'))}\n"
+        f"dashboard: {slack_dashboard_url(fleet.dashboard_url)}"
+    )
+
+
 def snapshot_last_poll(snapshot: dict[str, Any]) -> float | None:
     if "last_poll" not in snapshot:
         # Dashboards deployed before the atomic diagnostic payload omitted this
@@ -996,6 +1204,8 @@ class Watchdog:
                 snapshot = fetch_json(fleet.url, self.args.request_timeout)
                 node_rows = validated_fleet_rows(snapshot)
                 last_poll = snapshot_last_poll(snapshot)
+                fork_observation = settled_fork_observation(snapshot, node_rows)
+                reorg_events = snapshot_reorg_events(snapshot)
             except Exception as error:
                 self.handle_fleet_error(state, fleet, error, now, suppressed)
                 continue
@@ -1021,6 +1231,13 @@ class Watchdog:
 
             if not self.handle_fleet_recovered(state, fleet, now):
                 continue
+            if fork_observation is not None:
+                self.handle_fork_observation(
+                    state, fleet, fork_observation, now, suppressed
+                )
+            self.handle_reorg_events(
+                state, fleet, reorg_events, now, suppressed
+            )
             grace_since = max(
                 self.started_at, self.fetch_recovered_at.get(fleet.name, 0)
             )
@@ -1061,6 +1278,135 @@ class Watchdog:
 
         for target in self.release_state:
             self.handle_release_state(state, target, now, suppressed)
+
+    def handle_fork_observation(
+        self,
+        state: dict[str, Any],
+        fleet: Fleet,
+        observation: ForkObservation,
+        now: float,
+        suppressed: bool,
+    ) -> None:
+        bucket = state.setdefault("forks", {})
+        previous = dict(bucket.get(fleet.name, {}))
+
+        if observation.status == "diverged":
+            partition = [list(names) for names in observation.partition]
+            continuously_diverged = previous.get("condition") == "diverged"
+            previous_bad_since = coerce_float(previous.get("bad_since"))
+            bad_since = (
+                previous_bad_since
+                if continuously_diverged and previous_bad_since is not None
+                else now
+            )
+            alerting = bool(previous.get("alerting"))
+            # Once Slack owns an incident, keep it open across membership changes
+            # until a complete settled comparison proves convergence.
+            if alerting and previous_bad_since is not None:
+                bad_since = previous_bad_since
+            age = now - bad_since
+            next_entry = {
+                "condition": "diverged",
+                "partition": partition,
+                "bad_since": bad_since,
+                "alerting": alerting,
+                "event_height": observation.height,
+                "last_seen": now,
+            }
+            if alerting and "last_alert_at" in previous:
+                next_entry["last_alert_at"] = previous["last_alert_at"]
+            if not alerting and age >= self.args.fork_after:
+                if suppressed:
+                    if not previous.get("suppression_logged"):
+                        print(
+                            f"suppressed alert for {fleet.name}: fork for "
+                            f"{format_duration(age)}"
+                        )
+                    next_entry["suppression_logged"] = True
+                elif post_slack(
+                    fork_alert_text(fleet, observation, age), self.args
+                ):
+                    next_entry["alerting"] = True
+                    next_entry["last_alert_at"] = now
+            bucket[fleet.name] = next_entry
+            return
+
+        if observation.status == "agreed":
+            if previous.get("alerting"):
+                if post_slack(
+                    fork_recovery_text(fleet, observation), self.args
+                ):
+                    bucket[fleet.name] = {
+                        "condition": "ok",
+                        "alerting": False,
+                    }
+                return
+            bucket[fleet.name] = {"condition": "ok", "alerting": False}
+            return
+
+        if previous.get("alerting"):
+            # Missing sources are not proof that the fork healed. The separate
+            # source health path will alert if the blind spot persists.
+            previous["last_seen"] = now
+            previous["inconclusive"] = observation.status
+            bucket[fleet.name] = previous
+        else:
+            bucket[fleet.name] = {
+                "condition": observation.status,
+                "alerting": False,
+                "last_seen": now,
+            }
+
+    def handle_reorg_events(
+        self,
+        state: dict[str, Any],
+        fleet: Fleet,
+        events: list[dict[str, Any]],
+        now: float,
+        suppressed: bool,
+    ) -> None:
+        bucket = state.setdefault("reorg_events", {})
+        entry = bucket.setdefault(fleet.name, {"seen": {}})
+        seen = entry.get("seen")
+        if not isinstance(seen, dict):
+            seen = {}
+
+        retention = max(86_400.0, self.args.reorg_lookback * 10)
+        seen = {
+            key: timestamp
+            for key, timestamp in seen.items()
+            if (value := coerce_float(timestamp)) is not None
+            if now - value <= retention
+        }
+        for event in sorted(
+            events,
+            key=lambda candidate: coerce_float(candidate.get("at")) or 0,
+        ):
+            identity = reorg_event_id(event)
+            if identity in seen:
+                continue
+            observed_at = coerce_float(event.get("at"))
+            depth = coerce_height(event.get("depth"))
+            if (
+                observed_at is None
+                or observed_at > now + 300
+                or now - observed_at > self.args.reorg_lookback
+                or depth is None
+                or depth < self.args.reorg_depth
+                or bool(event.get("demo"))
+            ):
+                seen[identity] = observed_at if observed_at is not None else now
+                continue
+            if suppressed or post_slack(reorg_alert_text(fleet, event), self.args):
+                seen[identity] = observed_at
+
+        if len(seen) > MAX_REORG_EVENTS:
+            seen = dict(
+                sorted(seen.items(), key=lambda item: item[1], reverse=True)[
+                    :MAX_REORG_EVENTS
+                ]
+            )
+        entry["seen"] = seen
 
     def handle_release_state(
         self,
@@ -1603,6 +1949,24 @@ def parse_args() -> argparse.Namespace:
         help="alert after a dashboard fetch failure persists this many seconds",
     )
     parser.add_argument(
+        "--fork-after",
+        type=float,
+        default=180.0,
+        help="alert after settled chain divergence persists this many seconds",
+    )
+    parser.add_argument(
+        "--reorg-depth",
+        type=int,
+        default=2,
+        help="alert immediately for new reorg/orphan events at least this deep",
+    )
+    parser.add_argument(
+        "--reorg-lookback",
+        type=float,
+        default=600.0,
+        help="maximum age of a reorg/orphan event eligible for a new alert",
+    )
+    parser.add_argument(
         "--starting-grace",
         type=float,
         default=120.0,
@@ -1628,7 +1992,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--once", action="store_true", help="poll once, update state, and exit")
     parser.add_argument("--dry-run", action="store_true", help="log Slack messages instead")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.fork_after < 0:
+        parser.error("--fork-after must be non-negative")
+    if args.reorg_depth < 1:
+        parser.error("--reorg-depth must be at least 1")
+    if args.reorg_lookback < 0:
+        parser.error("--reorg-lookback must be non-negative")
+    return args
 
 
 def main() -> int:

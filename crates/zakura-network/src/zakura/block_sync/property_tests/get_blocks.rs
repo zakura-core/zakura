@@ -32,6 +32,10 @@ const GET_BLOCKS_TYPE: u8 = 2;
 const GET_BLOCKS_PAYLOAD_BYTES: usize = 9;
 const GET_BLOCKS_MAX_HEIGHT: u32 = 0x7fff_ffff;
 const GET_BLOCKS_MAX_COUNT: u32 = 128;
+const BLOCK_TYPE: u8 = 3;
+const BLOCKS_DONE_TYPE: u8 = 4;
+const RANGE_UNAVAILABLE_TYPE: u8 = 5;
+const TERMINAL_PAYLOAD_BYTES: usize = 9;
 
 const GB_WF_TEST_MANIFEST: &[(&str, &[&str])] = &[
     ("GB-WF-01", &["gb_wf_01_payload_and_frame_type_are_two"]),
@@ -67,13 +71,42 @@ const GB_WF_TEST_MANIFEST: &[(&str, &[&str])] = &[
         "GB-WF-12",
         &["gb_wf_12_arbitrary_get_blocks_payloads_never_panic"],
     ),
+    (
+        "GB-WF-13",
+        &["gb_wf_13_response_discriminators_and_flags_match_wire_kinds"],
+    ),
+    (
+        "GB-WF-14",
+        &["gb_wf_14_block_payload_is_one_canonical_bounded_block"],
+    ),
+    (
+        "GB-WF-15",
+        &["gb_wf_15_block_payload_cap_precedes_allocation"],
+    ),
+    (
+        "GB-WF-16",
+        &["gb_wf_16_blocks_done_uses_canonical_nine_byte_layout"],
+    ),
+    (
+        "GB-WF-17",
+        &["gb_wf_17_blocks_done_payload_cap_precedes_allocation"],
+    ),
+    (
+        "GB-WF-18",
+        &["gb_wf_18_range_unavailable_uses_canonical_nine_byte_layout"],
+    ),
+    (
+        "GB-WF-19",
+        &["gb_wf_19_range_unavailable_payload_cap_precedes_allocation"],
+    ),
 ];
 
 #[test]
 fn gb_wf_contract_manifest_names_every_requirement() {
     const EXPECTED_IDS: &[&str] = &[
         "GB-WF-01", "GB-WF-02", "GB-WF-03", "GB-WF-04", "GB-WF-05", "GB-WF-06", "GB-WF-07",
-        "GB-WF-08", "GB-WF-09", "GB-WF-10", "GB-WF-11", "GB-WF-12",
+        "GB-WF-08", "GB-WF-09", "GB-WF-10", "GB-WF-11", "GB-WF-12", "GB-WF-13", "GB-WF-14",
+        "GB-WF-15", "GB-WF-16", "GB-WF-17", "GB-WF-18", "GB-WF-19",
     ];
     assert_contract_test_manifest(EXPECTED_IDS, GB_WF_TEST_MANIFEST);
 }
@@ -101,6 +134,15 @@ fn structured_payload(message_type: u8, start_height: u32, count: u32, trailing:
     payload.extend_from_slice(&start_height.to_le_bytes());
     payload.extend_from_slice(&count.to_le_bytes());
     payload.extend_from_slice(trailing);
+    payload
+}
+
+/// Build one fixed response payload from independent literal contract values.
+fn terminal_payload(message_type: u8, start_height: u32, count: u32) -> [u8; 9] {
+    let mut payload = [0; TERMINAL_PAYLOAD_BYTES];
+    payload[0] = message_type;
+    payload[1..5].copy_from_slice(&start_height.to_le_bytes());
+    payload[5..9].copy_from_slice(&count.to_le_bytes());
     payload
 }
 
@@ -384,6 +426,127 @@ proptest! {
             prop_assert_eq!(flags, 0);
             prop_assert_eq!(message_type, u16::from(message.message_type()));
         }
+    }
+}
+
+#[test]
+fn gb_wf_13_response_discriminators_and_flags_match_wire_kinds() {
+    let block = mainnet_blocks_1_to_3()[0].clone();
+    let messages = [
+        (BLOCK_TYPE, BlockSyncMessage::Block(block)),
+        (
+            BLOCKS_DONE_TYPE,
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(1),
+                returned: 1,
+            },
+        ),
+        (
+            RANGE_UNAVAILABLE_TYPE,
+            BlockSyncMessage::RangeUnavailable {
+                start_height: block::Height(1),
+                count: 1,
+            },
+        ),
+    ];
+
+    for (expected_type, message) in messages {
+        let frame = message.encode_frame().expect("response frame encodes");
+        assert_eq!(frame.message_type, u16::from(expected_type));
+        assert_eq!(frame.payload.first(), Some(&expected_type));
+        assert_eq!(frame.flags, 0);
+        assert_eq!(
+            BlockSyncMessage::decode_frame(frame.clone()).expect("response frame decodes"),
+            message
+        );
+
+        for flags in [1, u16::MAX] {
+            let mut invalid = frame.clone();
+            invalid.flags = flags;
+            assert!(matches!(
+                BlockSyncMessage::decode_frame(invalid),
+                Err(BlockSyncWireError::UnsupportedFlags(rejected)) if rejected == flags
+            ));
+        }
+
+        let mut mismatched = frame;
+        mismatched.message_type = u16::from(expected_type.saturating_add(1));
+        assert!(BlockSyncMessage::decode_frame(mismatched).is_err());
+    }
+}
+
+#[test]
+fn gb_wf_14_block_payload_is_one_canonical_bounded_block() {
+    assert_eq!(block::MAX_BLOCK_BYTES, 2_000_000);
+    for block in mainnet_blocks_1_to_3() {
+        let message = BlockSyncMessage::Block(block);
+        let payload = message.encode().expect("fixture block encodes");
+        assert_eq!(payload.first(), Some(&BLOCK_TYPE));
+        assert!(payload.len() <= 1 + 2_000_000);
+        let decoded = BlockSyncMessage::decode(&payload).expect("fixture block decodes");
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.encode().expect("block re-encodes"), payload);
+
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert!(BlockSyncMessage::decode(&trailing).is_err());
+        assert!(BlockSyncMessage::decode(&payload[..payload.len() - 1]).is_err());
+    }
+}
+
+proptest! {
+    #[test]
+    fn gb_wf_16_blocks_done_uses_canonical_nine_byte_layout(
+        start_height in any::<u32>(),
+        returned in any::<u32>(),
+    ) {
+        let payload = terminal_payload(BLOCKS_DONE_TYPE, start_height, returned);
+        let valid = start_height <= GET_BLOCKS_MAX_HEIGHT
+            && (1..=GET_BLOCKS_MAX_COUNT).contains(&returned);
+        match BlockSyncMessage::decode(&payload) {
+            Ok(message @ BlockSyncMessage::BlocksDone {
+                start_height: decoded_start,
+                returned: decoded_returned,
+            }) => {
+                prop_assert!(valid);
+                prop_assert_eq!(decoded_start.0, start_height);
+                prop_assert_eq!(decoded_returned, returned);
+                prop_assert_eq!(message.encode().expect("terminal response re-encodes"), payload);
+            }
+            Ok(message) => prop_assert!(false, "decoded wrong message: {message:?}"),
+            Err(_) => prop_assert!(!valid),
+        }
+        let mut trailing = payload.to_vec();
+        trailing.push(0);
+        prop_assert!(BlockSyncMessage::decode(&trailing).is_err());
+        prop_assert!(BlockSyncMessage::decode(&payload[..payload.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn gb_wf_18_range_unavailable_uses_canonical_nine_byte_layout(
+        start_height in any::<u32>(),
+        count in any::<u32>(),
+    ) {
+        let payload = terminal_payload(RANGE_UNAVAILABLE_TYPE, start_height, count);
+        let valid = start_height <= GET_BLOCKS_MAX_HEIGHT
+            && (1..=GET_BLOCKS_MAX_COUNT).contains(&count);
+        match BlockSyncMessage::decode(&payload) {
+            Ok(message @ BlockSyncMessage::RangeUnavailable {
+                start_height: decoded_start,
+                count: decoded_count,
+            }) => {
+                prop_assert!(valid);
+                prop_assert_eq!(decoded_start.0, start_height);
+                prop_assert_eq!(decoded_count, count);
+                prop_assert_eq!(message.encode().expect("terminal response re-encodes"), payload);
+            }
+            Ok(message) => prop_assert!(false, "decoded wrong message: {message:?}"),
+            Err(_) => prop_assert!(!valid),
+        }
+        let mut trailing = payload.to_vec();
+        trailing.push(0);
+        prop_assert!(BlockSyncMessage::decode(&trailing).is_err());
+        prop_assert!(BlockSyncMessage::decode(&payload[..payload.len() - 1]).is_err());
     }
 }
 

@@ -41,6 +41,25 @@ def remote(ip, command, timeout=120):
     ).stdout.strip()
 
 
+def source_plans(source_args, candidates, images, sizes):
+    """Keep the closest usable fixture for each regional capacity candidate."""
+    result, seen = [], set()
+    for snapshot in sorted(
+        candidates,
+        key=lambda s: (provision.height(s), s.get("created_at", "")),
+        reverse=True,
+    ):
+        request = argparse.Namespace(**vars(source_args))
+        request.regions = ",".join(snapshot["regions"])
+        request.snapshot_id = str(snapshot["id"])
+        for plan in provision.plans(request, images, candidates, sizes):
+            key = (plan["region"], plan["size"]["slug"])
+            if key not in seen:
+                result.append(plan)
+                seen.add(key)
+    return result
+
+
 def seed(args):
     snapshots = provision.doctl("snapshot", "list", "--resource", "volume")
     # Only dedicated approach fixtures have a single tip/ tree, unlike the
@@ -56,9 +75,6 @@ def seed(args):
         raise RuntimeError(
             "no retained approach fixture; run an explicit approach rebuild"
         )
-    snapshot = max(
-        candidates, key=lambda s: (provision.height(s), s.get("created_at", ""))
-    )
     source_args = provision.parser().parse_args(
         [
             "--name",
@@ -67,10 +83,6 @@ def seed(args):
             "correctness",
             "--size",
             "c-8",
-            "--regions",
-            ",".join(snapshot["regions"]),
-            "--snapshot-id",
-            str(snapshot["id"]),
             "--volume-name",
             args.name + "-vol",
             "--ssh-fingerprint",
@@ -84,17 +96,21 @@ def seed(args):
         for v in provision.doctl("volume", "list")
     ):
         raise RuntimeError("seed volume name already exists; refusing to adopt it")
-    plans = provision.plans(
+    plans = source_plans(
         source_args,
+        candidates,
         provision.doctl("image", "list-user"),
-        snapshots,
         provision.doctl("size", "list"),
     )
     if not plans:
         raise RuntimeError("no compatible host can read the retained approach fixture")
+    source_args.regions = ",".join(dict.fromkeys(plan["region"] for plan in plans))
     source = None
     try:
         source = provision.provision(source_args, plans)
+        snapshot = next(
+            s for s in candidates if str(s["id"]) == str(source["state_snapshot_id"])
+        )
         for attempt in range(90):
             try:
                 remote(source["ip"], "true", timeout=15)

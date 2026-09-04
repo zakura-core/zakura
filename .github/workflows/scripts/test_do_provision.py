@@ -317,9 +317,23 @@ class Retention(unittest.TestCase):
 
 
 class ApproachCopy(unittest.TestCase):
+    def test_seed_can_use_another_region_when_newest_source_is_unavailable(self):
+        request = args("--policy", "correctness")
+        states = [snapshot("nyc1", 95, id="new"), snapshot("sfo3", 90, id="old")]
+        plans = seed.source_plans(
+            request, states, [image("sfo3")], [size("c-8", ["nyc1", "sfo3"])]
+        )
+        self.assertEqual([plan["state"]["id"] for plan in plans], ["old"])
+
+    def test_seed_does_not_retry_one_capacity_pool_for_multiple_snapshots(self):
+        request = args("--policy", "correctness")
+        states = [snapshot(height=95, id="new"), snapshot(height=90, id="old")]
+        plans = seed.source_plans(request, states, [image()], [size("c-8")])
+        self.assertEqual([plan["state"]["id"] for plan in plans], ["new"])
+
     @patch.object(seed.provision, "cleanup")
     @patch.object(seed.provision, "provision")
-    @patch.object(seed.provision, "plans", return_value=[{}])
+    @patch.object(seed, "source_plans", return_value=[{"region": "nyc1"}])
     @patch.object(seed.provision, "doctl")
     @patch.object(seed, "remote")
     @patch.object(seed.subprocess, "Popen")
@@ -335,7 +349,11 @@ class ApproachCopy(unittest.TestCase):
         )
         api.side_effect = [[snapshot()], [], [], [image()], [size("c-8")]]
         provision.return_value = dict(
-            id=1, ip="192.0.2.1", volume_id="v1", volume_name="source"
+            id=1,
+            ip="192.0.2.1",
+            volume_id="v1",
+            volume_name="source",
+            state_snapshot_id="state",
         )
         process = unittest.mock.MagicMock()
         process.returncode = 0

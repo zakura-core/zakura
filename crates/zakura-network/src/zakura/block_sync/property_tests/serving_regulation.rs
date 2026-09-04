@@ -242,6 +242,10 @@ fn serving_status() -> BlockSyncStatus {
     }
 }
 
+fn minimum_response_bytes() -> u32 {
+    u32::try_from(block::MAX_BLOCK_BYTES).expect("maximum block bytes fit u32")
+}
+
 fn regulated_config(response_bytes: u32) -> ZakuraBlockSyncConfig {
     let mut config = ZakuraBlockSyncConfig {
         max_blocks_per_response: 1,
@@ -375,7 +379,7 @@ async fn finish_unavailable(handle: &BlockSyncHandle, peer: &ZakuraPeerId, query
 
 #[tokio::test(start_paused = true)]
 async fn gb_rl_02_blocked_request_bounds_queue_and_is_admitted_once_after_release() {
-    let mut config = regulated_config(512);
+    let mut config = regulated_config(minimum_response_bytes());
     config.max_inflight_requests = 1;
     let cost = serving_cost(&config, 1).expect("test request cost is valid");
     config.get_blocks_serving_regulation.peer_backlog_bytes = cost.response_cap;
@@ -480,7 +484,7 @@ async fn gb_rl_02_blocked_request_bounds_queue_and_is_admitted_once_after_releas
 
 #[tokio::test(start_paused = true)]
 async fn gb_rl_16_pending_requests_stay_within_session_and_node_bounds() {
-    let mut config = regulated_config(512);
+    let mut config = regulated_config(minimum_response_bytes());
     config.max_inflight_requests = 2;
     let cost = serving_cost(&config, 1).expect("test request cost is valid");
     config.get_blocks_serving_regulation.node_outstanding_bytes = cost.response_cap;
@@ -549,7 +553,7 @@ async fn gb_rl_16_pending_requests_stay_within_session_and_node_bounds() {
 
 #[tokio::test(start_paused = true)]
 async fn gb_rl_17_state_query_receives_local_response_byte_limit() {
-    let config = regulated_config(777);
+    let config = regulated_config(minimum_response_bytes().saturating_add(777));
     let expected_limit = config.advertised_max_response_bytes();
     let mut harness = ServingHarness::new(config, 4, 1);
     let peer_id = peer(0x18);
@@ -568,7 +572,7 @@ async fn gb_rl_17_state_query_receives_local_response_byte_limit() {
 
 #[tokio::test(start_paused = true)]
 async fn gb_rl_04_rejections_settle_once_and_account_their_terminal_frame() {
-    let config = regulated_config(512);
+    let config = regulated_config(minimum_response_bytes());
     let cost = serving_cost(&config, 1).expect("test request cost is valid");
     let mut harness = ServingHarness::new(config, 4, 2);
 
@@ -674,7 +678,7 @@ async fn gb_rl_04_rejections_settle_once_and_account_their_terminal_frame() {
 
 #[tokio::test(start_paused = true)]
 async fn gb_rl_05_peer_rate_backlog_and_ledger_are_isolated() {
-    let mut config = regulated_config(512);
+    let mut config = regulated_config(minimum_response_bytes());
     let cost = serving_cost(&config, 1).expect("test request cost is valid");
     config.get_blocks_serving_regulation.peer_backlog_bytes = cost.response_cap;
     config.get_blocks_serving_regulation.node_outstanding_bytes = cost.response_cap * 2;
@@ -738,7 +742,7 @@ async fn gb_rl_06_backlog_never_overshoots_and_draining_resumes_work() {
     let body_size = corpus
         .size_at(block::Height(1))
         .expect("the synthetic body has a serialized size");
-    let mut config = regulated_config(u32::try_from(body_size).expect("test body size fits u32"));
+    let mut config = regulated_config(minimum_response_bytes());
     let cost = serving_cost(&config, 1).expect("test request cost is valid");
     config.get_blocks_serving_regulation.peer_backlog_bytes = cost.response_cap;
     config.get_blocks_serving_regulation.node_outstanding_bytes = cost.response_cap;
@@ -805,7 +809,7 @@ async fn gb_rl_06_backlog_never_overshoots_and_draining_resumes_work() {
 
 #[tokio::test(start_paused = true)]
 async fn gb_rl_08_handoff_failures_hold_rollback_or_settle_exactly_once() {
-    let config = regulated_config(512);
+    let config = regulated_config(minimum_response_bytes());
     let cost = serving_cost(&config, 1).expect("test request cost is valid");
     let regulator = GetBlocksServingRegulator::new(config.clone(), 1);
     let peer_id = peer(0x80);
@@ -1184,7 +1188,11 @@ fn regulated_load_case_strategy() -> impl Strategy<Value = GeneratedRegulatedLoa
         1usize..=8,
         prop_oneof![Just(1u32), Just(2u32), Just(127u32), Just(128u32)],
         prop_oneof![Just(1u32), Just(2u32), Just(8u32), 1u32..=8u32],
-        prop_oneof![Just(1u32), Just(512u32), Just(4_096u32)],
+        prop_oneof![
+            Just(minimum_response_bytes()),
+            Just(minimum_response_bytes().saturating_add(1)),
+            Just(MAX_BS_RESPONSE_BYTES),
+        ],
         1u64..=3,
         1u64..=3,
         1u64..=8,

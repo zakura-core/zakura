@@ -11927,11 +11927,14 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
 
 #[tokio::test]
 async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
-    let blocks = mainnet_blocks_1_to_3();
+    let large_block =
+        Arc::new(zakura_chain::block::tests::generate::large_multi_transaction_block());
+    let blocks = [large_block.clone(), large_block.clone(), large_block];
     let block1_size = block_size(&blocks[0]);
     let mut config = ZakuraBlockSyncConfig {
         max_blocks_per_response: 2,
-        max_response_bytes: block1_size,
+        max_response_bytes: u32::try_from(block::MAX_BLOCK_BYTES)
+            .expect("maximum block bytes fit u32"),
         ..ZakuraBlockSyncConfig::default()
     };
     config.peer_limits.outbound_queue_depth = 16;

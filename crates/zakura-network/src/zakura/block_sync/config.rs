@@ -253,6 +253,8 @@ pub struct ZakuraBlockSyncConfig {
     /// BDP-derived target once the first delivery is measured.
     pub initial_inflight_requests: u32,
     /// Maximum total response bytes this node advertises per `GetBlocks` response.
+    ///
+    /// Startup validation requires this limit to fit one maximum-size block.
     pub max_response_bytes: u32,
     /// Maximum estimated bytes reserved for outstanding block-body requests: a
     /// DoS/pacing bound on in-flight wire data, released at receipt. Received

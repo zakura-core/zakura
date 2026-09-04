@@ -54,6 +54,9 @@ pub(super) fn serving_cost(
 /// Validate that every legal request can eventually fit every configured bound.
 pub(super) fn validate_config(config: &ZakuraBlockSyncConfig) -> Result<(), &'static str> {
     let regulation = &config.get_blocks_serving_regulation;
+    if u64::from(config.advertised_max_response_bytes()) < block::MAX_BLOCK_BYTES {
+        return Err("max_response_bytes must cover one maximum-size block");
+    }
     if regulation.peer_rate_bytes_per_second == 0 {
         return Err(
             "get_blocks_serving_regulation.peer_rate_bytes_per_second must be greater than zero",
@@ -1065,7 +1068,8 @@ mod tests {
         #[test]
         fn gb_rl_12_supported_configuration_covers_largest_request(
             local_count_limit in any::<u32>(),
-            response_byte_limit in any::<u32>(),
+            response_byte_limit in u32::try_from(block::MAX_BLOCK_BYTES)
+                .expect("maximum block bytes fit u32")..=MAX_BS_RESPONSE_BYTES,
         ) {
             let mut config = ZakuraBlockSyncConfig {
                 max_blocks_per_response: local_count_limit,
@@ -1109,6 +1113,13 @@ mod tests {
             config.get_blocks_serving_regulation.node_outstanding_bytes =
                 response_cap.saturating_sub(1);
             prop_assert!(validate_config(&config).is_err());
+
+            let mut invalid = config.clone();
+            invalid.get_blocks_serving_regulation.node_outstanding_bytes = response_cap;
+            invalid.max_response_bytes = u32::try_from(block::MAX_BLOCK_BYTES)
+                .expect("maximum block bytes fit u32")
+                .saturating_sub(1);
+            prop_assert!(validate_config(&invalid).is_err());
         }
     }
 

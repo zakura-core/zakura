@@ -49,9 +49,9 @@ original proposal. They do not specify the currently deployed stream versions.
 |  |  | ↳ `HeadersOutcome` — terminal response | TBD; [v9 successor draft](header-lookup.md) | TBD; [v9 successor draft](header-lookup.md) | Covered by future request contract |
 | Block sync (6) | Advertisement | `Status` | [Draft](block-advertisement.md) | [Draft](block-advertisement.md) | [Draft](block-advertisement.md) |
 | Block sync (6) | Block range | `GetBlocks` — request | [Implemented](block-range.md#wire-format-contract) | [Implemented](block-range.md#serving-model-contract) | [Specified](block-range.md#regulated-load-contract) |
-|  |  | ↳ `Block` — response item | [Draft](block-range.md#draft-response-receiving-contract) | [Sending implemented](block-range.md#serving-model-contract); [receiving draft](block-range.md#draft-response-receiving-contract) | [Covered by `GetBlocks`](block-range.md#regulated-load-contract) |
-|  |  | ↳ `BlocksDone` — terminal response | [Draft](block-range.md#draft-response-receiving-contract) | [Sending implemented](block-range.md#serving-model-contract); [receiving draft](block-range.md#draft-response-receiving-contract) | [Covered by `GetBlocks`](block-range.md#regulated-load-contract) |
-|  |  | ↳ `RangeUnavailable` — terminal response | [Draft](block-range.md#draft-response-receiving-contract) | [Sending implemented](block-range.md#serving-model-contract); [receiving draft](block-range.md#draft-response-receiving-contract) | [Covered by `GetBlocks`](block-range.md#regulated-load-contract) |
+|  |  | ↳ `Block` — response item | [Implemented](block-range.md#wire-format-contract) | [Sending implemented](block-range.md#serving-model-contract); [receiving draft](block-range.md#draft-response-receiving-model) | [Covered by `GetBlocks`](block-range.md#regulated-load-contract) |
+|  |  | ↳ `BlocksDone` — terminal response | [Implemented](block-range.md#wire-format-contract) | [Sending implemented](block-range.md#serving-model-contract); [receiving draft](block-range.md#draft-response-receiving-model) | [Covered by `GetBlocks`](block-range.md#regulated-load-contract) |
+|  |  | ↳ `RangeUnavailable` — terminal response | [Implemented](block-range.md#wire-format-contract) | [Sending implemented](block-range.md#serving-model-contract); [receiving draft](block-range.md#draft-response-receiving-model) | [Covered by `GetBlocks`](block-range.md#regulated-load-contract) |
 
 The indented rows are protocol roles, not Rust subtypes.
 

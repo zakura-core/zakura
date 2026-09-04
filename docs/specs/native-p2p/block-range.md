@@ -190,21 +190,24 @@ These are implementation candidates until native load evidence validates them:
 | Node rate | 64 MiB/s | All inbound `GetBlocks` serving |
 | Node rate capacity | 128 MiB | All inbound `GetBlocks` serving |
 | Node outstanding | 256 MiB | Admitted response bytes not yet handed to QUIC |
+| Session pending inputs | Advertised in-flight limit + 1 | Decoded requests waiting before reactor processing in one session |
+| Node pending inputs | 32,001 requests | Decoded requests waiting before reactor processing across live and draining sessions |
 | QUIC send window | At most 32 MiB and no more than node QUIC envelope / configured connections | One connection |
 | Node QUIC envelope | 512 MiB | Sum of send windows at the configured connection limit |
 
 Startup validation requires the largest legal request to fit every applicable
-capacity. Rate balances refill with time; outstanding and backlog capacity
-return only when ownership is released.
+byte capacity and the node pending-input capacity to fit one configured session
+window. Rate balances refill with time; outstanding and backlog capacity return
+only when ownership is released.
 
 One admission may wait while the routine continues decoding the bidirectional
-stream so responses to Zakura's own block requests can pass. The pending-input
-capacity allows one admission plus the advertised in-flight count queued behind
-it. A request beyond this pre-reactor capacity is dropped without a query,
-response, or peer score. This is separate from the committed-request ledger:
-once admitted, a request rejected by that full ledger follows GB-SM-05. The
-implementation must also account for aggregate pending-input memory across the
-maximum connection count.
+stream so responses to Zakura's own block requests can pass. Each session may
+retain one admission plus its advertised in-flight count behind it. The node
+has a separate configured capacity that does not grow with the connection
+limit; the initial value fits one complete default session window. A request
+beyond either capacity is dropped without a query, response, or peer score.
+This is separate from the committed-request ledger: once admitted, a request
+rejected by that full ledger follows GB-SM-05.
 
 ### Failure outcomes
 
@@ -234,11 +237,11 @@ maximum connection count.
 | GB-RL-10b | Fifteen reading flood peers do not push an honest tiny- or full-block response beyond the existing eight-second request timeout in the named native topology. |
 | GB-RL-10c | Stopped readers remain within the application budgets and per-connection QUIC windows; the sum of configured windows fits the node QUIC envelope; the combined application and QUIC envelope is reported; writes release every lease after failure or timeout; and honest service recovers within the write timeout plus stated slack. |
 | GB-RL-11 | Responses to Zakura's downloads continue within the request timeout behind admission-delayed serving requests on the same stream. |
-| GB-RL-12 | Supported configurations use checked arithmetic, fit the largest legal request and one maximum-size block, and reject insufficient response limits or capacities. |
+| GB-RL-12 | Supported configurations use checked arithmetic, fit the largest legal request, one maximum-size block, and one session's pending-input window, and reject insufficient limits or capacities. |
 | GB-RL-13 | Under-budget histories produce the same queries, frames, and ownership state as the unregulated serving reference model. |
 | GB-RL-14 | Reconnects retain a depleted identity bucket; inactive retention is bounded and early eviction restores no more than the evicted deficit. |
 | GB-RL-15 | Rejecting a superseded routine at the session gate rolls back all provisional regulation ownership. |
-| GB-RL-16 | Pending serving-request state stays within its per-session bound and its derived aggregate bound at the configured maximum connection count. |
+| GB-RL-16 | Pending serving-request state stays within its per-session bound and an independently configured node-wide count; exhausting either bound drops the excess request with no work, response, or peer score. |
 | GB-RL-17 | The state query receives the local response-body byte limit and never returns block bodies whose total encoded size exceeds it. |
 
 The fast lane uses small capacities to reach every boundary deterministically.

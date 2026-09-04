@@ -198,8 +198,11 @@ frame's accounted payload bytes from the request permit into one non-cloneable
 lease.
 
 The lease MUST remain live until the application transport accepts the write or
-drops the frame. Bytes retained later by QUIC MUST fit a separately declared
-send-window envelope.
+drops the frame. Bytes retained later by QUIC MUST fit declared per-connection
+and node-wide send-window caps. Startup validation MUST ensure the sum of all
+connection windows at the configured connection limit fits the node-wide QUIC
+cap. Slow-reader evidence MUST check the application budget, the QUIC budget,
+and their combined envelope.
 
 Dropping a session MUST settle its permits without transferring them to a
 replacement session. Already queued frame leases remain responsible for their

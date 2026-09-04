@@ -152,8 +152,9 @@ next candidate may temporarily materialize one additional block, bounded by
 
 Admission reserves the worst case. The 64 KiB request overhead remains spent
 after commit. Unused response capacity is refunded. Response bytes remain
-reserved until their frames are accepted by QUIC or dropped; QUIC's
-unacknowledged send window is bounded separately.
+reserved until their frames are accepted by QUIC or dropped. QUIC may then
+retain them under both the per-connection window and the node-wide transport
+envelope below.
 
 ### Initial parameters
 
@@ -167,6 +168,8 @@ These are implementation candidates until native load evidence validates them:
 | Node rate | 64 MiB/s | All inbound `GetBlocks` serving |
 | Node rate capacity | 128 MiB | All inbound `GetBlocks` serving |
 | Node outstanding | 256 MiB | Admitted response bytes not yet handed to QUIC |
+| QUIC send window | At most 32 MiB and no more than node QUIC envelope / configured connections | One connection |
+| Node QUIC envelope | 512 MiB | Sum of send windows at the configured connection limit |
 
 Startup validation requires the largest legal request to fit every applicable
 capacity. Rate balances refill with time; outstanding and backlog capacity
@@ -207,7 +210,7 @@ maximum connection count.
 | GB-RL-09 | Session end settles permits without moving them to a replacement; frame leases survive until their frames leave the application transport. |
 | GB-RL-10a | Generated hostile histories vary peer count and every configured bound without exceeding peer or node accounting. |
 | GB-RL-10b | Fifteen reading flood peers do not push an honest tiny- or full-block response beyond the existing eight-second request timeout in the named native topology. |
-| GB-RL-10c | Stopped readers remain within application and QUIC envelopes, their writes release all leases after failure or timeout, and honest service recovers within the write timeout plus stated slack. |
+| GB-RL-10c | Stopped readers remain within the application budgets and per-connection QUIC windows; the sum of configured windows fits the node QUIC envelope; the combined application and QUIC envelope is reported; writes release every lease after failure or timeout; and honest service recovers within the write timeout plus stated slack. |
 | GB-RL-11 | Responses to Zakura's downloads continue within the request timeout behind admission-delayed serving requests on the same stream. |
 | GB-RL-12 | Supported configurations use checked arithmetic, fit the largest legal request, and reject insufficient capacities. |
 | GB-RL-13 | Under-budget histories produce the same queries, frames, and ownership state as the unregulated serving reference model. |

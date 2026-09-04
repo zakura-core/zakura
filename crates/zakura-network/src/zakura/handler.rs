@@ -9174,6 +9174,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gb_wf_11_incomplete_get_blocks_frame_expires_at_read_deadline() -> Result<(), BoxError>
+    {
+        const ALPN: &[u8] = b"/zakura/testkit/get-blocks-incomplete-frame/0";
+        const READ_DEADLINE: Duration = Duration::from_millis(100);
+
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(94).await?;
+        let (connection_tx, _connection_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(2);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(95).await?;
+        let server_addr = router.endpoint().node_addr().initialized().await;
+        client.add_node_addr(server_addr.clone())?;
+        let connection = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
+            .await
+            .expect("client connects for the incomplete GetBlocks frame test")?;
+
+        let (mut header_send, _header_recv) = timeout(Duration::from_secs(1), connection.open_bi())
+            .await
+            .expect("client opens the incomplete-header stream")?;
+        timeout(
+            Duration::from_secs(1),
+            header_send.write_all(&[crate::zakura::MSG_BS_GET_BLOCKS]),
+        )
+        .await
+        .expect("client writes the first GetBlocks frame byte")?;
+        let (_server_send, mut header_server_recv) =
+            timeout(Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("server accepts the incomplete-header stream")
+                .expect("capture handler forwards the incomplete-header stream");
+        let header_result = timeout(
+            Duration::from_secs(1),
+            read_service_frame(
+                &mut header_server_recv,
+                ZAKURA_STREAM_BLOCK_SYNC,
+                ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                MAX_BS_FRAME_BYTES,
+                READ_DEADLINE,
+                Some(Duration::from_secs(1)),
+            ),
+        )
+        .await
+        .expect("the frame read enforces its internal header deadline");
+        assert!(matches!(
+            header_result,
+            Err(ZakuraHandlerError::Timeout("frame header"))
+        ));
+
+        let (mut payload_send, _payload_recv) =
+            timeout(Duration::from_secs(1), connection.open_bi())
+                .await
+                .expect("client opens the incomplete-payload stream")?;
+        let mut incomplete_payload = Vec::with_capacity(FRAME_HEADER_BYTES + 1);
+        incomplete_payload
+            .extend_from_slice(&u16::from(crate::zakura::MSG_BS_GET_BLOCKS).to_le_bytes());
+        incomplete_payload.extend_from_slice(&0u16.to_le_bytes());
+        incomplete_payload.extend_from_slice(&9u32.to_le_bytes());
+        incomplete_payload.push(crate::zakura::MSG_BS_GET_BLOCKS);
+        timeout(
+            Duration::from_secs(1),
+            payload_send.write_all(&incomplete_payload),
+        )
+        .await
+        .expect("client writes a partial GetBlocks payload")?;
+        let (_server_send, mut payload_server_recv) =
+            timeout(Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("server accepts the incomplete-payload stream")
+                .expect("capture handler forwards the incomplete-payload stream");
+        let payload_result = timeout(
+            Duration::from_secs(1),
+            read_service_frame(
+                &mut payload_server_recv,
+                ZAKURA_STREAM_BLOCK_SYNC,
+                ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                MAX_BS_FRAME_BYTES,
+                READ_DEADLINE,
+                Some(Duration::from_secs(1)),
+            ),
+        )
+        .await
+        .expect("the frame read enforces its internal payload deadline");
+        assert!(matches!(
+            payload_result,
+            Err(ZakuraHandlerError::Timeout("frame payload"))
+        ));
+
+        connection.close(0u32.into(), b"done");
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn invalid_prelude_stream_churn_charges_open_rate_token() -> Result<(), BoxError> {
         // claude-invalid-stream-prelude-churn-bypasses-open-rate: a peer that
         // opens a stream naming an unregistered kind is reset stream-only and the

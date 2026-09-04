@@ -69,6 +69,7 @@ impl SyntheticBlockSyncPeer {
 
     /// Wait until the real peer routine has handled all messages queued before
     /// this call and returned to its inbound receive loop.
+    #[cfg(test)]
     pub(crate) async fn barrier_for_test(&self) -> Result<(), crate::BoxError> {
         self.inbound.barrier_for_test().await.map_err(Into::into)
     }

@@ -45,6 +45,7 @@ the reactor, or request identity allocation.
 | GB-WF-08 | `gb_wf_08_maximum_start_and_count_are_safe_to_serve` | Start and count are independently valid. A request beginning at `Height::MAX` with count 128 is valid; serving safely clamps it to the representable and available prefix. |
 | GB-WF-09 | `gb_wf_09_get_blocks_payload_cap_precedes_allocation` | The frame reader rejects a payload longer than nine bytes before allocation when either its outer frame type or payload discriminator identifies `GetBlocks`. |
 | GB-WF-10 | `gb_wf_10_fixed_fields_do_not_size_decode_allocation` | Decoding the fixed payload performs no allocation sized from peer-provided fields. |
+| GB-WF-11 | `gb_wf_11_incomplete_get_blocks_frame_expires_at_read_deadline` | Once any frame byte arrives, the transport bounds partial-frame state and expires an incomplete `GetBlocks` frame at the configured read deadline. |
 
 Deterministic cases cover:
 
@@ -55,12 +56,28 @@ Deterministic cases cover:
 - `Height::MAX` with count 128;
 - truncated and trailing payloads;
 - mismatched outer and payload discriminators;
-- nonzero flags; and
-- a declared `GetBlocks` frame longer than nine bytes.
+- nonzero flags;
+- a declared `GetBlocks` frame longer than nine bytes; and
+- an incomplete header and payload held through the read deadline.
 
 A malformed frame or payload is a protocol error and closes the affected peer
 or stream according to the surrounding transport policy. A valid request for
 unavailable blocks is not malformed; it follows the serving contract.
+
+### Status prerequisite for serving
+
+GB-SM-03 uses a narrow prerequisite from the otherwise draft block-sync
+`Status` exchange. A Status becomes retained for GetBlocks serving only when:
+
+- it decodes as the current `BlockSyncStatus` wire type;
+- `servable_low` is not above `servable_high`; and
+- the peer routine accepts it under the existing Status cadence or
+  servable-range-growth gate.
+
+Acceptance sets the routine's `received_status` state and publishes the range
+and locally clamped serving limits. The generated model uses one valid class
+whose range covers its block corpus and one invalid class whose range is
+inverted. It does not claim coverage of the remaining Status policy.
 
 ## Serving model contract
 
@@ -117,7 +134,7 @@ limit, request size, and response-byte limit. It contains:
 | `Connect` | Connect or replace a logical peer. |
 | `Disconnect` | Remove its current or an older connection. |
 | `Cancel` | Cancel the current peer session. |
-| `Status` | Send a valid or invalid status frame. |
+| `Status` | Send one of the valid or inverted-range prerequisite classes defined above. |
 | `GetBlocks` | Send a boundary-biased request. |
 | `Complete` | Return a result for a live, completed, orphaned, unknown, or mismatched query. |
 
@@ -152,10 +169,15 @@ and truncating them afterward does not satisfy this contract. Inspecting the
 next candidate may temporarily materialize one additional block, bounded by
 `MAX_BLOCK_BYTES`, but that block must not remain in the returned result.
 
+The local response-body byte limit must be at least `MAX_BLOCK_BYTES`, so every
+valid block can be served by itself. This is a local configuration requirement,
+not a stricter wire range for limits advertised by a remote peer.
+
 Admission reserves the worst case. The 64 KiB request overhead remains spent
 after commit. Unused response capacity is refunded. Response bytes remain
-reserved until their frames are accepted by QUIC or dropped; QUIC's
-unacknowledged send window is bounded separately.
+reserved until their frames are accepted by QUIC or dropped. QUIC may then
+retain them under both the per-connection window and the node-wide transport
+envelope below.
 
 ### Default parameters
 
@@ -164,6 +186,7 @@ named local topology:
 
 | Bound | Default | Scope |
 | --- | --- | --- |
+| Response-body limit | 32 MiB; minimum `MAX_BLOCK_BYTES` | One state query and response |
 | Peer rate | 16 MiB/s | One authenticated identity |
 | Peer rate capacity | 32 MiB response cap + 128 discriminators + 9 terminal bytes + 64 KiB overhead | One authenticated identity, retained while depleted |
 | Peer backlog | 64 MiB | One session's reserved and application-owned response bytes |
@@ -172,6 +195,8 @@ named local topology:
 | Node outstanding | 256 MiB | Admitted response bytes not yet handed to QUIC |
 | Session pending inputs | advertised in-flight limit + 1 | Decoded requests waiting before reactor processing in one session |
 | Node pending inputs | session pending-input cap × maximum connections | Decoded requests waiting before reactor processing across live and draining sessions |
+| QUIC send window | At most 32 MiB and no more than node QUIC envelope / configured connections | One connection |
+| Node QUIC envelope | 512 MiB | Sum of send windows at the configured connection limit |
 
 Startup validation requires the largest legal request to fit every applicable
 capacity. Rate balances refill with time; outstanding and backlog capacity
@@ -212,9 +237,9 @@ ledger: once admitted, a request rejected by that full ledger follows GB-SM-05.
 | GB-RL-09 | `gb_rl_09_session_end_settles_permit_but_frame_leases_survive_until_drop` | Session end settles permits without moving them to a replacement; frame leases survive until their frames leave the application transport. |
 | GB-RL-10a | `gb_rl_10a_generated_hostile_flood_stays_within_all_declared_bounds` | Generated hostile histories vary peer count and every configured bound without exceeding peer or node accounting. |
 | GB-RL-10b | `gb_rl_10b_native_reading_flood_preserves_honest_tiny_and_full_service` | Fifteen reading flood peers do not push an honest tiny- or full-block response beyond the existing eight-second request timeout in the named native topology. |
-| GB-RL-10c | `gb_rl_10c_native_stopped_readers_stay_bounded_reclaim_and_restore_service`<br>`gb_rl_10c_quic_send_windows_fit_node_transport_envelope` | Stopped readers remain within application and QUIC envelopes, their writes release all leases after failure or timeout, and honest service recovers within the write timeout plus stated slack. |
+| GB-RL-10c | `gb_rl_10c_native_stopped_readers_stay_bounded_reclaim_and_restore_service`<br>`gb_rl_10c_quic_send_windows_fit_node_transport_envelope` | Stopped readers remain within the application budgets and per-connection QUIC windows; the sum of configured windows fits the node QUIC envelope; the combined application and QUIC envelope is reported; writes release every lease after failure or timeout; and honest service recovers within the write timeout plus stated slack. |
 | GB-RL-11 | `gb_rl_11_pipelined_serving_requests_keep_same_stream_download_live` | Responses to Zakura's downloads continue within the request timeout behind admission-delayed serving requests on the same stream. |
-| GB-RL-12 | `gb_rl_12_supported_configuration_covers_largest_request` | Supported configurations use checked arithmetic, fit the largest legal request, and reject insufficient capacities. |
+| GB-RL-12 | `gb_rl_12_supported_configuration_covers_largest_request` | Supported configurations use checked arithmetic, fit the largest legal request and one maximum-size block, and reject insufficient response limits or capacities. |
 | GB-RL-13 | `gb_rl_13_under_budget_histories_match_pre_regulation_reference_model` | Under-budget histories produce the same queries, frames, and ownership state as the unregulated serving reference model. |
 | GB-RL-14 | `gb_rl_14_reconnect_retains_rate_bucket_and_bounds_inactive_cache` | Reconnects retain a depleted identity bucket; inactive retention is bounded and early eviction restores no more than the evicted deficit. |
 | GB-RL-15 | `gb_rl_15_stale_session_gate_rolls_back_regulation_ownership` | Rejecting a superseded routine at the session gate rolls back all provisional regulation ownership. |
@@ -355,7 +380,9 @@ defines that complete wire contract.
 
 The first implementation deliberately leaves these policies separate:
 
-- Block-sync `Status` cadence has its own future contract.
+- The full block-sync `Status` contract, including cadence policy, remains
+  separate. This contract defines only the prerequisite used by GetBlocks
+  serving.
 - Overlapping outbound range reservations remain receiving-side work.
 - Exceeding the serving ledger is rejected rather than treated as a
   disconnect-worthy peer violation.
@@ -364,6 +391,33 @@ The first implementation deliberately leaves these policies separate:
   observed admission order.
 - A successor stream version may add a wire request ID and block hashes to make
   response ownership explicit.
+
+## Implementation evidence
+
+### Shared regulation coverage
+
+The serving exchange maps the shared regulation requirements as follows. A
+mapping names the message-specific evidence that must exist before this layer
+can be marked implemented.
+
+| Shared ID | GetBlocks evidence |
+| --- | --- |
+| P2P-RG-01 | The catalog plus GB-WF-01 through GB-WF-11, GB-SM-09, and GB-RL-01 close the serving request and its response kinds. |
+| P2P-RG-02 | GB-WF-01 through GB-WF-06, GB-SM-03, GB-SM-05, GB-SM-06, GB-RL-02, and GB-RL-08 cover declared outcomes and sender obligations. |
+| P2P-RG-03 | GB-WF-01 through GB-WF-10, GB-SM-03, and GB-RL-15 enforce the processing order. |
+| P2P-RG-04 | GB-SM-03, GB-SM-06, GB-SM-10, GB-SM-12, GB-SM-17, and GB-SM-18 distinguish invalid, stale, and unavailable work. |
+| P2P-RG-05 | GB-WF-01, GB-WF-02, GB-WF-09, and GB-WF-10 cover allocation caps. |
+| P2P-RG-06 | GB-WF-11 covers partial-frame state and the read deadline. |
+| P2P-RG-07 | GB-WF-01 through GB-WF-08 and GB-WF-10 cover total and canonical decoding. |
+| P2P-RG-08 | GB-RL-01, GB-RL-12, and GB-RL-17 cover checked charges and bounded state results. |
+| P2P-RG-09 | GB-SM-04, GB-SM-13, GB-RL-05 through GB-RL-07, GB-RL-10a through GB-RL-10c, GB-RL-12, and GB-RL-16 cover peer and node bounds. |
+| P2P-RG-10 | GB-SM-08 through GB-SM-12, GB-SM-14, GB-SM-17, GB-SM-18, GB-RL-03, GB-RL-04, GB-RL-08, GB-RL-09, and GB-RL-15 cover ownership and settlement. |
+| P2P-RG-11 | GB-RL-06, GB-RL-08 through GB-RL-10c, and GB-RL-12 cover application and transport buffering. |
+| P2P-RG-12 | GB-RL-02, GB-RL-08, GB-RL-11, and GB-RL-16 cover waiting, pending input, and overload. |
+| P2P-RG-13 | Not applicable to serving responses. The receiving direction remains draft below. |
+| P2P-RG-14 | Not applicable because `GetBlocks` is a request, not an announcement. |
+| P2P-RG-15 | GB-RL-05 and GB-RL-14 cover session- and identity-owned state. |
+| P2P-RG-16 | GB-RL-08 and the native GB-RL-10 cases cover local faults and bounded evidence. |
 
 ## Peer reachability evidence
 

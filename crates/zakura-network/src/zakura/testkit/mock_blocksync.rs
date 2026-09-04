@@ -58,6 +58,8 @@ impl SyntheticBlockShape {
 
 #[derive(Clone)]
 pub(crate) struct SyntheticBlockCorpus {
+    genesis: Arc<block::Block>,
+    genesis_size: usize,
     blocks: Arc<Vec<Arc<block::Block>>>,
     sizes: Arc<Vec<usize>>,
     by_hash: Arc<HashMap<block::Hash, block::Height>>,
@@ -65,12 +67,14 @@ pub(crate) struct SyntheticBlockCorpus {
 
 impl SyntheticBlockCorpus {
     pub(crate) fn generate(count: u32, seed: u64, shape: SyntheticBlockShape) -> Self {
+        let genesis = mainnet_block(&BLOCK_MAINNET_GENESIS_BYTES);
+        let genesis_size = block_size(&genesis);
         let template = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let fixed_tx_count = shape.fixed_tx_count(&template);
         let mut blocks = Vec::with_capacity(usize::try_from(count).expect("u32 fits usize"));
         let mut sizes = Vec::with_capacity(usize::try_from(count).expect("u32 fits usize"));
-        let mut by_hash = HashMap::new();
-        let mut previous_hash = mainnet_genesis_hash();
+        let mut by_hash = HashMap::from([(genesis.hash(), block::Height::MIN)]);
+        let mut previous_hash = genesis.hash();
 
         for height in 1..=count {
             let random = splitmix64(seed ^ u64::from(height));
@@ -89,6 +93,8 @@ impl SyntheticBlockCorpus {
         }
 
         Self {
+            genesis,
+            genesis_size,
             blocks: Arc::new(blocks),
             sizes: Arc::new(sizes),
             by_hash: Arc::new(by_hash),
@@ -108,6 +114,9 @@ impl SyntheticBlockCorpus {
     }
 
     pub(crate) fn block_at(&self, height: block::Height) -> Option<Arc<block::Block>> {
+        if height == block::Height::MIN {
+            return Some(self.genesis.clone());
+        }
         let index = height.0.checked_sub(1)?;
         self.blocks
             .get(usize::try_from(index).expect("u32 fits usize"))
@@ -115,6 +124,9 @@ impl SyntheticBlockCorpus {
     }
 
     pub(crate) fn size_at(&self, height: block::Height) -> Option<usize> {
+        if height == block::Height::MIN {
+            return Some(self.genesis_size);
+        }
         let index = height.0.checked_sub(1)?;
         self.sizes
             .get(usize::try_from(index).expect("u32 fits usize"))
@@ -941,6 +953,17 @@ fn synthetic_block_generation_is_stable_and_serializable() {
     let repeat =
         SyntheticBlockCorpus::generate(64, SYNTHETIC_CORPUS_SEED, SyntheticBlockShape::default());
     let mut previous_hash = mainnet_genesis_hash();
+
+    let genesis = corpus.block_at(block::Height::MIN).expect("genesis exists");
+    assert_eq!(genesis.hash(), previous_hash);
+    assert_eq!(
+        corpus.size_at(block::Height::MIN),
+        Some(BLOCK_MAINNET_GENESIS_BYTES.len())
+    );
+    assert_eq!(
+        corpus.height_for_hash(previous_hash),
+        Some(block::Height::MIN)
+    );
 
     for height in 1..=64 {
         let height = block::Height(height);

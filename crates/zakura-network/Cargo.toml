@@ -88,6 +88,7 @@ zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.1" }
 
 [dev-dependencies]
+allocation-counter = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 criterion = { workspace = true }

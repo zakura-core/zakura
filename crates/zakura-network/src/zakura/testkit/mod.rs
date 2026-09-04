@@ -28,6 +28,8 @@ pub use matrix::{
     default_profiles, default_remote_profiles, expected_outcomes, run_default_matrix,
     ExpectedOutcome, MatrixCell, MatrixExpectation, ProfileId,
 };
+#[cfg(test)]
+pub(crate) use mock_blocksync::{SyntheticBlockCorpus, SyntheticBlockShape};
 pub use node::{ZakuraTestNode, ZakuraTestNodeBuilder};
 pub use pinned::{
     PeerProfile, PinnedNegotiation, PinnedPeer, PinnedProfileError, PinnedZakuraProfile,

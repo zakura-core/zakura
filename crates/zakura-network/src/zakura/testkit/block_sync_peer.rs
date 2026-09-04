@@ -10,14 +10,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::zakura::{
     framed_channel, BlockSyncHandle, BlockSyncMessage, BlockSyncService, BlockSyncStatus,
-    FramedRecv, FramedSend, Peer, Service, ServicePeerDirection, ZakuraBlockSyncConfig,
-    ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
+    CloseCause, FramedRecv, FramedSend, Peer, Service, ServicePeerDirection, ServiceStream,
+    ZakuraBlockSyncConfig, ZakuraConnId, ZakuraPeerId, ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+    ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
 };
 
 /// A connected synthetic block-sync peer backed by in-memory stream channels.
 #[derive(Debug)]
 pub struct SyntheticBlockSyncPeer {
     peer_id: ZakuraPeerId,
+    conn_id: ZakuraConnId,
+    direction: ServicePeerDirection,
     inbound: FramedSend,
     outbound: FramedRecv,
     cancel: CancellationToken,
@@ -29,11 +32,39 @@ impl SyntheticBlockSyncPeer {
         &self.peer_id
     }
 
+    /// Synthetic transport connection identity.
+    pub fn conn_id(&self) -> ZakuraConnId {
+        self.conn_id
+    }
+
+    /// Direction used for service admission.
+    pub fn direction(&self) -> ServicePeerDirection {
+        self.direction
+    }
+
+    /// Cancellation token for observing session ownership and teardown.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
     /// Queue a real stream-6 message as inbound peer traffic to the node.
     pub async fn send(&self, msg: BlockSyncMessage) -> Result<(), crate::BoxError> {
         let frame = msg.encode_frame()?;
         self.inbound.send(frame).await?;
         Ok(())
+    }
+
+    /// Queue a real stream-6 message without yielding to the node runtime.
+    pub fn try_send(&self, msg: BlockSyncMessage) -> Result<(), crate::BoxError> {
+        let frame = msg.encode_frame()?;
+        self.inbound.try_send(frame)?;
+        Ok(())
+    }
+
+    /// Wait until the real peer routine has handled all messages queued before
+    /// this call and returned to its inbound receive loop.
+    pub(crate) async fn barrier_for_test(&self) -> Result<(), crate::BoxError> {
+        self.inbound.barrier_for_test().await.map_err(Into::into)
     }
 
     /// Receive the next real stream-6 message sent by the node to this peer.
@@ -83,27 +114,60 @@ impl SyntheticBlockSyncPeers {
         peer_id: ZakuraPeerId,
         status: BlockSyncStatus,
     ) -> Result<SyntheticBlockSyncPeer, crate::BoxError> {
+        let peer = self.connect_peer(peer_id, 0, ServicePeerDirection::Outbound)?;
+        peer.send(BlockSyncMessage::Status(status)).await?;
+        Ok(peer)
+    }
+
+    /// Attach a synthetic peer without sending its first `Status`.
+    ///
+    /// The explicit connection id and direction let lifecycle tests distinguish
+    /// a current session from a stale predecessor.
+    pub fn connect_peer(
+        &self,
+        peer_id: ZakuraPeerId,
+        conn_id: ZakuraConnId,
+        direction: ServicePeerDirection,
+    ) -> Result<SyntheticBlockSyncPeer, crate::BoxError> {
         let (inbound_tx, inbound_rx) = framed_channel(self.queue_depth);
         let (outbound_tx, outbound_rx) = framed_channel(self.queue_depth);
-        let cancel = CancellationToken::new();
-        let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+        let connection_cancel = CancellationToken::new();
+        let service_cancel = connection_cancel.child_token();
+        let streams = HashMap::from([(
+            ZAKURA_STREAM_BLOCK_SYNC,
+            ServiceStream::new(
+                0,
+                ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                inbound_rx,
+                outbound_tx,
+                service_cancel.clone(),
+            ),
+        )]);
 
-        self.service.add_peer(Peer::new_with_direction(
+        self.service.add_peer(Peer::new_with_service_cancel_token(
+            conn_id,
             peer_id.clone(),
             None,
             ZAKURA_CAP_BLOCK_SYNC,
-            ServicePeerDirection::Outbound,
+            direction,
             streams,
-            cancel.clone(),
+            connection_cancel,
+            service_cancel.clone(),
+            CloseCause::default(),
         ));
 
-        let peer = SyntheticBlockSyncPeer {
+        Ok(SyntheticBlockSyncPeer {
             peer_id,
+            conn_id,
+            direction,
             inbound: inbound_tx,
             outbound: outbound_rx,
-            cancel,
-        };
-        peer.send(BlockSyncMessage::Status(status)).await?;
-        Ok(peer)
+            cancel: service_cancel,
+        })
+    }
+
+    /// Remove exactly one synthetic connection from the service.
+    pub fn remove_peer(&self, peer_id: &ZakuraPeerId, conn_id: ZakuraConnId) {
+        self.service.remove_peer(peer_id, conn_id);
     }
 }

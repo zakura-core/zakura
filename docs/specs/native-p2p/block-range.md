@@ -1,7 +1,8 @@
 # Block-range exchange (`GetBlocks`)
 
-> **Status: specified.** Implementation PRs must add evidence before changing
-> any layer to implemented.
+> **Status: partially implemented.** The wire-format and serving-model layers
+> are implemented. Regulated load is specified here and gains implementation
+> evidence in the regulation layer of the stack.
 
 This contract covers the stream-6 block-range serving exchange initiated by
 `GetBlocks`. It specifies the request wire format, the server's state and
@@ -33,18 +34,18 @@ the reactor, or request identity allocation.
 
 ## Wire format contract
 
-| ID | Requirement |
-| --- | --- |
-| GB-WF-01 | The outer frame type and payload discriminator are both `2`. |
-| GB-WF-02 | The canonical payload is nine bytes: discriminator, little-endian start height, and little-endian count. |
-| GB-WF-03 | The start height is in `0..=0x7fff_ffff`. |
-| GB-WF-04 | The count is in `1..=128`. |
-| GB-WF-05 | The decoder consumes the payload exactly and rejects trailing bytes. |
-| GB-WF-06 | Accepted frames have zero flags. |
-| GB-WF-07 | Every accepted request re-encodes to the same canonical payload. |
-| GB-WF-08 | Start and count are independently valid. A request beginning at `Height::MAX` with count 128 is valid; serving safely clamps it to the representable and available prefix. |
-| GB-WF-09 | The frame reader rejects a `GetBlocks` payload longer than nine bytes before allocating its payload buffer. |
-| GB-WF-10 | Decoding the fixed payload performs no allocation sized from peer-provided fields. |
+| ID | Test | Requirement |
+| --- | --- | --- |
+| GB-WF-01 | `gb_wf_01_payload_and_frame_type_are_two` | The outer frame type and payload discriminator are both `2`. |
+| GB-WF-02 | `gb_wf_02_payload_uses_canonical_nine_byte_layout` | The canonical payload is nine bytes: discriminator, little-endian start height, and little-endian count. |
+| GB-WF-03 | `gb_wf_03_start_height_is_bounded` | The start height is in `0..=0x7fff_ffff`. |
+| GB-WF-04 | `gb_wf_04_count_is_between_one_and_128` | The count is in `1..=128`. |
+| GB-WF-05 | `gb_wf_05_decoder_rejects_trailing_bytes` | The decoder consumes the payload exactly and rejects trailing bytes. |
+| GB-WF-06 | `gb_wf_06_frames_require_zero_flags` | Accepted frames have zero flags. |
+| GB-WF-07 | `gb_wf_07_accepted_messages_reencode_canonically` | Every accepted request re-encodes to the same canonical payload. |
+| GB-WF-08 | `gb_wf_08_maximum_start_and_count_are_safe_to_serve` | Start and count are independently valid. A request beginning at `Height::MAX` with count 128 is valid; serving safely clamps it to the representable and available prefix. |
+| GB-WF-09 | `gb_wf_09_get_blocks_payload_cap_precedes_allocation` | The frame reader rejects a payload longer than nine bytes before allocation when either its outer frame type or payload discriminator identifies `GetBlocks`. |
+| GB-WF-10 | `gb_wf_10_fixed_fields_do_not_size_decode_allocation` | Decoding the fixed payload performs no allocation sized from peer-provided fields. |
 
 Deterministic cases cover:
 
@@ -72,27 +73,27 @@ Input classes identify who can create each event:
   behavior.
 - **All:** invariants checked after each settled step.
 
-| ID | Class | Requirement |
-| --- | --- | --- |
-| GB-SM-01 | Peer | A replacement connection cancels the preceding session for the same peer. |
-| GB-SM-02 | Peer | A stale disconnect does not close or mutate the current session. |
-| GB-SM-03 | Peer | A peer without retained valid `Status` cannot start a request; the attempt is recorded as `GetBlocksSpam`. |
-| GB-SM-04 | All | Each peer has an independent request ledger bounded by the configured local in-flight cap. |
-| GB-SM-05 | Peer | A cap-rejected request emits no state query and receives `RangeUnavailable` while output capacity is available. |
-| GB-SM-06 | Peer | A request starting above the servable tip emits no state query and receives `RangeUnavailable`. |
-| GB-SM-07 | Peer | An accepted query count is clamped by the wire count, local count limit, representable heights, and available range. |
-| GB-SM-08 | Driver | Request identities are nonzero and are not reused during one replay. |
-| GB-SM-09 | Driver | A matching ready response sends the largest contiguous prefix within the byte cap followed by exactly one appropriate terminal frame. |
-| GB-SM-10 | Internal | Unknown, retired, mismatched, repeated, or orphaned completion identities have no serving effect. |
-| GB-SM-11 | Internal | Repeating a completed response does not release another live request slot. |
-| GB-SM-12 | Peer | Disconnecting or replacing a session orphans its queries; later results never reach the replacement. |
-| GB-SM-13 | Peer | Saturating one peer does not consume another peer's request ledger. |
-| GB-SM-14 | All | Every `Block` or terminal frame is attributable to the live session and request that owns it. |
-| GB-SM-15 | Peer | A delayed older `PeerConnected` event cannot replace a newer reactor session for the same peer. |
-| GB-SM-16 | Peer | A peer routine does not process frames until the reactor admits or rejects its session. |
-| GB-SM-17 | Peer | A request decoded by a superseded routine produces no state query, reply, or misbehavior record for its replacement session. |
-| GB-SM-18 | Driver | A matching zero-result state completion sends `RangeUnavailable`, retires the request, and releases its slot. |
-| GB-SM-19 | Peer | Inbound sessions serve `GetBlocks` through the same path and use the inbound peer cap independently of the outbound cap. |
+| ID | Test | Class | Requirement |
+| --- | --- | --- | --- |
+| GB-SM-01 | `gb_sm_01_replacement_cancels_previous_session` | Peer | A replacement connection cancels the preceding session for the same peer. |
+| GB-SM-02 | `gb_sm_02_stale_disconnect_preserves_current_session` | Peer | A stale disconnect does not close or mutate the current session. |
+| GB-SM-03 | `gb_sm_03_missing_status_is_rejected_as_spam` | Peer | A peer without retained valid `Status` cannot start a request; the attempt is recorded as `GetBlocksSpam`. |
+| GB-SM-04 | `gb_sm_04_peer_ledgers_are_independent_and_bounded` | All | Each peer has an independent request ledger bounded by the configured local in-flight cap. |
+| GB-SM-05 | `gb_sm_05_saturated_ledger_rejects_without_state_query` | Peer | A cap-rejected request emits no state query and receives `RangeUnavailable` while output capacity is available. |
+| GB-SM-06 | `gb_sm_06_above_tip_request_is_unavailable_without_state_query` | Peer | A request starting above the servable tip emits no state query and receives `RangeUnavailable`. |
+| GB-SM-07 | `gb_sm_07_accepted_query_count_respects_all_bounds` | Peer | An accepted query count is clamped by the wire count, local count limit, representable heights, and available range. |
+| GB-SM-08 | `gb_sm_08_request_ids_are_nonzero_and_unique` | Driver | Request identities are nonzero and are not reused during one replay. |
+| GB-SM-09 | `gb_sm_09_ready_response_sends_largest_valid_prefix_and_one_terminal` | Driver | A matching ready response sends the largest contiguous prefix within the requested count and byte cap, followed by exactly one appropriate terminal frame. |
+| GB-SM-10 | `gb_sm_10_invalid_completion_has_no_serving_effect` | Internal | Unknown, retired, mismatched, repeated, or orphaned completion identities have no serving effect. |
+| GB-SM-11 | `gb_sm_11_repeated_completion_does_not_release_live_slot` | Internal | Repeating a completed response does not release another live request slot. |
+| GB-SM-12 | `gb_sm_12_ended_session_responses_do_not_reach_replacement` | Peer | Disconnecting or replacing a session orphans its queries; later results never reach the replacement. |
+| GB-SM-13 | `gb_sm_13_saturated_peer_does_not_block_other_peers` | Peer | Saturating one peer does not consume another peer's request ledger. |
+| GB-SM-14 | `gb_sm_14_frames_are_attributable_to_live_request_owner` | All | Every `Block` or terminal frame is attributable to the live session and request that owns it. |
+| GB-SM-15 | `gb_sm_15_delayed_older_connect_cannot_replace_newer_session` | Peer | A delayed older `PeerConnected` event cannot replace a newer reactor session for the same peer. |
+| GB-SM-16 | `gb_sm_16_peer_frames_wait_for_reactor_admission` | Peer | A peer routine does not process frames until the reactor admits or rejects its session. |
+| GB-SM-17 | `gb_sm_17_superseded_routine_request_cannot_reach_replacement_session` | Peer | A request decoded by a superseded routine produces no state query, reply, or misbehavior record for its replacement session. |
+| GB-SM-18 | `gb_sm_18_live_unavailable_completion_sends_terminal_and_releases_slot` | Driver | A matching zero-result state completion sends `RangeUnavailable`, retires the request, and releases its slot. |
+| GB-SM-19 | `gb_sm_19_inbound_sessions_serve_and_use_inbound_cap` | Peer | Inbound sessions serve `GetBlocks` through the same path and use the inbound peer cap independently of the outbound cap. |
 
 Serving `Status` survives an overlapping replacement for the same authenticated
 peer, but not a fully settled disconnect. Changing that policy requires a
@@ -109,7 +110,8 @@ limit, request size, and response-byte limit. It contains:
 
 1. A successful exchange proving the full path works.
 2. One focused boundary or lifecycle scenario.
-3. Generated steps that search interactions among the requirements.
+3. Between 8 and 32 generated steps that search interactions among the
+   requirements.
 
 | Operation | Effect |
 | --- | --- |
@@ -121,13 +123,14 @@ limit, request size, and response-byte limit. It contains:
 | `Complete` | Return a result for a live, completed, orphaned, unknown, or mismatched query. |
 
 A step may issue several operations before settling only when they share a
-defined FIFO order or happens-before relationship. Normal settled steps use an
-explicit production barrier. Fixed sleeps or yield counts are not a settlement
-contract.
+defined FIFO order or happens-before relationship. Focused scenarios cover
+every model-checkable `GB-SM` occurrence before random histories run, and
+forced regressions cover task orderings the normal runner cannot reliably
+place.
 
-Focused scenarios cover every model-checkable `GB-SM` occurrence before random
-histories run. Invariants report their successful comparison count. Forced
-regressions cover task orderings the normal runner cannot reliably place.
+The runner settles each step with explicit acknowledgements from the reactor
+and every live peer routine. It rejects invalid case-count or seed overrides
+and prints the effective values for rerunning the unchanged generator.
 
 ## Regulated load contract
 
@@ -308,17 +311,79 @@ The first implementation deliberately leaves these policies separate:
 - A successor stream version may add a wire request ID and block hashes to make
   response ownership explicit.
 
-## Implementation evidence
+## Peer reachability evidence
 
-The implementation PR for each layer must add:
+The contract records eight failure scenarios in three fix areas. Several
+scenarios share one ownership or ordering fix, so there are three production
+fixes rather than eight.
 
-- the ID-named Rust test for every requirement;
-- a machine-checked ID-to-test manifest;
-- run and replay commands;
-- generated case and successful comparison counts;
-- focused regressions for forced schedules;
-- sensitivity results for historical defects and observation channels; and
-- peer-reachability or native-load evidence for operational claims.
+- **Natural** means peer traffic triggered the behavior without timing
+  controls.
+- **Controlled schedule** means a delay made a production-valid ordering
+  repeatable.
+- **Internal only** means a peer cannot create the event.
 
-Until that evidence exists, the catalog must continue to show the layer as
-**Specified**, not **Implemented**.
+| Fix area | Scenario exercised | Reachability |
+| --- | --- | --- |
+| Admission ordering | Peer reads begin before reactor admission | Natural |
+| Admission ordering | A valid first request is treated as spam | Controlled schedule |
+| Connection lifecycle | An older connection replaces the current session | Controlled schedule |
+| Connection lifecycle | A stale disconnect removes the replacement | Controlled schedule |
+| Request ownership | An old response reaches a replacement session | Controlled schedule |
+| Request ownership | A stale completion releases a live request slot | Controlled schedule |
+| Request ownership | A forged response identity changes serving state | Internal only |
+| Request ownership | A superseded routine's request reaches its replacement session | Controlled schedule |
+
+The three production fixes are:
+
+1. **Admission ordering:** prevent peer reads until reactor admission finishes.
+2. **Connection lifecycle:** tie connect and disconnect events to the correct
+   connection generation.
+3. **Request ownership:** bind serving requests to the originating session and
+   responses and capacity to the exact live request.
+
+### Confirmation results
+
+Temporary local-network probes compared complete source snapshots before and
+after each fix. The probes were removed after recording the results. The
+superseded-routine case remains as a forced-ordering regression because its
+exact handoff must be intercepted deterministically.
+
+| Fix area | Before-fix snapshot | Fixed snapshot | Result |
+| --- | --- | --- | --- |
+| Admission ordering | `5f1e12367` | `cdc769f19` | Under simultaneous peer load, `Status` preceded admission in 90 of 96 sessions before the fix and 0 of 96 after it. Reproducing the dropped-as-spam consequence required delaying the real `Connected` event. |
+| Connection lifecycle | `5f1e12367` | `28b4aef9e` | Delaying real lifecycle events displaced the current session 6 of 6 times before the fix. A stronger wire replay failed 3 of 3 times before the fix. Neither failed afterward. |
+| Request ownership | `38538d460` | `6d6ab411f` | Before the fix, a delayed state result produced three `Block`/`BlocksDone` sequences and no rejection. After the fix, Zakura produced one valid sequence and rejected the stale request with `RangeUnavailable`. |
+| Request session ownership | `6d6ab411f` | `070247cbe` | Two real peer routines decoded requests around a replacement. Delaying the older routine's request made the pre-fix reactor query its range through the replacement; the fixed reactor ignored it and queried only the replacement's range. |
+
+See [reachability claims](../../design/property-testing.md#reachability-claims) for
+the evidence required by each label.
+
+## Running and replaying
+
+Run the current wire-format and serving-model evidence:
+
+```sh
+cargo test -p zakura-network --lib message_contracts -- --nocapture --test-threads=1
+cargo test -p zakura-network --lib gb_wf_09 -- --nocapture
+```
+
+Run more generated serving scenarios before changing block-sync lifecycle or
+serving logic:
+
+```sh
+ZAKURA_SERVING_MODEL_CASES=1000 \
+  cargo test -p zakura-network --lib message_contracts::serving_model \
+  -- --nocapture --test-threads=1
+```
+
+Every generated run prints its effective case count and seed. Set both values
+to rerun the same cases on the same revision and generator, and preserve
+important failures as focused regressions:
+
+```sh
+ZAKURA_SERVING_MODEL_CASES=1000 \
+ZAKURA_SERVING_MODEL_SEED=<printed-seed> \
+  cargo test -p zakura-network --lib message_contracts::serving_model \
+  -- --nocapture --test-threads=1
+```

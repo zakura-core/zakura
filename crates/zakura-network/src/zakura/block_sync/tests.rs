@@ -44,6 +44,9 @@ use zakura_chain::{
 };
 use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES};
 
+#[path = "property_tests/mod.rs"]
+mod message_contracts;
+
 fn peer(byte: u8) -> ZakuraPeerId {
     ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds")
 }
@@ -6437,6 +6440,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
         // No reactor wiring: `add_peer` drains inbound (no routine), and this test
         // only checks the lifecycle-bypass plumbing.
         routine_wiring: None,
+        test_barriers: mpsc::unbounded_channel().0,
     };
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let peer = peer(91);

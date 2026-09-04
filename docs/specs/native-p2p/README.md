@@ -25,6 +25,8 @@ Status is tracked separately for each contract layer:
 - **Draft:** an earlier proposal is preserved, but it still needs stable IDs
   and reconciliation with the production protocol.
 - **Specified:** requirements exist, but implementation evidence is incomplete.
+- **Partially implemented:** some requirements have evidence and the contract
+  names what remains.
 - **Implemented:** the contract links every requirement to passing evidence.
 - **Covered by request:** response load is owned by the initiating request;
   this does not complete the response's wire or receiving-side contract.
@@ -46,10 +48,10 @@ original proposal. They do not specify the currently deployed stream versions.
 |  |  | ↳ `Headers` — response | TBD; [v9 successor draft](header-lookup.md) | TBD; [v9 successor draft](header-lookup.md) | Covered by future request contract |
 |  |  | ↳ `HeadersOutcome` — terminal response | TBD; [v9 successor draft](header-lookup.md) | TBD; [v9 successor draft](header-lookup.md) | Covered by future request contract |
 | Block sync (6) | Advertisement | `Status` | [Draft](block-advertisement.md) | [Draft](block-advertisement.md) | [Draft](block-advertisement.md) |
-| Block sync (6) | Block range | `GetBlocks` — request | [Specified](block-range.md#wire-format-contract) | [Specified](block-range.md#serving-model-contract) | [Specified](block-range.md#regulated-load-contract) |
-|  |  | ↳ `Block` — response item | [Draft](block-range.md#draft-response-receiving-contract) | [Sending specified](block-range.md#serving-model-contract); [receiving draft](block-range.md#draft-response-receiving-contract) | [Covered by `GetBlocks`](block-range.md#regulated-load-contract) |
-|  |  | ↳ `BlocksDone` — terminal response | [Draft](block-range.md#draft-response-receiving-contract) | [Sending specified](block-range.md#serving-model-contract); [receiving draft](block-range.md#draft-response-receiving-contract) | [Covered by `GetBlocks`](block-range.md#regulated-load-contract) |
-|  |  | ↳ `RangeUnavailable` — terminal response | [Draft](block-range.md#draft-response-receiving-contract) | [Sending specified](block-range.md#serving-model-contract); [receiving draft](block-range.md#draft-response-receiving-contract) | [Covered by `GetBlocks`](block-range.md#regulated-load-contract) |
+| Block sync (6) | Block range | `GetBlocks` — request | [Implemented](block-range.md#wire-format-contract) | [Implemented](block-range.md#serving-model-contract) | [Specified](block-range.md#regulated-load-contract) |
+|  |  | ↳ `Block` — response item | [Draft](block-range.md#draft-response-receiving-contract) | [Sending implemented](block-range.md#serving-model-contract); [receiving draft](block-range.md#draft-response-receiving-contract) | [Covered by `GetBlocks`](block-range.md#regulated-load-contract) |
+|  |  | ↳ `BlocksDone` — terminal response | [Draft](block-range.md#draft-response-receiving-contract) | [Sending implemented](block-range.md#serving-model-contract); [receiving draft](block-range.md#draft-response-receiving-contract) | [Covered by `GetBlocks`](block-range.md#regulated-load-contract) |
+|  |  | ↳ `RangeUnavailable` — terminal response | [Draft](block-range.md#draft-response-receiving-contract) | [Sending implemented](block-range.md#serving-model-contract); [receiving draft](block-range.md#draft-response-receiving-contract) | [Covered by `GetBlocks`](block-range.md#regulated-load-contract) |
 
 The indented rows are protocol roles, not Rust subtypes.
 

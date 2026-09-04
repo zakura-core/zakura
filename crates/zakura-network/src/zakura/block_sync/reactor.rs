@@ -135,6 +135,10 @@ pub fn spawn_block_sync_reactor(
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
     let lifecycle_keepalive = lifecycle_tx.clone();
     let (peer_lifecycle_tx, peer_lifecycle_rx) = mpsc::unbounded_channel();
+    #[cfg(test)]
+    let (test_barriers_tx, test_barriers_rx) = mpsc::unbounded_channel();
+    #[cfg(test)]
+    let test_barriers_keepalive = test_barriers_tx.clone();
     // Size the action channel so the Sequencer can dispatch a full checkpoint
     // window of `SubmitBlock`s (`submitted_apply_limit`) plus the query/misbehavior
     // spare pool. The resident look-ahead gate — not this channel — bounds body
@@ -244,6 +248,8 @@ pub fn spawn_block_sync_reactor(
         status: status_rx,
         candidates: candidates_rx,
         routine_wiring: Some(routine_wiring),
+        #[cfg(test)]
+        test_barriers: test_barriers_tx,
     };
     let reactor = BlockSyncReactor {
         verified_block_tip: startup.frontiers.verified_block_tip,
@@ -283,6 +289,10 @@ pub fn spawn_block_sync_reactor(
         sequencer_input_decoded_attributed_memory_bytes,
         sequencer_control: sequencer_control_tx,
         sequencer_view: sequencer_view_rx,
+        #[cfg(test)]
+        test_barriers: test_barriers_rx,
+        #[cfg(test)]
+        _test_barriers_keepalive: test_barriers_keepalive,
     };
     let task = tokio::spawn(reactor.run());
 
@@ -338,6 +348,14 @@ pub(super) struct BlockSyncReactor {
     sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
     /// Latest-wins progress view published by the Sequencer task.
     sequencer_view: watch::Receiver<SequencerView>,
+    /// Test-only control path that acknowledges only after all currently
+    /// queued reactor inputs have passed through their production handlers.
+    #[cfg(test)]
+    test_barriers: mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<()>>,
+    /// Keep the optional test barrier path open when a production-shaped test
+    /// moves or drops every external [`BlockSyncHandle`].
+    #[cfg(test)]
+    _test_barriers_keepalive: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
     /// Reactor-side mirror of the Sequencer's verified tip (it no longer lives
     /// in `state`). Updated from the progress view; initialized from startup.
     verified_block_tip: block::Height,
@@ -497,6 +515,25 @@ impl BlockSyncReactor {
                         None => break,
                     }
                 }
+                _barrier = async {
+                    #[cfg(test)]
+                    {
+                        self.test_barriers.recv().await
+                    }
+                    #[cfg(not(test))]
+                    {
+                        std::future::pending::<Option<tokio::sync::oneshot::Sender<()>>>().await
+                    }
+                } => {
+                    #[cfg(test)]
+                    {
+                        let Some(barrier) = _barrier else { break };
+                        self.drain_test_inputs().await;
+                        let _ = barrier.send(());
+                    }
+                    #[cfg(not(test))]
+                    unreachable!("the production test-barrier future never resolves");
+                }
                 _ = metrics_ticks.tick() => {
                     self.publish_metrics();
                     self.refresh_throughput();
@@ -513,6 +550,34 @@ impl BlockSyncReactor {
                     self.empty_state_header_quiet_until = None;
                     self.query_needed_blocks_with_options(true).await;
                 }
+            }
+        }
+    }
+
+    /// Run every input already visible to the reactor through the same handlers
+    /// as the main select loop before acknowledging a deterministic test step.
+    #[cfg(test)]
+    async fn drain_test_inputs(&mut self) {
+        loop {
+            let mut drained = false;
+            while let Ok(event) = self.lifecycle.try_recv() {
+                self.handle_event(event).await;
+                drained = true;
+            }
+            while let Ok(event) = self.peer_lifecycle.try_recv() {
+                self.handle_peer_lifecycle_event(event).await;
+                drained = true;
+            }
+            while let Ok(event) = self.events.try_recv() {
+                self.handle_event(event).await;
+                drained = true;
+            }
+            while let Ok(message) = self.routine_to_reactor.try_recv() {
+                self.handle_routine_message(message).await;
+                drained = true;
+            }
+            if !drained {
+                break;
             }
         }
     }

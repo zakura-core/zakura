@@ -15,6 +15,9 @@ use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCa
 // `MAX_BS_INFLIGHT_REQUESTS` is a `u32`, which fits in `usize` on supported targets.
 pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = MAX_BS_INFLIGHT_REQUESTS as usize;
 
+#[cfg(test)]
+const TEST_BARRIER_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Cached chain frontiers used by the block-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BlockSyncFrontiers {
@@ -125,6 +128,9 @@ pub struct BlockSyncHandle {
     /// (`service::add_peer`). `None` for the inert/handle-less test constructors
     /// that never spawn routines.
     pub(super) routine_wiring: Option<RoutineWiring>,
+    /// Explicit acknowledgement path used by deterministic reactor tests.
+    #[cfg(test)]
+    pub(super) test_barriers: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// The shared download primitives a per-peer pipe-routine is constructed with.
@@ -147,6 +153,20 @@ pub(super) struct RoutineWiring {
 }
 
 impl BlockSyncHandle {
+    /// Wait until the reactor has drained every input already queued on its
+    /// driver, lifecycle, peer-lifecycle, and peer-routine paths.
+    #[cfg(test)]
+    pub(crate) async fn barrier_for_test(&self) -> Result<(), &'static str> {
+        let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
+        self.test_barriers
+            .send(acknowledge)
+            .map_err(|_| "the block-sync reactor closed before the test barrier")?;
+        time::timeout(TEST_BARRIER_TIMEOUT, acknowledged)
+            .await
+            .map_err(|_| "the block-sync reactor timed out before the test barrier")?
+            .map_err(|_| "the block-sync reactor dropped the test barrier")
+    }
+
     /// Send a fact/event to the block-sync reactor.
     pub async fn send(
         &self,

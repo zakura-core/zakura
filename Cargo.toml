@@ -59,6 +59,7 @@ zcash_proofs = { version = "1.0.1", package = "zakura-proofs" }
 zcash_transparent = "0.10.0"
 zcash_protocol = "0.10.1"
 abscissa_core = { version = "0.7", default-features = false }
+allocation-counter = "0.8.1"
 base64 = "0.22.1"
 bech32 = "0.11.0"
 bellman = { version = "1.0.1", package = "zakura-bellman" }

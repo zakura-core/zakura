@@ -254,6 +254,15 @@ rejected by that full ledger follows GB-SM-05.
 | Output queue is full after commit | Drop the unsent response or terminal frame, settle its permit exactly once, keep the session connected, and assign no peer score. Existing frame leases remain until transport releases them. No terminal frame is required while the queue is full. |
 | Output queue is closed or otherwise fails after commit | End the affected session without a peer score and settle its permit exactly once. If the session remains registered when the failure is observed, cancel it. Existing frame leases remain until transport releases them. No terminal frame is required when its output path is unavailable. |
 
+### Observability
+
+Regulation trace rows identify `block_sync` and `get_blocks`, the peer and
+session when known, and one closed-set bound or terminal-reason label. Delayed
+and pending-cap rows report the requested or spent units. Settlement rows
+report reserved, transferred, used, and refunded bytes plus the request ID when
+allocated. Peer and session identifiers appear only in traces; metric labels
+use the bounded reason and resource enums.
+
 ### Requirements
 
 | ID | Requirement |
@@ -280,6 +289,7 @@ rejected by that full ledger follows GB-SM-05.
 | GB-RL-18 | A panic while holding a provisional attempt, committed permit, or frame lease releases that ownership, records no peer violation, and leaves unrelated peer admission usable. |
 | GB-RL-19 | Every decoded request that reaches pending-input admission first reserves the fixed request overhead from both rate buckets. A pending-cap drop spends that overhead, and an unavailable ingress charge leaves at most one decoded request waiting, so repeated drops cannot bypass peer or node rate limits. |
 | GB-RL-20 | A state query that has not completed by the configured block-sync `request_timeout`, measured from ledger commit, is retired at that deadline, releases its slot and permit, and queues `RangeUnavailable` with the original wire count when output remains available. |
+| GB-RL-21 | Delays, pending-cap drops, rejections, disconnect cleanup, and local-fault settlements expose the service, exchange, peer and session when known, responsible bound or terminal reason, and applicable reserved, transferred, used, and refunded units. Metrics use only closed-set labels and never peer or session identity. |
 
 The fast lane uses small capacities to reach every boundary deterministically.
 The native lane uses real stream-6 frames, the production peer routine and
@@ -408,7 +418,7 @@ can be marked implemented.
 | P2P-RG-13 | Not applicable to serving responses. The receiving direction remains draft below. |
 | P2P-RG-14 | Not applicable because `GetBlocks` is a request, not an announcement. |
 | P2P-RG-15 | GB-RL-05 and GB-RL-14 cover session- and identity-owned state. |
-| P2P-RG-16 | GB-RL-08, the native GB-RL-10 cases, and GB-RL-18 cover local faults, panic cleanup, isolation, and bounded evidence. |
+| P2P-RG-16 | GB-RL-08, the native GB-RL-10 cases, GB-RL-18, and GB-RL-21 cover local faults, panic cleanup, isolation, and bounded evidence. |
 
 The implementation PR for each layer must add:
 

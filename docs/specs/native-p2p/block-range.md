@@ -143,6 +143,13 @@ charge       = response_cap + 64 KiB
 The nine bytes cover the terminal response. `N` covers one discriminator byte
 per `Block` payload. The remaining term covers encoded block bodies.
 
+The state query receives the local response-body byte limit and returns only
+the largest contiguous prefix whose encoded block sizes fit that limit. It must
+enforce the limit while constructing the result; materializing all `N` blocks
+and truncating them afterward does not satisfy this contract. Inspecting the
+next candidate may temporarily materialize one additional block, bounded by
+`MAX_BLOCK_BYTES`, but that block must not remain in the returned result.
+
 Admission reserves the worst case. The 64 KiB request overhead remains spent
 after commit. Unused response capacity is refunded. Response bytes remain
 reserved until their frames are accepted by QUIC or dropped; QUIC's
@@ -196,6 +203,7 @@ maximum connection count.
 | GB-RL-14 | Reconnects retain a depleted identity bucket; inactive retention is bounded and early eviction restores no more than the evicted deficit. |
 | GB-RL-15 | Rejecting a superseded routine at the session gate rolls back all provisional regulation ownership. |
 | GB-RL-16 | Pending serving-request state stays within its per-session bound and its derived aggregate bound at the configured maximum connection count. |
+| GB-RL-17 | The state query receives the local response-body byte limit and never returns block bodies whose total encoded size exceeds it. |
 
 The fast lane uses small capacities to reach every boundary deterministically.
 The native lane uses real stream-6 frames, the production peer routine and

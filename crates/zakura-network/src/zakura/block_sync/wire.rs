@@ -30,18 +30,26 @@ pub const MAX_BS_MESSAGE_BYTES: usize = 3 * 1024 * 1024;
 
 pub(super) const BLOCK_SYNC_MESSAGE_TYPE_BYTES: usize = 1;
 const GET_BLOCKS_PAYLOAD_BYTES: usize = BLOCK_SYNC_MESSAGE_TYPE_BYTES + 4 + 4;
+const BLOCK_PAYLOAD_BYTES: usize = BLOCK_SYNC_MESSAGE_TYPE_BYTES + 2_000_000;
+const TERMINAL_PAYLOAD_BYTES: usize = BLOCK_SYNC_MESSAGE_TYPE_BYTES + 4 + 4;
 
 const _: () = assert!(MAX_BS_MESSAGE_BYTES < 4 * 1024 * 1024);
 const _: () = assert!(MAX_BS_MESSAGE_BYTES > block::MAX_BLOCK_BYTES as usize);
+const _: () = assert!(block::MAX_BLOCK_BYTES == 2_000_000);
 
-/// Return the payload cap that must be enforced before allocating a buffer for
-/// a fixed-size inbound message.
+/// Return the wire payload cap enforced before allocating an inbound buffer.
 ///
-/// Variable-size messages return `None` and remain bounded by the stream cap.
-/// Keeping this table beside the codec makes each future fixed-size message's
-/// allocation boundary part of its wire definition.
+/// Messages without a specified per-kind cap return `None` and remain bounded
+/// by the stream cap. Keeping this table beside the codec makes each allocation
+/// boundary part of its wire definition.
 pub(crate) fn preallocation_payload_cap(message_type: u16) -> Option<usize> {
-    (message_type == u16::from(MSG_BS_GET_BLOCKS)).then_some(GET_BLOCKS_PAYLOAD_BYTES)
+    match message_type {
+        value if value == u16::from(MSG_BS_GET_BLOCKS) => Some(GET_BLOCKS_PAYLOAD_BYTES),
+        value if value == u16::from(MSG_BS_BLOCK) => Some(BLOCK_PAYLOAD_BYTES),
+        value if value == u16::from(MSG_BS_BLOCKS_DONE) => Some(TERMINAL_PAYLOAD_BYTES),
+        value if value == u16::from(MSG_BS_RANGE_UNAVAILABLE) => Some(TERMINAL_PAYLOAD_BYTES),
+        _ => None,
+    }
 }
 
 /// Native stream-6 block-sync message.

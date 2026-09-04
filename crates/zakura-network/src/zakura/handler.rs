@@ -8770,6 +8770,116 @@ mod tests {
         Ok(())
     }
 
+    async fn assert_block_sync_payload_cap_precedes_allocation(
+        alpn: &'static [u8],
+        server_seed: u64,
+        client_seed: u64,
+        message_type: u8,
+        payload_cap: usize,
+    ) -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(server_seed).await?;
+        let (connection_tx, _connection_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        let router = Router::builder(server)
+            .accept(
+                alpn,
+                CaptureConnection {
+                    connection_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(client_seed).await?;
+        let server_addr = router.endpoint().node_addr().initialized().await;
+        client.add_node_addr(server_addr.clone())?;
+        let connection = timeout(Duration::from_secs(10), client.connect(server_addr, alpn))
+            .await
+            .expect("client connects for the block-sync payload cap test")?;
+        let (mut peer_send, _peer_recv) = timeout(Duration::from_secs(1), connection.open_bi())
+            .await
+            .expect("client opens the block-sync stream")?;
+
+        let oversized_payload = payload_cap
+            .checked_add(1)
+            .expect("the specified payload caps fit usize");
+        let oversized_payload = u32::try_from(oversized_payload)
+            .expect("the specified payload caps fit the wire length field");
+        let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
+        header.extend_from_slice(&u16::from(message_type).to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&oversized_payload.to_le_bytes());
+        timeout(Duration::from_secs(1), peer_send.write_all(&header))
+            .await
+            .expect("client writes the oversized block-sync header")?;
+        let _ = peer_send.finish();
+
+        let (_server_send, mut server_recv) = timeout(Duration::from_secs(1), stream_rx.recv())
+            .await
+            .expect("server accepts the block-sync stream")
+            .expect("capture handler forwards the block-sync stream");
+        let rejected = read_service_frame(
+            &mut server_recv,
+            ZAKURA_STREAM_BLOCK_SYNC,
+            ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            MAX_BS_FRAME_BYTES,
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+        )
+        .await;
+        assert!(matches!(
+            rejected,
+            Err(ZakuraHandlerError::OversizeFrame {
+                payload_len,
+                max_frame_bytes,
+                ..
+            }) if payload_len == usize::try_from(oversized_payload).expect("u32 fits usize")
+                && max_frame_bytes == FRAME_HEADER_BYTES + payload_cap
+        ));
+
+        connection.close(0u32.into(), b"done");
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gb_wf_15_block_payload_cap_precedes_allocation() -> Result<(), BoxError> {
+        assert_block_sync_payload_cap_precedes_allocation(
+            b"/zakura/testkit/block-payload-cap/0",
+            194,
+            195,
+            crate::zakura::MSG_BS_BLOCK,
+            1 + usize::try_from(zakura_chain::block::MAX_BLOCK_BYTES)
+                .expect("the consensus block cap fits usize"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn gb_wf_17_blocks_done_payload_cap_precedes_allocation() -> Result<(), BoxError> {
+        assert_block_sync_payload_cap_precedes_allocation(
+            b"/zakura/testkit/blocks-done-payload-cap/0",
+            196,
+            197,
+            crate::zakura::MSG_BS_BLOCKS_DONE,
+            9,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn gb_wf_19_range_unavailable_payload_cap_precedes_allocation() -> Result<(), BoxError> {
+        assert_block_sync_payload_cap_precedes_allocation(
+            b"/zakura/testkit/range-unavailable-payload-cap/0",
+            198,
+            199,
+            crate::zakura::MSG_BS_RANGE_UNAVAILABLE,
+            9,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn gb_wf_11_incomplete_get_blocks_frame_expires_at_read_deadline() -> Result<(), BoxError>
     {

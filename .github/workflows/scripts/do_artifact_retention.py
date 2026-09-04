@@ -4,7 +4,7 @@
 import argparse
 from datetime import datetime, timedelta, timezone
 
-from do_provision import REGIONS, doctl, height, newest
+from do_provision import REGIONS, doctl, height, newest, output
 
 
 def retained_ids(images, snapshots, checkpoint):
@@ -97,7 +97,9 @@ def main():
     ]
     keep = retained_ids(images, snapshots, args.checkpoint)
     now = datetime.now(timezone.utc)
-    for region in stale_regions(images, now):
+    stale = stale_regions(images, now)
+    output(stale_regions=",".join(stale), notify_stale=str(now.hour == 12).lower())
+    for region in stale:
         print(
             f"::warning::CI image missing or older than 14 days in {region}; "
             "repair the regional bake"

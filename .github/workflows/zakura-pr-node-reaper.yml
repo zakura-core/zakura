@@ -99,7 +99,31 @@ jobs:
           done
 
       - name: Prune old images and volume snapshots
+        id: artifacts
         run: |
           set -euo pipefail
           MAINNET_C=$(tail -1 crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
           python3 .github/workflows/scripts/do_artifact_retention.py --checkpoint "$MAINNET_C" --apply
+
+      - name: Report stale regional images once daily
+        if: >-
+          github.event_name == 'schedule'
+          && steps.artifacts.outputs.notify_stale == 'true'
+          && steps.artifacts.outputs.stale_regions != ''
+        env:
+          SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+          REGIONS: ${{ steps.artifacts.outputs.stale_regions }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import urllib.request
+          text = ("Zakura CI images missing or older than 14 days in " + os.environ["REGIONS"]
+              + ". Repair the regional bake. " + os.environ["RUN_URL"])
+          request = urllib.request.Request(os.environ["SLACK_WEB_HOOK"],
+              data=json.dumps({"text": text}).encode(), headers={"Content-Type": "application/json"})
+          with urllib.request.urlopen(request, timeout=8) as response:
+              if response.read().decode().strip() != "ok":
+                  raise SystemExit("Slack did not acknowledge the stale-image alert")
+          PYTHON

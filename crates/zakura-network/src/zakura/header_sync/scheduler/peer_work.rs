@@ -314,6 +314,13 @@ pub enum HeaderTargetPurpose {
 }
 
 impl HeaderTargetPurpose {
+    /// Return the target purpose's exact response-count requirement, when fixed.
+    ///
+    /// Selected auxiliary repairs can cover a negotiated range, so they have no fixed count.
+    pub const fn exact_header_count(&self) -> Option<usize> {
+        None
+    }
+
     /// Return the selected target fixed by an auxiliary repair.
     pub fn selected_repair_target(&self) -> Option<Frontier> {
         match self {
@@ -1512,7 +1519,9 @@ mod tests {
             repair_generation: 7,
         };
 
+        assert_eq!(purpose.exact_header_count(), None);
         assert_eq!(purpose.selected_repair_target(), Some(selected_target));
+        assert_eq!(HeaderTargetPurpose::Normal.exact_header_count(), None);
         assert_eq!(HeaderTargetPurpose::Normal.selected_repair_target(), None);
     }
 }

@@ -3267,7 +3267,7 @@ impl HeaderSyncReactor {
             );
             return;
         }
-        candidates.sort_by(|left, right| right.4.cmp(&left.4));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.4));
         let mut local_capacity_unavailable = false;
         for (peer, source, session, mut status, request_count) in candidates {
             self.peer_work_queue.remove_unstarted(&peer);

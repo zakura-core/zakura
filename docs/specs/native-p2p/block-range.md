@@ -399,7 +399,7 @@ Run the current wire-format and serving-model evidence:
 
 ```sh
 cargo test -p zakura-network --lib message_contracts -- --nocapture --test-threads=1
-cargo test -p zakura-network --lib gb_wf_09 -- --nocapture
+cargo test -p zakura-network --lib payload_cap_precedes_allocation -- --nocapture --test-threads=1
 ```
 
 Run more generated serving scenarios before changing block-sync lifecycle or

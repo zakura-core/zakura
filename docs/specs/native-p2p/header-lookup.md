@@ -75,7 +75,7 @@ target hash, and a one-byte outcome.
   - `initial_target_tip_hash` and `tree_aux_schema` remain fixed
   - the acknowledged cursor and counters equal the current acknowledgement or advance to a prefix
     in the sent-cursor ring (capacity = `HS_SENT_CURSOR_RING`)
-  - remaining header credit <= 4,000
+  - unacknowledged sent pages + remaining header credit <= 4,000 after the update
   - remaining byte credit <= 8 MiB
   - terminal tombstone capacity = 1
 - **Work**
@@ -96,7 +96,9 @@ subscription reservation before it sends `Open`.
 
 `Grant` MUST carry no locator hashes. It MUST acknowledge a cursor accepted from this subscription.
 It MUST add nonzero header or byte credit. The subscriber MUST add the credit to its local
-subscription reservation before it sends `Grant`. Until the subscription reaches its initial
+subscription reservation before it sends `Grant`. It MUST acknowledge enough sent pages that those
+still unacknowledged plus the resulting remaining header credit do not exceed 4,000. A publisher
+MUST return `Disconnect` if a grant exceeds that bound. Until the subscription reaches its initial
 target, the resulting header and byte credit MUST fit at least one legal nonempty page. A smaller
 grant stalls the subscription: the publisher cannot legally send a page, and the subscriber waits
 for one. After the subscription reaches its target, the publisher may have nothing to send. The
@@ -127,8 +129,10 @@ subscription work charge covers the terminal outcome, which consumes no header o
 The publisher MUST split output into frames that satisfy its advertised per-response count and byte
 limits. It MAY send several frames without another `Grant` while credit remains. It MUST NOT treat
 bytes sent on the ordered stream as new credit. The sent-cursor ring MUST hold at least the
-maximum number of unacknowledged pages. The header credit bound limits that number to 4,000
-one-header pages, so `HS_SENT_CURSOR_RING` always suffices.
+maximum number of unacknowledged pages. Sending a page adds one cursor while consuming at least one
+header credit, so the combined 4,000-page-and-credit bound remains true as credit is renewed.
+`HS_SENT_CURSOR_RING` therefore retains every cursor the subscriber is still allowed to
+acknowledge.
 
 A subscription renews its reservation and drains responses already in flight before it closes:
 

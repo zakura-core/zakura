@@ -64,6 +64,21 @@ A malformed frame or payload is a protocol error and closes the affected peer
 or stream according to the surrounding transport policy. A valid request for
 unavailable blocks is not malformed; it follows the serving contract.
 
+### Status prerequisite for serving
+
+GB-SM-03 uses a narrow prerequisite from the otherwise draft block-sync
+`Status` exchange. A Status becomes retained for GetBlocks serving only when:
+
+- it decodes as the current `BlockSyncStatus` wire type;
+- `servable_low` is not above `servable_high`; and
+- the peer routine accepts it under the existing Status cadence or
+  servable-range-growth gate.
+
+Acceptance sets the routine's `received_status` state and publishes the range
+and locally clamped serving limits. The generated model uses one valid class
+whose range covers its block corpus and one invalid class whose range is
+inverted. It does not claim coverage of the remaining Status policy.
+
 ## Serving model contract
 
 Input classes identify who can create each event:
@@ -118,7 +133,7 @@ limit, request size, and response-byte limit. It contains:
 | `Connect` | Connect or replace a logical peer. |
 | `Disconnect` | Remove its current or an older connection. |
 | `Cancel` | Cancel the current peer session. |
-| `Status` | Send a valid or invalid status frame. |
+| `Status` | Send one of the valid or inverted-range prerequisite classes defined above. |
 | `GetBlocks` | Send a boundary-biased request. |
 | `Complete` | Return a result for a live, completed, orphaned, unknown, or mismatched query. |
 
@@ -324,7 +339,9 @@ defines that complete wire contract.
 
 The first implementation deliberately leaves these policies separate:
 
-- Block-sync `Status` cadence has its own future contract.
+- The full block-sync `Status` contract, including cadence policy, remains
+  separate. This contract defines only the prerequisite used by GetBlocks
+  serving.
 - Overlapping outbound range reservations remain receiving-side work.
 - Exceeding the serving ledger is rejected rather than treated as a
   disconnect-worthy peer violation.

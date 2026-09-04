@@ -116,6 +116,10 @@ jobs:
           umask 077
           {
             printf 'BAKE_SHA=%q\n'                 "${BAKE_SHA}"
+            # One deadline includes compilation and all state downloads. Leave
+            # three hours of the seven-hour job for extraction, fixture copying,
+            # image/volume snapshots, and cleanup.
+            printf 'BAKE_DOWNLOAD_DEADLINE=%q\n' "$(( $(date +%s) + (420 - 180) * 60 ))"
             printf 'GH_REPO=%q\n'                 "${GITHUB_REPOSITORY}"
             printf 'GH_CLONE_TOKEN=%q\n'          "${GH_CLONE_TOKEN}"
             printf 'MAINNET_VOLUME_NAME=%q\n'     "${MAINNET_VOLUME_NAME}"

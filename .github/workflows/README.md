@@ -86,6 +86,8 @@ The provisioner only retries an explicitly rejected capacity request. Ambiguous 
 
 Bakes on a branch write `zakura-pr-validation-*` artifacts, which scheduled jobs never select. The workflow uploads their exact IDs for explicit `image_id`/`state_snapshot_id` PR-node validation. Delete those temporary images and snapshots after validation. Only a bake on `main` publishes the ordinary artifact names. Manual `notify=false` and PR-node `post_comment=false` allow quiet validation.
 
+State downloads resume across bounded connections until one shared deadline, four hours after the bake script step starts. Compilation and earlier downloads consume that same budget. Each connection lasts at most ten minutes, with its timeout and retry delay shortened near the deadline. The seven-hour job reserves the remaining three hours for extraction, fixture copying, snapshots, and cleanup. This permits slow but viable downloads without an attempt-count cap; it cannot make an archive that needs days fit into the job.
+
 To validate a change, run the provisioning regression tests and a read-only catalog plan, then bake both regions on the branch. Run a pre-checkpoint PR-node test against each region's exact artifact IDs with the Zakura P2P stack and immediate teardown. Verify finalized C, best height C+1, VCT activity, and cleanup before promoting the code. A successful fallback catalog plan alone is not a successful handoff test.
 
 ## Fork maintenance

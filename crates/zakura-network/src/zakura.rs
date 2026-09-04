@@ -22,6 +22,7 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
+mod regulation;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub mod testkit;
 mod trace;

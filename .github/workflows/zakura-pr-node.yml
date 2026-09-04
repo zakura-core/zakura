@@ -14,6 +14,22 @@ name: PR node
 on:
   workflow_call:
     inputs:
+      image_id:
+        description: "Exact image for artifact validation; empty selects a regional image"
+        type: string
+        default: ""
+      state_snapshot_id:
+        description: "Exact state fixture for artifact validation"
+        type: string
+        default: ""
+      regions:
+        description: "Ordered candidate regions"
+        type: string
+        default: nyc1,sfo3,nyc3
+      post_comment:
+        description: "Post a summary to the target PR"
+        type: boolean
+        default: true
       pr_number:
         description: "PR number to test (exactly one of pr_number / ref)"
         required: false
@@ -63,6 +79,8 @@ on:
         value: ${{ jobs.node.outputs.start_height }}
       end_height:
         value: ${{ jobs.node.outputs.end_height }}
+      failure_phase:
+        value: ${{ jobs.node.outputs.failure_phase }}
       verdict:
         value: ${{ jobs.node.outputs.verdict }}
     secrets:
@@ -72,6 +90,22 @@ on:
         required: true
   workflow_dispatch:
     inputs:
+      image_id:
+        description: "Exact image for artifact validation; empty selects a regional image"
+        type: string
+        default: ""
+      state_snapshot_id:
+        description: "Exact state fixture for artifact validation"
+        type: string
+        default: ""
+      regions:
+        description: "Ordered candidate regions"
+        type: string
+        default: nyc1,sfo3,nyc3
+      post_comment:
+        description: "Post a summary to the target PR"
+        type: boolean
+        default: true
       pr_number:
         description: "PR number to test (exactly one of pr_number / ref)"
         required: false
@@ -123,6 +157,7 @@ jobs:
       start_height: ${{ steps.result.outputs.start_height }}
       end_height: ${{ steps.result.outputs.end_height }}
       verdict: ${{ steps.result.outputs.verdict }}
+      failure_phase: ${{ steps.phase.outputs.failure_phase }}
     # duration_minutes (<=60 typically) + incremental build + provisioning overhead.
     timeout-minutes: 110
     steps:
@@ -196,76 +231,22 @@ jobs:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
           ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
 
-      - name: Pick state snapshot
-        id: baked
-        env:
-          MODE: ${{ inputs.snapshot_mode }}
-          NETWORK: ${{ inputs.network }}
-          MAX_CKPT: ${{ steps.target.outputs.max_ckpt }}
-        run: |
-          set -euo pipefail
-          if [ "${MODE}" = "genesis" ]; then
-            echo "vol_snap_id=" >> "$GITHUB_OUTPUT"
-            echo "snapshot_height=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          SNAPS=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
-            awk -v pre="zakura-pr-state-${NETWORK}-" 'index($2, pre) == 1 {print $2, $1}' | sort)
-          APPROACH_SNAPS=""
-          if [ "${MODE}" = "pre-checkpoint" ] && [ "${NETWORK}" = "mainnet" ]; then
-            APPROACH_SNAPS=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
-              awk '$2 ~ /^zakura-vct-approach-mainnet-/ {print $2, $1}' | sort)
-          fi
-          if [ -z "${SNAPS}" ] && [ -z "${APPROACH_SNAPS}" ]; then
-            echo "no zakura-pr-state-${NETWORK}-* volume snapshot found; run the bake workflow first" >&2
-            exit 1
-          fi
-          if [ "${MODE}" = "pre-checkpoint" ]; then
-            # Newest retained snapshot whose baked state height (the -h<height>
-            # name suffix) is below the target's max checkpoint: guarantees a
-            # handoff crossing with the shortest possible sync.
-            SEARCH_SNAPS=$(printf '%s\n%s\n' "${SNAPS}" "${APPROACH_SNAPS}" | awk 'NF' | sort)
-            CANDIDATES=$(echo "${SEARCH_SNAPS}" | while read -r name id; do
-              h=$(printf '%s' "$name" | sed -n 's/.*-h\([0-9][0-9]*\)$/\1/p')
-              [ -n "$h" ] && [ "$h" -lt "${MAX_CKPT}" ] && echo "$h $name $id"
-            done | sort -n || true)
-            if [ -n "${CANDIDATES}" ]; then
-              SELECTED=$(echo "${CANDIDATES}" | tail -1)
-              SNAP=$(echo "${SELECTED}" | awk '{print $3}')
-              SNAP_NAME=$(echo "${SELECTED}" | awk '{print $2}')
-              echo "picked ${SNAP_NAME} (below max checkpoint ${MAX_CKPT})"
-            else
-              # Transition fallback for pre-existing date-only assets. The
-              # restored DB tip is verified directly before the node starts.
-              LEGACY_SNAPS=$(echo "${SNAPS}" | awk '$1 !~ /-h[0-9]+$/')
-              if [ -z "${LEGACY_SNAPS}" ]; then
-                echo "no retained ${NETWORK} snapshot is below the target's max checkpoint ${MAX_CKPT}; a handoff crossing is impossible" >&2
-                exit 1
-              fi
-              SELECTED=$(echo "${LEGACY_SNAPS}" | head -1)
-              SNAP=$(echo "${SELECTED}" | awk '{print $2}')
-              SNAP_NAME=$(echo "${SELECTED}" | awk '{print $1}')
-            fi
-          else
-            SELECTED=$(echo "${SNAPS}" | tail -1)
-            SNAP=$(echo "${SELECTED}" | awk '{print $2}')
-            SNAP_NAME=$(echo "${SELECTED}" | awk '{print $1}')
-          fi
-          echo "vol_snap_id=${SNAP}" >> "$GITHUB_OUTPUT"
-          SNAPSHOT_HEIGHT=$(printf '%s' "${SNAP_NAME}" | sed -n 's/.*-h\([0-9][0-9]*\)$/\1/p')
-          echo "snapshot_height=${SNAPSHOT_HEIGHT}" >> "$GITHUB_OUTPUT"
-
       - name: Create droplet (+ state volume)
         id: droplet
         uses: ./.github/actions/do-droplet
         with:
           name: zakura-pr-${{ steps.target.outputs.slug }}-${{ github.run_id }}
+          policy: correctness
+          regions: ${{ inputs.regions }}
+          image_id: ${{ inputs.image_id }}
+          state_snapshot_id: ${{ inputs.state_snapshot_id }}
+          snapshot_mode: ${{ inputs.snapshot_mode }}
+          max_checkpoint: ${{ steps.target.outputs.max_ckpt }}
           size: ${{ inputs.droplet_size || 'c-8' }}
           ssh_fingerprint: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
           tag: zakura-pr-node
           # genesis syncs from scratch, so it gets no state volume
           state_network: ${{ inputs.snapshot_mode != 'genesis' && inputs.network || '' }}
-          state_snapshot_id: ${{ steps.baked.outputs.vol_snap_id }}
           volume_name: zakura-pr-vol-${{ github.run_id }}
 
       - name: Wait for SSH
@@ -286,7 +267,7 @@ jobs:
           VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
           P2P_STACK: ${{ inputs.p2p_stack || 'default' }}
           MAX_CKPT: ${{ steps.target.outputs.max_ckpt }}
-          SNAPSHOT_HEIGHT: ${{ steps.baked.outputs.snapshot_height }}
+          SNAPSHOT_HEIGHT: ${{ steps.droplet.outputs.snapshot_height }}
         run: |
           set -euo pipefail
           umask 077
@@ -313,6 +294,21 @@ jobs:
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \
             'set -euo pipefail; set -a; . /root/run.env; set +a; bash /root/pr-node-run.sh'
+
+      - name: Classify failure phase
+        id: phase
+        if: always()
+        env:
+          TARGET: ${{ steps.target.outcome }}
+          PROVISION: ${{ steps.droplet.outcome }}
+          SSH: ${{ steps.sshwait.outcome }}
+        run: |
+          if [ "$TARGET" != success ]; then PHASE=input-validation
+          elif [ "$PROVISION" != success ]; then PHASE=provisioning
+          elif [ "$SSH" != success ]; then PHASE=node-startup
+          else PHASE=node-execution
+          fi
+          echo "failure_phase=$PHASE" >> "$GITHUB_OUTPUT"
 
       - name: Collect run outputs
         id: result
@@ -360,7 +356,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Post PR comment
-        if: always() && steps.target.outputs.pr != '' && steps.droplet.outputs.ip != ''
+        if: always() && inputs.post_comment && steps.target.outputs.pr != '' && steps.droplet.outputs.ip != ''
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PR: ${{ steps.target.outputs.pr }}
@@ -424,7 +420,7 @@ jobs:
           droplet_id: ${{ steps.droplet.outputs.id }}
           droplet_name: zakura-pr-${{ steps.target.outputs.slug }}-${{ github.run_id }}
           volume_ids: ${{ steps.droplet.outputs.volume_id }}
-          volume_names: ${{ inputs.snapshot_mode != 'genesis' && format('zakura-pr-vol-{0}', github.run_id) || '' }}
+          volume_names: ${{ steps.droplet.outputs.volume_name }}
           # A droplet we can never SSH into is useless to keep for inspection.
           # string-compare the input: it is null under any non-dispatch trigger,
           # and `null || ...` would quietly resolve to "keep" (this workflow's

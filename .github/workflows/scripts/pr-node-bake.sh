@@ -7,6 +7,7 @@
 #
 # Config via /root/bake.env (sourced by the caller before exec):
 #   GH_REPO                  owner/name of this repository
+#   BAKE_SHA                 exact workflow revision to build
 #   GH_CLONE_TOKEN           token used once for the clone; the remote URL is
 #                            reset token-free afterwards, nothing is baked
 #   MAINNET_VOLUME_NAME      DO volume that gets tip/ + sandblast/ mainnet state
@@ -69,6 +70,8 @@ git clone "https://x-access-token:${GH_CLONE_TOKEN}@github.com/${GH_REPO}.git" /
 git -C /root/zakura remote set-url origin "https://github.com/${GH_REPO}.git"
 rm -f /root/bake.env
 unset GH_CLONE_TOKEN
+git -C /root/zakura fetch --no-tags origin "${BAKE_SHA}"
+git -C /root/zakura checkout --detach "${BAKE_SHA}"
 
 # Warm the shared target dir that deploy.py's per-run worktree builds reuse.
 cd /root/zakura

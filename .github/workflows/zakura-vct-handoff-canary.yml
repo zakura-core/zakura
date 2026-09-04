@@ -22,6 +22,10 @@ on:
         default: main
   workflow_dispatch:
     inputs:
+      notify:
+        description: "Send failure alerts"
+        type: boolean
+        default: true
       target_ref:
         description: "Commit, branch, or tag to test"
         required: false
@@ -48,6 +52,7 @@ jobs:
         || (
           github.event.pull_request.head.repo.full_name == github.repository
           && contains(github.event.pull_request.labels.*.name, 'A-release-state')
+          && (github.event.action != 'labeled' || github.event.label.name == 'A-release-state')
         )
       }}
     uses: ./.github/workflows/zakura-pr-node.yml
@@ -69,13 +74,14 @@ jobs:
   alert:
     name: Alert #zakura-alerts
     needs: [handoff]
-    if: ${{ always() && needs.handoff.result == 'failure' }}
+    if: ${{ always() && needs.handoff.result == 'failure' && (github.event_name != 'workflow_dispatch' || inputs.notify) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
       SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
       TARGET_REF: ${{ inputs.target_ref || github.event.pull_request.head.sha || 'main' }}
+      FAILURE_PHASE: ${{ needs.handoff.outputs.failure_phase }}
       TARGET_SHA: ${{ needs.handoff.outputs.target_sha }}
       MAX_CHECKPOINT: ${{ needs.handoff.outputs.max_checkpoint }}
       START_HEIGHT: ${{ needs.handoff.outputs.start_height }}
@@ -99,7 +105,7 @@ jobs:
 
           text = (
               ":rotating_light: Zakura VCT handoff canary failed\n"
-              f"mainnet | ref={value('TARGET_REF')} | sha={value('TARGET_SHA')} | "
+              f"phase={value('FAILURE_PHASE')} | mainnet | ref={value('TARGET_REF')} | sha={value('TARGET_SHA')} | "
               f"C={value('MAX_CHECKPOINT')} | start={value('START_HEIGHT')} | "
               f"end={value('END_HEIGHT')} | {value('RUN_URL')}"
           )

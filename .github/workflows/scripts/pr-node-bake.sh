@@ -7,6 +7,8 @@
 #
 # Config via /root/bake.env (sourced by the caller before exec):
 #   GH_REPO                  owner/name of this repository
+#   BAKE_SHA                 exact workflow revision to build
+#   BAKE_DOWNLOAD_DEADLINE   Unix deadline shared by all state downloads
 #   GH_CLONE_TOKEN           token used once for the clone; the remote URL is
 #                            reset token-free afterwards, nothing is baked
 #   MAINNET_VOLUME_NAME      DO volume that gets tip/ + sandblast/ mainnet state
@@ -18,6 +20,8 @@
 #   SANDBLAST_SHA256         its sha256
 #   TESTNET_SNAPSHOTS_BASE   testnet snapshots site (serves /snapshots.json)
 set -euo pipefail
+
+: "${BAKE_DOWNLOAD_DEADLINE:?bake workflow must provide the download deadline}"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -69,6 +73,8 @@ git clone "https://x-access-token:${GH_CLONE_TOKEN}@github.com/${GH_REPO}.git" /
 git -C /root/zakura remote set-url origin "https://github.com/${GH_REPO}.git"
 rm -f /root/bake.env
 unset GH_CLONE_TOKEN
+git -C /root/zakura fetch --no-tags origin "${BAKE_SHA}"
+git -C /root/zakura checkout --detach "${BAKE_SHA}"
 
 # Warm the shared target dir that deploy.py's per-run worktree builds reuse.
 cd /root/zakura
@@ -148,10 +154,25 @@ fetch_state() {
   local tarball="${dest%/}.tar.zst"
   echo "Fetching ${url} -> ${dest}"
   df -h "$(dirname "$dest")"
-  # --retry-all-errors + -C - resumes interrupted multi-GB transfers instead of
-  # failing the whole bake (plain --retry does not cover mid-stream resets).
-  curl -fL --retry 8 --retry-delay 15 --retry-all-errors -C - \
-    -o "$tarball" "$url"
+  # Start a fresh curl for each retry so -C - rechecks the saved byte count.
+  # Curl's internal retries reset to the offset from its original invocation.
+  local remaining attempt_timeout
+  while true; do
+    remaining=$((BAKE_DOWNLOAD_DEADLINE - $(date +%s)))
+    if [ "$remaining" -le 0 ]; then
+      echo "state download deadline reached: $url" >&2
+      return 1
+    fi
+    attempt_timeout=$((remaining < 600 ? remaining : 600))
+    if curl -fL --connect-timeout 30 --speed-limit 1024 --speed-time 120 \
+      --max-time "$attempt_timeout" -C - -o "$tarball" "$url"; then
+      break
+    fi
+    remaining=$((BAKE_DOWNLOAD_DEADLINE - $(date +%s)))
+    if [ "$remaining" -gt 0 ]; then
+      sleep "$((remaining < 15 ? remaining : 15))"
+    fi
+  done
   if [ -n "$sha" ]; then
     echo "${sha}  ${tarball}" | sha256sum -c -
   fi

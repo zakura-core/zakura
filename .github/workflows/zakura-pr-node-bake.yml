@@ -5,15 +5,27 @@ name: PR node image bake
 #     release cache + a loopback SSH identity for deploy.py,
 #   - one volume snapshot per network with extracted chain state
 #     (mainnet: tip/ + sandblast/, testnet: tip/),
-#   - one small Mainnet pruned-state snapshot rolled back below the VCT handoff.
+#   - one small Mainnet pruned-state snapshot below the VCT handoff.
 # Runs weekly so the tip states and the cargo cache never drift far from main;
 # PR-node runs sync the remaining gap during their hour.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - .github/actions/do-droplet/**
+      - .github/workflows/zakura-pr-node-bake.yml
+      - .github/workflows/scripts/do_provision.py
+      - .github/workflows/scripts/do_seed_approach.py
+      - .github/workflows/scripts/pr-node-bake.sh
   workflow_dispatch:
     inputs:
+      notify:
+        description: "Send failure alerts"
+        type: boolean
+        default: true
       droplet_size:
-        description: "Bake droplet size (its disk becomes the image's minimum disk)"
+        description: "Preferred bake size; alternatives must retain a 100 GB root disk"
         required: false
         default: c-8
       kresko_ref:
@@ -21,9 +33,10 @@ on:
         required: false
         default: main
       region:
-        description: "DO region (must host the run droplets too)"
-        required: false
-        default: nyc3
+        description: "Prepare both runtime regions, or repair one region"
+        type: choice
+        options: [all, nyc1, sfo3]
+        default: all
       rebuild_approach_from_sandblast:
         description: "One-time: sync the historical Mainnet state to C-100 for the VCT canary"
         type: boolean
@@ -40,7 +53,16 @@ concurrency:
 
 jobs:
   bake:
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJSON(inputs.region == 'nyc1' && '["nyc1"]' || inputs.region == 'sfo3' && '["sfo3"]' || '["nyc1","sfo3"]') }}
     runs-on: ubuntu-latest
+    env:
+      # Branch validation must not replace artifacts used by scheduled jobs.
+      NODE_PREFIX: ${{ github.ref == 'refs/heads/main' && 'zakura-pr-node' || 'zakura-pr-validation-node' }}
+      STATE_PREFIX: ${{ github.ref == 'refs/heads/main' && 'zakura-pr-state' || 'zakura-pr-validation-state' }}
+      APPROACH_PREFIX: ${{ github.ref == 'refs/heads/main' && 'zakura-vct-approach' || 'zakura-pr-validation-approach' }}
     # Cold cargo build + three snapshot downloads + a ~50GB image snapshot.
     timeout-minutes: 420
     steps:
@@ -54,48 +76,17 @@ jobs:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
           ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
 
-      # Not the shared do-droplet action: the bake starts from a stock Ubuntu
-      # image (it is what produces the baked one) and attaches blank tip-state
-      # and VCT-approach volumes that it later snapshots.
       - name: Create state volumes + bake droplet
         id: droplet
-        env:
-          REGION: ${{ inputs.region || 'nyc3' }}
-          DROPLET_SIZE: ${{ inputs.droplet_size || 'c-8' }}
-          SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
-        run: |
-          set -euo pipefail
-          MAINNET_VOL="zakura-pr-bake-mainnet-${GITHUB_RUN_ID}"
-          TESTNET_VOL="zakura-pr-bake-testnet-${GITHUB_RUN_ID}"
-          APPROACH_VOL="zakura-pr-bake-approach-${GITHUB_RUN_ID}"
-          {
-            echo "mainnet_vol=$MAINNET_VOL"
-            echo "testnet_vol=$TESTNET_VOL"
-            echo "approach_vol=$APPROACH_VOL"
-          } >> "$GITHUB_OUTPUT"
-          MAINNET_VOL_ID=$(doctl compute volume create "$MAINNET_VOL" \
-            --region "${REGION}" --size 300GiB --format ID --no-header)
-          echo "mainnet_vol_id=$MAINNET_VOL_ID" >> "$GITHUB_OUTPUT"
-          TESTNET_VOL_ID=$(doctl compute volume create "$TESTNET_VOL" \
-            --region "${REGION}" --size 100GiB --format ID --no-header)
-          echo "testnet_vol_id=$TESTNET_VOL_ID" >> "$GITHUB_OUTPUT"
-          APPROACH_VOL_ID=$(doctl compute volume create "$APPROACH_VOL" \
-            --region "${REGION}" --size 100GiB --format ID --no-header)
-          echo "approach_vol_id=$APPROACH_VOL_ID" >> "$GITHUB_OUTPUT"
-          NAME="zakura-pr-bake-${GITHUB_RUN_ID}"
-          echo "droplet_name=$NAME" >> "$GITHUB_OUTPUT"
-          doctl compute droplet create "$NAME" \
-            --region "${REGION}" \
-            --size "${DROPLET_SIZE}" \
-            --image ubuntu-24-04-x64 \
-            --ssh-keys "${SSH_FINGERPRINT}" \
-            --volumes "${MAINNET_VOL_ID}" \
-            --volumes "${TESTNET_VOL_ID}" \
-            --volumes "${APPROACH_VOL_ID}" \
-            --tag-name zakura-image-bake \
-            --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
-          echo "id=$(awk '{print $1}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
-          echo "ip=$(awk '{print $2}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/do-droplet
+        with:
+          name: zakura-pr-bake-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.region }}
+          size: ${{ inputs.droplet_size || 'c-8' }}
+          policy: bake
+          regions: ${{ matrix.region }}
+          ssh_fingerprint: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+          tag: zakura-image-bake
+          volume_name: zakura-pr-bake-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Wait for SSH
         uses: ./.github/actions/do-wait-ssh
@@ -105,6 +96,7 @@ jobs:
       - name: Run bake script
         env:
           IP: ${{ steps.droplet.outputs.ip }}
+          BAKE_SHA: ${{ github.sha }}
           GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Keep in step with zakura-mempool-load.yml's kresko_ref default: a
           # mismatch just means that workflow rebuilds kresko instead of using
@@ -123,6 +115,11 @@ jobs:
           set -euo pipefail
           umask 077
           {
+            printf 'BAKE_SHA=%q\n'                 "${BAKE_SHA}"
+            # One deadline includes compilation and all state downloads. Leave
+            # three hours of the seven-hour job for extraction, fixture copying,
+            # image/volume snapshots, and cleanup.
+            printf 'BAKE_DOWNLOAD_DEADLINE=%q\n' "$(( $(date +%s) + (420 - 180) * 60 ))"
             printf 'GH_REPO=%q\n'                 "${GITHUB_REPOSITORY}"
             printf 'GH_CLONE_TOKEN=%q\n'          "${GH_CLONE_TOKEN}"
             printf 'MAINNET_VOLUME_NAME=%q\n'     "${MAINNET_VOLUME_NAME}"
@@ -143,13 +140,30 @@ jobs:
             -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \
             'set -euo pipefail; set -a; . /root/bake.env; set +a; bash /root/pr-node-bake.sh'
 
+      - name: Seed retained approach fixture in this region
+        id: seed
+        if: ${{ !inputs.rebuild_approach_from_sandblast }}
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+          VOLUME_NAME: ${{ steps.droplet.outputs.approach_vol }}
+          SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+          SEED_NAME: zakura-pr-seed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.region }}
+        run: |
+          set -euo pipefail
+          CHECKPOINT=$(tail -1 crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
+          python3 .github/workflows/scripts/do_seed_approach.py \
+            --name "$SEED_NAME" --ip "$IP" --volume-name "$VOLUME_NAME" \
+            --checkpoint "$CHECKPOINT" --ssh-fingerprint "$SSH_FINGERPRINT"
+
       - name: Snapshot state volumes
+        id: state
         env:
           IP: ${{ steps.droplet.outputs.ip }}
           MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
           TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
           APPROACH_VOL_ID: ${{ steps.droplet.outputs.approach_vol_id }}
           REBUILD_APPROACH_FROM_SANDBLAST: ${{ inputs.rebuild_approach_from_sandblast || false }}
+          REGION: ${{ matrix.region }}
         run: |
           set -euo pipefail
           # The -h<height> suffix lets the pr-node pre-checkpoint mode pick the
@@ -174,28 +188,33 @@ jobs:
           if [ "$REBUILD_APPROACH_FROM_SANDBLAST" != "true" ]; then
             MAINNET_H=$(fetch_height /root/mainnet-state-height)
             TESTNET_H=$(fetch_height /root/testnet-state-height)
-            doctl compute volume snapshot "${MAINNET_VOL_ID}" \
-              --snapshot-name "zakura-pr-state-mainnet-${STAMP}-h${MAINNET_H}"
-            doctl compute volume snapshot "${TESTNET_VOL_ID}" \
-              --snapshot-name "zakura-pr-state-testnet-${STAMP}-h${TESTNET_H}"
+            MAINNET_ID=$(doctl compute volume snapshot "${MAINNET_VOL_ID}" \
+              --snapshot-name "${STATE_PREFIX}-mainnet-${STAMP}-${REGION}-h${MAINNET_H}" --output json | jq -er 'if type == "array" then .[0].id else .id end')
+            echo "mainnet_id=$MAINNET_ID" >> "$GITHUB_OUTPUT"
+            TESTNET_ID=$(doctl compute volume snapshot "${TESTNET_VOL_ID}" \
+              --snapshot-name "${STATE_PREFIX}-testnet-${STAMP}-${REGION}-h${TESTNET_H}" --output json | jq -er 'if type == "array" then .[0].id else .id end')
+            echo "testnet_id=$TESTNET_ID" >> "$GITHUB_OUTPUT"
           fi
           if [ -n "$APPROACH_H" ]; then
-            doctl compute volume snapshot "${APPROACH_VOL_ID}" \
-              --snapshot-name "zakura-vct-approach-mainnet-${STAMP}-h${APPROACH_H}"
+            APPROACH_ID=$(doctl compute volume snapshot "${APPROACH_VOL_ID}" \
+              --snapshot-name "${APPROACH_PREFIX}-mainnet-${STAMP}-${REGION}-h${APPROACH_H}" --output json | jq -er 'if type == "array" then .[0].id else .id end')
+            echo "approach_id=$APPROACH_ID" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::approach state was not refreshed; retaining the existing pinned snapshot"
           fi
 
       - name: Snapshot droplet image
+        id: image
         if: ${{ !inputs.rebuild_approach_from_sandblast }}
         env:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
+          REGION: ${{ matrix.region }}
         run: |
           set -euo pipefail
           doctl compute droplet-action power-off "${DROPLET_ID}" --wait
           STAMP=$(date -u +%Y%m%d-%H%M)
           ACTION_ID=$(doctl compute droplet-action snapshot "${DROPLET_ID}" \
-            --snapshot-name "zakura-pr-node-${STAMP}" --format ID --no-header)
+            --snapshot-name "${NODE_PREFIX}-${STAMP}-${REGION}" --format ID --no-header)
           # Poll instead of --wait: image snapshots of large disks routinely
           # exceed doctl's action wait and the status is worth logging.
           for _ in $(seq 1 180); do
@@ -203,31 +222,85 @@ jobs:
               --action-id "${ACTION_ID}" --format Status --no-header)
             echo "snapshot action: ${STATUS}"
             case "${STATUS}" in
-              completed) exit 0 ;;
+              completed)
+                IMAGE=$(doctl compute image list-user --output json | jq -er \
+                  --arg name "${NODE_PREFIX}-${STAMP}-${REGION}" \
+                  '.[] | select(.name == $name and .status == "available" and .min_disk_size == 100) | .id')
+                test -n "$IMAGE"
+                echo "image_id=$IMAGE" >> "$GITHUB_OUTPUT"
+                echo "Validated 100 GB image $IMAGE in $REGION"
+                exit 0 ;;
+
               errored)   echo "image snapshot failed"; exit 1 ;;
             esac
             sleep 30
           done
           echo "image snapshot did not complete in time"; exit 1
 
+      - name: Record regional artifacts
+        if: always()
+        env:
+          IMAGE_ID: ${{ steps.image.outputs.image_id }}
+          MAINNET_ID: ${{ steps.state.outputs.mainnet_id }}
+          TESTNET_ID: ${{ steps.state.outputs.testnet_id }}
+          APPROACH_ID: ${{ steps.state.outputs.approach_id }}
+          REGION: ${{ matrix.region }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          Path("/tmp/regional-bake.json").write_text(json.dumps({k.lower(): os.environ[k]
+              for k in ("IMAGE_ID", "MAINNET_ID", "TESTNET_ID", "APPROACH_ID", "REGION")}, indent=2))
+          PYTHON
+
+      - name: Upload regional artifact IDs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: regional-bake-${{ github.run_id }}-${{ matrix.region }}
+          path: /tmp/regional-bake.json
+          retention-days: 14
+
+      - name: Cleanup approach copy host
+        if: always()
+        uses: ./.github/actions/do-teardown
+        with:
+          droplet_id: ${{ steps.seed.outputs.id }}
+          droplet_name: zakura-pr-seed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.region }}
+          volume_ids: ${{ steps.seed.outputs.volume_id }}
+          volume_names: ${{ steps.seed.outputs.volume_name }}
+
       - name: Cleanup droplet + volumes
         if: always()
         uses: ./.github/actions/do-teardown
         with:
           droplet_id: ${{ steps.droplet.outputs.id }}
-          droplet_name: ${{ steps.droplet.outputs.droplet_name || format('zakura-pr-bake-{0}', github.run_id) }}
+          droplet_name: zakura-pr-bake-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.region }}
           volume_ids: ${{ steps.droplet.outputs.mainnet_vol_id }} ${{ steps.droplet.outputs.testnet_vol_id }} ${{ steps.droplet.outputs.approach_vol_id }}
-          volume_names: ${{ steps.droplet.outputs.mainnet_vol || format('zakura-pr-bake-mainnet-{0}', github.run_id) }} ${{ steps.droplet.outputs.testnet_vol || format('zakura-pr-bake-testnet-{0}', github.run_id) }} ${{ steps.droplet.outputs.approach_vol || format('zakura-pr-bake-approach-{0}', github.run_id) }}
+          volume_names: ${{ steps.droplet.outputs.mainnet_vol }} ${{ steps.droplet.outputs.testnet_vol }} ${{ steps.droplet.outputs.approach_vol }}
 
-      - name: Prune old images
-        if: always()
+      # Artifact retention is centralized in the hourly reaper and is regional.
+
+  alert:
+    needs: [bake]
+    if: ${{ always() && needs.bake.result == 'failure' && (github.event_name != 'workflow_dispatch' || inputs.notify) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report failed regional bake
+        env:
+          SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          set +e
-          # Keep the newest 2 images so runs never depend on the latest bake
-          # having succeeded. The hourly reaper owns volume-snapshot retention:
-          # it keeps 6 Mainnet and 3 Testnet generations, plus the dynamically
-          # pinned Mainnet snapshot immediately below the current VCT handoff.
-          doctl compute image list-user --format ID,Name --no-header | \
-            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | head -n -2 | \
-            while read -r _name id; do doctl compute image delete "$id" -f; done
-          true
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import urllib.request
+          text = "Zakura regional image/state bake failed; retained artifacts remain in use. " + os.environ["RUN_URL"]
+          request = urllib.request.Request(os.environ["SLACK_WEB_HOOK"],
+              data=json.dumps({"text": text}).encode(), headers={"Content-Type": "application/json"})
+          with urllib.request.urlopen(request, timeout=8) as response:
+              if response.read().decode().strip() != "ok":
+                  raise SystemExit("Slack did not acknowledge the bake alert")
+          PYTHON

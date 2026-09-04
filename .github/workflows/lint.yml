@@ -200,6 +200,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_pr_node_monitor.py
 
+      - name: Regional provisioning tests
+        if: ${{ !cancelled() }}
+        run: python3 .github/workflows/scripts/test_do_provision.py
+
+      - name: Bake download recovery test
+        if: ${{ !cancelled() }}
+        run: python3 .github/workflows/scripts/test_pr_node_bake.py
+
       - name: Perf-bench compare tests
         if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_perf_bench_compare.py

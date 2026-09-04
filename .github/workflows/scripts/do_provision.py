@@ -21,6 +21,7 @@ TAGS = {"zakura-pr-node", "zakura-image-bake", "zakura-mempool-load"}
 
 def doctl(*args):
     """Run one bounded API operation; never retry an ambiguous mutation."""
+    retries = "3" if args[1] in {"get", "list", "list-user"} else "0"
     result = subprocess.run(
         [
             "doctl",
@@ -29,7 +30,7 @@ def doctl(*args):
             "--output",
             "json",
             "--http-retry-max",
-            "0",
+            retries,
         ],
         capture_output=True,
         text=True,
@@ -76,7 +77,15 @@ def select_state(snapshots, region, network, mode, checkpoint=None, snapshot_id=
     """Pick a regional fixture, preserving exact IDs and the handoff boundary."""
     regional = [s for s in snapshots if region in s["regions"]]
     if snapshot_id:
-        return next((s for s in regional if str(s["id"]) == snapshot_id), None)
+        selected = next((s for s in regional if str(s["id"]) == snapshot_id), None)
+        if selected and mode == "pre-checkpoint":
+            if (
+                not checkpoint
+                or height(selected) is None
+                or height(selected) >= checkpoint
+            ):
+                return None
+        return selected
     if not network:
         return None
     states = [

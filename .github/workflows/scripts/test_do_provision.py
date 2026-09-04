@@ -94,6 +94,18 @@ class Selection(unittest.TestCase):
             [],
         )
 
+    def test_exact_snapshot_still_must_be_below_handoff(self):
+        self.assertIsNone(
+            p.select_state(
+                [snapshot(height=100)],
+                "nyc1",
+                "mainnet",
+                "pre-checkpoint",
+                100,
+                "state",
+            )
+        )
+
     def test_highest_height_below_checkpoint_wins_even_if_older(self):
         states = [
             snapshot(height=95, id="older", created="2026-08-01T00:00:00Z"),
@@ -315,6 +327,14 @@ class ApproachCopy(unittest.TestCase):
                 for call in remote.call_args_list
             )
         )
+        api.reset_mock(side_effect=True)
+        api.side_effect = [[snapshot()], [], [], [image()], [size("c-8")]]
+        remote.reset_mock(side_effect=True)
+        remote.side_effect = ["", "", "", "90", ""]
+        cleanup.reset_mock()
+        seed.seed(request)
+        cleanup.assert_called_once_with([1], ["v1"])
+        self.assertIn("mainnet-approach-height", remote.call_args.args[1])
 
 
 if __name__ == "__main__":

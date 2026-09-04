@@ -45,7 +45,9 @@ use super::{
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
-use crate::zakura::{Admit, FramedRecv, OrderedSendError, SinkReject, ZakuraConnId};
+use crate::zakura::{
+    trace::BlockBodySource, Admit, FramedRecv, OrderedSendError, SinkReject, ZakuraConnId,
+};
 use std::{sync::Arc, time::Duration, time::Instant};
 use tokio::time;
 use zakura_chain::{block, serialization::ZcashSerialize};
@@ -1503,6 +1505,8 @@ impl PeerRoutine {
                 return;
             }
         }
+        self.trace
+            .record_block_body_received(hash, BlockBodySource::Zakura);
         let outstanding_owner = outstanding.request.owner;
         if self.work.owner_for_height(height) != Some(outstanding_owner) {
             metrics::counter!("sync.block.stale_completion.total", "kind" => "body_range")
@@ -1713,7 +1717,6 @@ impl PeerRoutine {
         if !self.received_status || height < self.servable_low || height > self.servable_high {
             return false;
         }
-
         let serialized_bytes = match body_wire_bytes {
             Some(bytes) => bytes,
             None => match block.zcash_serialize_to_vec() {
@@ -1737,6 +1740,8 @@ impl PeerRoutine {
         if reserved_in_flight.is_none() && !is_pending {
             return false;
         }
+        self.trace
+            .record_block_body_received(hash, BlockBodySource::Zakura);
         let Some(owner) = self.work.owner_for_height(height) else {
             // Pending work has no active request owner.
             // Accepting a body here would create an unowned completion.

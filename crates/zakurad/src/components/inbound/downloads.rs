@@ -28,11 +28,7 @@ use zakura_chain::{
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
-use crate::components::{
-    auth_download_height::tip_child_mismatch,
-    metrics::{record_first_block_commit, BlockCommitPath},
-    sync::MIN_CONCURRENCY_LIMIT,
-};
+use crate::components::{auth_download_height::tip_child_mismatch, sync::MIN_CONCURRENCY_LIMIT};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -797,7 +793,6 @@ where
         }
         .map_ok(|(hash, height)| {
             info!(?height, "downloaded and verified gossiped block");
-            record_first_block_commit(BlockCommitPath::Legacy);
             metrics::counter!("gossip.verified.block.count").increment(1);
             hash
         })

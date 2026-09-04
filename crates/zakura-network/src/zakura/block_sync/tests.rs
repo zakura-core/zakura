@@ -28,12 +28,12 @@ use super::{
     state::*,
     work_queue::WorkQueue,
 };
-use crate::zakura::OrderedSessionDemand;
 use crate::zakura::{
     framed_channel,
     testkit::{await_until, TraceCapture, TraceValue},
-    FramedRecv, FramedSend, Peer, Service, ServicePeerSnapshot, ServiceRegistry, StreamMode,
-    ZakuraBlockSyncCandidateState,
+    trace::BlockBodySource,
+    FramedRecv, FramedSend, OrderedSessionDemand, Peer, Service, ServicePeerSnapshot,
+    ServiceRegistry, StreamMode, ZakuraBlockSyncCandidateState,
 };
 use zakura_chain::{
     fmt::HexDebug,
@@ -6628,7 +6628,7 @@ async fn wants_peer_rejects_when_configured_slot_cap_is_reached() {
 async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
     let config = immediate_body_download_config();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
+    let mut startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
@@ -6638,6 +6638,8 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
         tip_rx,
         config.clone(),
     );
+    let trace = ZakuraTrace::noop();
+    startup.trace = trace.clone();
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(40);
@@ -6748,6 +6750,10 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
             action => panic!("unexpected action before submit: {action:?}"),
         }
     }
+    assert_eq!(
+        trace.first_block_body_source(block_hash),
+        Some(BlockBodySource::Zakura)
+    );
     reactor_task.abort();
 }
 
@@ -14398,7 +14404,7 @@ async fn reactor_accepts_unmatched_body_for_height_active_on_another_request() {
     let config = immediate_body_download_config();
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
+    let mut startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -14408,6 +14414,8 @@ async fn reactor_accepts_unmatched_body_for_height_active_on_another_request() {
         tip_rx,
         config.clone(),
     );
+    let trace = ZakuraTrace::noop();
+    startup.trace = trace.clone();
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
@@ -14486,6 +14494,10 @@ async fn reactor_accepts_unmatched_body_for_height_active_on_another_request() {
     .await
     .expect("late active body is accepted and submitted");
     assert_eq!(submitted, blocks[1].hash());
+    assert_eq!(
+        trace.first_block_body_source(submitted),
+        Some(BlockBodySource::Zakura)
+    );
 
     send_inbound(
         &late_inbound,

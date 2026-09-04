@@ -38,6 +38,7 @@ use crate::{
     BoxError, MAX_TX_INV_IN_SENT_MESSAGE,
 };
 
+use super::trace::BlockBodySource;
 use super::{
     spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError,
     OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer, RequestResponseService,
@@ -1843,6 +1844,7 @@ pub(crate) struct ZakuraDualStackService<L> {
     gossip: LegacyGossipAdapter,
     request: LegacyRequestAdapter,
     legacy_enabled: bool,
+    trace: ZakuraTrace,
 }
 
 impl<L> ZakuraDualStackService<L> {
@@ -1852,11 +1854,13 @@ impl<L> ZakuraDualStackService<L> {
     /// shared with the inbound sink.
     #[cfg(test)]
     pub(crate) fn new(legacy: L, supervisor: ZakuraSupervisorHandle, legacy_enabled: bool) -> Self {
+        let trace = ZakuraTrace::noop();
         Self {
             legacy,
             gossip: LegacyGossipAdapter::new(supervisor.clone()),
-            request: LegacyRequestAdapter::new(supervisor),
+            request: LegacyRequestAdapter::new_with_trace(supervisor, trace.clone()),
             legacy_enabled,
+            trace,
         }
     }
 
@@ -1873,10 +1877,11 @@ impl<L> ZakuraDualStackService<L> {
             gossip: LegacyGossipAdapter::new(supervisor.clone()),
             request: LegacyRequestAdapter::new_with_trace_and_stream_rate(
                 supervisor,
-                trace,
+                trace.clone(),
                 stream_open_rate_per_second,
             ),
             legacy_enabled,
+            trace,
         }
     }
 }
@@ -1916,11 +1921,27 @@ where
         };
 
         let legacy_enabled = self.legacy_enabled;
+        let requested_block_hashes = match &request {
+            Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
+                Some(hashes.clone())
+            }
+            _ => None,
+        };
         let mut gossip = self.gossip.clone();
         let mut request_adapter = self.request.clone();
         let mut legacy = self.legacy.clone();
+        let trace = self.trace.clone();
 
         Box::pin(async move {
+            let record_source = |response, source| {
+                record_block_response_source(
+                    &trace,
+                    response,
+                    source,
+                    requested_block_hashes.as_ref(),
+                )
+            };
+
             match route {
                 DualStackRoute::Advertise => {
                     // Fan out concurrently so a slow/empty Zakura path can't delay
@@ -1948,10 +1969,16 @@ where
                 }
                 DualStackRoute::LegacyFirstThenZakura => {
                     if matches!(request.inventory_source(), Some(PeerSource::Zakura(_))) {
-                        return request_adapter.call(request).await;
+                        return request_adapter
+                            .call(request)
+                            .await
+                            .map(|response| record_source(response, BlockBodySource::Zakura));
                     }
                     if !legacy_enabled {
-                        return request_adapter.call(request).await;
+                        return request_adapter
+                            .call(request)
+                            .await
+                            .map(|response| record_source(response, BlockBodySource::Zakura));
                     }
                     // The legacy peer set is buffered, so it queues this fetch
                     // even when it has no ready peer (e.g. every legacy peer was
@@ -1962,23 +1989,52 @@ where
                     })
                     .await;
                     match legacy_attempt {
-                        Ok(Ok(response)) if !all_inventory_missing(&response) => Ok(response),
+                        Ok(Ok(response)) if !all_inventory_missing(&response) => {
+                            Ok(record_source(response, BlockBodySource::Legacy))
+                        }
                         Ok(Ok(response)) => match request_adapter.call(request).await {
-                            Ok(zakura) if !all_inventory_missing(&zakura) => Ok(zakura),
+                            Ok(zakura) if !all_inventory_missing(&zakura) => {
+                                Ok(record_source(zakura, BlockBodySource::Zakura))
+                            }
                             _ => Ok(response),
                         },
                         Ok(Err(legacy_error)) => match request_adapter.call(request).await {
-                            Ok(zakura) => Ok(zakura),
+                            Ok(zakura) => Ok(record_source(zakura, BlockBodySource::Zakura)),
                             Err(_) => Err(legacy_error),
                         },
                         // Legacy timed out (no ready peer): use Zakura.
-                        Err(_) => request_adapter.call(request).await,
+                        Err(_) => request_adapter
+                            .call(request)
+                            .await
+                            .map(|response| record_source(response, BlockBodySource::Zakura)),
                     }
                 }
                 DualStackRoute::Passthrough => legacy.ready().await?.call(request).await,
             }
         })
     }
+}
+
+fn record_block_response_source(
+    trace: &ZakuraTrace,
+    response: Response,
+    source: BlockBodySource,
+    requested_hashes: Option<&HashSet<block::Hash>>,
+) -> Response {
+    if let (Response::Blocks(blocks), Some(requested_hashes)) = (&response, requested_hashes) {
+        for block in blocks {
+            match block {
+                InventoryResponse::Available((block, _))
+                    if requested_hashes.contains(&block.hash()) =>
+                {
+                    trace.record_block_body_received(block.hash(), source);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    response
 }
 
 /// Outbound Zakura inventory request client.
@@ -5841,8 +5897,6 @@ mod tests {
     enum StubInventory {
         /// Return every requested id as missing (triggers Zakura fallback).
         Missing,
-        /// Return the given transaction as available.
-        Available(UnminedTx),
         /// Error on inventory (used to prove the legacy path is bypassed).
         Error,
     }
@@ -5874,17 +5928,6 @@ mod tests {
                         }
                         StubInventory::Missing => Response::Transactions(
                             ids.into_iter().map(InventoryResponse::Missing).collect(),
-                        ),
-                        StubInventory::Available(tx) => Response::Transactions(
-                            ids.into_iter()
-                                .map(|id| {
-                                    if id == tx.id() {
-                                        InventoryResponse::Available((tx.clone(), None))
-                                    } else {
-                                        InventoryResponse::Missing(id)
-                                    }
-                                })
-                                .collect(),
                         ),
                     }
                 }
@@ -5949,35 +5992,44 @@ mod tests {
     async fn dual_stack_inventory_falls_back_to_zakura_when_legacy_missing() -> Result<(), BoxError>
     {
         let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
         let transaction = UnminedTx::from(empty_v5_transaction(7));
-        let advertiser = inventory_node(203, transaction.clone()).await?;
+        let (advertiser, _pushed_rx) = normal_network_node(203, block, transaction).await?;
         let requester = ZakuraTestNode::builder(204).spawn().await?;
         requester
             .connect_native(&advertiser, TEST_NET_TIMEOUT)
             .await?;
 
         let (legacy_tx, _rx_legacy) = tokio::sync::mpsc::unbounded_channel();
-        let mut composite = ZakuraDualStackService::new(
+        let trace = ZakuraTrace::noop();
+        let mut composite = ZakuraDualStackService::new_with_trace(
             DualStackLegacyStub {
                 tx: legacy_tx,
                 inventory: StubInventory::Missing,
             },
             requester.supervisor(),
             true,
+            trace.clone(),
+            1,
         );
 
         let response = composite
             .ready()
             .await?
-            .call(Request::TransactionsById(HashSet::from([transaction.id()])))
+            .call(Request::BlocksByHash(HashSet::from([hash])))
             .await?;
-        match response {
-            Response::Transactions(items) => {
-                assert_eq!(items.len(), 1);
-                assert!(matches!(items[0], InventoryResponse::Available(_)));
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
+        assert!(matches!(
+            response,
+            Response::Blocks(ref blocks)
+                if matches!(blocks.as_slice(), [InventoryResponse::Available(_)])
+        ));
+        assert_eq!(
+            trace.first_block_body_source(hash),
+            Some(BlockBodySource::Zakura)
+        );
 
         advertiser.shutdown().await;
         requester.shutdown().await;
@@ -5987,34 +6039,60 @@ mod tests {
     #[tokio::test]
     async fn dual_stack_inventory_uses_legacy_when_available() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
-        let transaction = UnminedTx::from(empty_v5_transaction(8));
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
         // No Zakura advertiser is connected, so any fallback would fail; the
         // legacy-available short-circuit is what makes this succeed.
         let requester = ZakuraTestNode::builder(205).spawn().await?;
 
-        let (legacy_tx, _rx_legacy) = tokio::sync::mpsc::unbounded_channel();
-        let mut composite = ZakuraDualStackService::new(
-            DualStackLegacyStub {
-                tx: legacy_tx,
-                inventory: StubInventory::Available(transaction.clone()),
-            },
+        let trace = ZakuraTrace::noop();
+        let mut composite = ZakuraDualStackService::new_with_trace(
+            BlockInventoryResponder { block },
             requester.supervisor(),
             true,
+            trace.clone(),
+            1,
         );
 
         let response = composite
             .ready()
             .await?
-            .call(Request::TransactionsById(HashSet::from([transaction.id()])))
+            .call(Request::BlocksByHash(HashSet::from([hash])))
             .await?;
-        match response {
-            Response::Transactions(items) => {
-                assert!(matches!(items[0], InventoryResponse::Available(_)));
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
+        assert!(matches!(
+            response,
+            Response::Blocks(ref blocks)
+                if matches!(blocks.as_slice(), [InventoryResponse::Available(_)])
+        ));
+        assert_eq!(
+            trace.first_block_body_source(hash),
+            Some(BlockBodySource::Legacy)
+        );
 
         requester.shutdown().await;
+        Ok(())
+    }
+
+    #[test]
+    fn block_source_ignores_unrequested_body() -> Result<(), BoxError> {
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let received_hash = block.hash();
+        let requested_hashes = HashSet::from([block_hash(250)]);
+        assert!(!requested_hashes.contains(&received_hash));
+        let trace = ZakuraTrace::noop();
+
+        record_block_response_source(
+            &trace,
+            Response::Blocks(vec![InventoryResponse::Available((block, None))]),
+            BlockBodySource::Legacy,
+            Some(&requested_hashes),
+        );
+
+        assert_eq!(trace.first_block_body_source(received_hash), None);
         Ok(())
     }
 

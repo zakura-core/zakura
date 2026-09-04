@@ -5,8 +5,8 @@ use zakura_chain::{block::Height, serialization::ZcashDeserializeInto};
 use zakura_header_chain::EvidenceId;
 
 use super::{
-    VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager, VCT_AWAIT_SUCCESSOR_WAIT,
-    VCT_ROOT_RETRY_WAIT,
+    VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager, VctWriteRetryWait,
+    VCT_AWAIT_SUCCESSOR_WAIT,
 };
 use crate::{
     request::CheckpointVerifiedBlock,
@@ -75,6 +75,7 @@ fn on_commit_success_is_a_no_op_without_a_stall() {
     // A successful commit leaves an inactive stall unchanged.
     manager.on_commit_success();
     assert!(manager.root_stall.is_none());
+    assert!(manager.block_wait_started.is_none());
     assert!(!manager.root_stall_reported);
 }
 
@@ -116,6 +117,9 @@ fn on_retryable_error_resets_the_stall_for_a_different_height() {
     let mut manager = VctWriteRetryManager::default();
 
     manager.on_retryable_error(Height(1), MISSING_ROOT, queued_block(1));
+    let block_wait_started = manager
+        .block_wait_started
+        .expect("the blocked checkpoint wait is tracked");
     manager.root_stall_reported = true;
 
     manager.on_retryable_error(Height(2), MISSING_ROOT, queued_block(2));
@@ -127,6 +131,11 @@ fn on_retryable_error_resets_the_stall_for_a_different_height() {
     assert!(
         !manager.root_stall_reported,
         "a new height starts an unreported stall"
+    );
+    assert_eq!(
+        manager.block_wait_started,
+        Some(block_wait_started),
+        "a new missing height keeps the same checkpoint wait"
     );
 }
 
@@ -164,18 +173,21 @@ fn on_retryable_error_wait_depends_on_root_availability() {
     let mut manager = VctWriteRetryManager::default();
 
     let missing_root_wait = manager.on_retryable_error(Height(1), MISSING_ROOT, queued_block(1));
-    assert_eq!(missing_root_wait, VCT_ROOT_RETRY_WAIT);
+    assert_eq!(missing_root_wait, VctWriteRetryWait::HeaderChainInsert);
 
     let successor_wait = manager.on_retryable_error(
         Height(2),
         VctWriteRetryCause::MissingSuccessor,
         queued_block(2),
     );
-    assert_eq!(successor_wait, VCT_AWAIT_SUCCESSOR_WAIT);
+    assert_eq!(
+        successor_wait,
+        VctWriteRetryWait::Delay(VCT_AWAIT_SUCCESSOR_WAIT)
+    );
 }
 
 #[test]
-fn root_repair_signal_deduplicates_repeated_missing_root_polls() {
+fn root_repair_signal_deduplicates_repeated_missing_root_attempts() {
     let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
     let mut manager = VctWriteRetryManager::new(tx);
 
@@ -190,7 +202,7 @@ fn root_repair_signal_deduplicates_repeated_missing_root_polls() {
     manager.on_retryable_error(Height(42), MISSING_ROOT, queued_block(2));
     assert!(
         !rx.has_changed().expect("watch channel remains open"),
-        "polling the same absent root must not flood repair notifications"
+        "repeating the same absent root must not flood repair notifications"
     );
 }
 
@@ -235,7 +247,7 @@ fn unrecorded_rejection_refetches_each_delivery_once() {
     );
     assert!(
         !rx.has_changed().expect("watch channel remains open"),
-        "polling the same unrecorded rejection must keep its replacement in flight"
+        "repeating the same unrecorded rejection must keep its replacement in flight"
     );
 
     manager.on_retryable_error(
@@ -249,7 +261,7 @@ fn unrecorded_rejection_refetches_each_delivery_once() {
 }
 
 #[test]
-fn sweep_rejection_restarts_the_same_height_after_missing_polls_deduplicate() {
+fn sweep_rejection_restarts_the_same_height_after_missing_attempts_deduplicate() {
     let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
     let mut manager = VctWriteRetryManager::new(tx);
     let height = Height(42);

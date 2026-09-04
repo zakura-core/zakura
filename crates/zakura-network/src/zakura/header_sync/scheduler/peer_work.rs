@@ -304,7 +304,7 @@ pub struct ActiveHeaderRequest {
 pub enum HeaderTargetPurpose {
     /// Admit a complete parent-linked branch target.
     Normal,
-    /// Redeliver auxiliary metadata for one exact selected header.
+    /// Redeliver auxiliary metadata for an exact selected range.
     SelectedAuxiliaryRepair {
         /// Selected target fixed by the durable repair context.
         selected_target: Frontier,
@@ -315,11 +315,10 @@ pub enum HeaderTargetPurpose {
 
 impl HeaderTargetPurpose {
     /// Return the target purpose's exact response-count requirement, when fixed.
-    pub fn exact_header_count(&self) -> Option<usize> {
-        match self {
-            Self::Normal => None,
-            Self::SelectedAuxiliaryRepair { .. } => Some(1),
-        }
+    ///
+    /// Selected auxiliary repairs can cover a negotiated range, so they have no fixed count.
+    pub const fn exact_header_count(&self) -> Option<usize> {
+        None
     }
 
     /// Return the selected target fixed by an auxiliary repair.
@@ -775,6 +774,16 @@ impl PeerWorkQueue {
         .expect("the header budget capacity fits u32")
     }
 
+    /// Bound one VCT repair request by all currently unowned aggregate capacity.
+    pub(in crate::zakura::header_sync) fn reservable_repair_header_count(
+        &self,
+        desired: u32,
+    ) -> u32 {
+        let desired = usize::try_from(desired).unwrap_or(usize::MAX);
+        u32::try_from(desired.min(self.budget.remaining()))
+            .expect("the header budget capacity fits u32")
+    }
+
     /// Reserve capacity before publishing one wire request.
     pub(in crate::zakura::header_sync) fn reserve_request(
         &mut self,
@@ -788,6 +797,23 @@ impl PeerWorkQueue {
         if count > MAX_HEADER_CHUNK_RESERVATION_V1 {
             return false;
         }
+        let Some(reservation) = self.budget.reserve(count) else {
+            return false;
+        };
+        self.request_reservations.insert(peer.clone(), reservation);
+        true
+    }
+
+    /// Reserve aggregate capacity for one selected auxiliary repair range.
+    pub(in crate::zakura::header_sync) fn reserve_repair_request(
+        &mut self,
+        peer: &ZakuraPeerId,
+        count: u32,
+    ) -> bool {
+        if self.request_reservations.contains_key(peer) {
+            return false;
+        }
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
         let Some(reservation) = self.budget.reserve(count) else {
             return false;
         };
@@ -1486,15 +1512,16 @@ mod tests {
     }
 
     #[test]
-    fn selected_auxiliary_repair_is_an_exact_one_header_target_purpose() {
+    fn selected_auxiliary_repair_keeps_its_selected_target() {
         let selected_target = Frontier::new(zakura_chain::block::Height(11), hash(11));
         let purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
             selected_target,
             repair_generation: 7,
         };
 
-        assert_eq!(purpose.exact_header_count(), Some(1));
+        assert_eq!(purpose.exact_header_count(), None);
         assert_eq!(purpose.selected_repair_target(), Some(selected_target));
         assert_eq!(HeaderTargetPurpose::Normal.exact_header_count(), None);
+        assert_eq!(HeaderTargetPurpose::Normal.selected_repair_target(), None);
     }
 }

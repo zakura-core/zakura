@@ -1722,6 +1722,16 @@ impl HeaderChainReader {
         owner: BodyWorkOwner,
         height: block::Height,
     ) -> Result<Option<zakura_header_chain::VctRepairContext>, HeaderChainStoreError> {
+        self.vct_repair_context_bounded(owner, height, block::Height::MAX)
+    }
+
+    /// Resolve a VCT repair without crossing the checkpoint handoff ceiling.
+    pub(crate) fn vct_repair_context_bounded(
+        &self,
+        owner: BodyWorkOwner,
+        height: block::Height,
+        checkpoint_ceiling: block::Height,
+    ) -> Result<Option<zakura_header_chain::VctRepairContext>, HeaderChainStoreError> {
         let _writer = self
             .store
             .writer
@@ -1734,6 +1744,7 @@ impl HeaderChainReader {
         if owner.authority != BodyWorkAuthority::for_snapshot(&snapshot)
             || height <= snapshot.frontiers.finalized.height
             || height > snapshot.frontiers.header_best.height
+            || height > checkpoint_ceiling
         {
             return Ok(None);
         }
@@ -1779,25 +1790,113 @@ impl HeaderChainReader {
             };
         let deliveries = self.coherent_aux_deliveries(&target)?;
         let durable_rows = self.store.untrusted_aux_deliveries(target_hash)?;
-        let total_delivery_count = self
+        let engine = self
             .transition_engine
             .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .aux_delivery_count();
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let total_delivery_count = engine.aux_delivery_count();
         let admission_capacity_available = deliveries.len()
             < self.config.limits.max_aux_deliveries_per_header.get()
             && total_delivery_count < self.config.limits.max_aux_deliveries_total.get()
             && !snapshot.alarms.resource_stalled;
-        Ok(Some(
-            zakura_header_chain::VctRepairContext::from_durable_rows(
-                selected_target,
-                HeaderLocator::for_continuation(parent),
-                snapshot.state_version,
-                boundary_hash,
-                admission_capacity_available,
-                &durable_rows,
-            )?,
-        ))
+        let mut context = zakura_header_chain::VctRepairContext::from_durable_rows(
+            selected_target,
+            HeaderLocator::for_continuation(parent),
+            snapshot.state_version,
+            boundary_hash,
+            admission_capacity_available,
+            &durable_rows,
+        )?;
+        if !durable_rows.is_empty() || !admission_capacity_available {
+            return Ok(Some(context));
+        }
+
+        let available_aggregate_capacity = self
+            .config
+            .limits
+            .max_aux_deliveries_total
+            .get()
+            .saturating_sub(total_delivery_count);
+        let range_limit =
+            available_aggregate_capacity.min(self.config.limits.max_headers_per_transition.get());
+        if range_limit <= 1 {
+            return Ok(Some(context));
+        }
+        let selected = engine.selected_projection();
+        let start_index = selected
+            .binary_search_by_key(&height, |frontier| frontier.height)
+            .map_err(|_| StoreError::Incoherent("VCT repair target is absent from selection"))?;
+        if selected[start_index] != selected_target {
+            return Err(StoreError::Incoherent(
+                "VCT repair target disagrees with the selected projection",
+            )
+            .into());
+        }
+        let mut suffix: Vec<Frontier> = Vec::new();
+        for candidate in selected
+            .iter()
+            .copied()
+            .skip(start_index.saturating_add(1))
+            .take(range_limit.saturating_sub(1))
+        {
+            if candidate.height > checkpoint_ceiling {
+                break;
+            }
+            let candidate_node =
+                engine
+                    .graph()
+                    .header_node(candidate.hash)
+                    .ok_or(StoreError::Incoherent(
+                        "selected VCT repair range references a missing node",
+                    ))?;
+            if candidate_node.height != candidate.height {
+                return Err(StoreError::Incoherent(
+                    "selected VCT repair range disagrees with its node",
+                )
+                .into());
+            }
+            let previous_hash = suffix
+                .last()
+                .map_or(selected_target.hash, |previous| previous.hash);
+            if candidate_node.parent_hash != previous_hash {
+                return Err(StoreError::Incoherent(
+                    "selected VCT repair range is not parent-contiguous",
+                )
+                .into());
+            }
+            let candidate_rows = self.store.untrusted_aux_deliveries(candidate.hash)?;
+            if !auxiliary_rows_are_coherent(
+                &candidate_node.aux_delivery_ids,
+                engine.aux_deliveries(candidate.hash),
+                &candidate_rows,
+            ) {
+                return Err(StoreError::Incoherent(
+                    "retained node and auxiliary delivery index disagree",
+                )
+                .into());
+            }
+            if !candidate_rows.is_empty() {
+                break;
+            }
+            suffix.push(candidate);
+        }
+        if suffix.is_empty() {
+            return Ok(Some(context));
+        }
+        let request_target = *suffix
+            .last()
+            .expect("a nonempty VCT repair suffix has a final target");
+        let terminal_boundary_hash =
+            if request_target.height < snapshot.frontiers.header_best.height {
+                selected
+                    .get(start_index.saturating_add(suffix.len()).saturating_add(1))
+                    .map(|successor| successor.hash)
+            } else {
+                None
+            };
+        drop(engine);
+        context = context.extend_empty_selected_range(&suffix, terminal_boundary_hash)?;
+        Ok(Some(context))
     }
 
     /// Commit a lease only if the branch has not moved since the caller read its snapshot.
@@ -1830,12 +1929,12 @@ impl HeaderChainReader {
         reservation.commit(spec, Instant::now())
     }
 
-    /// Lease one canonical header that ends at a finalized target below the header frontier.
+    /// Lease one bounded canonical range that ends below the finalized frontier.
     ///
     /// Refusing a finalized target would strand any node whose VCT repair height every peer has
-    /// already finalized: the requester has no other way to obtain that exact header and its
-    /// authenticated roots. The fallback requires the target's canonical predecessor as a
-    /// locator. This bound makes every finalized fallback lease complete in one page.
+    /// already finalized: the requester has no other way to obtain those headers and their
+    /// authenticated roots. The fallback accepts a canonical locator within one protocol range
+    /// of the target.
     fn acquire_finalized_target_path(
         &self,
         reservation: RetainedPathReservation,
@@ -1854,13 +1953,13 @@ impl HeaderChainReader {
             // means the branch moved under the request, so the requester must re-derive it.
             return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
         }
-        let Ok(predecessor_height) = target.height.previous() else {
-            return Ok(RetainedPathLeaseOutcome::NoLocatorIntersection);
-        };
         let mut common_ancestor = None;
         for locator_hash in locator_hashes {
             if let Some(frontier) = self.finalized_frontier(*locator_hash)? {
-                if frontier.height == predecessor_height {
+                let distance = target.height.0.checked_sub(frontier.height.0);
+                if distance.is_some_and(|distance| {
+                    distance > 0 && distance <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE
+                }) {
                     common_ancestor = Some(frontier);
                     break;
                 }
@@ -1894,16 +1993,16 @@ impl HeaderChainReader {
     /// Lease a canonical header path from a locator intersection up to an exact target.
     ///
     /// The target resolves from the retained header graph, or, when it sits below the finalized
-    /// frontier, from the canonical finalized indexes. A VCT repair asks for one stalled height
-    /// that every peer past it has already finalized, so refusing the second band would strand
-    /// the requester.
+    /// frontier, from the canonical finalized indexes. A VCT repair can ask for a bounded range
+    /// that every peer past it has already finalized. Refusing the second band would strand the
+    /// requester.
     ///
     /// Returns `TargetNotRetained` when neither band holds the target, `NoLocatorIntersection`
     /// when no locator hash is a canonical ancestor of it, `HistoryPruned` when the retained
     /// path no longer reaches the finalized frontier, and `Busy` when the peer already holds a
     /// lease or the branch moved under the request. On success the peer owns one lease until it
-    /// releases the lease or the idle deadline expires. A finalized fallback requires the exact
-    /// canonical predecessor, so it cannot retain a multi-page historical path.
+    /// releases the lease or the idle deadline expires. The finalized fallback limits the
+    /// complete historical path to one protocol range.
     pub(crate) fn acquire_retained_path(
         &self,
         peer: SourceId,
@@ -1979,9 +2078,9 @@ impl HeaderChainReader {
             }
         };
         let Some((target, mut reverse_path)) = retained_target else {
-            // The header graph holds only the retained suffix. A VCT repair asks for the exact
-            // header at one stalled height, which every peer that moved past it has finalized,
-            // so the target is absent here but present and immutable in the finalized indexes.
+            // The header graph holds only the retained suffix. A VCT repair can ask for a bounded
+            // range that every peer past it has finalized. The target is absent here but present
+            // and immutable in the finalized indexes.
             return self.acquire_finalized_target_path(
                 reservation,
                 session_id,
@@ -3011,26 +3110,56 @@ impl HeaderChainRuntime {
             .map(|authority| authority.branch)
             .or_else(|| request.event.body_owner().map(|owner| owner.branch));
         if let TransitionEvent::InsertHeaders(insert) = &request.event {
-            let mut selected_repair_boundary = None;
             if let zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                 common_ancestor,
                 selected_target,
                 episode,
             } = insert.completion
             {
+                let repair_headers = insert.batch.headers();
+                let Some(first_header) = repair_headers.first() else {
+                    return Ok(ApplyResult::Stale(StaleReceipt {
+                        current_version: before.state_version,
+                        branch,
+                    }));
+                };
+                let repair_range: Vec<_> = repair_headers
+                    .iter()
+                    .map(|header| Frontier::new(header.height, header.hash))
+                    .collect();
+                if repair_range.last().copied() != Some(selected_target)
+                    || repair_range.len() != insert.aux.len()
+                    || insert
+                        .aux
+                        .iter()
+                        .any(|delivery| delivery.tree_aux.is_none())
+                {
+                    return Ok(ApplyResult::Stale(StaleReceipt {
+                        current_version: before.state_version,
+                        branch,
+                    }));
+                }
                 let selected = transition_engine.selected_projection();
                 let selected_index = selected
-                    .binary_search_by_key(&selected_target.height, |frontier| frontier.height)
+                    .binary_search_by_key(&first_header.height, |frontier| frontier.height)
                     .ok()
-                    .filter(|index| selected[*index] == selected_target);
+                    .filter(|index| {
+                        index
+                            .checked_sub(1)
+                            .and_then(|parent_index| selected.get(parent_index))
+                            .copied()
+                            == Some(common_ancestor)
+                            && selected.get(*index..index.saturating_add(repair_range.len()))
+                                == Some(repair_range.as_slice())
+                    });
                 let Some(selected_index) = selected_index else {
                     return Ok(ApplyResult::Stale(StaleReceipt {
                         current_version: before.state_version,
                         branch,
                     }));
                 };
-                let boundary_hash = selected
-                    .get(selected_index.saturating_add(1))
+                let terminal_boundary_hash = selected
+                    .get(selected_index.saturating_add(repair_range.len()))
                     .map(|successor| {
                         let expected_height = selected_target.height.next().map_err(|_| {
                             StoreError::Incoherent("VCT repair successor height overflowed")
@@ -3052,50 +3181,81 @@ impl HeaderChainRuntime {
                         Ok(successor.hash)
                     })
                     .transpose()?;
-                selected_repair_boundary = Some(boundary_hash);
-                let durable_rows = self.store.untrusted_aux_deliveries(selected_target.hash)?;
-                let target_node = transition_engine
-                    .graph()
-                    .header_node(selected_target.hash)
-                    .ok_or(StoreError::Incoherent(
-                        "selected VCT repair target is absent from the graph",
-                    ))?;
-                let live_deliveries = transition_engine.aux_deliveries(selected_target.hash);
-                if !auxiliary_rows_are_coherent(
-                    &target_node.aux_delivery_ids,
-                    live_deliveries,
-                    &durable_rows,
-                ) {
-                    return Err(StoreError::Incoherent(
-                        "retained node and auxiliary delivery index disagree",
-                    )
-                    .into());
+                let mut durable_rows_by_target = Vec::with_capacity(repair_range.len());
+                for target in &repair_range {
+                    let target_node = transition_engine.graph().header_node(target.hash).ok_or(
+                        StoreError::Incoherent(
+                            "selected VCT repair target is absent from the graph",
+                        ),
+                    )?;
+                    let durable_rows = self.store.untrusted_aux_deliveries(target.hash)?;
+                    if !auxiliary_rows_are_coherent(
+                        &target_node.aux_delivery_ids,
+                        transition_engine.aux_deliveries(target.hash),
+                        &durable_rows,
+                    ) {
+                        return Err(StoreError::Incoherent(
+                            "retained node and auxiliary delivery index disagree",
+                        )
+                        .into());
+                    }
+                    durable_rows_by_target.push(durable_rows);
                 }
-                let current = zakura_header_chain::VctRepairContext::from_durable_rows(
-                    selected_target,
+                let first_target = repair_range[0];
+                let first_boundary_hash = repair_range
+                    .get(1)
+                    .map(|successor| successor.hash)
+                    .or(terminal_boundary_hash);
+                let aggregate_capacity_available = transition_engine
+                    .aux_delivery_count()
+                    .checked_add(repair_range.len())
+                    .is_some_and(|count| {
+                        count <= context.config.limits.max_aux_deliveries_total.get()
+                    });
+                let mut current = zakura_header_chain::VctRepairContext::from_durable_rows(
+                    first_target,
                     HeaderLocator::for_continuation(common_ancestor),
                     before.state_version,
-                    boundary_hash,
-                    live_deliveries.len()
-                        < context.config.limits.max_aux_deliveries_per_header.get()
-                        && transition_engine.aux_delivery_count()
-                            < context.config.limits.max_aux_deliveries_total.get()
+                    first_boundary_hash,
+                    aggregate_capacity_available
+                        && transition_engine.aux_deliveries(first_target.hash).len()
+                            < context.config.limits.max_aux_deliveries_per_header.get()
                         && !before.alarms.resource_stalled,
-                    &durable_rows,
+                    &durable_rows_by_target[0],
                 )?;
+                if repair_range.len() > 1 {
+                    if durable_rows_by_target.iter().any(|rows| !rows.is_empty())
+                        || !aggregate_capacity_available
+                        || before.alarms.resource_stalled
+                    {
+                        return Ok(ApplyResult::Stale(StaleReceipt {
+                            current_version: before.state_version,
+                            branch,
+                        }));
+                    }
+                    current = current
+                        .extend_empty_selected_range(&repair_range[1..], terminal_boundary_hash)?;
+                } else if durable_rows_by_target[0].is_empty()
+                    && current.admission_capacity_available
+                    && current.episode != episode
+                {
+                    current = current.extend_empty_selected_range(&[], terminal_boundary_hash)?;
+                }
                 if current.episode != episode {
                     return Ok(ApplyResult::Stale(StaleReceipt {
                         current_version: before.state_version,
                         branch,
                     }));
                 }
-                for delivery in insert.aux.iter().filter(|delivery| {
-                    delivery.header_hash == selected_target.hash && delivery.tree_aux.is_some()
-                }) {
+                for delivery in &insert.aux {
+                    let live_deliveries = transition_engine.aux_deliveries(delivery.header_hash);
                     let repeats_retained_payload = live_deliveries.iter().any(|retained| {
                         retained.semantic_fingerprint() == delivery.semantic_fingerprint()
                     });
-                    if repeats_retained_payload || current.retains_source(delivery.source) {
+                    let retained_source = live_deliveries.iter().any(|retained| {
+                        retained.tree_aux.is_some() && retained.source == delivery.source
+                    });
+                    if repeats_retained_payload || retained_source {
                         return Ok(ApplyResult::Stale(StaleReceipt {
                             current_version: before.state_version,
                             branch,
@@ -3111,27 +3271,23 @@ impl HeaderChainRuntime {
                 .enumerate()
                 .map(|(index, header)| {
                     let target = Frontier::new(header.height, header.hash);
-                    let boundary_hash = selected_repair_boundary.unwrap_or_else(|| {
-                        insert
-                            .batch
-                            .headers()
-                            .get(index.saturating_add(1))
-                            .map(|successor| successor.hash)
-                            .or_else(|| {
-                                let selected = transition_engine.selected_projection();
-                                selected
-                                    .binary_search_by_key(&target.height, |frontier| {
-                                        frontier.height
-                                    })
-                                    .ok()
-                                    .filter(|selected_index| selected[*selected_index] == target)
-                                    .and_then(|selected_index| {
-                                        selected
-                                            .get(selected_index.saturating_add(1))
-                                            .map(|successor| successor.hash)
-                                    })
-                            })
-                    });
+                    let boundary_hash = insert
+                        .batch
+                        .headers()
+                        .get(index.saturating_add(1))
+                        .map(|successor| successor.hash)
+                        .or_else(|| {
+                            let selected = transition_engine.selected_projection();
+                            selected
+                                .binary_search_by_key(&target.height, |frontier| frontier.height)
+                                .ok()
+                                .filter(|selected_index| selected[*selected_index] == target)
+                                .and_then(|selected_index| {
+                                    selected
+                                        .get(selected_index.saturating_add(1))
+                                        .map(|successor| successor.hash)
+                                })
+                        });
                     (header.hash, (target, boundary_hash))
                 })
                 .collect();

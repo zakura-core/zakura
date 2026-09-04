@@ -276,3 +276,101 @@ fn idle_writer_promotes_a_due_persisted_deferred_header() {
         None
     );
 }
+
+#[test]
+fn header_insertion_wakes_a_vct_park_and_preserves_deferred_order() {
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("the fixture finalized state opens");
+    let anchor = regtest_genesis_block();
+    let anchor_height = anchor
+        .coinbase_height()
+        .expect("the anchor has a coinbase height");
+    let writer = header_writer(&finalized_state, &network, anchor_height, &anchor);
+    let snapshot = writer.runtime.publisher().snapshot();
+    let lease = writer
+        .runtime
+        .reader()
+        .validation_context(anchor.hash())
+        .expect("the anchor validation context read succeeds")
+        .expect("the retained anchor has validation context");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the anchor produces deterministic header rules");
+    let mut child_header = *anchor.header;
+    child_header.previous_block_hash = anchor.hash();
+    child_header.time += chrono::Duration::seconds(1);
+    child_header.nonce.0[0] = 0xe0;
+    let child_header = Arc::new(child_header);
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&child_header)),
+        lease.parent(),
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected child header prepares");
+    let child = Frontier::new(
+        anchor_height.next().expect("the anchor has a child height"),
+        child_header.hash(),
+    );
+    let insert = Box::new(InsertHeaders {
+        owner: header_owner(&snapshot, child.hash, 71, 72),
+        source: SourceId::from_digest([0xe1; 32]),
+        parent_hash: anchor.hash(),
+        target_tip_hash: child.hash,
+        completion: TargetCompletion::TargetComplete {
+            common_ancestor: Frontier::new(anchor_height, anchor.hash()),
+        },
+        batch,
+        aux: Vec::new(),
+    });
+    let authority = crate::HeaderChainBodyEvidenceAuthority::new_test();
+    let prepared = authority.from_registered_header_attempt(insert);
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (invalidate_tx, _invalidate_rx) = oneshot::channel();
+    let deferred_hash = block::Hash([0xe2; 32]);
+    sender
+        .send(NonFinalizedWriteMessage::Invalidate {
+            hash: deferred_hash,
+            rsp_tx: invalidate_tx,
+        })
+        .expect("the unrelated write message queues");
+    let (insert_tx, insert_rx) = oneshot::channel();
+    sender
+        .send(NonFinalizedWriteMessage::ApplyHeaderChainInsert {
+            prepared,
+            rsp_tx: insert_tx,
+        })
+        .expect("the header insertion queues");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("the test deadline runtime is available");
+    let mut deferred = VecDeque::new();
+    let mut retry_manager = VctWriteRetryManager::default();
+
+    assert!(wait_for_vct_root_insert(
+        &mut receiver,
+        Some(&writer),
+        &mut deferred,
+        &runtime,
+        &mut retry_manager,
+    )
+    .expect("the VCT repair wait processes the insertion"));
+    assert!(insert_rx
+        .blocking_recv()
+        .expect("the insertion response is sent")
+        .is_ok());
+    let deferred_message = deferred
+        .pop_front()
+        .expect("the unrelated write is deferred");
+    assert!(matches!(
+        deferred_message,
+        NonFinalizedWriteMessage::Invalidate { hash, .. } if hash == deferred_hash
+    ));
+    assert!(deferred.is_empty());
+    assert_eq!(
+        writer.runtime.publisher().snapshot().frontiers.header_best,
+        child
+    );
+}

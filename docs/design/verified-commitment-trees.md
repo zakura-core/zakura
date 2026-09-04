@@ -65,7 +65,7 @@ Mainnet → the committer is built in peer mode.
 (2) Header sync requests the per-height roots in-band with the finalized header ranges it already fetches (`want_tree_aux_roots`); each root is stored as an auxiliary delivery on its header's DAG node and authenticated there as soon as the successor header that proves it arrives, far ahead of the committer (§4.2, §6.0). (3) Each checkpoint block: look up its root; verify it (own header now, successor header next block, plus
 the direct below-Heartwood/below-NU5/below-Nu6_3 checks); fold it in; freeze the frontier (§6, §7).
 (4) At the last checkpoint height, verify and write the embedded frontier and unfreeze.
-(5) Above the last checkpoint height, ordinary semantic verification resumes from the real frontier. A bad/missing root anywhere in the frozen window parks the block and retries in place; it never writes wrong state. Roots are not individually re-requested, so a hole that no in-flight re-delivery of the same header range fills is a fail-closed stall, surfaced loudly by the §8 metrics.
+(5) Above the last checkpoint height, ordinary semantic verification resumes from the real frontier. A bad or missing root anywhere in the frozen window parks the block in place. The writer publishes a bounded selected-range repair request. A header insertion retries the parked block. A repair that cannot fill the gap remains a fail-closed stall that the §8 metrics report.
 
 **Glossary.**
 
@@ -563,10 +563,15 @@ So the committer **fails closed** rather than falling back to recompute (commit 
 
 Outside the frozen window (legacy), a missing root is
 simply the ordinary legacy recompute — bit-identical to today. Inside the frozen window, a
-missing root parks the current checkpoint block and retries the same commit **in place** —
-**without resetting the block queue**. The write loop also publishes a bounded repair request
-(`VctRootRepairRequested`) back to header sync, which re-fetches the covered range and runs it
-through the root-authentication lane; the retry is satisfied once a verifiable row is stored.
+missing root parks the current checkpoint block **in place** — **without resetting the block
+queue**. The writer continues to process header-chain control messages while it remains parked.
+An `ApplyHeaderChainInsert` completion retries the parked block immediately. The writer defers
+unrelated block-write messages in their original order. The write loop also publishes a bounded
+repair request (`VctRootRepairRequested`) back to header sync. Header sync fetches a contiguous
+selected prefix through the root-authentication lane. Durable evidence at the blocking height
+keeps the existing one-height repair. An empty gap can use one atomic range up to the selected
+tip, checkpoint handoff, 4,000-header transition limit, aggregate capacity, or first durable row.
+The retry is satisfied once a verifiable row is stored.
 If no repair delivery fills the hole, the node stays parked
 fail-closed at that height (§8.1). A peer-supplied root that has no buffered successor to
 confirm it against the header
@@ -587,6 +592,9 @@ window is never entered without its roots in hand. Counters:
 `state.vct.root.retry.count` (park-and-retry attempts),
 `state.vct.root.repair.requested` (bounded repair requests published to header sync), and the
 `state.vct.root.stalled.height` gauge (raised once a height is stuck past the warn threshold).
+`state.vct.root.wait.seconds` records the time a block waits for VCT metadata.
+`sync.header.vct.repair.requested.headers` and
+`sync.header.vct.repair.admitted.headers` count range volume.
 
 ### 8.1 Adversarial peer handling
 

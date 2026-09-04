@@ -699,7 +699,7 @@ async fn sync_singleton_extend_tips_ok() -> Result<(), crate::BoxError> {
 /// Time is paused, so a syncer that instead waits out [`sync::BLOCK_VERIFY_TIMEOUT`] and restarts
 /// fails here in milliseconds of wall-clock time.
 #[tokio::test(start_paused = true)]
-async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
+async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_timeout(
 ) -> Result<(), crate::BoxError> {
     let (
         chain_sync,
@@ -826,17 +826,19 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
     );
 
     // Nothing is left to discover, but blocks 1-3 are parked in the verifier and can only be
-    // verified once the rest of the range arrives. The syncer must run a fresh fanout to find it,
-    // rather than waiting for its in-flight downloads to drain: that wait cannot terminate.
+    // verified once the rest of the range arrives. The first refresh stalls while obtaining the
+    // state locator. The syncer must preserve the parked blocks and retry the refresh.
     let refresh_requested_at = tokio::time::Instant::now();
+    let _stalled_refresh = state_service
+        .expect_request(zs::Request::BlockLocator)
+        .await;
     let refreshed_locator = tokio::time::timeout(
         sync::BLOCK_VERIFY_TIMEOUT,
         state_service.expect_request(zs::Request::BlockLocator),
     )
     .await
     .expect(
-        "syncer must discover the rest of the checkpoint range while its blocks are parked in the \
-         verifier: waiting out BLOCK_VERIFY_TIMEOUT and restarting discards the partial range",
+        "syncer must retry a timed-out tip refresh while its blocks are parked in the verifier",
     );
 
     // The chain has grown to block 5, so the refreshed fanout covers the rest of the range. Blocks

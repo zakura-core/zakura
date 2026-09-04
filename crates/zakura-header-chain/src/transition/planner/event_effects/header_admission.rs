@@ -168,6 +168,11 @@ pub(super) fn admit_prepared_headers(
             if event.batch.headers().is_empty()
                 || event.aux.len() != event.batch.headers().len()
                 || event.aux.iter().any(|delivery| delivery.tree_aux.is_none())
+                || event
+                    .aux
+                    .iter()
+                    .zip(event.batch.headers())
+                    .any(|(delivery, header)| delivery.header_hash != header.hash)
                 || selected_target != parent
                 || event.owner.header_authority().branch.target_tip_hash
                     != event_context

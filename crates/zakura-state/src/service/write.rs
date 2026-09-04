@@ -2441,8 +2441,8 @@ impl WriteBlockWorkerTask {
                     // Retryable VCT root stalls park and retry the same block.
                     // The write loop does not reset the queue for these stalls.
                     // A later delivery of the same header range can fill an absent root.
-                    // Header sync does not request individual roots.
-                    // The write loop therefore polls absent-root stalls slowly.
+                    // Header sync repairs the missing selected range.
+                    // A completed header insertion wakes an absent-root stall.
                     // An await-successor stall waits only for state to store the next header.
                     // The write loop polls await-successor stalls faster.
                     if let Some(height) = error.vct_retryable_height() {

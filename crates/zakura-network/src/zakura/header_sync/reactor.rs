@@ -3206,12 +3206,19 @@ impl HeaderSyncReactor {
             let message_capacity = headers_response_capacity(
                 &self.startup.network,
                 AuxSchema::V1,
-                usize::try_from(status.max_message_bytes).unwrap_or(usize::MAX),
+                usize::try_from(
+                    status
+                        .max_message_bytes
+                        .min(self.serving_limits.max_message_bytes()),
+                )
+                .unwrap_or(usize::MAX),
             );
             let peer_supported_count = desired_count
                 .min(reachable_count)
                 .min(status.max_headers_per_response)
-                .min(message_capacity);
+                .min(self.serving_limits.max_headers_per_response())
+                .min(message_capacity)
+                .min(MAX_HS_RANGE);
             if peer_supported_count == 0 || status.max_inflight_requests == 0 {
                 rejections.insufficient_capacity += 1;
                 continue;

@@ -33,6 +33,8 @@ pub(super) struct VctWriteRetryManager {
     retryable_block: Option<QueuedCheckpointVerified>,
     /// Height and start time for the active VCT metadata stall.
     root_stall: Option<(Height, Instant)>,
+    /// Start time for the checkpoint block's complete VCT metadata wait.
+    block_wait_started: Option<Instant>,
     /// Whether the manager reported the active stall at error level.
     root_stall_reported: bool,
     /// Broadcasts missing-root repair needs to node orchestration.
@@ -113,6 +115,7 @@ impl VctWriteRetryManager {
         Self {
             retryable_block: None,
             root_stall: None,
+            block_wait_started: None,
             root_stall_reported: false,
             root_repair_sender,
             root_repair_status: VctRootRepairStatus::default(),
@@ -158,6 +161,8 @@ impl VctWriteRetryManager {
     /// a new repair generation when the metadata remains unavailable.
     pub(super) fn reset(&mut self, finalized_state: &mut FinalizedState) {
         finalized_state.clear_vct_prevalidated_next();
+        self.finish_block_wait();
+        self.clear_root_stall();
         self.clear_committer_repair();
     }
 
@@ -165,19 +170,14 @@ impl VctWriteRetryManager {
     ///
     /// The manager also clears the stalled-height gauge when it previously reported the stall.
     pub(super) fn on_commit_success(&mut self) {
-        if let Some((_, since)) = self.root_stall {
-            metrics::histogram!("state.vct.root.wait.seconds")
-                .record(since.elapsed().as_secs_f64());
-            if self.root_stall_reported {
-                info!(
-                    stalled_height = ?self.root_stall.map(|(height, _)| height),
-                    "VCT: checkpoint commit recovered; the stalled height now has a verifiable supplied root"
-                );
-                metrics::gauge!("state.vct.root.stalled.height").set(0.0);
-            }
-            self.root_stall = None;
-            self.root_stall_reported = false;
+        self.finish_block_wait();
+        if self.root_stall_reported {
+            info!(
+                stalled_height = ?self.root_stall.map(|(height, _)| height),
+                "VCT: checkpoint commit recovered; the stalled height now has a verifiable supplied root"
+            );
         }
+        self.clear_root_stall();
         self.clear_committer_repair();
     }
 
@@ -195,14 +195,15 @@ impl VctWriteRetryManager {
         if let VctWriteRetryCause::MissingRoot { trigger } = retry_cause {
             self.request_committer_repair(height, trigger);
         }
+        self.block_wait_started.get_or_insert_with(Instant::now);
 
         // The manager reports only stalls that exceed the warning threshold. Transient stalls stay
         // below error level.
         let new_stall = match self.root_stall {
             Some((stalled_height, _)) if stalled_height == height => false,
             _ => {
+                self.clear_root_stall();
                 self.root_stall = Some((height, Instant::now()));
-                self.root_stall_reported = false;
                 true
             }
         };
@@ -261,6 +262,21 @@ impl VctWriteRetryManager {
         );
         metrics::gauge!("state.vct.root.stalled.height").set(f64::from(height.0));
         self.root_stall_reported = true;
+    }
+
+    fn finish_block_wait(&mut self) {
+        if let Some(since) = self.block_wait_started.take() {
+            metrics::histogram!("state.vct.root.wait.seconds")
+                .record(since.elapsed().as_secs_f64());
+        }
+    }
+
+    fn clear_root_stall(&mut self) {
+        if self.root_stall_reported {
+            metrics::gauge!("state.vct.root.stalled.height").set(0.0);
+        }
+        self.root_stall = None;
+        self.root_stall_reported = false;
     }
 
     fn request_committer_repair(&mut self, height: Height, trigger: VctRepairTrigger) {

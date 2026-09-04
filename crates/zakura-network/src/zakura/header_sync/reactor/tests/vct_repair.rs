@@ -5,6 +5,7 @@ use crate::zakura::testkit::{TraceCapture, TraceValue};
 async fn vct_repair_selects_the_peer_with_the_largest_supported_prefix() {
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown.clone());
+    startup.config.max_headers_per_response = 2;
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let selected = [
         zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
@@ -54,7 +55,7 @@ async fn vct_repair_selects_the_peer_with_the_largest_supported_prefix() {
         .recv()
         .await
         .expect("the local status is sent");
-    for (peer, max_headers_per_response) in [(small_peer.clone(), 1), (large_peer.clone(), 2)] {
+    for (peer, max_headers_per_response) in [(small_peer.clone(), 1), (large_peer.clone(), 3)] {
         handle
             .send(Event::WireMessage {
                 peer,
@@ -100,9 +101,9 @@ async fn vct_repair_selects_the_peer_with_the_largest_supported_prefix() {
             .is_err(),
         "the smaller prefix supplier remains unused"
     );
-    let frame = large_outbound
-        .recv()
+    let frame = time::timeout(std::time::Duration::from_secs(1), large_outbound.recv())
         .await
+        .expect("the local response cap permits a bounded repair request")
         .expect("the largest prefix supplier receives the request");
     let HeaderSyncMessage::GetHeaders(request) = handle
         .codec()

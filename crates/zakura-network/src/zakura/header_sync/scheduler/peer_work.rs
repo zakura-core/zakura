@@ -314,14 +314,6 @@ pub enum HeaderTargetPurpose {
 }
 
 impl HeaderTargetPurpose {
-    /// Return the target purpose's exact response-count requirement, when fixed.
-    pub fn exact_header_count(&self) -> Option<usize> {
-        match self {
-            Self::Normal => None,
-            Self::SelectedAuxiliaryRepair { .. } => Some(1),
-        }
-    }
-
     /// Return the selected target fixed by an auxiliary repair.
     pub fn selected_repair_target(&self) -> Option<Frontier> {
         match self {
@@ -1513,15 +1505,14 @@ mod tests {
     }
 
     #[test]
-    fn selected_auxiliary_repair_is_an_exact_one_header_target_purpose() {
+    fn selected_auxiliary_repair_keeps_its_selected_target() {
         let selected_target = Frontier::new(zakura_chain::block::Height(11), hash(11));
         let purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
             selected_target,
             repair_generation: 7,
         };
 
-        assert_eq!(purpose.exact_header_count(), Some(1));
         assert_eq!(purpose.selected_repair_target(), Some(selected_target));
-        assert_eq!(HeaderTargetPurpose::Normal.exact_header_count(), None);
+        assert_eq!(HeaderTargetPurpose::Normal.selected_repair_target(), None);
     }
 }

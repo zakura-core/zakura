@@ -554,6 +554,31 @@ fn selected_auxiliary_range_rejects_atomically_and_then_admits_every_root() {
         })),
     };
 
+    let mut duplicate_target_deliveries = vec![
+        make_delivery(0, selected[0].height),
+        make_delivery(1, selected[1].height),
+    ];
+    duplicate_target_deliveries[1].header_hash = selected[0].hash;
+    duplicate_target_deliveries[1]
+        .tree_aux
+        .as_mut()
+        .expect("the range delivery contains roots")
+        .height = selected[0].height;
+    assert!(matches!(
+        apply_transition(
+            &store,
+            make_repair(duplicate_target_deliveries),
+            &context(&config, &clock, None)
+        ),
+        Err(TransitionFailure::InvalidEvidence(
+            InvalidTransitionEvidence::Header(HeaderViolation::AuxiliaryRepairShape)
+        ))
+    ));
+    assert!(
+        store.aux.is_empty(),
+        "a range with duplicate target deliveries changes no auxiliary state"
+    );
+
     let malformed = make_repair(vec![
         make_delivery(0, selected[0].height),
         make_delivery(1, selected[0].height),

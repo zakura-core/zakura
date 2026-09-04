@@ -75,6 +75,7 @@ fn on_commit_success_is_a_no_op_without_a_stall() {
     // A successful commit leaves an inactive stall unchanged.
     manager.on_commit_success();
     assert!(manager.root_stall.is_none());
+    assert!(manager.block_wait_started.is_none());
     assert!(!manager.root_stall_reported);
 }
 
@@ -116,6 +117,9 @@ fn on_retryable_error_resets_the_stall_for_a_different_height() {
     let mut manager = VctWriteRetryManager::default();
 
     manager.on_retryable_error(Height(1), MISSING_ROOT, queued_block(1));
+    let block_wait_started = manager
+        .block_wait_started
+        .expect("the blocked checkpoint wait is tracked");
     manager.root_stall_reported = true;
 
     manager.on_retryable_error(Height(2), MISSING_ROOT, queued_block(2));
@@ -127,6 +131,11 @@ fn on_retryable_error_resets_the_stall_for_a_different_height() {
     assert!(
         !manager.root_stall_reported,
         "a new height starts an unreported stall"
+    );
+    assert_eq!(
+        manager.block_wait_started,
+        Some(block_wait_started),
+        "a new missing height keeps the same checkpoint wait"
     );
 }
 

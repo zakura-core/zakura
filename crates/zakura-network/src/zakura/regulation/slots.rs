@@ -60,6 +60,21 @@ impl SlotBudget {
             .ok()
             .map(|permit| SlotPermit { _permit: permit })
     }
+
+    /// Wait until one slot could be reserved, without retaining it.
+    ///
+    /// Acquiring and immediately releasing the semaphore permit makes the wait
+    /// race-free. A caller retries its complete multi-resource admission after
+    /// this method returns.
+    pub(crate) async fn wait_for(&self) {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("slot budget semaphore stays open because this type never closes it");
+        drop(permit);
+    }
 }
 
 /// Linear ownership of one slot.

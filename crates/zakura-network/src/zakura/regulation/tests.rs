@@ -239,3 +239,20 @@ fn slot_permits_bound_and_release_owned_items() {
     drop((second, replacement));
     assert_eq!(budget.reserved(), 0);
 }
+
+#[tokio::test]
+async fn slot_wait_wakes_after_an_owner_releases_capacity() {
+    let budget = SlotBudget::new(1).expect("one slot fits the semaphore");
+    let reservation = budget.try_reserve().expect("the slot is initially free");
+    let waiting_budget = budget.clone();
+    let waiter = tokio::spawn(async move { waiting_budget.wait_for().await });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    drop(reservation);
+
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("the release must wake the slot waiter")
+        .expect("the waiter task should not panic");
+}

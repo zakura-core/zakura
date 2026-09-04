@@ -75,12 +75,13 @@ target hash, and a one-byte outcome.
   - `initial_target_tip_hash` and `tree_aux_schema` remain fixed
   - the acknowledged cursor and counters equal the current acknowledgement or advance to a prefix
     in the sent-cursor ring (capacity = `HS_SENT_CURSOR_RING`)
-  - remaining header credit <= 4,000
+  - unacknowledged sent pages + remaining header credit <= 4,000 after the update
   - remaining byte credit <= 8 MiB
   - terminal tombstone capacity = 1
 - **Work**
   - `Open` charge = `added_byte_credit` + `HEADERS_OUTCOME_BYTES` + 64 KiB
-  - `Grant` charge = `added_byte_credit` + 64 KiB
+  - live `Grant` charge = `added_byte_credit` + 64 KiB
+  - tombstoned `Grant` charge = 64 KiB
   - `Close` charge = 0 and cannot `Delay`
   - capacity = `HS_WORK_CAPACITY`
   - refill = `HS_WORK_REFILL`
@@ -95,7 +96,9 @@ subscription reservation before it sends `Open`.
 
 `Grant` MUST carry no locator hashes. It MUST acknowledge a cursor accepted from this subscription.
 It MUST add nonzero header or byte credit. The subscriber MUST add the credit to its local
-subscription reservation before it sends `Grant`. Until the subscription reaches its initial
+subscription reservation before it sends `Grant`. It MUST acknowledge enough sent pages that those
+still unacknowledged plus the resulting remaining header credit do not exceed 4,000. A publisher
+MUST return `Disconnect` if a grant exceeds that bound. Until the subscription reaches its initial
 target, the resulting header and byte credit MUST fit at least one legal nonempty page. A smaller
 grant stalls the subscription: the publisher cannot legally send a page, and the subscriber waits
 for one. After the subscription reaches its target, the publisher may have nothing to send. The
@@ -110,10 +113,13 @@ further `Grant` on that subscription MUST return `Disconnect`.
 Receiving `Close` or queueing a terminal outcome frees the publisher slot. The publisher MUST
 retain a terminal tombstone until it receives a crossing `Close` or the next `Open`. The tombstone
 prevents a conformant update that crossed the terminal outcome from causing a violation. A
-tombstone match validates only the subscription ID. A crossing `Grant` that matches the tombstone
-MUST return `Drop`, MUST charge no work, and MUST NOT consume the tombstone. A crossing `Close`
-consumes the tombstone. An `Open` that finds no free publisher slot MUST return `Disconnect`,
-because the subscriber knows its own live subscription count.
+tombstone retains the subscription ID and last accepted update sequence. A crossing `Grant` or
+`Close` MUST advance that sequence by exactly one; a duplicate or gap MUST return `Disconnect`.
+A matching crossing `Grant` passes the Work gate with the fixed 64 KiB tombstone charge, then
+returns `Drop` without adding response credit or consuming the tombstone. This rate bounds repeated
+ignored updates while allowing several conformant updates to cross a terminal outcome. A matching
+crossing `Close` consumes the tombstone. An `Open` that finds no free publisher slot MUST return
+`Disconnect`, because the subscriber knows its own live subscription count.
 
 The subscriber MUST receive the terminal outcome before it sends the next `Open`. The next `Open`
 clears the tombstone and MUST use a different subscription ID. This rule bounds each side to one
@@ -123,8 +129,10 @@ subscription work charge covers the terminal outcome, which consumes no header o
 The publisher MUST split output into frames that satisfy its advertised per-response count and byte
 limits. It MAY send several frames without another `Grant` while credit remains. It MUST NOT treat
 bytes sent on the ordered stream as new credit. The sent-cursor ring MUST hold at least the
-maximum number of unacknowledged pages. The header credit bound limits that number to 4,000
-one-header pages, so `HS_SENT_CURSOR_RING` always suffices.
+maximum number of unacknowledged pages. Sending a page adds one cursor while consuming at least one
+header credit, so the combined 4,000-page-and-credit bound remains true as credit is renewed.
+`HS_SENT_CURSOR_RING` therefore retains every cursor the subscriber is still allowed to
+acknowledge.
 
 A subscription renews its reservation and drains responses already in flight before it closes:
 

@@ -6,7 +6,6 @@ untouched. The destination is the empty approach volume of this bake.
 """
 
 import argparse
-import os
 import shlex
 import subprocess
 import time
@@ -94,7 +93,6 @@ def seed(args):
     if not plans:
         raise RuntimeError("no compatible host can read the retained approach fixture")
     source = None
-    github_output = os.environ.pop("GITHUB_OUTPUT", None)
     try:
         source = provision.provision(source_args, plans)
         for attempt in range(90):
@@ -162,8 +160,6 @@ def seed(args):
     finally:
         if source:
             provision.cleanup([source["id"]], [source["volume_id"]])
-        if github_output is not None:
-            os.environ["GITHUB_OUTPUT"] = github_output
 
 
 if __name__ == "__main__":

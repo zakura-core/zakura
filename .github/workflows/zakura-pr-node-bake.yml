@@ -129,6 +129,7 @@ jobs:
             'set -euo pipefail; set -a; . /root/bake.env; set +a; bash /root/pr-node-bake.sh'
 
       - name: Seed retained approach fixture in this region
+        id: seed
         if: ${{ !inputs.rebuild_approach_from_sandblast }}
         env:
           IP: ${{ steps.droplet.outputs.ip }}
@@ -248,6 +249,15 @@ jobs:
           name: regional-bake-${{ github.run_id }}-${{ matrix.region }}
           path: /tmp/regional-bake.json
           retention-days: 14
+
+      - name: Cleanup approach copy host
+        if: always()
+        uses: ./.github/actions/do-teardown
+        with:
+          droplet_id: ${{ steps.seed.outputs.id }}
+          droplet_name: zakura-pr-seed-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.region }}
+          volume_ids: ${{ steps.seed.outputs.volume_id }}
+          volume_names: ${{ steps.seed.outputs.volume_name }}
 
       - name: Cleanup droplet + volumes
         if: always()

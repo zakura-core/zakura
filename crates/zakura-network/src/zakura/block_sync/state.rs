@@ -796,11 +796,17 @@ pub(super) struct PeerBlockState {
 pub(super) struct ServingBlockRequest {
     id: BlockRangeRequestId,
     start_height: block::Height,
+    original_count: u32,
     requested_count: u32,
     started: Instant,
 }
 
 impl ServingBlockRequest {
+    /// Count received in the validated wire request and echoed by `RangeUnavailable`.
+    pub(super) fn original_count(self) -> u32 {
+        self.original_count
+    }
+
     /// Count accepted after the wire, configuration, and servable-range clamps.
     pub(super) fn requested_count(self) -> u32 {
         self.requested_count
@@ -827,6 +833,7 @@ impl PeerBlockState {
         local_inflight_cap: u32,
         request_id: BlockRangeRequestId,
         start_height: block::Height,
+        original_count: u32,
         requested_count: u32,
     ) -> bool {
         if self.served_block_requests.len()
@@ -838,6 +845,7 @@ impl PeerBlockState {
         self.served_block_requests.push_back(ServingBlockRequest {
             id: request_id,
             start_height,
+            original_count,
             requested_count,
             started: Instant::now(),
         });

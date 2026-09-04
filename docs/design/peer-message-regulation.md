@@ -229,9 +229,10 @@ lease carried with that frame. Reserving the queue slot happens before the
 transfer, so a failed enqueue moves no accounting. The lease ends when the
 transport accepts the write or drops the frame.
 
-QUIC may retain bytes after the application write completes. Its send-window
-envelope is a separate transport bound and must be included in slow-reader
-tests.
+QUIC may retain bytes after the application write completes. Its send windows
+therefore need both a per-connection cap and a node-wide aggregate cap. The
+application budget and QUIC budget are separate, but slow-reader tests must
+check both and report their combined envelope.
 
 ### 4. Release capacity on every exit
 

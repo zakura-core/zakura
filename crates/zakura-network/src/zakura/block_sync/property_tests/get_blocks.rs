@@ -59,13 +59,17 @@ const GB_WF_TEST_MANIFEST: &[(&str, &[&str])] = &[
         "GB-WF-10",
         &["gb_wf_10_fixed_fields_do_not_size_decode_allocation"],
     ),
+    (
+        "GB-WF-11",
+        &["gb_wf_11_incomplete_get_blocks_frame_expires_at_read_deadline"],
+    ),
 ];
 
 #[test]
 fn gb_wf_contract_manifest_names_every_requirement() {
     const EXPECTED_IDS: &[&str] = &[
         "GB-WF-01", "GB-WF-02", "GB-WF-03", "GB-WF-04", "GB-WF-05", "GB-WF-06", "GB-WF-07",
-        "GB-WF-08", "GB-WF-09", "GB-WF-10",
+        "GB-WF-08", "GB-WF-09", "GB-WF-10", "GB-WF-11",
     ];
     assert_contract_test_manifest(EXPECTED_IDS, GB_WF_TEST_MANIFEST);
 }

@@ -33,6 +33,11 @@ lowercase, underscore-separated ID, such as `gb_sm_01_...`. A contract is
 specified when the requirements are written. It is implemented only when those
 requirements point to executable evidence.
 
+Shared framework requirements may map to one or more exchange-specific IDs
+instead of duplicating the same test for every message. The exchange contract
+must make that mapping explicit and may use shared evidence only when it runs
+through the same production path.
+
 ## Test layers
 
 Use the smallest production boundary that proves the claim:

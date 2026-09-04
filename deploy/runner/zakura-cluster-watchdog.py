@@ -572,7 +572,11 @@ def shared_stall_candidate(
     rows: list[dict[str, Any]],
     now: float,
 ) -> SharedTip | None:
-    """Return a common verifiable tip before individual stall alerts become due."""
+    """Group a strict majority at the highest observable tip, leaving laggards out.
+
+    Incomplete observations or competing hashes at that height prevent grouping.
+    Agreement is not proof of network health; the shared stall timer still applies.
+    """
     observed: list[tuple[int, str, float, str]] = []
 
     for row in rows:
@@ -590,17 +594,20 @@ def shared_stall_candidate(
     if len(observed) < 2 or len({item[3] for item in observed}) != len(observed):
         return None
 
-    identities = {(height, block_hash) for height, block_hash, *_rest in observed}
-    if len(identities) != 1:
+    highest = max(item[0] for item in observed)
+    participants = [item for item in observed if item[0] == highest]
+    if len(participants) * 2 <= len(observed):
+        return None
+    if len({item[1] for item in participants}) != 1:
         return None
 
-    height, block_hash = next(iter(identities))
+    height, block_hash, *_rest = participants[0]
     return SharedTip(
         height=height,
         block_hash=block_hash,
         # The shared interval starts when the last node reached this tip.
-        bad_since=max(bad_since for _height, _hash, bad_since, _name in observed),
-        node_names=tuple(name for _height, _hash, _bad_since, name in observed),
+        bad_since=max(bad_since for _height, _hash, bad_since, _name in participants),
+        node_names=tuple(name for _height, _hash, _bad_since, name in participants),
     )
 
 
@@ -752,9 +759,18 @@ def node_recovery_text(fleet: Fleet, row: dict[str, Any], previous: dict[str, An
     height = coerce_height(row.get("height"))
     height_text = str(height) if height is not None else "-"
 
+    if row.get("health") == "healthy":
+        status = (
+            f":white_check_mark: *Zakura {fleet_name}* - `{name}` "
+            f"recovered from {condition}"
+        )
+    else:
+        status = (
+            f":warning: *Zakura {fleet_name}* - `{name}` condition changed "
+            f"from {condition}; current health: {health}"
+        )
     return (
-        f":white_check_mark: *Zakura {fleet_name}* - `{name}` recovered "
-        f"from {condition}\n"
+        f"{status}\n"
         f"health: {health} - height: {height_text}\n"
         f"dashboard: {slack_dashboard_url(fleet.dashboard_url)}"
     )
@@ -792,10 +808,11 @@ def shared_stall_alert_text(
 ) -> str:
     fleet_name = slack_identity(fleet.name, MAX_ALERT_NAME_CHARS, "unknown")
     lines = [
-        f":rotating_light: *Zakura {fleet_name}* network height has not advanced "
+        f":rotating_light: *Zakura {fleet_name}* observed tip has not advanced "
         f"for {format_duration(age)}",
         f"{node_count} nodes agree at height {int(height)}",
         f"tip hash: {slack_block_hash(block_hash)}",
+        "Fleet agreement does not rule out a shared sync failure.",
     ]
     for row in rows[:MAX_SHARED_DIAGNOSTIC_ROWS]:
         summary = named_metrics(
@@ -846,8 +863,12 @@ def shared_stall_recovery_text(
 ) -> str:
     fleet_name = slack_identity(fleet.name, MAX_ALERT_NAME_CHARS, "unknown")
     height_text = str(int(height)) if height is not None else "-"
+    if detail == "network height advanced":
+        status, summary = ":white_check_mark:", "shared stall cleared"
+    else:
+        status, summary = ":information_source:", "shared stall tracking changed"
     return (
-        f":white_check_mark: *Zakura {fleet_name}* shared stall cleared\n"
+        f"{status} *Zakura {fleet_name}* {summary}\n"
         f"detail: {detail}\n"
         f"height: {height_text}\n"
         f"dashboard: {slack_dashboard_url(fleet.dashboard_url)}"
@@ -866,7 +887,7 @@ def duplicate_stall_recovery_text(
     height_value = coerce_height(height)
     height_text = str(height_value) if height_value is not None else "-"
     return (
-        f":white_check_mark: *Zakura {fleet_name}* - `{duplicate}` "
+        f":information_source: *Zakura {fleet_name}* - `{duplicate}` "
         "duplicate stall alert cleared\n"
         f"detail: `{owner}` continues to represent the shared incident\n"
         f"height: {height_text}\n"
@@ -1594,7 +1615,7 @@ def parse_args() -> argparse.Namespace:
         "--shared-stalled-after",
         type=float,
         default=1800.0,
-        help="alert after every observable node shares one stalled tip this long",
+        help="alert after a strict majority shares the highest observable tip this long",
     )
     parser.add_argument(
         "--dashboard-down-after",

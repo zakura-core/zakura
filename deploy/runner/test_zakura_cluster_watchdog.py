@@ -452,7 +452,7 @@ class SlackPayloadTests(unittest.TestCase):
         self.assertEqual(
             posted_text.splitlines()[:3],
             [
-                ":rotating_light: *Zakura mainnet* network height has not advanced for 31m 40s",
+                ":rotating_light: *Zakura mainnet* observed tip has not advanced for 31m 40s",
                 "8 nodes agree at height 100",
                 "tip hash: invalid (" + "g" * watchdog.MAX_BLOCK_HASH_CHARS + ")",
             ],
@@ -742,6 +742,205 @@ class SharedStallTests(unittest.TestCase):
         self.assertEqual(self.posted, [])
         self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
 
+    def test_long_block_with_resyncing_nodes_does_not_page_tip_followers(self):
+        # Model the nine-node burst seen at 3470914, with three separate resyncs.
+        followers = [self.row(f"tip-{i}", 3_470_914, 602) for i in range(9)]
+        resyncs = [
+            self.row(f"resync-{i}", 3_450_000 + i, 5, "healthy")
+            for i in range(3)
+        ]
+        self.run_snapshot(followers + resyncs)
+        self.assertEqual(self.posted, [])
+
+        self.run_snapshot(
+            [self.row(row["name"], 3_470_915, 5, "healthy") for row in followers]
+            + resyncs,
+            now=self.NOW + 180,
+        )
+        self.assertEqual(self.posted, [])
+
+    def test_majority_gap_keeps_lagging_node_alert_and_eventual_shared_warning(self):
+        for elapsed in (0, 600, 1200, 1260):
+            self.run_snapshot(
+                [
+                    self.row("node-a", 100, 600 + elapsed),
+                    self.row("node-b", 100, 600 + elapsed),
+                    self.row("laggard", 90, 900 + elapsed),
+                ],
+                now=self.NOW + elapsed,
+            )
+            expected_count = 1 if elapsed < 1200 else 2
+            self.assertEqual(len(self.posted), expected_count)
+            self.assertTrue(self.state["nodes"]["testnet/laggard"]["alerting"])
+
+        self.assertIn("`laggard` stalled", self.posted[0])
+        self.assertIn("2 nodes agree at height 100", self.posted[1])
+        self.assertNotIn("- laggard:", self.posted[1])
+        self.assertIn("does not rule out a shared sync failure", self.posted[1])
+        self.posted.clear()
+        self.run_snapshot(
+            [
+                self.row("node-a", 101, 5, "healthy"),
+                self.row("node-b", 101, 5, "healthy"),
+                self.row("laggard", 90, 2220),
+            ],
+            now=self.NOW + 1320,
+        )
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("network height advanced", self.posted[0])
+        self.assertTrue(self.state["nodes"]["testnet/laggard"]["alerting"])
+
+    def test_one_higher_reference_prevents_suppression_of_stuck_majority(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 601),
+                self.row("node-b", 100, 601),
+                self.row("reference", 101, 5, "healthy"),
+            ]
+        )
+        self.assertEqual(len(self.posted), 2)
+        for name in ("node-a", "node-b"):
+            self.assertTrue(self.state["nodes"][f"testnet/{name}"]["alerting"])
+
+    def test_equal_sized_height_groups_keep_all_individual_alerts(self):
+        self.run_snapshot(
+            [self.row(f"node-{i}", 100 + i // 2, 601) for i in range(4)]
+        )
+        self.assertEqual(len(self.posted), 4)
+        self.assertTrue(all(entry["alerting"] for entry in self.state["nodes"].values()))
+
+    def test_conflicting_highest_hash_prevents_majority_suppression(self):
+        self.run_snapshot(
+            [
+                self.row("node-a", 100, 601),
+                self.row("node-b", 100, 601),
+                self.row("fork", 100, 601, block_hash="bbbb"),
+            ]
+        )
+        self.assertEqual(len(self.posted), 3)
+        self.assertTrue(all(entry["alerting"] for entry in self.state["nodes"].values()))
+
+    def test_incomplete_laggard_observation_prevents_majority_suppression(self):
+        for field in ("height", "block_hash", "seconds_since_advanced"):
+            with self.subTest(field=field):
+                self.state = {}
+                self.posted.clear()
+                laggard = self.row("laggard", 90, 601)
+                laggard[field] = None
+                self.run_snapshot(
+                    [self.row("node-a", 100, 601), self.row("node-b", 100, 601), laggard]
+                )
+                for name in ("node-a", "node-b"):
+                    self.assertTrue(self.state["nodes"][f"testnet/{name}"]["alerting"])
+                self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
+
+    def test_down_alert_keeps_its_deadline_during_majority_gap(self):
+        for elapsed in (0, 600):
+            self.run_snapshot(
+                [
+                    self.row("node-a", 100, 601 + elapsed),
+                    self.row("node-b", 100, 601 + elapsed),
+                    self.row("resync", 90, 5, "healthy"),
+                    self.row("down", None, None, "rpc_error", block_hash=""),
+                ],
+                now=self.NOW + elapsed,
+            )
+            self.assertEqual(len(self.posted), int(elapsed == 600))
+        self.assertIn("`down` down for 10m\n", self.posted[0])
+
+    def test_a_former_participant_is_alerted_when_majority_moves_ahead(self):
+        self.run_snapshot([self.row(f"node-{i}", 100, 601) for i in range(3)])
+        self.assertEqual(self.posted, [])
+        self.run_snapshot(
+            [
+                self.row("node-0", 101, 5, "healthy"),
+                self.row("node-1", 101, 5, "healthy"),
+                self.row("node-2", 100, 661),
+            ],
+            now=self.NOW + 60,
+        )
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("`node-2` stalled", self.posted[0])
+
+    def test_majority_incident_survives_state_reload_without_duplicate(self):
+        rows = [
+            self.row("node-a", 100, 1801),
+            self.row("node-b", 100, 1801),
+            self.row("laggard", 90, 601),
+        ]
+        self.run_snapshot(rows)
+        self.assertEqual(len(self.posted), 2)
+        self.state = json.loads(json.dumps(self.state))
+        self.instance = watchdog.Watchdog([self.fleet], self.args)
+        self.run_snapshot(rows, now=self.NOW + 60)
+        self.assertEqual(len(self.posted), 2)
+        self.assertTrue(self.state["shared_stalls"]["testnet"]["alerting"])
+        self.assertTrue(self.state["nodes"]["testnet/laggard"]["alerting"])
+
+    def test_higher_reference_breaks_existing_group_and_exposes_stalled_nodes(self):
+        self.run_snapshot(
+            [self.row(f"node-{i}", 100, 1801) for i in range(3)]
+            + [self.row("laggard", 90, 1900, block_hash="bbbb")]
+        )
+        self.assertEqual(len(self.posted), 2)
+        self.posted.clear()
+        self.run_snapshot(
+            [
+                self.row("node-0", 101, 5, "healthy", block_hash="cccc"),
+                self.row("node-1", 100, 1861),
+                self.row("node-2", 100, 1861),
+                self.row("laggard", 90, 1960, block_hash="bbbb"),
+            ],
+            now=self.NOW + 60,
+        )
+        self.assertEqual(len(self.posted), 3)
+        self.assertIn("network height advanced", self.posted[0])
+        for name in ("node-1", "node-2", "laggard"):
+            self.assertTrue(self.state["nodes"][f"testnet/{name}"]["alerting"])
+        self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
+
+    def test_failed_majority_delivery_does_not_hide_laggard_and_retries(self):
+        rows = [
+            self.row("node-a", 100, 1801),
+            self.row("node-b", 100, 1801),
+            self.row("laggard", 90, 601),
+        ]
+        watchdog.post_slack = lambda text, _args: (
+            self.posted.append(text), "observed tip" not in text
+        )[1]
+        self.run_snapshot(rows)
+        self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
+        self.assertTrue(self.state["nodes"]["testnet/laggard"]["alerting"])
+        self.assertEqual(len(self.posted), 2)
+        watchdog.post_slack = lambda text, _args: (self.posted.append(text), True)[1]
+        self.run_snapshot(rows, now=self.NOW + 60)
+        self.assertEqual(len(self.posted), 3)
+        self.assertTrue(self.state["shared_stalls"]["testnet"]["alerting"])
+
+    def test_stall_to_rpc_failure_is_a_change_and_still_alerts_when_due(self):
+        self.run_snapshot([self.row("node-a", 100, 601)])
+        self.posted.clear()
+        down = [self.row("node-a", None, None, "rpc_error", block_hash="")]
+        self.run_snapshot(down, now=self.NOW + 60)
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("condition changed from stalled", self.posted[0])
+        self.assertNotIn(":white_check_mark:", self.posted[0])
+        self.run_snapshot(down, now=self.NOW + 660)
+        self.assertEqual(len(self.posted), 2)
+        self.assertIn("`node-a` down for 10m\n", self.posted[1])
+        self.assertTrue(self.state["nodes"]["testnet/node-a"]["alerting"])
+
+    def test_only_healthy_node_transition_uses_green_recovery(self):
+        for health in ("healthy", "stale", "down", "rpc_error", "starting", None):
+            with self.subTest(health=health):
+                text = watchdog.node_recovery_text(
+                    self.fleet,
+                    self.row("node-a", 101, 5, health),
+                    {"condition": "stalled"},
+                )
+                self.assertEqual(":white_check_mark:" in text, health == "healthy")
+                self.assertEqual("recovered from" in text, health == "healthy")
+
     def test_common_height_recovery_posts_once_after_progress(self):
         stalled = [
             self.row("node-a", 4_302_737, 1_817),
@@ -819,7 +1018,8 @@ class SharedStallTests(unittest.TestCase):
         )
 
         self.assertEqual(len(self.posted), 3)
-        self.assertIn("shared stall cleared", self.posted[0])
+        self.assertIn("shared stall tracking changed", self.posted[0])
+        self.assertNotIn(":white_check_mark:", self.posted[0])
         self.assertTrue(all("stalled" in post for post in self.posted[1:]))
         self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
 
@@ -841,7 +1041,7 @@ class SharedStallTests(unittest.TestCase):
         )
 
         self.assertEqual(len(self.posted), 1)
-        self.assertIn("network height has not advanced", self.posted[0])
+        self.assertIn("observed tip has not advanced", self.posted[0])
         self.assertTrue(
             all(not entry["alerting"] for entry in self.state["nodes"].values())
         )
@@ -955,7 +1155,7 @@ class SharedStallTests(unittest.TestCase):
         )
 
         self.assertEqual(len(self.posted), 2)
-        self.assertIn("`node-a` recovered from stalled", self.posted[1])
+        self.assertIn("`node-a` condition changed from stalled", self.posted[1])
         self.assertFalse(self.state["nodes"]["testnet/node-a"]["alerting"])
         self.assertEqual(
             self.state["nodes"]["testnet/node-a"]["event_height"], 101
@@ -971,7 +1171,7 @@ class SharedStallTests(unittest.TestCase):
         )
 
         self.assertEqual(len(self.posted), 1)
-        self.assertIn("network height has not advanced", self.posted[0])
+        self.assertIn("observed tip has not advanced", self.posted[0])
         self.assertTrue(self.state["shared_stalls"]["testnet"]["alerting"])
         self.assertFalse(self.state["nodes"]["testnet/node-a"]["alerting"])
 
@@ -1078,7 +1278,7 @@ class SharedStallTests(unittest.TestCase):
 
         def fail_recovery(text, _args):
             self.posted.append(text)
-            return "shared stall cleared" not in text
+            return "shared stall tracking changed" not in text
 
         watchdog.post_slack = fail_recovery
         self.run_snapshot(
@@ -1090,7 +1290,7 @@ class SharedStallTests(unittest.TestCase):
         )
 
         self.assertEqual(len(self.posted), 1)
-        self.assertIn("shared stall cleared", self.posted[0])
+        self.assertIn("shared stall tracking changed", self.posted[0])
         self.assertTrue(self.state["shared_stalls"]["testnet"]["alerting"])
         self.assertTrue(
             all(not entry["alerting"] for entry in self.state["nodes"].values())
@@ -1141,7 +1341,7 @@ class SharedStallTests(unittest.TestCase):
         )
 
         self.assertEqual(len(self.posted), 1)
-        self.assertIn("`node-a` recovered from stalled", self.posted[0])
+        self.assertIn("`node-a` condition changed from stalled", self.posted[0])
         self.assertEqual(self.state["nodes"]["testnet/node-a"], old_node)
         self.assertEqual(self.state["shared_stalls"]["testnet"]["condition"], "ok")
 

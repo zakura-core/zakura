@@ -33,6 +33,7 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
+    metrics::{record_first_block_commit, BlockCommitPath},
     sync::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
@@ -851,6 +852,7 @@ where
                     .record(verify_start.elapsed().as_secs_f64());
 
                 if verification.is_ok() {
+                    record_first_block_commit(BlockCommitPath::Legacy);
                     metrics::counter!("sync.verified.block.count").increment(1);
                 }
 

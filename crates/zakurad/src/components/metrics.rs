@@ -7,6 +7,33 @@ use std::net::SocketAddr;
 use abscissa_core::{Component, FrameworkError};
 use serde::{Deserialize, Serialize};
 
+/// The block delivery path that first committed a block.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BlockCommitPath {
+    /// Zakura's native block sync path.
+    Zakura,
+
+    /// The legacy TCP gossip or sync path.
+    Legacy,
+}
+
+impl BlockCommitPath {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Zakura => "zakura",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
+/// Record the path that won the race to commit a new block.
+///
+/// Call this only after the verifier successfully commits the block. Duplicate
+/// submissions fail verification, so they must not increment this counter.
+pub(crate) fn record_first_block_commit(path: BlockCommitPath) {
+    metrics::counter!("sync.block.first_commit.count", "path" => path.as_str()).increment(1);
+}
+
 /// Abscissa component which runs a metrics endpoint.
 #[derive(Debug, Component)]
 pub struct MetricsEndpoint {}
@@ -81,5 +108,16 @@ impl Default for Config {
         Self {
             endpoint_addr: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlockCommitPath;
+
+    #[test]
+    fn block_commit_path_labels_are_bounded() {
+        assert_eq!(BlockCommitPath::Zakura.as_str(), "zakura");
+        assert_eq!(BlockCommitPath::Legacy.as_str(), "legacy");
     }
 }

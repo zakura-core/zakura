@@ -21,7 +21,10 @@ use zakura_network::zakura::{
     BlockSyncBlockMeta, BlockSyncEvent, BlockSyncHandle, ZakuraEndpoint, ZakuraTrace,
 };
 
-use crate::components::sync;
+use crate::components::{
+    metrics::{record_first_block_commit, BlockCommitPath},
+    sync,
+};
 
 use super::{
     block_verify_error_class, block_verify_error_diagnostic,
@@ -1483,6 +1486,7 @@ where
                 ?committed_hash,
                 "Zakura block sync committed block body through verifier"
             );
+            record_first_block_commit(BlockCommitPath::Zakura);
             BlockApplyOutcome::committed(zakura_header_chain::VerifiedBodyEvidence {
                 hash: expected_hash,
                 evidence: body_outcome_evidence(b"committed", owner, source, expected_hash, &[]),

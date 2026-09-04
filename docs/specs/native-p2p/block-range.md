@@ -186,6 +186,7 @@ These are implementation candidates until native load evidence validates them:
 | Response-body limit | 32 MiB; minimum `MAX_BLOCK_BYTES` | One state query and response |
 | Peer rate | 16 MiB/s | One authenticated identity |
 | Peer rate capacity | 32 MiB response cap + 128 discriminators + 9 terminal bytes + 64 KiB overhead | One authenticated identity, retained while depleted |
+| Inactive identity buckets | Configured maximum connection count | Depleted peer-rate buckets without an active session or permit |
 | Peer backlog | 64 MiB | One session's reserved and application-owned response bytes |
 | Node rate | 64 MiB/s | All inbound `GetBlocks` serving |
 | Node rate capacity | 128 MiB | All inbound `GetBlocks` serving |
@@ -199,6 +200,15 @@ Startup validation requires the largest legal request to fit every applicable
 byte capacity and the node pending-input capacity to fit one configured session
 window. Rate balances refill with time; outstanding and backlog capacity return
 only when ownership is released.
+
+A depleted peer-rate bucket survives reconnects under its authenticated
+identity. An inactive bucket remains cached until it refills, for at most
+`ceil(deficit / peer rate)` seconds, unless the inactive cache reaches the
+configured maximum connection count. The cache then evicts the inactive bucket
+with the smallest deficit. It never evicts an active or permit-referenced
+bucket. One eviction can restore at most that bucket's deficit, which is no
+greater than the peer-rate capacity; the node-rate bucket still bounds
+aggregate work across identities.
 
 One admission may wait while the routine continues decoding the bidirectional
 stream so responses to Zakura's own block requests can pass. Each session may
@@ -239,7 +249,7 @@ rejected by that full ledger follows GB-SM-05.
 | GB-RL-11 | Responses to Zakura's downloads continue within the request timeout behind admission-delayed serving requests on the same stream. |
 | GB-RL-12 | Supported configurations use checked arithmetic, fit the largest legal request, one maximum-size block, and one session's pending-input window, and reject insufficient limits or capacities. |
 | GB-RL-13 | Under-budget histories produce the same queries, frames, and ownership state as the unregulated serving reference model. |
-| GB-RL-14 | Reconnects retain a depleted identity bucket; inactive retention is bounded and early eviction restores no more than the evicted deficit. |
+| GB-RL-14 | Reconnects retain a depleted identity bucket; the inactive cache follows the capacity, retention, and smallest-deficit eviction policy above; active and permit-referenced buckets survive churn; and one eviction restores no more than the evicted deficit. |
 | GB-RL-15 | Rejecting a superseded routine at the session gate rolls back all provisional regulation ownership. |
 | GB-RL-16 | Pending serving-request state stays within its per-session bound and an independently configured node-wide count; exhausting either bound drops the excess request with no work, response, or peer score. |
 | GB-RL-17 | The state query receives the local response-body byte limit and never returns block bodies whose total encoded size exceeds it. |

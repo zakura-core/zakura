@@ -30,6 +30,7 @@ healthy_url = "http://127.0.0.1:8080/healthy"
 poll_interval_seconds = 30
 startup_timeout_seconds = 600
 stall_seconds = 600
+status_unavailable_seconds = 600
 max_run_seconds = 172800
 ready_samples = 6
 ready_sample_interval_seconds = 30

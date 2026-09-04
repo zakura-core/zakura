@@ -28,6 +28,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `status_unavailable_seconds` | `deploy/continuous-sync/continuous-sync.py` and `deploy/continuous-sync/nodes.toml` | new → `600 s` | [#846](https://github.com/zakura-core/zakura/pull/846) | Stop a canary after ten continuous minutes without exact sync evidence while allowing individual metrics errors and timeouts to recover. |
 | `LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE` | `crates/zakurad/src/commands/start/zakura/coordinator.rs` | new → `30 min` | [#831](https://github.com/zakura-core/zakura/pull/831) | Terminate the node when native block applies prevent legacy fallback from acquiring exclusive ownership, instead of leaving the fallback handoff pending forever. |
 | `MAX_CANDIDATE_TIPS_V1` | `crates/zakura-header-chain/src/config.rs` | `10` → `11` | [#831](https://github.com/zakura-core/zakura/pull/831) | Retain ten full-state fork tips plus one independent selected header tip, so header candidate pressure cannot evict a branch that full state still owns. |
 | `VCT_LOCAL_OPERATION_FATAL_AFTER` | `crates/zakura-network/src/zakura/header_sync/reactor.rs` | new → `30 min` | [#821](https://github.com/zakura-core/zakura/pull/821) | Terminate a node whose local VCT repair prepare or apply operation remains pending, while allowing slow valid operations substantially more time than the existing one-minute stall diagnostic. |

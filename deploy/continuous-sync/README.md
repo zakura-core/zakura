@@ -39,6 +39,33 @@ v2 stack.
 The same commit may be tested repeatedly. That is intentional: the fleet is a
 continuous sync canary, not a once-per-SHA CI job.
 
+For Zakura and dual-stack nodes, the controller distinguishes an idle chain from
+a stalled node. It compares the exact committed block height with the exact
+local header-chain height. A header height at or below the committed height
+means that the node has no local header backlog, so a long Mainnet block
+interval does not start the stall deadline. A higher header height starts the
+deadline because the node has a local backlog that it can process. New
+committed progress restarts the deadline.
+
+A dual-stack node that hands block sync to legacy fallback stops the run
+immediately, naming the handoff as the reason. The canary exists to catch v2
+stalls before legacy masks them, so an active fallback is the failure it is
+looking for, not a recovery window to wait out. Measuring legacy progress after
+the handoff would report a healthy node while the v2 stack stayed stalled.
+
+The controller records a metrics error or missing exact height as unavailable
+status evidence. It does not classify that sample as a sync stall. Continuous
+status unavailability has its own deadline and failure reason. Wall-clock tip
+estimates remain available for diagnostics, but they do not supply stall
+evidence.
+
+The legacy-only node does not run the Zakura header chain. It retains its
+1800-second height-only deadline. The cluster monitor independently requires a
+healthy peer with an exact committed height to advance before it reports a local
+sync stall. It never uses a wall-clock estimate as peer evidence. That peer
+evidence covers a header-sync failure where the local node never learns the
+newer header.
+
 ## Failure Semantics
 
 Any build, install, cleanup, startup, sync, stall, timeout, disk, metrics, or

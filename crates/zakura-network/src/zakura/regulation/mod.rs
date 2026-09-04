@@ -22,3 +22,9 @@ pub(crate) use slots::{SlotBudget, SlotBudgetCapacityError, SlotPermit};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod properties;
+
+#[cfg(test)]
+pub(crate) mod test_support;

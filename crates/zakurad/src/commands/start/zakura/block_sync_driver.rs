@@ -2325,3 +2325,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod regulation_properties;

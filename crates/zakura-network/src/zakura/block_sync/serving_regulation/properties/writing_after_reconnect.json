@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "limit": "node_bytes",
+  "actions": [
+    {"action": "admit", "peer": 0, "request": 0},
+    {"action": "commit", "request": 0},
+    {"action": "claim_query", "request": 0},
+    {"action": "drop_query_lease", "request": 0},
+    {"action": "queue_block", "request": 0},
+    {"action": "queue_terminal", "request": 0},
+    {"action": "begin_write", "session": 0},
+    {"action": "reconnect", "peer": 0},
+    {"action": "admit", "peer": 1, "request": 1},
+    {"action": "end_write", "session": 0, "outcome": "complete"},
+    {"action": "begin_write", "session": 0},
+    {"action": "end_write", "session": 0, "outcome": "cancel"},
+    {"action": "admit", "peer": 1, "request": 1},
+    {"action": "drop_ledger", "request": 1}
+  ]
+}

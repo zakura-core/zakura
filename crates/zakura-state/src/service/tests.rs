@@ -1547,3 +1547,5 @@ fn read_only_open_with_malformed_version_returns_typed_error() {
         Ok(_) => panic!("expected malformed state version to fail closed"),
     }
 }
+
+mod regulation_properties;

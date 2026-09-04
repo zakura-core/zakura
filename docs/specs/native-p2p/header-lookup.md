@@ -80,7 +80,8 @@ target hash, and a one-byte outcome.
   - terminal tombstone capacity = 1
 - **Work**
   - `Open` charge = `added_byte_credit` + `HEADERS_OUTCOME_BYTES` + 64 KiB
-  - `Grant` charge = `added_byte_credit` + 64 KiB
+  - live `Grant` charge = `added_byte_credit` + 64 KiB
+  - tombstoned `Grant` charge = 64 KiB
   - `Close` charge = 0 and cannot `Delay`
   - capacity = `HS_WORK_CAPACITY`
   - refill = `HS_WORK_REFILL`
@@ -110,10 +111,13 @@ further `Grant` on that subscription MUST return `Disconnect`.
 Receiving `Close` or queueing a terminal outcome frees the publisher slot. The publisher MUST
 retain a terminal tombstone until it receives a crossing `Close` or the next `Open`. The tombstone
 prevents a conformant update that crossed the terminal outcome from causing a violation. A
-tombstone match validates only the subscription ID. A crossing `Grant` that matches the tombstone
-MUST return `Drop`, MUST charge no work, and MUST NOT consume the tombstone. A crossing `Close`
-consumes the tombstone. An `Open` that finds no free publisher slot MUST return `Disconnect`,
-because the subscriber knows its own live subscription count.
+tombstone retains the subscription ID and last accepted update sequence. A crossing `Grant` or
+`Close` MUST advance that sequence by exactly one; a duplicate or gap MUST return `Disconnect`.
+A matching crossing `Grant` passes the Work gate with the fixed 64 KiB tombstone charge, then
+returns `Drop` without adding response credit or consuming the tombstone. This rate bounds repeated
+ignored updates while allowing several conformant updates to cross a terminal outcome. A matching
+crossing `Close` consumes the tombstone. An `Open` that finds no free publisher slot MUST return
+`Disconnect`, because the subscriber knows its own live subscription count.
 
 The subscriber MUST receive the terminal outcome before it sends the next `Open`. The next `Open`
 clears the tombstone and MUST use a different subscription ID. This rule bounds each side to one

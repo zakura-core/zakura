@@ -254,12 +254,14 @@ fn regulated_config(response_bytes: u32) -> ZakuraBlockSyncConfig {
         ..ZakuraBlockSyncConfig::default()
     };
     let cost = serving_cost(&config, 1).expect("one-block serving arithmetic fits");
+    let node_pending_requests = config.advertised_max_inflight_requests().saturating_add(1);
     config.get_blocks_serving_regulation = GetBlocksServingRegulationConfig {
         peer_rate_bytes_per_second: 1,
         peer_rate_capacity_bytes: cost.charge * 8,
         peer_backlog_bytes: cost.response_cap * 8,
         node_rate_bytes_per_second: 1,
         node_rate_capacity_bytes: cost.charge * 32,
+        node_pending_requests,
         node_outstanding_bytes: cost.response_cap * 32,
     };
     assert!(config.validate().is_ok());
@@ -487,14 +489,15 @@ async fn gb_rl_16_pending_requests_stay_within_session_and_node_bounds() {
     let mut config = regulated_config(minimum_response_bytes());
     config.max_inflight_requests = 2;
     let cost = serving_cost(&config, 1).expect("test request cost is valid");
+    config.get_blocks_serving_regulation.node_pending_requests = 4;
     config.get_blocks_serving_regulation.node_outstanding_bytes = cost.response_cap;
 
     let max_connections = 2;
     let mut harness = ServingHarness::new(config, 16, max_connections);
     let peer_a = peer(0x16);
     let peer_b = peer(0x17);
-    let remote_a = harness.connect_ready(peer_a.clone(), 16).await;
-    let remote_b = harness.connect_ready(peer_b, 17).await;
+    let mut remote_a = harness.connect_ready(peer_a.clone(), 16).await;
+    let mut remote_b = harness.connect_ready(peer_b, 17).await;
 
     remote_a
         .try_send(BlockSyncMessage::GetBlocks {
@@ -525,7 +528,7 @@ async fn gb_rl_16_pending_requests_stay_within_session_and_node_bounds() {
     let snapshot = harness.handle.serving_regulation_snapshot();
     assert_eq!(snapshot.session_pending_input_capacity, 3);
     assert_eq!(snapshot.max_session_pending_inputs, 3);
-    assert_eq!(snapshot.pending_input_capacity, 3 * max_connections);
+    assert_eq!(snapshot.pending_input_capacity, 4);
     assert_eq!(snapshot.pending_inputs, snapshot.pending_input_capacity);
     assert_eq!(
         snapshot.aggregate_session_pending_inputs, snapshot.pending_inputs,
@@ -535,6 +538,16 @@ async fn gb_rl_16_pending_requests_stay_within_session_and_node_bounds() {
         harness.actions.try_recv().is_err(),
         "pending or excess requests must not reach the state driver"
     );
+    for remote in [&mut remote_a, &mut remote_b] {
+        assert!(
+            remote
+                .recv_timeout(Duration::from_nanos(1))
+                .await
+                .expect("the bounded peer stream stays readable")
+                .is_none(),
+            "pending-input exhaustion must not send a protocol response"
+        );
+    }
 
     remote_a.cancel();
     remote_b.cancel();
@@ -1154,6 +1167,7 @@ struct GeneratedRegulatedLoadCase {
     peer_backlog_slots: u64,
     node_rate_slots: u64,
     node_outstanding_slots: u64,
+    node_pending_windows: u32,
     refill_divisor: u64,
     operations: Vec<GeneratedLoadOperation>,
 }
@@ -1197,6 +1211,7 @@ fn regulated_load_case_strategy() -> impl Strategy<Value = GeneratedRegulatedLoa
         1u64..=3,
         1u64..=8,
         1u64..=8,
+        1u32..=3,
         1u64..=4,
         proptest::collection::vec(operation, 16..=64),
     )
@@ -1210,6 +1225,7 @@ fn regulated_load_case_strategy() -> impl Strategy<Value = GeneratedRegulatedLoa
                 peer_backlog_slots,
                 node_rate_slots,
                 node_outstanding_slots,
+                node_pending_windows,
                 refill_divisor,
                 mut operations,
             )| {
@@ -1239,6 +1255,7 @@ fn regulated_load_case_strategy() -> impl Strategy<Value = GeneratedRegulatedLoa
                     peer_backlog_slots,
                     node_rate_slots,
                     node_outstanding_slots,
+                    node_pending_windows,
                     refill_divisor,
                     operations: required,
                 }
@@ -1260,12 +1277,17 @@ fn replay_regulated_load_history(case: GeneratedRegulatedLoadCase) -> Result<(),
                 ..ZakuraBlockSyncConfig::default()
             };
             let largest = serving_cost(&config, 128).map_err(str::to_string)?;
+            let session_pending = config
+                .advertised_max_inflight_requests()
+                .checked_add(1)
+                .ok_or_else(|| "generated session pending-input limit overflowed".to_string())?;
             config.get_blocks_serving_regulation = GetBlocksServingRegulationConfig {
                 peer_rate_bytes_per_second: largest.charge / case.refill_divisor,
                 peer_rate_capacity_bytes: largest.charge * case.peer_rate_slots,
                 peer_backlog_bytes: largest.response_cap * case.peer_backlog_slots,
                 node_rate_bytes_per_second: largest.charge / case.refill_divisor,
                 node_rate_capacity_bytes: largest.charge * case.node_rate_slots,
+                node_pending_requests: session_pending * case.node_pending_windows,
                 node_outstanding_bytes: largest.response_cap * case.node_outstanding_slots,
             };
             if let Err(error) = super::super::super::serving_regulation::validate_config(&config) {
@@ -1409,8 +1431,7 @@ fn assert_generated_load_bounds(
     let regulation = &config.get_blocks_serving_regulation;
     let session_pending_capacity =
         pending_input_capacity_per_session(config).map_err(str::to_owned)?;
-    let node_pending_capacity =
-        pending_input_capacity(config, peer_ids.len()).map_err(str::to_owned)?;
+    let node_pending_capacity = pending_input_capacity(config).map_err(str::to_owned)?;
     if snapshot.node_rate_capacity != regulation.node_rate_capacity_bytes
         || snapshot.node_outstanding_capacity != regulation.node_outstanding_bytes
         || snapshot.session_pending_input_capacity != session_pending_capacity

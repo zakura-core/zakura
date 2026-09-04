@@ -104,6 +104,7 @@ async fn replay_serving_case_inner(case: &ServingCase) -> Result<ServingCoverage
         peer_backlog_bytes: u64::MAX,
         node_rate_bytes_per_second: 1,
         node_rate_capacity_bytes: u64::MAX,
+        node_pending_requests: u32::MAX,
         node_outstanding_bytes: u64::MAX,
     };
     let tip = (corpus.target_height(), corpus.tip_hash());

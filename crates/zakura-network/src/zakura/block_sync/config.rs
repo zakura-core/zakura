@@ -121,6 +121,7 @@ const DEFAULT_GET_BLOCKS_PEER_BACKLOG_BYTES: u64 = 64 * MIB;
 const DEFAULT_GET_BLOCKS_NODE_RATE_BYTES_PER_SECOND: u64 = 64 * MIB;
 const DEFAULT_GET_BLOCKS_NODE_RATE_CAPACITY_BYTES: u64 = 128 * MIB;
 const DEFAULT_GET_BLOCKS_NODE_OUTSTANDING_BYTES: u64 = 256 * MIB;
+const DEFAULT_GET_BLOCKS_NODE_PENDING_REQUESTS: u32 = DEFAULT_BS_MAX_INFLIGHT + 1;
 
 /// Default steady-state cwnd gain, percent of the bandwidth-delay product. 300% ramps a
 /// proven peer up as `1 → 3 → 9 …`; the reliability discount and delay-gradient ceiling
@@ -359,6 +360,10 @@ pub struct GetBlocksServingRegulationConfig {
     pub node_rate_bytes_per_second: u64,
     /// Aggregate node burst allowance.
     pub node_rate_capacity_bytes: u64,
+    /// Aggregate decoded requests retained before reactor processing.
+    ///
+    /// This explicit node bound does not grow with the connection limit.
+    pub node_pending_requests: u32,
     /// Aggregate admitted response bytes not yet handed to QUIC.
     pub node_outstanding_bytes: u64,
 }
@@ -371,6 +376,7 @@ impl Default for GetBlocksServingRegulationConfig {
             peer_backlog_bytes: DEFAULT_GET_BLOCKS_PEER_BACKLOG_BYTES,
             node_rate_bytes_per_second: DEFAULT_GET_BLOCKS_NODE_RATE_BYTES_PER_SECOND,
             node_rate_capacity_bytes: DEFAULT_GET_BLOCKS_NODE_RATE_CAPACITY_BYTES,
+            node_pending_requests: DEFAULT_GET_BLOCKS_NODE_PENDING_REQUESTS,
             node_outstanding_bytes: DEFAULT_GET_BLOCKS_NODE_OUTSTANDING_BYTES,
         }
     }

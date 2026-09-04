@@ -67,6 +67,9 @@ pub(super) fn validate_config(config: &ZakuraBlockSyncConfig) -> Result<(), &'st
             "get_blocks_serving_regulation.node_rate_bytes_per_second must be greater than zero",
         );
     }
+    if pending_input_capacity(config)? < pending_input_capacity_per_session(config)? {
+        return Err("get_blocks_serving_regulation.node_pending_requests must cover one session pending-input window");
+    }
 
     let largest = serving_cost(config, MAX_BS_BLOCKS_PER_REQUEST)?;
     if regulation.peer_rate_capacity_bytes < largest.charge {
@@ -97,14 +100,18 @@ pub(super) fn pending_input_capacity_per_session(
         .ok_or("GetBlocks per-session pending-input capacity overflowed")
 }
 
-/// Derive the node-wide decoded-request bound from the session and connection caps.
+/// Return the configured node-wide decoded-request bound.
 pub(super) fn pending_input_capacity(
     config: &ZakuraBlockSyncConfig,
-    max_connections: usize,
 ) -> Result<usize, &'static str> {
-    pending_input_capacity_per_session(config)?
-        .checked_mul(max_connections.max(1))
-        .ok_or("GetBlocks node pending-input capacity overflowed")
+    let capacity = usize::try_from(config.get_blocks_serving_regulation.node_pending_requests)
+        .map_err(|_| "GetBlocks node pending-input capacity does not fit usize")?;
+    if capacity > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(
+            "get_blocks_serving_regulation.node_pending_requests exceeds Tokio's semaphore limit",
+        );
+    }
+    Ok(capacity)
 }
 
 /// Node-owned serving resources and reconnect-persistent peer rate buckets.
@@ -233,8 +240,8 @@ impl GetBlocksServingRegulator {
         let regulation = &config.get_blocks_serving_regulation;
         let session_pending_capacity = pending_input_capacity_per_session(&config)
             .expect("the clamped GetBlocks in-flight limit fits supported targets");
-        let node_pending_capacity = pending_input_capacity(&config, max_connections)
-            .expect("the configured connection and GetBlocks limits have a representable product");
+        let node_pending_capacity = pending_input_capacity(&config)
+            .expect("the validated GetBlocks node pending-input limit fits supported targets");
         Self {
             inner: Arc::new(RegulatorInner {
                 node_rate: ByteRateBucket::new(
@@ -243,7 +250,7 @@ impl GetBlocksServingRegulator {
                 ),
                 node_outstanding: OutstandingByteBudget::new(regulation.node_outstanding_bytes),
                 pending_inputs: PendingInputBudget::new(node_pending_capacity)
-                    .expect("the configured connection and GetBlocks limits fit Tokio's semaphore"),
+                    .expect("the validated GetBlocks pending-input limit fits Tokio's semaphore"),
                 session_pending_capacity,
                 config,
                 peer_rates: StdMutex::new(HashMap::new()),
@@ -1068,11 +1075,13 @@ mod tests {
         #[test]
         fn gb_rl_12_supported_configuration_covers_largest_request(
             local_count_limit in any::<u32>(),
+            local_inflight_limit in any::<u32>(),
             response_byte_limit in u32::try_from(block::MAX_BLOCK_BYTES)
                 .expect("maximum block bytes fit u32")..=MAX_BS_RESPONSE_BYTES,
         ) {
             let mut config = ZakuraBlockSyncConfig {
                 max_blocks_per_response: local_count_limit,
+                max_inflight_requests: local_inflight_limit,
                 max_response_bytes: response_byte_limit,
                 ..ZakuraBlockSyncConfig::default()
             };
@@ -1085,7 +1094,15 @@ mod tests {
             config.get_blocks_serving_regulation.node_rate_capacity_bytes = charge;
             config.get_blocks_serving_regulation.peer_backlog_bytes = response_cap;
             config.get_blocks_serving_regulation.node_outstanding_bytes = response_cap;
+            config.get_blocks_serving_regulation.node_pending_requests = config
+                .advertised_max_inflight_requests()
+                .saturating_add(1);
             prop_assert!(validate_config(&config).is_ok());
+
+            let mut invalid = config.clone();
+            invalid.get_blocks_serving_regulation.node_pending_requests =
+                config.advertised_max_inflight_requests();
+            prop_assert!(validate_config(&invalid).is_err());
 
             let mut invalid = config.clone();
             invalid.get_blocks_serving_regulation.peer_rate_bytes_per_second = 0;

@@ -331,9 +331,10 @@ mod tests {
             hash: transaction::Hash([0x50; 32]),
             index: 0,
         };
-        let provider_hash = block::Hash([1; 32]);
-        let unknown_hash = block::Hash([2; 32]);
-        let utxo = transparent::Utxo::new(
+        let first_hash = block::Hash([1; 32]);
+        let second_hash = block::Hash([2; 32]);
+        let unknown_hash = block::Hash([3; 32]);
+        let first_utxo = transparent::Utxo::new(
             transparent::Output {
                 value: Amount::zero(),
                 lock_script: transparent::Script::new(&[]),
@@ -341,13 +342,32 @@ mod tests {
             block::Height(1),
             false,
         );
+        let second_utxo =
+            transparent::Utxo::new(first_utxo.output.clone(), block::Height(2), false);
         let mut cache = UtxoProviderCache::default();
-        cache.insert(provider_hash, existing_outpoint, utxo.clone());
+        cache.insert(first_hash, existing_outpoint, first_utxo.clone());
 
         cache.remove_provider(&unknown_hash, &existing_outpoint);
-        cache.remove_provider(&provider_hash, &unknown_outpoint);
+        cache.remove_provider(&first_hash, &unknown_outpoint);
 
-        assert_eq!(cache.get(&existing_outpoint), Some(&utxo));
+        assert_eq!(cache.get(&existing_outpoint), Some(&first_utxo));
         assert!(cache.get(&unknown_outpoint).is_none());
+
+        cache.insert(second_hash, existing_outpoint, second_utxo.clone());
+        cache.remove_provider(&unknown_hash, &existing_outpoint);
+
+        let Some(UtxoProviders::Multiple(providers)) =
+            cache.providers_by_outpoint.get(&existing_outpoint)
+        else {
+            panic!("removing an unknown provider leaves both existing UTXO providers unchanged");
+        };
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers.get(&first_hash), Some(&first_utxo));
+        assert_eq!(providers.get(&second_hash), Some(&second_utxo));
+
+        cache.remove_provider(&first_hash, &existing_outpoint);
+        assert_eq!(cache.get(&existing_outpoint), Some(&second_utxo));
+        cache.remove_provider(&second_hash, &existing_outpoint);
+        assert!(cache.is_empty());
     }
 }

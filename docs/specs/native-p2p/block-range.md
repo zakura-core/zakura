@@ -403,6 +403,10 @@ The first implementation deliberately leaves these policies separate:
 - Universal fair-admission latency requires an explicit fair scheduler. The
   initial native case gates on the existing request timeout and reports
   observed admission order.
+- Versioned scenario replay is deferred. Seeds reproduce cases only on the
+  same revision and generator, so important failures must become focused
+  regressions. Before claiming replay across generator or backend changes, add
+  schema-versioned scenarios, direct replay, and repeat-run comparison.
 - A successor stream version may add a wire request ID and block hashes to make
   response ownership explicit.
 

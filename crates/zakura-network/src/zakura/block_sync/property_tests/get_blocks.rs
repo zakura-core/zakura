@@ -499,6 +499,7 @@ proptest! {
     fn gb_wf_16_blocks_done_uses_canonical_nine_byte_layout(
         start_height in any::<u32>(),
         returned in any::<u32>(),
+        arbitrary_bytes in any::<[u8; TERMINAL_PAYLOAD_BYTES]>(),
     ) {
         let payload = terminal_payload(BLOCKS_DONE_TYPE, start_height, returned);
         let valid = start_height <= GET_BLOCKS_MAX_HEIGHT
@@ -519,13 +520,31 @@ proptest! {
         let mut trailing = payload.to_vec();
         trailing.push(0);
         prop_assert!(BlockSyncMessage::decode(&trailing).is_err());
-        prop_assert!(BlockSyncMessage::decode(&payload[..payload.len() - 1]).is_err());
+
+        for payload_len in 0..=TERMINAL_PAYLOAD_BYTES {
+            let mut bounded_payload = arbitrary_bytes[..payload_len].to_vec();
+            if let Some(discriminator) = bounded_payload.first_mut() {
+                *discriminator = BLOCKS_DONE_TYPE;
+            }
+            match BlockSyncMessage::decode(&bounded_payload) {
+                Ok(message @ BlockSyncMessage::BlocksDone { .. }) => {
+                    prop_assert_eq!(payload_len, TERMINAL_PAYLOAD_BYTES);
+                    prop_assert_eq!(
+                        message.encode().expect("accepted terminal response re-encodes"),
+                        bounded_payload,
+                    );
+                }
+                Ok(message) => prop_assert!(false, "decoded wrong message: {message:?}"),
+                Err(_) => {}
+            }
+        }
     }
 
     #[test]
     fn gb_wf_18_range_unavailable_uses_canonical_nine_byte_layout(
         start_height in any::<u32>(),
         count in any::<u32>(),
+        arbitrary_bytes in any::<[u8; TERMINAL_PAYLOAD_BYTES]>(),
     ) {
         let payload = terminal_payload(RANGE_UNAVAILABLE_TYPE, start_height, count);
         let valid = start_height <= GET_BLOCKS_MAX_HEIGHT
@@ -546,7 +565,24 @@ proptest! {
         let mut trailing = payload.to_vec();
         trailing.push(0);
         prop_assert!(BlockSyncMessage::decode(&trailing).is_err());
-        prop_assert!(BlockSyncMessage::decode(&payload[..payload.len() - 1]).is_err());
+
+        for payload_len in 0..=TERMINAL_PAYLOAD_BYTES {
+            let mut bounded_payload = arbitrary_bytes[..payload_len].to_vec();
+            if let Some(discriminator) = bounded_payload.first_mut() {
+                *discriminator = RANGE_UNAVAILABLE_TYPE;
+            }
+            match BlockSyncMessage::decode(&bounded_payload) {
+                Ok(message @ BlockSyncMessage::RangeUnavailable { .. }) => {
+                    prop_assert_eq!(payload_len, TERMINAL_PAYLOAD_BYTES);
+                    prop_assert_eq!(
+                        message.encode().expect("accepted terminal response re-encodes"),
+                        bounded_payload,
+                    );
+                }
+                Ok(message) => prop_assert!(false, "decoded wrong message: {message:?}"),
+                Err(_) => {}
+            }
+        }
     }
 }
 

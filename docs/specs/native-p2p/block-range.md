@@ -109,7 +109,7 @@ Input classes identify who can create each event:
 | GB-SM-03 | `gb_sm_03_missing_status_is_rejected_as_spam` | Peer | A peer without retained valid `Status` cannot start a request; the attempt is recorded as `GetBlocksSpam`. |
 | GB-SM-04 | `gb_sm_04_peer_ledgers_are_independent_and_bounded` | All | Each peer has an independent committed-request ledger bounded by the configured local in-flight cap. |
 | GB-SM-05 | `gb_sm_05_saturated_ledger_rejects_without_state_query` | Peer | A request rejected by the full committed-request ledger emits no state query and receives `RangeUnavailable` echoing its original wire count while output capacity is available. |
-| GB-SM-06 | `gb_sm_06_above_tip_request_is_unavailable_without_state_query` | Peer | A request starting above the servable tip emits no state query and receives `RangeUnavailable` echoing its original wire count. |
+| GB-SM-06 | `gb_sm_06_above_tip_request_is_unavailable_without_state_query` | Peer | A request starting above the servable tip emits no state query. While output capacity is available, the peer receives `RangeUnavailable` echoing its original wire count. |
 | GB-SM-07 | `gb_sm_07_accepted_query_count_respects_all_bounds` | Peer | An accepted query count is clamped by the wire count, local count limit, representable heights, and available range. |
 | GB-SM-08 | `gb_sm_08_request_ids_are_nonzero_and_unique` | Driver | Request identities are nonzero and are not reused during one replay. |
 | GB-SM-09 | `gb_sm_09_ready_response_sends_largest_valid_prefix_and_one_terminal` | Driver | While the output path remains available, a matching ready response sends the largest contiguous prefix within the byte cap followed by exactly one appropriate terminal frame; output failure follows the regulated-load failure policy. |
@@ -121,7 +121,7 @@ Input classes identify who can create each event:
 | GB-SM-15 | `gb_sm_15_delayed_older_connect_cannot_replace_newer_session` | Peer | A delayed older `PeerConnected` event cannot replace a newer reactor session for the same peer. |
 | GB-SM-16 | `gb_sm_16_peer_frames_wait_for_reactor_admission` | Peer | A peer routine does not process frames until the reactor admits or rejects its session. |
 | GB-SM-17 | `gb_sm_17_superseded_routine_request_cannot_reach_replacement_session` | Peer | A request decoded by a superseded routine produces no state query, reply, or misbehavior record for its replacement session. |
-| GB-SM-18 | `gb_sm_18_live_unavailable_completion_sends_terminal_and_releases_slot` | Driver | A matching zero-result state completion sends `RangeUnavailable` echoing the original wire count, retires the request, and releases its slot. |
+| GB-SM-18 | `gb_sm_18_live_unavailable_completion_sends_terminal_and_releases_slot` | Driver | A matching zero-result state completion retires the request and releases its slot. While output capacity is available, it also sends `RangeUnavailable` echoing the original wire count. |
 | GB-SM-19 | `gb_sm_19_inbound_sessions_serve_and_use_inbound_cap` | Peer | Inbound sessions serve `GetBlocks` through the same path and use the inbound peer cap independently of the outbound cap. |
 
 Serving `Status` survives an overlapping replacement for the same authenticated
@@ -163,17 +163,23 @@ and prints the effective values for rerunning the unchanged generator.
 
 ## Regulated load contract
 
-The request owns admission and response accounting for the exchange. For
-request count `C`:
+This layer defines what GetBlocks regulation must protect. It deliberately does
+not choose production limits or prescribe a benchmark schedule. The
+implementation records those values and the measurements used to validate
+them.
+
+For request count `C`, the maximum charge is:
 
 ```text
 N            = min(C, local GetBlocks count limit)
 response_cap = 9 + N + min(N × MAX_BLOCK_BYTES, local response-byte limit)
-charge       = response_cap + 64 KiB
+charge       = response_cap + local request-overhead charge
 ```
 
 The nine bytes cover the terminal response. `N` covers one discriminator byte
-per `Block` payload. The remaining term covers encoded block bodies.
+per `Block` payload. The remaining term covers encoded block bodies, and the
+request-overhead term bounds request-processing work. The implementation must
+justify its chosen value.
 
 The state query receives the local response-body byte limit and returns only
 the largest contiguous prefix whose encoded block sizes fit that limit. It must
@@ -182,89 +188,25 @@ and truncating them afterward does not satisfy this contract. Inspecting the
 next candidate may temporarily materialize one additional block, bounded by
 `MAX_BLOCK_BYTES`, but that block must not remain in the returned result.
 
-The local response-body byte limit must be at least `MAX_BLOCK_BYTES`, so every
-valid block can be served by itself. This is a local configuration requirement,
-not a stricter wire range for limits advertised by a remote peer.
+Regulation applies independent peer and node rate limits, outstanding-work
+limits, per-session outbound backlog limits, and per-session and node pending
+request limits. These are separate from the serving ledger in GB-SM-04 because
+they bound different resources. Startup validation must reject configurations
+that cannot fit the largest legal request or one maximum-size block.
 
-The 64 KiB request overhead bounds ingress processing. After wire validation
-and the Status prerequisite, Zakura reserves that overhead from both rate
-buckets before retaining the decoded request. A request dropped at pending
-capacity spends the overhead; a retained request carries it provisionally
-until reactor commit. The remaining admission reserves the worst-case response
-capacity. Unused response capacity is refunded. Response bytes remain reserved
-until their frames are accepted by QUIC or dropped. QUIC may then retain them
-under both the per-connection window and the node-wide transport envelope
-below.
+An admission owns its charges until it is rejected, completed, cancelled, or
+its session ends. Committing binds that ownership to the originating session
+and request. Queued response bytes remain owned until the transport accepts or
+drops their frames. Every exit releases ownership exactly once, and a
+replacement session never inherits the preceding session's work. Reconnecting
+also must not provide an unbounded fresh peer-rate burst.
 
-### Initial parameters
-
-These are implementation candidates until native load evidence validates them:
-
-| Bound | Initial value | Scope |
-| --- | --- | --- |
-| Response-body limit | 32 MiB; minimum `MAX_BLOCK_BYTES` | One state query and response |
-| Peer rate | 16 MiB/s | One authenticated identity |
-| Peer rate capacity | 32 MiB response cap + 128 discriminators + 9 terminal bytes + 64 KiB overhead | One authenticated identity, retained while depleted |
-| Inactive identity buckets | Configured maximum connection count | Depleted peer-rate buckets without an active session or permit |
-| Peer backlog | 64 MiB | One session's reserved and application-owned response bytes |
-| Node rate | 64 MiB/s | All inbound `GetBlocks` serving |
-| Node rate capacity | 128 MiB | All inbound `GetBlocks` serving |
-| Node outstanding | 256 MiB | Admitted response bytes not yet handed to QUIC |
-| Session pending inputs | Advertised in-flight limit + 1 | Decoded requests waiting before reactor processing in one session |
-| Node pending inputs | 32,001 requests | Decoded requests waiting before reactor processing across live and draining sessions |
-| State-query deadline | Existing block-sync `request_timeout`, default 8 seconds | One committed serving query |
-| QUIC send window | At most 32 MiB and no more than node QUIC envelope / configured connections | One connection |
-| Node QUIC envelope | 512 MiB | Sum of send windows at the configured connection limit |
-| Stopped-reader recovery deadline | 12 seconds: 10-second transport write timeout + 2-second scheduling slack | Honest request admission after saturation |
-
-Startup validation requires the largest legal request to fit every applicable
-byte capacity and the node pending-input capacity to fit one configured session
-window. Rate balances refill with time; outstanding and backlog capacity return
-only when ownership is released.
-
-A depleted peer-rate bucket survives reconnects under its authenticated
-identity. An inactive bucket remains cached until it refills, for at most
-`ceil(deficit / peer rate)` seconds, unless the inactive cache reaches the
-configured maximum connection count. The cache then evicts the inactive bucket
-with the smallest deficit. It never evicts an active or permit-referenced
-bucket. One eviction can restore at most that bucket's deficit, which is no
-greater than the peer-rate capacity; the node-rate bucket still bounds
-aggregate work across identities.
-
-One admission may wait while the routine continues decoding the bidirectional
-stream so responses to Zakura's own block requests can pass. Each session may
-retain one admission plus its advertised in-flight count behind it. The node
-has a separate configured capacity that does not grow with the connection
-limit; the initial value fits one complete default session window. A request
-beyond either capacity spends its fixed ingress overhead, then is dropped
-without a query, response, or peer score. If the ingress rate charge itself is
-unavailable, the routine holds only that decoded request and stops reading
-until the charge fits or the session ends. This bounds sustained processing
-without allowing later requests to bypass the rate buckets. The short ingress
-wait remains subject to the full-duplex progress rule in GB-RL-11.
-
-This is separate from the committed-request ledger: once admitted, a request
-rejected by that full ledger follows GB-SM-05.
-
-### Failure outcomes
-
-| Failure point | Required outcome |
-| --- | --- |
-| Routine-to-reactor handoff is full | Keep the provisional attempt and wait for that channel only. |
-| Handoff closes or the session ends before commit | Roll back the attempt and end that admission with no query, response, or peer score. |
-| State-action channel is full or closed after commit | Retire the ledger entry and queue `RangeUnavailable` with the original wire count if output remains available, with no peer score. |
-| State driver fails, returns the wrong response, or does not complete by the configured block-sync `request_timeout` after ledger commit | Retire the ledger entry and queue `RangeUnavailable` with the original wire count if output remains available, with no peer score. |
-| Output queue is full after commit | Drop the unsent response or terminal frame, settle its permit exactly once, keep the session connected, and assign no peer score. Existing frame leases remain until transport releases them. No terminal frame is required while the queue is full. |
-| Output queue is closed or otherwise fails after commit | End the affected session without a peer score and settle its permit exactly once. If the session remains registered when the failure is observed, cancel it. Existing frame leases remain until transport releases them. No terminal frame is required when its output path is unavailable. |
-
-### Observability
-
-Regulation trace rows identify `block_sync` and `get_blocks`, the peer and
-session when known, and one closed-set bound or terminal-reason label. Delayed
-and pending-cap rows report the requested or spent units. Settlement rows
-report reserved, transferred, used, and refunded bytes plus the request ID when
-allocated. Peer and session identifiers appear only in traces; metric labels
-use the bounded reason and resource enums.
+Invalid requests and requests without the Status prerequisite are rejected
+before regulation. When a valid request cannot be admitted, retained pending
+work remains bounded and no state query begins. Local congestion or failure is
+not peer misbehavior. If output remains available, a committed request that
+cannot finish may receive `RangeUnavailable`; otherwise its response may be
+dropped while its accounting is still settled.
 
 ### Requirements
 
@@ -277,38 +219,27 @@ use the bounded reason and resource enums.
 | GB-RL-05 | One peer cannot consume another peer's rate bucket, backlog, or request ledger. |
 | GB-RL-06 | Reserved and application-owned unwritten response bytes never exceed the peer backlog; draining resumes admission. |
 | GB-RL-07 | Time refills rate tokens but never outstanding-byte capacity. |
-| GB-RL-08 | Handoff, action, driver, and output failures follow the failure-outcome table and settle each attempt or permit exactly once. |
+| GB-RL-08 | Handoff, action, driver, and output failures settle each attempt or permit exactly once and never blame the peer for local failure. |
 | GB-RL-09 | Session end settles permits without moving them to a replacement; frame leases survive until their frames leave the application transport. |
 | GB-RL-10a | Generated hostile histories vary peer count and every configured bound without exceeding peer or node accounting. |
-| GB-RL-10b | Fifteen reading flood peers do not push an honest tiny- or full-block response beyond the existing eight-second request timeout in the named native topology. |
-| GB-RL-10c | Stopped readers remain within the application budgets and per-connection QUIC windows; the sum of configured windows fits the node QUIC envelope; the combined application and QUIC envelope is reported; writes release every lease after failure or timeout; and honest admission recovers within the 12-second deadline above. |
+| GB-RL-10b | A named native reading-flood workload preserves useful service for an honest peer within the declared local deadline. |
+| GB-RL-10c | A named native stopped-reader workload stays within the declared application and transport envelopes, releases ownership after failure or timeout, and restores honest service. |
 | GB-RL-11 | Responses to Zakura's downloads continue within the request timeout behind admission-delayed serving requests on the same stream. |
 | GB-RL-12 | Supported configurations use checked arithmetic, fit the largest legal request, one maximum-size block, and one session's pending-input window, and reject insufficient limits or capacities. |
 | GB-RL-13 | The frozen reference model and focused scenarios first pass against the unregulated production path. With every regulation bound made nonbinding, the regulated path then produces the same queries, frames, and ownership state without changing the model transitions or expected observations. |
-| GB-RL-14 | Reconnects retain a depleted identity bucket; the inactive cache follows the capacity, retention, and smallest-deficit eviction policy above; active and permit-referenced buckets survive churn; and one eviction restores no more than the evicted deficit. |
+| GB-RL-14 | Reconnects do not reset depleted peer-rate state, and retention of inactive peer state remains bounded. |
 | GB-RL-15 | Rejecting a superseded routine at the session gate rolls back all provisional regulation ownership. |
 | GB-RL-16 | Pending serving-request state stays within its per-session bound and an independently configured node-wide count; exhausting either bound drops the excess request with no work, response, or peer score. |
 | GB-RL-17 | The state query receives the local response-body byte limit and never returns block bodies whose total encoded size exceeds it. |
 | GB-RL-18 | A panic while holding a provisional attempt, committed permit, or frame lease releases that ownership, records no peer violation, and leaves unrelated peer admission usable. |
-| GB-RL-19 | Every decoded request that reaches pending-input admission first reserves the fixed request overhead from both rate buckets. A pending-cap drop spends that overhead, and an unavailable ingress charge leaves at most one decoded request waiting, so repeated drops cannot bypass peer or node rate limits. |
-| GB-RL-20 | A state query that has not completed by the configured block-sync `request_timeout`, measured from ledger commit, is retired at that deadline, releases its slot and permit, and queues `RangeUnavailable` with the original wire count when output remains available. |
-| GB-RL-21 | Delays, pending-cap drops, rejections, disconnect cleanup, and local-fault settlements expose the service, exchange, peer and session when known, responsible bound or terminal reason, and applicable reserved, transferred, used, and refunded units. Metrics use only closed-set labels and never peer or session identity. |
-| GB-RL-22 | Frame and canonical-value validation plus the valid-Status prerequisite complete before any peer or node regulation ownership is acquired. A malformed request or request without retained Status leaves every regulation balance unchanged. |
+| GB-RL-19 | Frame and canonical-value validation plus the valid-Status prerequisite complete before any peer or node regulation ownership is acquired. A malformed request or request without retained Status leaves every regulation balance unchanged. |
 
 The fast lane uses small capacities to reach every boundary deterministically.
-The native lane uses real stream-6 frames, the production peer routine and
-reactor, a controlled state driver, the ordered transport worker, and loopback
-QUIC.
-
-The first native topology uses:
-
-- fifteen reading flood peers plus one honest peer for GB-RL-10b;
-- nine stopped readers plus one honest peer for GB-RL-10c; and
-- three stopped readers plus one full-duplex peer for GB-RL-11.
-
-These are reproducible experiments, not network-wide proofs. CPU, RSS, UDP
-traffic, and throughput are diagnostics. The request timeout, write timeout,
-application budgets, and configured QUIC envelope are contract gates.
+The native lane uses real stream-6 frames and loopback QUIC to check that
+declared limits protect an honest peer under reading floods, stopped readers,
+and same-stream full-duplex traffic. The implementation PR owns the concrete
+limits, workloads, deadlines, and measurements. Those experiments provide
+local evidence, not network-wide performance guarantees.
 
 ## Draft response-receiving model
 
@@ -409,30 +340,10 @@ The first implementation deliberately leaves these policies separate:
 
 ## Implementation evidence
 
-### Shared regulation coverage
-
-The serving exchange maps the shared regulation requirements as follows. A
-mapping names the message-specific evidence that must exist before this layer
-can be marked implemented.
-
-| Shared ID | GetBlocks evidence |
-| --- | --- |
-| P2P-RG-01 | The catalog plus GB-WF-01 through GB-WF-19, GB-SM-09, and GB-RL-01 close the serving request and its response kinds. |
-| P2P-RG-02 | GB-WF-01 through GB-WF-06, GB-SM-03, GB-SM-05, GB-SM-06, GB-RL-02, and GB-RL-08 cover declared outcomes and sender obligations. |
-| P2P-RG-03 | GB-WF-01 through GB-WF-10, GB-SM-03, GB-RL-15, and GB-RL-22 enforce the processing order. |
-| P2P-RG-04 | GB-SM-03, GB-SM-06, GB-SM-10, GB-SM-12, GB-SM-17, and GB-SM-18 distinguish invalid, stale, and unavailable work. |
-| P2P-RG-05 | GB-WF-01, GB-WF-02, GB-WF-09, GB-WF-10, GB-WF-15, GB-WF-17, and GB-WF-19 cover allocation caps. |
-| P2P-RG-06 | GB-WF-11 covers partial-frame state and the read deadline. |
-| P2P-RG-07 | GB-WF-01 through GB-WF-08, GB-WF-10, GB-WF-12 through GB-WF-14, GB-WF-16, and GB-WF-18 cover total and canonical decoding. |
-| P2P-RG-08 | GB-RL-01, GB-RL-12, and GB-RL-17 cover checked charges and bounded state results. |
-| P2P-RG-09 | GB-SM-04, GB-SM-13, GB-RL-05 through GB-RL-07, GB-RL-10a through GB-RL-10c, GB-RL-12, GB-RL-16, and GB-RL-19 cover peer and node bounds. |
-| P2P-RG-10 | GB-SM-08 through GB-SM-12, GB-SM-14, GB-SM-17, GB-SM-18, GB-RL-03, GB-RL-04, GB-RL-08, GB-RL-09, GB-RL-15, and GB-RL-20 cover ownership and settlement. |
-| P2P-RG-11 | GB-RL-06, GB-RL-08 through GB-RL-10c, and GB-RL-12 cover application and transport buffering. |
-| P2P-RG-12 | GB-RL-02, GB-RL-08, GB-RL-11, GB-RL-16, GB-RL-19, and GB-RL-20 cover waiting, pending input, and overload. |
-| P2P-RG-13 | Not applicable to serving responses. The receiving direction remains draft below. |
-| P2P-RG-14 | Not applicable because `GetBlocks` is a request, not an announcement. |
-| P2P-RG-15 | GB-RL-05 and GB-RL-14 cover session- and identity-owned state. |
-| P2P-RG-16 | GB-RL-08, the native GB-RL-10 cases, GB-RL-18, and GB-RL-21 cover local faults, panic cleanup, isolation, and bounded evidence. |
+The GetBlocks properties above specialize the shared requirements in
+[the regulation specification](regulation.md). The implementation's
+machine-checked test manifest is the authoritative mapping from requirement IDs
+to tests.
 
 ## Peer reachability evidence
 

@@ -8780,7 +8780,7 @@ mod tests {
         let _guard = zakura_test::init();
         let server = LocalEndpointFactory::new().endpoint(server_seed).await?;
         let (connection_tx, _connection_rx) = mpsc::channel(1);
-        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(2);
         let router = Router::builder(server)
             .accept(
                 alpn,
@@ -8829,6 +8829,50 @@ mod tests {
         .await;
         assert!(matches!(
             rejected,
+            Err(ZakuraHandlerError::OversizeFrame {
+                payload_len,
+                max_frame_bytes,
+                ..
+            }) if payload_len == usize::try_from(oversized_payload).expect("u32 fits usize")
+                && max_frame_bytes == FRAME_HEADER_BYTES + payload_cap
+        ));
+
+        let (mut mismatched_send, _mismatched_recv) =
+            timeout(Duration::from_secs(1), connection.open_bi())
+                .await
+                .expect("client opens the mismatched block-sync stream")?;
+        let mut mismatched_prefix = Vec::with_capacity(FRAME_HEADER_BYTES + 1);
+        mismatched_prefix.extend_from_slice(&u16::from(crate::zakura::MSG_BS_STATUS).to_le_bytes());
+        mismatched_prefix.extend_from_slice(&0u16.to_le_bytes());
+        mismatched_prefix.extend_from_slice(&oversized_payload.to_le_bytes());
+        mismatched_prefix.push(message_type);
+        timeout(
+            Duration::from_secs(1),
+            mismatched_send.write_all(&mismatched_prefix),
+        )
+        .await
+        .expect("client writes the mismatched block-sync prefix")?;
+
+        let (_server_send, mut mismatched_server_recv) =
+            timeout(Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("server accepts the mismatched block-sync stream")
+                .expect("capture handler forwards the mismatched block-sync stream");
+        let mismatched_rejection = timeout(
+            Duration::from_secs(1),
+            read_service_frame(
+                &mut mismatched_server_recv,
+                ZAKURA_STREAM_BLOCK_SYNC,
+                ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                MAX_BS_FRAME_BYTES,
+                Duration::from_secs(2),
+                Some(Duration::from_secs(2)),
+            ),
+        )
+        .await
+        .expect("the response discriminator rejects before its declared remainder is read");
+        assert!(matches!(
+            mismatched_rejection,
             Err(ZakuraHandlerError::OversizeFrame {
                 payload_len,
                 max_frame_bytes,

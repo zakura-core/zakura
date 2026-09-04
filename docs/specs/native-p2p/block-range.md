@@ -314,10 +314,18 @@ application budgets, and configured QUIC envelope are contract gates.
 > preserves only the unfinished reservation and state rules for responses
 > Zakura receives.
 
-The requester must not send overlapping live ranges on one connection. The
-original proposal treated an overlapping request as a protocol violation so
-each response could match one range despite version 2 having no wire request
-ID. That policy remains deferred until the receiving-side contract is written.
+When Zakura is the requester, it must not send overlapping live ranges on one
+connection. Its receiver otherwise cannot assign an incoming `Block` to
+exactly one range because version 2 has no wire request ID. This outbound
+scheduler obligation remains deferred until the receiving-side contract is
+written.
+
+The restriction does not make overlapping requests from a peer ambiguous to
+Zakura's serving path. Each inbound request has a distinct reactor request ID,
+ledger entry, and regulation permit. The first serving implementation may
+therefore process two bounded overlapping peer requests independently; the
+peer is responsible for matching the responses it requested. Detecting or
+rejecting peer overlap is not a serving safety requirement.
 
 ### `Block` — Response, discriminator 3
 
@@ -381,7 +389,9 @@ The first implementation deliberately leaves these policies separate:
 - The full block-sync `Status` contract, including cadence policy, remains
   separate. This contract defines only the prerequisite used by GetBlocks
   serving.
-- Overlapping outbound range reservations remain receiving-side work.
+- Preventing overlapping ranges sent by Zakura remains receiving-side work.
+  Overlapping requests received from a peer stay independently owned and
+  bounded by the serving ledger and regulation limits.
 - Exceeding the serving ledger is rejected rather than treated as a
   disconnect-worthy peer violation.
 - Universal fair-admission latency requires an explicit fair scheduler. The

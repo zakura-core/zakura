@@ -192,6 +192,10 @@ Startup validation MUST ensure the largest legal request fits every applicable
 rate capacity, outstanding budget, and backlog. A legal request MUST NOT wait
 forever because it can never fit a configured bound.
 
+When an exchange promises at least one response item, its local response limit
+MUST fit the largest legal item unless the exchange defines another bounded
+outcome that guarantees progress.
+
 ## Ownership and settlement
 
 **P2P-RG-10 — Accounting has one session-gated ownership chain.**

@@ -167,6 +167,10 @@ and truncating them afterward does not satisfy this contract. Inspecting the
 next candidate may temporarily materialize one additional block, bounded by
 `MAX_BLOCK_BYTES`, but that block must not remain in the returned result.
 
+The local response-body byte limit must be at least `MAX_BLOCK_BYTES`, so every
+valid block can be served by itself. This is a local configuration requirement,
+not a stricter wire range for limits advertised by a remote peer.
+
 Admission reserves the worst case. The 64 KiB request overhead remains spent
 after commit. Unused response capacity is refunded. Response bytes remain
 reserved until their frames are accepted by QUIC or dropped. QUIC may then
@@ -179,6 +183,7 @@ These are implementation candidates until native load evidence validates them:
 
 | Bound | Initial value | Scope |
 | --- | --- | --- |
+| Response-body limit | 32 MiB; minimum `MAX_BLOCK_BYTES` | One state query and response |
 | Peer rate | 16 MiB/s | One authenticated identity |
 | Peer rate capacity | 32 MiB response cap + 128 discriminators + 9 terminal bytes + 64 KiB overhead | One authenticated identity, retained while depleted |
 | Peer backlog | 64 MiB | One session's reserved and application-owned response bytes |
@@ -229,7 +234,7 @@ maximum connection count.
 | GB-RL-10b | Fifteen reading flood peers do not push an honest tiny- or full-block response beyond the existing eight-second request timeout in the named native topology. |
 | GB-RL-10c | Stopped readers remain within the application budgets and per-connection QUIC windows; the sum of configured windows fits the node QUIC envelope; the combined application and QUIC envelope is reported; writes release every lease after failure or timeout; and honest service recovers within the write timeout plus stated slack. |
 | GB-RL-11 | Responses to Zakura's downloads continue within the request timeout behind admission-delayed serving requests on the same stream. |
-| GB-RL-12 | Supported configurations use checked arithmetic, fit the largest legal request, and reject insufficient capacities. |
+| GB-RL-12 | Supported configurations use checked arithmetic, fit the largest legal request and one maximum-size block, and reject insufficient response limits or capacities. |
 | GB-RL-13 | Under-budget histories produce the same queries, frames, and ownership state as the unregulated serving reference model. |
 | GB-RL-14 | Reconnects retain a depleted identity bucket; inactive retention is bounded and early eviction restores no more than the evicted deficit. |
 | GB-RL-15 | Rejecting a superseded routine at the session gate rolls back all provisional regulation ownership. |

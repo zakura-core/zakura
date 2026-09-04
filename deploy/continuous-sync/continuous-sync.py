@@ -602,10 +602,11 @@ def failure_text(config: Config, run_state: dict[str, Any], reason: str) -> str:
     duration = format_duration(int(run_state["time_to_failure_seconds"]))
     height = run_state.get("height")
     height_text = str(height) if isinstance(height, int) else "unknown"
+    run_text = f" | run: {run_state['run_id']}" if run_state.get("run_id") else ""
     return (
         f":rotating_light: Zakura failed: {p.hostname} | {policy_mode(p)} | "
         f"{ssh_target(p)} | time to failure: {duration} | height: {height_text} | "
-        f"reason: {short_reason(reason)}"
+        f"reason: {short_reason(reason)}{run_text}"
     )
 
 

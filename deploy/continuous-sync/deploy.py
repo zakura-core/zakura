@@ -415,11 +415,12 @@ def cmd_resume(args: argparse.Namespace) -> int:
 class Problem(NamedTuple):
     """One node's audit failure.
 
-    `kind` is the throttle identity: it must stay byte-identical for as long as
+    `kind` is the failure category: it must stay byte-identical for as long as
     the same underlying failure persists, or every cycle looks like a brand-new
     problem and pages again. `detail` is the line posted to Slack and may embed
     volatile values -- free bytes, SSH stderr, an exception message -- that must
-    therefore stay out of `kind`.
+    therefore stay out of `kind`. `incident_id` distinguishes controller runs;
+    `delivered_at` is set only for a verified controller delivery receipt.
     """
 
     kind: str
@@ -454,8 +455,11 @@ def audit_problem(
             and 0 < receipt["sent_at"] <= now()
         ):
             delivered_at = receipt["sent_at"]
+        detail = f"controller halted: {failure}"
+        if run_id:
+            detail += f" (run {run_id})"
         return Problem(
-            f"controller-halted:{failure}", f"controller halted: {failure}",
+            f"controller-halted:{failure}", detail,
             incident_id, delivered_at,
         )
     if not data.get("service_active") and state.get("phase") == "syncing":
@@ -585,10 +589,10 @@ def audit_transitions(
 ) -> tuple[list[str], list[str], list[str], dict[str, Any]]:
     """Split current problems into new/reminder/recovered lines.
 
-    A problem alerts immediately the first time it is seen, and again only once
-    `reminder_interval` has elapsed, so a node that stays broken reminds on a slow
-    cadence instead of re-paging every audit cycle. Continuity is judged on
-    `Problem.kind`, never on the rendered detail, which changes between samples.
+    New problems alert unless a matching controller receipt already accounts for
+    that first delivery. Changed categories or runs still alert. Unchanged
+    problems remind only when due; volatile message detail does not define the
+    incident. The caller persists the returned state only after successful delivery.
     """
     prior = previous.get("problems", {})
     new_lines: list[str] = []

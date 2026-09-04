@@ -1128,6 +1128,7 @@ class NotificationTests(unittest.TestCase):
                         hashlib.sha256(self.WEBHOOK.encode()).hexdigest(),
                     )
                 self.assertEqual(problem.delivered_at, 900 if delivered else None)
+                self.assertIn("run-1", problem.detail)
 
     def test_receipt_must_match_incident_destination_and_valid_delivery_time(self):
         destination = hashlib.sha256(self.WEBHOOK.encode()).hexdigest()
@@ -1241,7 +1242,7 @@ class NotificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
             config = make_config(Path(tmp))
             for name in (
-                "build_binary", "sha256_file", "install_binary", "stop_service",
+                "preflight", "build_binary", "sha256_file", "install_binary", "stop_service",
                 "safe_wipe_state", "render_config", "start_service", "wait_for_completion",
                 "archive_run_log", "cleanup_retention",
             ):

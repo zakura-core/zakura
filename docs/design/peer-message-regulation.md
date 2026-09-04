@@ -133,8 +133,10 @@ Charging serving work to the request does not remove the response contracts.
 `Block`, `BlocksDone`, and `RangeUnavailable` still need their own wire and
 receiving-side rules when Zakura receives them.
 
-The remaining sections focus on controls for serving peer requests, which is
-the direction implemented first for GetBlocks.
+The design covers both directions, but each requires different controls. The
+sections below develop the shared resource accounting through the first
+implementation, where Zakura serves `GetBlocks`. Responses Zakura receives
+remain governed by their own message contracts.
 
 ## Separate resource controls
 

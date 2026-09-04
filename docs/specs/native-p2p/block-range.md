@@ -254,6 +254,7 @@ rejected by that full ledger follows GB-SM-05.
 | GB-RL-15 | Rejecting a superseded routine at the session gate rolls back all provisional regulation ownership. |
 | GB-RL-16 | Pending serving-request state stays within its per-session bound and an independently configured node-wide count; exhausting either bound drops the excess request with no work, response, or peer score. |
 | GB-RL-17 | The state query receives the local response-body byte limit and never returns block bodies whose total encoded size exceeds it. |
+| GB-RL-18 | A panic while holding a provisional attempt, committed permit, or frame lease releases that ownership, records no peer violation, and leaves unrelated peer admission usable. |
 
 The fast lane uses small capacities to reach every boundary deterministically.
 The native lane uses real stream-6 frames, the production peer routine and
@@ -396,7 +397,7 @@ can be marked implemented.
 | P2P-RG-13 | Not applicable to serving responses. The receiving direction remains draft below. |
 | P2P-RG-14 | Not applicable because `GetBlocks` is a request, not an announcement. |
 | P2P-RG-15 | GB-RL-05 and GB-RL-14 cover session- and identity-owned state. |
-| P2P-RG-16 | GB-RL-08 and the native GB-RL-10 cases cover local faults and bounded evidence. |
+| P2P-RG-16 | GB-RL-08, the native GB-RL-10 cases, and GB-RL-18 cover local faults, panic cleanup, isolation, and bounded evidence. |
 
 The implementation PR for each layer must add:
 

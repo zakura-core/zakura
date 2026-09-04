@@ -1848,10 +1848,12 @@ def compute_chain_summary(
                 group["fork_depth"] = depth_info.get("depth")
                 group["fork_depth_label"] = depth_info.get("label") or "unknown"
             else:
-                behind = majority["height"] - group["height"]
-                group["fork_depth"] = behind
+                height_delta = majority["height"] - group["height"]
+                group["fork_depth"] = abs(height_delta)
                 group["fork_depth_label"] = (
-                    f"{behind} behind" if behind > 0 else f"{-behind} ahead"
+                    f"{height_delta} behind"
+                    if height_delta > 0
+                    else f"{-height_delta} ahead"
                 )
 
     return {
@@ -3034,7 +3036,7 @@ function renderChain(data) {
 
   el('chain-summary').textContent = {
     split: 'Nodes disagree on the tip hash at the leading height.',
-    lagging: 'One tip hash leads; some nodes are behind.',
+    lagging: 'Nodes report different tip heights.',
     agreed: 'All observed nodes share the same tip.',
   }[status] || 'Waiting for tip observations.';
 

@@ -77,8 +77,8 @@ Input classes identify who can create each event:
 | GB-SM-01 | Peer | A replacement connection cancels the preceding session for the same peer. |
 | GB-SM-02 | Peer | A stale disconnect does not close or mutate the current session. |
 | GB-SM-03 | Peer | A peer without retained valid `Status` cannot start a request; the attempt is recorded as `GetBlocksSpam`. |
-| GB-SM-04 | All | Each peer has an independent request ledger bounded by the configured local in-flight cap. |
-| GB-SM-05 | Peer | A cap-rejected request emits no state query and receives `RangeUnavailable` while output capacity is available. |
+| GB-SM-04 | All | Each peer has an independent committed-request ledger bounded by the configured local in-flight cap. |
+| GB-SM-05 | Peer | A request rejected by the full committed-request ledger emits no state query and receives `RangeUnavailable` while output capacity is available. |
 | GB-SM-06 | Peer | A request starting above the servable tip emits no state query and receives `RangeUnavailable`. |
 | GB-SM-07 | Peer | An accepted query count is clamped by the wire count, local count limit, representable heights, and available range. |
 | GB-SM-08 | Driver | Request identities are nonzero and are not reused during one replay. |
@@ -166,11 +166,13 @@ capacity. Rate balances refill with time; outstanding and backlog capacity
 return only when ownership is released.
 
 One admission may wait while the routine continues decoding the bidirectional
-stream so responses to Zakura's own block requests can pass. Later serving
-requests are bounded by the advertised in-flight limit. Requests beyond that
-bound are dropped without a query, response, or peer score. The implementation
-must also account for the aggregate pending-request memory implied by that
-limit across the maximum connection count.
+stream so responses to Zakura's own block requests can pass. The pending-input
+capacity allows one admission plus the advertised in-flight count queued behind
+it. A request beyond this pre-reactor capacity is dropped without a query,
+response, or peer score. This is separate from the committed-request ledger:
+once admitted, a request rejected by that full ledger follows GB-SM-05. The
+implementation must also account for aggregate pending-input memory across the
+maximum connection count.
 
 ### Requirements
 

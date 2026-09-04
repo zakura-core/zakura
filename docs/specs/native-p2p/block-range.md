@@ -209,6 +209,7 @@ These are implementation candidates until native load evidence validates them:
 | Node outstanding | 256 MiB | Admitted response bytes not yet handed to QUIC |
 | Session pending inputs | Advertised in-flight limit + 1 | Decoded requests waiting before reactor processing in one session |
 | Node pending inputs | 32,001 requests | Decoded requests waiting before reactor processing across live and draining sessions |
+| State-query deadline | Existing block-sync `request_timeout`, default 8 seconds | One committed serving query |
 | QUIC send window | At most 32 MiB and no more than node QUIC envelope / configured connections | One connection |
 | Node QUIC envelope | 512 MiB | Sum of send windows at the configured connection limit |
 | Stopped-reader recovery deadline | 12 seconds: 10-second transport write timeout + 2-second scheduling slack | Honest request admission after saturation |
@@ -249,7 +250,7 @@ rejected by that full ledger follows GB-SM-05.
 | Routine-to-reactor handoff is full | Keep the provisional attempt and wait for that channel only. |
 | Handoff closes or the session ends before commit | Roll back the attempt and end that admission with no query, response, or peer score. |
 | State-action channel is full or closed after commit | Retire the ledger entry and queue `RangeUnavailable` with the original wire count if output remains available, with no peer score. |
-| State driver fails, times out, or returns the wrong response | Retire the ledger entry and queue `RangeUnavailable` with the original wire count if output remains available, with no peer score. |
+| State driver fails, returns the wrong response, or does not complete by the configured block-sync `request_timeout` after ledger commit | Retire the ledger entry and queue `RangeUnavailable` with the original wire count if output remains available, with no peer score. |
 | Output queue is full after commit | Drop the unsent response or terminal frame, settle its permit exactly once, keep the session connected, and assign no peer score. Existing frame leases remain until transport releases them. No terminal frame is required while the queue is full. |
 | Output queue is closed or otherwise fails after commit | End the affected session without a peer score and settle its permit exactly once. If the session remains registered when the failure is observed, cancel it. Existing frame leases remain until transport releases them. No terminal frame is required when its output path is unavailable. |
 
@@ -278,6 +279,7 @@ rejected by that full ledger follows GB-SM-05.
 | GB-RL-17 | The state query receives the local response-body byte limit and never returns block bodies whose total encoded size exceeds it. |
 | GB-RL-18 | A panic while holding a provisional attempt, committed permit, or frame lease releases that ownership, records no peer violation, and leaves unrelated peer admission usable. |
 | GB-RL-19 | Every decoded request that reaches pending-input admission first reserves the fixed request overhead from both rate buckets. A pending-cap drop spends that overhead, and an unavailable ingress charge leaves at most one decoded request waiting, so repeated drops cannot bypass peer or node rate limits. |
+| GB-RL-20 | A state query that has not completed by the configured block-sync `request_timeout`, measured from ledger commit, is retired at that deadline, releases its slot and permit, and queues `RangeUnavailable` with the original wire count when output remains available. |
 
 The fast lane uses small capacities to reach every boundary deterministically.
 The native lane uses real stream-6 frames, the production peer routine and
@@ -400,9 +402,9 @@ can be marked implemented.
 | P2P-RG-07 | GB-WF-01 through GB-WF-08, GB-WF-10, GB-WF-12 through GB-WF-14, GB-WF-16, and GB-WF-18 cover total and canonical decoding. |
 | P2P-RG-08 | GB-RL-01, GB-RL-12, and GB-RL-17 cover checked charges and bounded state results. |
 | P2P-RG-09 | GB-SM-04, GB-SM-13, GB-RL-05 through GB-RL-07, GB-RL-10a through GB-RL-10c, GB-RL-12, GB-RL-16, and GB-RL-19 cover peer and node bounds. |
-| P2P-RG-10 | GB-SM-08 through GB-SM-12, GB-SM-14, GB-SM-17, GB-SM-18, GB-RL-03, GB-RL-04, GB-RL-08, GB-RL-09, and GB-RL-15 cover ownership and settlement. |
+| P2P-RG-10 | GB-SM-08 through GB-SM-12, GB-SM-14, GB-SM-17, GB-SM-18, GB-RL-03, GB-RL-04, GB-RL-08, GB-RL-09, GB-RL-15, and GB-RL-20 cover ownership and settlement. |
 | P2P-RG-11 | GB-RL-06, GB-RL-08 through GB-RL-10c, and GB-RL-12 cover application and transport buffering. |
-| P2P-RG-12 | GB-RL-02, GB-RL-08, GB-RL-11, GB-RL-16, and GB-RL-19 cover waiting, pending input, and overload. |
+| P2P-RG-12 | GB-RL-02, GB-RL-08, GB-RL-11, GB-RL-16, GB-RL-19, and GB-RL-20 cover waiting, pending input, and overload. |
 | P2P-RG-13 | Not applicable to serving responses. The receiving direction remains draft below. |
 | P2P-RG-14 | Not applicable because `GetBlocks` is a request, not an announcement. |
 | P2P-RG-15 | GB-RL-05 and GB-RL-14 cover session- and identity-owned state. |

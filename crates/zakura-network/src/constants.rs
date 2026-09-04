@@ -342,11 +342,11 @@ pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize =
 /// messages from each of our peers.
 pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 
-// TODO: The NU7 protocol version is provisional. Update this constant and the mapping in
-// `Version::min_specified_for_upgrade` once NU7's deployment ZIP is published.
-// Next upgrade values, uncomment on activation:
-//   const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_170; // NU7 Testnet.
-//   const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_180; // NU7 Mainnet.
+// TODO: The NU7 and NuTachyon protocol versions are provisional. Update this constant and the
+// mapping in `Version::min_specified_for_upgrade` when their deployment ZIPs are published.
+#[cfg(zcash_unstable = "nutachyon")]
+const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_190; // NuTachyon (Mainnet + Testnet).
+#[cfg(not(zcash_unstable = "nutachyon"))]
 const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_160; // NU6.3 (Mainnet + Testnet).
 
 /// The Zcash network protocol version implemented by this crate, and advertised

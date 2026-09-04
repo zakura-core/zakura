@@ -87,6 +87,9 @@ proptest-derive = { workspace = true, optional = true }
 derive-getters.workspace = true
 derive-new.workspace = true
 
+[target.'cfg(zcash_unstable = "nutachyon")'.dependencies]
+zcash_tachyon = { workspace = true }
+
 [dev-dependencies]
 zakura-header-chain = { path = "../zakura-header-chain", version = "2.0.0", features = ["test-support"] }
 color-eyre = { workspace = true }

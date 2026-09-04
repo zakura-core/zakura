@@ -214,6 +214,14 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "ironwood_anchors",
     "ironwood_note_commitment_tree",
     "ironwood_note_commitment_subtree",
+    #[cfg(zcash_unstable = "nutachyon")]
+    "tachyon_anchors",
+    #[cfg(zcash_unstable = "nutachyon")]
+    "tachyon_anchor_by_height",
+    #[cfg(zcash_unstable = "nutachyon")]
+    "tachyon_epoch_anchor_by_epoch",
+    #[cfg(zcash_unstable = "nutachyon")]
+    "tachyon_tachygrams",
     // Chain
     "history_tree",
     "tip_chain_value_pool",
@@ -897,6 +905,13 @@ impl FinalizedState {
                         }),
                     };
 
+                    // The roots-only VCT payload does not carry Tachyon anchors or transaction
+                    // counts, so NuTachyon blocks must use the body-derived commitment path.
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    let vct_roots = vct_roots.filter(|_| {
+                        NetworkUpgrade::current(&network, height) < NetworkUpgrade::NuTachyon
+                    });
+
                     let mut vct_write = VctWriteData::default();
 
                     if let Some((sapling_root, orchard_root, ironwood_root)) = vct_roots {
@@ -1028,6 +1043,8 @@ impl FinalizedState {
                                 commitment_aux_verify::verify_commitment_roots(
                                     &network,
                                     (*history_tree).clone(),
+                                    #[cfg(zcash_unstable = "nutachyon")]
+                                    prev_note_commitment_trees.tachyon_anchor,
                                     verification_items,
                                 )
                             })
@@ -1171,6 +1188,10 @@ impl FinalizedState {
                                 orchard_subtree: None,
                                 ironwood: ironwood_frontier,
                                 ironwood_subtree: None,
+                                #[cfg(zcash_unstable = "nutachyon")]
+                                tachyon_anchor: note_commitment_trees.tachyon_anchor,
+                                #[cfg(zcash_unstable = "nutachyon")]
+                                tachyon_epoch_anchor: None,
                             };
 
                             // The handoff writes the real final frontier as the tip
@@ -1256,10 +1277,24 @@ impl FinalizedState {
                         commitment_result.expect("scope has already finished")?;
 
                         // Update the history tree (depends on both operations above).
+                        #[cfg(zcash_unstable = "nutachyon")]
+                        if let Some(pool_height) =
+                            zakura_chain::tachyon::pool_height(&network, checkpoint_verified.height)
+                        {
+                            let advance = note_commitment_trees
+                                .tachyon_anchor
+                                .advance_with_block(pool_height, &block)
+                                .map_err(ValidateContextError::from)?;
+                            note_commitment_trees.tachyon_anchor = advance.post_block;
+                            note_commitment_trees.tachyon_epoch_anchor = advance.epoch_boundary;
+                        }
+
                         let history_tree_mut = Arc::make_mut(&mut history_tree);
                         let sapling_root = note_commitment_trees.sapling.root();
                         let orchard_root = note_commitment_trees.orchard.root();
                         let ironwood_root = note_commitment_trees.ironwood.root();
+                        #[cfg(zcash_unstable = "nutachyon")]
+                        let tachyon_anchor = note_commitment_trees.tachyon_anchor;
                         history_tree_mut
                             .push(
                                 &network,
@@ -1267,6 +1302,8 @@ impl FinalizedState {
                                 &sapling_root,
                                 &orchard_root,
                                 &ironwood_root,
+                                #[cfg(zcash_unstable = "nutachyon")]
+                                &tachyon_anchor,
                             )
                             .map_err(Arc::new)
                             .map_err(ValidateContextError::from)?;

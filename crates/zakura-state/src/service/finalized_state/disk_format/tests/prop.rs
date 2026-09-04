@@ -576,14 +576,41 @@ fn roundtrip_value_balance() {
 }
 
 #[test]
-fn roundtrip_block_info_with_ironwood_value_pool() {
+#[cfg(zcash_unstable = "nutachyon")]
+fn roundtrip_block_info_with_tachyon_value_pool() {
     let _init_guard = zakura_test::init();
 
     let ironwood_amount = Amount::<NonNegative>::try_from(7).expect("7 zatoshi is a valid amount");
-    let block_info = BlockInfo::new(ValueBalance::from_ironwood_amount(ironwood_amount), 123);
+    let tachyon_amount = Amount::<NonNegative>::try_from(13).expect("13 zatoshi is a valid amount");
+    let block_info = BlockInfo::new(
+        (ValueBalance::from_ironwood_amount(ironwood_amount)
+            + ValueBalance::from_tachyon_amount(tachyon_amount))
+        .expect("small non-negative pool balances have a valid sum"),
+        123,
+    );
 
-    assert_eq!(block_info.as_bytes().len(), 52);
+    assert_eq!(block_info.as_bytes().len(), 60);
     assert_value_properties(block_info);
+}
+
+#[test]
+fn block_info_decodes_ironwood_value_pools() {
+    let _init_guard = zakura_test::init();
+
+    let ironwood_amount = Amount::<NonNegative>::try_from(7).expect("7 zatoshi is a valid amount");
+    let ironwood_value_pools = ValueBalance::from_ironwood_amount(ironwood_amount);
+    let mut ironwood_bytes = ironwood_value_pools.as_bytes()[..48].to_vec();
+    ironwood_bytes.extend_from_slice(&123_u32.to_le_bytes());
+
+    let block_info = BlockInfo::from_bytes(ironwood_bytes);
+
+    assert_eq!(block_info.value_pools().ironwood_amount(), ironwood_amount);
+    #[cfg(zcash_unstable = "nutachyon")]
+    assert_eq!(
+        block_info.value_pools().tachyon_amount(),
+        Amount::<NonNegative>::zero()
+    );
+    assert_eq!(block_info.size(), 123);
 }
 
 #[test]

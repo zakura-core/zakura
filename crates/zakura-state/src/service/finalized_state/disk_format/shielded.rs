@@ -7,6 +7,8 @@
 
 use bincode::Options;
 
+#[cfg(zcash_unstable = "nutachyon")]
+use zakura_chain::tachyon;
 use zakura_chain::{
     block::{merkle::AuthDataRoot, Height},
     ironwood, orchard, sapling, sprout,
@@ -84,6 +86,71 @@ impl FromDisk for orchard::tree::Root {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         let array: [u8; 32] = bytes.as_ref().try_into().unwrap();
         array.try_into().expect("finalized data must be valid")
+    }
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+impl IntoDisk for tachyon::Anchor {
+    type Bytes = [u8; 32];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        self.into()
+    }
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+impl FromDisk for tachyon::Anchor {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let bytes: [u8; 32] = bytes
+            .as_ref()
+            .try_into()
+            .expect("Tachyon anchors have a fixed 32-byte disk encoding");
+        bytes.into()
+    }
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+impl IntoDisk for tachyon::Tachygram {
+    type Bytes = [u8; 32];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        self.into()
+    }
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+impl FromDisk for tachyon::Tachygram {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let bytes: [u8; 32] = bytes
+            .as_ref()
+            .try_into()
+            .expect("Tachygrams have a fixed 32-byte disk encoding");
+        bytes.into()
+    }
+}
+
+/// An on-disk Tachyon epoch index, encoded big-endian for sort order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(zcash_unstable = "nutachyon")]
+pub struct TachyonEpoch(pub u32);
+
+#[cfg(zcash_unstable = "nutachyon")]
+impl IntoDisk for TachyonEpoch {
+    type Bytes = [u8; 4];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        self.0.to_be_bytes()
+    }
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+impl FromDisk for TachyonEpoch {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let bytes: [u8; 4] = bytes
+            .as_ref()
+            .try_into()
+            .expect("Tachyon epochs have a fixed 4-byte disk encoding");
+        Self(u32::from_be_bytes(bytes))
     }
 }
 

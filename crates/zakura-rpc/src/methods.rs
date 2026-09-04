@@ -2830,6 +2830,26 @@ where
             mempool_tx_deps,
         );
 
+        #[cfg(all(test, zcash_unstable = "nutachyon"))]
+        let (dependency_depths, selected_txs): (Vec<_>, Vec<_>) = mempool_txs.into_iter().unzip();
+        #[cfg(all(not(test), zcash_unstable = "nutachyon"))]
+        let selected_txs = mempool_txs;
+
+        #[cfg(zcash_unstable = "nutachyon")]
+        let selected_txs = types::get_block_template::tachyon::aggregate_transactions(
+            self.network.clone(),
+            height,
+            chain_info.tip_hash,
+            read_state,
+            selected_txs,
+        )
+        .await;
+
+        #[cfg(all(test, zcash_unstable = "nutachyon"))]
+        let mempool_txs: Vec<_> = dependency_depths.into_iter().zip(selected_txs).collect();
+        #[cfg(all(not(test), zcash_unstable = "nutachyon"))]
+        let mempool_txs = selected_txs;
+
         tracing::debug!(
             selected_mempool_tx_hashes = ?mempool_txs
                 .iter()

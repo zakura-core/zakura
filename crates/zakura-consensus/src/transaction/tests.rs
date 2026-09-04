@@ -54,6 +54,8 @@ use super::{check, Request, Verifier};
 
 #[cfg(test)]
 mod prop;
+#[cfg(all(test, zcash_unstable = "nutachyon"))]
+mod tachyon;
 
 /// Returns the timeout duration for tests, extended when running under coverage
 /// instrumentation to account for the performance overhead.

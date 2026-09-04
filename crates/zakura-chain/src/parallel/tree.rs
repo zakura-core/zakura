@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+#[cfg(zcash_unstable = "nutachyon")]
+use crate::tachyon;
 use crate::{
     block::Block,
     ironwood, orchard, sapling, sprout,
@@ -35,6 +37,14 @@ pub struct NoteCommitmentTrees {
 
     /// The Ironwood note commitment subtree.
     pub ironwood_subtree: Option<NoteCommitmentSubtree<ironwood::tree::Node>>,
+
+    /// The Tachyon pool anchor after this block.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub tachyon_anchor: tachyon::Anchor,
+
+    /// The epoch-boundary anchor if this block starts a Tachyon epoch.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub tachyon_epoch_anchor: Option<tachyon::Anchor>,
 }
 
 /// Note commitment tree errors.

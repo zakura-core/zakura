@@ -64,6 +64,8 @@ pub use request::{
 #[cfg(feature = "indexer")]
 pub use request::Spend;
 
+#[cfg(zcash_unstable = "nutachyon")]
+pub use response::TachyonMiningData;
 pub use response::{
     AnyTx, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock, MinedTx,
     NonFinalizedBlocksListener, ReadResponse, Response,

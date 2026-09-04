@@ -95,7 +95,10 @@ pub const MAX_PRUNE_HEIGHTS_PER_COMMIT: u32 = 100;
 ///
 /// Instead of using this constant directly, use [`constants::state_database_format_version_in_code()`]
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
+#[cfg(not(zcash_unstable = "nutachyon"))]
 const DATABASE_FORMAT_VERSION: u64 = 28;
+#[cfg(zcash_unstable = "nutachyon")]
+const DATABASE_FORMAT_VERSION: u64 = 29;
 
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.
@@ -104,11 +107,23 @@ const DATABASE_FORMAT_VERSION: u64 = 28;
 /// - adding new column families,
 /// - changing the format of a column family in a compatible way, or
 /// - breaking changes with compatibility code in all supported Zebra versions.
+///
+/// Version history:
+/// - 29.0.0: adds the Tachyon anchor and Tachygram column families, widens the chain value
+///   balance from 48 to 56 bytes, and widens history entries for the V4 history-node fields.
+///   Existing value-balance and history rows remain readable, so version 29 can reuse a version
+///   28 database without a row migration.
+#[cfg(not(zcash_unstable = "nutachyon"))]
 const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
+#[cfg(zcash_unstable = "nutachyon")]
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.
+#[cfg(not(zcash_unstable = "nutachyon"))]
 const DATABASE_FORMAT_PATCH_VERSION: u64 = 5;
+#[cfg(zcash_unstable = "nutachyon")]
+const DATABASE_FORMAT_PATCH_VERSION: u64 = 0;
 
 /// Returns the full semantic version of the currently running state database format code.
 ///

@@ -2499,6 +2499,97 @@ impl Service<ReadRequest> for ReadStateService {
                 })
             }
 
+            #[cfg(zcash_unstable = "nutachyon")]
+            ReadRequest::TachyonMiningData {
+                anchors,
+                tachygrams,
+                tip_hash,
+                candidate_height,
+            } => {
+                let best_chain = state.latest_best_chain();
+                if read::tip(best_chain.clone(), &state.db).is_none_or(
+                    |(current_tip_height, current_tip_hash)| {
+                        current_tip_hash != tip_hash
+                            || current_tip_height.0.checked_add(1) != Some(candidate_height.0)
+                    },
+                ) {
+                    return Ok(ReadResponse::TachyonMiningData(None));
+                }
+
+                let anchor_heights: HashMap<_, _> = anchors
+                    .into_iter()
+                    .filter_map(|anchor| {
+                        best_chain
+                            .as_ref()
+                            .and_then(|chain| chain.tachyon_anchors.get(&anchor))
+                            .and_then(|heights| heights.last().copied())
+                            .or_else(|| state.db.tachyon_anchor_height(&anchor))
+                            .map(|height| (anchor, height))
+                    })
+                    .collect();
+
+                let mut epoch_ranges = HashMap::new();
+                for &height in anchor_heights.values() {
+                    let Some(epoch) = zakura_chain::tachyon::epoch(&state.network, height) else {
+                        continue;
+                    };
+
+                    epoch_ranges
+                        .entry(epoch)
+                        .and_modify(|(start, end): &mut (block::Height, block::Height)| {
+                            *start = (*start).min(height);
+                            *end = (*end).max(height);
+                        })
+                        .or_insert((height, height));
+                }
+
+                let mut blocks = BTreeMap::new();
+                for (start, end) in epoch_ranges.into_values() {
+                    if start == end {
+                        continue;
+                    }
+
+                    for height_value in (start.0 + 1)..=end.0 {
+                        let height = block::Height(height_value);
+                        if let Some(block) =
+                            read::block(best_chain.clone(), &state.db, height.into())
+                        {
+                            blocks.insert(height, block);
+                        }
+                    }
+                }
+
+                let revealed_tachygrams = tachygrams
+                    .into_iter()
+                    .filter(|tachygram| {
+                        let in_window = |revealed_height| {
+                            zakura_chain::tachyon::within_scan_window(
+                                &state.network,
+                                revealed_height,
+                                candidate_height,
+                            )
+                        };
+
+                        best_chain
+                            .as_ref()
+                            .and_then(|chain| chain.tachyon_tachygrams.get(tachygram))
+                            .is_some_and(|heights| heights.iter().copied().any(in_window))
+                            || state
+                                .db
+                                .tachyon_tachygram_revealed_height(tachygram)
+                                .is_some_and(in_window)
+                    })
+                    .collect();
+
+                Ok(ReadResponse::TachyonMiningData(Some(
+                    crate::response::TachyonMiningData {
+                        anchor_heights,
+                        blocks,
+                        revealed_tachygrams,
+                    },
+                )))
+            }
+
             // Used by getblock
             ReadRequest::BlockInfo(hash_or_height) => Ok(ReadResponse::BlockInfo(
                 read::block_info(state.latest_best_chain(), &state.db, hash_or_height),

@@ -767,6 +767,10 @@ pub enum ValidateContextError {
     #[error("error updating a note commitment tree: {0}")]
     NoteCommitmentTreeError(#[from] zakura_chain::parallel::tree::NoteCommitmentTreeError),
 
+    #[error("error advancing the Tachyon anchor: {0}")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonAnchorError(#[source] Arc<zcash_tachyon::AnchorError>),
+
     #[error("error building the history tree: {0}")]
     HistoryTreeError(#[from] Arc<HistoryTreeError>),
 
@@ -820,6 +824,31 @@ pub enum ValidateContextError {
         tx_index_in_block: Option<usize>,
         transaction_hash: transaction::Hash,
     },
+
+    #[error("unknown Tachyon anchor {anchor:?}")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[non_exhaustive]
+    UnknownTachyonAnchor {
+        anchor: zakura_chain::tachyon::Anchor,
+        height: Option<block::Height>,
+        tx_index_in_block: Option<usize>,
+        transaction_hash: transaction::Hash,
+    },
+
+    #[error("duplicate Tachyon Tachygram {tachygram:?}, in finalized state: {in_finalized_state}")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[non_exhaustive]
+    DuplicateTachyonTachygram {
+        tachygram: zakura_chain::tachyon::Tachygram,
+        in_finalized_state: bool,
+    },
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+impl From<zcash_tachyon::AnchorError> for ValidateContextError {
+    fn from(error: zcash_tachyon::AnchorError) -> Self {
+        Self::TachyonAnchorError(Arc::new(error))
+    }
 }
 
 impl ValidateContextError {
@@ -851,6 +880,10 @@ impl ValidateContextError {
             | Self::CumulativeWorkOverflow { .. }
             | Self::NoteCommitmentTreeError(_)
             | Self::HistoryTreeError(_) => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
+            }
+            #[cfg(zcash_unstable = "nutachyon")]
+            Self::TachyonAnchorError(_) => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
             }
             Self::InvalidBlockCommitment(error) => {
@@ -942,6 +975,12 @@ impl ValidateContextError {
             Self::UnknownSaplingAnchor { .. } => consensus("context.unknown_sapling_anchor"),
             Self::UnknownOrchardAnchor { .. } => consensus("context.unknown_orchard_anchor"),
             Self::UnknownIronwoodAnchor { .. } => consensus("context.unknown_ironwood_anchor"),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Self::UnknownTachyonAnchor { .. } => consensus("context.unknown_tachyon_anchor"),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Self::DuplicateTachyonTachygram { .. } => {
+                consensus("context.duplicate_tachyon_tachygram")
+            }
         }
     }
 
@@ -971,6 +1010,10 @@ impl ValidateContextError {
             | ValidateContextError::UnknownSaplingAnchor { .. }
             | ValidateContextError::UnknownOrchardAnchor { .. }
             | ValidateContextError::UnknownIronwoodAnchor { .. } => 100,
+            #[cfg(zcash_unstable = "nutachyon")]
+            ValidateContextError::DuplicateTachyonTachygram { .. } => 100,
+            #[cfg(zcash_unstable = "nutachyon")]
+            ValidateContextError::UnknownTachyonAnchor { .. } => 100,
 
             // Residual arithmetic failures in our own value summation, not
             // consensus violations. `remaining_transaction_value()` and
@@ -1001,6 +1044,8 @@ impl ValidateContextError {
             | ValidateContextError::OrphanedBlock { .. }
             | ValidateContextError::NoteCommitmentTreeError(_)
             | ValidateContextError::HistoryTreeError(_) => 0,
+            #[cfg(zcash_unstable = "nutachyon")]
+            ValidateContextError::TachyonAnchorError(_) => 0,
         }
     }
 

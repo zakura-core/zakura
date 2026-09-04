@@ -134,6 +134,10 @@ jobs:
       # coverage. `zakura-watchdog` is excluded: it depends on `sentry`, which
       # requires a newer rustc than the workspace library MSRV.
       - run: cargo check --workspace --bins --exclude zakura-watchdog
+        env:
+          # NuTachyon's Tachyon dependency requires Rust 1.97. Clear the repository-level
+          # opt-in cfg so this job continues to check the supported cfg-off build on 1.91.
+          RUSTFLAGS: ""
 
   docs:
     name: docs

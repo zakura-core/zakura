@@ -7,6 +7,10 @@ use std::{
 
 use chrono::{DateTime, Utc};
 
+#[cfg(zcash_unstable = "nutachyon")]
+use std::collections::HashMap;
+#[cfg(zcash_unstable = "nutachyon")]
+use zakura_chain::tachyon;
 use zakura_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, ChainHistoryMmrRootHash},
@@ -34,6 +38,20 @@ use crate::{
 
 #[cfg(test)]
 mod tests;
+
+/// Best-chain data used to aggregate selected autonome Tachyon transactions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(zcash_unstable = "nutachyon")]
+pub struct TachyonMiningData {
+    /// Heights that created the requested anchors. Unknown anchors are omitted.
+    pub anchor_heights: HashMap<tachyon::Anchor, block::Height>,
+
+    /// Blocks needed to advance from each epoch's earliest requested anchor to its latest one.
+    pub blocks: BTreeMap<block::Height, Arc<Block>>,
+
+    /// Requested tachygrams already revealed in the candidate block's two-epoch window.
+    pub revealed_tachygrams: HashSet<tachyon::Tachygram>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
@@ -427,6 +445,11 @@ pub enum ReadResponse {
         value_balance: ValueBalance<NonNegative>,
     },
 
+    /// Response to [`ReadRequest::TachyonMiningData`], or `None` when the requested chain tip is
+    /// no longer current.
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonMiningData(Option<TachyonMiningData>),
+
     /// Response to [`ReadRequest::BlockInfo`] with
     /// the block info after the specified block.
     BlockInfo(Option<BlockInfo>),
@@ -726,6 +749,11 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::Blocks(_)
             | ReadResponse::NonFinalizedBlocksListener(_)
             | ReadResponse::IsTransparentOutputSpent(_) => {
+                Err("there is no corresponding Response for this ReadResponse")
+            }
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            ReadResponse::TachyonMiningData(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
 

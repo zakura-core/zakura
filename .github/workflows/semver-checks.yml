@@ -269,7 +269,7 @@ jobs:
         run: |
           # cargo-public-api builds both the current and published crate with
           # nightly. Nightly-only warnings are evidence, not the lint gate.
-          RUSTFLAGS='' cargo public-api diff latest -p "$PACKAGE" -sss
+          RUSTFLAGS='--cfg zcash_unstable="nutachyon"' cargo public-api diff latest -p "$PACKAGE" -sss
 
   warm-baselines:
     name: Warm semver baselines

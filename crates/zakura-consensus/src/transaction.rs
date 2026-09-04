@@ -486,6 +486,12 @@ where
             // Transaction parsing enforces the same rule. Repeat it here for
             // defense-in-depth and transactions constructed in memory.
             check::shielded_proof_size_is_canonical(&tx)?;
+            #[cfg(zcash_unstable = "nutachyon")]
+            check::tachyon_actions_have_valid_digests(&tx)?;
+            #[cfg(zcash_unstable = "nutachyon")]
+            if req.is_mempool() {
+                check::tachyon_bundle_is_autonome(&tx)?;
+            }
 
             // Validate the coinbase input consensus rules
             if req.is_mempool() && tx.is_coinbase() {
@@ -612,14 +618,22 @@ where
                     cached_ffi_transaction.clone(),
                     wtx_id.expect("a v5 transaction has a witnessed transaction ID"),
                 )?,
-                Transaction::V6 {
-                    ..
-                } => Self::verify_v6_transaction(
+                Transaction::V6 { .. } => {
+                    Self::verify_v6_or_v7_transaction(
+                        &req,
+                        &network,
+                        script_verifier,
+                        cached_ffi_transaction.clone(),
+                        wtx_id.expect("a v6 or v7 transaction has a witnessed transaction ID"),
+                    )?
+                }
+                #[cfg(zcash_unstable = "nutachyon")]
+                Transaction::V7 { .. } => Self::verify_v6_or_v7_transaction(
                     &req,
                     &network,
                     script_verifier,
                     cached_ffi_transaction.clone(),
-                    wtx_id.expect("a v6 transaction has a witnessed transaction ID"),
+                    wtx_id.expect("a v6 or v7 transaction has a witnessed transaction ID"),
                 )?,
             };
 
@@ -998,6 +1012,12 @@ where
                 transaction.version(),
                 network_upgrade,
             )),
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => Err(TransactionError::UnsupportedByNetworkUpgrade(
+                transaction.version(),
+                network_upgrade,
+            )),
         }
     }
 
@@ -1082,6 +1102,9 @@ where
             | NetworkUpgrade::Nu6_3
             | NetworkUpgrade::Nu7 => Ok(()),
 
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => Ok(()),
+
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),
 
@@ -1099,8 +1122,8 @@ where
         }
     }
 
-    /// Verify a V6 transaction.
-    fn verify_v6_transaction(
+    /// Verify a V6 or V7 transaction.
+    fn verify_v6_or_v7_transaction(
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
@@ -1110,7 +1133,16 @@ where
         let transaction = request.transaction();
         let nu = request.upgrade(network);
 
-        Self::verify_v6_transaction_network_upgrade(&transaction, nu)?;
+        match transaction.as_ref() {
+            Transaction::V6 { .. } => {
+                Self::verify_v6_transaction_network_upgrade(&transaction, nu)?
+            }
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { .. } => {
+                Self::verify_v7_transaction_network_upgrade(&transaction, nu)?
+            }
+            _ => unreachable!("V6/V7 verification is only called for V6 or V7 transactions"),
+        }
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
@@ -1120,7 +1152,7 @@ where
             .sighasher()
             .sighash(HashType::ALL, None);
 
-        Ok(Self::verify_transparent_inputs_and_outputs(
+        let async_checks = Self::verify_transparent_inputs_and_outputs(
             request,
             script_verifier,
             cached_ffi_transaction,
@@ -1141,7 +1173,13 @@ where
             &sighash,
             nu,
             wtx_id,
-        )))
+        ));
+
+        #[cfg(zcash_unstable = "nutachyon")]
+        let async_checks =
+            async_checks.and(Self::verify_tachyon_signatures(&transaction, &sighash));
+
+        Ok(async_checks)
     }
 
     /// Verifies if a V6 `transaction` is supported by `network_upgrade`.
@@ -1157,6 +1195,46 @@ where
         }
 
         Ok(())
+    }
+
+    /// Verifies if a V7 `transaction` is supported by `network_upgrade`.
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn verify_v7_transaction_network_upgrade(
+        transaction: &Transaction,
+        network_upgrade: NetworkUpgrade,
+    ) -> Result<(), TransactionError> {
+        if network_upgrade < NetworkUpgrade::NuTachyon {
+            return Err(TransactionError::UnsupportedByNetworkUpgrade(
+                transaction.version(),
+                network_upgrade,
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Queues verification of a V7 transaction's Tachyon action and binding signatures.
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn verify_tachyon_signatures(tx: &Transaction, sighash: &SigHash) -> AsyncChecks {
+        use zcash_tachyon::TachyonBundle;
+
+        let mut async_checks = AsyncChecks::new();
+        let Some(tachyon_shielded_data) = tx.tachyon_shielded_data() else {
+            return async_checks;
+        };
+
+        let bundle = tachyon_shielded_data.0.clone();
+        let sighash_bytes = sighash.0;
+        async_checks.push(primitives::spawn_fifo_and_convert(move || {
+            match &bundle {
+                TachyonBundle::NoBundle => Ok(()),
+                TachyonBundle::Proven(bundle) => bundle.verify_signatures(&sighash_bytes),
+                TachyonBundle::Adjunct(bundle) => bundle.verify_signatures(&sighash_bytes),
+            }
+            .map_err(|error| TransactionError::TachyonSignatureInvalid(error.to_string()))
+        }));
+
+        async_checks
     }
 
     /// Verifies if a transaction's transparent inputs are valid using the provided
@@ -1346,7 +1424,7 @@ where
     ///
     /// `wtx_id` identifies the transaction containing `bundle`; the cache adds
     /// the bundle's value pool to distinguish the Orchard and Ironwood slots in
-    /// a v6 transaction.
+    /// a v6 or v7 transaction.
     fn verify_orchard_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,

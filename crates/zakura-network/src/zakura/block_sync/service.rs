@@ -41,6 +41,7 @@ pub struct BlockSyncPeerSession {
     direction: ServicePeerDirection,
     send: FramedSend,
     cancel_token: CancellationToken,
+    routine_generation: Option<u64>,
 }
 
 impl BlockSyncPeerSession {
@@ -50,6 +51,7 @@ impl BlockSyncPeerSession {
             direction,
             send: session.sender(),
             cancel_token: session.cancel_token(),
+            routine_generation: None,
         }
     }
 
@@ -67,12 +69,35 @@ impl BlockSyncPeerSession {
             direction: ServicePeerDirection::Outbound,
             send,
             cancel_token,
+            routine_generation: None,
+        }
+    }
+
+    /// Build a test session associated with an admitted routine generation.
+    #[cfg(test)]
+    pub(super) fn for_test_with_generation(
+        peer_id: ZakuraPeerId,
+        send: FramedSend,
+        cancel_token: CancellationToken,
+        routine_generation: u64,
+    ) -> Self {
+        Self {
+            peer_id,
+            direction: ServicePeerDirection::Outbound,
+            send,
+            cancel_token,
+            routine_generation: Some(routine_generation),
         }
     }
 
     /// Authenticated peer identity for this block-sync session.
     pub fn peer_id(&self) -> &ZakuraPeerId {
         &self.peer_id
+    }
+
+    /// Registry generation of the routine that owns this session, when present.
+    pub(super) fn routine_generation(&self) -> Option<u64> {
+        self.routine_generation
     }
 
     /// Direction of the underlying Zakura connection.
@@ -550,7 +575,7 @@ impl Service for BlockSyncService {
         let service_cancel_token = session.cancel_token();
         let connection_cancel_token = peer.cancel_token();
         let close_cause = peer.close_cause();
-        let block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
+        let mut block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
         let session_id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
         let conn_id = peer.conn_id;
         let (_session_peer, _stream_kind, _stream_version, recv, send, _session_cancel) =
@@ -640,6 +665,8 @@ impl Service for BlockSyncService {
                 routine_generation,
             )
         };
+        block_sync_session.routine_generation = routine_generation;
+
         if let Some(old_record) = old_record {
             old_record.cancel_token.cancel();
         }

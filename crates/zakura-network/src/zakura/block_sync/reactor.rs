@@ -1414,6 +1414,14 @@ impl BlockSyncReactor {
             return;
         }
 
+        // The registry advances before the replacement session is installed in
+        // reactor state. Do not commit its request into the predecessor's ledger.
+        if !self.state.peers.get(&peer).is_some_and(|peer_state| {
+            peer_state.session.routine_generation() == Some(session_generation)
+        }) {
+            return;
+        }
+
         let local_inflight_cap = self.startup.config.advertised_max_inflight_requests();
         if !self.state.peers.contains_key(&peer) {
             self.report_misbehavior(peer, BlockSyncMisbehavior::GetBlocksSpam)

@@ -11978,7 +11978,7 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
 }
 
 #[tokio::test]
-async fn reactor_ignores_get_blocks_from_superseded_routine_generation() {
+async fn reactor_serves_get_blocks_only_after_replacement_generation_is_installed() {
     let config = ZakuraBlockSyncConfig::default();
     let mut startup = BlockSyncStartup::inert(config.clone());
     startup.frontiers.finalized_height = block::Height(3);
@@ -12000,6 +12000,21 @@ async fn reactor_ignores_get_blocks_from_superseded_routine_generation() {
             Instant::now(),
         )
         .generation();
+
+    let (old_outbound, mut old_outbound_recv) = framed_channel(4);
+    handle
+        .send(BlockSyncEvent::PeerConnected(
+            BlockSyncPeerSession::for_test_with_generation(
+                peer_id.clone(),
+                old_outbound,
+                CancellationToken::new(),
+                old_generation,
+            ),
+        ))
+        .await
+        .expect("the predecessor peer connection queues");
+    wait_for_outbound_status(&mut old_outbound_recv).await;
+
     let current_generation = wiring
         .registry
         .admit_session(
@@ -12020,14 +12035,36 @@ async fn reactor_ignores_get_blocks_from_superseded_routine_generation() {
         },
     );
 
-    let (outbound, mut outbound_recv) = framed_channel(4);
+    wiring
+        .routine_to_reactor
+        .send(RoutineToReactor::ServeGetBlocks {
+            peer: peer_id.clone(),
+            session_generation: current_generation,
+            start_height: block::Height(1),
+            count: 1,
+        })
+        .await
+        .expect("the replacement's early serving request queues");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), actions.recv())
+            .await
+            .is_err(),
+        "a replacement request must wait until that generation is installed"
+    );
+
+    let (current_outbound, mut current_outbound_recv) = framed_channel(4);
     handle
         .send(BlockSyncEvent::PeerConnected(
-            BlockSyncPeerSession::for_test(peer_id.clone(), outbound, CancellationToken::new()),
+            BlockSyncPeerSession::for_test_with_generation(
+                peer_id.clone(),
+                current_outbound,
+                CancellationToken::new(),
+                current_generation,
+            ),
         ))
         .await
-        .expect("the peer connection queues");
-    wait_for_outbound_status(&mut outbound_recv).await;
+        .expect("the replacement peer connection queues");
+    wait_for_outbound_status(&mut current_outbound_recv).await;
 
     wiring
         .routine_to_reactor
@@ -12065,7 +12102,7 @@ async fn reactor_ignores_get_blocks_from_superseded_routine_generation() {
         "the stale serving request must not produce a second action"
     );
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), outbound_recv.recv())
+        tokio::time::timeout(Duration::from_millis(20), current_outbound_recv.recv())
             .await
             .is_err(),
         "the stale serving request must not send a frame"

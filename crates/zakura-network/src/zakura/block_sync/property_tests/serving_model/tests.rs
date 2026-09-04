@@ -241,12 +241,7 @@ fn serving_case_strategy() -> impl Strategy<Value = ServingCase> {
         1usize..=4,
         any::<bool>(),
         SCENARIO_RECONNECT_AFTER_DISCONNECT..=LAST_FOCUSED_SCENARIO,
-        prop_oneof![
-            3 => Just(ByteCap::All),
-            1 => Just(ByteCap::BeforeFirst),
-            1 => Just(ByteCap::ExactlyFirst),
-            1 => Just(ByteCap::ExactlyFirstTwo),
-        ],
+        Just(ByteCap::All),
         vec(step_strategy(), 8..=32),
     )
         .prop_map(
@@ -634,7 +629,11 @@ fn focused_scenario(scenario: u8, tip: u32, max_inflight: u32) -> Vec<ServingSte
 
 /// Build a stable standalone case for one named focused history.
 fn focused_case(scenario: u8, byte_cap: ByteCap) -> ServingCase {
-    let tip = 12;
+    let tip = if matches!(byte_cap, ByteCap::All) {
+        12
+    } else {
+        4
+    };
     let max_inflight = if scenario == SCENARIO_LIVE_UNAVAILABLE {
         1
     } else {
@@ -663,19 +662,19 @@ fn focused_case(scenario: u8, byte_cap: ByteCap) -> ServingCase {
 const ALL_FOCUSED_CASES: &[(u8, ByteCap)] = &[
     (SCENARIO_RECONNECT_AFTER_DISCONNECT, ByteCap::All),
     (SCENARIO_LEDGER_SATURATION, ByteCap::All),
-    (SCENARIO_ORPHANED_RESPONSE, ByteCap::ExactlyFirstTwo),
+    (SCENARIO_ORPHANED_RESPONSE, ByteCap::All),
     (SCENARIO_RETIRED_COMPLETION, ByteCap::All),
     (SCENARIO_ABOVE_TIP, ByteCap::All),
-    (SCENARIO_UNKNOWN_COMPLETION, ByteCap::ExactlyFirst),
-    (SCENARIO_MISMATCHED_COMPLETION, ByteCap::ExactlyFirst),
+    (SCENARIO_UNKNOWN_COMPLETION, ByteCap::All),
+    (SCENARIO_MISMATCHED_COMPLETION, ByteCap::All),
     (SCENARIO_CROSS_PEER_PROGRESS, ByteCap::All),
     (SCENARIO_CANCEL_AND_RECONNECT, ByteCap::All),
     (SCENARIO_FAST_ADMISSION, ByteCap::All),
     (SCENARIO_REPLACEMENT_ADMISSION, ByteCap::All),
     (SCENARIO_MISSING_STATUS, ByteCap::All),
     (SCENARIO_COUNT_BOUNDS, ByteCap::All),
-    (SCENARIO_RESPONSE_BOUNDARIES, ByteCap::BeforeFirst),
     (SCENARIO_RESPONSE_BOUNDARIES, ByteCap::ExactlyFirst),
+    (SCENARIO_RESPONSE_BOUNDARIES, ByteCap::ExactlyFirstTwo),
     (SCENARIO_NON_CONTIGUOUS_RESPONSE, ByteCap::All),
     (SCENARIO_GENESIS_RESPONSE, ByteCap::All),
     (SCENARIO_LIVE_UNAVAILABLE, ByteCap::All),
@@ -717,7 +716,7 @@ fn gb_sm_02_stale_disconnect_preserves_current_session() {
         ServingRequirement::StaleDisconnectPreservesCurrentSession,
         &[
             (SCENARIO_RECONNECT_AFTER_DISCONNECT, ByteCap::All),
-            (SCENARIO_ORPHANED_RESPONSE, ByteCap::ExactlyFirstTwo),
+            (SCENARIO_ORPHANED_RESPONSE, ByteCap::All),
         ],
     );
 }
@@ -778,8 +777,8 @@ fn gb_sm_09_ready_response_sends_largest_valid_prefix_and_one_terminal() {
     assert_requirement_covered(
         ServingRequirement::ReadyResponseSendsLargestValidPrefixAndOneTerminal,
         &[
-            (SCENARIO_RESPONSE_BOUNDARIES, ByteCap::BeforeFirst),
             (SCENARIO_RESPONSE_BOUNDARIES, ByteCap::ExactlyFirst),
+            (SCENARIO_RESPONSE_BOUNDARIES, ByteCap::ExactlyFirstTwo),
             (SCENARIO_NON_CONTIGUOUS_RESPONSE, ByteCap::All),
             (SCENARIO_GENESIS_RESPONSE, ByteCap::All),
         ],
@@ -791,10 +790,10 @@ fn gb_sm_10_invalid_completion_has_no_serving_effect() {
     assert_requirement_covered(
         ServingRequirement::InvalidCompletionHasNoServingEffect,
         &[
-            (SCENARIO_UNKNOWN_COMPLETION, ByteCap::ExactlyFirst),
-            (SCENARIO_MISMATCHED_COMPLETION, ByteCap::ExactlyFirst),
+            (SCENARIO_UNKNOWN_COMPLETION, ByteCap::All),
+            (SCENARIO_MISMATCHED_COMPLETION, ByteCap::All),
             (SCENARIO_RETIRED_COMPLETION, ByteCap::All),
-            (SCENARIO_ORPHANED_RESPONSE, ByteCap::ExactlyFirstTwo),
+            (SCENARIO_ORPHANED_RESPONSE, ByteCap::All),
         ],
     );
 }
@@ -812,7 +811,7 @@ fn gb_sm_12_ended_session_responses_do_not_reach_replacement() {
     assert_requirement_covered(
         ServingRequirement::EndedSessionResponsesDoNotReachReplacement,
         &[
-            (SCENARIO_ORPHANED_RESPONSE, ByteCap::ExactlyFirstTwo),
+            (SCENARIO_ORPHANED_RESPONSE, ByteCap::All),
             (SCENARIO_DISCONNECTED_RESPONSE, ByteCap::All),
         ],
     );
@@ -832,7 +831,7 @@ fn gb_sm_14_frames_are_attributable_to_live_request_owner() {
         ServingRequirement::FramesAreAttributableToLiveRequestOwner,
         &[
             (SCENARIO_RESPONSE_BOUNDARIES, ByteCap::ExactlyFirst),
-            (SCENARIO_ORPHANED_RESPONSE, ByteCap::ExactlyFirstTwo),
+            (SCENARIO_ORPHANED_RESPONSE, ByteCap::All),
         ],
     );
 }

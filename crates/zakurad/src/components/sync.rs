@@ -1694,11 +1694,7 @@ where
                         // and re-downloading. Only a completed block or a finished extension counts,
                         // which is what the arms below record.
                         match refreshed {
-                            Ok(Ok(hashes)) => reserve.extend(hashes),
-                            Ok(Err(error)) => info!(
-                                ?error,
-                                "tip refresh failed while blocks remain in flight; retrying"
-                            ),
+                            Ok(hashes) => reserve.extend(hashes?),
                             Err(_) => info!(
                                 "tip refresh timed out while blocks remain in flight; retrying"
                             ),

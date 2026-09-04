@@ -182,15 +182,22 @@ serving exchange MUST use the controls that apply:
 | Peer backlog | Bounds reserved, queued, and application-owned unwritten response bytes for one session. |
 | Node outstanding | Bounds all admitted response bytes not yet handed to transport. It does not refill with time. |
 | Concurrency ledger | Bounds committed requests and associates each with one owner. |
-| Pending-input bound | Bounds decoded requests waiting behind admission, per session and in aggregate. |
+| Session pending inputs | Bounds decoded requests waiting behind admission for one session. |
+| Node pending inputs | Independently bounds decoded requests waiting behind admission across all live and draining sessions. |
 
 Per-peer controls MUST NOT be the only aggregate defense. Each capacity and
 collection MUST fit its node-wide resource budget at the configured maximum
-connection count.
+connection count. A node pending-input capacity MUST be an explicit limit; it
+MUST NOT be derived only by multiplying the per-session limit by the connection
+count.
 
 Startup validation MUST ensure the largest legal request fits every applicable
 rate capacity, outstanding budget, and backlog. A legal request MUST NOT wait
 forever because it can never fit a configured bound.
+
+Startup validation MUST also reject a zero node pending-input capacity. If the
+exchange promises one complete per-session pending window, the node capacity
+MUST fit at least one such window.
 
 When an exchange promises at least one response item, its local response limit
 MUST fit the largest legal item unless the exchange defines another bounded
@@ -254,10 +261,10 @@ A waiting request:
 - MUST end cleanly when its session or handoff channel closes.
 
 If a routine continues reading a bidirectional stream while admission waits, it
-MUST bound decoded pending requests per session and across the maximum peer
-count. It MUST let required response traffic reach its receiving path, define
-what happens when the pending bound is full, and test that a peer Zakura is
-downloading from can still make progress.
+MUST bound decoded pending requests both per session and under an independent
+node-wide capacity. It MUST let required response traffic reach its receiving
+path, define what happens when either pending bound is full, and test that a
+peer Zakura is downloading from can still make progress.
 
 A full internal handoff channel MUST retain a provisional attempt until the
 channel accepts it or closes. A committed request MUST not disappear because an

@@ -95,8 +95,8 @@ Input classes identify who can create each event:
 | GB-SM-02 | `gb_sm_02_stale_disconnect_preserves_current_session` | Peer | A stale disconnect does not close or mutate the current session. |
 | GB-SM-03 | `gb_sm_03_missing_status_is_rejected_as_spam` | Peer | A peer without retained valid `Status` cannot start a request; the attempt is recorded as `GetBlocksSpam`. |
 | GB-SM-04 | `gb_sm_04_peer_ledgers_are_independent_and_bounded` | All | Each peer has an independent committed-request ledger bounded by the configured local in-flight cap. |
-| GB-SM-05 | `gb_sm_05_saturated_ledger_rejects_without_state_query` | Peer | A request rejected by the full committed-request ledger emits no state query and receives `RangeUnavailable` while output capacity is available. |
-| GB-SM-06 | `gb_sm_06_above_tip_request_is_unavailable_without_state_query` | Peer | A request starting above the servable tip emits no state query and receives `RangeUnavailable`. |
+| GB-SM-05 | `gb_sm_05_saturated_ledger_rejects_without_state_query` | Peer | A request rejected by the full committed-request ledger emits no state query and receives `RangeUnavailable` echoing its original wire count while output capacity is available. |
+| GB-SM-06 | `gb_sm_06_above_tip_request_is_unavailable_without_state_query` | Peer | A request starting above the servable tip emits no state query and receives `RangeUnavailable` echoing its original wire count. |
 | GB-SM-07 | `gb_sm_07_accepted_query_count_respects_all_bounds` | Peer | An accepted query count is clamped by the wire count, local count limit, representable heights, and available range. |
 | GB-SM-08 | `gb_sm_08_request_ids_are_nonzero_and_unique` | Driver | Request identities are nonzero and are not reused during one replay. |
 | GB-SM-09 | `gb_sm_09_ready_response_sends_largest_valid_prefix_and_one_terminal` | Driver | While the output path remains available, a matching ready response sends the largest contiguous prefix within the byte cap followed by exactly one appropriate terminal frame; output failure follows the regulated-load failure policy. |
@@ -108,7 +108,7 @@ Input classes identify who can create each event:
 | GB-SM-15 | `gb_sm_15_delayed_older_connect_cannot_replace_newer_session` | Peer | A delayed older `PeerConnected` event cannot replace a newer reactor session for the same peer. |
 | GB-SM-16 | `gb_sm_16_peer_frames_wait_for_reactor_admission` | Peer | A peer routine does not process frames until the reactor admits or rejects its session. |
 | GB-SM-17 | `gb_sm_17_superseded_routine_request_cannot_reach_replacement_session` | Peer | A request decoded by a superseded routine produces no state query, reply, or misbehavior record for its replacement session. |
-| GB-SM-18 | `gb_sm_18_live_unavailable_completion_sends_terminal_and_releases_slot` | Driver | A matching zero-result state completion sends `RangeUnavailable`, retires the request, and releases its slot. |
+| GB-SM-18 | `gb_sm_18_live_unavailable_completion_sends_terminal_and_releases_slot` | Driver | A matching zero-result state completion sends `RangeUnavailable` echoing the original wire count, retires the request, and releases its slot. |
 | GB-SM-19 | `gb_sm_19_inbound_sessions_serve_and_use_inbound_cap` | Peer | Inbound sessions serve `GetBlocks` through the same path and use the inbound peer cap independently of the outbound cap. |
 
 Serving `Status` survives an overlapping replacement for the same authenticated
@@ -193,23 +193,24 @@ named local topology:
 | Node rate | 64 MiB/s | All inbound `GetBlocks` serving |
 | Node rate capacity | 128 MiB | All inbound `GetBlocks` serving |
 | Node outstanding | 256 MiB | Admitted response bytes not yet handed to QUIC |
-| Session pending inputs | advertised in-flight limit + 1 | Decoded requests waiting before reactor processing in one session |
-| Node pending inputs | session pending-input cap × maximum connections | Decoded requests waiting before reactor processing across live and draining sessions |
+| Session pending inputs | Advertised in-flight limit + 1 | Decoded requests waiting before reactor processing in one session |
+| Node pending inputs | 32,001 requests | Decoded requests waiting before reactor processing across live and draining sessions |
 | QUIC send window | At most 32 MiB and no more than node QUIC envelope / configured connections | One connection |
 | Node QUIC envelope | 512 MiB | Sum of send windows at the configured connection limit |
 
 Startup validation requires the largest legal request to fit every applicable
-capacity. Rate balances refill with time; outstanding and backlog capacity
-return only when ownership is released.
+byte capacity and the node pending-input capacity to fit one configured session
+window. Rate balances refill with time; outstanding and backlog capacity return
+only when ownership is released.
 
 One admission may wait while the routine continues decoding the bidirectional
-stream so responses to Zakura's own block requests can pass. A retained request
-owns both a session and node pending-input slot until the reactor processes it.
-Each session can own one active admission plus the advertised in-flight limit
-behind it; the node cap is that total multiplied by the maximum connection
-count. Requests beyond either cap are dropped without a query, response, or
-peer score. This pre-reactor capacity is separate from the committed-request
-ledger: once admitted, a request rejected by that full ledger follows GB-SM-05.
+stream so responses to Zakura's own block requests can pass. Each session may
+retain one admission plus its advertised in-flight count behind it. The node
+has a separate configured capacity that does not grow with the connection
+limit; the initial value fits one complete default session window. A request
+beyond either capacity is dropped without a query, response, or peer score.
+This is separate from the committed-request ledger: once admitted, a request
+rejected by that full ledger follows GB-SM-05.
 
 ### Failure outcomes
 
@@ -217,8 +218,8 @@ ledger: once admitted, a request rejected by that full ledger follows GB-SM-05.
 | --- | --- |
 | Routine-to-reactor handoff is full | Keep the provisional attempt and wait for that channel only. |
 | Handoff closes or the session ends before commit | Roll back the attempt and end that admission with no query, response, or peer score. |
-| State-action channel is full or closed after commit | Retire the ledger entry and queue `RangeUnavailable` if output remains available, with no peer score. |
-| State driver fails, times out, or returns the wrong response | Retire the ledger entry and queue `RangeUnavailable` if output remains available, with no peer score. |
+| State-action channel is full or closed after commit | Retire the ledger entry and queue `RangeUnavailable` with the original wire count if output remains available, with no peer score. |
+| State driver fails, times out, or returns the wrong response | Retire the ledger entry and queue `RangeUnavailable` with the original wire count if output remains available, with no peer score. |
 | Output queue is full after commit | Drop the unsent response or terminal frame, settle its permit exactly once, keep the session connected, and assign no peer score. Existing frame leases remain until transport releases them. No terminal frame is required while the queue is full. |
 | Output queue is closed or otherwise fails after commit | End the affected session without a peer score and settle its permit exactly once. If the session remains registered when the failure is observed, cancel it. Existing frame leases remain until transport releases them. No terminal frame is required when its output path is unavailable. |
 
@@ -239,11 +240,11 @@ ledger: once admitted, a request rejected by that full ledger follows GB-SM-05.
 | GB-RL-10b | `gb_rl_10b_native_reading_flood_preserves_honest_tiny_and_full_service` | Fifteen reading flood peers do not push an honest tiny- or full-block response beyond the existing eight-second request timeout in the named native topology. |
 | GB-RL-10c | `gb_rl_10c_native_stopped_readers_stay_bounded_reclaim_and_restore_service`<br>`gb_rl_10c_quic_send_windows_fit_node_transport_envelope` | Stopped readers remain within the application budgets and per-connection QUIC windows; the sum of configured windows fits the node QUIC envelope; the combined application and QUIC envelope is reported; writes release every lease after failure or timeout; and honest service recovers within the write timeout plus stated slack. |
 | GB-RL-11 | `gb_rl_11_pipelined_serving_requests_keep_same_stream_download_live` | Responses to Zakura's downloads continue within the request timeout behind admission-delayed serving requests on the same stream. |
-| GB-RL-12 | `gb_rl_12_supported_configuration_covers_largest_request` | Supported configurations use checked arithmetic, fit the largest legal request and one maximum-size block, and reject insufficient response limits or capacities. |
+| GB-RL-12 | `gb_rl_12_supported_configuration_covers_largest_request` | Supported configurations use checked arithmetic, fit the largest legal request, one maximum-size block, and one session's pending-input window, and reject insufficient limits or capacities. |
 | GB-RL-13 | `gb_rl_13_under_budget_histories_match_pre_regulation_reference_model` | Under-budget histories produce the same queries, frames, and ownership state as the unregulated serving reference model. |
 | GB-RL-14 | `gb_rl_14_reconnect_retains_rate_bucket_and_bounds_inactive_cache` | Reconnects retain a depleted identity bucket; inactive retention is bounded and early eviction restores no more than the evicted deficit. |
 | GB-RL-15 | `gb_rl_15_stale_session_gate_rolls_back_regulation_ownership` | Rejecting a superseded routine at the session gate rolls back all provisional regulation ownership. |
-| GB-RL-16 | `gb_rl_16_pending_requests_stay_within_session_and_node_bounds` | Pending serving-request state stays within its per-session bound and its derived aggregate bound at the configured maximum connection count. |
+| GB-RL-16 | `gb_rl_16_pending_requests_stay_within_session_and_node_bounds` | Pending serving-request state stays within its per-session bound and an independently configured node-wide count; exhausting either bound drops the excess request with no work, response, or peer score. |
 | GB-RL-17 | `gb_rl_17_state_query_receives_local_response_byte_limit`<br>`gb_rl_17_state_query_result_never_exceeds_response_byte_limit` | The state query receives the local response-body byte limit and never returns block bodies whose total encoded size exceeds it. |
 
 The fast lane uses small capacities to reach every boundary deterministically.
@@ -360,7 +361,8 @@ peer that serves no blocks for heights inside its advertised servable range.
 - **Reservation**
   - live `GetBlocks` range with this `start_height` and requested count
   - no block has been consumed from the range
-  - `count` equals the requested count
+  - `count` equals the original wire-request count; local state-query and
+    serving clamps do not change this echoed value
   - consumes the terminal part and closes the reservation
 
 The handler MUST requeue the range. A retry policy MAY avoid this peer for the immediate retry.

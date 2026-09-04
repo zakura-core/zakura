@@ -171,11 +171,15 @@ The local response-body byte limit must be at least `MAX_BLOCK_BYTES`, so every
 valid block can be served by itself. This is a local configuration requirement,
 not a stricter wire range for limits advertised by a remote peer.
 
-Admission reserves the worst case. The 64 KiB request overhead remains spent
-after commit. Unused response capacity is refunded. Response bytes remain
-reserved until their frames are accepted by QUIC or dropped. QUIC may then
-retain them under both the per-connection window and the node-wide transport
-envelope below.
+The 64 KiB request overhead bounds ingress processing. After wire validation
+and the Status prerequisite, Zakura reserves that overhead from both rate
+buckets before retaining the decoded request. A request dropped at pending
+capacity spends the overhead; a retained request carries it provisionally
+until reactor commit. The remaining admission reserves the worst-case response
+capacity. Unused response capacity is refunded. Response bytes remain reserved
+until their frames are accepted by QUIC or dropped. QUIC may then retain them
+under both the per-connection window and the node-wide transport envelope
+below.
 
 ### Initial parameters
 
@@ -216,7 +220,13 @@ stream so responses to Zakura's own block requests can pass. Each session may
 retain one admission plus its advertised in-flight count behind it. The node
 has a separate configured capacity that does not grow with the connection
 limit; the initial value fits one complete default session window. A request
-beyond either capacity is dropped without a query, response, or peer score.
+beyond either capacity spends its fixed ingress overhead, then is dropped
+without a query, response, or peer score. If the ingress rate charge itself is
+unavailable, the routine holds only that decoded request and stops reading
+until the charge fits or the session ends. This bounds sustained processing
+without allowing later requests to bypass the rate buckets. The short ingress
+wait remains subject to the full-duplex progress rule in GB-RL-11.
+
 This is separate from the committed-request ledger: once admitted, a request
 rejected by that full ledger follows GB-SM-05.
 
@@ -255,6 +265,7 @@ rejected by that full ledger follows GB-SM-05.
 | GB-RL-16 | Pending serving-request state stays within its per-session bound and an independently configured node-wide count; exhausting either bound drops the excess request with no work, response, or peer score. |
 | GB-RL-17 | The state query receives the local response-body byte limit and never returns block bodies whose total encoded size exceeds it. |
 | GB-RL-18 | A panic while holding a provisional attempt, committed permit, or frame lease releases that ownership, records no peer violation, and leaves unrelated peer admission usable. |
+| GB-RL-19 | Every decoded request that reaches pending-input admission first reserves the fixed request overhead from both rate buckets. A pending-cap drop spends that overhead, and an unavailable ingress charge leaves at most one decoded request waiting, so repeated drops cannot bypass peer or node rate limits. |
 
 The fast lane uses small capacities to reach every boundary deterministically.
 The native lane uses real stream-6 frames, the production peer routine and
@@ -394,10 +405,10 @@ can be marked implemented.
 | P2P-RG-06 | GB-WF-11 covers partial-frame state and the read deadline. |
 | P2P-RG-07 | GB-WF-01 through GB-WF-08 and GB-WF-10 cover total and canonical decoding. |
 | P2P-RG-08 | GB-RL-01, GB-RL-12, and GB-RL-17 cover checked charges and bounded state results. |
-| P2P-RG-09 | GB-SM-04, GB-SM-13, GB-RL-05 through GB-RL-07, GB-RL-10a through GB-RL-10c, GB-RL-12, and GB-RL-16 cover peer and node bounds. |
+| P2P-RG-09 | GB-SM-04, GB-SM-13, GB-RL-05 through GB-RL-07, GB-RL-10a through GB-RL-10c, GB-RL-12, GB-RL-16, and GB-RL-19 cover peer and node bounds. |
 | P2P-RG-10 | GB-SM-08 through GB-SM-12, GB-SM-14, GB-SM-17, GB-SM-18, GB-RL-03, GB-RL-04, GB-RL-08, GB-RL-09, and GB-RL-15 cover ownership and settlement. |
 | P2P-RG-11 | GB-RL-06, GB-RL-08 through GB-RL-10c, and GB-RL-12 cover application and transport buffering. |
-| P2P-RG-12 | GB-RL-02, GB-RL-08, GB-RL-11, and GB-RL-16 cover waiting, pending input, and overload. |
+| P2P-RG-12 | GB-RL-02, GB-RL-08, GB-RL-11, GB-RL-16, and GB-RL-19 cover waiting, pending input, and overload. |
 | P2P-RG-13 | Not applicable to serving responses. The receiving direction remains draft below. |
 | P2P-RG-14 | Not applicable because `GetBlocks` is a request, not an announcement. |
 | P2P-RG-15 | GB-RL-05 and GB-RL-14 cover session- and identity-owned state. |

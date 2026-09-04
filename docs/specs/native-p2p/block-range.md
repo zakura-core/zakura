@@ -95,8 +95,8 @@ Input classes identify who can create each event:
 | GB-SM-02 | Peer | A stale disconnect does not close or mutate the current session. |
 | GB-SM-03 | Peer | A peer without retained valid `Status` cannot start a request; the attempt is recorded as `GetBlocksSpam`. |
 | GB-SM-04 | All | Each peer has an independent committed-request ledger bounded by the configured local in-flight cap. |
-| GB-SM-05 | Peer | A request rejected by the full committed-request ledger emits no state query and receives `RangeUnavailable` while output capacity is available. |
-| GB-SM-06 | Peer | A request starting above the servable tip emits no state query and receives `RangeUnavailable`. |
+| GB-SM-05 | Peer | A request rejected by the full committed-request ledger emits no state query and receives `RangeUnavailable` echoing its original wire count while output capacity is available. |
+| GB-SM-06 | Peer | A request starting above the servable tip emits no state query and receives `RangeUnavailable` echoing its original wire count. |
 | GB-SM-07 | Peer | An accepted query count is clamped by the wire count, local count limit, representable heights, and available range. |
 | GB-SM-08 | Driver | Request identities are nonzero and are not reused during one replay. |
 | GB-SM-09 | Driver | While the output path remains available, a matching ready response sends the largest contiguous prefix within the byte cap followed by exactly one appropriate terminal frame; output failure follows the regulated-load failure policy. |
@@ -108,7 +108,7 @@ Input classes identify who can create each event:
 | GB-SM-15 | Peer | A delayed older `PeerConnected` event cannot replace a newer reactor session for the same peer. |
 | GB-SM-16 | Peer | A peer routine does not process frames until the reactor admits or rejects its session. |
 | GB-SM-17 | Peer | A request decoded by a superseded routine produces no state query, reply, or misbehavior record for its replacement session. |
-| GB-SM-18 | Driver | A matching zero-result state completion sends `RangeUnavailable`, retires the request, and releases its slot. |
+| GB-SM-18 | Driver | A matching zero-result state completion sends `RangeUnavailable` echoing the original wire count, retires the request, and releases its slot. |
 | GB-SM-19 | Peer | Inbound sessions serve `GetBlocks` through the same path and use the inbound peer cap independently of the outbound cap. |
 
 Serving `Status` survives an overlapping replacement for the same authenticated
@@ -212,8 +212,8 @@ maximum connection count.
 | --- | --- |
 | Routine-to-reactor handoff is full | Keep the provisional attempt and wait for that channel only. |
 | Handoff closes or the session ends before commit | Roll back the attempt and end that admission with no query, response, or peer score. |
-| State-action channel is full or closed after commit | Retire the ledger entry and queue `RangeUnavailable` if output remains available, with no peer score. |
-| State driver fails, times out, or returns the wrong response | Retire the ledger entry and queue `RangeUnavailable` if output remains available, with no peer score. |
+| State-action channel is full or closed after commit | Retire the ledger entry and queue `RangeUnavailable` with the original wire count if output remains available, with no peer score. |
+| State driver fails, times out, or returns the wrong response | Retire the ledger entry and queue `RangeUnavailable` with the original wire count if output remains available, with no peer score. |
 | Output queue is full after commit | Drop the unsent response or terminal frame, settle its permit exactly once, keep the session connected, and assign no peer score. Existing frame leases remain until transport releases them. No terminal frame is required while the queue is full. |
 | Output queue is closed or otherwise fails after commit | End the affected session without a peer score and settle its permit exactly once. If the session remains registered when the failure is observed, cancel it. Existing frame leases remain until transport releases them. No terminal frame is required when its output path is unavailable. |
 
@@ -324,7 +324,8 @@ peer that serves no blocks for heights inside its advertised servable range.
 - **Reservation**
   - live `GetBlocks` range with this `start_height` and requested count
   - no block has been consumed from the range
-  - `count` equals the requested count
+  - `count` equals the original wire-request count; local state-query and
+    serving clamps do not change this echoed value
   - consumes the terminal part and closes the reservation
 
 The handler MUST requeue the range. A retry policy MAY avoid this peer for the immediate retry.

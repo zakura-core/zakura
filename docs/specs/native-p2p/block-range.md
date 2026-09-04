@@ -45,6 +45,7 @@ the reactor, or request identity allocation.
 | GB-WF-08 | Start and count are independently valid. A request beginning at `Height::MAX` with count 128 is valid; serving safely clamps it to the representable and available prefix. |
 | GB-WF-09 | The frame reader rejects a `GetBlocks` payload longer than nine bytes before allocating its payload buffer. |
 | GB-WF-10 | Decoding the fixed payload performs no allocation sized from peer-provided fields. |
+| GB-WF-11 | Once any frame byte arrives, the transport bounds partial-frame state and expires an incomplete `GetBlocks` frame at the configured read deadline. |
 
 Deterministic cases cover:
 
@@ -56,7 +57,8 @@ Deterministic cases cover:
 - truncated and trailing payloads;
 - mismatched outer and payload discriminators;
 - nonzero flags; and
-- a declared `GetBlocks` frame longer than nine bytes.
+- a declared `GetBlocks` frame longer than nine bytes; and
+- an incomplete header and payload held through the read deadline.
 
 A malformed frame or payload is a protocol error and closes the affected peer
 or stream according to the surrounding transport policy. A valid request for
@@ -333,6 +335,31 @@ The first implementation deliberately leaves these policies separate:
   response ownership explicit.
 
 ## Implementation evidence
+
+### Shared regulation coverage
+
+The serving exchange maps the shared regulation requirements as follows. A
+mapping names the message-specific evidence that must exist before this layer
+can be marked implemented.
+
+| Shared ID | GetBlocks evidence |
+| --- | --- |
+| P2P-RG-01 | The catalog plus GB-WF-01 through GB-WF-11, GB-SM-09, and GB-RL-01 close the serving request and its response kinds. |
+| P2P-RG-02 | GB-WF-01 through GB-WF-06, GB-SM-03, GB-SM-05, GB-SM-06, GB-RL-02, and GB-RL-08 cover declared outcomes and sender obligations. |
+| P2P-RG-03 | GB-WF-01 through GB-WF-10, GB-SM-03, and GB-RL-15 enforce the processing order. |
+| P2P-RG-04 | GB-SM-03, GB-SM-06, GB-SM-10, GB-SM-12, GB-SM-17, and GB-SM-18 distinguish invalid, stale, and unavailable work. |
+| P2P-RG-05 | GB-WF-01, GB-WF-02, GB-WF-09, and GB-WF-10 cover allocation caps. |
+| P2P-RG-06 | GB-WF-11 covers partial-frame state and the read deadline. |
+| P2P-RG-07 | GB-WF-01 through GB-WF-08 and GB-WF-10 cover total and canonical decoding. |
+| P2P-RG-08 | GB-RL-01, GB-RL-12, and GB-RL-17 cover checked charges and bounded state results. |
+| P2P-RG-09 | GB-SM-04, GB-SM-13, GB-RL-05 through GB-RL-07, GB-RL-10a through GB-RL-10c, GB-RL-12, and GB-RL-16 cover peer and node bounds. |
+| P2P-RG-10 | GB-SM-08 through GB-SM-12, GB-SM-14, GB-SM-17, GB-SM-18, GB-RL-03, GB-RL-04, GB-RL-08, GB-RL-09, and GB-RL-15 cover ownership and settlement. |
+| P2P-RG-11 | GB-RL-06, GB-RL-08 through GB-RL-10c, and GB-RL-12 cover application and transport buffering. |
+| P2P-RG-12 | GB-RL-02, GB-RL-08, GB-RL-11, and GB-RL-16 cover waiting, pending input, and overload. |
+| P2P-RG-13 | Not applicable to serving responses. The receiving direction remains draft below. |
+| P2P-RG-14 | Not applicable because `GetBlocks` is a request, not an announcement. |
+| P2P-RG-15 | GB-RL-05 and GB-RL-14 cover session- and identity-owned state. |
+| P2P-RG-16 | GB-RL-08 and the native GB-RL-10 cases cover local faults and bounded evidence. |
 
 The implementation PR for each layer must add:
 

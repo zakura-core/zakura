@@ -82,6 +82,8 @@ Droplet lifecycle is shared, not copy-pasted, through the composite actions in `
 
 Runtime regions are tried in order (`nyc1,sfo3,nyc3`). Only regions with an available compatible image and the requested state are eligible. An explicit artifact ID is never substituted. Pre-checkpoint selection requires a known height strictly below C; the restored database is still checked independently before networking starts. Existing date-only states remain usable for tip and sandblast tests.
 
+Within each region, the newest image is tried first. Older retained images add fallback sizes when their smaller disk requirement permits machines that the newer image cannot use. Each size is tried once per region with its newest compatible image.
+
 The provisioner only retries an explicitly rejected capacity request. Ambiguous creation errors recover deterministic resource names and clean up instead of issuing another create. Workflow teardown and the hourly reaper remain cleanup backstops. Regional retention is essential: a global newest-two policy could delete the only image or approach fixture in the fallback region.
 
 Bakes on a branch write `zakura-pr-validation-*` artifacts, which scheduled jobs never select. The workflow uploads their exact IDs for explicit `image_id`/`state_snapshot_id` PR-node validation. Delete those temporary images and snapshots after validation. Only a bake on `main` publishes the ordinary artifact names. Manual `notify=false` and PR-node `post_comment=false` allow quiet validation.

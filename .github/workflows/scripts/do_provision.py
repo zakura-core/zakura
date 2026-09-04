@@ -180,6 +180,7 @@ def plans(args, images, snapshots, sizes):
                     )
                 ]
             )
+        planned_sizes = set()
         for image in choices:
             candidates = eligible_sizes(
                 sizes,
@@ -189,12 +190,14 @@ def plans(args, images, snapshots, sizes):
                 image["min_disk_size"],
                 args.max_price,
             )
-            if candidates:
-                result.extend(
+            for size in candidates:
+                if size["slug"] in planned_sizes:
+                    continue
+                # Keep the newest compatible image for each regional size.
+                planned_sizes.add(size["slug"])
+                result.append(
                     {"region": region, "image": image, "state": state, "size": size}
-                    for size in candidates
                 )
-                break
     return result
 
 

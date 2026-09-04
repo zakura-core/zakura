@@ -173,8 +173,57 @@ class Selection(unittest.TestCase):
         candidate["status"] = "pending"
         self.assertEqual(p.plans(args(), [candidate], [], [size("c-8")]), [])
 
+    def test_older_image_adds_sizes_without_repeating_capacity_pools(self):
+        images = [
+            image(disk=320, created="2026-09-02T00:00:00Z"),
+            image(id="older"),
+            image(id="oldest", created="2026-08-01T00:00:00Z"),
+        ]
+        sizes = [size("c-8"), size("shared", disk=320)]
+        request = args("--policy", "correctness")
+        result = p.plans(request, images, [], sizes)
+        self.assertEqual(
+            [(plan["image"]["id"], plan["size"]["slug"]) for plan in result],
+            [("image", "shared"), ("older", "c-8")],
+        )
+        request.image_id = "image"
+        result = p.plans(request, images, [], sizes)
+        self.assertEqual(
+            [(plan["image"]["id"], plan["size"]["slug"]) for plan in result],
+            [("image", "shared")],
+        )
+
 
 class Lifecycle(unittest.TestCase):
+    @patch.object(p, "output")
+    @patch.object(p, "wait_droplet", return_value="192.0.2.1")
+    @patch.object(p, "doctl")
+    def test_capacity_rejection_falls_back_to_size_enabled_by_older_image(
+        self, api, wait, output
+    ):
+        request = args("--policy", "correctness", "--regions", "nyc1")
+        plans = p.plans(
+            request,
+            [image(disk=320, created="2026-09-02T00:00:00Z"), image(id="older")],
+            [],
+            [size("c-8"), size("shared", disk=320)],
+        )
+        api.side_effect = [
+            subprocess.CalledProcessError(1, "doctl", stderr="422 capacity exhausted"),
+            [{"id": 2}],
+        ]
+        result = p.provision(request, plans)
+        self.assertEqual(result["image_id"], "older")
+        self.assertEqual(result["size"], "c-8")
+        creates = [call.args for call in api.call_args_list]
+        self.assertEqual(
+            [
+                (call[call.index("--image") + 1], call[call.index("--size") + 1])
+                for call in creates
+            ],
+            [("image", "shared"), ("older", "c-8")],
+        )
+
     @patch.object(p.subprocess, "run")
     def test_json_stdout_capacity_error_is_classified(self, run):
         run.return_value = subprocess.CompletedProcess(

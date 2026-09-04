@@ -240,19 +240,57 @@ fn slot_permits_bound_and_release_owned_items() {
     assert_eq!(budget.reserved(), 0);
 }
 
+#[test]
+fn slot_budget_rejects_unusable_capacities() {
+    assert!(SlotBudget::new(0).is_err());
+    assert!(SlotBudget::new(tokio::sync::Semaphore::MAX_PERMITS + 1).is_err());
+}
+
 #[tokio::test]
-async fn slot_wait_wakes_after_an_owner_releases_capacity() {
+async fn slot_waiters_receive_and_retain_owned_capacity() {
+    use futures::poll;
+
     let budget = SlotBudget::new(1).expect("one slot fits the semaphore");
     let reservation = budget.try_reserve().expect("the slot is initially free");
-    let waiting_budget = budget.clone();
-    let waiter = tokio::spawn(async move { waiting_budget.wait_for().await });
-    tokio::task::yield_now().await;
-    assert!(!waiter.is_finished());
+    let first = budget.reserve();
+    let second = budget.reserve();
+    tokio::pin!(first, second);
+    assert!(poll!(&mut first).is_pending());
+    assert!(poll!(&mut second).is_pending());
 
     drop(reservation);
-
-    tokio::time::timeout(Duration::from_secs(1), waiter)
+    let first_permit = tokio::time::timeout(Duration::from_secs(1), &mut first)
         .await
-        .expect("the release must wake the slot waiter")
-        .expect("the waiter task should not panic");
+        .expect("the first waiter receives the released slot");
+    assert_eq!(budget.reserved(), 1);
+    assert!(budget.try_reserve().is_none());
+    assert!(poll!(&mut second).is_pending());
+
+    drop(first_permit);
+    let second_permit = tokio::time::timeout(Duration::from_secs(1), &mut second)
+        .await
+        .expect("the second waiter receives the next released slot");
+    assert_eq!(budget.reserved(), 1);
+    drop(second_permit);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[tokio::test]
+async fn cancelled_slot_waiter_leaves_capacity_for_its_successor() {
+    use futures::poll;
+
+    let budget = SlotBudget::new(1).expect("one slot fits the semaphore");
+    let owner = budget.try_reserve().expect("the slot is initially free");
+    let mut cancelled = Box::pin(budget.reserve());
+    let mut successor = Box::pin(budget.reserve());
+    assert!(poll!(&mut cancelled).is_pending());
+    assert!(poll!(&mut successor).is_pending());
+    drop(cancelled);
+    drop(owner);
+    let permit = tokio::time::timeout(Duration::from_secs(1), successor)
+        .await
+        .expect("cancelling the first waiter does not strand the next one");
+    assert_eq!(budget.reserved(), 1);
+    drop(permit);
+    assert_eq!(budget.reserved(), 0);
 }

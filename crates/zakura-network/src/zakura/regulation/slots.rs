@@ -5,9 +5,9 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// A slot capacity cannot be represented by Tokio's semaphore.
+/// A slot capacity cannot provide usable, representable permits.
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
-#[error("slot capacity {requested} exceeds maximum {maximum}")]
+#[error("slot capacity {requested} must be in 1..={maximum}")]
 pub(crate) struct SlotBudgetCapacityError {
     /// Requested slot count.
     pub(crate) requested: usize,
@@ -28,7 +28,7 @@ pub(crate) struct SlotBudget {
 impl SlotBudget {
     /// Create a budget with `capacity` independently owned slots.
     pub(crate) fn new(capacity: usize) -> Result<Self, SlotBudgetCapacityError> {
-        if capacity > Semaphore::MAX_PERMITS {
+        if capacity == 0 || capacity > Semaphore::MAX_PERMITS {
             return Err(SlotBudgetCapacityError {
                 requested: capacity,
                 maximum: Semaphore::MAX_PERMITS,
@@ -61,19 +61,19 @@ impl SlotBudget {
             .map(|permit| SlotPermit { _permit: permit })
     }
 
-    /// Wait until one slot could be reserved, without retaining it.
+    /// Wait for a slot and return its ownership in semaphore queue order.
     ///
-    /// Acquiring and immediately releasing the semaphore permit makes the wait
-    /// race-free. A caller retries its complete multi-resource admission after
-    /// this method returns.
-    pub(crate) async fn wait_for(&self) {
+    /// Keep the returned permit through admission. If another resource cannot
+    /// be reserved, drop it before waiting for that resource. Cancelling this
+    /// future removes its waiter without consuming a slot.
+    pub(crate) async fn reserve(&self) -> SlotPermit {
         let permit = self
             .permits
             .clone()
             .acquire_owned()
             .await
             .expect("slot budget semaphore stays open because this type never closes it");
-        drop(permit);
+        SlotPermit { _permit: permit }
     }
 }
 

@@ -186,6 +186,7 @@ These are implementation candidates until native load evidence validates them:
 | Response-body limit | 32 MiB; minimum `MAX_BLOCK_BYTES` | One state query and response |
 | Peer rate | 16 MiB/s | One authenticated identity |
 | Peer rate capacity | 32 MiB response cap + 128 discriminators + 9 terminal bytes + 64 KiB overhead | One authenticated identity, retained while depleted |
+| Inactive identity buckets | Configured maximum connection count | Depleted peer-rate buckets without an active session or permit |
 | Peer backlog | 64 MiB | One session's reserved and application-owned response bytes |
 | Node rate | 64 MiB/s | All inbound `GetBlocks` serving |
 | Node rate capacity | 128 MiB | All inbound `GetBlocks` serving |
@@ -194,11 +195,21 @@ These are implementation candidates until native load evidence validates them:
 | Node pending inputs | 32,001 requests | Decoded requests waiting before reactor processing across live and draining sessions |
 | QUIC send window | At most 32 MiB and no more than node QUIC envelope / configured connections | One connection |
 | Node QUIC envelope | 512 MiB | Sum of send windows at the configured connection limit |
+| Stopped-reader recovery deadline | 12 seconds: 10-second transport write timeout + 2-second scheduling slack | Honest request admission after saturation |
 
 Startup validation requires the largest legal request to fit every applicable
 byte capacity and the node pending-input capacity to fit one configured session
 window. Rate balances refill with time; outstanding and backlog capacity return
 only when ownership is released.
+
+A depleted peer-rate bucket survives reconnects under its authenticated
+identity. An inactive bucket remains cached until it refills, for at most
+`ceil(deficit / peer rate)` seconds, unless the inactive cache reaches the
+configured maximum connection count. The cache then evicts the inactive bucket
+with the smallest deficit. It never evicts an active or permit-referenced
+bucket. One eviction can restore at most that bucket's deficit, which is no
+greater than the peer-rate capacity; the node-rate bucket still bounds
+aggregate work across identities.
 
 One admission may wait while the routine continues decoding the bidirectional
 stream so responses to Zakura's own block requests can pass. Each session may
@@ -235,14 +246,15 @@ rejected by that full ledger follows GB-SM-05.
 | GB-RL-09 | Session end settles permits without moving them to a replacement; frame leases survive until their frames leave the application transport. |
 | GB-RL-10a | Generated hostile histories vary peer count and every configured bound without exceeding peer or node accounting. |
 | GB-RL-10b | Fifteen reading flood peers do not push an honest tiny- or full-block response beyond the existing eight-second request timeout in the named native topology. |
-| GB-RL-10c | Stopped readers remain within the application budgets and per-connection QUIC windows; the sum of configured windows fits the node QUIC envelope; the combined application and QUIC envelope is reported; writes release every lease after failure or timeout; and honest service recovers within the write timeout plus stated slack. |
+| GB-RL-10c | Stopped readers remain within the application budgets and per-connection QUIC windows; the sum of configured windows fits the node QUIC envelope; the combined application and QUIC envelope is reported; writes release every lease after failure or timeout; and honest admission recovers within the 12-second deadline above. |
 | GB-RL-11 | Responses to Zakura's downloads continue within the request timeout behind admission-delayed serving requests on the same stream. |
 | GB-RL-12 | Supported configurations use checked arithmetic, fit the largest legal request, one maximum-size block, and one session's pending-input window, and reject insufficient limits or capacities. |
 | GB-RL-13 | Under-budget histories produce the same queries, frames, and ownership state as the unregulated serving reference model. |
-| GB-RL-14 | Reconnects retain a depleted identity bucket; inactive retention is bounded and early eviction restores no more than the evicted deficit. |
+| GB-RL-14 | Reconnects retain a depleted identity bucket; the inactive cache follows the capacity, retention, and smallest-deficit eviction policy above; active and permit-referenced buckets survive churn; and one eviction restores no more than the evicted deficit. |
 | GB-RL-15 | Rejecting a superseded routine at the session gate rolls back all provisional regulation ownership. |
 | GB-RL-16 | Pending serving-request state stays within its per-session bound and an independently configured node-wide count; exhausting either bound drops the excess request with no work, response, or peer score. |
 | GB-RL-17 | The state query receives the local response-body byte limit and never returns block bodies whose total encoded size exceeds it. |
+| GB-RL-18 | A panic while holding a provisional attempt, committed permit, or frame lease releases that ownership, records no peer violation, and leaves unrelated peer admission usable. |
 
 The fast lane uses small capacities to reach every boundary deterministically.
 The native lane uses real stream-6 frames, the production peer routine and
@@ -385,7 +397,7 @@ can be marked implemented.
 | P2P-RG-13 | Not applicable to serving responses. The receiving direction remains draft below. |
 | P2P-RG-14 | Not applicable because `GetBlocks` is a request, not an announcement. |
 | P2P-RG-15 | GB-RL-05 and GB-RL-14 cover session- and identity-owned state. |
-| P2P-RG-16 | GB-RL-08 and the native GB-RL-10 cases cover local faults and bounded evidence. |
+| P2P-RG-16 | GB-RL-08, the native GB-RL-10 cases, and GB-RL-18 cover local faults, panic cleanup, isolation, and bounded evidence. |
 
 The implementation PR for each layer must add:
 

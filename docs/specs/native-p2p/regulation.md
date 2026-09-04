@@ -18,7 +18,15 @@ separate policies.
 
 The keywords **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
+Shared requirements use the prefix `P2P-RG`, meaning native P2P regulation.
+An exchange contract must map every applicable `P2P-RG` ID to one or more of
+its own ID-named tests. A shared transport test may satisfy the mapping when the
+exchange uses that exact transport path. An inapplicable requirement needs a
+reason; an applicable requirement may not be omitted.
+
 ## Contract inventories
+
+**P2P-RG-01 — Closed inventories.**
 
 A completed multi-exchange implementation MUST derive a closed wire-kind
 inventory from production code. For the first exchange, the catalog and
@@ -55,6 +63,8 @@ shared declaration. They MUST NOT treat a fixed message count as closure.
 
 ## Admission outcomes
 
+**P2P-RG-02 — Declared outcomes and sender obligations.**
+
 Contracts use these semantic outcomes even when production names them
 differently:
 
@@ -78,6 +88,8 @@ that obligation.
 
 ## Processing order
 
+**P2P-RG-03 — Checks precede the work they bound.**
+
 Checks MUST run before the work they bound. A serving request uses this order:
 
 1. Read the fixed frame header.
@@ -97,6 +109,8 @@ response also checks the reservation created by the request Zakura sent.
 
 ## Message validity and harmless ignores
 
+**P2P-RG-04 — Invalid and harmless messages remain distinct.**
+
 **Message validity** asks whether the peer sent a valid message. These checks
 use the decoded message, the authenticated peer identity, and fixed network
 rules. They run before consulting mutable chain or service state. A failure
@@ -111,16 +125,20 @@ another declared limit MUST bound repeated ignored messages.
 
 ## Framing and decoding
 
+**P2P-RG-05 — Message-specific caps precede allocation.**
+
 The fixed frame header MUST identify the message kind before its payload buffer
 is allocated. The transport MUST reject a payload longer than that kind's
 declared cap before allocation. A stream-wide frame maximum MUST remain as a
 defense in depth limit but MUST NOT replace the per-message cap.
 
-The transport MUST separately bound partial-frame state and enforce a read
+**P2P-RG-06 — Incomplete frames are bounded.** The transport MUST separately
+bound partial-frame state and enforce a read
 deadline for an incomplete frame. Complete-message admission limits do not
 prevent a peer from starting a frame and then withholding the remaining bytes.
 
-For every payload within the cap, decoding MUST return a result without
+**P2P-RG-07 — Decoding is total, canonical, and independently bounded.** For
+every payload within the cap, decoding MUST return a result without
 panicking. Accepted payloads MUST be canonical and consumed exactly. Decoding
 MUST reject unknown flags, reserved bits, trailing bytes, and values outside
 their declared wire ranges.
@@ -133,6 +151,8 @@ The contract MUST distinguish invalid encoding from a valid request whose
 requested application data is unavailable.
 
 ## Resource bounds
+
+**P2P-RG-08 — Charges and internal results are locally bounded.**
 
 A request that can cause response work MUST declare a worst-case charge from
 local inputs:
@@ -152,7 +172,8 @@ applicable local byte limit and enforce it while constructing its result.
 Charging only the outbound prefix does not bound a larger intermediate result
 that is materialized and discarded later.
 
-Each regulated serving exchange MUST use the controls that apply:
+**P2P-RG-09 — Peer and node controls bound aggregate state.** Each regulated
+serving exchange MUST use the controls that apply:
 
 | Control | Required behavior |
 | --- | --- |
@@ -171,7 +192,13 @@ Startup validation MUST ensure the largest legal request fits every applicable
 rate capacity, outstanding budget, and backlog. A legal request MUST NOT wait
 forever because it can never fit a configured bound.
 
+When an exchange promises at least one response item, its local response limit
+MUST fit the largest legal item unless the exchange defines another bounded
+outcome that guarantees progress.
+
 ## Ownership and settlement
+
+**P2P-RG-10 — Accounting has one session-gated ownership chain.**
 
 Resource accounting MUST follow one linear ownership chain:
 
@@ -192,14 +219,18 @@ After commit:
 - every completion, rejection, channel failure, cancellation, disconnect, and
   replacement settles it exactly once.
 
-Enqueueing a leased frame MUST reserve a queue slot before ownership moves. A
+**P2P-RG-11 — Queues, leases, and transport buffers remain bounded.** Enqueueing
+a leased frame MUST reserve a queue slot before ownership moves. A
 failed reservation MUST move no accounting. A successful enqueue transfers the
 frame's accounted payload bytes from the request permit into one non-cloneable
 lease.
 
 The lease MUST remain live until the application transport accepts the write or
-drops the frame. Bytes retained later by QUIC MUST fit a separately declared
-send-window envelope.
+drops the frame. Bytes retained later by QUIC MUST fit declared per-connection
+and node-wide send-window caps. Startup validation MUST ensure the sum of all
+connection windows at the configured connection limit fits the node-wide QUIC
+cap. Slow-reader evidence MUST check the application budget, the QUIC budget,
+and their combined envelope.
 
 Dropping a session MUST settle its permits without transferring them to a
 replacement session. Already queued frame leases remain responsible for their
@@ -207,6 +238,8 @@ bytes until the transport releases them. An unknown, repeated, stale, or
 mismatched completion MUST NOT release another request's resources.
 
 ## Waiting and overload
+
+**P2P-RG-12 — Waiting and overload remain bounded and explicit.**
 
 When rate or outstanding capacity is unavailable, the contract MUST state
 whether the request waits, is rejected, or is dropped. It MUST also state the
@@ -233,6 +266,8 @@ or local-fault path.
 
 ## Responses and reservations
 
+**P2P-RG-13 — Inbound responses consume live reservations.**
+
 Before Zakura sends a request, it MUST create a bounded reservation for the
 responses that request authorizes. The reservation identifies the peer,
 session, request, response kinds, and count or byte limits.
@@ -247,6 +282,8 @@ removed on terminal completion or connection end.
 
 ## Announcements
 
+**P2P-RG-14 — Announcements have bounded state and cadence.**
+
 An unsolicited announcement MUST have a fixed payload and state bound. If it
 can arrive repeatedly, its contract MUST define a peer cadence with enough
 burst allowance for connection setup and scheduling jitter.
@@ -257,6 +294,8 @@ announcement SHOULD be dropped rather than scored.
 
 ## Identity and cache bounds
 
+**P2P-RG-15 — Identity-owned state has bounded retention.**
+
 The contract MUST say whether each resource belongs to a session or an
 authenticated identity. Identity-owned rate state MAY survive reconnects to
 prevent burst resets.
@@ -266,6 +305,8 @@ MUST NOT evict active or permit-referenced state. Its contract MUST bound the
 allowance an early eviction can restore.
 
 ## Faults and observability
+
+**P2P-RG-16 — Local faults release ownership and expose bounded evidence.**
 
 A local panic or dependency failure MUST release all owned resources. It MUST
 NOT be recorded as peer misbehavior. Failure isolation MUST keep unrelated peer
@@ -286,8 +327,8 @@ MUST remain bounded.
 
 A regulation layer is implemented only when:
 
-1. The [property-testing standard](../../design/property-testing.md) maps every
-   regulation requirement to an ID-named test.
+1. Its contract maps every applicable `P2P-RG` ID to exchange-specific,
+   ID-named tests and gives a reason for every inapplicable ID.
 2. Fast properties check charge arithmetic, conservation, rollback,
    settlement, session ownership, and configured bounds.
 3. Generated histories vary peers and every applicable resource boundary.

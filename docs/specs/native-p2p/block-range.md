@@ -12,9 +12,9 @@ Zakura sends. Their earlier standalone wire and receiving-side proposal is
 preserved as a draft below. Block-sync `Status` has a separate draft.
 
 The contract follows the
-[native P2P contract catalog](README.md). `GB-WF` means
-GetBlocks wire format, `GB-SM` means GetBlocks serving model, and `GB-RL` means
-GetBlocks regulated load.
+[native P2P contract catalog](README.md). `GB-WF` means block-range exchange
+wire format, `GB-SM` means GetBlocks serving model, and `GB-RL` means GetBlocks
+regulated load.
 
 ## Production path
 
@@ -47,6 +47,13 @@ the reactor, or request identity allocation.
 | GB-WF-10 | Decoding the fixed payload performs no allocation sized from peer-provided fields. |
 | GB-WF-11 | Once any frame byte arrives, the transport bounds partial-frame state and expires an incomplete `GetBlocks` frame at the configured read deadline. |
 | GB-WF-12 | Decoding every `GetBlocks` payload from zero through nine bytes returns a result without panicking; every accepted payload re-encodes canonically. |
+| GB-WF-13 | `Block`, `BlocksDone`, and `RangeUnavailable` use outer and payload discriminators `3`, `4`, and `5` respectively, and every accepted response frame has zero flags. |
+| GB-WF-14 | A `Block` payload is its discriminator followed by exactly one canonical block encoding of at most `MAX_BLOCK_BYTES`; decoding consumes it exactly and canonical re-encoding is stable. |
+| GB-WF-15 | The frame reader rejects a `Block` payload longer than `1 + MAX_BLOCK_BYTES` before allocating its payload buffer. |
+| GB-WF-16 | A `BlocksDone` payload is nine bytes: its discriminator, little-endian start height, and little-endian returned count in `1..=128`; decoding consumes it exactly and canonical re-encoding is stable. |
+| GB-WF-17 | The frame reader rejects a `BlocksDone` payload longer than nine bytes before allocating its payload buffer. |
+| GB-WF-18 | A `RangeUnavailable` payload is nine bytes: its discriminator, little-endian start height, and little-endian original request count in `1..=128`; decoding consumes it exactly and canonical re-encoding is stable. |
+| GB-WF-19 | The frame reader rejects a `RangeUnavailable` payload longer than nine bytes before allocating its payload buffer. |
 
 Deterministic cases cover:
 
@@ -60,7 +67,10 @@ Deterministic cases cover:
 - nonzero flags; and
 - a declared `GetBlocks` frame longer than nine bytes; and
 - an incomplete header and payload held through the read deadline; and
-- arbitrary payload bytes at every length through the nine-byte cap.
+- arbitrary payload bytes at every length through the nine-byte cap;
+- minimum, maximum, truncated, trailing, and arbitrary fixed response payloads;
+  and
+- a declared response frame one byte above each response kind's allocation cap.
 
 A malformed frame or payload is a protocol error and closes the affected peer
 or stream according to the surrounding transport policy. A valid request for
@@ -284,12 +294,12 @@ These are reproducible experiments, not network-wide proofs. CPU, RSS, UDP
 traffic, and throughput are diagnostics. The request timeout, write timeout,
 application budgets, and configured QUIC envelope are contract gates.
 
-## Draft response-receiving contract
+## Draft response-receiving model
 
-> **Status: draft.** The serving rules above cover responses Zakura sends.
-> This section preserves the original proposal for responses Zakura receives.
-> It is not part of the currently specified GetBlocks layers. Stable response
-> wire and receiving-side IDs still need to be assigned.
+> **Status: draft.** GB-WF-13 through GB-WF-19 specify the response wire
+> formats. The serving rules specify responses Zakura sends. This section
+> preserves only the unfinished reservation and state rules for responses
+> Zakura receives.
 
 The requester must not send overlapping live ranges on one connection. The
 original proposal treated an overlapping request as a protocol violation so
@@ -298,12 +308,6 @@ ID. That policy remains deferred until the receiving-side contract is written.
 
 ### `Block` — Response, discriminator 3
 
-- **Frame**
-  - payload cap = 2,000,001 bytes
-- **Decode** — `BlockSyncMessage::decode`,
-  `validate_encoded_block_len`
-  - one complete block
-  - exact consumption
 - **Reservation** — `BlockRangeRequest::expected_hash`
   - one live `GetBlocks` range whose next unconsumed height expects this header hash
   - consumes that hash's part of the reservation
@@ -323,12 +327,6 @@ option today: it matches the hash at `peer_routine` and leaves
 
 ### `BlocksDone` — Response, discriminator 4
 
-- **Frame**
-  - payload cap = 9 bytes
-- **Decode** — `BlockSyncMessage::decode`, `validate_block_count`
-  - `start_height <= Height::MAX`
-  - returned = 1..=128
-  - exact consumption
 - **Reservation**
   - live `GetBlocks` range with this `start_height`
   - `returned` equals the number of blocks consumed from the range and does not exceed its requested
@@ -343,12 +341,6 @@ peer that serves no blocks for heights inside its advertised servable range.
 
 ### `RangeUnavailable` — Response, discriminator 5
 
-- **Frame**
-  - payload cap = 9 bytes
-- **Decode** — `BlockSyncMessage::decode`, `validate_block_count`
-  - `start_height <= Height::MAX`
-  - count = 1..=128
-  - exact consumption
 - **Reservation**
   - live `GetBlocks` range with this `start_height` and requested count
   - no block has been consumed from the range
@@ -399,13 +391,13 @@ can be marked implemented.
 
 | Shared ID | GetBlocks evidence |
 | --- | --- |
-| P2P-RG-01 | The catalog plus GB-WF-01 through GB-WF-11, GB-SM-09, and GB-RL-01 close the serving request and its response kinds. |
+| P2P-RG-01 | The catalog plus GB-WF-01 through GB-WF-19, GB-SM-09, and GB-RL-01 close the serving request and its response kinds. |
 | P2P-RG-02 | GB-WF-01 through GB-WF-06, GB-SM-03, GB-SM-05, GB-SM-06, GB-RL-02, and GB-RL-08 cover declared outcomes and sender obligations. |
 | P2P-RG-03 | GB-WF-01 through GB-WF-10, GB-SM-03, and GB-RL-15 enforce the processing order. |
 | P2P-RG-04 | GB-SM-03, GB-SM-06, GB-SM-10, GB-SM-12, GB-SM-17, and GB-SM-18 distinguish invalid, stale, and unavailable work. |
-| P2P-RG-05 | GB-WF-01, GB-WF-02, GB-WF-09, and GB-WF-10 cover allocation caps. |
+| P2P-RG-05 | GB-WF-01, GB-WF-02, GB-WF-09, GB-WF-10, GB-WF-15, GB-WF-17, and GB-WF-19 cover allocation caps. |
 | P2P-RG-06 | GB-WF-11 covers partial-frame state and the read deadline. |
-| P2P-RG-07 | GB-WF-01 through GB-WF-08, GB-WF-10, and GB-WF-12 cover total and canonical decoding. |
+| P2P-RG-07 | GB-WF-01 through GB-WF-08, GB-WF-10, GB-WF-12 through GB-WF-14, GB-WF-16, and GB-WF-18 cover total and canonical decoding. |
 | P2P-RG-08 | GB-RL-01, GB-RL-12, and GB-RL-17 cover checked charges and bounded state results. |
 | P2P-RG-09 | GB-SM-04, GB-SM-13, GB-RL-05 through GB-RL-07, GB-RL-10a through GB-RL-10c, GB-RL-12, GB-RL-16, and GB-RL-19 cover peer and node bounds. |
 | P2P-RG-10 | GB-SM-08 through GB-SM-12, GB-SM-14, GB-SM-17, GB-SM-18, GB-RL-03, GB-RL-04, GB-RL-08, GB-RL-09, and GB-RL-15 cover ownership and settlement. |

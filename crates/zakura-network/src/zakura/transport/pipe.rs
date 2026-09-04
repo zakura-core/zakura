@@ -478,7 +478,7 @@ mod tests {
 
     use super::*;
     use crate::zakura::transport::framed_channel;
-    use crate::zakura::transport::guard::ByteBudget;
+    use crate::zakura::transport::ByteBudget;
 
     const SHAPE: PipeShape = PipeShape {
         service: "test",

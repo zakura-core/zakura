@@ -44,6 +44,7 @@ use zakura_chain::{
 use self::trace::ZakuraConnTrace;
 use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
 use super::trace::{reject_reason_label, ZakuraTrace};
+use super::transport::{worker_framed_channel, FramedWorkerRecv, QueuedFrame};
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -256,6 +257,12 @@ const ZAKURA_CLOSE_OVERSIZE: u32 = 4;
 /// from the malformed-prelude code so peers can tell a parse failure from an
 /// unsupported-but-well-formed stream.
 const ZAKURA_CLOSE_UNKNOWN_STREAM: u32 = 5;
+/// Stream-local reset used when a service generation is replaced or cancelled.
+///
+/// Peers that predate this code treat the reset as connection-terminal, so a
+/// mixed-version peer can reconnect instead of preserving sibling streams on
+/// this exceptional cancellation path.
+const ZAKURA_CLOSE_STREAM_CANCELLED: u32 = 6;
 
 /// Native Zakura endpoint and handler configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3980,13 +3987,13 @@ fn spawn_persistent_stream_worker(
     ordered_session_exit_tx: mpsc::UnboundedSender<OrderedSessionExit>,
 ) -> AdmittedOrderedSession {
     let (to_service_tx, to_service_rx) = mpsc::channel(queue_depth);
-    let (from_service_tx, from_service_rx) = mpsc::channel(queue_depth);
+    let (from_service_tx, from_service_rx) = worker_framed_channel(queue_depth);
     let admitted = AdmittedOrderedSession {
         kind: prelude.stream_kind,
         version: prelude.stream_version,
         session_id: context.stream_id,
         recv: FramedRecv::new(to_service_rx),
-        send: FramedSend::new(from_service_tx),
+        send: from_service_tx,
         cancel_token: context.stream_token.clone(),
     };
 
@@ -4018,7 +4025,7 @@ async fn persistent_stream_worker(
     prelude: StreamPrelude,
     context: StreamWorkerContext,
     inbound_tx: mpsc::Sender<Frame>,
-    outbound_rx: mpsc::Receiver<Frame>,
+    outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
 ) {
     let context = Arc::new(context);
@@ -4118,7 +4125,10 @@ async fn persistent_stream_worker(
         tokio::select! {
             biased;
             _ = context.connection_token.cancelled() => break,
-            _ = context.stream_token.cancelled() => break,
+            _ = context.stream_token.cancelled() => {
+                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_STREAM_CANCELLED));
+                break;
+            }
             outbound = async {
                 match outbound_rx.as_mut() {
                     Some(outbound_rx) => outbound_rx.recv().await,
@@ -4126,13 +4136,30 @@ async fn persistent_stream_worker(
                 }
             } => {
                 match outbound {
-                    Some(frame) => {
-                        if let Err(error) = write_ordered_frame(
-                            &mut send,
-                            frame,
-                            context.limits,
-                            context.outbound_frame_cap,
-                        ).await {
+                    Some(queued_frame) => {
+                        let write_result = write_queued_frame_until_cancelled(
+                            queued_frame,
+                            &context.connection_token,
+                            &context.stream_token,
+                            |frame| {
+                                write_ordered_frame(
+                                    &mut send,
+                                    frame,
+                                    context.limits,
+                                    context.outbound_frame_cap,
+                                )
+                            },
+                        )
+                        .await;
+                        let write_result = match write_result {
+                            QueuedFrameWriteOutcome::Completed(result) => result,
+                            QueuedFrameWriteOutcome::ConnectionCancelled => break,
+                            QueuedFrameWriteOutcome::StreamCancelled => {
+                                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_STREAM_CANCELLED));
+                                break;
+                            }
+                        };
+                        if let Err(error) = write_result {
                             if ordered_stream_write_was_stopped(&error) {
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");
                                 break;
@@ -4480,7 +4507,9 @@ async fn read_frame_with_message_cap(
         }
 
         let mut payload_discriminator = [0];
-        recv.read_exact(&mut payload_discriminator).await?;
+        recv.read_exact(&mut payload_discriminator)
+            .await
+            .map_err(classify_ordered_read_error)?;
         if let Some((stream_kind, stream_version)) = service_message {
             if let Some(payload_cap) = preallocation_payload_cap(
                 stream_kind,
@@ -4497,7 +4526,9 @@ async fn read_frame_with_message_cap(
 
         let mut payload = vec![0; payload_len];
         payload[0] = payload_discriminator[0];
-        recv.read_exact(&mut payload[1..]).await?;
+        recv.read_exact(&mut payload[1..])
+            .await
+            .map_err(classify_ordered_read_error)?;
         Ok::<_, ZakuraHandlerError>(payload)
     })
     .await
@@ -4524,6 +4555,18 @@ fn validate_declared_frame_len(
         });
     }
     Ok(())
+}
+
+/// Treat a generation-cancellation reset as a clean stream-local close.
+fn classify_ordered_read_error(error: iroh::endpoint::ReadExactError) -> ZakuraHandlerError {
+    match &error {
+        iroh::endpoint::ReadExactError::ReadError(iroh::endpoint::ReadError::Reset(code))
+            if *code == VarInt::from_u32(ZAKURA_CLOSE_STREAM_CANCELLED) =>
+        {
+            ZakuraHandlerError::Closed
+        }
+        _ => ZakuraHandlerError::IrohRead(error),
+    }
 }
 
 /// Resolve message-specific allocation caps through the codec that owns the
@@ -4612,6 +4655,68 @@ async fn write_ordered_frame(
         .await
         .map_err(|_| -> BoxError { "Zakura outbound frame write timed out".into() })??;
     Ok(())
+}
+
+/// Write one transport-owned frame while retaining its accounting lease.
+///
+/// The lease remains in scope until the QUIC write succeeds or fails. Dropping
+/// this future, including task cancellation, drops the lease as well.
+#[cfg(test)]
+async fn write_queued_ordered_frame(
+    send: &mut SendStream,
+    queued_frame: QueuedFrame,
+    limits: ZakuraConnectionLimits,
+    max_frame_bytes: u32,
+) -> Result<(), BoxError> {
+    write_queued_frame_with_lease(queued_frame, |frame| {
+        write_ordered_frame(send, frame, limits, max_frame_bytes)
+    })
+    .await
+}
+
+/// Keep an envelope's lease alive for exactly as long as its write future.
+async fn write_queued_frame_with_lease<F, Fut>(
+    queued_frame: QueuedFrame,
+    write: F,
+) -> Result<(), BoxError>
+where
+    F: FnOnce(Frame) -> Fut,
+    Fut: std::future::Future<Output = Result<(), BoxError>>,
+{
+    let (frame, _lease) = queued_frame.into_parts();
+    write(frame).await
+}
+
+/// Retain a queued frame's lease until its write completes or its owner ends.
+///
+/// Cancellation drops the in-progress write future and the lease immediately.
+/// In particular, cancelling one service stream does not wait for the transport
+/// write timeout or turn that local teardown into a connection-wide failure.
+#[derive(Debug)]
+enum QueuedFrameWriteOutcome {
+    Completed(Result<(), BoxError>),
+    ConnectionCancelled,
+    StreamCancelled,
+}
+
+async fn write_queued_frame_until_cancelled<F, Fut>(
+    queued_frame: QueuedFrame,
+    connection_token: &CancellationToken,
+    stream_token: &CancellationToken,
+    write: F,
+) -> QueuedFrameWriteOutcome
+where
+    F: FnOnce(Frame) -> Fut,
+    Fut: std::future::Future<Output = Result<(), BoxError>>,
+{
+    tokio::select! {
+        biased;
+        () = connection_token.cancelled() => QueuedFrameWriteOutcome::ConnectionCancelled,
+        () = stream_token.cancelled() => QueuedFrameWriteOutcome::StreamCancelled,
+        result = write_queued_frame_with_lease(queued_frame, write) => {
+            QueuedFrameWriteOutcome::Completed(result)
+        },
+    }
 }
 
 async fn write_outbound_request_frame(
@@ -7896,7 +8001,11 @@ mod tests {
         const ALPN: &[u8] = b"/zakura/testkit/stream-cancel/0";
 
         let _guard = zakura_test::init();
-        let server = LocalEndpointFactory::new().endpoint(50).await?;
+        let mut server_transport = TransportConfig::default();
+        server_transport.send_window(1_024);
+        let server = LocalEndpointFactory::with_transport_config(server_transport)
+            .endpoint(50)
+            .await?;
         let (conn_tx, mut conn_rx) = mpsc::channel(1);
         let (stream_tx, mut stream_rx) = mpsc::channel(2);
         let router = Router::builder(server)
@@ -7908,7 +8017,13 @@ mod tests {
                 },
             )
             .spawn();
-        let client = LocalEndpointFactory::new().endpoint(51).await?;
+        let mut client_transport = TransportConfig::default();
+        client_transport
+            .stream_receive_window(VarInt::from_u32(1_024))
+            .receive_window(VarInt::from_u32(1_024));
+        let client = LocalEndpointFactory::with_transport_config(client_transport)
+            .endpoint(51)
+            .await?;
         let server_addr = router.endpoint().node_addr().initialized().await;
         client.add_node_addr(server_addr.clone())?;
 
@@ -7920,10 +8035,9 @@ mod tests {
             .expect("server connection is captured")
             .expect("capture handler sends the accepted connection");
         drop(server_conn);
-        let (mut client_send, _client_recv) =
-            timeout(Duration::from_secs(1), client_conn.open_bi())
-                .await
-                .expect("client opens the worker stream")?;
+        let (mut client_send, client_recv) = timeout(Duration::from_secs(1), client_conn.open_bi())
+            .await
+            .expect("client opens the worker stream")?;
         let test_frame = Frame {
             message_type: 1,
             flags: 0,
@@ -7939,7 +8053,7 @@ mod tests {
             .expect("capture handler sends the worker stream");
 
         let mut limits = test_connection_limits();
-        limits.idle_timeout = Duration::from_millis(50);
+        limits.idle_timeout = Duration::from_secs(5);
         let stream_kind = DISCOVERY_STREAM_KIND;
         let connection_token = CancellationToken::new();
         let stream_token = connection_token.child_token();
@@ -7989,6 +8103,78 @@ mod tests {
             ordered_session_exit_tx,
         );
 
+        // Run the production reader on the other endpoint as well. Its small
+        // receive window makes the large response stop after partial frame
+        // progress, so cancellation must reset rather than implicitly finish
+        // the truncated frame.
+        let client_connection_token = CancellationToken::new();
+        let client_stream_token = client_connection_token.child_token();
+        let client_close_cause = CloseCause::new();
+        let (client_freshness_tx, _client_freshness_rx) = watch::channel(Instant::now());
+        let client_permit = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("test semaphore starts with one permit");
+        let client_context = StreamWorkerContext {
+            conn: ZakuraConnTrace::without_peer(2),
+            peer_id: test_peer(56),
+            stream_id: 2,
+            _permit: client_permit,
+            limits,
+            inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
+            outbound_frame_cap: application_frame_cap(&limits, stream),
+            message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
+            connection_token: client_connection_token.clone(),
+            stream_token: client_stream_token,
+            close_cause: client_close_cause.clone(),
+            freshness_tx: client_freshness_tx,
+        };
+        let (client_inbound_tx, _client_inbound_rx) = mpsc::channel(1);
+        let (_client_outbound_tx, client_outbound_rx) = worker_framed_channel(1);
+        let client_worker = tokio::spawn(persistent_stream_worker(
+            client_send,
+            client_recv,
+            prelude,
+            client_context,
+            client_inbound_tx,
+            client_outbound_rx,
+            1,
+        ));
+
+        const LEASED_PAYLOAD_BYTES: u64 = 512 * 1_024;
+        let budget = crate::zakura::regulation::OutstandingByteBudget::new(LEASED_PAYLOAD_BYTES);
+        let mut reservation = budget
+            .try_reserve_owned(LEASED_PAYLOAD_BYTES)
+            .expect("the frame fits the test budget")
+            .expect("the empty test budget admits the frame");
+        admitted
+            .send
+            .try_send_leased(
+                Frame {
+                    message_type: 1,
+                    flags: 0,
+                    payload: vec![
+                        0xab;
+                        usize::try_from(LEASED_PAYLOAD_BYTES)
+                            .expect("the test payload length fits usize")
+                    ],
+                },
+                || {
+                    crate::zakura::regulation::OutstandingByteReservation::transfer_all(
+                        [&mut reservation],
+                        LEASED_PAYLOAD_BYTES,
+                    )
+                    .expect("the reservation covers the large frame")
+                },
+            )
+            .expect("the worker queue accepts the large leased frame");
+        drop(reservation);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            budget.reserved(),
+            LEASED_PAYLOAD_BYTES,
+            "the tiny receive window keeps the partially written frame leased"
+        );
+
         admitted.cancel_token.cancel();
         // The exit must be reported, or the connection loop never prunes the dead
         // generation and never reopens the stream.
@@ -8003,10 +8189,24 @@ mod tests {
             .await
             .expect("stream cancellation stops the worker promptly")
             .expect("worker exit is observed")?;
+        timeout(Duration::from_secs(1), client_worker)
+            .await
+            .expect("the peer treats the cancellation reset as stream-local")
+            .expect("the peer worker does not panic");
         tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "stream reset releases the frame lease"
+        );
         assert!(
             !connection_token.is_cancelled(),
             "stream-local cancellation must not cancel the shared connection"
+        );
+        assert!(
+            !client_connection_token.is_cancelled(),
+            "the peer must not promote a generation reset to connection failure; close cause: {}",
+            client_close_cause.get_or("none")
         );
 
         let (mut sibling_send, _sibling_recv) =
@@ -8162,7 +8362,7 @@ mod tests {
             // read frame to a full service channel (which would itself stop the
             // reader and confound the test). The outbound side is unused here.
             let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
-            let (_outbound_tx, outbound_rx) = mpsc::channel(1);
+            let (_outbound_tx, outbound_rx) = worker_framed_channel(1);
             tokio::spawn(async move { while inbound_rx.recv().await.is_some() {} });
             tokio::spawn(persistent_stream_worker(
                 send,
@@ -8222,6 +8422,134 @@ mod tests {
         client.close().await;
         router.shutdown().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_write_holds_lease_until_write_future_finishes() {
+        let budget = crate::zakura::regulation::OutstandingByteBudget::new(128);
+        let mut reservation = budget
+            .try_reserve_owned(128)
+            .expect("the frame fits the test budget")
+            .expect("the empty test budget admits the frame");
+        let (sender, mut receiver) = worker_framed_channel(1);
+        sender
+            .try_send_leased(
+                Frame {
+                    message_type: 1,
+                    flags: 0,
+                    payload: vec![0; 128],
+                },
+                || {
+                    crate::zakura::regulation::OutstandingByteReservation::transfer_all(
+                        [&mut reservation],
+                        128,
+                    )
+                    .expect("the reservation covers the queued frame")
+                },
+            )
+            .expect("the worker queue has a slot");
+        drop(reservation);
+        let queued = receiver
+            .recv()
+            .await
+            .expect("the worker receives the leased frame");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+
+        let write = tokio::spawn(write_queued_frame_with_lease(
+            queued,
+            move |_frame| async move {
+                let _ = started_tx.send(());
+                let _ = finish_rx.await;
+                Ok(())
+            },
+        ));
+        started_rx
+            .await
+            .expect("the controlled write reaches its pending point");
+        assert_eq!(
+            budget.reserved(),
+            128,
+            "a dequeued frame keeps its lease while the write is pending"
+        );
+
+        let _ = finish_tx.send(());
+        write
+            .await
+            .expect("the controlled write task does not panic")
+            .expect("the controlled write succeeds");
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_cancellation_drops_pending_write_lease_without_cancelling_connection() {
+        let budget = crate::zakura::regulation::OutstandingByteBudget::new(128);
+        let mut reservation = budget
+            .try_reserve_owned(128)
+            .expect("the frame fits the test budget")
+            .expect("the empty test budget admits the frame");
+        let (sender, mut receiver) = worker_framed_channel(1);
+        sender
+            .try_send_leased(
+                Frame {
+                    message_type: 1,
+                    flags: 0,
+                    payload: vec![0; 128],
+                },
+                || {
+                    crate::zakura::regulation::OutstandingByteReservation::transfer_all(
+                        [&mut reservation],
+                        128,
+                    )
+                    .expect("the reservation covers the queued frame")
+                },
+            )
+            .expect("the worker queue has a slot");
+        drop(reservation);
+        let queued = receiver
+            .recv()
+            .await
+            .expect("the worker receives the leased frame");
+
+        let connection_token = CancellationToken::new();
+        let stream_token = connection_token.child_token();
+        let task_connection_token = connection_token.clone();
+        let task_stream_token = stream_token.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let write = tokio::spawn(async move {
+            write_queued_frame_until_cancelled(
+                queued,
+                &task_connection_token,
+                &task_stream_token,
+                move |_frame| async move {
+                    let _ = started_tx.send(());
+                    std::future::pending::<Result<(), BoxError>>().await
+                },
+            )
+            .await
+        });
+
+        started_rx
+            .await
+            .expect("the controlled write reaches its pending point");
+        assert_eq!(budget.reserved(), 128);
+        stream_token.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), write)
+                .await
+                .expect("stream cancellation promptly ends the pending write")
+                .expect("the controlled write task does not panic"),
+            QueuedFrameWriteOutcome::StreamCancelled
+        ));
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "cancelling a pending write releases its frame lease"
+        );
+        assert!(
+            !connection_token.is_cancelled(),
+            "stream-local cancellation must not cancel the shared connection"
+        );
     }
 
     /// Regression for `claude-outbound-write-ignores-message-cap` (persistent
@@ -8289,11 +8617,37 @@ mod tests {
             "test payload must fit the frame cap so only the message cap can reject it"
         );
 
-        let result = write_ordered_frame(&mut send, oversized, limits, frame_cap).await;
+        let failed_write_budget = crate::zakura::regulation::OutstandingByteBudget::new(4_096);
+        let mut failed_write_reservation = failed_write_budget
+            .try_reserve_owned(4_096)
+            .expect("the frame fits the test budget")
+            .expect("the empty test budget admits the frame");
+        let (failed_write_tx, mut failed_write_rx) = worker_framed_channel(1);
+        failed_write_tx
+            .try_send_leased(oversized, || {
+                crate::zakura::regulation::OutstandingByteReservation::transfer_all(
+                    [&mut failed_write_reservation],
+                    4_096,
+                )
+                .expect("the reservation covers the failed frame")
+            })
+            .expect("the worker queue has a slot");
+        drop(failed_write_reservation);
+        let failed_write = failed_write_rx
+            .recv()
+            .await
+            .expect("the worker receives the failed frame");
+
+        let result = write_queued_ordered_frame(&mut send, failed_write, limits, frame_cap).await;
         assert!(
             result.is_err(),
             "write_ordered_frame must reject a payload over the negotiated max_message_bytes \
              before encoding/writing it, mirroring write_response_frame; got {result:?}"
+        );
+        assert_eq!(
+            failed_write_budget.reserved(),
+            0,
+            "a failed transport write must release its frame lease"
         );
 
         // A payload within the negotiated message cap must still be written.
@@ -8302,9 +8656,35 @@ mod tests {
             flags: 0,
             payload: vec![0xcd; 128],
         };
-        write_ordered_frame(&mut send, within_cap, limits, frame_cap)
+        let successful_write_budget = crate::zakura::regulation::OutstandingByteBudget::new(128);
+        let mut successful_write_reservation = successful_write_budget
+            .try_reserve_owned(128)
+            .expect("the frame fits the test budget")
+            .expect("the empty test budget admits the frame");
+        let (successful_write_tx, mut successful_write_rx) = worker_framed_channel(1);
+        successful_write_tx
+            .try_send_leased(within_cap, || {
+                crate::zakura::regulation::OutstandingByteReservation::transfer_all(
+                    [&mut successful_write_reservation],
+                    128,
+                )
+                .expect("the reservation covers the successful frame")
+            })
+            .expect("the worker queue has a slot");
+        drop(successful_write_reservation);
+        let successful_write = successful_write_rx
+            .recv()
+            .await
+            .expect("the worker receives the successful frame");
+
+        write_queued_ordered_frame(&mut send, successful_write, limits, frame_cap)
             .await
             .expect("a frame within the negotiated message cap must still be written");
+        assert_eq!(
+            successful_write_budget.reserved(),
+            0,
+            "a successful transport write must release its frame lease"
+        );
 
         client_conn.close(0u32.into(), b"done");
         client.close().await;

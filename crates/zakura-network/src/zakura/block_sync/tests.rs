@@ -6422,12 +6422,14 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
         })
         .expect("test fills bounded wire queue");
     let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+    let (needed_query_failures, _needed_query_failure_rx) = mpsc::unbounded_channel();
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
         events,
         lifecycle,
+        needed_query_failures,
         peers,
         status,
         candidates,
@@ -13411,11 +13413,7 @@ async fn failed_needed_block_query_retries_without_losing_newer_query_ownership(
         panic!("startup must query needed blocks");
     };
     handle
-        .send(BlockSyncEvent::NeededBlocksQueryFailed {
-            query_id: first_query_id,
-            scope,
-        })
-        .await
+        .send_needed_blocks_query_failure(first_query_id, scope)
         .expect("query failure queues");
 
     assert!(
@@ -13437,18 +13435,10 @@ async fn failed_needed_block_query_retries_without_losing_newer_query_ownership(
     assert_eq!(scope, second_scope);
 
     handle
-        .send(BlockSyncEvent::NeededBlocksQueryFailed {
-            query_id: first_query_id,
-            scope,
-        })
-        .await
+        .send_needed_blocks_query_failure(first_query_id, scope)
         .expect("stale failure queues");
     handle
-        .send(BlockSyncEvent::NeededBlocksQueryFailed {
-            query_id: second_query_id,
-            scope: second_scope,
-        })
-        .await
+        .send_needed_blocks_query_failure(second_query_id, second_scope)
         .expect("current failure queues");
 
     assert!(matches!(
@@ -13485,11 +13475,7 @@ async fn failed_needed_block_query_keeps_retrying_when_action_queue_is_full() {
         panic!("startup must query needed blocks");
     };
     handle
-        .send(BlockSyncEvent::NeededBlocksQueryFailed {
-            query_id: first_query_id,
-            scope,
-        })
-        .await
+        .send_needed_blocks_query_failure(first_query_id, scope)
         .expect("query failure queues");
 
     let action_sender = &handle

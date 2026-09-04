@@ -512,7 +512,6 @@ enum BlockEventDetail {
         #[serde(skip_serializing_if = "Option::is_none")]
         range_start: Option<u64>,
     },
-    NeededBlocksQueryFailed {},
     RetryBodyAvailability {
         hash: String,
     },
@@ -580,9 +579,6 @@ impl BlockEventReceived {
                 range_count: saturating_usize(blocks.len()),
                 range_start: blocks.first().map(|block| height(block.height)),
             },
-            BlockSyncEvent::NeededBlocksQueryFailed { .. } => {
-                BlockEventDetail::NeededBlocksQueryFailed {}
-            }
             #[cfg(test)]
             BlockSyncEvent::NeededBlocks(blocks) => BlockEventDetail::NeededBlocks {
                 range_count: saturating_usize(blocks.len()),

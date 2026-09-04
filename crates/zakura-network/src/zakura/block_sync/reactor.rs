@@ -143,6 +143,8 @@ pub fn spawn_block_sync_reactor(
         mpsc::channel(startup.config.peer_limits.inbound_queue_depth.max(1));
     let events_keepalive = events_tx.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+    let (needed_query_failure_tx, needed_query_failure_rx) = mpsc::unbounded_channel();
+    let needed_query_failure_keepalive = needed_query_failure_tx.clone();
     // Size the action channel so the Sequencer can dispatch a full checkpoint
     // window of `SubmitBlock`s (`submitted_apply_limit`) plus the query/misbehavior
     // spare pool. The resident look-ahead gate — not this channel — bounds body
@@ -248,6 +250,7 @@ pub fn spawn_block_sync_reactor(
     let handle = BlockSyncHandle {
         events: events_tx,
         lifecycle: lifecycle_tx,
+        needed_query_failures: needed_query_failure_tx,
         peers: peers_rx,
         status: status_rx,
         candidates: candidates_rx,
@@ -278,6 +281,8 @@ pub fn spawn_block_sync_reactor(
         events: events_rx,
         _events_keepalive: events_keepalive,
         lifecycle: lifecycle_rx,
+        needed_query_failures: needed_query_failure_rx,
+        _needed_query_failure_keepalive: needed_query_failure_keepalive,
         actions: actions_tx,
         routine_to_reactor: routine_to_reactor_rx,
         _routine_to_reactor_keepalive: routine_to_reactor_keepalive,
@@ -313,6 +318,9 @@ pub(super) struct BlockSyncReactor {
     /// as a consumer moved (not cloned) the handle. The reactor never sends on it.
     _events_keepalive: mpsc::Sender<BlockSyncEvent>,
     lifecycle: mpsc::UnboundedReceiver<BlockSyncEvent>,
+    needed_query_failures: mpsc::UnboundedReceiver<NeededBlocksQueryFailure>,
+    /// Keep the private driver-completion channel open while the reactor lives.
+    _needed_query_failure_keepalive: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
     actions: mpsc::Sender<BlockSyncAction>,
     /// Shared routine→reactor channel: serving (`ServeGetBlocks`), status
     /// advertisement (`StatusReceived`), the producer re-query ping
@@ -424,6 +432,10 @@ impl BlockSyncReactor {
                 event = self.lifecycle.recv() => {
                     let Some(event) = event else { break };
                     self.handle_event(event).await;
+                }
+                failure = self.needed_query_failures.recv() => {
+                    let Some(failure) = failure else { break };
+                    self.handle_needed_blocks_query_failed(failure.query_id, failure.scope);
                 }
                 event = self.events.recv() => {
                     let Some(event) = event else { break };
@@ -622,9 +634,6 @@ impl BlockSyncReactor {
             } => {
                 self.handle_scoped_needed_blocks(query_id, scope, body_anchor, blocks)
                     .await;
-            }
-            BlockSyncEvent::NeededBlocksQueryFailed { query_id, scope } => {
-                self.handle_needed_blocks_query_failed(query_id, scope);
             }
             #[cfg(test)]
             BlockSyncEvent::NeededBlocks(blocks) => {

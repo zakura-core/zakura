@@ -6,6 +6,7 @@ use super::{
     *,
 };
 use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState};
+use std::num::NonZeroU64;
 
 /// Hard ceiling on outbound block-range requests kept in flight to one peer.
 ///
@@ -24,6 +25,13 @@ pub struct BlockSyncFrontiers {
     pub verified_block_tip: block::Height,
     /// Hash of [`verified_block_tip`](Self::verified_block_tip).
     pub verified_block_hash: block::Hash,
+}
+
+/// Failed body-missing metadata query returned through the private driver channel.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct NeededBlocksQueryFailure {
+    pub(super) query_id: NonZeroU64,
+    pub(super) scope: zakura_header_chain::BodyWorkAuthority,
 }
 
 /// Startup inputs for the dependency-neutral block-sync reactor.
@@ -115,6 +123,7 @@ impl BlockSyncStartup {
 pub struct BlockSyncHandle {
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
+    pub(super) needed_query_failures: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) status: watch::Receiver<BlockSyncStatus>,
     pub(super) candidates: watch::Receiver<ZakuraBlockSyncCandidateState>,
@@ -169,6 +178,17 @@ impl BlockSyncHandle {
         self.lifecycle
             .send(event)
             .map_err(|error| mpsc::error::SendError(error.0))
+    }
+
+    /// Report one failed body-missing metadata query to the reactor.
+    pub fn send_needed_blocks_query_failure(
+        &self,
+        query_id: NonZeroU64,
+        scope: zakura_header_chain::BodyWorkAuthority,
+    ) -> Result<(), mpsc::error::SendError<()>> {
+        self.needed_query_failures
+            .send(NeededBlocksQueryFailure { query_id, scope })
+            .map_err(|_| mpsc::error::SendError(()))
     }
 
     /// Request a fresh body-availability episode for one exact persistent alarm.

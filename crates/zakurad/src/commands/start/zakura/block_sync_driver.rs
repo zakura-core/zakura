@@ -472,10 +472,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     Err(error) => {
                         trace.trace_needed_blocks_query_failed(&format!("{error}"), started);
                         if block_sync
-                            .send_control(BlockSyncEvent::NeededBlocksQueryFailed {
-                                query_id,
-                                scope,
-                            })
+                            .send_needed_blocks_query_failure(query_id, scope)
                             .is_err()
                         {
                             error!("block-sync reactor closed before needed-body query failure");

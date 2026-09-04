@@ -96,9 +96,7 @@ impl ServingStep {
 pub(super) enum ByteCap {
     /// Use the production maximum.
     All,
-    /// Stop before even the first block fits.
-    BeforeFirst,
-    /// End exactly after the first block.
+    /// Fit one block but stop before the second.
     ExactlyFirst,
     /// End exactly after the first two blocks.
     ExactlyFirstTwo,
@@ -385,7 +383,6 @@ pub(super) enum ServingEvidence {
     OverlongResponseStoppedAtRequestedCount,
     GenesisReadyResponseCompleted,
     ByteCapStoppedPrefix,
-    ByteCapStoppedBeforeFirstBlock,
     NonContiguousResponseStopped,
     EmptyReadyResponseTerminated,
     NonEmptyReadyResponseTerminated,
@@ -573,7 +570,6 @@ impl ServingCoverage {
                     && has(Evidence::OverlongResponseStoppedAtRequestedCount)
                     && has(Evidence::GenesisReadyResponseCompleted)
                     && has(Evidence::ByteCapStoppedPrefix)
-                    && has(Evidence::ByteCapStoppedBeforeFirstBlock)
                     && has(Evidence::NonContiguousResponseStopped)
                     && has(Evidence::EmptyReadyResponseTerminated)
                     && has(Evidence::NonEmptyReadyResponseTerminated)

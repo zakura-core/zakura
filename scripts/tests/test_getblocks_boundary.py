@@ -1,7 +1,13 @@
 """Boundary checks must not mistake a stable unfinished owner for a drained run."""
 from pathlib import Path
+from contextlib import redirect_stdout
+import importlib.util
+import io
+import json
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from getblocks_boundary import COUNTER_FAMILIES, await_quiescence, unsettled
@@ -21,6 +27,37 @@ class Clock:
 
 
 class BoundaryTests(unittest.TestCase):
+    def test_default_finalizer_waits_for_transport_session_expiry(self):
+        module = importlib.util.spec_from_file_location(
+            "finalizer", Path(__file__).parents[1] / "finalize-getblocks-capture.py")
+        finalizer = importlib.util.module_from_spec(module)
+        module.loader.exec_module(finalizer)
+        raw, clock = metrics_for(*episode()), Clock()
+        unfinished = raw.replace(b"sync_block_capture_sessions_finished 1", b"sync_block_capture_sessions_finished 0")
+
+        def response(*args, **kwargs):
+            # The process stopped, but its remote session can survive until the
+            # production QUIC idle timeout. All request owners already drained.
+            return io.BytesIO(unfinished if clock.now < 150 else raw)
+
+        def await_with_test_clock(scrape, timeout):
+            return await_quiescence(scrape, timeout, clock=clock.time, sleep=clock.sleep)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "clients-stopped.json").write_text(json.dumps({
+                "schema_version": 1, "no_new_clients": True,
+                "clients": [{"MainPID": 0, "ActiveState": "inactive"}],
+            }))
+            with patch.object(sys, "argv", ["finalize-getblocks-capture.py", directory]), \
+                    patch.object(finalizer, "urlopen", response), \
+                    patch.object(finalizer, "await_quiescence", await_with_test_clock), \
+                    redirect_stdout(io.StringIO()):
+                finalizer.main()
+            self.assertEqual(clock.now, 152)
+            self.assertEqual((root / "final-metrics.prom").read_bytes(), raw)
+            self.assertTrue(json.loads((root / "capture-boundary.json").read_text())["quiescent_counters_verified"])
+
     def test_two_stable_drained_samples_are_required(self):
         raw = metrics_for(*episode())
         clock, calls = Clock(), []

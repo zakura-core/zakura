@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 
 
-SCRIPT = Path(__file__).parents[1] / "import-getblocks-arrivals.py"
+SCRIPT = Path(__file__).parents[1] / "getblocks_capture.py"
 SPEC = importlib.util.spec_from_file_location("getblocks_arrivals", SCRIPT)
 arrivals = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(arrivals)
@@ -47,6 +47,26 @@ sync_block_capture_decoded_messages{kind="get_blocks"} 2
 
 
 class ImportTests(unittest.TestCase):
+    def test_metric_label_order_does_not_change_counter_identity(self):
+        first = b'sync_block_capture_wait_events{stage="admission",phase="ready"} 2\n'
+        second = b'sync_block_capture_wait_events{phase="ready",stage="admission"} 2\n'
+        self.assertEqual(
+            arrivals.read_capture_metrics(first, {"wait_events"}),
+            arrivals.read_capture_metrics(second, {"wait_events"}),
+        )
+        with self.assertRaisesRegex(arrivals.IncompleteCapture, "duplicate capture metric sample"):
+            arrivals.read_capture_metrics(first + second, {"wait_events"})
+
+    def test_selected_metrics_reject_duplicate_labels_and_inexact_counts(self):
+        for sample in [
+            b'sync_block_capture_wait_events{stage="admission",stage="admission"} 2\n',
+            b'sync_block_capture_wait_events{phase="ready"} 9007199254740992\n',
+            b'sync_block_capture_wait_events{phase="ready"} 1.5\n',
+            b'sync_block_capture_wait_events{phase="ready"} NaN\n',
+        ]:
+            with self.subTest(sample=sample), self.assertRaises(arrivals.IncompleteCapture):
+                arrivals.read_capture_metrics(sample, {"wait_events"})
+
     def test_duplicate_ranges_remain_distinct_and_reconnect_keeps_identity(self):
         first = episode()
         second = [dict(item, session_id=2, ts=item["ts"] + 100) for item in episode()]

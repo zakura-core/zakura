@@ -1746,6 +1746,30 @@ fn config_deserialize_clamps_sub_floor_request_inflight_block_bytes() {
 }
 
 #[test]
+fn config_deserialize_requires_room_for_one_maximum_size_block() {
+    let minimum = u32::try_from(block::MAX_BLOCK_BYTES).unwrap();
+    for cap in [0, 1, minimum - 1] {
+        let error = toml::from_str::<crate::Config>(&format!(
+            "[zakura.block_sync]\nmax_response_bytes = {cap}"
+        ))
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("max_response_bytes must cover one maximum-size block"));
+    }
+    for cap in [minimum, minimum + 1, DEFAULT_BS_MAX_RESPONSE_BYTES] {
+        let config = toml::from_str::<crate::Config>(&format!(
+            "[zakura.block_sync]\nmax_response_bytes = {cap}"
+        ))
+        .unwrap();
+        assert_eq!(
+            config.zakura.block_sync.advertised_max_response_bytes(),
+            cap
+        );
+    }
+}
+
+#[test]
 fn codec_round_trips_every_message_variant() {
     round_trip(BlockSyncMessage::Status(status()));
     round_trip(BlockSyncMessage::GetBlocks {
@@ -11935,14 +11959,22 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
 }
 
 #[tokio::test]
-async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
-    let blocks = mainnet_blocks_1_to_3();
+async fn reactor_serves_blocks_with_count_and_byte_clamps() {
+    let mut blocks = mainnet_blocks_1_to_3();
+    // This serialization fixture exercises the byte boundary, not consensus validation.
+    blocks[0] = Arc::new(zakura_chain::block::tests::generate::large_multi_transaction_block());
     let block1_size = block_size(&blocks[0]);
+    let minimum_cap = u32::try_from(block::MAX_BLOCK_BYTES).unwrap();
+    assert!(block1_size <= minimum_cap);
+    assert!(block1_size + block_size(&blocks[1]) > minimum_cap);
     let mut config = ZakuraBlockSyncConfig {
         max_blocks_per_response: 2,
-        max_response_bytes: block1_size,
+        max_response_bytes: minimum_cap,
         ..ZakuraBlockSyncConfig::default()
     };
+    config
+        .validate()
+        .expect("the minimum response cap is valid");
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
     let startup = BlockSyncStartup::new(

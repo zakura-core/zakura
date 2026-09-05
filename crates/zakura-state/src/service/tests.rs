@@ -72,6 +72,15 @@ fn block_range_response_stops_before_crossing_its_byte_limit() {
     );
 }
 
+#[test]
+fn block_range_response_includes_a_maximum_size_first_block() {
+    let maximum = usize::try_from(block::MAX_BLOCK_BYTES).unwrap();
+    let cap = u32::try_from(block::MAX_BLOCK_BYTES).unwrap();
+    let result =
+        super::collect_bounded_height_range(Height(10), 2, cap, |height| Some((height, maximum)));
+    assert_eq!(result, vec![(Height(10), Height(10), maximum)]);
+}
+
 #[tokio::test]
 async fn descendant_arriving_after_a_local_parent_failure_completes_immediately() {
     let network = Network::Mainnet;

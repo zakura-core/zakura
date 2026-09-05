@@ -54,6 +54,9 @@ pub(super) fn serving_cost(
 
 /// Validate that every legal request can eventually fit every configured bound.
 pub(super) fn validate_config(config: &ZakuraBlockSyncConfig) -> Result<(), &'static str> {
+    if u64::from(config.max_response_bytes) < block::MAX_BLOCK_BYTES {
+        return Err("max_response_bytes must cover one maximum-size block");
+    }
     let regulation = &config.get_blocks_regulation;
     if regulation.request_overhead_bytes == 0 {
         return Err("get_blocks_regulation.request_overhead_bytes must be greater than zero");
@@ -1184,13 +1187,13 @@ mod tests {
         assert_eq!(cost.charge, cost.response_cap + 17);
 
         config.max_blocks_per_response = 3;
-        config.max_response_bytes = 5;
+        config.max_response_bytes = u32::try_from(block::MAX_BLOCK_BYTES).unwrap();
         let byte_limited = serving_cost(&config, MAX_BS_BLOCKS_PER_REQUEST)
             .expect("the byte-limited cost is representable");
         assert_eq!(byte_limited.count, 3);
         assert_eq!(
             byte_limited.response_cap,
-            GET_BLOCKS_TERMINAL_PAYLOAD_BYTES + 3 + 5,
+            GET_BLOCKS_TERMINAL_PAYLOAD_BYTES + 3 + block::MAX_BLOCK_BYTES,
             "the body-byte cap is separate from discriminators and the terminal frame",
         );
     }
@@ -1208,17 +1211,17 @@ mod tests {
         );
 
         let mut small_response = ZakuraBlockSyncConfig {
-            max_response_bytes: 1,
+            max_response_bytes: u32::try_from(block::MAX_BLOCK_BYTES).unwrap(),
             ..ZakuraBlockSyncConfig::default()
         };
         let largest = serving_cost(&small_response, MAX_BS_BLOCKS_PER_REQUEST)
-            .expect("the one-byte response policy is representable");
+            .expect("the minimum response policy is representable");
         small_response.get_blocks_regulation.peer_outstanding_bytes = largest.response_cap;
         small_response.get_blocks_regulation.node_outstanding_bytes = largest.response_cap;
         assert_eq!(
             validate_config(&small_response),
             Ok(()),
-            "a configured response cap may be smaller than one maximum-size block",
+            "the minimum response cap and its framing allowance admit any single block",
         );
     }
 

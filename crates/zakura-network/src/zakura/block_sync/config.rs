@@ -257,7 +257,9 @@ pub struct ZakuraBlockSyncConfig {
     /// Initial per-peer BBR cwnd (cold-start point), in blocks; converges to the
     /// BDP-derived target once the first delivery is measured.
     pub initial_inflight_requests: u32,
-    /// Maximum total response bytes this node advertises per `GetBlocks` response.
+    /// Maximum serialized block bytes this node advertises per `GetBlocks` response.
+    /// Must be at least [`block::MAX_BLOCK_BYTES`] so any single valid block fits.
+    /// Message discriminators and the response terminator are reserved separately.
     pub max_response_bytes: u32,
     /// Maximum estimated bytes reserved for outstanding block-body requests: a
     /// DoS/pacing bound on in-flight wire data, released at receipt. Received

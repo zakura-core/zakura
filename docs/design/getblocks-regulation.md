@@ -38,8 +38,10 @@ queue entries; there can also be one blocked input per live session. That input
 may own a session slot while waiting for a node slot.
 
 The query lease follows the dispatched action, the underlying state future, and
-the returned blocks. Dropping request ownership cancels delivery and prevents
-queued work from starting. A running read drains even after timeout or disconnect,
+the returned blocks. Dropping request ownership cancels delivery. Ledger closure and the one-time
+query claim share a synchronized state. Closure before the claim prevents the
+read; a successful claim retains capacity even if closure immediately follows.
+A claimed read drains even after timeout or disconnect,
 because dropping its awaiter would not stop blocking state work. Each lease
 authorizes at most one query. A read that never completes keeps its capacity;
 the timeout cannot promise to terminate the underlying storage operation.

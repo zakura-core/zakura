@@ -32,7 +32,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/zakura-core/zakura"
 homepage = "https://github.com/zakura-core/zakura"
 keywords = ["zakura", "zcash"]
-rust-version = "1.91"
+rust-version = "1.97"
 edition = "2021"
 
 [workspace.dependencies]

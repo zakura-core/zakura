@@ -62,7 +62,7 @@ cargo nextest run --profile zakura-integration
 Zakura is a Zcash full node implementation in Rust. It is a validator node — it excludes features not strictly needed for block validation and chain sync.
 
 - **Rust edition**: 2021
-- **MSRV**: 1.91 (unified across the library crates and the zakurad binary)
+- **MSRV**: 1.97 (unified across the library crates and the zakurad binary)
 - **Database format version**: defined in `crates/zakura-state/src/constants.rs`
 
 ## Crate Architecture

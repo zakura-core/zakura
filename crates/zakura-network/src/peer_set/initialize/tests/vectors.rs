@@ -2480,7 +2480,7 @@ async fn spawn_replenishment_crawler_with(
                 .expect("replenishment connection observer remains open");
 
             if remaining_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failures| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |failures| {
                     failures.checked_sub(1)
                 })
                 .is_ok()

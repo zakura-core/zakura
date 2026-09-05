@@ -9,6 +9,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
+use tokio::sync::Notify;
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
@@ -38,18 +39,27 @@ pub(crate) fn block_sync_streams() -> &'static [Stream] {
 #[derive(Clone, Debug)]
 pub struct BlockSyncPeerSession {
     peer_id: ZakuraPeerId,
+    session_id: u64,
     direction: ServicePeerDirection,
     send: FramedSend,
     cancel_token: CancellationToken,
+    /// One stored wake released after the reactor installs this serving handle.
+    reactor_ready: Arc<Notify>,
 }
 
 impl BlockSyncPeerSession {
-    pub(crate) fn new(session: &PeerStreamSession, direction: ServicePeerDirection) -> Self {
+    pub(crate) fn new(
+        session: &PeerStreamSession,
+        session_id: u64,
+        direction: ServicePeerDirection,
+    ) -> Self {
         Self {
             peer_id: session.peer_id().clone(),
+            session_id,
             direction,
             send: session.sender(),
             cancel_token: session.cancel_token(),
+            reactor_ready: Arc::new(Notify::new()),
         }
     }
 
@@ -62,17 +72,35 @@ impl BlockSyncPeerSession {
         send: FramedSend,
         cancel_token: CancellationToken,
     ) -> Self {
+        Self::for_test_with_session_id(peer_id, 0, send, cancel_token)
+    }
+
+    /// Build a test session with an explicit generation for ordering tests.
+    #[cfg(test)]
+    pub(super) fn for_test_with_session_id(
+        peer_id: ZakuraPeerId,
+        session_id: u64,
+        send: FramedSend,
+        cancel_token: CancellationToken,
+    ) -> Self {
         Self {
             peer_id,
+            session_id,
             direction: ServicePeerDirection::Outbound,
             send,
             cancel_token,
+            reactor_ready: Arc::new(Notify::new()),
         }
     }
 
     /// Authenticated peer identity for this block-sync session.
     pub fn peer_id(&self) -> &ZakuraPeerId {
         &self.peer_id
+    }
+
+    /// Reactor generation that owns this stream session.
+    pub(super) fn session_id(&self) -> u64 {
+        self.session_id
     }
 
     /// Direction of the underlying Zakura connection.
@@ -83,6 +111,16 @@ impl BlockSyncPeerSession {
     /// Peer disconnect/local shutdown cancellation token.
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel_token.clone()
+    }
+
+    /// Wait until the reactor has installed or rejected this exact session.
+    pub(super) async fn wait_until_reactor_ready(&self) {
+        self.reactor_ready.notified().await;
+    }
+
+    /// Release the peer routine after reactor-side admission finishes.
+    pub(super) fn mark_reactor_ready(&self) {
+        self.reactor_ready.notify_one();
     }
 
     /// Current free slots in this peer's bounded outbound stream queue.
@@ -177,6 +215,90 @@ impl BlockSyncPeerSession {
         .await
     }
 
+    /// Queue one block response and transfer its accounted bytes to transport.
+    pub(super) fn try_send_regulated_block(
+        &self,
+        block: Arc<block::Block>,
+        permit: &mut super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(), OrderedSendError> {
+        self.try_send_regulated_message(BlockSyncMessage::Block(block), permit)
+    }
+
+    /// Queue a regulated successful-response terminator.
+    #[cfg(test)]
+    pub(super) fn try_send_regulated_blocks_done(
+        &self,
+        start_height: block::Height,
+        returned: u32,
+        permit: &mut super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(), OrderedSendError> {
+        self.try_send_regulated_message(
+            BlockSyncMessage::BlocksDone {
+                start_height,
+                returned,
+            },
+            permit,
+        )
+    }
+
+    /// Transfer response bytes only when a transport queue slot is available.
+    pub(super) fn try_send_regulated_message(
+        &self,
+        msg: BlockSyncMessage,
+        permit: &mut super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(), OrderedSendError> {
+        let (frame, accounted_bytes) = Self::encode_regulated_message(msg, permit)?;
+        self.send
+            .try_send_leased(frame, || permit.transfer_frame(accounted_bytes))
+            .map_err(|error| {
+                let send_error = if error.is_full() {
+                    OrderedSendError::Full
+                } else if error.is_closed() {
+                    OrderedSendError::Closed
+                } else {
+                    // Compatibility senders do not support attaching leases.
+                    OrderedSendError::Closed
+                };
+                drop(error.into_frame());
+                send_error
+            })
+    }
+
+    /// Wait for transport capacity without releasing the request's reservations.
+    pub(super) async fn send_regulated_message(
+        &self,
+        msg: BlockSyncMessage,
+        permit: &mut super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(), OrderedSendError> {
+        let (frame, accounted_bytes) = Self::encode_regulated_message(msg, permit)?;
+        self.send
+            .send_leased(frame, || permit.transfer_frame(accounted_bytes))
+            .await
+            .map_err(|_| OrderedSendError::Closed)
+    }
+
+    fn encode_regulated_message(
+        msg: BlockSyncMessage,
+        permit: &super::serving_regulation::GetBlocksServingPermit,
+    ) -> Result<(Frame, u64), OrderedSendError> {
+        let frame = msg
+            .encode_frame()
+            .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+        let accounted_bytes = u64::try_from(frame.payload.len()).map_err(|_| {
+            OrderedSendError::Encode(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "block-sync frame payload length does not fit in u64",
+            )))
+        })?;
+        if !permit.can_transfer_frame(accounted_bytes) {
+            return Err(OrderedSendError::Encode(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded GetBlocks response exceeded its admitted byte cap",
+            ))));
+        }
+        Ok((frame, accounted_bytes))
+    }
+
     fn try_send_message(&self, msg: BlockSyncMessage) -> Result<(), OrderedSendError> {
         let frame = msg
             .encode_frame()
@@ -212,7 +334,7 @@ pub(crate) struct BlockSyncService {
 #[derive(Debug)]
 struct BlockSyncServiceInner {
     config: ZakuraBlockSyncConfig,
-    lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
+    peer_lifecycle: mpsc::UnboundedSender<BlockSyncPeerLifecycleEvent>,
     /// Shared download primitives every per-peer pipe-routine is wired with at
     /// `add_peer` (per-peer routines). `None` for the inert/handle-less constructors that never
     /// spawn routines (they only observe `events`/`lifecycle`).
@@ -276,6 +398,27 @@ impl BlockSyncServiceInner {
         }
         true
     }
+
+    /// Roll back a service admission that could not reach the reactor.
+    fn abandon_session_admission(
+        &self,
+        peer: &ZakuraPeerId,
+        conn_id: ZakuraConnId,
+        session_id: u64,
+    ) {
+        if let Ok(mut active_peers) = self.active_peers.lock() {
+            if active_peers
+                .get(peer)
+                .is_some_and(|record| record.conn_id == conn_id && record.session_id == session_id)
+            {
+                active_peers.remove(peer);
+            }
+        }
+
+        if let Some(wiring) = &self.routine_wiring {
+            wiring.registry.remove_session(peer, session_id);
+        }
+    }
 }
 
 impl BlockSyncService {
@@ -287,7 +430,7 @@ impl BlockSyncService {
         Self {
             inner: Arc::new(BlockSyncServiceInner {
                 config,
-                lifecycle: handle.lifecycle.clone(),
+                peer_lifecycle: handle.peer_lifecycle.clone(),
                 routine_wiring: handle.routine_wiring.clone(),
                 peer_snapshot: handle.subscribe_peer_snapshot(),
                 candidates: handle.subscribe_candidate_state(),
@@ -325,7 +468,7 @@ impl BlockSyncService {
         Self {
             inner: Arc::new(BlockSyncServiceInner {
                 config,
-                lifecycle: handle.lifecycle.clone(),
+                peer_lifecycle: handle.peer_lifecycle.clone(),
                 routine_wiring: handle.routine_wiring.clone(),
                 peer_snapshot: handle.subscribe_peer_snapshot(),
                 candidates: handle.subscribe_candidate_state(),
@@ -344,21 +487,28 @@ impl BlockSyncService {
         config: ZakuraBlockSyncConfig,
     ) -> (Self, mpsc::Receiver<BlockSyncEvent>) {
         let (events, event_rx) = mpsc::channel(config.peer_limits.inbound_queue_depth.max(1));
-        let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let (peer_lifecycle, mut peer_lifecycle_rx) = mpsc::unbounded_channel();
         let (_peer_snapshot_tx, peer_snapshot) =
             watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
         let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
-        let events_for_lifecycle = events.clone();
         tokio::spawn(async move {
-            while let Some(event) = lifecycle_rx.recv().await {
-                let _ = events_for_lifecycle.send(event).await;
+            while let Some(event) = peer_lifecycle_rx.recv().await {
+                let public_event = match event {
+                    BlockSyncPeerLifecycleEvent::Connected(session) => {
+                        BlockSyncEvent::PeerConnected(session)
+                    }
+                    BlockSyncPeerLifecycleEvent::Disconnected { peer, .. } => {
+                        BlockSyncEvent::PeerDisconnected(peer)
+                    }
+                };
+                let _ = events.send(public_event).await;
             }
         });
         (
             Self {
                 inner: Arc::new(BlockSyncServiceInner {
                     config,
-                    lifecycle,
+                    peer_lifecycle,
                     routine_wiring: None,
                     peer_snapshot,
                     candidates,
@@ -550,21 +700,9 @@ impl Service for BlockSyncService {
         let service_cancel_token = session.cancel_token();
         let connection_cancel_token = peer.cancel_token();
         let close_cause = peer.close_cause();
-        let block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
-        let session_id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
         let conn_id = peer.conn_id;
-        let (_session_peer, _stream_kind, _stream_version, recv, send, _session_cancel) =
-            session.into_parts();
 
-        // Production outbound block-sync frames go directly through
-        // `BlockSyncPeerSession` (the per-peer routine's `try_send_get_blocks` /
-        // the reactor's `try_send_status`/serving sends), so the raw transport
-        // sender taken from the stream here is redundant. The outbound stream stays
-        // alive through the `BlockSyncPeerSession` clone the reactor holds, so
-        // nothing is lost by dropping it.
-        drop(send);
-
-        let (old_record, re_admitted_after_no_progress, routine_generation) = {
+        let (old_record, re_admitted_after_no_progress, routine_generation, session_id) = {
             let mut active_peers = self
                 .inner
                 .active_peers
@@ -625,6 +763,10 @@ impl Service for BlockSyncService {
                 } else {
                     (None, false)
                 };
+            // Production uses the registry's globally unique routine generation.
+            // Handle-less tests use the service-local fallback.
+            let session_id = routine_generation
+                .unwrap_or_else(|| self.inner.next_session_id.fetch_add(1, Ordering::Relaxed));
             let old_record = active_peers.insert(
                 peer_id.clone(),
                 BlockSyncPeerRecord {
@@ -638,8 +780,16 @@ impl Service for BlockSyncService {
                 old_record,
                 re_admitted_after_no_progress,
                 routine_generation,
+                session_id,
             )
         };
+        let block_sync_session = BlockSyncPeerSession::new(&session, session_id, peer.direction);
+        let (_session_peer, _stream_kind, _stream_version, recv, send, _session_cancel) =
+            session.into_parts();
+
+        // Production outbound frames go through `BlockSyncPeerSession`; its
+        // sender clone keeps the stream alive after this redundant half drops.
+        drop(send);
         if let Some(old_record) = old_record {
             old_record.cancel_token.cancel();
         }
@@ -652,14 +802,17 @@ impl Service for BlockSyncService {
 
         let run_cancel = service_cancel_token.clone();
         let on_teardown = {
-            let lifecycle = self.inner.lifecycle.clone();
+            let peer_lifecycle = self.inner.peer_lifecycle.clone();
             let peer_id = peer_id.clone();
             let inner = self.inner.clone();
             move || {
                 let should_notify = inner.finish_session(&peer_id, conn_id, session_id);
 
                 if should_notify {
-                    let _ = lifecycle.send(BlockSyncEvent::PeerDisconnected(peer_id));
+                    let _ = peer_lifecycle.send(BlockSyncPeerLifecycleEvent::Disconnected {
+                        peer: peer_id,
+                        session_id,
+                    });
                 }
             }
         };
@@ -671,6 +824,22 @@ impl Service for BlockSyncService {
                 connection_cancel_token.cancel();
             }
         };
+        // Queue admission before spawning the reader. `Notify` stores the ready
+        // permit if the reactor processes this event before the task begins.
+        if self
+            .inner
+            .peer_lifecycle
+            .send(BlockSyncPeerLifecycleEvent::Connected(
+                block_sync_session.clone(),
+            ))
+            .is_err()
+        {
+            service_cancel_token.cancel();
+            self.inner
+                .abandon_session_admission(&peer_id, conn_id, session_id);
+            return;
+        }
+
         // the per-peer pipe-routine is spawned HERE (the pipe spawn point), so
         // a protocol reject still cancels the whole connection via
         // `handle_pipe_exit`. The routine owns `recv` (the transport read), decodes
@@ -686,34 +855,50 @@ impl Service for BlockSyncService {
             let block_sync_session = block_sync_session.clone();
             let peer_id = peer_id.clone();
             async move {
-                let result = match routine_wiring {
-                    Some(wiring) => {
-                        let generation = routine_generation.expect(
+                let reactor_ready = if routine_wiring.is_some() {
+                    tokio::select! {
+                        () = block_sync_session.wait_until_reactor_ready() => true,
+                        () = run_cancel.cancelled() => false,
+                    }
+                } else {
+                    true
+                };
+                let result = if !reactor_ready || run_cancel.is_cancelled() {
+                    Ok(())
+                } else {
+                    match routine_wiring {
+                        Some(wiring) => {
+                            let generation = routine_generation.expect(
                             "production block-sync wiring allocates a routine generation before spawn",
                         );
-                        let routine = super::peer_routine::PeerRoutine::new(
-                            peer_id,
-                            conn_id,
-                            block_sync_session,
-                            recv,
-                            wiring.config,
-                            !re_admitted_after_no_progress,
-                            generation,
-                            wiring.budget,
-                            wiring.work,
-                            wiring.registry,
-                            wiring.received_throughput,
-                            wiring.sequencer_input,
-                            wiring.sequencer_input_bytes,
-                            wiring.sequencer_input_decoded_attributed_memory_bytes,
-                            wiring.routine_to_reactor,
-                            wiring.view,
-                            run_cancel,
-                            wiring.trace,
-                        );
-                        routine.run().await
+                            let serving = wiring
+                                .serving_regulator
+                                .session(peer_id.clone(), generation);
+                            let routine = super::peer_routine::PeerRoutine::new(
+                                peer_id,
+                                conn_id,
+                                block_sync_session,
+                                recv,
+                                wiring.config,
+                                !re_admitted_after_no_progress,
+                                generation,
+                                wiring.budget,
+                                wiring.work,
+                                wiring.registry,
+                                wiring.received_throughput,
+                                wiring.sequencer_input,
+                                wiring.sequencer_input_bytes,
+                                wiring.sequencer_input_decoded_attributed_memory_bytes,
+                                wiring.routine_to_reactor,
+                                serving,
+                                wiring.view,
+                                run_cancel,
+                                wiring.trace,
+                            );
+                            routine.run().await
+                        }
+                        None => drain_inbound(recv, run_cancel).await,
                     }
-                    None => drain_inbound(recv, run_cancel).await,
                 };
                 handle_pipe_exit("block-sync", &connection_cancel_token, &close_cause, result);
             }
@@ -727,11 +912,6 @@ impl Service for BlockSyncService {
             on_panic,
             pipe,
         );
-
-        let _ = self
-            .inner
-            .lifecycle
-            .send(BlockSyncEvent::PeerConnected(block_sync_session));
     }
 
     fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
@@ -805,8 +985,11 @@ impl Service for BlockSyncService {
         record.cancel_token.cancel();
         let _ = self
             .inner
-            .lifecycle
-            .send(BlockSyncEvent::PeerDisconnected(peer.clone()));
+            .peer_lifecycle
+            .send(BlockSyncPeerLifecycleEvent::Disconnected {
+                peer: peer.clone(),
+                session_id: record.session_id,
+            });
     }
 
     fn deliver_frame(

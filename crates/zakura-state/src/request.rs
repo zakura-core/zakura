@@ -1727,6 +1727,8 @@ pub enum ReadRequest {
         start: block::Height,
         /// Maximum number of blocks to return.
         count: u32,
+        /// Maximum total encoded bytes across all returned block bodies.
+        max_response_bytes: u32,
     },
 
     /// Returns contiguous committed blocks by height from the finalized state,

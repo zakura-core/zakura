@@ -39,6 +39,48 @@ use crate::{
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
 
+#[test]
+fn block_range_response_stops_before_crossing_its_byte_limit() {
+    let sizes = [3usize, 2, 4];
+    let exact = super::collect_bounded_height_range(Height(10), 3, 5, |height| {
+        let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
+        sizes.get(index).copied().map(|size| (index, size))
+    });
+    assert_eq!(
+        exact,
+        vec![(Height(10), 0, 3), (Height(11), 1, 2)],
+        "the exact-fit prefix is returned and the first over-limit block is excluded",
+    );
+
+    let one_byte_short = super::collect_bounded_height_range(Height(10), 3, 4, |height| {
+        let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
+        sizes.get(index).copied().map(|size| (index, size))
+    });
+    assert_eq!(
+        one_byte_short,
+        vec![(Height(10), 0, 3)],
+        "a prefix that would cross the cap by one byte stops before that block",
+    );
+
+    let first_too_large = super::collect_bounded_height_range(Height(10), 3, 2, |height| {
+        let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
+        sizes.get(index).copied().map(|size| (index, size))
+    });
+    assert!(
+        first_too_large.is_empty(),
+        "a first block larger than the response budget is not retained",
+    );
+}
+
+#[test]
+fn block_range_response_includes_a_maximum_size_first_block() {
+    let maximum = usize::try_from(block::MAX_BLOCK_BYTES).unwrap();
+    let cap = u32::try_from(block::MAX_BLOCK_BYTES).unwrap();
+    let result =
+        super::collect_bounded_height_range(Height(10), 2, cap, |height| Some((height, maximum)));
+    assert_eq!(result, vec![(Height(10), Height(10), maximum)]);
+}
+
 #[tokio::test]
 async fn descendant_arriving_after_a_local_parent_failure_completes_immediately() {
     let network = Network::Mainnet;

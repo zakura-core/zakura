@@ -42,11 +42,13 @@ impl SlotBudget {
     }
 
     /// Return the maximum number of owned slots.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
 
     /// Return the number of currently owned slots.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn reserved(&self) -> usize {
         self.capacity
             .saturating_sub(self.permits.available_permits())

@@ -598,9 +598,35 @@ impl PeerRegistry {
         }
     }
 
-    /// Remove a peer's entry entirely (disconnect/teardown/admission-reject).
+    /// Remove a peer only when the event still owns its current session.
+    pub(super) fn remove_session(&self, peer: &ZakuraPeerId, session_id: u64) {
+        let mut peers = self.lock();
+        if peers
+            .get(peer)
+            .is_some_and(|entry| entry.generation == session_id)
+        {
+            peers.remove(peer);
+        }
+    }
+
+    /// Remove a peer's entry for a public, ownerless test or driver event.
     pub(super) fn remove(&self, peer: &ZakuraPeerId) {
         self.lock().remove(peer);
+    }
+
+    /// Return whether this exact routine generation still owns the peer entry.
+    ///
+    /// Serving admission uses this immediately before committing resources, so
+    /// a superseded session cannot start work through its replacement.
+    pub(super) fn owns_generation(&self, peer: &ZakuraPeerId, generation: u64) -> bool {
+        self.lock()
+            .get(peer)
+            .is_some_and(|entry| entry.generation == generation)
+    }
+
+    #[cfg(test)]
+    pub(super) fn generation_for_test(&self, peer: &ZakuraPeerId) -> Option<u64> {
+        self.lock().get(peer).map(|entry| entry.generation)
     }
 
     /// Publish a freshly-applied `Status` (routine-side, inverted inbound flow): grow

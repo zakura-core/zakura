@@ -99,7 +99,6 @@ impl FramedSend {
     /// `make_lease` is called only after the transport owns a queue slot. This
     /// prevents accounting from moving to the transport when the queue is full
     /// or closed.
-    #[allow(dead_code)] // consumed by the GetBlocks policy in the stacked PR
     pub(crate) fn try_send_leased(
         &self,
         frame: Frame,
@@ -116,6 +115,25 @@ impl FramedSend {
             }
             Err(mpsc::error::TrySendError::Full(())) => Err(LeasedSendError::Full(frame)),
             Err(mpsc::error::TrySendError::Closed(())) => Err(LeasedSendError::Closed(frame)),
+        }
+    }
+
+    /// Wait for a queue slot before attaching an outstanding-byte lease.
+    /// Cancelling this wait leaves the lease with the caller.
+    pub(crate) async fn send_leased(
+        &self,
+        frame: Frame,
+        make_lease: impl FnOnce() -> FrameLease,
+    ) -> Result<(), LeasedSendError> {
+        let FramedSender::Queued(sender) = &self.sender else {
+            return Err(LeasedSendError::Unsupported(frame));
+        };
+        match sender.reserve().await {
+            Ok(slot) => {
+                slot.send(QueuedFrame::leased(frame, make_lease()));
+                Ok(())
+            }
+            Err(_) => Err(LeasedSendError::Closed(frame)),
         }
     }
 
@@ -138,7 +156,6 @@ impl FramedSend {
 
 /// Failure to queue a leased frame.
 #[derive(Debug)]
-#[allow(dead_code)] // consumed by the GetBlocks policy in the stacked PR
 pub(crate) enum LeasedSendError {
     /// The bounded transport queue has no free slot.
     Full(Frame),
@@ -148,7 +165,6 @@ pub(crate) enum LeasedSendError {
     Unsupported(Frame),
 }
 
-#[allow(dead_code)] // consumed by the GetBlocks policy in the stacked PR
 impl LeasedSendError {
     /// Recover the frame that was not queued.
     pub(crate) fn into_frame(self) -> Frame {
@@ -180,8 +196,12 @@ impl QueuedFrame {
         Self { frame, lease: None }
     }
 
-    #[allow(dead_code)] // consumed through `try_send_leased` in the stacked PR
     fn leased(frame: Frame, lease: FrameLease) -> Self {
+        debug_assert_eq!(
+            u64::try_from(frame.payload.len()).ok(),
+            Some(lease.accounted_bytes()),
+            "a frame lease accounts for its exact payload bytes"
+        );
         Self {
             frame,
             lease: Some(lease),
@@ -256,7 +276,7 @@ mod tests {
         Frame {
             message_type,
             flags: 0,
-            payload: vec![u8::try_from(message_type).unwrap_or(u8::MAX)],
+            payload: vec![u8::try_from(message_type).unwrap_or(u8::MAX); 10],
         }
     }
 
@@ -392,6 +412,75 @@ mod tests {
             .await
             .expect_err("the write should be cancelled")
             .is_cancelled());
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn waiting_leased_send_transfers_only_after_capacity_and_holds_through_write() {
+        let (sender, mut receiver) = worker_framed_channel(1);
+        sender.try_send(frame(1)).expect("filler fits");
+        let budget = OutstandingByteBudget::new(10);
+        let mut reservation = budget
+            .try_reserve(10)
+            .expect("valid amount")
+            .expect("capacity");
+        let called = AtomicBool::new(false);
+        let mut send = Box::pin(sender.send_leased(frame(2), || {
+            called.store(true, Ordering::SeqCst);
+            OutstandingByteReservation::transfer_to_frame([&mut reservation], 10)
+                .expect("the reservation covers the frame")
+        }));
+        assert!(futures::poll!(&mut send).is_pending());
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(budget.reserved(), 10);
+        drop(receiver.recv().await.expect("filler queued"));
+        send.await.expect("the freed slot admits the frame");
+        assert!(called.load(Ordering::SeqCst));
+        drop(reservation);
+        assert_eq!(budget.reserved(), 10);
+        let queued = receiver.recv().await.expect("leased frame queued");
+        let mut write = Box::pin(queued.write_with(|received| async move {
+            assert_eq!(received, frame(2));
+            std::future::pending::<()>().await;
+        }));
+        assert!(futures::poll!(&mut write).is_pending());
+        assert_eq!(budget.reserved(), 10);
+        drop(write);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_or_closing_a_leased_queue_wait_keeps_the_callers_reservation() {
+        let (sender, mut receiver) = worker_framed_channel(1);
+        sender.try_send(frame(1)).expect("filler fits");
+        let budget = OutstandingByteBudget::new(10);
+        let mut reservation = budget
+            .try_reserve(10)
+            .expect("valid amount")
+            .expect("capacity");
+        let called = AtomicBool::new(false);
+        let mut send = Box::pin(sender.send_leased(frame(2), || {
+            called.store(true, Ordering::SeqCst);
+            OutstandingByteReservation::transfer_to_frame([&mut reservation], 10)
+                .expect("the reservation covers the frame")
+        }));
+        assert!(futures::poll!(&mut send).is_pending());
+        drop(send);
+        drop(receiver.recv().await.expect("filler queued"));
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(budget.reserved(), 10);
+        drop(receiver);
+        let result = sender
+            .send_leased(frame(2), || {
+                called.store(true, Ordering::SeqCst);
+                OutstandingByteReservation::transfer_to_frame([&mut reservation], 10)
+                    .expect("the reservation covers the frame")
+            })
+            .await;
+        assert!(matches!(result, Err(LeasedSendError::Closed(_))));
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(budget.reserved(), 10);
+        drop(reservation);
         assert_eq!(budget.reserved(), 0);
     }
 

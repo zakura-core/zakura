@@ -602,6 +602,7 @@ impl BlockEventReceived {
                 start_height,
                 requested_count,
                 returned_count,
+                ..
             } => BlockEventDetail::BlockRangeResponseFinished {
                 peer: peer_label(peer),
                 range_start: height(*start_height),
@@ -613,6 +614,7 @@ impl BlockEventReceived {
                 start_height,
                 requested_count,
                 blocks,
+                ..
             } => BlockEventDetail::BlockRangeResponseReady {
                 peer: peer_label(peer),
                 range_start: height(*start_height),
@@ -680,13 +682,13 @@ impl BlockActionDispatched {
                 range_count: u64::from(*limit),
                 best_header_tip: height(*best_header_tip),
             },
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                BlockActionDetail::QueryBlocksByHeightRange {
-                    peer: peer_label(peer),
-                    range_start: height(*start),
-                    range_count: u64::from(*count),
-                }
-            }
+            BlockSyncAction::QueryBlocksByHeightRange {
+                peer, start, count, ..
+            } => BlockActionDetail::QueryBlocksByHeightRange {
+                peer: peer_label(peer),
+                range_start: height(*start),
+                range_count: u64::from(*count),
+            },
             BlockSyncAction::SubmitBlock { token, block, .. } => BlockActionDetail::SubmitBlock {
                 apply_token: *token,
                 hash: hash(block.hash()),

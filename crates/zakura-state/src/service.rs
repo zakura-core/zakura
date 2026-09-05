@@ -2395,6 +2395,33 @@ where
     Ok(roots)
 }
 
+/// Read a contiguous prefix without retaining more encoded block bytes than
+/// the caller permits.
+///
+/// The first block that does not fit can be materialized by the lookup, but is
+/// dropped immediately and never enters the returned response.
+fn collect_bounded_height_range<T>(
+    start: block::Height,
+    count: u32,
+    max_response_bytes: u32,
+    mut get_block: impl FnMut(block::Height) -> Option<(T, usize)>,
+) -> Vec<(block::Height, T, usize)> {
+    let mut response_bytes = 0u64;
+    (0..count)
+        .map_while(|offset| {
+            let height = start.0.checked_add(offset).map(block::Height)?;
+            let (block, size) = get_block(height)?;
+            let size_u64 = u64::try_from(size).ok()?;
+            let next_response_bytes = response_bytes.checked_add(size_u64)?;
+            if next_response_bytes > u64::from(max_response_bytes) {
+                return None;
+            }
+            response_bytes = next_response_bytes;
+            Some((height, block, size))
+        })
+        .collect()
+}
+
 impl Service<ReadRequest> for ReadStateService {
     type Response = ReadResponse;
     type Error = BoxError;
@@ -2777,20 +2804,16 @@ impl Service<ReadRequest> for ReadStateService {
                 ))
             }
 
-            ReadRequest::BlocksByHeightRange { start, count } => {
+            ReadRequest::BlocksByHeightRange {
+                start,
+                count,
+                max_response_bytes,
+            } => {
                 let best_chain = state.latest_best_chain();
-                let blocks = (0..count)
-                    .map_while(|offset| {
-                        start
-                            .0
-                            .checked_add(offset)
-                            .map(block::Height)
-                            .and_then(|height| {
-                                read::block_and_size(best_chain.clone(), &state.db, height.into())
-                                    .map(|(block, size)| (height, block, size))
-                            })
-                    })
-                    .collect();
+                let blocks =
+                    collect_bounded_height_range(start, count, max_response_bytes, |height| {
+                        read::block_and_size(best_chain.clone(), &state.db, height.into())
+                    });
 
                 Ok(ReadResponse::Blocks(blocks))
             }

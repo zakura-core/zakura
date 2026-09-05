@@ -404,6 +404,8 @@ pub mod commit_state_trace {
     pub const RANGE_START: &str = "range_start";
     /// Range count field.
     pub const RANGE_COUNT: &str = "range_count";
+    /// Requested range count field.
+    pub const REQUESTED_COUNT: &str = "requested_count";
     /// Number of header-carried tree-aux roots supplied to this commit.
     pub const TREE_AUX_ROOTS_LEN: &str = "tree_aux_roots_len";
     /// Result label field.

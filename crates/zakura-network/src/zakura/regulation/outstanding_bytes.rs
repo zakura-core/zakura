@@ -205,6 +205,7 @@ impl OutstandingByteReservation {
     }
 
     /// Release all remaining bytes now.
+    #[allow(dead_code)] // Useful for exchanges that settle before owner drop.
     pub(crate) fn release(self) {
         drop(self);
     }

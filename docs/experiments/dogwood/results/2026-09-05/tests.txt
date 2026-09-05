@@ -1,0 +1,19 @@
+codec tests passed; RS subsets=121
+test_cancel_censors_failures (test_sim.Tests.test_cancel_censors_failures) ... ok
+test_counterexample (test_sim.Tests.test_counterexample) ... ok
+test_coverage (test_sim.Tests.test_coverage) ... ok
+test_exploration_and_queue_bounds (test_sim.Tests.test_exploration_and_queue_bounds) ... ok
+test_fallback_is_not_decode (test_sim.Tests.test_fallback_is_not_decode) ... ok
+test_header_tree_repair (test_sim.Tests.test_header_tree_repair) ... ok
+test_link_service_and_fairness (test_sim.Tests.test_link_service_and_fairness) ... ok
+test_no_idle_budget_growth (test_sim.Tests.test_no_idle_budget_growth) ... ok
+test_parity_threshold (test_sim.Tests.test_parity_threshold) ... ok
+test_proposer_isolation (test_sim.Tests.test_proposer_isolation) ... ok
+test_replay (test_sim.Tests.test_replay) ... ok
+test_shared_load (test_sim.Tests.test_shared_load) ... ok
+test_subscription_cycle (test_sim.Tests.test_subscription_cycle) ... ok
+
+----------------------------------------------------------------------
+Ran 13 tests in 0.053s
+
+OK

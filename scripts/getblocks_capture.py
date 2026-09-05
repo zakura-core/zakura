@@ -206,4 +206,3 @@ def import_arrivals(lines, final_metrics=None):
         ],
         "requests": requests,
     }
-

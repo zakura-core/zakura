@@ -131,9 +131,8 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       # Type-check every workspace binary (and, transitively, every library) on
       # the MSRV toolchain. Stable CI retains final code generation and linking
-      # coverage. `zakura-watchdog` is excluded: it depends on `sentry`, which
-      # requires a newer rustc than the workspace library MSRV.
-      - run: cargo check --workspace --bins --exclude zakura-watchdog
+      # coverage.
+      - run: cargo check --workspace --bins
 
   docs:
     name: docs

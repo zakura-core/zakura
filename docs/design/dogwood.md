@@ -19,6 +19,12 @@ coverage, and a reduced controller. They do not establish overlay convergence.
 
 Block propagation balances latency, throughput, and robustness.
 
+We include scalability under robustness: a larger network should not require
+each node to serve more peers. Like
+[Gossipsub](https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.0.md#gossipsub-the-gossiping-mesh-router),
+Dogwood uses bounded local forwarding, with a separate subscription graph for
+each part.
+
 [Rotor](https://www.anza.xyz/blog/alpenglow-a-new-consensus-for-solana) uses
 erasure coding and a single relay layer to reduce the proposer's upload burden
 and propagation hops. Its routes depend on a known proposer and validator set.

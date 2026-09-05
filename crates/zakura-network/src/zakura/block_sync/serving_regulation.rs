@@ -6,12 +6,9 @@
 //! response capacity is refunded, while bytes actually queued for a peer remain
 //! owned by transport frame leases until their writes finish or are dropped.
 
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Weak;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 
 use super::{config::*, wire::MAX_BS_BLOCKS_PER_REQUEST, *};
 use crate::zakura::regulation::{
@@ -678,7 +675,7 @@ impl AdmissionAttempt {
             .expect("validated GetBlocks charge contains its request overhead");
         metrics::counter!("sync.block.serving.admitted").increment(1);
         GetBlocksServingPermit {
-            cancelled: CancellationToken::new(),
+            query: Arc::new(QueryLifecycle::default()),
             resources: Arc::new(StdMutex::new(ServingResources {
                 peer: self.peer,
                 session_id: self.session_id,
@@ -703,7 +700,7 @@ impl AdmissionAttempt {
 #[derive(Debug)]
 #[must_use = "the serving ledger must retain this permit until request settlement"]
 pub(super) struct GetBlocksServingPermit {
-    cancelled: CancellationToken,
+    query: Arc<QueryLifecycle>,
     resources: Arc<StdMutex<ServingResources>>,
 }
 
@@ -814,8 +811,7 @@ impl GetBlocksServingPermit {
     pub(super) fn query_lease(&self) -> BlockRangeQueryLease {
         BlockRangeQueryLease {
             _resources: self.resources.clone(),
-            cancelled: self.cancelled.clone(),
-            started: Arc::new(AtomicBool::new(false)),
+            query: self.query.clone(),
         }
     }
 
@@ -830,6 +826,39 @@ impl GetBlocksServingPermit {
 
 impl Drop for GetBlocksServingPermit {
     fn drop(&mut self) {
+        self.query.cancel();
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum QueryState {
+    #[default]
+    Queued,
+    Started,
+    Cancelled,
+}
+
+/// One ordering for execution claims and ledger closure, shared by all leases.
+#[derive(Debug, Default)]
+struct QueryLifecycle {
+    state: StdMutex<QueryState>,
+    cancelled: CancellationToken,
+}
+
+impl QueryLifecycle {
+    fn try_start(&self) -> bool {
+        let mut state = self.state.lock().expect("query lifecycle is not poisoned");
+        if *state != QueryState::Queued {
+            return false;
+        }
+        *state = QueryState::Started;
+        true
+    }
+
+    fn cancel(&self) {
+        // Close admission before waking a worker. A previously claimed read
+        // still owns its resource lease and must drain to completion.
+        *self.state.lock().expect("query lifecycle is not poisoned") = QueryState::Cancelled;
         self.cancelled.cancel();
     }
 }
@@ -844,28 +873,26 @@ impl Drop for GetBlocksServingPermit {
 #[derive(Clone, Debug)]
 pub struct BlockRangeQueryLease {
     _resources: Arc<StdMutex<ServingResources>>,
-    cancelled: CancellationToken,
-    started: Arc<AtomicBool>,
+    query: Arc<QueryLifecycle>,
 }
 
 impl BlockRangeQueryLease {
-    /// Claim the only execution of this query, unless its ledger already closed.
+    /// Claim the only execution, serialized against ledger closure.
+    ///
+    /// If closure wins, no read starts. If the claim wins, the worker retains
+    /// capacity until the read finishes, even if delivery is then cancelled.
     pub fn try_start(&self) -> bool {
-        !self.cancelled.is_cancelled()
-            && self
-                .started
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+        self.query.try_start()
     }
 
     /// Whether the request no longer has a live delivery owner.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.is_cancelled()
+        self.query.cancelled.is_cancelled()
     }
 
     /// Wait for the ledger to close. This does not cancel an active state read.
     pub async fn cancelled(&self) {
-        self.cancelled.cancelled().await;
+        self.query.cancelled.cancelled().await;
     }
 }
 
@@ -882,7 +909,7 @@ pub(crate) fn query_lease_for_test() -> BlockRangeQueryLease {
         .commit();
     let mut lease = permit.query_lease();
     // Standalone driver fixtures have no reactor ledger to signal cancellation.
-    lease.cancelled = CancellationToken::new();
+    lease.query = Arc::new(QueryLifecycle::default());
     lease
 }
 
@@ -946,6 +973,70 @@ mod tests {
         assert!(!query.try_start());
         drop(query);
         assert_eq!(regulator.snapshot().node_active, 0);
+    }
+
+    #[test]
+    fn separately_issued_query_leases_share_one_execution_claim() {
+        let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
+        let session = regulator.session(peer(9), 9);
+        let permit = session.try_admit(1).unwrap().commit();
+        let first = permit.query_lease();
+        let second = permit.query_lease();
+        assert!(first.try_start());
+        assert!(!second.try_start());
+        drop(permit);
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+        assert_eq!(regulator.snapshot().node_active, 1);
+        drop((first, second));
+        assert_eq!(regulator.snapshot().node_active, 0);
+    }
+
+    #[test]
+    fn concurrent_claims_and_cancellation_preserve_one_charged_owner() {
+        use std::{sync::Barrier, thread};
+
+        // Exercise overlapping calls; deterministic tests above require both
+        // ordered outcomes. This does not claim exhaustive schedule coverage.
+        for _ in 0..64 {
+            let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
+            let session = regulator.session(peer(9), 9);
+            let permit = session.try_admit(1).unwrap().commit();
+            let lease = permit.query_lease();
+            let charged = regulator.snapshot().node_outstanding;
+            let barrier = Barrier::new(4);
+
+            thread::scope(|scope| {
+                let first = scope.spawn(|| {
+                    barrier.wait();
+                    lease.try_start()
+                });
+                let second = scope.spawn(|| {
+                    barrier.wait();
+                    lease.try_start()
+                });
+                let cancellation = scope.spawn(|| {
+                    barrier.wait();
+                    drop(permit);
+                });
+                barrier.wait();
+                let claims =
+                    usize::from(first.join().unwrap()) + usize::from(second.join().unwrap());
+                cancellation.join().unwrap();
+                assert!(claims <= 1);
+            });
+
+            assert!(lease.is_cancelled());
+            assert!(
+                !lease.try_start(),
+                "ledger closure permanently prevents new claims"
+            );
+            assert_eq!(regulator.snapshot().node_active, 1);
+            assert_eq!(regulator.snapshot().node_outstanding, charged);
+            drop(lease);
+            assert_eq!(regulator.snapshot().node_active, 0);
+            assert_eq!(regulator.snapshot().node_outstanding, 0);
+        }
     }
 
     #[tokio::test]

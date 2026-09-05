@@ -10,11 +10,15 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Weak;
 
+use super::serving_observation::{
+    OwnershipRelease, ServingObservation, SettlementObservation, WaitObservation,
+};
 use super::{config::*, wire::MAX_BS_BLOCKS_PER_REQUEST, *};
 use crate::zakura::regulation::{
     CommittedRateReservation, FrameLease, OutstandingByteBudget, OutstandingByteReservation,
     RateBudget, RateReservation, SlotBudget, SlotPermit,
 };
+use crate::zakura::transport::FrameOwnership;
 
 /// The bounded work declaration for one decoded request.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -340,11 +344,14 @@ impl GetBlocksServingSession {
             .try_reserve()
             .ok_or_else(PendingInputBlocked::node)?;
         Ok(PendingGetBlocksRequest {
+            release_start: OwnershipRelease::default(),
             start_height,
             count,
+            observation: None,
             _session: session,
             _node: node,
             _resources: self.resources.clone(),
+            release_finish: OwnershipRelease::default(),
         })
     }
 
@@ -357,11 +364,14 @@ impl GetBlocksServingSession {
         let session = self.resources.pending.reserve().await;
         let node = self.regulator.inner.node_pending.reserve().await;
         PendingGetBlocksRequest {
+            release_start: OwnershipRelease::default(),
             start_height,
             count,
+            observation: None,
             _session: session,
             _node: node,
             _resources: self.resources.clone(),
+            release_finish: OwnershipRelease::default(),
         }
     }
 
@@ -410,8 +420,10 @@ impl GetBlocksServingSession {
         )?;
 
         Ok(AdmissionAttempt {
+            rollback_start: OwnershipRelease::default(),
             peer: self.peer.clone(),
             session_id: self.session_id,
+            observation: None,
             request_overhead: self
                 .regulator
                 .inner
@@ -427,6 +439,7 @@ impl GetBlocksServingSession {
             _node_active: node_active,
             _peer_rate_account: self.peer_rate.clone(),
             _session_resources: self.resources.clone(),
+            rollback_finish: OwnershipRelease::default(),
         })
     }
 
@@ -523,14 +536,46 @@ impl PendingInputBlocked {
 #[derive(Debug)]
 #[must_use = "a retained GetBlocks request must be forwarded or explicitly dropped"]
 pub(super) struct PendingGetBlocksRequest {
+    // These guards bracket the resource fields in Rust's declaration-order drop.
+    release_start: OwnershipRelease,
     start_height: block::Height,
     count: u32,
+    observation: Option<Arc<ServingObservation>>,
     _session: SlotPermit,
     _node: SlotPermit,
     _resources: Arc<SessionResources>,
+    release_finish: OwnershipRelease,
 }
 
 impl PendingGetBlocksRequest {
+    pub(super) fn observe_wait(
+        &self,
+        stage: &'static str,
+        bound: &'static str,
+    ) -> Option<WaitObservation> {
+        self.observation
+            .as_ref()
+            .map(|observation| observation.start_wait(stage, bound))
+    }
+
+    pub(super) fn with_observation(mut self, observation: Option<Arc<ServingObservation>>) -> Self {
+        (self.release_start, self.release_finish) = OwnershipRelease::pair(&observation, "pending");
+        if let Some(observation) = &observation {
+            observation.emit("input_retained", None);
+        }
+        self.observation = observation;
+        self
+    }
+
+    pub(super) fn observe_admission(&self, attempt: &mut AdmissionAttempt) {
+        (attempt.rollback_start, attempt.rollback_finish) =
+            OwnershipRelease::pair(&self.observation, "provisional");
+        if let Some(observation) = &self.observation {
+            observation.emit("admission_reserved", None);
+        }
+        attempt.observation = self.observation.clone();
+    }
+
     /// Count used to reserve the request's worst-case response work.
     pub(super) fn count(&self) -> u32 {
         self.count
@@ -538,6 +583,9 @@ impl PendingGetBlocksRequest {
 
     /// End pending ownership and return the validated request fields.
     pub(super) fn into_parts(self) -> (block::Height, u32) {
+        if let Some(observation) = &self.observation {
+            observation.emit("input_consumed", None);
+        }
         (self.start_height, self.count)
     }
 }
@@ -638,8 +686,11 @@ impl AdmissionBlocked {
 #[derive(Debug)]
 #[must_use = "dropping a GetBlocks admission attempt rolls back every reservation"]
 pub(super) struct AdmissionAttempt {
+    // Keep the rollback guards around every resource field; commit disarms them.
+    rollback_start: OwnershipRelease,
     peer: ZakuraPeerId,
     session_id: u64,
+    observation: Option<Arc<ServingObservation>>,
     request_overhead: u64,
     response_cap: u64,
     peer_rate: RateReservation,
@@ -650,6 +701,7 @@ pub(super) struct AdmissionAttempt {
     _node_active: SlotPermit,
     _peer_rate_account: Arc<PeerRateAccount>,
     _session_resources: Arc<SessionResources>,
+    rollback_finish: OwnershipRelease,
 }
 
 impl AdmissionAttempt {
@@ -662,7 +714,7 @@ impl AdmissionAttempt {
     }
 
     /// Commit fixed request work after the reactor accepts this exact session.
-    pub(super) fn commit(self) -> GetBlocksServingPermit {
+    pub(super) fn commit(mut self) -> GetBlocksServingPermit {
         debug_assert_eq!(
             self.peer_rate.reserved(),
             self.response_cap.saturating_add(self.request_overhead)
@@ -677,15 +729,22 @@ impl AdmissionAttempt {
             .commit(self.request_overhead)
             .expect("validated GetBlocks charge contains its request overhead");
         metrics::counter!("sync.block.serving.admitted").increment(1);
+        self.rollback_start.disarm();
+        self.rollback_finish.disarm();
+        if let Some(observation) = &self.observation {
+            observation.emit("committed", None);
+        }
         GetBlocksServingPermit {
             query: Arc::new(QueryLifecycle::default()),
             resources: Arc::new(StdMutex::new(ServingResources {
                 peer: self.peer,
                 session_id: self.session_id,
+                observation: self.observation,
                 request_id: None,
                 request_overhead: self.request_overhead,
                 response_cap: self.response_cap,
                 transferred: 0,
+                next_frame_sequence: 0,
                 peer_rate,
                 node_rate,
                 node_outstanding: self.node_outstanding,
@@ -694,6 +753,7 @@ impl AdmissionAttempt {
                 _node_active: self._node_active,
                 _peer_rate_account: self._peer_rate_account,
                 _session_resources: self._session_resources,
+                settlement: None,
             })),
         }
     }
@@ -711,10 +771,12 @@ pub(super) struct GetBlocksServingPermit {
 struct ServingResources {
     peer: ZakuraPeerId,
     session_id: u64,
+    observation: Option<Arc<ServingObservation>>,
     request_id: Option<BlockRangeRequestId>,
     request_overhead: u64,
     response_cap: u64,
     transferred: u64,
+    next_frame_sequence: u64,
     peer_rate: CommittedRateReservation,
     node_rate: CommittedRateReservation,
     node_outstanding: OutstandingByteReservation,
@@ -723,6 +785,8 @@ struct ServingResources {
     _node_active: SlotPermit,
     _peer_rate_account: Arc<PeerRateAccount>,
     _session_resources: Arc<SessionResources>,
+    // Rust drops fields in declaration order. Keep this after every resource owner.
+    settlement: Option<SettlementObservation>,
 }
 
 impl ServingResources {
@@ -732,6 +796,9 @@ impl ServingResources {
             self.request_id.replace(request_id).is_none(),
             "a GetBlocks serving permit is bound to one request"
         );
+        if let Some(observation) = &self.observation {
+            observation.emit("request_bound", Some(request_id));
+        }
     }
 
     /// Return whether an encoded response frame fits every remaining balance.
@@ -774,6 +841,14 @@ impl ServingResources {
 
 impl Drop for ServingResources {
     fn drop(&mut self) {
+        self.settlement = self.observation.as_ref().map(|observation| {
+            observation.start_settlement(
+                self.request_id,
+                self.request_overhead,
+                self.response_cap,
+                self.transferred,
+            )
+        });
         let refunded = self.response_cap.saturating_sub(self.transferred);
         metrics::counter!("sync.block.serving.refunded_bytes").increment(refunded);
         tracing::trace!(
@@ -803,11 +878,29 @@ impl GetBlocksServingPermit {
             .can_transfer_frame(bytes)
     }
 
+    #[cfg(test)]
     pub(super) fn transfer_frame(&mut self, bytes: u64) -> FrameLease {
         self.resources
             .lock()
             .expect("a panic in serving accounting invalidates its balances")
             .transfer_frame(bytes)
+    }
+
+    /// Transfer the byte lease and attach diagnostic identity without retaining this permit.
+    pub(super) fn transfer_frame_for_write(&mut self, bytes: u64) -> FrameOwnership {
+        let mut resources = self
+            .resources
+            .lock()
+            .expect("a panic in serving accounting invalidates its balances");
+        let ownership = FrameOwnership::from(resources.transfer_frame(bytes));
+        let Some(observation) = resources.observation.clone() else {
+            return ownership;
+        };
+        let sequence = resources.next_frame_sequence;
+        resources.next_frame_sequence = sequence
+            .checked_add(1)
+            .expect("nonempty response frames are bounded by the admitted response capacity");
+        ownership.with_observer(observation.frame_observer(resources.request_id, sequence, bytes))
     }
 
     /// Share capacity with the dispatched query and its response, without charging twice.
@@ -1376,3 +1469,6 @@ mod tests {
 
 #[cfg(test)]
 mod properties;
+
+#[cfg(test)]
+mod workloads;

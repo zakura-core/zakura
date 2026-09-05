@@ -99,10 +99,10 @@ impl FramedSend {
     /// `make_lease` is called only after the transport owns a queue slot. This
     /// prevents accounting from moving to the transport when the queue is full
     /// or closed.
-    pub(crate) fn try_send_leased(
+    pub(crate) fn try_send_leased<O: Into<FrameOwnership>>(
         &self,
         frame: Frame,
-        make_lease: impl FnOnce() -> FrameLease,
+        make_lease: impl FnOnce() -> O,
     ) -> Result<(), LeasedSendError> {
         let FramedSender::Queued(sender) = &self.sender else {
             return Err(LeasedSendError::Unsupported(frame));
@@ -110,7 +110,7 @@ impl FramedSend {
 
         match sender.try_reserve() {
             Ok(slot) => {
-                slot.send(QueuedFrame::leased(frame, make_lease()));
+                slot.send(QueuedFrame::leased(frame, make_lease().into()));
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(())) => Err(LeasedSendError::Full(frame)),
@@ -120,17 +120,17 @@ impl FramedSend {
 
     /// Wait for a queue slot before attaching an outstanding-byte lease.
     /// Cancelling this wait leaves the lease with the caller.
-    pub(crate) async fn send_leased(
+    pub(crate) async fn send_leased<O: Into<FrameOwnership>>(
         &self,
         frame: Frame,
-        make_lease: impl FnOnce() -> FrameLease,
+        make_lease: impl FnOnce() -> O,
     ) -> Result<(), LeasedSendError> {
         let FramedSender::Queued(sender) = &self.sender else {
             return Err(LeasedSendError::Unsupported(frame));
         };
         match sender.reserve().await {
             Ok(slot) => {
-                slot.send(QueuedFrame::leased(frame, make_lease()));
+                slot.send(QueuedFrame::leased(frame, make_lease().into()));
                 Ok(())
             }
             Err(_) => Err(LeasedSendError::Closed(frame)),
@@ -184,33 +184,89 @@ impl LeasedSendError {
     }
 }
 
+/// Transport transitions. A returned write future may have returned an error.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FrameObservation {
+    Queued { message_type: u16 },
+    WriteStarted,
+    WriteReturned,
+    ReleaseStarted,
+    ReleaseFinished,
+}
+
+/// Optional diagnostic observer; implementations must not retain resource owners.
+pub(crate) trait FrameObserver: std::fmt::Debug + Send + Sync {
+    fn observe(&mut self, event: FrameObservation);
+}
+
+/// Capacity and optional diagnostics kept until the queue or writer releases a frame.
+#[derive(Debug, Default)]
+pub(crate) struct FrameOwnership {
+    lease: Option<FrameLease>,
+    observer: Option<Box<dyn FrameObserver>>,
+}
+
+impl From<FrameLease> for FrameOwnership {
+    fn from(lease: FrameLease) -> Self {
+        Self {
+            lease: Some(lease),
+            observer: None,
+        }
+    }
+}
+
+impl FrameOwnership {
+    pub(crate) fn with_observer(mut self, observer: Box<dyn FrameObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    fn observe(&mut self, event: FrameObservation) {
+        if let Some(observer) = &mut self.observer {
+            observer.observe(event);
+        }
+    }
+}
+
+impl Drop for FrameOwnership {
+    fn drop(&mut self) {
+        self.observe(FrameObservation::ReleaseStarted);
+        drop(self.lease.take());
+        // Woken tasks may run during release; these rows bracket that interval.
+        self.observe(FrameObservation::ReleaseFinished);
+    }
+}
+
 /// Frame plus optional byte ownership retained through its transport write.
 #[derive(Debug)]
 pub(crate) struct QueuedFrame {
     frame: Frame,
-    lease: Option<FrameLease>,
+    ownership: FrameOwnership,
 }
 
 impl QueuedFrame {
     fn plain(frame: Frame) -> Self {
-        Self { frame, lease: None }
-    }
-
-    fn leased(frame: Frame, lease: FrameLease) -> Self {
-        debug_assert_eq!(
-            u64::try_from(frame.payload.len()).ok(),
-            Some(lease.accounted_bytes()),
-            "a frame lease accounts for its exact payload bytes"
-        );
         Self {
             frame,
-            lease: Some(lease),
+            ownership: FrameOwnership::default(),
         }
     }
 
+    fn leased(frame: Frame, mut ownership: FrameOwnership) -> Self {
+        debug_assert_eq!(
+            u64::try_from(frame.payload.len()).ok(),
+            ownership.lease.as_ref().map(FrameLease::accounted_bytes),
+            "a frame lease accounts for its exact payload bytes"
+        );
+        ownership.observe(FrameObservation::Queued {
+            message_type: frame.message_type,
+        });
+        Self { frame, ownership }
+    }
+
     /// Split the frame from its lease while retaining both in the caller.
-    pub(crate) fn into_parts(self) -> (Frame, Option<FrameLease>) {
-        (self.frame, self.lease)
+    pub(crate) fn into_parts(self) -> (Frame, FrameOwnership) {
+        (self.frame, self.ownership)
     }
 
     /// Run the transport write while retaining this frame's lease.
@@ -219,8 +275,11 @@ impl QueuedFrame {
         F: FnOnce(Frame) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
-        let (frame, _lease) = self.into_parts();
-        write(frame).await
+        let (frame, mut ownership) = self.into_parts();
+        ownership.observe(FrameObservation::WriteStarted);
+        let result = write(frame).await;
+        ownership.observe(FrameObservation::WriteReturned);
+        result
     }
 }
 
@@ -277,6 +336,78 @@ mod tests {
             message_type,
             flags: 0,
             payload: vec![u8::try_from(message_type).unwrap_or(u8::MAX); 10],
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReleaseProbe {
+        budget: OutstandingByteBudget,
+        events: Arc<std::sync::Mutex<Vec<(FrameObservation, u64)>>>,
+    }
+
+    impl FrameObserver for ReleaseProbe {
+        fn observe(&mut self, event: FrameObservation) {
+            self.events
+                .lock()
+                .unwrap()
+                .push((event, self.budget.reserved()));
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_observation_brackets_release_on_queue_drop_cancel_and_write_return() {
+        for outcome in ["queue_drop", "cancel", "success", "error"] {
+            let (sender, mut receiver) = worker_framed_channel(1);
+            let budget = OutstandingByteBudget::new(10);
+            let mut reservation = budget.try_reserve(10).unwrap().unwrap();
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            sender
+                .try_send_leased(frame(1), || {
+                    FrameOwnership::from(
+                        OutstandingByteReservation::transfer_to_frame([&mut reservation], 10)
+                            .unwrap(),
+                    )
+                    .with_observer(Box::new(ReleaseProbe {
+                        budget: budget.clone(),
+                        events: events.clone(),
+                    }))
+                })
+                .unwrap();
+            drop(reservation);
+            if outcome == "queue_drop" {
+                drop(receiver);
+            } else {
+                let queued = receiver.recv().await.unwrap();
+                if outcome == "cancel" {
+                    let mut write = Box::pin(queued.write_with(|_| std::future::pending::<()>()));
+                    assert!(futures::poll!(&mut write).is_pending());
+                    drop(write);
+                } else {
+                    let result = queued
+                        .write_with(|_| async {
+                            if outcome == "error" {
+                                Err(())
+                            } else {
+                                Ok(())
+                            }
+                        })
+                        .await;
+                    assert_eq!(result.is_err(), outcome == "error");
+                }
+            }
+            let mut expected = vec![(FrameObservation::Queued { message_type: 1 }, 10)];
+            if outcome != "queue_drop" {
+                expected.push((FrameObservation::WriteStarted, 10));
+            }
+            if matches!(outcome, "success" | "error") {
+                expected.push((FrameObservation::WriteReturned, 10));
+            }
+            expected.extend([
+                (FrameObservation::ReleaseStarted, 10),
+                (FrameObservation::ReleaseFinished, 0),
+            ]);
+            assert_eq!(*events.lock().unwrap(), expected, "{outcome}");
+            assert_eq!(budget.reserved(), 0);
         }
     }
 

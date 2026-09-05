@@ -41,6 +41,7 @@ use super::{
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerView},
+    serving_observation::ServingObservation,
     serving_regulation::{GetBlocksServingSession, PendingGetBlocksRequest, PendingInputBlocked},
     state::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
@@ -315,6 +316,8 @@ pub(super) struct PeerRoutine {
     /// Next request identity in this peer-session generation. Exhaustion fails
     /// closed instead of reusing an owner.
     next_request_id: Option<NonZeroU64>,
+    /// Decode-trace sequence, including messages lost by the bounded trace writer.
+    received_message_sequence: u64,
     budget: super::state::ByteBudget,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
@@ -415,6 +418,7 @@ impl PeerRoutine {
             fill_stop_trace_at: BTreeMap::new(),
             generation,
             next_request_id: NonZeroU64::new(1),
+            received_message_sequence: 0,
             budget,
             work,
             registry,
@@ -440,6 +444,7 @@ impl PeerRoutine {
     /// reject. A reject returns `Err(SinkReject::protocol(..))` so the supervised
     /// pipe tears the whole connection down.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
+        self.trace_decode_session_started();
         // Local clones so the `Notified` futures below borrow these handles, not
         // `self` — `self.try_fill()` needs `&mut self` while the notifications are
         // pinned. The clones share the same underlying `Arc`, so the wakes still
@@ -668,13 +673,26 @@ impl PeerRoutine {
 
     /// Queue a request or install a bounded wait without suspending the routine.
     fn retain_serving_request(&mut self, start_height: block::Height, count: u32) {
+        let observation = ServingObservation::for_request(
+            &self.trace,
+            &self.peer,
+            self.generation,
+            self.received_message_sequence,
+        );
         match self.serving.try_retain_input(start_height, count) {
-            Ok(request) => self.enqueue_serving_request(request),
+            Ok(request) => self.enqueue_serving_request(request.with_observation(observation)),
             Err(blocked) => {
                 self.record_pending_input_delay(&blocked);
+                let wait_observation = observation
+                    .as_ref()
+                    .map(|observation| observation.start_wait("pending_input", blocked.label()));
                 let serving = self.serving.clone();
                 self.pending_input = Some(Box::pin(async move {
-                    serving.retain_input(start_height, count).await
+                    let request = serving.retain_input(start_height, count).await;
+                    if let Some(wait) = wait_observation {
+                        wait.ready();
+                    }
+                    request.with_observation(observation)
                 }));
                 self.pending_input_deadline =
                     Some(time::Instant::now() + self.config.request_timeout);
@@ -2360,7 +2378,7 @@ async fn admit_and_forward_get_blocks(
             Some(slot) => serving.try_admit_with_slot(request.count(), Some(slot)),
             None => serving.try_admit(request.count()),
         };
-        let attempt = match admission {
+        let mut attempt = match admission {
             Ok(attempt) => attempt,
             Err(blocked) => {
                 metrics::counter!(
@@ -2373,6 +2391,7 @@ async fn admit_and_forward_get_blocks(
                     bound = blocked.kind().label(),
                     "delaying GetBlocks at the work-admission bound"
                 );
+                let wait_observation = request.observe_wait("admission", blocked.kind().label());
                 let wait = blocked.wait();
                 tokio::pin!(wait);
                 tokio::select! {
@@ -2383,6 +2402,9 @@ async fn admit_and_forward_get_blocks(
                     }
                     () = done.closed() => return,
                     slot = &mut wait => {
+                        if let Some(wait) = wait_observation {
+                            wait.ready();
+                        }
                         acquired_slot = slot;
                         continue;
                     }
@@ -2390,6 +2412,9 @@ async fn admit_and_forward_get_blocks(
             }
         };
 
+        request.observe_admission(&mut attempt);
+
+        let wait_observation = request.observe_wait("reactor_queue", "reactor_queue");
         let channel_slot = routine_to_reactor.clone().reserve_owned();
         tokio::pin!(channel_slot);
         tokio::select! {
@@ -2405,10 +2430,16 @@ async fn admit_and_forward_get_blocks(
             }
             slot = &mut channel_slot => {
                 let Ok(slot) = slot else {
+                    if let Some(wait) = wait_observation {
+                        wait.closed();
+                    }
                     drop(attempt);
                     let _ = done.send(ServingAdmissionOutcome::ChannelClosed);
                     return;
                 };
+                if let Some(wait) = wait_observation {
+                            wait.ready();
+                        }
                 debug_assert_eq!(attempt.peer(), &peer);
                 slot.send(RoutineToReactor::ServeGetBlocks {
                     peer,
@@ -2437,6 +2468,7 @@ impl Drop for PeerRoutine {
     /// The reactor owns entry insert (on connect) and remove (on disconnect/
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {
+        self.trace_decode_session_finished();
         let outstanding_ranges = std::mem::take(&mut self.window.outstanding);
         for outstanding in outstanding_ranges {
             let unreceived: Vec<_> = outstanding
@@ -2487,6 +2519,152 @@ mod tests {
         peer: &ZakuraPeerId,
     ) -> GetBlocksServingSession {
         GetBlocksServingRegulator::new(config.clone()).session(peer.clone(), 0)
+    }
+
+    #[tokio::test]
+    async fn admission_wait_capture_distinguishes_readiness_cancel_and_channel_close() {
+        use super::{admit_and_forward_get_blocks, ServingAdmissionOutcome, ServingObservation};
+        use zakura_jsonl_trace::JsonlTracer;
+
+        for expected in [
+            ServingAdmissionOutcome::Sent,
+            ServingAdmissionOutcome::Cancelled,
+            ServingAdmissionOutcome::ChannelClosed,
+        ] {
+            let mut config = ZakuraBlockSyncConfig::default();
+            config.get_blocks_regulation.node_active_requests = 1;
+            let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
+            let regulator = GetBlocksServingRegulator::new(config);
+            let serving = regulator.session(peer.clone(), 3);
+            let owner = serving.try_admit(1).unwrap().commit();
+            let (trace_send, mut traces) = mpsc::channel(32);
+            let trace = ZakuraTrace::new(JsonlTracer::new(trace_send), "test");
+            let request = serving
+                .try_retain_input(block::Height(100), 1)
+                .unwrap()
+                .with_observation(ServingObservation::for_request(&trace, &peer, 3, 20));
+            let (send, receive) = mpsc::channel(1);
+            let receiver = if expected == ServingAdmissionOutcome::ChannelClosed {
+                drop(receive);
+                None
+            } else {
+                Some(receive)
+            };
+            let cancel = CancellationToken::new();
+            let (done, outcome) = tokio::sync::oneshot::channel();
+            let mut task = Box::pin(admit_and_forward_get_blocks(
+                serving,
+                send,
+                peer,
+                request,
+                cancel.clone(),
+                done,
+            ));
+            assert!(futures::poll!(&mut task).is_pending());
+            if expected == ServingAdmissionOutcome::Cancelled {
+                cancel.cancel();
+            }
+            drop(owner);
+            timeout(Duration::from_secs(1), task).await.unwrap();
+            assert_eq!(outcome.await.unwrap(), expected);
+            // A sent request still has provisional ownership in the reactor channel.
+            drop(receiver);
+            assert_eq!(regulator.snapshot().node_active, 0);
+            assert_eq!(regulator.snapshot().node_pending, 0);
+            assert_eq!(regulator.snapshot().node_outstanding, 0);
+
+            let mut waits = Vec::new();
+            while let Ok(event) = traces.try_recv() {
+                let row: serde_json::Value = serde_json::from_slice(&event.line).unwrap();
+                if row["event"] == "get_blocks_wait" {
+                    waits.push(row);
+                }
+            }
+            assert_eq!(waits[0]["stage"], "admission");
+            assert_eq!(waits[0]["initial_bound"], "node_active");
+            assert_eq!(waits[0]["phase"], "started");
+            assert_eq!(waits[0]["wait_sequence"], 0);
+            assert_eq!(waits[1]["wait_sequence"], 0);
+            if expected == ServingAdmissionOutcome::Cancelled {
+                assert_eq!(waits.len(), 2);
+                assert_eq!(waits[1]["phase"], "cancelled");
+            } else {
+                assert_eq!(waits.len(), 4);
+                assert_eq!(waits[1]["phase"], "ready");
+                assert_eq!(waits[2]["stage"], "reactor_queue");
+                assert_eq!(waits[2]["wait_sequence"], 1);
+                assert_eq!(waits[3]["wait_sequence"], 1);
+                assert_eq!(
+                    waits[3]["phase"],
+                    if expected == ServingAdmissionOutcome::Sent {
+                        "ready"
+                    } else {
+                        "closed"
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_trace_counts_rows_lost_to_backpressure() {
+        let config = ZakuraBlockSyncConfig::default();
+        let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
+        let cancel = CancellationToken::new();
+        let (out_send, _out_recv) = framed_channel(1);
+        let (_in_send, in_recv) = framed_channel(1);
+        let (sequencer_send, _sequencer_recv) = mpsc::channel(1);
+        let (reactor_send, _reactor_recv) = mpsc::channel(1);
+        let (_view_send, view_recv) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let (trace_send, mut trace_recv) = mpsc::channel(1);
+        let trace = ZakuraTrace::new(zakura_jsonl_trace::JsonlTracer::new(trace_send), "test");
+        let mut routine = PeerRoutine::new(
+            peer.clone(),
+            0,
+            BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone()),
+            in_recv,
+            config.clone(),
+            true,
+            17,
+            ByteBudget::new(1_000_000),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_send,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            reactor_send,
+            test_serving(&config, &peer),
+            view_recv,
+            cancel,
+            trace,
+        );
+        let request = super::BlockSyncMessage::GetBlocks {
+            start_height: block::Height(20),
+            count: 1,
+        };
+        routine.trace_decode_session_started();
+        routine.trace_message_received(&request); // The start row fills the trace queue.
+        let start: serde_json::Value =
+            serde_json::from_slice(&trace_recv.try_recv().unwrap().line).unwrap();
+        assert_eq!(start["message_sequence"], 0);
+        routine.trace_message_received(&request);
+        let received: serde_json::Value =
+            serde_json::from_slice(&trace_recv.try_recv().unwrap().line).unwrap();
+        assert_eq!(received["message_sequence"], 2);
+        assert_eq!(received["session_id"], 17);
+        assert_eq!(received["peer"], start["peer"]);
+        assert_eq!(received["range_start"], 20);
+        assert_eq!(received["range_count"], 1);
+        drop(routine);
+        let finished: serde_json::Value =
+            serde_json::from_slice(&trace_recv.try_recv().unwrap().line).unwrap();
+        assert_eq!(finished["event"], "block_decode_session_finished");
+        assert_eq!(finished["message_sequence"], 2);
     }
 
     fn reference_first_allowed_run(allowed: &[bool]) -> Option<std::ops::Range<usize>> {

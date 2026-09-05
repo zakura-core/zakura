@@ -32,12 +32,55 @@ impl PeerRoutine {
         });
     }
 
-    /// Trace a decoded inbound message (the previous reactor's `trace_message_received`,
-    /// now emitted in the routine that decoded it). Records the message kind only;
-    /// the per-variant field detail lives on the reactor's heavier trace path.
-    pub(super) fn trace_message_received(&self, msg: &BlockSyncMessage) {
+    pub(super) fn trace_decode_session_started(&self) {
+        // Bind independent scrape totals to the same process as the JSONL rows.
+        metrics::gauge!(
+            "sync.block.capture.process_info",
+            "process_trace_id" => zakura_jsonl_trace::process_trace_id()
+        )
+        .set(1.0);
+        metrics::counter!("sync.block.capture.sessions_started").increment(1);
+        self.trace_decode_session_boundary("block_decode_session_started");
+    }
+
+    pub(super) fn trace_decode_session_finished(&self) {
+        metrics::counter!("sync.block.capture.sessions_finished").increment(1);
+        self.trace_decode_session_boundary("block_decode_session_finished");
+    }
+
+    fn trace_decode_session_boundary(&self, event: &'static str) {
+        self.emit(event, |row| {
+            row.capture_version = Some(1);
+            row.peer = Some(trace_peer(&self.peer));
+            row.session_id = Some(self.generation);
+            row.message_sequence = Some(self.received_message_sequence);
+        });
+    }
+
+    /// Observe decode after transport or pending-input backpressure.
+    /// Sequence gaps or a missing session boundary make this capture incomplete.
+    pub(super) fn trace_message_received(&mut self, msg: &BlockSyncMessage) {
+        metrics::counter!(
+            "sync.block.capture.decoded_messages",
+            "kind" => block_sync_message_label(msg)
+        )
+        .increment(1);
+        // Advance before attempting emission so a full trace queue leaves a gap.
+        // Importers reject a saturated sequence rather than inventing new identities.
+        self.received_message_sequence = self.received_message_sequence.saturating_add(1);
         self.emit(bs_trace::BLOCK_MESSAGE_RECEIVED, |row| {
+            row.peer = Some(trace_peer(&self.peer));
+            row.session_id = Some(self.generation);
+            row.message_sequence = Some(self.received_message_sequence);
             row.kind = Some(block_sync_message_label(msg));
+            if let BlockSyncMessage::GetBlocks {
+                start_height,
+                count,
+            } = msg
+            {
+                row.range_start = Some(trace_height(*start_height));
+                row.range_count = Some(u64::from(*count));
+            }
         });
     }
 

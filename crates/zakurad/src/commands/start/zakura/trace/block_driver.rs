@@ -7,7 +7,8 @@ use zakura_chain::block;
 use zakura_jsonl_trace::{saturating_count, saturating_millis, JsonlTraceEvent};
 use zakura_network::zakura::{
     commit_state_trace as event, zakura_trace_peer_label, BlockApplyResult, BlockApplyToken,
-    BlockSyncAction, BlockSyncMisbehavior, ZakuraPeerId, ZakuraTrace, COMMIT_STATE_TABLE,
+    BlockRangeRequestId, BlockSyncAction, BlockSyncMisbehavior, ZakuraPeerId, ZakuraTrace,
+    COMMIT_STATE_TABLE,
 };
 
 use super::super::block_sync_driver::BlockApplyClass;
@@ -96,6 +97,13 @@ struct Range<'a> {
 }
 
 #[derive(Serialize)]
+struct ServingQuery {
+    capture_version: u64,
+    request_id: u64,
+    phase: &'static str,
+}
+
+#[derive(Serialize)]
 struct ApplyIdentity {
     height: u64,
     hash: String,
@@ -144,6 +152,8 @@ struct SubmitQueued {
 }
 
 pub(crate) trait BlockDriverTraceExt {
+    /// Observe the driver read future separately from delivery timeout or cancellation.
+    fn trace_serving_query(&self, request_id: BlockRangeRequestId, phase: &'static str);
     fn trace_block_action_received(&self, action: &BlockSyncAction);
     fn trace_needed_blocks_query_started(
         &self,
@@ -239,6 +249,15 @@ pub(crate) trait BlockDriverTraceExt {
 }
 
 impl BlockDriverTraceExt for ZakuraTrace {
+    fn trace_serving_query(&self, request_id: BlockRangeRequestId, phase: &'static str) {
+        metrics::counter!("sync.block.capture.serving_query_events", "phase" => phase).increment(1);
+        emit(self, "get_blocks_query", || ServingQuery {
+            capture_version: 1,
+            request_id: request_id.get(),
+            phase,
+        });
+    }
+
     fn trace_block_action_received(&self, action: &BlockSyncAction) {
         self.emit_event(|| DriverEvent {
             event: event::ACTION_RECEIVED,

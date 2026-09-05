@@ -24,6 +24,12 @@ use crate::zakura::{
 #[derive(Default, Serialize)]
 pub(super) struct BlockTraceFields {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,

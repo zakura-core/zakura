@@ -31,10 +31,23 @@ continuity cannot detect a session whose entire trace disappeared. Process-wide
 event totals and a durable final loss report are needed to close that gap.
 The `sync.block.capture.sessions_started`, `sessions_finished`, and
 `decoded_messages` counters count attempts independently of trace emission;
-the latter is labeled by message kind. A capture controller must reconcile
-their final values with the trace after the clients disconnect and the server
-finishes the observed sessions. The arrival importer does not perform that
-cross-check yet.
+the latter is labeled by message kind. The `process_info` gauge binds these
+totals to the JSONL process identity. After all observed clients disconnect,
+keep new clients disconnected, wait for both session counters to agree, save
+the server's local Prometheus scrape, then stop the server and preserve its
+closed trace. Check those totals with:
+
+```sh
+python3 scripts/import-getblocks-arrivals.py block_sync.jsonl arrivals.json \
+  --final-metrics final-metrics.prom
+```
+
+This also rejects an entirely missing session, a different process's scrape,
+or unequal totals by message kind. The artifact records the scrape hash and
+sets `decode_totals_reconciled` to true. It leaves `capture_loss_verified` false:
+matching decode totals cannot prove coverage after the scrape or completeness
+of service events. The capture controller must establish the final observation
+boundary and retain that evidence separately.
 
 A resource replay additionally needs correlated admission, actual state-query
 completion, frame ownership through write completion or drop, and final

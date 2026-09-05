@@ -33,8 +33,17 @@ def episode():
     ]
 
 
-def load(rows):
-    return arrivals.import_arrivals((json.dumps(item) + "\n").encode() for item in rows)
+def load(rows, metrics=None):
+    return arrivals.import_arrivals(((json.dumps(item) + "\n").encode() for item in rows), metrics)
+
+
+METRICS = b'''# TYPE sync_block_capture_sessions_started counter
+sync_block_capture_process_info{process_trace_id="one-process"} 1
+sync_block_capture_sessions_started 1
+sync_block_capture_sessions_finished 1
+sync_block_capture_decoded_messages{kind="status"} 1
+sync_block_capture_decoded_messages{kind="get_blocks"} 2
+'''
 
 
 class ImportTests(unittest.TestCase):
@@ -87,6 +96,42 @@ class ImportTests(unittest.TestCase):
     def test_legacy_kind_only_trace_is_not_a_valid_empty_capture(self):
         with self.assertRaises(arrivals.IncompleteCapture):
             load([{"event": arrivals.MESSAGE, "kind": "get_blocks"}])
+
+    def test_reconciliation_checks_totals_without_claiming_service_coverage(self):
+        result = load(episode(), METRICS)
+        self.assertTrue(result["decode_totals_reconciled"])
+        self.assertFalse(result["capture_loss_verified"])
+        self.assertFalse(result["service_lifecycles_complete"])
+        self.assertEqual(result["final_metrics"]["messages_by_kind"], {"status": 1, "get_blocks": 2})
+
+    def test_wholly_missing_session_is_detected_by_independent_totals(self):
+        second = [dict(item, session_id=2, ts=item["ts"] + 100) for item in episode()]
+        totals = METRICS.replace(b"started 1", b"started 2").replace(b"finished 1", b"finished 2")
+        totals = totals.replace(b'kind="status"} 1', b'kind="status"} 2')
+        totals = totals.replace(b'kind="get_blocks"} 2', b'kind="get_blocks"} 4')
+        self.assertTrue(load(episode() + second, totals)["decode_totals_reconciled"])
+        with self.assertRaises(arrivals.IncompleteCapture):
+            load(episode(), totals)
+
+    def test_invalid_or_mismatched_scrapes_are_rejected(self):
+        for metrics in [
+            b"",
+            METRICS.replace(b"one-process", b"different-process"),
+            METRICS.replace(b"finished 1", b"finished 0"),
+            METRICS.replace(b'kind="get_blocks"} 2', b'kind="get_blocks"} 1'),
+            METRICS + b"sync_block_capture_sessions_started 1\n",
+            METRICS.replace(b"started 1", b"started NaN"),
+            METRICS.replace(b"started 1", b"started 1.5"),
+            METRICS.replace(b"started 1", b"started 9007199254740992"),
+        ]:
+            with self.subTest(metrics=metrics):
+                with self.assertRaises(arrivals.IncompleteCapture):
+                    load(episode(), metrics)
+
+    def test_exporter_zero_counters_and_exact_exponent_numbers_are_supported(self):
+        metrics = METRICS.replace(b"started 1", b"started 1e0")
+        metrics += b'sync_block_capture_decoded_messages{kind="block"} 0\n'
+        self.assertTrue(load(episode(), metrics)["decode_totals_reconciled"])
 
 
 if __name__ == "__main__":

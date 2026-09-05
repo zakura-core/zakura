@@ -33,6 +33,12 @@ impl PeerRoutine {
     }
 
     pub(super) fn trace_decode_session_started(&self) {
+        // Bind independent scrape totals to the same process as the JSONL rows.
+        metrics::gauge!(
+            "sync.block.capture.process_info",
+            "process_trace_id" => zakura_jsonl_trace::process_trace_id()
+        )
+        .set(1.0);
         metrics::counter!("sync.block.capture.sessions_started").increment(1);
         self.trace_decode_session_boundary("block_decode_session_started");
     }

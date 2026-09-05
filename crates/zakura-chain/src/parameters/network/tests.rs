@@ -386,7 +386,7 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     //                   = floor(1_250_000_000 / (2 * 3 * 8)) = 26_041_666 zatoshi
     assert_eq!(
         Amount::<NonNegative>::try_from(26_041_666)?,
-        block_subsidy(nu7_height, &network)?,
+        halving_block_subsidy(nu7_height, &network)?,
     );
 
     // The third halving boundary lands exactly at NU7 here, so the block before
@@ -394,7 +394,7 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     assert_eq!(2, halving((nu7_height - 1).unwrap(), &network));
     assert_eq!(
         Amount::<NonNegative>::try_from(156_250_000)?,
-        block_subsidy((nu7_height - 1).unwrap(), &network)?,
+        halving_block_subsidy((nu7_height - 1).unwrap(), &network)?,
     );
 
     // The halving counter does not reset at NU7. The next boundary arrives after
@@ -417,7 +417,7 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     assert_eq!(16, halving_divisor(next_halving, &network).unwrap());
     assert_eq!(
         Amount::<NonNegative>::try_from(13_020_833)?,
-        block_subsidy(next_halving, &network)?,
+        halving_block_subsidy(next_halving, &network)?,
     );
 
     Ok(())

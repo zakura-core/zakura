@@ -2702,13 +2702,22 @@ where
                     })
                 };
 
-                let precomputed_coinbase = precompute_coinbase(
-                    self.network.clone(),
-                    precomputed_height,
-                    miner_params.clone(),
-                )
-                .await
-                .expect("valid coinbase tx");
+                // ZIP 234 derives the subsidy from the new tip's value pools. Those pools
+                // are unknown until the tip arrives, so this optimization cannot construct
+                // a valid post-activation coinbase in advance.
+                let precomputed_coinbase = if is_zip234_active(&self.network, precomputed_height) {
+                    None
+                } else {
+                    Some(
+                        precompute_coinbase(
+                            self.network.clone(),
+                            precomputed_height,
+                            miner_params.clone(),
+                        )
+                        .await
+                        .expect("valid coinbase tx"),
+                    )
+                };
 
                 let _ = wait_for_new_tip.await;
 
@@ -2777,7 +2786,8 @@ where
                     // BIP-34 height and subsidies wouldn't match the block.
                     let next_height = chain_info.tip_height.next().map_misc_error()?;
                     let precomputed_coinbase = (next_height == precomputed_height)
-                        .then_some(precomputed_coinbase);
+                        .then_some(precomputed_coinbase)
+                        .flatten();
 
                     // Respond instantly with an empty block upon a chain tip change so that
                     // the miner doesn't waste their effort trying to extend a shorter
@@ -2832,6 +2842,7 @@ where
             &self.network,
             height,
             miner_params,
+            Some(chain_info.value_pools.money_reserve()),
             mempool_txs,
             mempool_tx_deps,
         );

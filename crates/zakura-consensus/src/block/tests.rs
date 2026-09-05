@@ -20,7 +20,7 @@ use zakura_chain::{
     parameters::{
         subsidy::block_subsidy,
         testnet::{ConfiguredActivationHeights, Parameters},
-        NetworkUpgrade,
+        NetworkUpgrade, Zip234Deployment,
     },
     primitives::Halo2Proof,
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
@@ -737,6 +737,7 @@ fn librustzcash_conversion_test_network(network_upgrade: NetworkUpgrade) -> Netw
         .with_slow_start_interval(Height::MIN)
         .with_disable_pow(true)
         .disable_temporary_orchard_disabling_soft_fork()
+        .with_zip234_deployment(Zip234Deployment::AtHeight(Height(2)))
         .with_target_difficulty_limit(target_difficulty_limit)
         .expect("failed to set target difficulty limit")
         .to_network()
@@ -771,7 +772,12 @@ fn v5_coinbase_transaction(
     network: &Network,
 ) -> Transaction {
     let mut outputs = vec![transparent::Output {
-        value: block_subsidy(height, network, None).expect("valid test block subsidy"),
+        value: block_subsidy(
+            height,
+            network,
+            Some(MAX_MONEY.try_into().expect("valid money reserve")),
+        )
+        .expect("valid test block subsidy"),
         lock_script: transparent::Script::new(&[0]),
     }];
 

@@ -173,14 +173,22 @@ in a wallet-specific mode.
 
 ## 4. Results and retries
 
-The wire response uses stable result and reason codes:
+The wire response uses stable result and reason codes. Wallets handle them as
+follows:
 
-| Result | Meaning |
-| --- | --- |
-| `Accepted` | This node inserted the submitted transaction into its verified mempool. |
-| `AlreadyPresent` | This node already holds the same authorized transaction in its verified mempool. |
-| `Rejected` | This node rejected it, with a reason distinguishing transaction validity, expiry, and local policy. |
-| `RetryLater` | The node is busy, not ready, or missing temporary validation context. |
+| Result | Meaning | Wallet action |
+| --- | --- | --- |
+| `Accepted` | This node inserted the submitted transaction into its verified mempool. | Record acceptance and monitor confirmation. |
+| `AlreadyPresent` | This node already holds the same authorized transaction in its verified mempool. | Record acceptance and monitor confirmation. |
+| `Rejected`: local policy | This node's relay policy excludes the transaction. | Try another suitable node within the native retry budget, then use lightwalletd fallback. |
+| `Rejected`: invalid or expired | This node reports a validity or expiry failure. | Confirm the reason using wallet checks or chain observation. Stop automatic retries if confirmed; otherwise try another node within the native retry budget, then use fallback. |
+| `RetryLater` | The node is busy, not ready, or missing temporary validation context. | Back off before retrying the same node, or select another node. Use fallback when the native retry budget is exhausted. |
+
+Each send or background retry pass has configured limits on attempts and elapsed
+time for native submission, followed by a separately bounded lightwalletd fallback.
+Responses and peer changes must not reset those limits. Acceptance or a confirmed
+invalidity or expiry ends the retry pass. Choose the limits before rollout as
+required in section 9.
 
 Responses identify the request and, when the transaction can be decoded, its
 transaction identity. Include bounded tip context for admission decisions.
@@ -276,8 +284,8 @@ Wallets adopting Zakura submission retain their configured lightwalletd endpoint
 as a fallback:
 
 - **Without Tor:** Try submission through discovered Zakura nodes first. If no
-  suitable nodes are reachable or submission times out after bounded retries,
-  fall back to the existing lightwalletd submission path.
+  suitable nodes are reachable or native retries are exhausted, fall back to the
+  existing lightwalletd submission path, following the result rules in section 4.
 - **With Tor:** Continue submitting through Tor to lightwalletd until the
   Tor-compatible Zakura follow-on is complete. Do not attempt direct P2P v2
   submission in this mode.

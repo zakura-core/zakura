@@ -114,3 +114,40 @@ failed synchronous admission attempt or partial pending-slot acquisition. They
 must not be treated as a complete trace of instantaneous global balances. The
 workload adapter must exercise the actual regulator and preserve uncertainty
 inside acquisition and release intervals.
+
+## Completed application lifetimes
+
+For a closed run with both trace tables, final metrics and the controller's
+boundary evidence, import a completed workload profile with:
+
+```sh
+python3 scripts/import-getblocks-workload.py closed-run workload.json
+python3 -m unittest discover -s scripts/tests -p 'test*getblocks*.py'
+```
+
+The run directory must contain `traces/block_sync.jsonl`,
+`traces/commit_state.jsonl`, `final-metrics.prom`, `capture-boundary.json` and
+`clients-stopped.json`. The controller evidence declares the owned clients
+stopped and the population closed. Its boundary binds that declaration and the
+final scrape by SHA-256 and declares quiescent counters verified. The importer
+checks those bindings, validates decode continuity, and reconciles all six
+lifecycle counter families against the closed files before joining requests.
+This declaration remains an operational prerequisite; the importer cannot
+independently observe stopped processes on remote machines.
+
+This profile accepts committed requests with completed reads and returned
+writes. It checks identities, phase order, response accounting, frame and wait
+sequences, and ownership release intervals. A missing event or unsupported
+outcome rejects the entire episode, even if other requests completed. Cancelled
+reads, rolled-back admissions, dropped writes and closed waits need a later
+profile extension; they are never silently omitted. A returned write can still
+be an error and does not establish peer receipt.
+
+The output retains decoded arrival times, admission and query timing, frame
+sizes, waits and release intervals. A frame may outlive the request that queued
+it. Timestamp ties remain explicit, and peer identities become local integers.
+The original startup configuration and binary provenance remain required run
+metadata. This artifact does not yet predict throughput or implement a replay;
+a test adapter must exercise the production regulator using an explicit policy
+and relative service durations. It must not interpret these observations as
+atomic changes to global resource balances.

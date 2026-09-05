@@ -91,6 +91,69 @@ impl ServingObservation {
             write_state: "queued",
         })
     }
+
+    pub(super) fn start_settlement(
+        self: &Arc<Self>,
+        request_id: Option<BlockRangeRequestId>,
+        request_overhead: u64,
+        response_cap: u64,
+        transferred: u64,
+    ) -> SettlementObservation {
+        let settlement = SettlementObservation {
+            request: self.clone(),
+            request_id,
+            request_overhead,
+            response_cap,
+            transferred,
+        };
+        settlement.emit("release_started");
+        settlement
+    }
+}
+
+/// Must be dropped after the request's resource fields to close the release interval.
+#[derive(Debug)]
+pub(super) struct SettlementObservation {
+    request: Arc<ServingObservation>,
+    request_id: Option<BlockRangeRequestId>,
+    request_overhead: u64,
+    response_cap: u64,
+    transferred: u64,
+}
+
+#[derive(Serialize)]
+struct SettlementEvent {
+    #[serde(flatten)]
+    request: ServingEvent,
+    request_overhead: u64,
+    response_cap: u64,
+    transferred: u64,
+    unused_response_capacity: u64,
+}
+
+impl JsonlTraceEvent for SettlementEvent {
+    const TABLE: zakura_jsonl_trace::JsonlTraceTable = BLOCK_SYNC_TABLE;
+}
+
+impl SettlementObservation {
+    fn emit(&self, phase: &'static str) {
+        metrics::counter!("sync.block.capture.settlement_events", "phase" => phase).increment(1);
+        self.request.trace.emit_event(|| SettlementEvent {
+            request: self
+                .request
+                .row("get_blocks_settlement", phase, self.request_id),
+            request_overhead: self.request_overhead,
+            response_cap: self.response_cap,
+            transferred: self.transferred,
+            unused_response_capacity: self.response_cap.saturating_sub(self.transferred),
+        });
+    }
+}
+
+impl Drop for SettlementObservation {
+    fn drop(&mut self) {
+        self.emit("release_finished");
+    }
 }
 
 #[derive(Debug)]
@@ -189,7 +252,17 @@ mod tests {
         service
             .try_send_regulated_blocks_done(height, 1, &mut permit)
             .unwrap();
+        let query = permit.query_lease();
         drop(permit);
+        assert_eq!(regulator.snapshot().node_active, 1);
+        let mut rows = Vec::new();
+        while let Ok(event) = observations.try_recv() {
+            let row: serde_json::Value = serde_json::from_slice(&event.line).unwrap();
+            assert_ne!(row["event"], "get_blocks_settlement");
+            rows.push(row);
+        }
+        // Ledger closure cannot settle a request still retained by its state query.
+        drop(query);
         assert_eq!(regulator.snapshot().node_active, 0);
         assert!(regulator.snapshot().node_outstanding > 0);
 
@@ -205,7 +278,29 @@ mod tests {
 
         let mut frames = [Vec::new(), Vec::new()];
         while let Ok(event) = observations.try_recv() {
-            let row: serde_json::Value = serde_json::from_slice(&event.line).unwrap();
+            rows.push(serde_json::from_slice(&event.line).unwrap());
+        }
+        let settlements: Vec<_> = rows
+            .iter()
+            .filter(|row| row["event"] == "get_blocks_settlement")
+            .collect();
+        assert_eq!(settlements.len(), 2);
+        assert_eq!(settlements[0]["phase"], "release_started");
+        assert_eq!(settlements[1]["phase"], "release_finished");
+        let queued_bytes: u64 = rows
+            .iter()
+            .filter(|row| row["event"] == "get_blocks_frame" && row["phase"] == "queued")
+            .map(|row| row["payload_bytes"].as_u64().unwrap())
+            .sum();
+        for row in settlements {
+            assert_eq!(row["request_id"], 30);
+            assert_eq!(row["transferred"], queued_bytes);
+            assert_eq!(
+                row["response_cap"].as_u64().unwrap(),
+                queued_bytes + row["unused_response_capacity"].as_u64().unwrap()
+            );
+        }
+        for row in rows {
             if row["event"] != "get_blocks_frame" {
                 continue;
             }
@@ -267,8 +362,8 @@ mod tests {
         while let Ok(event) = receiver.try_recv() {
             rows.push(serde_json::from_slice::<serde_json::Value>(&event.line).unwrap());
         }
-        assert_eq!(rows.len(), 8);
-        for (sequence, events) in [20, 21].into_iter().zip(rows.as_chunks::<4>().0) {
+        assert_eq!(rows.len(), 12);
+        for (sequence, events) in [20, 21].into_iter().zip(rows.as_chunks::<6>().0) {
             let phases: Vec<_> = events
                 .iter()
                 .map(|row| row["phase"].as_str().unwrap())
@@ -279,7 +374,9 @@ mod tests {
                     "input_retained",
                     "admission_reserved",
                     "committed",
-                    "request_bound"
+                    "request_bound",
+                    "release_started",
+                    "release_finished"
                 ]
             );
             for row in events {

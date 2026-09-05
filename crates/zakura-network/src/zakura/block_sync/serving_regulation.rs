@@ -10,7 +10,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Weak;
 
-use super::serving_observation::ServingObservation;
+use super::serving_observation::{ServingObservation, SettlementObservation};
 use super::{config::*, wire::MAX_BS_BLOCKS_PER_REQUEST, *};
 use crate::zakura::regulation::{
     CommittedRateReservation, FrameLease, OutstandingByteBudget, OutstandingByteReservation,
@@ -721,6 +721,7 @@ impl AdmissionAttempt {
                 _node_active: self._node_active,
                 _peer_rate_account: self._peer_rate_account,
                 _session_resources: self._session_resources,
+                settlement: None,
             })),
         }
     }
@@ -752,6 +753,8 @@ struct ServingResources {
     _node_active: SlotPermit,
     _peer_rate_account: Arc<PeerRateAccount>,
     _session_resources: Arc<SessionResources>,
+    // Rust drops fields in declaration order. Keep this after every resource owner.
+    settlement: Option<SettlementObservation>,
 }
 
 impl ServingResources {
@@ -806,6 +809,14 @@ impl ServingResources {
 
 impl Drop for ServingResources {
     fn drop(&mut self) {
+        self.settlement = self.observation.as_ref().map(|observation| {
+            observation.start_settlement(
+                self.request_id,
+                self.request_overhead,
+                self.response_cap,
+                self.transferred,
+            )
+        });
         let refunded = self.response_cap.saturating_sub(self.transferred);
         metrics::counter!("sync.block.serving.refunded_bytes").increment(refunded);
         tracing::trace!(

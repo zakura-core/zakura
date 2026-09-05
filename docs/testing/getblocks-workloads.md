@@ -85,6 +85,14 @@ accounting transition. Observers hold diagnostic identity only. Tests check
 that the final observation sees returned capacity after queue drop, write
 cancellation, and successful or failed write return.
 
+The `get_blocks_settlement` rows bracket final request-resource release after
+the last ledger, query, or response owner drops. They report fixed request work,
+response capacity, bytes transferred to transport, and unused response capacity.
+The release-finish guard follows every resource field in Rust's drop order.
+Transferred frames can remain outstanding after this request release finishes;
+their separate frame rows describe that ownership. The independent
+`sync.block.capture.settlement_events` counters count attempts by phase.
+
 The arrival importer does not yet join these rows or validate service lifetimes.
-Admission waits, cancellation outcomes, and final request settlement still need
-complete observations before this becomes an accounting replay input.
+Admission waits and cancellation outcomes still need complete observations
+before this becomes an accounting replay input.

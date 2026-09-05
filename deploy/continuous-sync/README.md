@@ -144,6 +144,12 @@ Missing, failed, mismatched, or future-dated receipts do not suppress the audit.
 A new run with the same failure reason remains a separate incident. Older
 controllers without receipts keep their existing audit fallback.
 
+Cached incident delivery is also tied to the Slack destination. After a webhook
+change, the next audit alerts the new destination unless a matching controller
+receipt confirms delivery there. It does not send recoveries for incidents known
+only to the old destination. Cache records without a destination cannot suppress
+an alert without a matching receipt.
+
 Unchanged failures and routine completions share a daily digest, replacing the
 six-hour reminders and individual completion messages. The first digest is due
 24 hours after the audit begins tracking it; subsequent digests follow that

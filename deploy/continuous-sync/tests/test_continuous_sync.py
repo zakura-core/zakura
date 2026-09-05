@@ -1092,7 +1092,7 @@ class NotificationTests(unittest.TestCase):
             "disk_free_bytes": 20 * 1024**3,
         }
 
-    def audit(self, path, data, timestamp, *, posted=True, selected=None):
+    def audit(self, path, data, timestamp, *, posted=True, selected=None, webhook=WEBHOOK):
         args = argparse.Namespace(
             config=Path("unused"), node=selected, dry_run=False,
             max_completion_age=0, reminder_interval=86400, state_file=path,
@@ -1103,7 +1103,7 @@ class NotificationTests(unittest.TestCase):
             patch.object(deploy, "remote_json", return_value=(True, data)),
             patch.object(deploy, "now", return_value=timestamp),
             patch.object(deploy, "post_slack", return_value=posted) as post,
-            patch.dict(os.environ, {"SLACK_WEB_HOOK": self.WEBHOOK}),
+            patch.dict(os.environ, {"SLACK_WEB_HOOK": webhook}),
         ):
             result = deploy.cmd_audit(args)
         return result, post
@@ -1171,6 +1171,71 @@ class NotificationTests(unittest.TestCase):
                     )
                 new, _, _, _ = deploy.audit_transitions({"node": problem}, previous, 86400, 1100)
                 self.assertEqual(len(new), 1)
+
+    def test_destination_change_realerts_cached_failure_and_retries_delivery(self):
+        other_webhook = "https://slack.invalid/other"
+        for receipt in (True, False):
+            with self.subTest(receipt=receipt), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "state.json"
+                data = self.halted_status()
+                if not receipt:
+                    del data["controller_state"]["failure_notification"]
+                self.audit(path, data, 1000)
+                before = path.read_text()
+                result, post = self.audit(path, data, 1100, webhook=other_webhook, posted=False)
+                self.assertEqual(result, 1)
+                post.assert_called_once()
+                self.assertIn("controller halted", post.call_args.args[0])
+                self.assertEqual(path.read_text(), before)
+
+                _, post = self.audit(path, data, 1200, webhook=other_webhook)
+                post.assert_called_once()
+                state = deploy.load_audit_state(path)
+                self.assertEqual(state["problems"]["node"]["destination"], hashlib.sha256(other_webhook.encode()).hexdigest())
+                _, post = self.audit(path, data, 1300, webhook=other_webhook)
+                post.assert_not_called()
+
+    def test_destination_change_accepts_receipt_for_new_destination(self):
+        other_webhook = "https://slack.invalid/other"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            data = self.halted_status()
+            self.audit(path, data, 1000)
+            data["controller_state"]["failure_notification"].update({
+                "destination": hashlib.sha256(other_webhook.encode()).hexdigest(),
+                "sent_at": 1050,
+            })
+            result, post = self.audit(path, data, 1100, webhook=other_webhook)
+            self.assertEqual(result, 1)
+            post.assert_not_called()
+            self.assertEqual(deploy.load_audit_state(path)["problems"]["node"]["last_sent"], 1050)
+
+    def test_recovery_requires_cached_delivery_to_current_destination(self):
+        for webhook in (self.WEBHOOK, "https://slack.invalid/other"):
+            with self.subTest(webhook=webhook), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "state.json"
+                self.audit(path, self.halted_status(), 1000)
+                healthy = {"controller_state": {}, "disk_free_bytes": 20 * 1024**3}
+                result, post = self.audit(path, healthy, 1100, webhook=webhook)
+                self.assertEqual(result, 0)
+                if webhook == self.WEBHOOK:
+                    post.assert_called_once()
+                    self.assertIn("recovered", post.call_args.args[0])
+                else:
+                    post.assert_not_called()
+
+    def test_cache_without_destination_cannot_suppress_undelivered_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            data = self.halted_status()
+            del data["controller_state"]["failure_notification"]
+            self.audit(path, data, 1000)
+            state = deploy.load_audit_state(path)
+            state["problems"]["node"].pop("destination", None)
+            deploy.save_audit_state(path, state)
+            _, post = self.audit(path, data, 1100)
+            post.assert_called_once()
+            self.assertIn("controller halted", post.call_args.args[0])
 
     def test_missing_receipt_preserves_audit_fallback_and_failed_delivery_retry(self):
         data = self.halted_status()

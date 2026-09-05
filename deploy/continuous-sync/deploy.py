@@ -586,15 +586,20 @@ def audit_transitions(
     timestamp: int,
     *,
     reminders_due: bool = True,
+    destination: str | None = None,
 ) -> tuple[list[str], list[str], list[str], dict[str, Any]]:
     """Split current problems into new/reminder/recovered lines.
 
     New problems alert unless a matching controller receipt already accounts for
     that first delivery. Changed categories or runs still alert. Unchanged
     problems remind only when due; volatile message detail does not define the
-    incident. The caller persists the returned state only after successful delivery.
+    incident. Cached delivery applies only to the same Slack destination. The
+    caller persists the returned state only after successful delivery.
     """
-    prior = previous.get("problems", {})
+    prior = {
+        name: record for name, record in previous.get("problems", {}).items()
+        if isinstance(record, dict) and record.get("destination") == destination
+    }
     new_lines: list[str] = []
     reminder_lines: list[str] = []
     current: dict[str, Any] = {}
@@ -610,6 +615,7 @@ def audit_transitions(
         ):
             # First sighting, or the failure changed to a different one.
             record = {
+                "destination": destination,
                 "kind": problem.kind,
                 "detail": problem.detail,
                 "incident_id": problem.incident_id,
@@ -631,6 +637,7 @@ def audit_transitions(
             )
             last_sent = timestamp
         current[name] = {
+            "destination": destination,
             "kind": problem.kind,
             "detail": problem.detail,
             "incident_id": problem.incident_id,
@@ -734,6 +741,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
     new_lines, reminder_lines, recovered_lines, state = audit_transitions(
         problems, scoped_previous, args.reminder_interval, timestamp,
         reminders_due=digest_due,
+        destination=destination,
     )
     state["problems"].update({k: v for k, v in prior_problems.items() if k not in selected})
     completion_lines, state["completions"] = completion_updates(statuses, previous, digest_due)

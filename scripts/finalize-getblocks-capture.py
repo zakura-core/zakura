@@ -15,7 +15,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path, help="run directory containing the verified clients-stopped.json declaration")
     parser.add_argument("--metrics-url", default="http://127.0.0.1:19999/metrics")
-    parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--timeout", type=float, default=240,
+                        help="seconds to await drained sessions and owners (default: 240)")
     args = parser.parse_args()
     try:
         clients = (args.run / "clients-stopped.json").read_bytes()

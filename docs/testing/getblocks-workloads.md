@@ -234,8 +234,10 @@ observation times retained in the run manifest. Then, on the serving node, run:
 python3 scripts/finalize-getblocks-capture.py /absolute/path/run
 ```
 
-By default it reads the local exporter on port 19999 and waits up to 120 seconds
-for two equal, drained capture-counter samples at least two seconds apart. It
+By default it reads the local exporter on port 19999 and waits up to 240 seconds
+for two equal, drained capture-counter samples at least two seconds apart. An
+abrupt client exit can leave its server session alive until the 150-second
+QUIC idle timeout expires, so the capture wait includes time for that cleanup. It
 rejects unknown counter labels and preserves existing boundary files. A failure
 leaves the capture unfinalized; retain its diagnostics instead of manufacturing
 a successful boundary. Success writes `final-metrics.prom` and

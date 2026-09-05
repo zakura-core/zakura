@@ -189,7 +189,9 @@ fetch_state() {
 snapshot_height() {
   # Snapshot publishers use both JSON numbers and decimal digit strings.
   jq -er '.height
-    | if type == "string" then select(test("^[0-9]+$")) | tonumber else . end
+    | if type == "string" then
+        select(length > 0 and (test("[^0-9]") | not)) | tonumber
+      else . end
     | select(type == "number")
     | select(. >= 0 and floor == .)' || {
     echo "snapshot height must be a nonnegative integer or decimal digit string" >&2

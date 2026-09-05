@@ -67,6 +67,9 @@ class SnapshotHeight(unittest.TestCase):
                     "1e6",
                     " 4128095",
                     "4128095\n",
+                    "4128095\r\n",
+                    "4128\n095",
+                    "4128095\t",
                 )
             ),
         ]:

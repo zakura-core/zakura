@@ -16,8 +16,12 @@ use crate::{
     SemanticallyVerifiedBlock,
 };
 
+mod utxo_provider_cache;
+
 #[cfg(test)]
 mod tests;
+
+use utxo_provider_cache::UtxoProviderCache;
 
 /// A queued checkpoint verified block, and its corresponding [`Result`] channel.
 pub type QueuedCheckpointVerified = (
@@ -40,16 +44,17 @@ pub struct QueuedBlocks {
     by_parent: HashMap<block::Hash, HashSet<block::Hash>>,
     /// Hashes from `queued_blocks`, indexed by block height.
     by_height: BTreeMap<block::Height, HashSet<block::Hash>>,
-    /// Known UTXOs.
-    known_utxos: HashMap<transparent::OutPoint, transparent::Utxo>,
+    /// Known UTXOs, indexed by outpoint and provider block.
+    known_utxos: UtxoProviderCache,
 }
 
 impl QueuedBlocks {
     /// Queue a block for eventual verification and commit.
     ///
-    /// # Panics
-    ///
-    /// - if a block with the same `block::Hash` has already been queued.
+    /// If a block with the same hash is already queued, this method keeps the
+    /// existing block and ignores `new`.
+    /// The ignored request is dropped without sending a result, so its response
+    /// receiver observes a closed channel.
     #[instrument(skip(self), fields(height = ?new.0.height, hash = %new.0.hash))]
     pub fn queue(&mut self, new: QueuedSemanticallyVerified) {
         let new_hash = new.0.hash;
@@ -64,7 +69,7 @@ impl QueuedBlocks {
         // Track known UTXOs in queued blocks.
         for (outpoint, ordered_utxo) in new.0.new_outputs.iter() {
             self.known_utxos
-                .insert(*outpoint, ordered_utxo.utxo.clone());
+                .insert(new_hash, *outpoint, ordered_utxo.utxo.clone());
         }
 
         self.blocks.insert(new_hash, new);
@@ -115,10 +120,8 @@ impl QueuedBlocks {
                 }
             }
 
-            // TODO: only remove UTXOs if there are no queued blocks with that UTXO
-            //       (known_utxos is best-effort, so this is ok for now)
             for outpoint in queued.0.new_outputs.keys() {
-                self.known_utxos.remove(outpoint);
+                self.known_utxos.remove_provider(&queued.0.hash, outpoint);
             }
         }
 
@@ -189,10 +192,8 @@ impl QueuedBlocks {
             )
             .into()));
 
-            // TODO: only remove UTXOs if there are no queued blocks with that UTXO
-            //       (known_utxos is best-effort, so this is ok for now)
             for outpoint in expired_block.new_outputs.keys() {
-                self.known_utxos.remove(outpoint);
+                self.known_utxos.remove_provider(&hash, outpoint);
             }
 
             let parent_list = self
@@ -278,8 +279,8 @@ pub(crate) struct SentHashes {
     /// may not be in the finalized state yet.
     pub sent: HashMap<block::Hash, Vec<transparent::OutPoint>>,
 
-    /// Known UTXOs.
-    known_utxos: HashMap<transparent::OutPoint, transparent::Utxo>,
+    /// Known UTXOs, indexed by outpoint and provider block.
+    known_utxos: UtxoProviderCache,
 
     /// Whether the hashes in this struct can be used check if the chain can be forked.
     /// This is set to false until all checkpoint-verified block hashes have been pruned.
@@ -290,11 +291,11 @@ impl SentHashes {
     /// Creates a new [`SentHashes`] with the block hashes and UTXOs in the provided non-finalized state.
     pub fn new(non_finalized_state: &NonFinalizedState) -> Self {
         let mut sent_hashes = Self::default();
-        for (_, block) in non_finalized_state
-            .chain_iter()
-            .flat_map(|c| c.blocks.clone())
-        {
-            sent_hashes.add(&block.into());
+        for chain in non_finalized_state.chain_iter() {
+            for (_, block) in chain.blocks.clone() {
+                sent_hashes.add(&block.into());
+            }
+            sent_hashes.finish_batch();
         }
 
         if !sent_hashes.sent.is_empty() {
@@ -307,25 +308,12 @@ impl SentHashes {
     /// Stores the `block`'s hash, height, and UTXOs, so they can be used to check if a block or UTXO
     /// is available in the state.
     ///
+    /// If the block hash is already present, this method keeps the existing block data.
+    ///
     /// Assumes that blocks are added in the order of their height between `finish_batch` calls
     /// for efficient pruning.
     pub fn add(&mut self, block: &SemanticallyVerifiedBlock) {
-        // Track known UTXOs in sent blocks.
-        let outpoints = block
-            .new_outputs
-            .iter()
-            .map(|(outpoint, ordered_utxo)| {
-                self.known_utxos
-                    .insert(*outpoint, ordered_utxo.utxo.clone());
-                outpoint
-            })
-            .cloned()
-            .collect();
-
-        self.curr_buf.push_back((block.hash, block.height));
-        self.sent.insert(block.hash, outpoints);
-
-        self.update_metrics_for_block(block.height);
+        self.add_block_outputs(block.hash, block.height, &block.new_outputs);
     }
 
     /// Stores the checkpoint verified `block`'s hash, height, and UTXOs, so they can be used to check if a
@@ -339,22 +327,35 @@ impl SentHashes {
     ///
     /// For more details see `add()`.
     pub fn add_finalized(&mut self, block: &CheckpointVerifiedBlock) {
+        self.add_block_outputs(block.hash, block.height, &block.new_outputs);
+    }
+
+    /// Stores one block and its UTXOs unless its hash is already present.
+    fn add_block_outputs(
+        &mut self,
+        hash: block::Hash,
+        height: block::Height,
+        new_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    ) {
+        if self.sent.contains_key(&hash) {
+            return;
+        }
+
         // Track known UTXOs in sent blocks.
-        let outpoints = block
-            .new_outputs
+        let outpoints = new_outputs
             .iter()
             .map(|(outpoint, ordered_utxo)| {
                 self.known_utxos
-                    .insert(*outpoint, ordered_utxo.utxo.clone());
+                    .insert(hash, *outpoint, ordered_utxo.utxo.clone());
                 outpoint
             })
             .cloned()
             .collect();
 
-        self.curr_buf.push_back((block.hash, block.height));
-        self.sent.insert(block.hash, outpoints);
+        self.curr_buf.push_back((hash, height));
+        self.sent.insert(hash, outpoints);
 
-        self.update_metrics_for_block(block.height);
+        self.update_metrics_for_block(height);
     }
 
     /// Try to look up this UTXO in any sent block.
@@ -387,10 +388,8 @@ impl SentHashes {
                     buf.push_front((hash, height));
                     return true;
                 } else if let Some(expired_outpoints) = self.sent.remove(&hash) {
-                    // TODO: only remove UTXOs if there are no queued blocks with that UTXO
-                    //       (known_utxos is best-effort, so this is ok for now)
                     for outpoint in expired_outpoints.iter() {
-                        self.known_utxos.remove(outpoint);
+                        self.known_utxos.remove_provider(&hash, outpoint);
                     }
                 }
             }
@@ -410,8 +409,8 @@ impl SentHashes {
         self.sent.contains_key(hash)
     }
 
-    /// Removes a `hash` from `SentHashes`, dropping its outpoints from `known_utxos`
-    /// and its entry from whichever batch buffer holds it.
+    /// Removes a `hash` from `SentHashes`, removing it as a provider for its outpoints
+    /// and dropping its entry from whichever batch buffer holds it.
     ///
     /// Called when the block write task rejects a block, so that a subsequent
     /// re-delivery of a block with the same hash is not short-circuited as a
@@ -422,13 +421,16 @@ impl SentHashes {
         };
 
         for outpoint in &outpoints {
-            self.known_utxos.remove(outpoint);
+            self.known_utxos.remove_provider(hash, outpoint);
         }
 
         self.curr_buf.retain(|(h, _)| h != hash);
-        for buf in &mut self.bufs {
+        self.bufs.retain_mut(|buf| {
             buf.retain(|(h, _)| h != hash);
-        }
+            !buf.is_empty()
+        });
+
+        self.update_metrics_for_cache();
     }
 
     /// Returns true if the chain can be forked at the provided hash

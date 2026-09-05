@@ -93,6 +93,24 @@ Transferred frames can remain outstanding after this request release finishes;
 their separate frame rows describe that ownership. The independent
 `sync.block.capture.settlement_events` counters count attempts by phase.
 
+The `get_blocks_ownership` rows bracket release of retained pending input or
+rollback of a fully reserved provisional admission. Rust drops paired guards
+before and after the resource fields; commit disarms the rollback guards.
+`input_consumed` means the reactor extracted the request, not that it accepted
+or committed the work. Dropped input has release rows without consumption.
+The `sync.block.capture.ownership_events` counters include stage and phase.
+
+The `get_blocks_wait` rows identify each pending-input, admission, or reactor
+queue wait with a per-request sequence. They end as ready, closed, or cancelled,
+including task aborts and waits dropped before their first poll. Readiness can
+still be followed by another blocked admission attempt. `initial_bound` names
+the original reason for waiting; pending retention can wait on both session and
+node capacity. The `sync.block.capture.wait_events` counters count attempts by
+stage and phase.
+
 The arrival importer does not yet join these rows or validate service lifetimes.
-Admission waits and cancellation outcomes still need complete observations
-before this becomes an accounting replay input.
+These observations do not individually record temporary reservations inside a
+failed synchronous admission attempt or partial pending-slot acquisition. They
+must not be treated as a complete trace of instantaneous global balances. The
+workload adapter must exercise the actual regulator and preserve uncertainty
+inside acquisition and release intervals.

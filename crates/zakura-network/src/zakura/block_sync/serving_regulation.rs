@@ -10,7 +10,9 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Weak;
 
-use super::serving_observation::{ServingObservation, SettlementObservation};
+use super::serving_observation::{
+    OwnershipRelease, ServingObservation, SettlementObservation, WaitObservation,
+};
 use super::{config::*, wire::MAX_BS_BLOCKS_PER_REQUEST, *};
 use crate::zakura::regulation::{
     CommittedRateReservation, FrameLease, OutstandingByteBudget, OutstandingByteReservation,
@@ -342,12 +344,14 @@ impl GetBlocksServingSession {
             .try_reserve()
             .ok_or_else(PendingInputBlocked::node)?;
         Ok(PendingGetBlocksRequest {
+            release_start: OwnershipRelease::default(),
             start_height,
             count,
             observation: None,
             _session: session,
             _node: node,
             _resources: self.resources.clone(),
+            release_finish: OwnershipRelease::default(),
         })
     }
 
@@ -360,12 +364,14 @@ impl GetBlocksServingSession {
         let session = self.resources.pending.reserve().await;
         let node = self.regulator.inner.node_pending.reserve().await;
         PendingGetBlocksRequest {
+            release_start: OwnershipRelease::default(),
             start_height,
             count,
             observation: None,
             _session: session,
             _node: node,
             _resources: self.resources.clone(),
+            release_finish: OwnershipRelease::default(),
         }
     }
 
@@ -414,6 +420,7 @@ impl GetBlocksServingSession {
         )?;
 
         Ok(AdmissionAttempt {
+            rollback_start: OwnershipRelease::default(),
             peer: self.peer.clone(),
             session_id: self.session_id,
             observation: None,
@@ -432,6 +439,7 @@ impl GetBlocksServingSession {
             _node_active: node_active,
             _peer_rate_account: self.peer_rate.clone(),
             _session_resources: self.resources.clone(),
+            rollback_finish: OwnershipRelease::default(),
         })
     }
 
@@ -528,16 +536,30 @@ impl PendingInputBlocked {
 #[derive(Debug)]
 #[must_use = "a retained GetBlocks request must be forwarded or explicitly dropped"]
 pub(super) struct PendingGetBlocksRequest {
+    // These guards bracket the resource fields in Rust's declaration-order drop.
+    release_start: OwnershipRelease,
     start_height: block::Height,
     count: u32,
     observation: Option<Arc<ServingObservation>>,
     _session: SlotPermit,
     _node: SlotPermit,
     _resources: Arc<SessionResources>,
+    release_finish: OwnershipRelease,
 }
 
 impl PendingGetBlocksRequest {
+    pub(super) fn observe_wait(
+        &self,
+        stage: &'static str,
+        bound: &'static str,
+    ) -> Option<WaitObservation> {
+        self.observation
+            .as_ref()
+            .map(|observation| observation.start_wait(stage, bound))
+    }
+
     pub(super) fn with_observation(mut self, observation: Option<Arc<ServingObservation>>) -> Self {
+        (self.release_start, self.release_finish) = OwnershipRelease::pair(&observation, "pending");
         if let Some(observation) = &observation {
             observation.emit("input_retained", None);
         }
@@ -546,6 +568,8 @@ impl PendingGetBlocksRequest {
     }
 
     pub(super) fn observe_admission(&self, attempt: &mut AdmissionAttempt) {
+        (attempt.rollback_start, attempt.rollback_finish) =
+            OwnershipRelease::pair(&self.observation, "provisional");
         if let Some(observation) = &self.observation {
             observation.emit("admission_reserved", None);
         }
@@ -559,6 +583,9 @@ impl PendingGetBlocksRequest {
 
     /// End pending ownership and return the validated request fields.
     pub(super) fn into_parts(self) -> (block::Height, u32) {
+        if let Some(observation) = &self.observation {
+            observation.emit("input_consumed", None);
+        }
         (self.start_height, self.count)
     }
 }
@@ -659,6 +686,8 @@ impl AdmissionBlocked {
 #[derive(Debug)]
 #[must_use = "dropping a GetBlocks admission attempt rolls back every reservation"]
 pub(super) struct AdmissionAttempt {
+    // Keep the rollback guards around every resource field; commit disarms them.
+    rollback_start: OwnershipRelease,
     peer: ZakuraPeerId,
     session_id: u64,
     observation: Option<Arc<ServingObservation>>,
@@ -672,6 +701,7 @@ pub(super) struct AdmissionAttempt {
     _node_active: SlotPermit,
     _peer_rate_account: Arc<PeerRateAccount>,
     _session_resources: Arc<SessionResources>,
+    rollback_finish: OwnershipRelease,
 }
 
 impl AdmissionAttempt {
@@ -684,7 +714,7 @@ impl AdmissionAttempt {
     }
 
     /// Commit fixed request work after the reactor accepts this exact session.
-    pub(super) fn commit(self) -> GetBlocksServingPermit {
+    pub(super) fn commit(mut self) -> GetBlocksServingPermit {
         debug_assert_eq!(
             self.peer_rate.reserved(),
             self.response_cap.saturating_add(self.request_overhead)
@@ -699,6 +729,8 @@ impl AdmissionAttempt {
             .commit(self.request_overhead)
             .expect("validated GetBlocks charge contains its request overhead");
         metrics::counter!("sync.block.serving.admitted").increment(1);
+        self.rollback_start.disarm();
+        self.rollback_finish.disarm();
         if let Some(observation) = &self.observation {
             observation.emit("committed", None);
         }

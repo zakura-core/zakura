@@ -1,5 +1,6 @@
 //! Request correlation for optional serving-workload captures.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -16,6 +17,7 @@ pub(super) struct ServingObservation {
     peer: ZakuraPeerId,
     session_id: u64,
     message_sequence: u64,
+    next_wait_sequence: AtomicU64,
 }
 
 #[derive(Serialize)]
@@ -48,6 +50,7 @@ impl ServingObservation {
                 peer: peer.clone(),
                 session_id,
                 message_sequence,
+                next_wait_sequence: AtomicU64::new(0),
             })
         })
     }
@@ -108,6 +111,138 @@ impl ServingObservation {
         };
         settlement.emit("release_started");
         settlement
+    }
+
+    pub(super) fn start_wait(
+        self: &Arc<Self>,
+        stage: &'static str,
+        initial_bound: &'static str,
+    ) -> WaitObservation {
+        let sequence = self
+            .next_wait_sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .expect("one request cannot exhaust u64 wait identities within a process lifetime");
+        let wait = WaitObservation {
+            request: self.clone(),
+            sequence,
+            stage,
+            initial_bound,
+            outcome: "cancelled",
+        };
+        wait.emit("started");
+        wait
+    }
+}
+
+/// A wait can end before its future is first polled or before admission succeeds.
+#[derive(Debug)]
+pub(super) struct WaitObservation {
+    request: Arc<ServingObservation>,
+    sequence: u64,
+    stage: &'static str,
+    initial_bound: &'static str,
+    outcome: &'static str,
+}
+
+#[derive(Serialize)]
+struct WaitEvent {
+    #[serde(flatten)]
+    request: ServingEvent,
+    wait_sequence: u64,
+    stage: &'static str,
+    initial_bound: &'static str,
+}
+
+impl JsonlTraceEvent for WaitEvent {
+    const TABLE: zakura_jsonl_trace::JsonlTraceTable = BLOCK_SYNC_TABLE;
+}
+
+impl WaitObservation {
+    /// Readiness only permits the caller's next step; it does not guarantee admission.
+    pub(super) fn ready(mut self) {
+        self.outcome = "ready";
+    }
+
+    pub(super) fn closed(mut self) {
+        self.outcome = "closed";
+    }
+
+    fn emit(&self, phase: &'static str) {
+        metrics::counter!("sync.block.capture.wait_events", "stage" => self.stage, "phase" => phase).increment(1);
+        self.request.trace.emit_event(|| WaitEvent {
+            request: self.request.row("get_blocks_wait", phase, None),
+            wait_sequence: self.sequence,
+            stage: self.stage,
+            initial_bound: self.initial_bound,
+        });
+    }
+}
+
+impl Drop for WaitObservation {
+    fn drop(&mut self) {
+        self.emit(self.outcome);
+    }
+}
+
+/// Place a pair before and after resource fields to observe their automatic drop.
+#[derive(Debug, Default)]
+pub(super) struct OwnershipRelease {
+    details: Option<Box<OwnershipReleaseDetails>>,
+}
+
+#[derive(Debug)]
+struct OwnershipReleaseDetails {
+    request: Arc<ServingObservation>,
+    stage: &'static str,
+    phase: &'static str,
+}
+
+#[derive(Serialize)]
+struct OwnershipEvent {
+    #[serde(flatten)]
+    request: ServingEvent,
+    stage: &'static str,
+}
+
+impl JsonlTraceEvent for OwnershipEvent {
+    const TABLE: zakura_jsonl_trace::JsonlTraceTable = BLOCK_SYNC_TABLE;
+}
+
+impl OwnershipRelease {
+    pub(super) fn pair(
+        observation: &Option<Arc<ServingObservation>>,
+        stage: &'static str,
+    ) -> (Self, Self) {
+        let boundary = |phase| Self {
+            details: observation.as_ref().map(|request| {
+                Box::new(OwnershipReleaseDetails {
+                    request: request.clone(),
+                    stage,
+                    phase,
+                })
+            }),
+        };
+        (boundary("release_started"), boundary("release_finished"))
+    }
+
+    /// Committing moves the reservations onward; it does not roll them back.
+    pub(super) fn disarm(&mut self) {
+        self.details = None;
+    }
+}
+
+impl Drop for OwnershipRelease {
+    fn drop(&mut self) {
+        let Some(details) = &self.details else {
+            return;
+        };
+        metrics::counter!("sync.block.capture.ownership_events", "stage" => details.stage, "phase" => details.phase).increment(1);
+        details.request.trace.emit_event(|| OwnershipEvent {
+            request: details
+                .request
+                .row("get_blocks_ownership", details.phase, None),
+            stage: details.stage,
+        });
     }
 }
 
@@ -223,6 +358,82 @@ mod tests {
     };
     use crate::zakura::transport::worker_framed_channel;
 
+    #[test]
+    fn dropping_an_unpolled_wait_records_cancellation_before_the_next_wait() {
+        let (sender, mut observations) = mpsc::channel(8);
+        let trace = ZakuraTrace::new(JsonlTracer::new(sender), "test");
+        let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
+        let observation = ServingObservation::for_request(&trace, &peer, 3, 20).unwrap();
+        let wait = observation.start_wait("pending_input", "node_pending");
+        let future = async move {
+            std::future::pending::<()>().await;
+            wait.ready();
+        };
+        drop(future);
+        observation.start_wait("admission", "node_rate").ready();
+        for (sequence, phase) in [
+            (0, "started"),
+            (0, "cancelled"),
+            (1, "started"),
+            (1, "ready"),
+        ] {
+            let event = observations.try_recv().unwrap();
+            let row: serde_json::Value = serde_json::from_slice(&event.line).unwrap();
+            assert_eq!(row["wait_sequence"], sequence);
+            assert_eq!(row["phase"], phase);
+            assert_eq!(row["message_sequence"], 20);
+        }
+        assert!(observations.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn aborted_admission_records_pending_release_and_provisional_rollback() {
+        let (sender, mut observations) = mpsc::channel(16);
+        let trace = ZakuraTrace::new(JsonlTracer::new(sender), "test");
+        let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
+        let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
+        let session = regulator.session(peer.clone(), 3);
+        let available = session.peer_rate_available();
+        let request = session
+            .try_retain_input(block::Height(100), 1)
+            .unwrap()
+            .with_observation(ServingObservation::for_request(&trace, &peer, 3, 20));
+        let mut attempt = session.try_admit(request.count()).unwrap();
+        request.observe_admission(&mut attempt);
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop((request, attempt));
+        });
+        started.await.unwrap();
+        assert_eq!(regulator.snapshot().node_active, 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(regulator.snapshot().node_pending, 0);
+        assert_eq!(regulator.snapshot().node_active, 0);
+        assert_eq!(regulator.snapshot().node_outstanding, 0);
+        assert_eq!(session.peer_rate_available(), available);
+
+        let mut releases = std::collections::BTreeMap::<String, Vec<String>>::new();
+        while let Ok(event) = observations.try_recv() {
+            let row: serde_json::Value = serde_json::from_slice(&event.line).unwrap();
+            assert_eq!(row["message_sequence"], 20);
+            assert_ne!(row["phase"], "committed");
+            assert_ne!(row["phase"], "input_consumed");
+            if row["event"] == "get_blocks_ownership" {
+                releases
+                    .entry(row["stage"].as_str().unwrap().to_owned())
+                    .or_default()
+                    .push(row["phase"].as_str().unwrap().to_owned());
+            }
+        }
+        assert_eq!(releases.len(), 2);
+        for stage in ["pending", "provisional"] {
+            assert_eq!(releases[stage], ["release_started", "release_finished"]);
+        }
+    }
+
     #[tokio::test]
     async fn service_frames_keep_request_identity_after_the_permit_is_dropped() {
         let (sender, mut observations) = mpsc::channel(32);
@@ -301,6 +512,10 @@ mod tests {
             );
         }
         for row in rows {
+            assert_ne!(
+                row["stage"], "provisional",
+                "commit moves capacity instead of rolling it back"
+            );
             if row["event"] != "get_blocks_frame" {
                 continue;
             }
@@ -327,7 +542,7 @@ mod tests {
 
     #[test]
     fn repeated_ranges_keep_decode_identity_without_retaining_capacity() {
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, mut receiver) = mpsc::channel(32);
         let trace = ZakuraTrace::new(JsonlTracer::new(sender), "test");
         let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
         let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
@@ -362,8 +577,8 @@ mod tests {
         while let Ok(event) = receiver.try_recv() {
             rows.push(serde_json::from_slice::<serde_json::Value>(&event.line).unwrap());
         }
-        assert_eq!(rows.len(), 12);
-        for (sequence, events) in [20, 21].into_iter().zip(rows.as_chunks::<6>().0) {
+        assert_eq!(rows.len(), 18);
+        for (sequence, events) in [20, 21].into_iter().zip(rows.as_chunks::<9>().0) {
             let phases: Vec<_> = events
                 .iter()
                 .map(|row| row["phase"].as_str().unwrap())
@@ -373,6 +588,9 @@ mod tests {
                 [
                     "input_retained",
                     "admission_reserved",
+                    "input_consumed",
+                    "release_started",
+                    "release_finished",
                     "committed",
                     "request_bound",
                     "release_started",
@@ -384,7 +602,7 @@ mod tests {
                 assert_eq!(row["session_id"], 3);
                 assert_eq!(row["peer"], rows[0]["peer"]);
             }
-            assert_eq!(events[3]["request_id"], sequence + 10);
+            assert_eq!(events[6]["request_id"], sequence + 10);
         }
     }
 }

@@ -683,12 +683,16 @@ impl PeerRoutine {
             Ok(request) => self.enqueue_serving_request(request.with_observation(observation)),
             Err(blocked) => {
                 self.record_pending_input_delay(&blocked);
+                let wait_observation = observation
+                    .as_ref()
+                    .map(|observation| observation.start_wait("pending_input", blocked.label()));
                 let serving = self.serving.clone();
                 self.pending_input = Some(Box::pin(async move {
-                    serving
-                        .retain_input(start_height, count)
-                        .await
-                        .with_observation(observation)
+                    let request = serving.retain_input(start_height, count).await;
+                    if let Some(wait) = wait_observation {
+                        wait.ready();
+                    }
+                    request.with_observation(observation)
                 }));
                 self.pending_input_deadline =
                     Some(time::Instant::now() + self.config.request_timeout);
@@ -2387,6 +2391,7 @@ async fn admit_and_forward_get_blocks(
                     bound = blocked.kind().label(),
                     "delaying GetBlocks at the work-admission bound"
                 );
+                let wait_observation = request.observe_wait("admission", blocked.kind().label());
                 let wait = blocked.wait();
                 tokio::pin!(wait);
                 tokio::select! {
@@ -2397,6 +2402,9 @@ async fn admit_and_forward_get_blocks(
                     }
                     () = done.closed() => return,
                     slot = &mut wait => {
+                        if let Some(wait) = wait_observation {
+                            wait.ready();
+                        }
                         acquired_slot = slot;
                         continue;
                     }
@@ -2406,6 +2414,7 @@ async fn admit_and_forward_get_blocks(
 
         request.observe_admission(&mut attempt);
 
+        let wait_observation = request.observe_wait("reactor_queue", "reactor_queue");
         let channel_slot = routine_to_reactor.clone().reserve_owned();
         tokio::pin!(channel_slot);
         tokio::select! {
@@ -2421,10 +2430,16 @@ async fn admit_and_forward_get_blocks(
             }
             slot = &mut channel_slot => {
                 let Ok(slot) = slot else {
+                    if let Some(wait) = wait_observation {
+                        wait.closed();
+                    }
                     drop(attempt);
                     let _ = done.send(ServingAdmissionOutcome::ChannelClosed);
                     return;
                 };
+                if let Some(wait) = wait_observation {
+                            wait.ready();
+                        }
                 debug_assert_eq!(attempt.peer(), &peer);
                 slot.send(RoutineToReactor::ServeGetBlocks {
                     peer,
@@ -2504,6 +2519,91 @@ mod tests {
         peer: &ZakuraPeerId,
     ) -> GetBlocksServingSession {
         GetBlocksServingRegulator::new(config.clone()).session(peer.clone(), 0)
+    }
+
+    #[tokio::test]
+    async fn admission_wait_capture_distinguishes_readiness_cancel_and_channel_close() {
+        use super::{admit_and_forward_get_blocks, ServingAdmissionOutcome, ServingObservation};
+        use zakura_jsonl_trace::JsonlTracer;
+
+        for expected in [
+            ServingAdmissionOutcome::Sent,
+            ServingAdmissionOutcome::Cancelled,
+            ServingAdmissionOutcome::ChannelClosed,
+        ] {
+            let mut config = ZakuraBlockSyncConfig::default();
+            config.get_blocks_regulation.node_active_requests = 1;
+            let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
+            let regulator = GetBlocksServingRegulator::new(config);
+            let serving = regulator.session(peer.clone(), 3);
+            let owner = serving.try_admit(1).unwrap().commit();
+            let (trace_send, mut traces) = mpsc::channel(32);
+            let trace = ZakuraTrace::new(JsonlTracer::new(trace_send), "test");
+            let request = serving
+                .try_retain_input(block::Height(100), 1)
+                .unwrap()
+                .with_observation(ServingObservation::for_request(&trace, &peer, 3, 20));
+            let (send, receive) = mpsc::channel(1);
+            let receiver = if expected == ServingAdmissionOutcome::ChannelClosed {
+                drop(receive);
+                None
+            } else {
+                Some(receive)
+            };
+            let cancel = CancellationToken::new();
+            let (done, outcome) = tokio::sync::oneshot::channel();
+            let mut task = Box::pin(admit_and_forward_get_blocks(
+                serving,
+                send,
+                peer,
+                request,
+                cancel.clone(),
+                done,
+            ));
+            assert!(futures::poll!(&mut task).is_pending());
+            if expected == ServingAdmissionOutcome::Cancelled {
+                cancel.cancel();
+            }
+            drop(owner);
+            timeout(Duration::from_secs(1), task).await.unwrap();
+            assert_eq!(outcome.await.unwrap(), expected);
+            // A sent request still has provisional ownership in the reactor channel.
+            drop(receiver);
+            assert_eq!(regulator.snapshot().node_active, 0);
+            assert_eq!(regulator.snapshot().node_pending, 0);
+            assert_eq!(regulator.snapshot().node_outstanding, 0);
+
+            let mut waits = Vec::new();
+            while let Ok(event) = traces.try_recv() {
+                let row: serde_json::Value = serde_json::from_slice(&event.line).unwrap();
+                if row["event"] == "get_blocks_wait" {
+                    waits.push(row);
+                }
+            }
+            assert_eq!(waits[0]["stage"], "admission");
+            assert_eq!(waits[0]["initial_bound"], "node_active");
+            assert_eq!(waits[0]["phase"], "started");
+            assert_eq!(waits[0]["wait_sequence"], 0);
+            assert_eq!(waits[1]["wait_sequence"], 0);
+            if expected == ServingAdmissionOutcome::Cancelled {
+                assert_eq!(waits.len(), 2);
+                assert_eq!(waits[1]["phase"], "cancelled");
+            } else {
+                assert_eq!(waits.len(), 4);
+                assert_eq!(waits[1]["phase"], "ready");
+                assert_eq!(waits[2]["stage"], "reactor_queue");
+                assert_eq!(waits[2]["wait_sequence"], 1);
+                assert_eq!(waits[3]["wait_sequence"], 1);
+                assert_eq!(
+                    waits[3]["phase"],
+                    if expected == ServingAdmissionOutcome::Sent {
+                        "ready"
+                    } else {
+                        "closed"
+                    }
+                );
+            }
+        }
     }
 
     #[tokio::test]

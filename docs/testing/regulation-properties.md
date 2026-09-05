@@ -23,7 +23,9 @@ PROPTEST_CASES=2048 PROPTEST_RNG_SEED=892 cargo nextest run --locked \
 ```
 
 The ordinary unit-test profiles include these tests. Their regulation overrides
-and the focused profile use zero retries. PR CI also runs a fixed seed;
+and the focused profile use zero retries. The focused suite also runs the
+serving policy's lifecycle tests, including concurrent claim and
+cancellation checks. PR CI also runs a fixed seed;
 scheduled and manual CI runs explore more cases with the CI run ID as their
 seed. Stacked PRs on `adam/**` receive the same Rust CI entrypoints as other
 development bases.
@@ -129,8 +131,10 @@ The component runner explicitly advances paused Tokio time and compares two
 replays. The reactor adapter uses production timers, including its output-queue
 poll, and waits for channel acknowledgements and frames under virtual
 deadlines. It compares resource and response semantics, not identical task
-schedules or wall-clock timestamps. No general scheduler or model-checking
-engine is involved.
+schedules or wall-clock timestamps. The lifecycle unit tests also exercise
+overlapping claims and cancellation on real threads. Either operation may win; no second claim may succeed, and the
+remaining lease must retain its resources. These runs do not exhaust thread
+schedules. No general scheduler or model-checking engine is involved.
 
 ## Adding another regulated message
 

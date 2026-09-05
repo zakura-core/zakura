@@ -8,6 +8,28 @@ use crate::{commands::StartCmd, components::tokio::run_until_shutdown, config::Z
 
 pub use zakura_network::zakura::CustomService;
 
+/// Initialized services for an embedding application.
+#[derive(Clone)]
+pub struct NodeServices {
+    /// Queries against the current best chain.
+    pub read_state: zakura_state::ReadStateService,
+    /// The current best chain tip.
+    pub latest_chain_tip: zakura_state::LatestChainTip,
+    /// An independent listener for best chain tip changes.
+    pub chain_tip_change: zakura_state::ChainTipChange,
+    /// The synchronizer's recent-tip status.
+    pub sync_status: crate::components::sync::SyncStatus,
+    /// Buffered access to the node's mempool.
+    pub mempool: tower::buffer::Buffer<
+        tower::util::BoxService<
+            zakura_node_services::mempool::Request,
+            zakura_node_services::mempool::Response,
+            crate::BoxError,
+        >,
+        zakura_node_services::mempool::Request,
+    >,
+}
+
 /// Runs a Zakura node on the current Tokio runtime until shutdown or failure.
 ///
 /// tracing, metrics, Rayon setup, and panic hooks are the embedding
@@ -22,6 +44,28 @@ pub async fn run_with_services(
     custom_services: Vec<CustomService>,
     shutdown: CancellationToken,
 ) -> Result<(), Report> {
+    run_with_services_inner(config, custom_services, shutdown, None).await
+}
+
+/// Runs a node and sends its service handles after all initial tasks have started.
+///
+/// The receiver closes without a value if startup fails or is cancelled. Dropping
+/// the receiver does not stop the node; use `shutdown` to request cleanup.
+pub async fn run_with_services_ready(
+    config: ZakuradConfig,
+    custom_services: Vec<CustomService>,
+    shutdown: CancellationToken,
+    ready: tokio::sync::oneshot::Sender<NodeServices>,
+) -> Result<(), Report> {
+    run_with_services_inner(config, custom_services, shutdown, Some(ready)).await
+}
+
+async fn run_with_services_inner(
+    config: ZakuradConfig,
+    custom_services: Vec<CustomService>,
+    shutdown: CancellationToken,
+    ready: Option<tokio::sync::oneshot::Sender<NodeServices>>,
+) -> Result<(), Report> {
     if shutdown.is_cancelled() {
         return Ok(());
     }
@@ -34,6 +78,7 @@ pub async fn run_with_services(
     let node = command.start(
         config.into(),
         custom_services,
+        ready,
         node_shutdown.clone(),
         shutdown_cleanup_required.clone(),
     );

@@ -8972,6 +8972,112 @@ mod tests {
         assert!(!context.connection_token.is_cancelled());
     }
 
+    #[tokio::test]
+    async fn block_sync_wait_keeps_writer_live_and_resumes_in_order() -> Result<(), BoxError> {
+        const ALPN: &[u8] = b"/zakura/testkit/block-sync-pacing/0";
+
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(82).await?;
+        let (connection_tx, _connection_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(83).await?;
+        let server_addr = router.endpoint().node_addr().initialized().await;
+        client.add_node_addr(server_addr.clone())?;
+        let client_conn =
+            timeout(Duration::from_secs(10), client.connect(server_addr, ALPN)).await??;
+        let (mut client_send, mut client_recv) =
+            timeout(Duration::from_secs(2), client_conn.open_bi()).await??;
+
+        let mut context = paced_message_context(2);
+        let limits = context.limits;
+        let connection_token = context.connection_token.clone();
+        let (freshness_tx, mut freshness_rx) = watch::channel(Instant::now());
+        context.freshness_tx = freshness_tx;
+        let bucket = Arc::clone(&context.message_bucket);
+        // Hold shared admission to witness the reader's wait without depending
+        // on socket scheduling or a wall-clock refill deadline.
+        let admission = bucket.admission_order.lock().await;
+        let frame = |value| Frame {
+            message_type: 1,
+            flags: 0,
+            payload: vec![value],
+        };
+        for value in [1, 2] {
+            timeout(
+                Duration::from_secs(2),
+                client_send.write_all(&frame(value).encode(limits.max_frame_bytes)?),
+            )
+            .await??;
+        }
+        let (send, recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await?
+            .expect("capture handler forwards the opened stream");
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: ZAKURA_STREAM_BLOCK_SYNC,
+            stream_version: ZAKURA_STREAM_VERSION_1,
+            request_id: None,
+            max_frame_bytes: limits.max_frame_bytes,
+        };
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(2);
+        let (outbound_tx, outbound_rx) = worker_framed_channel(1);
+        let worker = tokio::spawn(persistent_stream_worker(
+            send,
+            recv,
+            prelude,
+            context,
+            inbound_tx,
+            outbound_rx,
+            2,
+        ));
+
+        // Freshness is recorded after the complete frame is read, before its
+        // admission wait. Outbound progress must not require releasing that wait.
+        timeout(Duration::from_secs(2), freshness_rx.changed()).await??;
+        assert!(matches!(
+            inbound_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        timeout(Duration::from_secs(2), outbound_tx.send(frame(3))).await??;
+        let received = read_frame(
+            &mut client_recv,
+            limits.max_frame_bytes,
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+        )
+        .await?;
+        assert_eq!(received.payload, vec![3]);
+        assert!(matches!(
+            inbound_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!connection_token.is_cancelled());
+
+        drop(admission);
+        for value in [1, 2] {
+            let received = timeout(Duration::from_secs(2), inbound_rx.recv())
+                .await?
+                .expect("both admitted frames reach the service");
+            assert_eq!(received.payload, vec![value]);
+        }
+        assert!(!connection_token.is_cancelled());
+        connection_token.cancel();
+        timeout(Duration::from_secs(2), worker).await??;
+        client_conn.close(0u32.into(), b"done");
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn block_sync_rate_cancellation_preserves_waiter_order_and_credit() {
         let first = paced_message_context(1);

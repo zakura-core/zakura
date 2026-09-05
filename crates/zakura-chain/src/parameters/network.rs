@@ -388,7 +388,10 @@ impl Network {
     /// that does not activate NU7 keeps accepting version 4 transactions.
     pub fn v4_deprecation_height(&self) -> Option<Height> {
         match self.v4_deprecation() {
-            V4Deprecation::AtNu7 => NetworkUpgrade::Nu7.activation_height(self),
+            V4Deprecation::AtNu7 => self
+                .activation_list()
+                .iter()
+                .find_map(|(height, upgrade)| (*upgrade == NetworkUpgrade::Nu7).then_some(*height)),
             V4Deprecation::AtHeight(height) => Some(height),
             V4Deprecation::Never => None,
         }

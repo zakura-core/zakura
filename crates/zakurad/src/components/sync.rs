@@ -2776,14 +2776,6 @@ where
         Self::state_contains_service(&mut self.state, hash).await
     }
 
-    pub(crate) async fn into_state_contains(
-        mut self,
-        hash: block::Hash,
-    ) -> (Self, Result<bool, Report>) {
-        let result = Self::state_contains_service(&mut self.state, hash).await;
-        (self, result)
-    }
-
     async fn state_contains_service(state: &mut ZS, hash: block::Hash) -> Result<bool, Report> {
         match state
             .ready()

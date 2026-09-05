@@ -332,9 +332,9 @@ impl StartCmd {
         &self,
         config: Arc<ZakuradConfig>,
         custom_services: Vec<zakura_network::zakura::CustomService>,
+        ready: Option<tokio::sync::oneshot::Sender<crate::node::NodeServices>>,
         shutdown: CancellationToken,
         shutdown_cleanup_required: CancellationToken,
-        ready: Option<oneshot::Sender<crate::node::NodeClient>>,
     ) -> Result<(), Report> {
         check_tcp_slow_start_after_idle();
 
@@ -551,7 +551,7 @@ impl StartCmd {
                 custom_services,
             )
             .await
-            .map_err(|error| eyre!("network initialization failed: {error}"))?;
+            .map_err(|error| eyre!(error))?;
 
         let mut header_sync_fatal_events = match zakura_endpoint.as_ref() {
             Some(endpoint) => endpoint.take_header_sync_fatal_events().await,
@@ -577,22 +577,15 @@ impl StartCmd {
 
         info!("initializing verifiers");
         let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();
-        let consensus_config = config.consensus.clone();
-        let network = config.network.network.clone();
-        let consensus_state = state.clone();
-        let consensus_read_state = read_only_state_service.clone();
-        let consensus_init_task = tokio::spawn(zakura_consensus::router::init_with_read_state(
-            consensus_config,
-            network,
-            consensus_state,
-            consensus_read_state,
-            tx_verifier_setup_rx,
-        ));
-        node_tasks.track(&consensus_init_task);
         let (block_verifier_router, tx_verifier, consensus_task_handles, max_checkpoint_height) =
-            consensus_init_task
-                .await
-                .expect("unexpected panic during consensus initialization");
+            zakura_consensus::router::init_with_read_state(
+                config.consensus.clone(),
+                &config.network.network,
+                state.clone(),
+                read_only_state_service.clone(),
+                tx_verifier_setup_rx,
+            )
+            .await;
         node_tasks.track(&consensus_task_handles.state_checkpoint_verify_handle);
 
         if let Some(endpoint) = zakura_endpoint.clone() {
@@ -710,16 +703,13 @@ impl StartCmd {
         let rpc_impl = rpc_impl.with_end_of_support_height(
             sync::end_of_support::end_of_support_height(&config.network.network),
         );
-        let node_client = ready.as_ref().map(|_| {
-            crate::node::NodeClient::new(
-                read_only_state_service.clone(),
-                latest_chain_tip.clone(),
-                chain_tip_change.clone(),
-                sync_status.clone(),
-                mempool.clone(),
-                block_verifier_router.clone(),
-                submit_block_channel.sender(),
-            )
+
+        let node_services = ready.as_ref().map(|_| crate::node::NodeServices {
+            read_state: read_only_state_service.clone(),
+            latest_chain_tip: latest_chain_tip.clone(),
+            chain_tip_change: chain_tip_change.clone(),
+            sync_status: sync_status.clone(),
+            mempool: mempool.clone(),
         });
 
         let rpc_task_handle = if config.rpc.listen_addr.is_some() {
@@ -784,7 +774,7 @@ impl StartCmd {
                     mempool_transaction_subscriber.clone(),
                 )
                 .await
-                .map_err(|error| eyre!("indexer RPC initialization failed: {error}"))?;
+                .map_err(|err| eyre!(err))?;
 
                 indexer_rpc_task_handle
             } else {
@@ -889,35 +879,23 @@ impl StartCmd {
         // `debug_skip_regtest_genesis_self_seed` opts a node out of this shortcut so it
         // downloads genesis from a peer instead, exercising the production
         // genesis-bootstrap path (e.g. a Zakura-only node fetching genesis over Zakura).
-        if is_regtest && !config.sync.debug_skip_regtest_genesis_self_seed {
-            let state_contains_task =
-                tokio::spawn(syncer.into_state_contains(config.network.network.genesis_hash()));
-            node_tasks.track(&state_contains_task);
-            let (returned_syncer, contains_genesis) = state_contains_task
+        if is_regtest
+            && !config.sync.debug_skip_regtest_genesis_self_seed
+            && !syncer
+                .state_contains(config.network.network.genesis_hash())
+                .await?
+        {
+            let genesis_hash = block_verifier_router
+                .clone()
+                .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block()))
                 .await
-                .expect("unexpected panic during regtest genesis state query");
-            syncer = returned_syncer;
+                .expect("should validate Regtest genesis block");
 
-            if !contains_genesis
-                .map_err(|error| eyre!("regtest genesis state query failed: {error}"))?
-            {
-                let genesis_task = tokio::spawn(
-                    block_verifier_router
-                        .clone()
-                        .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block())),
-                );
-                node_tasks.track(&genesis_task);
-                let genesis_hash = genesis_task
-                    .await
-                    .expect("unexpected panic while validating Regtest genesis block")
-                    .expect("should validate Regtest genesis block");
-
-                assert_eq!(
-                    genesis_hash,
-                    config.network.network.genesis_hash(),
-                    "validated block hash should match network genesis hash"
-                )
-            }
+            assert_eq!(
+                genesis_hash,
+                config.network.network.genesis_hash(),
+                "validated block hash should match network genesis hash"
+            )
         }
         let syncer_task_handle = if use_zakura_block_sync(&config.network) {
             info!(
@@ -980,8 +958,8 @@ impl StartCmd {
         // await cleanup. Do not add a yield between the spawn and this marker.
         shutdown_cleanup_required.cancel();
 
-        if let (Some(ready), Some(node_client)) = (ready, node_client) {
-            let _ = ready.send(node_client);
+        if let Some((ready, services)) = ready.zip(node_services) {
+            let _ = ready.send(services);
         }
 
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
@@ -1097,22 +1075,22 @@ impl StartCmd {
                 block_gossip_result = &mut block_gossip_task_handle => block_gossip_result
                     .expect("unexpected panic in the chain tip block gossip task")
                     .map(|_| info!("chain tip block gossip task exited"))
-                    .map_err(|error| eyre!("chain tip block gossip failed: {error}")),
+                    .map_err(|e| eyre!(e)),
 
                 mempool_crawl_result = &mut mempool_crawler_task_handle => mempool_crawl_result
                     .expect("unexpected panic in the mempool crawler")
                     .map(|_| info!("mempool crawler task exited"))
-                    .map_err(|error| eyre!("mempool crawler failed: {error}")),
+                    .map_err(|e| eyre!(e)),
 
                 mempool_queue_result = &mut mempool_queue_checker_task_handle => mempool_queue_result
                     .expect("unexpected panic in the mempool queue checker")
                     .map(|_| info!("mempool queue checker task exited"))
-                    .map_err(|error| eyre!("mempool queue checker failed: {error}")),
+                    .map_err(|e| eyre!(e)),
 
                 tx_gossip_result = &mut tx_gossip_task_handle => tx_gossip_result
                     .expect("unexpected panic in the transaction gossip task")
                     .map(|_| info!("transaction gossip task exited"))
-                    .map_err(|error| eyre!("transaction gossip failed: {error}")),
+                    .map_err(|e| eyre!(e)),
 
                 // The progress task runs forever, unless it panics.
                 // So we don't need to provide an exit status for it.
@@ -1315,9 +1293,9 @@ impl Runnable for StartCmd {
                 self.start(
                     APPLICATION.config(),
                     Vec::new(),
+                    None,
                     shutdown,
                     shutdown_cleanup_required,
-                    None,
                 )
             });
 

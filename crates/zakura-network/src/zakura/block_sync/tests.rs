@@ -16343,3 +16343,5 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
     ));
     reactor_task.abort();
 }
+
+mod regulation_properties;

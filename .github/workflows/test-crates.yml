@@ -2,7 +2,7 @@ name: Test Crate Build
 
 on:
   pull_request:
-    branches: [main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**", "adam/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"

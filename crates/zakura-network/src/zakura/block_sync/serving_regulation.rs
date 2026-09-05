@@ -1373,3 +1373,6 @@ mod tests {
         assert_eq!(replacement.peer_rate_available(), full - 13);
     }
 }
+
+#[cfg(test)]
+mod properties;

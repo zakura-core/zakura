@@ -57,6 +57,26 @@ pub enum V4Deprecation {
     Never,
 }
 
+/// When a network starts ZIP 234 issuance.
+///
+/// The NU7 ballot offers activation with NU7 or at one of two later dates. A network
+/// can therefore activate ZIP 234 with NU7 or at a configured block height.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+#[derive(Copy, Clone, Default, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum Zip234Deployment {
+    /// ZIP 234 starts at the NU7 activation height.
+    ///
+    /// A network that does not activate NU7 never starts reissuance.
+    #[default]
+    AtNu7,
+
+    /// Reissuance starts at this height.
+    ///
+    /// The height must not precede the NU7 activation height.
+    AtHeight(Height),
+}
+
 /// An enum describing the kind of network, whether it's the production mainnet or a testnet.
 // Note: The order of these variants is important for correct bincode (de)serialization
 //       of history trees in the db format.
@@ -401,6 +421,20 @@ impl Network {
     pub fn is_v4_deprecated(&self, height: Height) -> bool {
         self.v4_deprecation_height()
             .is_some_and(|deprecation_height| height >= deprecation_height)
+    }
+
+    /// Returns when this network starts ZIP 234 issuance.
+    ///
+    /// See [`Zip234Deployment`] and [ZIP 234]. Use
+    /// [`subsidy::zip234_start_height`](crate::parameters::subsidy::zip234_start_height)
+    /// to resolve this to a height.
+    ///
+    /// [ZIP 234]: https://zips.z.cash/zip-0234
+    pub fn zip234_deployment(&self) -> Zip234Deployment {
+        match self {
+            Network::Mainnet => Zip234Deployment::AtNu7,
+            Network::Testnet(parameters) => parameters.zip234_deployment(),
+        }
     }
 
     /// Returns the height at which the soft fork that temporarily disables Orchard

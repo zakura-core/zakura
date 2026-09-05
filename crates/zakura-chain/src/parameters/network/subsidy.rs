@@ -17,9 +17,12 @@ pub(crate) mod constants;
 use std::collections::HashMap;
 
 use crate::{
-    amount::{self, Amount, NonNegative},
+    amount::{self, Amount, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
-    parameters::{Network, NetworkUpgrade},
+    parameters::{
+        Network, NetworkUpgrade, Zip234Deployment, ZIP234_ENABLED, ZIP234_HALVINGS_ENABLED,
+        ZIP234_SMOOTHING_ENABLED,
+    },
     transparent,
 };
 
@@ -385,6 +388,8 @@ pub enum SubsidyError {
     #[error("miner fees are invalid")]
     InvalidMinerFees,
 
+    #[error("ZIP 234 block subsidy needs the money reserve after the parent block")]
+    MissingMoneyReserve,
     #[error("addition of amounts overflowed")]
     Overflow,
 
@@ -451,10 +456,269 @@ pub fn halving(height: Height, network: &Network) -> u32 {
         .expect("halving index is non-negative and fits in u32")
 }
 
+/// The numerator of [ZIP 234]'s `BLOCK_SUBSIDY_FRACTION`.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+pub const BLOCK_SUBSIDY_FRACTION_NUMERATOR: u128 = 4_126;
+
+/// The denominator of [`BLOCK_SUBSIDY_FRACTION_NUMERATOR`].
+///
+/// At the 75-second post-Blossom target spacing, the fraction satisfies
+/// `(1 - BLOCK_SUBSIDY_FRACTION) ^ PostBlossomHalvingInterval` is approximately
+/// one half. [`smoothed_block_subsidy`] scales it with the target spacing when
+/// ZIP 218 enables 25-second blocks.
+pub const BLOCK_SUBSIDY_FRACTION_DENOMINATOR: u128 = 10_000_000_000;
+
+/// Returns the height at which [ZIP 234] starts to apply on `network`, or `None` if the
+/// network does not activate NU7.
+///
+/// The NU7 ballot asks when issuance should begin, so a network chooses the NU7
+/// activation height or a configured height. See [`Zip234Deployment`].
+///
+/// A configured height below the NU7 activation height is raised to it, because ZIP 234
+/// deploys with or after NU7. [`ParametersBuilder::to_network`] rejects that
+/// configuration, so the clamp only covers a network built without those checks.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+/// [`ParametersBuilder::to_network`]: crate::parameters::testnet::ParametersBuilder::to_network
+pub fn zip234_start_height(network: &Network) -> Option<Height> {
+    let nu7 = network
+        .activation_list()
+        .iter()
+        .find_map(|(height, upgrade)| (*upgrade == NetworkUpgrade::Nu7).then_some(*height))?;
+
+    match network.zip234_deployment() {
+        Zip234Deployment::AtNu7 => Some(nu7),
+        Zip234Deployment::AtHeight(height) => Some(height.max(nu7)),
+    }
+}
+
+/// Returns whether a ZIP 234 issuance option is compiled in and applies to `network` at
+/// `height`.
+///
+/// [`zip234_start_height`] gives the ZIP's height whatever the build, so that the height
+/// arithmetic is testable everywhere. This is the check that decides whether a block
+/// subsidy actually follows ZIP 234, and so whether a caller has to fetch the money
+/// reserve.
+pub fn is_zip234_active(network: &Network, height: Height) -> bool {
+    ZIP234_ENABLED && zip234_start_height(network).is_some_and(|start| height >= start)
+}
+
+/// Returns the smoothed block subsidy for `money_reserve`.
+///
+/// # Consensus
+///
+/// At the 75-second post-Blossom target spacing:
+///
+/// > BlockSubsidy(height) = ceiling(BLOCK_SUBSIDY_FRACTION * MoneyReserveAfter(height-1))
+///
+/// ZIP 218 triples the block rate. When both features are active, this calculation
+/// multiplies the fraction by `25 / 75` so the curve keeps the same wall-clock rate.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+fn smoothed_block_subsidy(
+    height: Height,
+    net: &Network,
+    money_reserve: Amount<NonNegative>,
+) -> Result<Amount<NonNegative>, SubsidyError> {
+    let money_reserve =
+        u128::try_from(i64::from(money_reserve)).map_err(|_| SubsidyError::Underflow)?;
+    let current_spacing =
+        NetworkUpgrade::target_spacing_for_height(net, height).num_seconds() as u128;
+    let post_blossom_spacing = NetworkUpgrade::Blossom.target_spacing().num_seconds() as u128;
+
+    let subsidy = money_reserve
+        .checked_mul(BLOCK_SUBSIDY_FRACTION_NUMERATOR)
+        .and_then(|amount| amount.checked_mul(current_spacing))
+        .ok_or(SubsidyError::Overflow)?
+        .div_ceil(
+            BLOCK_SUBSIDY_FRACTION_DENOMINATOR
+                .checked_mul(post_blossom_spacing)
+                .ok_or(SubsidyError::Overflow)?,
+        );
+
+    let subsidy = i64::try_from(subsidy).map_err(|_| SubsidyError::Overflow)?;
+
+    Ok(Amount::try_from(subsidy)?)
+}
+
+/// Returns the [ZIP 234] reissuance bonus for a block at `height`, given the money
+/// reserve after its parent.
+///
+/// This is the "preserve halvings" option on the NU7 ballot: the halving schedule keeps
+/// issuing new ZEC, and the bonus applies the smoothing fraction to the issuance deficit.
+///
+/// The deficit is what the halving schedule has issued so far minus what is actually in
+/// the chain value pools. The only way the chain falls behind its own schedule is value
+/// leaving circulation, so the deficit is exactly what is left to reissue.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+fn reissuance_bonus(
+    height: Height,
+    net: &Network,
+    money_reserve: Amount<NonNegative>,
+) -> Result<Amount<NonNegative>, SubsidyError> {
+    let max_money = Amount::<NonNegative>::try_from(MAX_MONEY)?;
+    let parent = height.previous().unwrap_or(Height(0));
+
+    let scheduled_supply = cumulative_halving_subsidies(parent, net)?;
+    let issued_supply = (max_money - money_reserve)?;
+
+    // A chain can be ahead of its own schedule if its chain pools contain more value than
+    // the scheduled supply. Saturating at zero leaves nothing to reissue in that case.
+    let Ok(deficit) = scheduled_supply - issued_supply else {
+        return Ok(Amount::zero());
+    };
+
+    smoothed_block_subsidy(height, net, deficit)
+}
+
+/// Returns the total block subsidy the halving schedule issues for blocks `1..=height`.
+///
+/// The subsidy is linear in the height through the slow start, and piecewise constant
+/// afterwards, changing only where a halving or a target spacing era begins. Summing over
+/// those pieces is exact, and takes a bounded number of steps no matter how tall the chain
+/// is.
+fn cumulative_halving_subsidies(
+    height: Height,
+    net: &Network,
+) -> Result<Amount<NonNegative>, SubsidyError> {
+    let slow_start_shift = u128::from(net.slow_start_shift().0);
+    let slow_start_interval = u128::from(net.slow_start_interval().0);
+    let height = u128::from(height.0);
+    let mut total: u128 = 0;
+
+    // The slow start issues `rate * h` below the shift and `rate * (h + 1)` from the shift
+    // up to the interval, so each phase is a triangular number rather than a rectangle.
+    if slow_start_interval > 0 && slow_start_shift > 0 {
+        let rate = u128::from(MAX_BLOCK_SUBSIDY) / slow_start_interval;
+        let triangle = |n: u128| n * (n + 1) / 2;
+
+        // `rate * h` for h in 1..=min(height, shift - 1).
+        let first_phase_end = height.min(slow_start_shift - 1);
+        total += triangle(first_phase_end) * rate;
+
+        // `rate * (h + 1)` for h in shift..=min(height, interval - 1), which is
+        // `rate * k` for k in shift + 1..=that end + 1.
+        if height >= slow_start_shift {
+            let second_phase_end = height.min(slow_start_interval - 1);
+            total += (triangle(second_phase_end + 1) - triangle(slow_start_shift)) * rate;
+        }
+    }
+
+    // After the slow start the subsidy only changes at a halving or a spacing era start,
+    // so walk those boundaries and multiply each run of blocks by its subsidy.
+    let mut block =
+        u32::try_from(slow_start_interval.max(1)).map_err(|_| SubsidyError::Overflow)?;
+    let height = u32::try_from(height).map_err(|_| SubsidyError::Overflow)?;
+
+    while block <= height {
+        let subsidy = u128::try_from(i64::from(halving_block_subsidy(Height(block), net)?))
+            .map_err(|_| SubsidyError::Overflow)?;
+
+        // The next boundary is whichever comes first: the end of this halving era, the
+        // start of the next spacing era, or the end of the range.
+        let next_boundary = next_subsidy_boundary(Height(block), net)
+            .unwrap_or(Height::MAX)
+            .0;
+        let run_end = next_boundary.saturating_sub(1).min(height);
+        let run_blocks = u128::from(run_end - block) + 1;
+
+        total += run_blocks * subsidy;
+
+        if run_end == height || run_end == u32::MAX {
+            break;
+        }
+        block = run_end + 1;
+    }
+
+    let total = i64::try_from(total).map_err(|_| SubsidyError::Overflow)?;
+
+    Ok(Amount::try_from(total)?)
+}
+
+/// Test-only accessor for [`cumulative_halving_subsidies`].
+#[cfg(any(test, feature = "proptest-impl"))]
+pub fn cumulative_halving_subsidies_for_tests(
+    height: Height,
+    net: &Network,
+) -> Result<Amount<NonNegative>, SubsidyError> {
+    cumulative_halving_subsidies(height, net)
+}
+
+/// Returns the lowest height above `height` at which the halving block subsidy changes,
+/// or `None` if it never changes again.
+fn next_subsidy_boundary(height: Height, net: &Network) -> Option<Height> {
+    let current_halving = halving(height, net);
+
+    // The next spacing era, if any, starts a new run.
+    let next_spacing_era = NetworkUpgrade::target_spacings(net)
+        .map(|(era_start, _)| era_start)
+        .find(|era_start| *era_start > height);
+
+    // `halving` is non-decreasing, so binary search for where it next increases.
+    let mut low = height.0.checked_add(1)?;
+    let mut high = Height::MAX_AS_U32;
+    let next_halving = if halving(Height(high), net) > current_halving {
+        while low < high {
+            let mid = low + (high - low) / 2;
+
+            if halving(Height(mid), net) > current_halving {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        Some(Height(low))
+    } else {
+        None
+    };
+
+    match (next_spacing_era, next_halving) {
+        (Some(spacing), Some(halving)) => Some(spacing.min(halving)),
+        (boundary, None) | (None, boundary) => boundary,
+    }
+}
+
 /// `BlockSubsidy(height)` as described in [protocol specification §7.8][7.8]
 ///
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
-pub fn block_subsidy(height: Height, net: &Network) -> Result<Amount<NonNegative>, SubsidyError> {
+pub fn block_subsidy(
+    height: Height,
+    net: &Network,
+    money_reserve: Option<Amount<NonNegative>>,
+) -> Result<Amount<NonNegative>, SubsidyError> {
+    if is_zip234_active(net, height) {
+        // The caller reads the money reserve from the parent block, so every caller that
+        // can reach a ZIP 234 height must supply it.
+        let money_reserve = money_reserve.ok_or(SubsidyError::MissingMoneyReserve)?;
+
+        if ZIP234_SMOOTHING_ENABLED {
+            // The smoothed curve replaces halvings outright.
+            return smoothed_block_subsidy(height, net, money_reserve);
+        }
+
+        if ZIP234_HALVINGS_ENABLED {
+            // Halvings stay, and the bonus applies the smoothing fraction to the
+            // issuance deficit.
+            let halving_subsidy = halving_block_subsidy(height, net)?;
+            let bonus = reissuance_bonus(height, net, money_reserve)?;
+
+            return Ok((halving_subsidy + bonus)?);
+        }
+    }
+
+    halving_block_subsidy(height, net)
+}
+
+/// `BlockSubsidy(height)` under the halving schedule, ignoring ZIP 234.
+///
+/// ZIP 234's "preserve halvings" option issues this plus a reissuance bonus, and its
+/// "smooth issuance curve" option replaces it. See [`block_subsidy`].
+pub fn halving_block_subsidy(
+    height: Height,
+    net: &Network,
+) -> Result<Amount<NonNegative>, SubsidyError> {
     let Some(halving_div) = halving_divisor(height, net) else {
         return Ok(Amount::zero());
     };
@@ -553,7 +817,9 @@ pub fn founders_reward(net: &Network, height: Height) -> Amount<NonNegative> {
     // inconsistency in the definition of the founders reward, which should occur only before
     // Canopy, so we check if Canopy is active as well.
     if halving(height, net) < 1 && NetworkUpgrade::current(net, height) < NetworkUpgrade::Canopy {
-        block_subsidy(height, net)
+        // The founders reward ends at the first halving, which is long before ZIP 234
+        // starts, so the halving schedule is the whole subsidy here.
+        halving_block_subsidy(height, net)
             .map(|subsidy| subsidy.div_exact(5))
             .expect("block subsidy must be valid for founders rewards")
     } else {

@@ -25,7 +25,7 @@ use zakura_chain::{
             self, ConfiguredActivationHeights, ConfiguredCheckpoints, ConfiguredFundingStreams,
             ConfiguredLockboxDisbursement, RegtestParameters,
         },
-        Magic, Network, NetworkKind, V4Deprecation,
+        Magic, Network, NetworkKind, V4Deprecation, Zip234Deployment,
     },
     work::difficulty::U256,
 };
@@ -977,6 +977,11 @@ struct DTestnetParameters {
     /// Accepts `"nu7"` (the default, the NU7 activation height), `"never"`, or a block
     /// height. If unset, the network deprecates version 4 transactions at NU7.
     v4_deprecation: Option<DV4Deprecation>,
+    /// When this network starts ZIP 234 issuance.
+    ///
+    /// Accepts `"nu7"` (the default) or a block height. A configured height must not
+    /// be below the NU7 activation height.
+    zip234_deployment: Option<DZip234Deployment>,
 }
 
 /// When a network stops accepting version 4 transactions, in configuration form.
@@ -1017,6 +1022,47 @@ impl TryFrom<DV4Deprecation> for V4Deprecation {
                 "never" => Ok(V4Deprecation::Never),
                 _ => Err(format!(
                     "invalid v4_deprecation {name:?}, expected \"nu7\", \"never\", or a block height"
+                )),
+            },
+        }
+    }
+}
+
+/// When a network starts ZIP 234 issuance, in configuration form.
+///
+/// Serializes as `"nu7"` or a block height.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum DZip234Deployment {
+    /// A block height for a network that starts ZIP 234 after NU7.
+    Height(u32),
+    /// `"nu7"`.
+    Named(String),
+}
+
+impl From<Zip234Deployment> for DZip234Deployment {
+    fn from(zip234_deployment: Zip234Deployment) -> Self {
+        match zip234_deployment {
+            Zip234Deployment::AtNu7 => DZip234Deployment::Named("nu7".to_string()),
+            Zip234Deployment::AtHeight(height) => DZip234Deployment::Height(height.0),
+        }
+    }
+}
+
+impl TryFrom<DZip234Deployment> for Zip234Deployment {
+    type Error = String;
+
+    fn try_from(zip234_deployment: DZip234Deployment) -> Result<Self, Self::Error> {
+        match zip234_deployment {
+            DZip234Deployment::Height(height) => {
+                Ok(Zip234Deployment::AtHeight(height.try_into().map_err(
+                    |_| format!("{height} is not a valid block height"),
+                )?))
+            }
+            DZip234Deployment::Named(name) => match name.to_lowercase().as_str() {
+                "nu7" => Ok(Zip234Deployment::AtNu7),
+                _ => Err(format!(
+                    "invalid zip234_deployment {name:?}, expected \"nu7\" or a block height"
                 )),
             },
         }
@@ -1139,6 +1185,7 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
                 .temporary_orchard_disabling_soft_fork_height()
                 .map(|height| height.0),
             v4_deprecation: Some(params.v4_deprecation().into()),
+            zip234_deployment: Some(params.zip234_deployment().into()),
         }
     }
 }
@@ -1409,6 +1456,7 @@ where
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
         v4_deprecation,
+        zip234_deployment,
     } = params;
 
     let mut params_builder = testnet::Parameters::build();
@@ -1507,6 +1555,12 @@ where
     if let Some(v4_deprecation) = v4_deprecation {
         params_builder = params_builder
             .with_v4_deprecation(v4_deprecation.try_into().map_err(de::Error::custom)?);
+    }
+
+    // Retain NU7 activation unless another deployment is configured.
+    if let Some(zip234_deployment) = zip234_deployment {
+        params_builder = params_builder
+            .with_zip234_deployment(zip234_deployment.try_into().map_err(de::Error::custom)?);
     }
 
     // Return an error if the initial testnet peers includes any of the default initial Mainnet or Testnet

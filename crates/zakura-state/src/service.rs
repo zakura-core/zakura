@@ -1820,6 +1820,7 @@ impl Service<Request> for StateService {
             | Request::Transaction(_)
             | Request::UnspentBestChainUtxo(_)
             | Request::Block(_)
+            | Request::BlockInfo(_)
             | Request::AnyChainBlock(_)
             | Request::BlockHeader(_)
             | Request::FindBlockHashes { .. }
@@ -2500,9 +2501,13 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             // Used by getblock
-            ReadRequest::BlockInfo(hash_or_height) => Ok(ReadResponse::BlockInfo(
-                read::block_info(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::BlockInfo(hash_or_height) => {
+                Ok(ReadResponse::BlockInfo(read::any_block_info(
+                    state.latest_non_finalized_state().chain_iter(),
+                    &state.db,
+                    hash_or_height,
+                )))
+            }
 
             // Used by the StateService.
             ReadRequest::Depth(hash) => Ok(ReadResponse::Depth(read::depth(

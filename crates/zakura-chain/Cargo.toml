@@ -1,6 +1,6 @@
 [package]
 name = "zakura-chain"
-version = "6.3.0"
+version = "7.0.0"
 authors.workspace = true
 description = "Core Zcash data structures for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -28,6 +28,18 @@ default = []
 # network, so this feature only changes consensus on a network that configures
 # one.
 zip218 = []
+
+# ZIP 234 "Network Sustainability Mechanism: Issuance Smoothing", the "smooth issuance
+# curve" option on the NU7 ballot: each block subsidy becomes a fixed fraction of the
+# money reserve, replacing halvings.
+zip234 = []
+
+# ZIP 234's "preserve halvings" option on the NU7 ballot: halvings continue, and a
+# bonus applies the smoothing fraction to the issuance deficit.
+#
+# Cargo features are additive. This feature enables ZIP 234 and selects the
+# preserve-halvings calculation.
+zip234-halvings = ["zip234"]
 
 # Consensus-critical conversion from JSON to Zcash types
 json-conversion = [

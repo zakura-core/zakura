@@ -111,7 +111,7 @@ fn local_genesis_activation_coinbase_includes_lockbox_marker() -> anyhow::Result
         .ok_or(anyhow!("hard-coded address must be valid"))?,
     );
     let transaction =
-        TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero())?
+        TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero(), None)?
             .data()
             .as_ref()
             .zcash_deserialize_into::<Transaction>()?;
@@ -196,7 +196,7 @@ fn coinbase_tag_and_limit() {
         .expect("maximum-length tag is valid");
     let max_params = params(Some(max_tag)).expect("maximum-length tag fits miner params");
     let max_coinbase =
-        TransactionTemplate::new_coinbase(&net, Height::MAX, &max_params, Amount::zero())
+        TransactionTemplate::new_coinbase(&net, Height::MAX, &max_params, Amount::zero(), None)
             .expect("maximum-length tag fits a coinbase transaction")
             .data()
             .as_ref()
@@ -352,7 +352,7 @@ fn coinbase_transaction(
     miner_params: &MinerParams,
 ) -> anyhow::Result<Transaction> {
     Ok(
-        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero())?
+        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero(), None)?
             .data()
             .as_ref()
             // Deserialization contains checks for elementary consensus rules,

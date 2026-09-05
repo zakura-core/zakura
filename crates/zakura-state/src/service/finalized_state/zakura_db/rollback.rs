@@ -473,7 +473,7 @@ fn prepare_rollback(
             .block(height.into())
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
         let semantically_verified = SemanticallyVerifiedBlock::from(block.clone())
-            .with_deferred_pool_balance_change(deferred_pool_balance_change(height, network)?);
+            .with_deferred_pool_balance_change(deferred_pool_balance_change(db, height, network)?);
 
         reverse_transparent_block(
             db,
@@ -695,6 +695,7 @@ fn rebuild_treestate_to_height(
 }
 
 fn deferred_pool_balance_change(
+    db: &ZakuraDb,
     height: Height,
     network: &Network,
 ) -> Result<Option<DeferredPoolBalanceChange>, RollbackFinalizedStateError> {
@@ -702,7 +703,16 @@ fn deferred_pool_balance_change(
         return Ok(None);
     }
 
-    let deferred_amount = funding_stream_values(height, network, block_subsidy(height, network)?)?
+    // ZIP 234 derives the block subsidy from the money reserve after the parent block.
+    // Every block being rolled back is finalized, so its parent's pools are in the db.
+    let money_reserve = height
+        .previous()
+        .ok()
+        .and_then(|parent| db.block_info(parent.into()))
+        .map(|parent_info| parent_info.value_pools().money_reserve());
+
+    let block_subsidy = block_subsidy(height, network, money_reserve)?;
+    let deferred_amount = funding_stream_values(height, network, block_subsidy)?
         .remove(&FundingStreamReceiver::Deferred)
         .unwrap_or_default()
         .checked_sub(network.lockbox_disbursement_total_amount(height))

@@ -11,6 +11,66 @@ independently.
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-09-05
+
+### Added
+
+- Added metrics, dashboard visibility, and alerts for the existing Mainnet
+  end-of-support schedule
+  ([#867](https://github.com/zakura-core/zakura/pull/867)).
+
+<!-- release-readiness: allow-patch; reason: The added metrics are backwards compatible, and the Changed entry is an internal dependency update with no operator-facing behavior change. -->
+- Added the `sync.block.first_received.count` metric, whose `source` label
+  reports whether Zakura or legacy TCP first delivers each complete block body
+  ([#882](https://github.com/zakura-core/zakura/pull/882)).
+
+### Changed
+
+- Updated the Zakura Common (`zakura-core/common`) crates from `1.0.1` to
+  `1.1.0`
+  ([#885](https://github.com/zakura-core/zakura/pull/885)).
+
+### Fixed
+
+- Fixed header-chain auxiliary admission so retention can free aggregate
+  capacity before the planner enforces retained delivery limits. The engine
+  retains one copy of each semantic payload and one rooted payload per supplier.
+  The per-header semantic-payload limit increases from 16 to 32. Event-local
+  bounds still protect projection work
+  ([#845](https://github.com/zakura-core/zakura/pull/845)).
+- Prevented header sync from admitting VCT auxiliary input that durable state
+  already retains or has rejected or disputed. Each repair now claims the exact
+  durable episode. Header sync rotates suppliers after peer-attributed failures.
+  It does not retry a failed supplier while that supplier remains connected.
+  It releases disconnected supplier identities so connection churn cannot
+  exhaust the supplier history. Durable state continues to exclude rejected or
+  disputed input after a supplier disconnects. Header sync waits when no
+  eligible supplier remains. An auxiliary-capacity refusal waits until state
+  reports available capacity
+  ([#847](https://github.com/zakura-core/zakura/pull/847)).
+- Prevented peer serving and misbehavior-report traffic from consuming the
+  block-sync action capacity reserved for needed-body refill recovery
+  ([#849](https://github.com/zakura-core/zakura/pull/849)).
+- Preserved deterministic invalid-body evidence and retry state until the
+  block-sync driver accepts each persistence action
+  ([#850](https://github.com/zakura-core/zakura/pull/850)).
+- Retried failed block-sync needed-body state queries through action-queue
+  contention without letting stale failures cancel newer query ownership
+  ([#852](https://github.com/zakura-core/zakura/pull/852)).
+- Stopped the node when the critical block-sync driver exits unexpectedly
+  instead of leaving native services running without block application
+  ([#853](https://github.com/zakura-core/zakura/pull/853)).
+- Legacy synchronization now preserves checkpoint work across temporary tip refresh timeouts
+  ([#884](https://github.com/zakura-core/zakura/pull/884)).
+
+### Security
+
+- Restricted administrative RPC methods to authenticated Mainnet and Testnet
+  listeners while keeping them available through an optional
+  `rpc.admin_listen_addr` loopback listener. The unauthenticated listener
+  remains intended for protected downstream connectivity, not arbitrary
+  Internet traffic ([#876](https://github.com/zakura-core/zakura/pull/876)).
+
 ## [1.3.1] - 2026-09-02
 
 ### Changed

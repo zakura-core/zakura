@@ -1,9 +1,25 @@
 //! The storage half of the serving byte contract, independent of network policy.
 
 use proptest::prelude::*;
-use zakura_chain::block::Height;
+use zakura_chain::block::{Height, MAX_BLOCK_BYTES};
 
 proptest! {
+    #[test]
+    fn response_cap_that_fits_any_block_makes_progress(
+        sizes in prop::collection::vec(1u32..=u32::try_from(MAX_BLOCK_BYTES).unwrap(), 1..16),
+        byte_cap in u32::try_from(MAX_BLOCK_BYTES).unwrap()..=33_554_432u32,
+    ) {
+        let response = super::super::collect_bounded_height_range(
+            Height(0), u32::try_from(sizes.len()).unwrap(), byte_cap, |height| {
+                let size = usize::try_from(sizes[usize::try_from(height.0).unwrap()]).unwrap();
+                Some((height, size))
+            });
+        prop_assert!(!response.is_empty(), "an available first block must fit");
+        prop_assert_eq!(response[0].0, Height(0));
+        prop_assert!(response.iter().map(|(_, _, size)| u64::try_from(*size).unwrap()).sum::<u64>()
+            <= u64::from(byte_cap));
+    }
+
     #[test]
     fn bounded_range_matches_a_contiguous_prefix(
         sizes in prop::collection::vec(prop::option::of(1u32..4_000_001), 0..16),

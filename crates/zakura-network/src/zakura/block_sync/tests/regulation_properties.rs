@@ -20,12 +20,18 @@ async fn reactor_barrier(handle: &BlockSyncHandle) {
         .unwrap();
 }
 
-async fn check_response_writes(responses: &[(usize, bool)], queue_depth: usize) {
-    let blocks = mainnet_blocks_1_to_3();
+async fn check_response_writes(
+    responses: &[(usize, bool)],
+    queue_depth: usize,
+    blocks: Vec<Arc<block::Block>>,
+    response_byte_cap: u32,
+) {
     let config = ZakuraBlockSyncConfig {
         max_blocks_per_response: 3,
+        max_response_bytes: response_byte_cap,
         ..Default::default()
     };
+    config.validate().unwrap();
     let (_tip_sender, tip) = watch::channel((block::Height(3), blocks[2].hash()));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -126,9 +132,10 @@ async fn check_response_writes(responses: &[(usize, bool)], queue_depth: usize) 
             blocks
                 .iter()
                 .take(count)
-                .map(|block| {
+                .enumerate()
+                .map(|(index, block)| {
                     (
-                        block.coinbase_height().unwrap(),
+                        block::Height(u32::try_from(index + 1).unwrap()),
                         block.clone(),
                         usize::try_from(block_size(block)).unwrap(),
                     )
@@ -158,7 +165,9 @@ async fn check_response_writes(responses: &[(usize, bool)], queue_depth: usize) 
             .map(|block| u64::from(block_size(block)) + 1)
             .collect();
         let expected_bytes = if waiting_terminal {
-            u64::from(count_u32) * 2_000_000 + u64::from(count_u32) + 9
+            (u64::from(count_u32) * 2_000_000).min(u64::from(response_byte_cap))
+                + u64::from(count_u32)
+                + 9
         } else {
             payloads.iter().sum::<u64>() + 9
         };
@@ -236,10 +245,26 @@ fn every_response_shape_retains_bytes_through_application_write() {
                     .start_paused(true)
                     .build()
                     .unwrap()
-                    .block_on(check_response_writes(&[(count, empty)], depth));
+                    .block_on(check_response_writes(
+                        &[(count, empty)],
+                        depth,
+                        mainnet_blocks_1_to_3(),
+                        DEFAULT_BS_MAX_RESPONSE_BYTES,
+                    ));
             }
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn minimum_response_cap_serves_a_large_block_with_charged_writes() {
+    let mut blocks = mainnet_blocks_1_to_3();
+    // A serialization boundary fixture; consensus validity is tested elsewhere.
+    blocks[0] = Arc::new(zakura_chain::block::tests::generate::large_multi_transaction_block());
+    let minimum = u32::try_from(block::MAX_BLOCK_BYTES).unwrap();
+    assert!(block_size(&blocks[0]) <= minimum);
+    assert!(block_size(&blocks[0]) > minimum - 1000);
+    check_response_writes(&[(1, false)], 1, blocks, minimum).await;
 }
 
 proptest! {
@@ -249,6 +274,8 @@ proptest! {
         responses in prop::collection::vec((1usize..4, any::<bool>()), 1..5),
     ) {
         tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap()
-            .block_on(check_response_writes(&responses, depth));
+            .block_on(check_response_writes(
+                &responses, depth, mainnet_blocks_1_to_3(), DEFAULT_BS_MAX_RESPONSE_BYTES,
+            ));
     }
 }

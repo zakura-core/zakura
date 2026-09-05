@@ -160,7 +160,7 @@ proptest! {
     fn response_cost_matches_independent_wire_arithmetic(
         requested in 1u32..=128,
         advertised_count in 1u32..=128,
-        body_cap in 1u32..=33_554_432,
+        body_cap in 2_000_000u32..=33_554_432,
         overhead in 1u64..=1_000_000,
     ) {
         let mut config = super::super::ZakuraBlockSyncConfig {
@@ -169,12 +169,16 @@ proptest! {
             ..Default::default()
         };
         config.get_blocks_regulation.request_overhead_bytes = overhead;
+        config.get_blocks_regulation.peer_rate_capacity_bytes = 64 * 1024 * 1024;
+        prop_assert_eq!(config.validate(), Ok(()));
         let count = requested.min(advertised_count);
         let payload = (u64::from(count) * 2_000_000).min(u64::from(body_cap)) + u64::from(count) + 9;
         let actual = super::super::serving_cost(&config, requested).unwrap();
         prop_assert_eq!(actual.count, count);
         prop_assert_eq!(actual.response_cap, payload);
         prop_assert_eq!(actual.charge, payload + overhead);
+        prop_assert!(actual.response_cap >= 2_000_000 + 1 + 9,
+            "every accepted configuration reserves room for any first block and its terminal");
     }
 }
 

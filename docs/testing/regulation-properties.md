@@ -60,6 +60,13 @@ request allows one block, using the committed mainnet height-one fixture. Its
 allowance is 2,000,010 payload bytes plus configured fixed work. It is a
 reservation; the test does not allocate that many bytes to fill a budget.
 
+Accepted local response caps must fit one maximum-sized block. Cost properties
+check its block and terminal reservation; storage properties require a nonempty
+prefix when valid-sized blocks are available. A fixed reactor witness uses the
+minimum accepted cap to serve a near-limit serialization fixture and retain its
+charge through the application write. That fixture checks size and ownership,
+not consensus validity.
+
 Separate cost properties vary legal counts and byte caps. Reactor histories use
 one to three committed blocks and queue depths one to three. These deliberately
 small capacities reach full queues and resource limits with bounded

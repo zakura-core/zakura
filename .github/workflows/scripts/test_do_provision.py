@@ -11,6 +11,7 @@ from unittest.mock import patch
 import do_artifact_retention as retention
 import do_provision as p
 import do_seed_approach as seed
+import do_snapshot as snapshots
 
 
 def size(slug, regions=("nyc1",), disk=100, price=0.25, cpu=8, memory=16384):
@@ -329,6 +330,73 @@ class Lifecycle(unittest.TestCase):
             args("--policy", "bake", "--regions", "sfo3"),
         )
         self.assertFalse(p.volume_names(first) & p.volume_names(second))
+
+
+class SnapshotCreation(unittest.TestCase):
+    def snapshot(self, **changes):
+        return (
+            dict(
+                id="snapshot-id",
+                name="fixture",
+                resource_id="volume-id",
+                regions=["nyc1"],
+            )
+            | changes
+        )
+
+    @patch.object(snapshots.time, "sleep")
+    @patch.object(p.subprocess, "run")
+    def test_empty_create_output_and_delayed_listing(self, run, sleep):
+        other_volume = self.snapshot(resource_id="other-volume")
+        other_region = self.snapshot(regions=["sfo3"])
+        other_name = self.snapshot(name="other-name")
+        run.side_effect = [
+            subprocess.CompletedProcess("doctl", 0, stdout=output, stderr="")
+            for output in (
+                "[]",
+                "",
+                json.dumps([other_volume, other_region, other_name]),
+                json.dumps([self.snapshot()]),
+            )
+        ]
+        self.assertEqual(
+            snapshots.create_snapshot("volume-id", "fixture", "nyc1"), "snapshot-id"
+        )
+        creates = [
+            call.args[0]
+            for call in run.call_args_list
+            if call.args[0][2:4] == ["volume", "snapshot"]
+        ]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0][-1], "0")
+        sleep.assert_called_once()
+
+    @patch.object(snapshots, "doctl")
+    def test_existing_snapshot_does_not_create_another(self, api):
+        api.return_value = [self.snapshot()]
+        with self.assertRaisesRegex(RuntimeError, "already exists"):
+            snapshots.create_snapshot("volume-id", "fixture", "nyc1")
+        api.assert_called_once()
+
+    @patch.object(snapshots, "doctl")
+    def test_duplicate_matches_are_not_arbitrarily_selected(self, api):
+        api.side_effect = [[], None, [self.snapshot(), self.snapshot(id="second")]]
+        with self.assertRaisesRegex(RuntimeError, "multiple snapshots"):
+            snapshots.create_snapshot("volume-id", "fixture", "nyc1")
+
+    @patch.object(snapshots, "doctl")
+    def test_missing_snapshot_times_out_without_recreating(self, api):
+        api.side_effect = [[], None, []]
+        with self.assertRaisesRegex(TimeoutError, "not listed"):
+            snapshots.create_snapshot("volume-id", "fixture", "nyc1", timeout=0)
+        self.assertEqual(api.call_count, 3)
+
+    @patch.object(snapshots, "doctl")
+    def test_ambiguous_create_is_not_retried(self, api):
+        api.side_effect = [[], subprocess.TimeoutExpired("doctl", 180)]
+        with self.assertRaises(subprocess.TimeoutExpired):
+            snapshots.create_snapshot("volume-id", "fixture", "nyc1")
+        self.assertEqual(api.call_count, 2)
 
 
 class Retention(unittest.TestCase):

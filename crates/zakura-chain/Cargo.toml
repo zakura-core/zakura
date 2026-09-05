@@ -1,6 +1,6 @@
 [package]
 name = "zakura-chain"
-version = "6.2.0"
+version = "6.3.0"
 authors.workspace = true
 description = "Core Zcash data structures for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -19,6 +19,15 @@ categories = ["asynchronous", "cryptography::cryptocurrencies", "encoding"]
 default = []
 
 # Production features that activate extra functionality
+
+# ZIP 218 "25-second Block Target Spacing": 25 second block target spacing, a
+# 102-block difficulty averaging window, a block subsidy divided by the spacing
+# ratio, and per-block shielded action limits, all from NU7 activation onwards.
+#
+# The rules stay dormant until NU7 has an activation height on the configured
+# network, so this feature only changes consensus on a network that configures
+# one.
+zip218 = []
 
 # Consensus-critical conversion from JSON to Zcash types
 json-conversion = [

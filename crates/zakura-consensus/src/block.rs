@@ -326,6 +326,8 @@ where
                 .map_err(VerifyBlockError::Time)?;
             let coinbase_tx = check::coinbase_is_first(&block)?;
 
+            check::shielded_action_limits_are_valid(&block.transactions, height, &network)?;
+
             let expected_block_subsidy =
                 zakura_chain::parameters::subsidy::block_subsidy(height, &network)?;
 

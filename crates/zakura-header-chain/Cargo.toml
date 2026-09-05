@@ -1,6 +1,6 @@
 [package]
 name = "zakura-header-chain"
-version = "2.0.0"
+version = "2.1.0"
 authors.workspace = true
 description = "Fork-aware header-chain domain types and transition engine for Zakura"
 license.workspace = true
@@ -12,6 +12,12 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
+
+# ZIP 218 "25-second Block Target Spacing" consensus rules, dormant until NU7 activates.
+zip218 = [
+    "zakura-chain/zip218",
+]
+
 fuzz-impl = []
 test-support = []
 
@@ -20,7 +26,7 @@ chrono = { workspace = true }
 rayon = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-zakura-chain = { path = "../zakura-chain", version = "6.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "6.3.0" }
 
 [dev-dependencies]
 criterion = { workspace = true }

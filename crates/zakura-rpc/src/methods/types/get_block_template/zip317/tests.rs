@@ -199,3 +199,150 @@ fn includes_tx_with_selected_dependencies() {
         "should return a dependency depth of 1 for the dependent tx"
     );
 }
+
+/// Tests that block template selection respects the ZIP 218 shielded limits, so
+/// a template cannot exceed a limit the block verifier enforces.
+mod zip218_template_limits {
+    use std::sync::Arc;
+
+    use zakura_chain::{
+        parameters::{
+            testnet::{ConfiguredActivationHeights, Parameters},
+            Network, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT, SAPLING_BLOCK_IO_LIMIT,
+            SPROUT_BLOCK_JOINSPLIT_LIMIT,
+        },
+        transaction::{
+            arbitrary::{fake_v5_with_orchard_actions, fake_v5_with_sapling_outputs},
+            ShieldedActionCounts, Transaction, UnminedTx, VerifiedUnminedTx,
+        },
+    };
+
+    use zcash_keys::address::Address;
+    use zcash_transparent::address::TransparentAddress;
+
+    use super::{
+        super::{BlockTemplateLimits, MinerParams},
+        Amount, Height, TransactionTemplate,
+    };
+
+    /// A transaction that fills the Orchard limit leaves no room under the
+    /// global budget for a single Sapling output, even though the Sapling
+    /// per-pool limit is untouched.
+    #[test]
+    fn the_global_budget_bounds_selection_across_pools() {
+        let mut limits = nu7_template_limits();
+
+        let orchard_tx = verified_unmined_tx(fake_v5_with_orchard_actions(
+            usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT).expect("the limit fits in usize"),
+        ));
+        let sapling_tx = verified_unmined_tx(fake_v5_with_sapling_outputs(1));
+
+        assert!(
+            limits.try_add(&orchard_tx),
+            "Orchard actions exactly at the per-pool limit fit in an empty template"
+        );
+        assert!(
+            !limits.try_add(&sapling_tx),
+            "a Sapling output past the global budget must not be selected"
+        );
+    }
+
+    /// The shielded limits only bind once ZIP 218 is active, so a pre-NU7
+    /// template accepts a transaction that a post-NU7 template rejects.
+    #[test]
+    fn the_shielded_limits_only_bind_after_activation() {
+        let network = nu7_activation_testnet(2);
+        let over_limit_tx = verified_unmined_tx(fake_v5_with_orchard_actions(
+            usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT + 1).expect("the limit fits in usize"),
+        ));
+
+        let mut pre_activation = template_limits(&network, Height(1));
+        assert!(
+            pre_activation.try_add(&over_limit_tx),
+            "the shielded limits are inactive below the NU7 activation height"
+        );
+
+        let mut post_activation = template_limits(&network, Height(2));
+        assert_eq!(
+            post_activation.try_add(&over_limit_tx),
+            !cfg!(feature = "zip218"),
+            "a zip218 build rejects Orchard actions above the per-block limit at NU7"
+        );
+    }
+
+    /// A shielded coinbase output consumes the same block capacity as a
+    /// shielded output in any other transaction.
+    #[test]
+    fn the_coinbase_consumes_shielded_capacity() {
+        let network = nu7_activation_testnet(1);
+        let limits = BlockTemplateLimits::remaining_shielded_limits(
+            &network,
+            Height(1),
+            ShieldedActionCounts {
+                sapling_ios: 1,
+                ..Default::default()
+            },
+        );
+
+        let expected_sapling_ios = if cfg!(feature = "zip218") {
+            SAPLING_BLOCK_IO_LIMIT - 1
+        } else {
+            u32::MAX
+        };
+        let expected_cost = if cfg!(feature = "zip218") {
+            GLOBAL_SHIELDED_BUDGET - 1
+        } else {
+            u32::MAX
+        };
+
+        assert_eq!(limits.sapling_ios, expected_sapling_ios);
+        assert_eq!(limits.cost, expected_cost);
+    }
+
+    fn template_limits(network: &Network, height: Height) -> BlockTemplateLimits {
+        let miner_params =
+            MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
+        let fake_coinbase_tx =
+            TransactionTemplate::new_coinbase(network, height, &miner_params, Amount::zero())
+                .expect("valid coinbase transaction template");
+
+        BlockTemplateLimits::initial(network, height, &fake_coinbase_tx)
+    }
+
+    fn nu7_template_limits() -> BlockTemplateLimits {
+        BlockTemplateLimits {
+            remaining_bytes: usize::MAX,
+            remaining_sigops: u32::MAX,
+            remaining_unpaid_actions: u32::MAX,
+            remaining_orchard_actions: ORCHARD_BLOCK_ACTION_LIMIT,
+            remaining_sapling_ios: SAPLING_BLOCK_IO_LIMIT,
+            remaining_sprout_joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT,
+            remaining_shielded_cost: GLOBAL_SHIELDED_BUDGET,
+        }
+    }
+
+    fn nu7_activation_testnet(nu7_activation_height: u32) -> Network {
+        Parameters::build()
+            .with_slow_start_interval(Height(0))
+            .with_activation_heights(ConfiguredActivationHeights {
+                // The coinbase template hashes the transaction, which the
+                // pre-Overwinter format does not support, so activate the
+                // earlier upgrades from height 1.
+                nu5: Some(1),
+                nu7: Some(nu7_activation_height),
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .clear_funding_streams()
+            .to_network()
+            .expect("configured testnet is valid")
+    }
+
+    fn verified_unmined_tx(transaction: Arc<Transaction>) -> VerifiedUnminedTx {
+        let unmined_tx = UnminedTx::from(transaction);
+        let miner_fee = unmined_tx.conventional_fee();
+
+        VerifiedUnminedTx::new(unmined_tx, miner_fee, 0, 0, Arc::new(Vec::new()))
+            .expect("the fake transaction pays the conventional fee")
+    }
+}

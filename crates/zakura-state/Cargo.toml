@@ -1,6 +1,6 @@
 [package]
 name = "zakura-state"
-version = "7.1.1"
+version = "7.2.0"
 authors.workspace = true
 description = "State contextual verification and storage code for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -16,6 +16,12 @@ keywords.workspace = true
 categories = ["asynchronous", "caching", "cryptography::cryptocurrencies"]
 
 [features]
+
+# ZIP 218 "25-second Block Target Spacing" consensus rules, dormant until NU7 activates.
+zip218 = [
+    "zakura-chain/zip218",
+    "zakura-header-chain/zip218",
+]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
@@ -74,9 +80,9 @@ tracing = { workspace = true }
 sapling-crypto = { workspace = true }
 
 zakura-assets = { workspace = true }
-zakura-node-services = { path = "../zakura-node-services", version = "3.2.1" }
-zakura-chain = { path = "../zakura-chain", version = "6.0.0", features = ["async-error"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "2.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.3" }
+zakura-chain = { path = "../zakura-chain", version = "6.3.0", features = ["async-error"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "2.1.0" }
 
 # prod feature progress-bar
 howudoin = { workspace = true, optional = true }
@@ -88,7 +94,7 @@ derive-getters.workspace = true
 derive-new.workspace = true
 
 [dev-dependencies]
-zakura-header-chain = { path = "../zakura-header-chain", version = "2.0.0", features = ["test-support"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "2.1.0", features = ["test-support"] }
 color-eyre = { workspace = true }
 
 once_cell = { workspace = true }
@@ -108,7 +114,7 @@ orchard = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-chain = { path = "../zakura-chain", version = "6.0.0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "6.3.0", features = ["proptest-impl"] }
 zakura-test = { path = "../zakura-test/", version = "2.1.0" }
 
 [lints]

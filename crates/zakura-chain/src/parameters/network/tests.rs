@@ -318,3 +318,123 @@ fn check_height_for_num_halvings() {
         }
     }
 }
+
+/// Tests the ZIP 218 target spacing, halving, and block subsidy across the NU7
+/// activation boundary on a configured Testnet.
+#[test]
+#[cfg(feature = "zip218")]
+fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
+    use crate::parameters::{
+        testnet::{self, ConfiguredActivationHeights},
+        NU7_POW_TARGET_SPACING_RATIO, POST_BLOSSOM_POW_TARGET_SPACING, POST_NU7_POW_TARGET_SPACING,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    // Choose parameters where slow_start_shift == blossom_height, so the
+    // pre-Blossom term of the spec's halving sum is exactly zero and the halving
+    // boundaries land on multiples of the post-Blossom halving interval.
+    let blossom = 1u32;
+    let canopy = blossom + u32::try_from(POST_BLOSSOM_HALVING_INTERVAL).unwrap();
+    let nu7 = canopy + u32::try_from(POST_BLOSSOM_HALVING_INTERVAL * 2).unwrap();
+
+    let network = testnet::Parameters::build()
+        // slow_start_shift = slow_start_interval / 2 = 1, the Blossom height.
+        .with_slow_start_interval(Height(2))
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(blossom),
+            canopy: Some(canopy),
+            nu7: Some(nu7),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let nu7_height = Height(nu7);
+
+    // The target spacing shortens exactly at the NU7 activation height.
+    assert_eq!(
+        i64::from(POST_BLOSSOM_POW_TARGET_SPACING),
+        NetworkUpgrade::target_spacing_for_height(&network, (nu7_height - 1).unwrap())
+            .num_seconds()
+    );
+    assert_eq!(
+        i64::from(POST_NU7_POW_TARGET_SPACING),
+        NetworkUpgrade::target_spacing_for_height(&network, nu7_height).num_seconds()
+    );
+
+    // Three post-Blossom halvings have elapsed at NU7 activation:
+    //   Halving = floor(0/PreBlossom + 1 + 2) = 3
+    assert_eq!(3, halving(nu7_height, &network));
+    assert_eq!(8, halving_divisor(nu7_height, &network).unwrap());
+
+    // BlockSubsidy(NU7) = floor(MAX / (BlossomRatio * NU7Ratio * 2^Halving))
+    //                   = floor(1_250_000_000 / (2 * 3 * 8)) = 26_041_666 zatoshi
+    assert_eq!(
+        Amount::<NonNegative>::try_from(26_041_666)?,
+        block_subsidy(nu7_height, &network)?,
+    );
+
+    // The third halving boundary lands exactly at NU7 here, so the block before
+    // NU7 is still in halving era 2: floor(1_250_000_000 / (2 * 4)) zatoshi.
+    assert_eq!(2, halving((nu7_height - 1).unwrap(), &network));
+    assert_eq!(
+        Amount::<NonNegative>::try_from(156_250_000)?,
+        block_subsidy((nu7_height - 1).unwrap(), &network)?,
+    );
+
+    // The halving counter does not reset at NU7. The next boundary arrives after
+    // one PostNU7HalvingInterval (= PostBlossomHalvingInterval * 3) of blocks.
+    let post_nu7_halving_interval =
+        POST_BLOSSOM_HALVING_INTERVAL * i64::from(NU7_POW_TARGET_SPACING_RATIO);
+    let next_halving = (nu7_height + post_nu7_halving_interval).unwrap();
+    assert_eq!(4, halving(next_halving, &network));
+    assert_eq!(16, halving_divisor(next_halving, &network).unwrap());
+    assert_eq!(
+        Amount::<NonNegative>::try_from(13_020_833)?,
+        block_subsidy(next_halving, &network)?,
+    );
+
+    Ok(())
+}
+
+/// Tests that the ZIP 218 difficulty averaging window widens at the NU7
+/// activation height.
+#[test]
+#[cfg(feature = "zip218")]
+fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
+    use crate::parameters::{
+        testnet::{self, ConfiguredActivationHeights},
+        POST_NU7_POW_AVERAGING_WINDOW, PRE_NU7_POW_AVERAGING_WINDOW,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            nu7: Some(10),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    assert_eq!(
+        PRE_NU7_POW_AVERAGING_WINDOW,
+        NetworkUpgrade::averaging_window_for_height(&network, Height(9))
+    );
+    assert_eq!(
+        POST_NU7_POW_AVERAGING_WINDOW,
+        NetworkUpgrade::averaging_window_for_height(&network, Height(10))
+    );
+    assert_eq!(
+        POST_NU7_POW_AVERAGING_WINDOW,
+        NetworkUpgrade::averaging_window_for_height(&network, Height(11))
+    );
+
+    Ok(())
+}

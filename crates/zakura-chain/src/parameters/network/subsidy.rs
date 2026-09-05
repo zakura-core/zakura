@@ -417,28 +417,38 @@ pub fn halving_divisor(height: Height, network: &Network) -> Option<u64> {
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
 pub fn halving(height: Height, network: &Network) -> u32 {
     let slow_start_shift = network.slow_start_shift();
-    let blossom_height = NetworkUpgrade::Blossom
-        .activation_height(network)
-        .expect("blossom activation height should be available");
+    if height < slow_start_shift {
+        return 0;
+    }
 
-    let halving_index = if height < slow_start_shift {
-        0
-    } else if height < blossom_height {
-        let pre_blossom_height = height - slow_start_shift;
-        pre_blossom_height / network.pre_blossom_halving_interval()
-    } else {
-        let pre_blossom_height = blossom_height - slow_start_shift;
-        let scaled_pre_blossom_height =
-            pre_blossom_height * HeightDiff::from(BLOSSOM_POW_TARGET_SPACING_RATIO);
+    // Each target spacing era contributes (blocks in the era * era spacing) to a
+    // running total of block seconds, which the pre-Blossom halving interval
+    // measured in seconds then divides. This is the spec's segmented sum of
+    // fractions with the common denominator factored out, so it stays in integer
+    // arithmetic no matter how many spacing eras a network has. ZIP 218 adds a
+    // third era at NU7.
+    let pre_blossom_spacing_seconds = NetworkUpgrade::Genesis.target_spacing().num_seconds();
+    let mut total_block_seconds: HeightDiff = 0;
 
-        let post_blossom_height = height - blossom_height;
+    let mut eras = NetworkUpgrade::target_spacings(network)
+        .filter(|(era_start, _)| *era_start <= height)
+        .peekable();
 
-        (scaled_pre_blossom_height + post_blossom_height) / network.post_blossom_halving_interval()
-    };
+    while let Some((era_start, era_spacing)) = eras.next() {
+        let era_end = eras
+            .peek()
+            .map(|(next_start, _)| *next_start)
+            .unwrap_or(height);
+        let era_blocks = (era_end - era_start.max(slow_start_shift)).max(0);
+        total_block_seconds += era_blocks * era_spacing.num_seconds();
+    }
 
-    halving_index
+    let pre_blossom_denominator =
+        network.pre_blossom_halving_interval() * pre_blossom_spacing_seconds;
+
+    (total_block_seconds / pre_blossom_denominator)
         .try_into()
-        .expect("already checked for negatives")
+        .expect("halving index is non-negative and fits in u32")
 }
 
 /// `BlockSubsidy(height)` as described in [protocol specification §7.8][7.8]
@@ -462,13 +472,17 @@ pub fn block_subsidy(height: Height, net: &Network) -> Result<Amount<NonNegative
             slow_start_rate * (u64::from(height) + 1)
         }
     } else {
-        let base_subsidy = if NetworkUpgrade::current(net, height) < NetworkUpgrade::Blossom {
-            MAX_BLOCK_SUBSIDY
-        } else {
-            MAX_BLOCK_SUBSIDY / u64::from(BLOSSOM_POW_TARGET_SPACING_RATIO)
-        };
+        // Each spacing era scales the per-block subsidy by
+        // `current_spacing / pre_blossom_spacing`, which keeps issuance per unit of
+        // wall-clock time constant across spacing changes. Blossom divides the
+        // subsidy by 2, and ZIP 218 divides it by a further 3 at NU7. The casts are
+        // safe because target spacings are small positive constants.
+        let current_spacing_seconds =
+            NetworkUpgrade::target_spacing_for_height(net, height).num_seconds() as u64;
+        let pre_blossom_spacing_seconds =
+            NetworkUpgrade::Genesis.target_spacing().num_seconds() as u64;
 
-        base_subsidy / halving_div
+        MAX_BLOCK_SUBSIDY * current_spacing_seconds / pre_blossom_spacing_seconds / halving_div
     };
 
     Ok(Amount::try_from(amount)?)

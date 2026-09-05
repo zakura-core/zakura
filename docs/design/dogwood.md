@@ -1,329 +1,253 @@
 # Dogwood: block propagation for Zcash
 
 Proof of work makes the next block's entry point unpredictable. Propagation
-delay increases the orphan rate. We therefore need low-latency propagation from
-any proposer across peers with unequal bandwidth.
+delay increases the orphan rate. We need low latency from any proposer across
+peers with unequal bandwidth.
 
-Dogwood minimizes latency by pushing block parts along existing subscriptions.
-Each receiver splits its subscriptions across peers to use their bandwidth.
-Upon receiving a valid block part, a peer pushes it to its subscribers.
+Dogwood pushes block parts along subscriptions established before the block
+exists. Each node requests different portions from different peers and forwards
+verified parts to its subscribers. It shifts subscriptions toward faster peers.
+Parity lets it reconstruct the block without waiting for every part.
 
-Each receiver adjusts its subscriptions using local delivery measurements,
-using a similar approach to
-[DOG](https://github.com/cometbft/cometbft/issues/3263). These local decisions
-adapt the propagation graph to the proposer and current network conditions.
-Dogwood starts with selected suppliers for each portion, not every portion
-from every peer. It adds routes for coverage, measurement, or recovery.
+The tradeoff is bandwidth: standing routes avoid request latency, but stale
+routes need redundancy and recovery. The [protocol specification](../specs/dogwood.md)
+defines the rules. This document explains the design.
 
-To increase throughput, receivers subscribe to different portions of the block
-from different peers. The subscription controller shifts portions between
-connections to use available bandwidth. Parity and alternate suppliers provide
-redundancy while routes adapt.
+## Tradeoffs
 
-This document explains the proposal. [protocol specification](../specs/dogwood.md) defines its rules.
-The proposer authentication and exact wire profile still need concrete choices.
-The subscription controller needs simulation and measurement.
-
-## Constraints, comparisons, and tradeoffs
-
-Block propagation balances throughput, latency, and robustness. Pull protocols
-use current availability to request missing data without excess duplication.
-Push protocols avoid request latency but need redundancy when routes fail or
-become congested. A protocol can also organize routes around a known proposer
-and participant set, which imposes different topology assumptions.
+Block propagation balances latency, throughput, and robustness.
 
 [Rotor](https://www.anza.xyz/blog/alpenglow-a-new-consensus-for-solana) uses
-erasure coding and a single relay layer, with bandwidth assigned according to
-stake. This reduces the proposer's upload burden and the number of network
-hops. Its routing model depends on a known proposer and validator set.
+erasure coding and a single relay layer to reduce the proposer's upload burden
+and propagation hops. Its routes depend on a known proposer and validator set.
 
 Celestia's Pull-Based Broadcast Tree
 ([PBBT](https://github.com/celestiaorg/celestia-app/blob/9c1e04d1dfd090531252f16f34293242d04b1157/specs/src/recovery.md))
-discovers routes as block parts propagate. It pipelines authenticated `Have`
-and `Want` messages with data transfer. FIFO scheduling makes congestion affect
-route selection. This favors throughput and adaptation to current conditions,
-but the first data transfer still waits for a request.
+discovers routes as parts propagate. It pipelines authenticated `Have` and
+`Want` messages with data transfer. Congestion affects route selection through
+FIFO scheduling, but the first transfer still waits for a request.
 
-Dogwood moves the request before the next block. Its subscriptions reflect
-previous observations, so route adaptation lags changes in congestion or block
-entry point. Redundancy compensates for some stale routes at a cost to bandwidth
-efficiency and throughput. Recovery handles cases where that redundancy is
-insufficient. The protocol permits any block entry point, but propagation
-latency can increase until subscriptions adapt to it.
+Dogwood moves that request before the block. Like
+[DOG](https://github.com/cometbft/cometbft/issues/3263), it uses local delivery
+measurements to adjust push routes. It starts with selected suppliers, not the
+whole block from every peer. Subscriptions divide the traffic across connections
+and adapt separately for each proposer.
 
-## Protocol
+This favors latency over bandwidth efficiency. A new proposer or a change in
+congestion can make existing routes unsuitable. Recovery must work before the
+controller learns better routes.
 
-### Parts and subscriptions
+## Parts and subscriptions
 
-A block body contains `k` data parts and `n - k` parity parts. Payloads default to
-64 KiB. The draft uses systematic Reed–Solomon over GF(2¹⁶).
+The proposer splits the block body into `k` data parts, with 64 KiB payloads
+by default. Systematic Reed–Solomon over GF(2¹⁶) adds `ceil(k / 4)` parity parts.
 Any `k` distinct correctly encoded parts reconstruct the body.
-The receiver combines it with the admitted header to reconstruct the block.
-A Merkle proof authenticates each part before a relay forwards it.
 
-Subscriptions must exist before the next block's size is known. We divide the
-part index space into a fixed number of portions. A permutation derived from
-the block hash spreads data and parity parts across portions. One portion can
-contain several parts of a large block.
+`HeaderMeta` wraps the consensus header with coding parameters, a Merkle root
+over the parts, and proposer authentication. Each `BlockPart` carries a proof
+against that root. Nodes verify parts before forwarding or decoding them.
 
-Each node keeps incoming and outgoing peer-by-portion bitmaps. Incoming cells
-record our requests. Outgoing cells record peers' requests. A default bitmap
-serves unfamiliar proposers. A learned bitmap can replace it for a particular
-authenticated proposer.
+The next block's size is unknown when a node subscribes. The subscription names
+a *portion*: one of a fixed number of groups, rather than fixed part indices.
+A block-hash-derived permutation distributes data and parity parts across these
+groups. The same subscription selects more parts when the block is larger.
 
-Together, these subscriptions form overlapping directed graphs. Different
-parts cross different paths. A node that reconstructs the block can regenerate
-missing parts and feed paths that have not received them yet. Each receiver
-shapes its own incoming traffic without needing a map of the network.
+Each node chooses its suppliers independently. These choices form overlapping
+directed graphs: different portions follow different paths through the same
+peers. A node can forward a part as soon as it verifies it. Once it reconstructs
+and checks the encoded body, it can regenerate parts that never reached it.
 
-### State examples
+### Block-part lifecycle
 
-Each table describes state at receiver R. `P` marks a primary subscription,
-`R` marks a redundant subscription, and `C` marks a challenge. All three are
-enabled bits on the wire. Peers do not receive these local labels.
+Node A and Node B already have subscriptions. The diagram follows one part.
+Both nodes collect other parts through their own subscriptions.
 
-An unfamiliar proposer uses the default incoming matrix. R distributes portions
-across peers and selects a second supplier for each portion during startup.
-It does not request the whole block from every peer.
-
-| Default incoming | Portion 0 | Portion 1 | Portion 2 | Portion 3 |
-| --- | --- | --- | --- | --- |
-| A | P | — | R | — |
-| B | R | P | — | — |
-| C | — | R | P | R |
-| D | — | — | — | P |
-
-Learned routes differ by proposer. Here A supplies most portions for proposer X,
-while C supplies most portions for proposer Y. These tables show primary routes
-and one challenge; the coverage rule may require additional redundant routes.
-
-| Proposer / incoming peer | Portion 0 | Portion 1 | Portion 2 | Portion 3 |
-| --- | --- | --- | --- | --- |
-| X / A | P | P | P | — |
-| X / B | — | — | C | P |
-| X / C | — | — | — | — |
-| Y / A | — | — | — | P |
-| Y / B | — | — | — | — |
-| Y / C | P | P | P | — |
-
-If B repeatedly beats A for X's portion 2, R promotes B and then removes A's
-subscription for that portion. R leaves Y's routes unchanged. Proposer rows
-override default rows per peer, not per cell: an explicit empty row disables
-that peer, while an absent row inherits the default.
-
-Outgoing state records independent demand. R can receive portion 0 from A
-while A also requests it from R.
-
-| X / outgoing peer | Portion 0 | Portion 1 | Portion 2 | Portion 3 |
-| --- | --- | --- | --- | --- |
-| A | P | — | — | — |
-| D | P | P | — | — |
-| E | — | — | P | P |
-
-If A supplies part `i` in portion 0, R forwards it to D and suppresses the echo
-to A. If R obtains `i` elsewhere first, R can forward it to both A and D.
-
-For repair, a block-specific peer-by-part row overrides that peer's persistent
-row. Creating the row first copies inherited demand. For example, if B's
-inherited indices are `{3, 7}`, adding missing index `5` produces `{3, 5, 7}`.
-The new grant must cover index `5`; the inherited indices still need credit.
-
-### Redundancy and recovery
-
-The steady-state target is one supplier per portion, including parity portions.
-For example, `k = 32, n = 40` costs 25% extra payload before duplicates and
-padding. It tolerates eight unavailable parts.
-
-This protection depends on where parts travel. If one peer supplies more than
-eight parts, losing it can prevent immediate decoding. A receiver can favor a
-nearby proposer for speed, but it must retain enough distinct parts elsewhere
-to meet its chosen failure target. Parity and duplicate routes share this
-budget; they are not interchangeable guarantees.
-
-For the same `32/40` block, A could supply indices `0..31`, B could supply
-`0..7` and `32..39`, and C could supply `8..23`. Losing any one peer leaves
-at least 32 distinct indices. A supplies the entire data set, but the alternate
-coverage raises assigned payload to 64 parts: twice the unpadded body size.
-The receiver can use less redundancy only by accepting recovery latency after
-A fails. A fast datacenter connection does not remove that tradeoff.
-
-Parity cannot repair an isolated subscription cycle. Two peers may request the
-same portion from each other while neither has it. We allow reciprocal
-subscriptions because either peer may obtain the part elsewhere or reconstruct
-it. We suppress echoes and never treat reciprocity as evidence of availability.
-
-Receivers start with extra suppliers, retain a small exploration budget, and
-add suppliers when decoding stalls. They can request specific parts of the
-current block using the subscription message. Existing full-block download
-provides final recovery. Sparse subscriptions alone do not guarantee delivery
-from every entry point.
-
-### Routing and congestion control
-
-The receiver moves demand toward peers that deliver sooner under the assigned
-load. It compares arrival times on its own clock, not RTT or sender timestamps.
-Transport congestion control paces bytes; this controller chooses suppliers.
-
-The core rules are:
-
-1. Start with selected suppliers per portion. Use one primary plus routes needed
-   for startup or failure coverage. Do not subscribe to everything from everyone.
-2. Occasionally add a random challenger for one portion. Race the same parts
-   from the same proposer under comparable block size and concurrent load.
-3. Move that portion only after repeated wins. Keep the old supplier until the
-   replacement delivers, and preserve enough distinct parts to decode after
-   the failures we intend to tolerate.
-4. Limit each move in bytes. Count all active blocks, proposers, backups, and
-   challenges against the connection's shared budget. Allow only one unsettled
-   move into a connection, then measure again at the new load.
-5. Raise the budget a little after successful delivery under increased load.
-   Lower it after repeated uncanceled deadline misses. Idle time is not evidence
-   of spare capacity. Continued bounded challenges let weak peers recover.
-6. Repair stalls immediately within a separate bounded reserve. Do not wait for
-   the learning loop. On reconstruction, send `FullBlock` and stop measuring
-   missing copies as failures because we have told their senders to stop.
-
-For proposer X and portion 2, the subscriptions evolve as follows.
-Arrows show pushed data; R sends subscription updates in the reverse direction.
-Other portions and required backup routes remain unchanged.
-
-```text
-Before:       A ---- portion 2 ----> R
-
-Challenge:    A ---- portion 2 ----> R <---- portion 2 ---- B
-              Add B within budget and compare the same parts.
-
-After:        B ---- portion 2 ----> R
-              Remove A after repeated B wins and successful replacement delivery.
-              Keep A if failure coverage still requires it.
-              Measure again before adding more load to B.
+```mermaid
+sequenceDiagram
+    participant P as Proposer
+    participant A as Node A
+    participant B as Node B
+    P->>A: HeaderMeta
+    A->>A: Verify header and metadata
+    A->>B: HeaderMeta
+    B->>B: Verify header and metadata
+    P->>A: BlockPart
+    A->>A: Verify block part
+    A->>B: BlockPart
+    B->>B: Verify block part
+    Note over A,B: Repeat for other parts
+    B->>B: Reconstruct and check block
+    B->>A: FullBlock
 ```
 
-The budget counts outstanding assigned bytes, not subscriptions. At 64 KiB per
-part and four portions, one portion of a 40-part block costs 640 KiB.
-Two concurrent blocks cost 1.25 MiB. One portion of a 400-part block costs
-6.25 MiB, so a small-block win cannot justify that move without a larger trial.
-
-Standing routes use an estimated workload because the next block is unknown.
-On `HeaderMeta`, the receiver checks actual byte demand and coverage. Corrections
-use block-specific subscriptions and incur control latency. The budget guides
-allocation; finite grants and queue bounds enforce hard limits.
-
-Randomized comparison follows the idea in
-[power of two choices](https://brooker.co.za/blog/2012/01/17/two-random.html).
-These rules do not establish convergence or guarantee delivery from an isolated
-subscription cycle. [Section 7 of the spec](../specs/dogwood.md#7-redundancy-and-route-control)
-defines the measurements, limits, and recovery rules we need to test.
-
-### Encoding
-
-Use systematic Reed–Solomon over GF(2¹⁶), with the generator from
-[RFC 5510, section 8](https://www.rfc-editor.org/rfc/rfc5510.html#section-8).
-Add `ceil(k / 4)` parity parts. Any `k` distinct correctly encoded parts suffice.
-The spec fixes the field representation and part layout.
-
-Decode incrementally: treat each verified part as an equation and eliminate
-known terms as it arrives. Finish solving after `k` parts, then re-encode and
-check the committed root. This overlaps decoding with transfer without RLNC's
-rank uncertainty. Relays forward verified parts without waiting for decoding.
-We still need to measure the remaining decode and root-verification latency.
-
-Encode only the body because `HeaderMeta` carries the header. The proposer
-prepares parity and the Merkle tree while mining, then signs the root with the
-final block hash. A body change invalidates that work; a header-only change does
-not. The root must be ready before the proposer publishes `HeaderMeta`.
+`FullBlock` stops further parts for that block toward its sender. Node A cancels
+queued sends to Node B, but in-flight parts may still arrive. Node B continues
+serving its own subscribers. Future subscriptions remain active.
+Reconstruction checks do not replace consensus block validation.
 
 ### Messages
 
 | Message | Purpose |
 | --- | --- |
-| `HeaderMeta` | Header, coding parameters, part root, and proposer authentication. |
-| `BlockPart` | One part, its Merkle proof, and subscription authorization. |
-| `SubscribePortion` | Enable future portions or request parts of an active block. |
-| `UnsubscribePortion` | Stop a route or restore the default route. |
-| `FullBlock` | Report reconstruction and stop further parts for this block. |
+| `HeaderMeta` | Announce the header and authenticated commitment to its encoded body. |
+| `BlockPart` | Send one part with its proof and subscription authorization. |
+| `SubscribePortion` | Request future portions or specific parts of an active block. |
+| `UnsubscribePortion` | Stop a route or restore inherited subscriptions. |
+| `FullBlock` | Report reconstruction and stop receiving parts for this block. |
 
-`FullBlock` is terminal on that connection. It stops queued sends toward its
-sender while leaving future subscriptions active. Its sender continues serving
-subscribers. Bytes already in flight can still arrive.
+Subscriptions grant finite part and byte credit over a bounded height range.
+Each part identifies its grant. Canceling a route stops future sends without
+making an authorized in-flight part a protocol violation.
 
-Bitmaps describe routes but do not bound hostile traffic. Subscriptions also
-grant finite part and byte credit over a bounded height range. Receivers issue
-credit ahead of time. Parts name their grants, so an unsubscribe does not turn
-an honest in-flight response into a violation. Repair uses the same machinery.
+## Subscription state
 
-### Block-part lifecycle
+Each node keeps two peer-by-portion bitmaps. Incoming bits record what it
+requests from peers. Outgoing bits record what peers request from it.
 
-The subscriptions below precede the block. The diagram follows one part through
-a relay; each receiver gathers the other parts through its own subscriptions.
+A default bitmap serves unfamiliar proposers. At startup, the node selects two
+suppliers per portion where available and distributes them across peers.
+Here, each checkmark enables a subscription:
 
-```mermaid
-sequenceDiagram
-    participant P as Proposer
-    participant R as Relay
-    participant H as Relay headerchain
-    participant S as Subscriber
-    S->>R: SubscribePortion(portion j, finite grant)
-    R->>P: SubscribePortion(portion j, finite grant)
-    Note over P: Prepare body parts and root while mining
-    Note over P: Find PoW and finish any pending encoding
-    P->>P: Sign metadata for the final block hash
-    P->>R: HeaderMeta(header, root, coding, authentication)
-    R->>H: Admit complete consensus header
-    H-->>R: Header admitted, including PoW and context
-    R->>R: Verify key binding and metadata signature
-    R->>S: Push HeaderMeta
-    S->>S: Admit header and authenticate metadata
-    P->>R: BlockPart(i, payload, proof, grant)
-    R->>R: Check grant and proof
-    R->>R: Record valid arrival
-    R->>S: Push BlockPart(i, payload, proof, subscriber grant)
-    S->>S: Check grant and proof
-    S->>S: Process decoding incrementally
-    Note over R,S: Repeat for other parts without waiting for decoding
-    S->>S: Reconstruct body and check padding and root
-    S->>S: Assemble body with the admitted header
-    S->>R: FullBlock(block_id)
-    R->>R: Cancel queued parts to S for this block
-    Note over R,S: In-flight parts may still arrive
-    Note over S: Continue serving subscribers
+| Incoming peer | Portion 0 | Portion 1 | Portion 2 | Portion 3 |
+| --- | --- | --- | --- | --- |
+| A | ✓ | — | ✓ | — |
+| B | ✓ | ✓ | — | — |
+| C | — | ✓ | ✓ | ✓ |
+| D | — | — | — | ✓ |
+
+The node learns separate routes for each authenticated proposer. A nearby peer
+may provide most of one proposer's block without being the best supplier for
+another. For example, learned primary assignments could look like this:
+
+| Proposer | Portion 0 | Portion 1 | Portion 2 | Portion 3 |
+| --- | --- | --- | --- | --- |
+| X | A | A | A | B |
+| Y | C | C | C | A |
+
+Backup subscriptions supplement these assignments where failure coverage
+requires them. Changing X's routes does not change Y's routes. All routes share
+the connection's byte budget.
+
+Outgoing demand is independent. A can request a portion from B while B requests
+it from A. Either node might receive a part elsewhere first or reconstruct it.
+A node suppresses an echo to the peer that supplied the part. Reciprocal
+subscriptions do not prove that either peer has the data.
+
+Block-specific subscriptions request missing parts during recovery without
+changing the learned routes for future blocks. The spec defines how these
+subscriptions override persistent state.
+
+## Routing and congestion control
+
+The receiver chooses suppliers. Transport congestion control paces each
+connection. The subscription controller decides how much traffic to assign
+to that connection.
+
+Arrival times alone cannot reveal unused capacity: a peer might be slow because
+it received the part late, or because its connection is congested. The receiver
+instead tests an alternative under load. It requests the same portion from two
+peers and compares verified arrivals on its own clock. No sender timestamp or
+RTT estimate is needed.
+
+The controller follows five rules:
+
+1. **Compare like with like.** Occasionally add a random challenger for one
+   portion. Compare the same parts from the same proposer under similar block
+   size and concurrent load.
+2. **Move gradually.** Require repeated wins. Keep the old supplier until the
+   replacement delivers. Preserve failure coverage.
+3. **Budget bytes, not portions.** Count active blocks, proposers, backups, and
+   challenges together per connection. Limit each move and measure its effect
+   before adding more demand.
+4. **Adjust the budget from delivery.** Raise it gradually after success under
+   increased load. Lower it after repeated uncanceled deadline misses.
+   Idle time does not establish spare capacity.
+5. **Recover independently.** Repair a stalled block within a bounded reserve.
+   Do not wait for route learning. Do not count canceled copies as failures.
+
+For one portion, a successful challenge changes the route as follows.
+Arrows show pushed data; subscription requests travel in the opposite direction.
+
+```text
+Before:       A ──> Receiver
+Challenge:    A ──> Receiver <── B
+After:             Receiver <── B
 ```
 
-### Authentication
+The receiver keeps A if it still needs A for failure coverage. Random challenges
+continue so peers can recover from past losses.
 
-The current header lacks this part root, parity layout, and proposer
-authentication. `HeaderMeta` adds them. Headerchain must validate the entire
-header, including proof of work and contextual difficulty, before the node
-relays metadata or allocates assembly state.
+A portion's byte cost grows with block size and concurrent block count. With
+four portions and 64 KiB parts, one portion of a 40-part block costs 640 KiB.
+Two such blocks cost 1.25 MiB. A win at the first load does not establish capacity
+for the second.
 
-A signature is insufficient if anyone can choose the signing key. The proposed
-binding commits the proposer key in the mined block and proves that commitment
-against the header. The proposer then signs the final block hash and coding
-metadata. A coinbase commitment and inclusion proof are one candidate; the
-exact chain-compatible encoding remains open.
+Standing subscriptions use an estimated workload. When `HeaderMeta` arrives,
+the receiver checks actual demand and coverage. Corrections take control-message
+latency. The learned budget guides allocation; finite grants and queue limits
+bound resource use.
 
-This avoids making the block contain its own encoded root. The signer can still
-equivocate, so nodes admit at most one metadata variant per block and use
-ordinary block recovery after authenticated conflicts. A Merkle proof proves
-membership in the signed root, not correct parity. Reconstruction must check
-the codeword and validate the block.
+[Section 7 of the spec](../specs/dogwood.md#7-redundancy-and-route-control)
+defines the measurements and update rules. We still need simulation to test
+whether this controller adapts quickly without oscillating.
+
+## Redundancy and recovery
+
+The steady-state target is one supplier per portion, plus routes needed for
+failure coverage and challenges. Parity covers missing parts without requiring
+a duplicate of each part.
+
+For a block with 32 data parts and eight parity parts, any eight parts can be
+unavailable. But if one peer supplies more than eight parts exclusively, losing
+that peer can prevent reconstruction. The default coverage target therefore
+keeps at least 32 distinct parts available after losing any one supplier.
+
+A fast connection can carry most of the block, provided other peers cover
+enough distinct parts. This costs duplicate traffic. The receiver can reduce
+that cost only by accepting recovery latency when the fast peer fails.
+Distinct peers also need not represent independent physical paths.
+
+Coverage describes assignments, not guaranteed availability. A subscription
+cycle may have no source for its parts. When progress stalls, the receiver
+requests missing parts from additional peers. Existing full-block download
+provides final recovery. Sparse subscriptions alone do not guarantee delivery
+from every entry point.
+
+## Encoding and verification
+
+The codec uses the systematic Reed–Solomon construction from
+[RFC 5510, section 8](https://www.rfc-editor.org/rfc/rfc5510.html#section-8).
+The decoder processes each verified part as an equation as it arrives.
+This overlaps decoding with transfer without requiring RLNC.
+Forwarding never waits for decoding.
+
+The proposer can prepare parity and the Merkle tree while mining. A body change
+invalidates that work; a header-only change does not. After mining, the proposer
+signs the final block hash and coding metadata.
+
+A Merkle proof establishes membership in the signed root, not correct encoding.
+After reconstruction, the receiver checks padding and re-encodes the body to
+verify the root. It combines the body with the admitted header and submits the
+block for consensus validation.
 
 ## Headerchain integration
 
-Headerchain owns header validation, fork choice, and header recovery.
-The propagation service submits the header from `HeaderMeta` to that admission
-path, then pushes the admitted wrapper to eligible peers. Peers without part
-subscriptions still receive metadata as a recovery starting point.
+Headerchain remains responsible for header validation, fork choice, and header
+recovery. The node admits the complete header, including proof of work and
+contextual difficulty, before authenticating metadata or allocating assembly
+state. It then pushes `HeaderMeta` through header gossip without a per-hop
+request exchange. Peers without part subscriptions also receive metadata.
 
-The current header-sync wire has `Status`, `GetHeaders`, `Headers`, and
-`HeadersOutcome`. `HeaderMeta` needs negotiated service integration. Its push
-must not wait for a status-and-request exchange on every hop.
+The current header does not commit to the part root or authenticate a proposer
+key. The proposed wrapper carries a signature from a key bound to the mined
+block. A coinbase commitment with an inclusion proof is one candidate.
+The chain-compatible binding remains open. A self-chosen signing key would
+let anyone attach conflicting roots to someone else's proof of work.
 
-The implementation authenticates parts, schedules bounded per-peer sends,
-reconstructs blocks, and adjusts subscriptions. Completed blocks enter existing
-block validation. One slow peer must not block another.
+Nodes accept at most one authenticated metadata variant per block. An
+authenticated conflict stops coded propagation for that block and triggers
+ordinary block recovery.
 
-[protocol specification](../specs/dogwood.md) separates these rules from the remaining choices:
-proposer-key binding, proof formats, wire limits, and measured
-controller parameters. Simulation must test arbitrary ingress, correlated
-failures, and changing congestion before we claim the desired tail latency.
+The spec leaves proposer-key binding, wire formats, and resource limits to be
+finalized. Controller simulations and codec measurements must establish the
+latency and throughput this design can achieve.

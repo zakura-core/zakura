@@ -72,6 +72,19 @@ visible. This timing includes the read service's readiness and internal queues;
 it is not a measurement of physical disk service time alone. The native startup
 passes the endpoint's cloned trace emitter to this driver.
 
+The `get_blocks_frame` rows follow each leased response into the transport queue,
+through write polling, and through byte-lease release. They include request and
+frame sequences, message type, payload bytes, and write state. `write_returned`
+means the write future returned, possibly with an error; it does not prove peer
+receipt. A queued drop has no write start, and a cancelled write has no return.
+The `sync.block.capture.frame_events` counters count emission attempts by phase.
+
+Release-start and release-finish bracket the actual byte release. Other tasks
+can wake during that interval, so neither timestamp alone is an atomic global
+accounting transition. Observers hold diagnostic identity only. Tests check
+that the final observation sees returned capacity after queue drop, write
+cancellation, and successful or failed write return.
+
 The arrival importer does not yet join these rows or validate service lifetimes.
-Admission waits, frames, cancellation outcomes, and final settlement still need
+Admission waits, cancellation outcomes, and final request settlement still need
 complete observations before this becomes an accounting replay input.

@@ -7,6 +7,7 @@ use zakura_jsonl_trace::JsonlTraceEvent;
 
 use super::{BlockRangeRequestId, ZakuraPeerId, ZakuraTrace};
 use crate::zakura::trace::{peer_label, BLOCK_SYNC_TABLE};
+use crate::zakura::transport::{FrameObservation, FrameObserver};
 
 /// Trace identity only. Clones must not retain sessions, permits, or budgets.
 #[derive(Debug)]
@@ -54,14 +55,93 @@ impl ServingObservation {
     /// Count attempts before emission so a full trace queue cannot hide a lost row.
     pub(super) fn emit(&self, phase: &'static str, request_id: Option<BlockRangeRequestId>) {
         metrics::counter!("sync.block.capture.serving_events", "phase" => phase).increment(1);
-        self.trace.emit_event(|| ServingEvent {
-            event: "get_blocks_serving",
+        self.trace
+            .emit_event(|| self.row("get_blocks_serving", phase, request_id));
+    }
+
+    fn row(
+        &self,
+        event: &'static str,
+        phase: &'static str,
+        request_id: Option<BlockRangeRequestId>,
+    ) -> ServingEvent {
+        ServingEvent {
+            event,
             capture_version: 1,
             peer: peer_label(&self.peer),
             session_id: self.session_id,
             message_sequence: self.message_sequence,
             phase,
             request_id: request_id.map(BlockRangeRequestId::get),
+        }
+    }
+
+    pub(super) fn frame_observer(
+        self: &Arc<Self>,
+        request_id: Option<BlockRangeRequestId>,
+        frame_sequence: u64,
+        payload_bytes: u64,
+    ) -> Box<dyn FrameObserver> {
+        Box::new(ServingFrameObservation {
+            request: self.clone(),
+            request_id,
+            frame_sequence,
+            payload_bytes,
+            message_type: None,
+            write_state: "queued",
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ServingFrameObservation {
+    request: Arc<ServingObservation>,
+    request_id: Option<BlockRangeRequestId>,
+    frame_sequence: u64,
+    payload_bytes: u64,
+    message_type: Option<u16>,
+    write_state: &'static str,
+}
+
+#[derive(Serialize)]
+struct ServingFrameEvent {
+    #[serde(flatten)]
+    request: ServingEvent,
+    frame_sequence: u64,
+    payload_bytes: u64,
+    message_type: Option<u16>,
+    write_state: &'static str,
+}
+
+impl JsonlTraceEvent for ServingFrameEvent {
+    const TABLE: zakura_jsonl_trace::JsonlTraceTable = BLOCK_SYNC_TABLE;
+}
+
+impl FrameObserver for ServingFrameObservation {
+    fn observe(&mut self, event: FrameObservation) {
+        let phase = match event {
+            FrameObservation::Queued { message_type } => {
+                self.message_type = Some(message_type);
+                "queued"
+            }
+            FrameObservation::WriteStarted => {
+                self.write_state = "writing";
+                "write_started"
+            }
+            FrameObservation::WriteReturned => {
+                self.write_state = "returned";
+                "write_returned"
+            }
+            FrameObservation::ReleaseStarted => "release_started",
+            FrameObservation::ReleaseFinished => "release_finished",
+        };
+        metrics::counter!("sync.block.capture.frame_events", "phase" => phase).increment(1);
+        self.request.trace.emit_event(|| ServingFrameEvent {
+            request: self.request.row("get_blocks_frame", phase, self.request_id),
+            frame_sequence: self.frame_sequence,
+            payload_bytes: self.payload_bytes,
+            message_type: self.message_type,
+            write_state: self.write_state,
         });
     }
 }
@@ -69,13 +149,86 @@ impl ServingObservation {
 #[cfg(test)]
 mod tests {
     use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
     use zakura_chain::block;
+    use zakura_chain::serialization::ZcashDeserialize;
     use zakura_jsonl_trace::JsonlTracer;
 
     use super::*;
     use crate::zakura::block_sync::{
-        serving_regulation::GetBlocksServingRegulator, ZakuraBlockSyncConfig,
+        serving_regulation::GetBlocksServingRegulator, BlockSyncPeerSession, ZakuraBlockSyncConfig,
     };
+    use crate::zakura::transport::worker_framed_channel;
+
+    #[tokio::test]
+    async fn service_frames_keep_request_identity_after_the_permit_is_dropped() {
+        let (sender, mut observations) = mpsc::channel(32);
+        let trace = ZakuraTrace::new(JsonlTracer::new(sender), "test");
+        let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
+        let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
+        let session = regulator.session(peer.clone(), 3);
+        let (send, mut receiver) = worker_framed_channel(2);
+        let service = BlockSyncPeerSession::for_test_with_session_id(
+            peer.clone(),
+            3,
+            send,
+            CancellationToken::new(),
+        );
+        let (height, bytes) = zakura_test::vectors::MAINNET_BLOCKS.iter().next().unwrap();
+        let body = Arc::new(block::Block::zcash_deserialize(*bytes).unwrap());
+        let request = session
+            .try_retain_input(block::Height(*height), 1)
+            .unwrap()
+            .with_observation(ServingObservation::for_request(&trace, &peer, 3, 20));
+        let mut attempt = session.try_admit(request.count()).unwrap();
+        request.observe_admission(&mut attempt);
+        let (height, _) = request.into_parts();
+        let mut permit = attempt.commit();
+        permit.bind_request_id(BlockRangeRequestId::new(30).unwrap());
+        service.try_send_regulated_block(body, &mut permit).unwrap();
+        service
+            .try_send_regulated_blocks_done(height, 1, &mut permit)
+            .unwrap();
+        drop(permit);
+        assert_eq!(regulator.snapshot().node_active, 0);
+        assert!(regulator.snapshot().node_outstanding > 0);
+
+        receiver
+            .recv()
+            .await
+            .unwrap()
+            .write_with(|_| async {})
+            .await;
+        // The terminal frame is still queued when the transport closes.
+        drop(receiver);
+        assert_eq!(regulator.snapshot().node_outstanding, 0);
+
+        let mut frames = [Vec::new(), Vec::new()];
+        while let Ok(event) = observations.try_recv() {
+            let row: serde_json::Value = serde_json::from_slice(&event.line).unwrap();
+            if row["event"] != "get_blocks_frame" {
+                continue;
+            }
+            assert_eq!(row["session_id"], 3);
+            assert_eq!(row["message_sequence"], 20);
+            assert_eq!(row["request_id"], 30);
+            assert!(row["payload_bytes"].as_u64().unwrap() > 0);
+            assert!(row["message_type"].as_u64().is_some());
+            let sequence = usize::try_from(row["frame_sequence"].as_u64().unwrap()).unwrap();
+            frames[sequence].push(row["phase"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(
+            frames[0],
+            [
+                "queued",
+                "write_started",
+                "write_returned",
+                "release_started",
+                "release_finished"
+            ]
+        );
+        assert_eq!(frames[1], ["queued", "release_started", "release_finished"]);
+    }
 
     #[test]
     fn repeated_ranges_keep_decode_identity_without_retaining_capacity() {

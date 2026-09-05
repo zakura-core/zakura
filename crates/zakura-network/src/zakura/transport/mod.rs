@@ -22,6 +22,7 @@ pub(crate) use guard::{Admit, ByteBudget, PeerMeters, SessionGuard};
 pub use io::{framed_channel, FramedRecv, FramedSend};
 #[allow(unused_imports)] // used by the first message policy in the stacked PR
 pub(crate) use io::{worker_framed_channel, FramedWorkerRecv, LeasedSendError, QueuedFrame};
+pub(crate) use io::{FrameObservation, FrameObserver, FrameOwnership};
 pub(crate) use pipe::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, CloseCause, Edge, Flow,
     Node, NodeKind, Pipe, PipeCx, PipeShape,

@@ -249,7 +249,7 @@ impl BlockSyncPeerSession {
     ) -> Result<(), OrderedSendError> {
         let (frame, accounted_bytes) = Self::encode_regulated_message(msg, permit)?;
         self.send
-            .try_send_leased(frame, || permit.transfer_frame(accounted_bytes))
+            .try_send_leased(frame, || permit.transfer_frame_for_write(accounted_bytes))
             .map_err(|error| {
                 let send_error = if error.is_full() {
                     OrderedSendError::Full
@@ -272,7 +272,7 @@ impl BlockSyncPeerSession {
     ) -> Result<(), OrderedSendError> {
         let (frame, accounted_bytes) = Self::encode_regulated_message(msg, permit)?;
         self.send
-            .send_leased(frame, || permit.transfer_frame(accounted_bytes))
+            .send_leased(frame, || permit.transfer_frame_for_write(accounted_bytes))
             .await
             .map_err(|_| OrderedSendError::Closed)
     }

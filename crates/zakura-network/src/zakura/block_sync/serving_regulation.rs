@@ -16,6 +16,7 @@ use crate::zakura::regulation::{
     CommittedRateReservation, FrameLease, OutstandingByteBudget, OutstandingByteReservation,
     RateBudget, RateReservation, SlotBudget, SlotPermit,
 };
+use crate::zakura::transport::FrameOwnership;
 
 /// The bounded work declaration for one decoded request.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -711,6 +712,7 @@ impl AdmissionAttempt {
                 request_overhead: self.request_overhead,
                 response_cap: self.response_cap,
                 transferred: 0,
+                next_frame_sequence: 0,
                 peer_rate,
                 node_rate,
                 node_outstanding: self.node_outstanding,
@@ -741,6 +743,7 @@ struct ServingResources {
     request_overhead: u64,
     response_cap: u64,
     transferred: u64,
+    next_frame_sequence: u64,
     peer_rate: CommittedRateReservation,
     node_rate: CommittedRateReservation,
     node_outstanding: OutstandingByteReservation,
@@ -832,11 +835,29 @@ impl GetBlocksServingPermit {
             .can_transfer_frame(bytes)
     }
 
+    #[cfg(test)]
     pub(super) fn transfer_frame(&mut self, bytes: u64) -> FrameLease {
         self.resources
             .lock()
             .expect("a panic in serving accounting invalidates its balances")
             .transfer_frame(bytes)
+    }
+
+    /// Transfer the byte lease and attach diagnostic identity without retaining this permit.
+    pub(super) fn transfer_frame_for_write(&mut self, bytes: u64) -> FrameOwnership {
+        let mut resources = self
+            .resources
+            .lock()
+            .expect("a panic in serving accounting invalidates its balances");
+        let ownership = FrameOwnership::from(resources.transfer_frame(bytes));
+        let Some(observation) = resources.observation.clone() else {
+            return ownership;
+        };
+        let sequence = resources.next_frame_sequence;
+        resources.next_frame_sequence = sequence
+            .checked_add(1)
+            .expect("nonempty response frames are bounded by the admitted response capacity");
+        ownership.with_observer(observation.frame_observer(resources.request_id, sequence, bytes))
     }
 
     /// Share capacity with the dispatched query and its response, without charging twice.

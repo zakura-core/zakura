@@ -41,6 +41,7 @@ use super::{
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerView},
+    serving_observation::ServingObservation,
     serving_regulation::{GetBlocksServingSession, PendingGetBlocksRequest, PendingInputBlocked},
     state::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
@@ -672,13 +673,22 @@ impl PeerRoutine {
 
     /// Queue a request or install a bounded wait without suspending the routine.
     fn retain_serving_request(&mut self, start_height: block::Height, count: u32) {
+        let observation = ServingObservation::for_request(
+            &self.trace,
+            &self.peer,
+            self.generation,
+            self.received_message_sequence,
+        );
         match self.serving.try_retain_input(start_height, count) {
-            Ok(request) => self.enqueue_serving_request(request),
+            Ok(request) => self.enqueue_serving_request(request.with_observation(observation)),
             Err(blocked) => {
                 self.record_pending_input_delay(&blocked);
                 let serving = self.serving.clone();
                 self.pending_input = Some(Box::pin(async move {
-                    serving.retain_input(start_height, count).await
+                    serving
+                        .retain_input(start_height, count)
+                        .await
+                        .with_observation(observation)
                 }));
                 self.pending_input_deadline =
                     Some(time::Instant::now() + self.config.request_timeout);
@@ -2364,7 +2374,7 @@ async fn admit_and_forward_get_blocks(
             Some(slot) => serving.try_admit_with_slot(request.count(), Some(slot)),
             None => serving.try_admit(request.count()),
         };
-        let attempt = match admission {
+        let mut attempt = match admission {
             Ok(attempt) => attempt,
             Err(blocked) => {
                 metrics::counter!(
@@ -2393,6 +2403,8 @@ async fn admit_and_forward_get_blocks(
                 }
             }
         };
+
+        request.observe_admission(&mut attempt);
 
         let channel_slot = routine_to_reactor.clone().reserve_owned();
         tokio::pin!(channel_slot);

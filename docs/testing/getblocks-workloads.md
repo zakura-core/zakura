@@ -56,3 +56,16 @@ capture timing, and native client progress with the run manifest. Arrival
 artifacts alone cannot establish accounting, capacity recovery, or predicted
 sync throughput. The existing ownership-scenario JSON remains a separate test
 format.
+
+## Serving correlation
+
+The `get_blocks_serving` rows carry the decoded session and message sequence
+through input retention, provisional admission, commitment, and reactor request
+ID assignment. They use the decode emitter's clock. Repeated ranges remain
+distinct, and the observation metadata retains no resource owners. The
+`sync.block.capture.serving_events` counter counts emission attempts by phase.
+
+These rows currently establish correlation only. The arrival importer does not
+join them or validate service lifetimes. Admission waits, queries, frames,
+cancellation outcomes, and final settlement still need complete observations
+before this becomes an accounting replay input.

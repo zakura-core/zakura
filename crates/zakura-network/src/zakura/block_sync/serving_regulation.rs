@@ -10,6 +10,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Weak;
 
+use super::serving_observation::ServingObservation;
 use super::{config::*, wire::MAX_BS_BLOCKS_PER_REQUEST, *};
 use crate::zakura::regulation::{
     CommittedRateReservation, FrameLease, OutstandingByteBudget, OutstandingByteReservation,
@@ -342,6 +343,7 @@ impl GetBlocksServingSession {
         Ok(PendingGetBlocksRequest {
             start_height,
             count,
+            observation: None,
             _session: session,
             _node: node,
             _resources: self.resources.clone(),
@@ -359,6 +361,7 @@ impl GetBlocksServingSession {
         PendingGetBlocksRequest {
             start_height,
             count,
+            observation: None,
             _session: session,
             _node: node,
             _resources: self.resources.clone(),
@@ -412,6 +415,7 @@ impl GetBlocksServingSession {
         Ok(AdmissionAttempt {
             peer: self.peer.clone(),
             session_id: self.session_id,
+            observation: None,
             request_overhead: self
                 .regulator
                 .inner
@@ -525,12 +529,28 @@ impl PendingInputBlocked {
 pub(super) struct PendingGetBlocksRequest {
     start_height: block::Height,
     count: u32,
+    observation: Option<Arc<ServingObservation>>,
     _session: SlotPermit,
     _node: SlotPermit,
     _resources: Arc<SessionResources>,
 }
 
 impl PendingGetBlocksRequest {
+    pub(super) fn with_observation(mut self, observation: Option<Arc<ServingObservation>>) -> Self {
+        if let Some(observation) = &observation {
+            observation.emit("input_retained", None);
+        }
+        self.observation = observation;
+        self
+    }
+
+    pub(super) fn observe_admission(&self, attempt: &mut AdmissionAttempt) {
+        if let Some(observation) = &self.observation {
+            observation.emit("admission_reserved", None);
+        }
+        attempt.observation = self.observation.clone();
+    }
+
     /// Count used to reserve the request's worst-case response work.
     pub(super) fn count(&self) -> u32 {
         self.count
@@ -640,6 +660,7 @@ impl AdmissionBlocked {
 pub(super) struct AdmissionAttempt {
     peer: ZakuraPeerId,
     session_id: u64,
+    observation: Option<Arc<ServingObservation>>,
     request_overhead: u64,
     response_cap: u64,
     peer_rate: RateReservation,
@@ -677,11 +698,15 @@ impl AdmissionAttempt {
             .commit(self.request_overhead)
             .expect("validated GetBlocks charge contains its request overhead");
         metrics::counter!("sync.block.serving.admitted").increment(1);
+        if let Some(observation) = &self.observation {
+            observation.emit("committed", None);
+        }
         GetBlocksServingPermit {
             query: Arc::new(QueryLifecycle::default()),
             resources: Arc::new(StdMutex::new(ServingResources {
                 peer: self.peer,
                 session_id: self.session_id,
+                observation: self.observation,
                 request_id: None,
                 request_overhead: self.request_overhead,
                 response_cap: self.response_cap,
@@ -711,6 +736,7 @@ pub(super) struct GetBlocksServingPermit {
 struct ServingResources {
     peer: ZakuraPeerId,
     session_id: u64,
+    observation: Option<Arc<ServingObservation>>,
     request_id: Option<BlockRangeRequestId>,
     request_overhead: u64,
     response_cap: u64,
@@ -732,6 +758,9 @@ impl ServingResources {
             self.request_id.replace(request_id).is_none(),
             "a GetBlocks serving permit is bound to one request"
         );
+        if let Some(observation) = &self.observation {
+            observation.emit("request_bound", Some(request_id));
+        }
     }
 
     /// Return whether an encoded response frame fits every remaining balance.

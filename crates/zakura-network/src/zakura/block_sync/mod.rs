@@ -46,6 +46,7 @@ mod request;
 mod sequencer;
 mod sequencer_task;
 mod service;
+mod serving_observation;
 mod serving_regulation;
 mod state;
 #[cfg(test)]

@@ -81,13 +81,10 @@ pub const DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES: usize = 32;
 pub const DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND: u32 = 32;
 /// Per-kind inbound message rate per connection.
 ///
-/// This is a generous universal cap: block-sync legitimately delivers
-/// hundreds of solicited bodies per second in bursts, so a low limit
-/// starves sync. Exceeding it is a transport-level hard failure rather than a
-/// peer-scoring decision: we never silently drop a solicited frame because a
-/// dropped block body is a permanent gap on a reliable stream. Longer term
-/// this should be split per message type (some unbounded, some near-one-shot)
-/// rather than a single universal value.
+/// Block-sync pauses inbound reads when this budget is exhausted, retaining
+/// the current bounded frame until credit refills. Other ordered streams treat
+/// exhaustion as a transport error. The allowance is shared across streams of
+/// the same kind on a connection.
 pub const DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND: u32 = 2048;
 /// Default native Zakura QUIC listen address.
 pub const DEFAULT_ZAKURA_LISTEN_ADDR: SocketAddr =
@@ -292,6 +289,7 @@ pub struct ZakuraConfig {
     /// New streams per second admitted per connection after a valid prelude.
     pub stream_open_rate_per_second: u32,
     /// Messages per second admitted per stream kind on a connection.
+    /// Block-sync waits for credit before forwarding frames to its service.
     pub message_rate_per_second: u32,
     /// Optional directory for structured Zakura JSONL trace tables.
     ///
@@ -1827,29 +1825,14 @@ fn admit_inbound_message(
     context: &StreamWorkerContext,
     stream_kind: u16,
 ) -> InboundMessageAdmission {
-    let stream_kind = stream_kind_label(stream_kind);
-    let max_message_bytes = usize::try_from(context.limits.max_message_bytes)
-        .expect("u32 message byte limit fits in usize");
-    if payload_len > max_message_bytes {
-        metrics::counter!(
-            "zakura.p2p.ratelimit.message.oversize",
-            "stream_kind" => stream_kind,
-        )
-        .increment(1);
-        context.conn.trace_rate_limit(
-            "message.oversize",
-            context.stream_id,
-            stream_kind,
-            None,
-            None,
-            None,
-        );
+    if inbound_message_is_oversize(payload_len, context, stream_kind) {
         return InboundMessageAdmission::Oversize;
     }
-
+    let stream_kind = stream_kind_label(stream_kind);
     let admitted = {
         let mut bucket = context
             .message_bucket
+            .rate
             .lock()
             .expect("Zakura message-rate bucket mutex is never poisoned");
         bucket.try_take()
@@ -1872,6 +1855,127 @@ fn admit_inbound_message(
     }
 
     InboundMessageAdmission::Admit
+}
+
+fn inbound_message_is_oversize(
+    payload_len: usize,
+    context: &StreamWorkerContext,
+    stream_kind: u16,
+) -> bool {
+    let stream_kind = stream_kind_label(stream_kind);
+    let max_message_bytes = usize::try_from(context.limits.max_message_bytes)
+        .expect("u32 message byte limit fits in usize");
+    if payload_len > max_message_bytes {
+        metrics::counter!(
+            "zakura.p2p.ratelimit.message.oversize",
+            "stream_kind" => stream_kind,
+        )
+        .increment(1);
+        context.conn.trace_rate_limit(
+            "message.oversize",
+            context.stream_id,
+            stream_kind,
+            None,
+            None,
+            None,
+        );
+        return true;
+    }
+    false
+}
+
+async fn admit_ordered_message(
+    payload_len: usize,
+    context: &StreamWorkerContext,
+    stream_kind: u16,
+) -> Result<(), ZakuraHandlerError> {
+    if stream_kind != ZAKURA_STREAM_BLOCK_SYNC {
+        return match admit_inbound_message(payload_len, context, stream_kind) {
+            InboundMessageAdmission::Admit => Ok(()),
+            InboundMessageAdmission::Oversize => Err(ZakuraHandlerError::Oversize),
+            InboundMessageAdmission::Throttled => Err(ZakuraHandlerError::RateLimited),
+        };
+    }
+    if inbound_message_is_oversize(payload_len, context, stream_kind) {
+        return Err(ZakuraHandlerError::Oversize);
+    }
+
+    // A valid response burst must not discard a solicited body or disconnect
+    // its peer. Holding this reader's current frame also stops further reads;
+    // the existing frame/channel bounds and QUIC backpressure remain in force.
+    if let Some(delay) = wait_for_message_budget(
+        &context.message_bucket,
+        &context.connection_token,
+        &context.stream_token,
+    )
+    .await?
+    {
+        metrics::counter!(
+            "zakura.p2p.ratelimit.message.delayed",
+            "stream_kind" => stream_kind_label(stream_kind),
+        )
+        .increment(1);
+        metrics::histogram!("zakura.p2p.ratelimit.message.delay_seconds")
+            .record(delay.as_secs_f64());
+        context.conn.trace_rate_limit(
+            "message.delayed",
+            context.stream_id,
+            stream_kind_label(stream_kind),
+            None,
+            None,
+            None,
+        );
+    }
+    Ok(())
+}
+
+/// Waiters share FIFO admission so a second stream cannot steal each refill.
+/// Cancellation releases queue ownership without consuming future credit.
+async fn wait_for_message_budget(
+    bucket: &SharedMessageBucket,
+    connection_token: &CancellationToken,
+    stream_token: &CancellationToken,
+) -> Result<Option<Duration>, ZakuraHandlerError> {
+    let started = Instant::now();
+    let mut delayed = false;
+    let _turn = match bucket.admission_order.try_lock() {
+        Ok(turn) => turn,
+        Err(_) => {
+            delayed = true;
+            tokio::select! {
+                biased;
+                _ = connection_token.cancelled() => return Err(ZakuraHandlerError::Closed),
+                _ = stream_token.cancelled() => return Err(ZakuraHandlerError::Closed),
+                turn = bucket.admission_order.lock() => turn,
+            }
+        }
+    };
+    loop {
+        if connection_token.is_cancelled() || stream_token.is_cancelled() {
+            return Err(ZakuraHandlerError::Closed);
+        }
+        let wait = {
+            let mut rate = bucket
+                .rate
+                .lock()
+                .expect("Zakura message-rate bucket mutex is never poisoned");
+            if rate.try_take() {
+                None
+            } else {
+                Some(rate.next_token_delay())
+            }
+        };
+        let Some(wait) = wait else {
+            return Ok(delayed.then(|| started.elapsed()));
+        };
+        delayed = true;
+        tokio::select! {
+            biased;
+            _ = connection_token.cancelled() => return Err(ZakuraHandlerError::Closed),
+            _ = stream_token.cancelled() => return Err(ZakuraHandlerError::Closed),
+            _ = tokio::time::sleep(wait) => {}
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -4057,21 +4161,15 @@ async fn persistent_stream_worker(
                     None,
                 ) => frame,
             };
-            // Admit (rate/oversize) at ingress, the instant a frame is read, so
-            // throttling never trails behind the main loop draining queued
-            // outbound writes or forwarding an earlier frame to a service that
-            // might disconnect first. The main loop only ever receives frames
-            // that already cleared admission, plus terminal errors it maps to a
-            // reset code (it owns the send half). Admission is charged exactly
-            // once, here.
+            // Check size and obtain rate credit before forwarding to the service.
+            // Block-sync can retain this one frame while awaiting credit; the
+            // writer continues independently. Charge admission exactly once.
             let message = match frame {
                 Ok(frame) => {
                     let _ = reader_context.freshness_tx.send(Instant::now());
-                    match admit_inbound_message(frame.payload.len(), &reader_context, stream_kind) {
-                        InboundMessageAdmission::Admit => Ok(frame),
-                        InboundMessageAdmission::Oversize => Err(ZakuraHandlerError::Oversize),
-                        InboundMessageAdmission::Throttled => Err(ZakuraHandlerError::RateLimited),
-                    }
+                    admit_ordered_message(frame.payload.len(), &reader_context, stream_kind)
+                        .await
+                        .map(|()| frame)
                 }
                 Err(error) => {
                     // Emit the oversize-desync diagnostic here, at the read, so
@@ -5295,7 +5393,12 @@ fn is_supported_stream(registry: &ServiceRegistry, stream_kind: u16, stream_vers
 /// A worker holds this briefly (no `.await` while locked) to spend one token
 /// per decoded frame, so N concurrent same-kind streams draw from a single
 /// per-connection budget instead of N independent ones (FLUP-014).
-type SharedMessageBucket<C = RealClock> = Arc<std::sync::Mutex<TokenBucket<C>>>;
+type SharedMessageBucket<C = RealClock> = Arc<MessageBucket<C>>;
+
+struct MessageBucket<C = RealClock> {
+    rate: StdMutex<TokenBucket<C>>,
+    admission_order: Mutex<()>,
+}
 
 /// Per-connection collection of message-rate buckets keyed by validated stream
 /// kind. Created lazily (FLUP-015 rejects unknown kinds before this point, so
@@ -5317,10 +5420,10 @@ fn message_bucket_for<C: Clock>(
     buckets
         .entry(stream_kind)
         .or_insert_with(|| {
-            Arc::new(std::sync::Mutex::new(TokenBucket::with_clock(
-                message_rate_per_second,
-                clock,
-            )))
+            Arc::new(MessageBucket {
+                rate: StdMutex::new(TokenBucket::with_clock(message_rate_per_second, clock)),
+                admission_order: Mutex::new(()),
+            })
         })
         .clone()
 }
@@ -5362,6 +5465,14 @@ impl<C: Clock> TokenBucket<C> {
         }
         self.tokens -= 1;
         true
+    }
+
+    /// Round up so a sleeping reader does not repeatedly wake before refill.
+    /// Call after `try_take` has refreshed the clock and found an empty bucket.
+    fn next_token_delay(&self) -> Duration {
+        let nanos =
+            (1_000_000_000 - self.fractional_credit).div_ceil(u128::from(self.refill_per_second));
+        Duration::from_nanos(u64::try_from(nanos).expect("one token takes at most one second"))
     }
 
     fn refill(&mut self, now: Instant) {
@@ -7896,7 +8007,12 @@ mod tests {
             limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
             outbound_frame_cap: application_frame_cap(&limits, stream),
-            message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
+            message_bucket: message_bucket_for(
+                &mut MessageRateBuckets::new(),
+                stream_kind,
+                128,
+                RealClock,
+            ),
             connection_token: connection_token.clone(),
             stream_token: stream_token.clone(),
             close_cause: CloseCause::new(),
@@ -8077,9 +8193,12 @@ mod tests {
                 limits,
                 inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
                 outbound_frame_cap: application_frame_cap(&limits, stream),
-                message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
+                message_bucket: message_bucket_for(
+                    &mut MessageRateBuckets::new(),
+                    stream_kind,
                     limits.message_rate_per_second,
-                ))),
+                    RealClock,
+                ),
                 connection_token: connection_token.clone(),
                 stream_token: connection_token.child_token(),
                 close_cause: CloseCause::new(),
@@ -8806,6 +8925,231 @@ mod tests {
         }
     }
 
+    fn paced_message_context(rate: u32) -> StreamWorkerContext {
+        let limits = test_connection_limits();
+        let (freshness_tx, _) = watch::channel(Instant::now());
+        StreamWorkerContext {
+            conn: ZakuraConnTrace::without_peer(1),
+            peer_id: test_peer(1),
+            stream_id: 1,
+            _permit: Arc::new(Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("test starts with one stream permit"),
+            limits,
+            inbound_frame_cap: limits.max_frame_bytes,
+            outbound_frame_cap: limits.max_frame_bytes,
+            message_bucket: message_bucket_for(
+                &mut MessageRateBuckets::new(),
+                ZAKURA_STREAM_BLOCK_SYNC,
+                rate,
+                RealClock,
+            ),
+            connection_token: CancellationToken::new(),
+            stream_token: CancellationToken::new(),
+            close_cause: CloseCause::new(),
+            freshness_tx,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn block_sync_rate_waits_for_credit_without_double_charging() {
+        let context = paced_message_context(2);
+        for _ in 0..2 {
+            admit_ordered_message(0, &context, ZAKURA_STREAM_BLOCK_SYNC)
+                .await
+                .expect("initial burst has credit");
+        }
+        let admission = admit_ordered_message(0, &context, ZAKURA_STREAM_BLOCK_SYNC);
+        tokio::pin!(admission);
+        assert!(futures::poll!(&mut admission).is_pending());
+        tokio::time::advance(Duration::from_millis(499)).await;
+        assert!(futures::poll!(&mut admission).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        admission
+            .await
+            .expect("one token refills after half a second");
+        assert_eq!(context.message_bucket.rate.lock().unwrap().tokens, 0);
+        assert!(!context.connection_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn block_sync_wait_keeps_writer_live_and_resumes_in_order() -> Result<(), BoxError> {
+        const ALPN: &[u8] = b"/zakura/testkit/block-sync-pacing/0";
+
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(82).await?;
+        let (connection_tx, _connection_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(83).await?;
+        let server_addr = router.endpoint().node_addr().initialized().await;
+        client.add_node_addr(server_addr.clone())?;
+        let client_conn =
+            timeout(Duration::from_secs(10), client.connect(server_addr, ALPN)).await??;
+        let (mut client_send, mut client_recv) =
+            timeout(Duration::from_secs(2), client_conn.open_bi()).await??;
+
+        let mut context = paced_message_context(2);
+        let limits = context.limits;
+        let connection_token = context.connection_token.clone();
+        let (freshness_tx, mut freshness_rx) = watch::channel(Instant::now());
+        context.freshness_tx = freshness_tx;
+        let bucket = Arc::clone(&context.message_bucket);
+        // Hold shared admission to witness the reader's wait without depending
+        // on socket scheduling or a wall-clock refill deadline.
+        let admission = bucket.admission_order.lock().await;
+        let frame = |value| Frame {
+            message_type: 1,
+            flags: 0,
+            payload: vec![value],
+        };
+        for value in [1, 2] {
+            timeout(
+                Duration::from_secs(2),
+                client_send.write_all(&frame(value).encode(limits.max_frame_bytes)?),
+            )
+            .await??;
+        }
+        let (send, recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await?
+            .expect("capture handler forwards the opened stream");
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: ZAKURA_STREAM_BLOCK_SYNC,
+            stream_version: ZAKURA_STREAM_VERSION_1,
+            request_id: None,
+            max_frame_bytes: limits.max_frame_bytes,
+        };
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(2);
+        let (outbound_tx, outbound_rx) = worker_framed_channel(1);
+        let worker = tokio::spawn(persistent_stream_worker(
+            send,
+            recv,
+            prelude,
+            context,
+            inbound_tx,
+            outbound_rx,
+            2,
+        ));
+
+        // Freshness is recorded after the complete frame is read, before its
+        // admission wait. Outbound progress must not require releasing that wait.
+        timeout(Duration::from_secs(2), freshness_rx.changed()).await??;
+        assert!(matches!(
+            inbound_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        timeout(Duration::from_secs(2), outbound_tx.send(frame(3))).await??;
+        let received = read_frame(
+            &mut client_recv,
+            limits.max_frame_bytes,
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+        )
+        .await?;
+        assert_eq!(received.payload, vec![3]);
+        assert!(matches!(
+            inbound_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(!connection_token.is_cancelled());
+
+        drop(admission);
+        for value in [1, 2] {
+            let received = timeout(Duration::from_secs(2), inbound_rx.recv())
+                .await?
+                .expect("both admitted frames reach the service");
+            assert_eq!(received.payload, vec![value]);
+        }
+        assert!(!connection_token.is_cancelled());
+        connection_token.cancel();
+        timeout(Duration::from_secs(2), worker).await??;
+        client_conn.close(0u32.into(), b"done");
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn block_sync_rate_cancellation_preserves_waiter_order_and_credit() {
+        let first = paced_message_context(1);
+        let mut second = paced_message_context(1);
+        let mut third = paced_message_context(1);
+        second.message_bucket = Arc::clone(&first.message_bucket);
+        third.message_bucket = Arc::clone(&first.message_bucket);
+        admit_ordered_message(0, &first, ZAKURA_STREAM_BLOCK_SYNC)
+            .await
+            .expect("initial token is available");
+
+        let a = admit_ordered_message(0, &first, ZAKURA_STREAM_BLOCK_SYNC);
+        let b = admit_ordered_message(0, &second, ZAKURA_STREAM_BLOCK_SYNC);
+        let c = admit_ordered_message(0, &third, ZAKURA_STREAM_BLOCK_SYNC);
+        tokio::pin!(a, b, c);
+        assert!(futures::poll!(&mut a).is_pending());
+        assert!(futures::poll!(&mut b).is_pending());
+        assert!(futures::poll!(&mut c).is_pending());
+        first.stream_token.cancel();
+        assert!(matches!(a.await, Err(ZakuraHandlerError::Closed)));
+        assert!(futures::poll!(&mut b).is_pending());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        // Poll the later arrival first: it must not take the earlier waiter's token.
+        assert!(futures::poll!(&mut c).is_pending());
+        b.await
+            .expect("cancelled waiter did not consume future credit");
+        assert!(futures::poll!(&mut c).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        c.await.expect("next waiter receives the next refill");
+        assert_eq!(third.message_bucket.rate.lock().unwrap().tokens, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn block_sync_rate_wait_ends_on_connection_cancellation() {
+        let context = paced_message_context(1);
+        admit_ordered_message(0, &context, ZAKURA_STREAM_BLOCK_SYNC)
+            .await
+            .expect("initial token is available");
+        let admission = admit_ordered_message(0, &context, ZAKURA_STREAM_BLOCK_SYNC);
+        tokio::pin!(admission);
+        assert!(futures::poll!(&mut admission).is_pending());
+        context.connection_token.cancel();
+        assert!(matches!(admission.await, Err(ZakuraHandlerError::Closed)));
+        assert!(context.message_bucket.admission_order.try_lock().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn block_sync_rate_wait_does_not_defer_oversize_rejection() {
+        let context = paced_message_context(1);
+        admit_ordered_message(0, &context, ZAKURA_STREAM_BLOCK_SYNC)
+            .await
+            .expect("initial token is available");
+        let payload_len = usize::try_from(context.limits.max_message_bytes).unwrap() + 1;
+        assert!(matches!(
+            admit_ordered_message(payload_len, &context, ZAKURA_STREAM_BLOCK_SYNC).await,
+            Err(ZakuraHandlerError::Oversize)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn other_ordered_streams_keep_rate_rejection() {
+        let context = paced_message_context(1);
+        admit_ordered_message(0, &context, ZAKURA_STREAM_HEADER_SYNC)
+            .await
+            .expect("initial token is available");
+        assert!(matches!(
+            admit_ordered_message(0, &context, ZAKURA_STREAM_HEADER_SYNC).await,
+            Err(ZakuraHandlerError::RateLimited)
+        ));
+    }
+
     #[test]
     fn supported_stream_accepts_registered_kinds_at_declared_version_only() {
         let registry = ServiceRegistry::new(vec![Arc::new(DeclaredStreamService {
@@ -9085,6 +9429,7 @@ mod tests {
         // The aggregate across both handles is capped at the single-bucket budget.
         let take = |bucket: &SharedMessageBucket<crate::zakura::testkit::TestClock>| {
             bucket
+                .rate
                 .lock()
                 .expect("test bucket mutex is never poisoned")
                 .try_take()
@@ -9139,6 +9484,7 @@ mod tests {
 
         let take = |bucket: &SharedMessageBucket<crate::zakura::testkit::TestClock>| {
             bucket
+                .rate
                 .lock()
                 .expect("test bucket mutex is never poisoned")
                 .try_take()

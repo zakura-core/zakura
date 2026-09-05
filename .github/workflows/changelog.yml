@@ -2,7 +2,7 @@ name: Changelog fragments
 
 on:
   pull_request:
-    branches: [main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**", "adam/**"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [main, "feat/**", "release/**"]

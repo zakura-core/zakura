@@ -147,7 +147,102 @@ The output retains decoded arrival times, admission and query timing, frame
 sizes, waits and release intervals. A frame may outlive the request that queued
 it. Timestamp ties remain explicit, and peer identities become local integers.
 The original startup configuration and binary provenance remain required run
-metadata. This artifact does not yet predict throughput or implement a replay;
-a test adapter must exercise the production regulator using an explicit policy
-and relative service durations. It must not interpret these observations as
-atomic changes to global resource balances.
+metadata. This artifact does not itself predict throughput;
+the resource adapter below exercises the production regulator using an explicit
+policy and relative service durations. These observations are not atomic
+changes to global resource balances.
+
+## Resource replay
+
+The test-only `serving_regulation::workloads` module replays an imported episode
+against the production GetBlocks regulator. It uses explicit captured and
+candidate policies and a paused Tokio clock. All serving cost inputs must be
+present; missing fields cannot inherit current defaults. Candidate response
+count/byte shapes must still match the recorded responses. The runner does not
+model changes to peer connection admission.
+
+Keep the imported JSON and a policy file alongside the original run evidence.
+The policy file has a `values` object containing every field read by serving
+admission; the Rust `Policy` type defines the required fields. Preserve the
+startup configuration witness and binary hashes with it. Run the local corpus
+entry point with:
+
+```sh
+GETBLOCKS_WORKLOAD=/absolute/path/workload.json \
+GETBLOCKS_CAPTURE_POLICY=/absolute/path/captured-policy.json \
+GETBLOCKS_CANDIDATE_POLICY=/absolute/path/candidate-policy.json \
+GETBLOCKS_REPLAY_OUTPUT=/absolute/path/new-report.json \
+cargo test --locked -p zakura-network captured_workload_local_corpus \
+  -- --ignored --nocapture
+```
+
+The report includes both explicit policies and four scheduling scenarios. They
+use each release interval's start or finish and each initial session polling
+order. These are sensitivity checks, not exhaustive best/worst bounds. A
+single-peer capture has no cross-session ordering variation. Source trace
+integrity is checked by the Python importer; the Rust reader validates the
+resource fields and dependency ordering needed to execute the profile.
+
+The runner preserves offered decoded arrival times and session order. When
+pending capacity fills, one input per session uses the real pending waiter;
+additional demand stays in an external harness queue. The report exposes that
+backlog and input delay. It exercises actual fair active-slot waits, admission,
+commitment, query claims, frame transfers and resource drops. Dependencies move
+with the new admission time, including the captured provisional interval,
+query duration, frame lifetime and request settlement. Original finish times
+cannot release a delayed request early. Sessions remain alive until their
+conditional work drains, with any extension beyond the observed end reported.
+
+Rate eligibility comes from the real budget, rounded up to a microsecond. The
+runner supplies captured service durations and does not simulate executor
+latency, storage contention, transport FIFO scheduling, actual writes, reader
+pausing, retries or cancellation. It reports long input delays and reads beyond
+the candidate query deadline as partial validity checks. An input delay over
+eight seconds is a signal to require native feedback validation, not an exact
+reconstruction of the peer routine's pending-wait deadline. A clean report does
+not establish every protocol deadline or native sync throughput.
+
+The runner asserts resource bounds throughout and requires complete ownership
+recovery at the end. Its results complement the independent ownership model
+and native integration tests. Capture policy replay must first be compared to
+observed admission timings; held-out native comparisons remain necessary before
+using a changed policy's results to choose production defaults. The full corpus
+stays with its provenance outside the repository; small deterministic witnesses
+cover frame retention, delayed completion, rate refunds and fair slot waits in
+ordinary tests.
+
+## Closing a capture
+
+The capture controller must stop the owned clients, verify their process state,
+and keep new clients disconnected until the server has stopped. Preserve the
+observed state in `clients-stopped.json` in the run directory. Its schema is:
+
+```json
+{
+  "schema_version": 1,
+  "no_new_clients": true,
+  "clients": [
+    {"host": "owned-downloader", "unit": "native-sync.service", "MainPID": 0, "ActiveState": "inactive"}
+  ]
+}
+```
+
+Populate this declaration from actual observations, with host identities and
+observation times retained in the run manifest. Then, on the serving node, run:
+
+```sh
+python3 scripts/finalize-getblocks-capture.py /absolute/path/run
+```
+
+By default it reads the local exporter on port 19999 and waits up to 120 seconds
+for two equal, drained capture-counter samples at least two seconds apart. It
+rejects unknown counter labels and preserves existing boundary files. A failure
+leaves the capture unfinalized; retain its diagnostics instead of manufacturing
+a successful boundary. Success writes `final-metrics.prom` and
+`capture-boundary.json`, binding the scrape and client declaration by SHA-256.
+
+Keep clients disconnected, stop the server, and preserve the closed trace files
+before running the workload importer. The finalizer checks application-owner
+counts and the declared controller boundary. It does not establish trace
+completeness; only the subsequent closed-file reconciliation can verify the
+observed lifecycle rows.

@@ -78,6 +78,7 @@ def load(blocks, queries, metrics=None, boundary_change=None, clients_change=Non
         clients.update(clients_change)
     clients_bytes = json.dumps(clients).encode()
     boundary = dict(schema_version=1, quiescent_counters_verified=True,
+                    stable_samples=2, minimum_sample_separation_seconds=2,
                     metrics_sha256=hashlib.sha256(metrics).hexdigest(),
                     clients_stopped_sha256=hashlib.sha256(clients_bytes).hexdigest())
     if boundary_change:
@@ -159,7 +160,8 @@ class LifetimeTests(unittest.TestCase):
 
     def test_boundary_proof_is_required(self):
         for change in [dict(schema_version=True), dict(quiescent_counters_verified=False),
-                       dict(metrics_sha256="wrong"), dict(clients_stopped_sha256="wrong")]:
+                       dict(metrics_sha256="wrong"), dict(clients_stopped_sha256="wrong"),
+                       dict(stable_samples=1), dict(minimum_sample_separation_seconds=0)]:
             with self.subTest(change=change), self.assertRaises(IncompleteCapture):
                 load(*episode(), boundary_change=change)
         for change in [dict(schema_version=True), dict(no_new_clients=False), dict(clients=[]),

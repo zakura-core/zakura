@@ -126,6 +126,17 @@ def completed_request(arrival, events):
     }
 
 
+def validate_stopped_clients(clients_bytes):
+    """Validate the controller's declaration, without inferring remote process state."""
+    clients = json.loads(clients_bytes)
+    require(isinstance(clients, dict), "client boundary must contain an object")
+    require(integer(clients, "schema_version") == 1, "unsupported client boundary version")
+    require(clients.get("no_new_clients") is True and isinstance(clients.get("clients"), list) and clients["clients"],
+            "controller has not closed the client population")
+    require(all(isinstance(client, dict) and type(client.get("MainPID")) is int and client["MainPID"] == 0
+                and client.get("ActiveState") == "inactive" for client in clients["clients"]), "a client was not stopped")
+
+
 def import_completed_lifetimes(block_lines, query_lines, arrivals, metrics, boundary_bytes, clients_bytes):
     """Join freshly validated arrivals with the same closed file and its query table.
 
@@ -133,16 +144,16 @@ def import_completed_lifetimes(block_lines, query_lines, arrivals, metrics, boun
     inferred from successful request timings or balanced event totals.
     """
     require(arrivals.get("decode_totals_reconciled") is True, "decoded totals were not reconciled")
-    boundary, clients = json.loads(boundary_bytes), json.loads(clients_bytes)
-    require(isinstance(boundary, dict) and isinstance(clients, dict), "boundary must contain objects")
-    require(integer(boundary, "schema_version") == 1 and integer(clients, "schema_version") == 1, "unsupported boundary version")
+    validate_stopped_clients(clients_bytes)
+    boundary = json.loads(boundary_bytes)
+    require(isinstance(boundary, dict), "boundary must contain an object")
+    require(integer(boundary, "schema_version") == 1, "unsupported boundary version")
     require(boundary.get("quiescent_counters_verified") is True, "missing quiescent boundary")
+    require(integer(boundary, "stable_samples") >= 2
+            and boundary.get("minimum_sample_separation_seconds") == 2,
+            "missing stable sample separation")
     require(boundary.get("metrics_sha256") == hashlib.sha256(metrics).hexdigest(), "boundary metrics hash differs")
     require(boundary.get("clients_stopped_sha256") == hashlib.sha256(clients_bytes).hexdigest(), "client boundary hash differs")
-    require(clients.get("no_new_clients") is True and isinstance(clients.get("clients"), list) and clients["clients"],
-            "controller has not closed the client population")
-    require(all(isinstance(client, dict) and type(client.get("MainPID")) is int and client["MainPID"] == 0
-                and client.get("ActiveState") == "inactive" for client in clients["clients"]), "a client was not stopped")
 
     expected = Counter()
     owners, by_id = {}, {}

@@ -1469,3 +1469,6 @@ mod tests {
 
 #[cfg(test)]
 mod properties;
+
+#[cfg(test)]
+mod workloads;

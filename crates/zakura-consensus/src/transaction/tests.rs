@@ -3931,7 +3931,6 @@ async fn v5_with_duplicate_orchard_action() {
     }
 }
 
-/// Checks the activation boundary of the temporary Orchard-disabling soft fork:
 /// Checks the ZIP 2003 version 4 deprecation boundary: a V4 transaction is valid below
 /// the deprecation height and invalid at and above it, the default deprecation is the NU7
 /// activation height, a network can name a later height, and a network can keep accepting
@@ -4049,6 +4048,7 @@ fn verify_v4_at(
     )
 }
 
+/// Checks the activation boundary of the temporary Orchard-disabling soft fork:
 /// it is inactive below the configured height and active at and above it, can be
 /// disabled entirely, and Mainnet uses its fixed activation height.
 #[test]

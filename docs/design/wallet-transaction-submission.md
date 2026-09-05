@@ -49,7 +49,7 @@ Non-goals:
 - Guaranteeing inclusion in a block or anonymity over direct QUIC.
 - Adding HTTP, onion endpoint discovery, or a new Tor transport in phase one.
 
-## 2. How a wallet submits without syncing a node
+## 2. Submission flow
 
 The distinction is between preparing a payment and delivering it. The wallet
 needs chain information to find spendable funds and construct a valid payment.
@@ -88,9 +88,9 @@ wallet only needs an outbound connection; it does not advertise a public
 listening address or serve chain data. An acceptance response means this node
 accepted the transaction. It does not mean a miner has included it in a block.
 
-## 3. Native integration with P2P v2
+## 3. P2P v2 integration
 
-### 3.1 A normal negotiated service
+### 3.1 Service protocol
 
 Introduce `zakura.tx_submit.v1` as a built-in request/response service in
 `zakura-network`. Allocate a new capability bit and stream kind through the
@@ -117,7 +117,7 @@ transport code owns framing, correlation, size limits, deadlines, and
 cancellation. Submission must not become a special case in legacy message
 handling.
 
-### 3.2 One admission path
+### 3.2 Mempool admission
 
 The submission service calls Zakura's existing mempool directly, using the same
 validation, insertion, and gossip pipeline as other incoming transactions.
@@ -149,7 +149,7 @@ Keep the RPC's existing retry retention policy separate. An unsolicited remote
 submission must not automatically acquire the background retry behavior used by
 [`sendrawtransaction`][rpc-submission].
 
-### 3.3 A client that does not act as a full node
+### 3.3 Wallet client
 
 Expose a small reusable Rust client with only the shared handshake, discovery,
 and submission dependencies. It takes signed transaction bytes, the intended
@@ -165,7 +165,7 @@ Share protocol encoders and transport machinery with the node. Do not copy
 handshake implementations into each wallet or wrap the full node startup path
 in a wallet-specific mode.
 
-## 4. Results and retry rules
+## 4. Results and retries
 
 The wire response uses stable result and reason codes:
 
@@ -201,7 +201,7 @@ accepted the parents. On failover, replay required ancestors in order. Preserve
 partial acceptance and unknown outcomes; a group of transactions is not an
 atomic network submission.
 
-## 5. Discovery and connection policy
+## 5. Discovery and routing
 
 Advertise `zakura.tx_submit.v1` in the existing [signed node records][node-records].
 Use their chain identity, sequence, expiration, and direct addresses. Phase one
@@ -229,7 +229,7 @@ This reduces persistent identity linkage; it does not provide source anonymity.
 The client must honor an explicit route policy, including during discovery and
 retries. Failure must not silently change a Tor request into a direct connection.
 
-## 6. Integration with message regulation
+## 6. Message regulation
 
 Transaction submission will build on Zakura's shared
 [message regulation framework](https://github.com/zakura-core/zakura/pull/747).
@@ -279,9 +279,9 @@ as a fallback:
 Initial sends and background retries follow the same routing policy. Fallback
 submits the same signed transaction bytes, preserving the retry rules in section 4.
 
-## 8. Follow-on: an HTTP endpoint for Tor
+## 8. Tor support (follow-on)
 
-### 8.1 Why another transport is needed
+### 8.1 Transport requirements
 
 Zakura's current native connection uses QUIC over UDP, with
 [iroh relays disabled][direct-endpoint]. Tor carries
@@ -294,7 +294,7 @@ Tor while Zakura keeps the same submission contract. Use HTTP/1.1 or HTTP/2;
 HTTP/3 would reintroduce the QUIC transport problem. A general TCP version of the
 P2P stack is a larger, separate design.
 
-### 8.2 What the endpoint does
+### 8.2 HTTP interface
 
 Each participating node can expose the same `GetInfo` and `Submit` operations
 over HTTPS. The adapter calls the same source-aware admission operation and
@@ -320,7 +320,7 @@ QUIC on a Tor failure. Validate that behavior under failures before enabling thi
 path. HTTP implementation, endpoint advertisement extensions, and these privacy
 tests belong to the follow-on, not the native service's launch requirements.
 
-## 9. Delivery and acceptance criteria
+## 9. Implementation and validation
 
 ### Phase one: native submission
 

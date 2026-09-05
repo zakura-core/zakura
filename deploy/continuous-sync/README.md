@@ -149,7 +149,9 @@ six-hour reminders and individual completion messages. The first digest is due
 24 hours after the audit begins tracking it; subsequent digests follow that
 cadence. New failures and recoveries do not wait for the digest. Completion counts
 include runs since the controller enabled digest reporting, then since the last
-successful digest. Per-run logs and artifacts remain available on each host.
+successful digest. An unchanged failure appears only in a digest at least 24 hours
+after its last alert or reminder; a recent alert waits for a later digest.
+Per-run logs and artifacts remain available on each host.
 A lost audit cache may repeat already summarized completions or alerts.
 
 Alert state is carried between workflow runs in the Actions cache. A failed Slack

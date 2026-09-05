@@ -732,7 +732,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
     prior_problems = previous.get("problems", {})
     scoped_previous = {"problems": {k: v for k, v in prior_problems.items() if k in selected}}
     new_lines, reminder_lines, recovered_lines, state = audit_transitions(
-        problems, scoped_previous, 0 if digest_due else args.reminder_interval, timestamp,
+        problems, scoped_previous, args.reminder_interval, timestamp,
         reminders_due=digest_due,
     )
     state["problems"].update({k: v for k, v in prior_problems.items() if k not in selected})

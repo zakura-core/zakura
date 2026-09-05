@@ -1207,6 +1207,77 @@ class NotificationTests(unittest.TestCase):
             _, post = self.audit(path, data, 88000)
             post.assert_not_called()
 
+    def test_digest_respects_failure_delivery_age(self):
+        boundary = 200000
+        for previously_observed in (False, True):
+            for age in (5, 86399, 86400, 86401):
+                with self.subTest(previously_observed=previously_observed, age=age), tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "state.json"
+                    data = self.halted_status()
+                    sent_at = boundary - age
+                    data["controller_state"]["failure_notification"]["sent_at"] = sent_at
+                    deploy.save_audit_state(path, {
+                        "version": deploy.AUDIT_STATE_VERSION, "problems": {},
+                        "last_digest_at": boundary - 86400,
+                    })
+                    if previously_observed:
+                        _, post = self.audit(path, data, boundary - 1)
+                        post.assert_not_called()
+
+                    result, post = self.audit(path, data, boundary)
+                    self.assertEqual(result, 1)
+                    if age < 86400:
+                        post.assert_not_called()
+                        self.assertEqual(deploy.load_audit_state(path)["problems"]["node"]["last_sent"], sent_at)
+                    else:
+                        post.assert_called_once()
+                        self.assertIn("unresolved", post.call_args.args[0])
+
+                    _, post = self.audit(path, data, boundary + 86400)
+                    post.assert_called_once()
+                    self.assertIn("unresolved", post.call_args.args[0])
+                    _, post = self.audit(path, data, boundary + 86401)
+                    post.assert_not_called()
+
+    def test_recent_failure_does_not_block_completion_digest(self):
+        data = self.halted_status()
+        data["controller_state"]["failure_notification"]["sent_at"] = 87395
+        data["controller_state"].update({
+            "completion_digest": True, "completion_digest_start_runs": 0,
+            "last_success_run": "success-3", "runs": 3,
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            deploy.save_audit_state(path, {
+                "version": deploy.AUDIT_STATE_VERSION, "problems": {},
+                "last_digest_at": 1000,
+            })
+            result, post = self.audit(path, data, 87400)
+            self.assertEqual(result, 1)
+            post.assert_called_once()
+            self.assertIn("3 completed run(s)", post.call_args.args[0])
+            self.assertNotIn("unresolved", post.call_args.args[0])
+            self.assertEqual(deploy.load_audit_state(path)["problems"]["node"]["last_sent"], 87395)
+
+    def test_digest_boundary_preserves_undelivered_failure_alert(self):
+        data = self.halted_status()
+        del data["controller_state"]["failure_notification"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            deploy.save_audit_state(path, {
+                "version": deploy.AUDIT_STATE_VERSION, "problems": {},
+                "last_digest_at": 1000,
+            })
+            before = path.read_text()
+            result, post = self.audit(path, data, 87400, posted=False)
+            self.assertEqual(result, 1)
+            post.assert_called_once()
+            self.assertIn("controller halted", post.call_args.args[0])
+            self.assertEqual(path.read_text(), before)
+            _, post = self.audit(path, data, 87460)
+            post.assert_called_once()
+            self.assertIn("controller halted", post.call_args.args[0])
+
     def test_completion_counter_reset_and_missing_host_preserve_pending_digest(self):
         previous = {"completions": {"node": {
             "run_id": "old", "total": 10, "pending": 2, "sha": "old", "duration": 30,

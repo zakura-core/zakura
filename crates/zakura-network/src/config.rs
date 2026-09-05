@@ -25,7 +25,7 @@ use zakura_chain::{
             self, ConfiguredActivationHeights, ConfiguredCheckpoints, ConfiguredFundingStreams,
             ConfiguredLockboxDisbursement, RegtestParameters,
         },
-        Magic, Network, NetworkKind,
+        Magic, Network, NetworkKind, V4Deprecation,
     },
     work::difficulty::U256,
 };
@@ -972,6 +972,55 @@ struct DTestnetParameters {
     /// If unset, the default activation height for the network is used; the soft fork
     /// cannot be disabled via configuration.
     temporary_orchard_disabling_soft_fork_height: Option<u32>,
+    /// When this network stops accepting version 4 transactions, see ZIP 2003.
+    ///
+    /// Accepts `"nu7"` (the default, the NU7 activation height), `"never"`, or a block
+    /// height. If unset, the network deprecates version 4 transactions at NU7.
+    v4_deprecation: Option<DV4Deprecation>,
+}
+
+/// When a network stops accepting version 4 transactions, in configuration form.
+///
+/// Serializes as `"nu7"`, `"never"`, or a block height.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum DV4Deprecation {
+    /// A block height, for a network that deprecates version 4 transactions at a height
+    /// other than the NU7 activation height.
+    Height(u32),
+    /// `"nu7"` or `"never"`.
+    Named(String),
+}
+
+impl From<V4Deprecation> for DV4Deprecation {
+    fn from(v4_deprecation: V4Deprecation) -> Self {
+        match v4_deprecation {
+            V4Deprecation::AtNu7 => DV4Deprecation::Named("nu7".to_string()),
+            V4Deprecation::AtHeight(height) => DV4Deprecation::Height(height.0),
+            V4Deprecation::Never => DV4Deprecation::Named("never".to_string()),
+        }
+    }
+}
+
+impl TryFrom<DV4Deprecation> for V4Deprecation {
+    type Error = String;
+
+    fn try_from(v4_deprecation: DV4Deprecation) -> Result<Self, Self::Error> {
+        match v4_deprecation {
+            DV4Deprecation::Height(height) => Ok(V4Deprecation::AtHeight(
+                height
+                    .try_into()
+                    .map_err(|_| format!("{height} is not a valid block height"))?,
+            )),
+            DV4Deprecation::Named(name) => match name.to_lowercase().as_str() {
+                "nu7" => Ok(V4Deprecation::AtNu7),
+                "never" => Ok(V4Deprecation::Never),
+                _ => Err(format!(
+                    "invalid v4_deprecation {name:?}, expected \"nu7\", \"never\", or a block height"
+                )),
+            },
+        }
+    }
 }
 
 /// Network configuration used during deserialization.
@@ -1089,6 +1138,7 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             temporary_orchard_disabling_soft_fork_height: params
                 .temporary_orchard_disabling_soft_fork_height()
                 .map(|height| height.0),
+            v4_deprecation: Some(params.v4_deprecation().into()),
         }
     }
 }
@@ -1358,6 +1408,7 @@ where
         checkpoints,
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
+        v4_deprecation,
     } = params;
 
     let mut params_builder = testnet::Parameters::build();
@@ -1449,6 +1500,13 @@ where
         params_builder = params_builder.with_temporary_orchard_disabling_soft_fork_height(
             height.try_into().map_err(de::Error::custom)?,
         );
+    }
+
+    // Retain the ZIP 2003 default of deprecating version 4 transactions at NU7 unless
+    // another deprecation is configured.
+    if let Some(v4_deprecation) = v4_deprecation {
+        params_builder = params_builder
+            .with_v4_deprecation(v4_deprecation.try_into().map_err(de::Error::custom)?);
     }
 
     // Return an error if the initial testnet peers includes any of the default initial Mainnet or Testnet

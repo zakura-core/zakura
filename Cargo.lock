@@ -8216,6 +8216,7 @@ dependencies = [
  "tonic-reflection",
  "tower 0.4.13",
  "tracing",
+ "tracing-subscriber",
  "zakura-chain",
  "zakura-consensus",
  "zakura-keys",

@@ -24,7 +24,10 @@ The extra bytes cover each Block discriminator and the terminal response.
 The rate reservation adds the fixed request work. The default advertisement
 serves one block per response; the 32 MiB range byte ceiling also supports larger
 configured ranges. Configuration validation requires each capacity to fit the
-largest request allowed by that configuration.
+largest request allowed by that configuration. The local `max_response_bytes`
+setting must be at least `MAX_BLOCK_BYTES` (2,000,000 bytes), so an available
+valid first block can fit. Smaller settings fail configuration loading instead
+of producing an empty response for larger blocks.
 
 Admission rolls back partial reservations before waiting. A slot waiter retains
 the permit assigned to it and uses that permit in its next admission attempt.

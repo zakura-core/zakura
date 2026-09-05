@@ -28,10 +28,10 @@ consensus requirement. The wallet has already constructed and authorized the
 transaction before it reaches the provider. A full node can receive those same
 bytes over P2P, validate them, and relay them to its peers.
 
-The goal is to let any participating Zakura operator offer that entry point
-without also running a wallet indexing service. Wallets discover suitable nodes
-through the network instead of depending on a small provider list. Submission
-then becomes an ordinary capability of the node network.
+The goal is to let any participating Zakura operator offer that entry point.
+Wallets discover suitable nodes through the network instead of depending on a
+small provider list. Submission then becomes an ordinary capability of the node
+network.
 
 Goals:
 

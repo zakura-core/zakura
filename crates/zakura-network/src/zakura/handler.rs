@@ -5329,6 +5329,8 @@ fn message_bucket_for<C: Clock>(
 struct TokenBucket<C = RealClock> {
     capacity: u32,
     tokens: u32,
+    /// Earned credit below one token, in billionths of a token.
+    fractional_credit: u128,
     refill_per_second: u32,
     last_refill: Instant,
     clock: C,
@@ -5346,6 +5348,7 @@ impl<C: Clock> TokenBucket<C> {
         Self {
             capacity,
             tokens: capacity,
+            fractional_credit: 0,
             refill_per_second: capacity,
             last_refill: clock.now(),
             clock,
@@ -5364,13 +5367,20 @@ impl<C: Clock> TokenBucket<C> {
     fn refill(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last_refill);
         let elapsed_nanos = elapsed.as_nanos();
-        let new_tokens =
-            elapsed_nanos.saturating_mul(u128::from(self.refill_per_second)) / 1_000_000_000;
-        if new_tokens == 0 {
-            return;
+        let earned_credit = elapsed_nanos
+            .saturating_mul(u128::from(self.refill_per_second))
+            .saturating_add(self.fractional_credit);
+        let new_tokens = earned_credit / 1_000_000_000;
+        let remaining_capacity = self.capacity - self.tokens;
+        if new_tokens >= u128::from(remaining_capacity) {
+            self.tokens = self.capacity;
+            // Idle time cannot accumulate credit beyond the burst allowance.
+            self.fractional_credit = 0;
+        } else {
+            self.tokens += u32::try_from(new_tokens)
+                .expect("earned tokens below remaining u32 capacity fit in u32");
+            self.fractional_credit = earned_credit % 1_000_000_000;
         }
-        let new_tokens = new_tokens.min(u128::from(u32::MAX)) as u32;
-        self.tokens = self.capacity.min(self.tokens.saturating_add(new_tokens));
         self.last_refill = now;
     }
 }
@@ -8749,6 +8759,51 @@ mod tests {
         assert!(!bucket.try_take());
         clock.advance(Duration::from_millis(500));
         assert!(bucket.try_take());
+    }
+
+    #[test]
+    fn token_bucket_preserves_fractional_refills() {
+        let clock = crate::zakura::testkit::TestClock::new();
+        let mut bucket = TokenBucket::with_clock(2, clock.clone());
+        assert!(bucket.try_take());
+        assert!(bucket.try_take());
+
+        clock.advance(Duration::from_millis(750));
+        assert!(bucket.try_take());
+        assert!(!bucket.try_take());
+        clock.advance(Duration::from_millis(250));
+        assert!(bucket.try_take(), "one second earns two tokens in total");
+        assert!(!bucket.try_take());
+    }
+
+    #[test]
+    fn token_bucket_caps_fractional_credit_after_idle() {
+        let clock = crate::zakura::testkit::TestClock::new();
+        let mut bucket = TokenBucket::with_clock(2, clock.clone());
+        clock.advance(Duration::from_millis(10_250));
+        assert!(bucket.try_take());
+        assert!(bucket.try_take());
+        assert!(!bucket.try_take());
+
+        clock.advance(Duration::from_millis(250));
+        assert!(!bucket.try_take(), "idle credit cannot exceed capacity");
+        clock.advance(Duration::from_millis(250));
+        assert!(bucket.try_take());
+        assert!(!bucket.try_take());
+    }
+
+    #[test]
+    fn token_bucket_accepts_sustained_traffic_below_configured_rate() {
+        let clock = crate::zakura::testkit::TestClock::new();
+        let mut bucket =
+            TokenBucket::with_clock(DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND, clock.clone());
+
+        // About 1,500 messages/second must remain below the 2,048/second
+        // allowance even when each interval earns a non-integral token count.
+        for _ in 0..10_000 {
+            clock.advance(Duration::from_micros(667));
+            assert!(bucket.try_take());
+        }
     }
 
     #[test]

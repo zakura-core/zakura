@@ -2601,9 +2601,20 @@ mod zakura_header_sync_driver_tests {
     #[tokio::test]
     async fn block_range_query_uses_its_owned_timeout() {
         let (action_tx, action_rx) = mpsc::channel(1);
-        let mut capture = TraceCapture::for_test("block_range_query_uses_its_owned_timeout")
-            .expect("test trace capture starts");
-        let trace = zakura_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+        let (trace_tx, mut trace_rx) = mpsc::channel(128);
+        let trace = zakura_network::zakura::ZakuraTrace::new(
+            zakura_jsonl_trace::JsonlTracer::new(trace_tx),
+            "01",
+        );
+        fn rows(
+            receiver: &mut mpsc::Receiver<zakura_jsonl_trace::JsonlWriteEvent>,
+        ) -> Vec<serde_json::Value> {
+            let mut rows = Vec::new();
+            while let Ok(event) = receiver.try_recv() {
+                rows.push(serde_json::from_slice(&event.line).expect("trace row is valid JSON"));
+            }
+            rows
+        }
         let mut startup = block_sync_startup_for_test();
         startup.trace = trace.clone();
         let (block_sync, _reactor_actions, reactor_task) =
@@ -2683,23 +2694,14 @@ mod zakura_header_sync_driver_tests {
         wait_for_query_seen(query_seen_rx).await;
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        capture.flush().await;
-        capture
-            .reader()
-            .expect("trace is readable")
-            .table(COMMIT_STATE_TABLE.table())
-            .assert_row(
-                cs_trace::REACTOR_EVENT_SENT,
-                &[
-                    (
-                        cs_trace::ACTION,
-                        TraceValue::Str("block_range_response_finished"),
-                    ),
-                    (cs_trace::RANGE_START, TraceValue::U64(7)),
-                    (cs_trace::RANGE_COUNT, TraceValue::U64(0)),
-                    (cs_trace::REQUESTED_COUNT, TraceValue::U64(1)),
-                ],
-            );
+        let before_finish = rows(&mut trace_rx);
+        assert!(before_finish.iter().any(|row| {
+            row["event"] == "reactor_event_sent"
+                && row["action"] == "block_range_response_finished"
+                && row["range_start"] == 7
+                && row["range_count"] == 0
+                && row["requested_count"] == 1
+        }));
 
         assert!(
             matches!(
@@ -2708,6 +2710,16 @@ mod zakura_header_sync_driver_tests {
             ),
             "the response timeout must retain the underlying state future"
         );
+        let phases: Vec<_> = before_finish
+            .iter()
+            .filter(|row| row["event"] == "get_blocks_query" && row["request_id"] == 99)
+            .map(|row| row["phase"].as_str().expect("query phase is a string"))
+            .collect();
+        assert_eq!(
+            phases,
+            ["read_started", "delivery_timeout"],
+            "the live read has no finish observation"
+        );
         finish_tx
             .send(())
             .expect("the state future still owns its completion gate");
@@ -2715,6 +2727,13 @@ mod zakura_header_sync_driver_tests {
             .await
             .expect("the completed state future releases ownership")
             .expect("the read lifetime guard reports completion");
+
+        let after_finish = rows(&mut trace_rx);
+        assert!(after_finish.iter().any(|row| {
+            row["event"] == "get_blocks_query"
+                && row["request_id"] == 99
+                && row["phase"] == "read_finished"
+        }));
 
         let _ = shutdown_tx.send(());
         driver.await.expect("driver exits after the query timeout");

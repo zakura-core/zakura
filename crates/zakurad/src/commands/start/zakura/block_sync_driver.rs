@@ -61,8 +61,10 @@ async fn serve_block_range<ReadState>(
         unreachable!("only serving range actions are dispatched to the serving worker");
     };
     if !lease.try_start() {
+        trace.trace_serving_query(request_id, "claim_rejected");
         return;
     }
+    trace.trace_serving_query(request_id, "read_started");
     trace.trace_block_range_query_started(&peer, start, count);
     let started = Instant::now();
     let query = std::panic::AssertUnwindSafe(read_state.oneshot(
@@ -77,15 +79,22 @@ async fn serve_block_range<ReadState>(
     let result = tokio::select! {
         biased;
         () = lease.cancelled() => {
+            trace.trace_serving_query(request_id, "delivery_cancelled");
             // Awaiting the retained future drains any blocking work before releasing its charge.
-            drop(query.await);
+            let drained = query.await;
+            trace.trace_serving_query(request_id, "read_finished");
+            drop(drained);
             return;
         }
         result = tokio::time::timeout(timeout, &mut query) => result,
     };
+    if result.is_ok() {
+        trace.trace_serving_query(request_id, "read_finished");
+    }
     match result {
         Ok(Ok(Ok(zakura_state::ReadResponse::Blocks(blocks)))) => {
             if lease.is_cancelled() {
+                trace.trace_serving_query(request_id, "delivery_cancelled");
                 return;
             }
             trace.trace_block_range_query_succeeded(&peer, start, blocks.len(), started);
@@ -100,6 +109,7 @@ async fn serve_block_range<ReadState>(
             });
         }
         Err(_) => {
+            trace.trace_serving_query(request_id, "delivery_timeout");
             trace.trace_block_range_query_timed_out(&peer, start, count, started);
             warn!(?peer, "timed out reading Zakura block-sync serving range");
             trace.trace_block_range_finished(&peer, start, count, 0);
@@ -110,7 +120,9 @@ async fn serve_block_range<ReadState>(
                 requested_count: count,
                 returned_count: 0,
             });
-            drop(query.await);
+            let drained = query.await;
+            trace.trace_serving_query(request_id, "read_finished");
+            drop(drained);
             // `lease` remains owned until the underlying read actually completes.
         }
         Ok(result) => {

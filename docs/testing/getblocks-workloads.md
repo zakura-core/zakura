@@ -65,7 +65,13 @@ ID assignment. They use the decode emitter's clock. Repeated ranges remain
 distinct, and the observation metadata retains no resource owners. The
 `sync.block.capture.serving_events` counter counts emission attempts by phase.
 
-These rows currently establish correlation only. The arrival importer does not
-join them or validate service lifetimes. Admission waits, queries, frames,
-cancellation outcomes, and final settlement still need complete observations
-before this becomes an accounting replay input.
+The commit-state table adds `get_blocks_query` rows keyed by reactor request ID.
+These distinguish the driver read future's start and completion from delivery
+timeout or cancellation. Read completion after an expired delivery remains
+visible. This timing includes the read service's readiness and internal queues;
+it is not a measurement of physical disk service time alone. The native startup
+passes the endpoint's cloned trace emitter to this driver.
+
+The arrival importer does not yet join these rows or validate service lifetimes.
+Admission waits, frames, cancellation outcomes, and final settlement still need
+complete observations before this becomes an accounting replay input.

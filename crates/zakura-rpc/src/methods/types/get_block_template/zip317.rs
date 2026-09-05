@@ -112,13 +112,14 @@ pub fn select_mempool_transactions(
     net: &Network,
     height: Height,
     miner_params: &MinerParams,
+    money_reserve: Option<Amount<amount::NonNegative>>,
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
 ) -> Vec<SelectedMempoolTx> {
     // Use a fake coinbase transaction to break the dependency between transaction
     // selection, the miner fee, and the fee payment in the coinbase transaction.
     let fake_coinbase_tx =
-        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero(), None)
+        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero(), money_reserve)
             .expect("valid coinbase transaction template");
 
     let tx_dependencies = mempool_tx_deps.dependencies();

@@ -8,7 +8,9 @@ use zakura_chain::{
     amount::NonNegative,
     block::{self, Block, Hash, Height},
     history_tree::HistoryTree,
-    parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
+    parameters::{
+        subsidy::is_zip234_active, Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING,
+    },
     serialization::{DateTime32, Duration32},
     value_balance::ValueBalance,
     work::difficulty::{CompactDifficulty, PartialCumulativeWork, Work, U256},
@@ -75,9 +77,17 @@ pub fn get_block_template_chain_info(
 
     // A candidate block's ZIP 234 subsidy comes from the money reserve after its parent,
     // which is this tip.
-    let value_pools = read::block_info(non_finalized_state.best_chain(), db, best_tip_hash.into())
-        .map(|block_info| *block_info.value_pools())
-        .unwrap_or_else(ValueBalance::zero);
+    let tip_info = read::block_info(non_finalized_state.best_chain(), db, best_tip_hash.into());
+    let value_pools = match tip_info {
+        Some(block_info) => *block_info.value_pools(),
+        None if best_tip_height
+            .next()
+            .is_ok_and(|height| is_zip234_active(network, height)) =>
+        {
+            return Err("missing chain value pools for the ZIP 234 candidate block parent".into());
+        }
+        None => ValueBalance::zero(),
+    };
 
     Ok(difficulty_time_and_history_tree(
         best_relevant_chain,

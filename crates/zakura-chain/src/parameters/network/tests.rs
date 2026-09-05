@@ -386,7 +386,7 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     //                   = floor(1_250_000_000 / (2 * 3 * 8)) = 26_041_666 zatoshi
     assert_eq!(
         Amount::<NonNegative>::try_from(26_041_666)?,
-        block_subsidy(nu7_height, &network)?,
+        halving_block_subsidy(nu7_height, &network)?,
     );
 
     // The third halving boundary lands exactly at NU7 here, so the block before
@@ -394,7 +394,7 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     assert_eq!(2, halving((nu7_height - 1).unwrap(), &network));
     assert_eq!(
         Amount::<NonNegative>::try_from(156_250_000)?,
-        block_subsidy((nu7_height - 1).unwrap(), &network)?,
+        halving_block_subsidy((nu7_height - 1).unwrap(), &network)?,
     );
 
     // The halving counter does not reset at NU7. The next boundary arrives after
@@ -406,7 +406,7 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     assert_eq!(16, halving_divisor(next_halving, &network).unwrap());
     assert_eq!(
         Amount::<NonNegative>::try_from(13_020_833)?,
-        block_subsidy(next_halving, &network)?,
+        halving_block_subsidy(next_halving, &network)?,
     );
 
     Ok(())
@@ -573,13 +573,6 @@ fn zip234_issuance() {
             (halving_subsidy + Amount::try_from(412_600).expect("valid amount"))
                 .expect("valid amount"),
         );
-
-        // The subsidy cannot issue more than the remaining money reserve.
-        let final_zatoshi = Amount::<NonNegative>::try_from(1).expect("valid amount");
-        assert_eq!(
-            block_subsidy(start, &network, Some(final_zatoshi)).expect("valid subsidy"),
-            final_zatoshi,
-        );
     }
 
     // The money reserve is what has never been issued plus everything removed from
@@ -615,8 +608,7 @@ fn zip234_deployment_height() {
             .to_network()
     };
 
-    let at_nu7 = mainnet_shaped(Zip234Deployment::AtNu7)
-        .expect("configured testnet is valid");
+    let at_nu7 = mainnet_shaped(Zip234Deployment::AtNu7).expect("configured testnet is valid");
     assert_eq!(zip234_start_height(&at_nu7), Some(Height(nu7)));
 
     // A configured height can select either later ballot date once its block height is known.

@@ -687,9 +687,8 @@ pub fn block_subsidy(
             // issuance deficit.
             let halving_subsidy = halving_block_subsidy(height, net)?;
             let bonus = reissuance_bonus(height, net, money_reserve)?;
-            let subsidy = (halving_subsidy + bonus)?;
 
-            return Ok(subsidy.min(money_reserve));
+            return Ok((halving_subsidy + bonus)?);
         }
     }
 

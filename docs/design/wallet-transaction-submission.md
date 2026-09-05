@@ -161,6 +161,12 @@ The wallet seeks submission and discovery; it does not claim to provide block
 serving or gossip. Support peer sampling by a non-advertising client without
 weakening the validation of addresses advertised by actual serving nodes.
 
+The `seeks` and `provides` labels guide discovery; they do not restrict who can
+open a request stream. The wallet client must reject peer-opened submission
+requests before decoding transaction payloads and accept only responses to its
+own outstanding requests. Negotiating submission support must not enable an
+inbound submission handler on the wallet.
+
 Share protocol encoders and transport machinery with the node. Do not copy
 handshake implementations into each wallet or wrap the full node startup path
 in a wallet-specific mode.

@@ -1,20 +1,24 @@
 # Changelog: Parameters
 
-A focused ledger of deliberate changes to **tunable parameters** in this fork —
+A focused ledger of deliberate changes to **node tunable parameters** in this fork —
 constants, config defaults, timeouts, window/limit sizes, and congestion-control
 coefficients.
 
 This complements the root `CHANGELOG.md`. The changelog records user-visible behavior in
-prose; this file is a compact table of every parameter value we have re-tuned, so
+prose; this file is a compact table of node parameter values we have re-tuned, so
 reviewers and operators can see — at a glance — what changed, where it lives, and
 why.
 
 ## How to use this file
 
-When a PR changes a tunable parameter, add a row to the table below **in the same
-PR**. A "tunable parameter" is any value chosen for behavior or performance rather
+When a PR changes a node tunable parameter, add a row to the table below **in the same
+PR**. A "tunable parameter" is any value chosen for node behavior or performance rather
 than correctness — a constant, a `Config` default, a timeout, a window or limit,
 or a backoff/growth coefficient.
+
+Infrastructure, CI, deployment, and notification settings are outside this
+ledger's scope. Document those changes in the relevant infrastructure or operator
+documentation instead.
 
 Keep entries **newest-first**. Each row records:
 
@@ -28,7 +32,6 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
-| `--reminder-interval` / `REMINDER_INTERVAL` | `deploy/continuous-sync/deploy.py`, `.github/workflows/zakura-continuous-sync.yml` | `6 h` → `24 h` | [#895](https://github.com/zakura-core/zakura/pull/895) | Group unchanged failures and routine completions into a daily digest; new failures, changed failures, and recoveries remain immediate. |
 | `LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE` | `crates/zakurad/src/commands/start/zakura/coordinator.rs` | new → `30 min` | [#831](https://github.com/zakura-core/zakura/pull/831) | Terminate the node when native block applies prevent legacy fallback from acquiring exclusive ownership, instead of leaving the fallback handoff pending forever. |
 | `MAX_CANDIDATE_TIPS_V1` | `crates/zakura-header-chain/src/config.rs` | `10` → `11` | [#831](https://github.com/zakura-core/zakura/pull/831) | Retain ten full-state fork tips plus one independent selected header tip, so header candidate pressure cannot evict a branch that full state still owns. |
 | `VCT_LOCAL_OPERATION_FATAL_AFTER` | `crates/zakura-network/src/zakura/header_sync/reactor.rs` | new → `30 min` | [#821](https://github.com/zakura-core/zakura/pull/821) | Terminate a node whose local VCT repair prepare or apply operation remains pending, while allowing slow valid operations substantially more time than the existing one-minute stall diagnostic. |

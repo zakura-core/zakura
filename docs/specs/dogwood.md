@@ -89,6 +89,8 @@ The baseline decoder SHOULD maintain an incremental elimination state. Part
 `i` supplies coefficient row `G[:,i]` and its payload as the right-hand side.
 On each verified arrival, eliminate existing pivots and retain the new pivot.
 After `k` distinct parts, finish back-substitution and the checks below.
+An eager decoder MAY also eliminate each new pivot from existing rows on
+arrival. This moves work out of back-substitution without changing the code.
 Systematic parts expose their body bytes directly, but those bytes remain
 provisional until verification completes. A decoder MAY use an equivalent
 algorithm that produces the same result within the same work bounds.
@@ -519,6 +521,12 @@ to other peers that announced metadata. It SHOULD prefer peers that reported
 
 Recovery MUST first request enough distinct missing indices to make decoding
 possible. Additional parity indices are valid substitutes for missing data.
+The receiver MAY retain the first peer that supplied its admitted, authenticated
+`HeaderMeta` as a block-scoped repair candidate. Header propagation can provide
+a dependency path toward the source when standing part routes have none.
+Metadata arrival does not prove part availability or honesty. This candidate
+MUST remain subject to the same credits, timeouts, and alternative recovery
+paths as other suppliers; it MUST NOT replace bounded fallback.
 It MAY add duplicate requests when expected latency justifies their cost.
 No separate repair request, acknowledgement, or unavailable message is needed:
 the subscription schedules current and future availability, and a local
@@ -539,6 +547,9 @@ policy. Its stability and performance have not been established. Implementations
 MAY improve its estimator while preserving explicit resource, exploration,
 recovery, and coverage bounds. The controller allocates subscriptions;
 transport congestion control separately paces bytes.
+The [reference experiments](../experiments/dogwood/README.md) test a reduced
+controller and do not consistently improve on static allocation. They do not
+validate the full policy or select production values for its learned budget.
 
 ### Core rules
 
@@ -577,8 +588,12 @@ failure set in its configured failure model. `safety_parts` is nonnegative.
 The default model SHOULD include loss of any one upstream peer. A receiver
 MUST NOT describe distinct peer identities as independent physical paths.
 
-With one supplier per index and no extra routes, tolerance of any one peer
-requires `max_p |A[p]| <= n - k - safety_parts`. If a fast peer exceeds that
+Let `m = |union(A[p] for all p)|` be subscribed distinct coverage. With one
+supplier per subscribed index and no extra routes, tolerance of any one peer
+requires `max_p |A[p]| <= m - k - safety_parts`. This equals the `n - k`
+parity allowance only when every encoded index is subscribed and the safety
+margin is zero. Committing more parity without subscribing to more distinct
+indices MUST NOT increase reported coverage. If a fast peer exceeds its allowed
 share, the receiver needs extra distinct coverage elsewhere. This permits many
 parts per connection without silently abandoning redundancy.
 
@@ -675,6 +690,10 @@ Pooled measurements MUST NOT supply promotion votes for another proposer or
 replace its learned routes merely because a different proposer published a block.
 The receiver MUST age out stale comparisons. Idle periods supply no successful
 samples.
+Different-part delivery statistics MAY guide candidate selection. They MUST
+NOT count as paired promotion votes. Randomized assignment can support a
+separate estimator under explicit load and censoring assumptions; random
+source placement alone does not establish those assumptions.
 One large block MUST NOT count as hundreds of independent block observations.
 The receiver MUST cap contexts, peer pairs, and tracked proposers.
 
@@ -813,6 +832,14 @@ eight blocks; three observations cost about 24 blocks. Warming or inconclusive
 observations increase this cost. These are accounting examples, not recommended
 parameters. Smaller selections permit more observations for the same budget.
 More frequent trials cannot create observations for a proposer that rarely mines.
+The receiver SHOULD size trial lifetime against proposer opportunities as well
+as byte credit. If a proposer supplies an estimated `lambda_p` blocks per unit
+time, an age cap `A` supplies only `lambda_p * A` expected block opportunities.
+Useful trials need opportunities for warming and repeated votes. The expectation
+does not guarantee arrivals or decisive comparisons. Sparse or unfamiliar
+proposers MUST retain usable existing or default routes and independent recovery
+when trials cannot obtain enough evidence. Expiry MUST NOT become evidence that
+the challenger is slow.
 
 Simulations MUST sweep the byte fraction, minimum interval, selection width,
 and trial lifetime together. They MUST measure adaptation in both elapsed time

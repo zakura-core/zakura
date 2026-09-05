@@ -12,6 +12,8 @@ Parity lets it reconstruct the block without waiting for every part.
 The tradeoff is bandwidth: standing routes avoid request latency, but stale
 routes need redundancy and recovery. The [protocol specification](../specs/dogwood.md)
 defines the rules. This document explains the design.
+The [experiments](../experiments/dogwood/README.md) test the codec, measurements,
+coverage, and a reduced controller. They do not establish overlay convergence.
 
 ## Tradeoffs
 
@@ -154,6 +156,8 @@ it received the part late, or because its connection is congested. The receiver
 instead tests an alternative under load. It requests the same parts from two
 peers and compares verified arrivals on its own clock. No sender timestamp or
 RTT estimate is needed.
+Ordinary deliveries help select candidates. Different-part comparisons alone
+can confuse peer performance with upstream part availability.
 
 The controller follows five rules:
 
@@ -201,7 +205,8 @@ bound resource use.
 
 [Section 7 of the spec](../specs/dogwood.md#7-redundancy-and-route-control)
 defines the measurements and update rules. We still need simulation to test
-whether this controller adapts quickly without oscillating.
+the full feedback loop. The reduced controller experiments do not consistently
+improve on static allocation, so the learned budget remains experimental.
 
 ## Redundancy and recovery
 
@@ -219,23 +224,31 @@ enough distinct parts. This costs duplicate traffic. The receiver can reduce
 that cost only by accepting recovery latency when the fast peer fails.
 Distinct peers also need not represent independent physical paths.
 
+Committed parity and subscribed redundancy are separate choices. Encoding more
+parity provides no additional failure coverage unless the receiver requests
+enough distinct parts. The draft's 25% parity schedule is not a measured optimum.
+
 Coverage describes assignments, not guaranteed availability. A subscription
 cycle may have no source for its parts. When progress stalls, the receiver
 requests missing parts from additional peers. Existing full-block download
 provides final recovery. Sparse subscriptions alone do not guarantee delivery
 from every entry point.
+The first authenticated header supplier is one repair candidate, not proof of
+part availability. Learned routes avoid request latency; unfamiliar entry
+points may still pay discovery or repair latency.
 
 ## Encoding and verification
 
 The codec uses the systematic Reed–Solomon construction from
 [RFC 5510, section 8](https://www.rfc-editor.org/rfc/rfc5510.html#section-8).
 The decoder processes each verified part as an equation as it arrives.
-This overlaps decoding with transfer without requiring RLNC.
+It can also reduce existing equations with each new pivot to shorten the final
+decode step. The reference benchmarks support testing this eager schedule
+without switching to RLNC. Re-encoding and root verification still remain.
 Forwarding never waits for decoding.
 
-The proposer can prepare parity and the Merkle tree while mining. A body change
-invalidates that work; a header-only change does not. After mining, the proposer
-signs the final block hash and coding metadata.
+A body change requires new parity and a new Merkle tree. A header-only change
+does not. After mining, the proposer signs the final block hash and coding metadata.
 
 A Merkle proof establishes membership in the signed root, not correct encoding.
 After reconstruction, the receiver checks padding and re-encodes the body to

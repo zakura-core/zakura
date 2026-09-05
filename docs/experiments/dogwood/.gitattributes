@@ -1,0 +1,2 @@
+# Preserve the CSV writer's CRLF bytes for result checksums.
+*.csv -text whitespace=cr-at-eol

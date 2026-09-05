@@ -1,0 +1,534 @@
+[
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "8",
+      "0.25",
+      "rs",
+      "systematic",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.022497999999999838,
+    "wall_seconds": 0.02306500996928662
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "8",
+      "0.25",
+      "rlnc",
+      "systematic",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.024439999999999767,
+    "wall_seconds": 0.024712751037441194
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "8",
+      "0.25",
+      "rs",
+      "random",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.02625100000000019,
+    "wall_seconds": 0.0266633199644275
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "8",
+      "0.25",
+      "rlnc",
+      "random",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.016568999999999945,
+    "wall_seconds": 0.0167973919888027
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "8",
+      "0.25",
+      "rs",
+      "parity_first",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.03247799999999998,
+    "wall_seconds": 0.032889459980651736
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "8",
+      "0.25",
+      "rlnc",
+      "parity_first",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.026621000000000117,
+    "wall_seconds": 0.027095059980638325
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "8",
+      "0.25",
+      "rs",
+      "withheld",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.02248300000000024,
+    "wall_seconds": 0.022785646026022732
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "8",
+      "0.25",
+      "rlnc",
+      "withheld",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.016256000000000007,
+    "wall_seconds": 0.01653446804266423
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rs",
+      "systematic",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.09615500000000003,
+    "wall_seconds": 0.0967139049898833
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rlnc",
+      "systematic",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.0878980000000002,
+    "wall_seconds": 0.0887202590238303
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rs",
+      "random",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.1287479999999998,
+    "wall_seconds": 0.12940873100887984
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rlnc",
+      "random",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.1264559999999999,
+    "wall_seconds": 0.12713021598756313
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rs",
+      "parity_first",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.1580110000000001,
+    "wall_seconds": 0.1589069899637252
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rlnc",
+      "parity_first",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.16183599999999984,
+    "wall_seconds": 0.16259225294925272
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rs",
+      "withheld",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.137481,
+    "wall_seconds": 0.13835651701083407
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rlnc",
+      "withheld",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.1409889999999998,
+    "wall_seconds": 0.1427460809936747
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "128",
+      "0.25",
+      "rs",
+      "systematic",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.9762640000000005,
+    "wall_seconds": 0.9803871589829214
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "128",
+      "0.25",
+      "rlnc",
+      "systematic",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.9715360000000006,
+    "wall_seconds": 0.9752653330215253
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "128",
+      "0.25",
+      "rs",
+      "random",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 1.5923900000000002,
+    "wall_seconds": 1.5990331679931842
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "128",
+      "0.25",
+      "rlnc",
+      "random",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 1.5678749999999992,
+    "wall_seconds": 1.5735258409986272
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "128",
+      "0.25",
+      "rs",
+      "parity_first",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 1.9911949999999987,
+    "wall_seconds": 1.9996985520119779
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "128",
+      "0.25",
+      "rlnc",
+      "parity_first",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 2.0150230000000007,
+    "wall_seconds": 2.023486076039262
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "128",
+      "0.25",
+      "rs",
+      "withheld",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 1.5208360000000005,
+    "wall_seconds": 1.5268022730015218
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "128",
+      "0.25",
+      "rlnc",
+      "withheld",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 1.5199149999999981,
+    "wall_seconds": 1.5261398540460505
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.125",
+      "rs",
+      "parity_first",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.11412900000000137,
+    "wall_seconds": 0.11490480502834544
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.125",
+      "rlnc",
+      "parity_first",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.12686499999999912,
+    "wall_seconds": 0.127640476974193
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.5",
+      "rs",
+      "parity_first",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.2454130000000025,
+    "wall_seconds": 0.2468495760113001
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.5",
+      "rlnc",
+      "parity_first",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.24149899999999885,
+    "wall_seconds": 0.24276533402735367
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "1",
+      "rs",
+      "parity_first",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.4102050000000014,
+    "wall_seconds": 0.41354234697064385
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "1",
+      "rlnc",
+      "parity_first",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.3881970000000016,
+    "wall_seconds": 0.3899180080043152
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rs",
+      "systematic",
+      "4",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.2584330000000018,
+    "wall_seconds": 0.25957480899523944
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rlnc",
+      "systematic",
+      "4",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.2832659999999986,
+    "wall_seconds": 0.28723316796822473
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rs",
+      "parity_first",
+      "4",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.5432460000000001,
+    "wall_seconds": 0.5455399089842103
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rlnc",
+      "parity_first",
+      "4",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.5272539999999976,
+    "wall_seconds": 0.5293922059936449
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rs",
+      "insufficient",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.04655500000000168,
+    "wall_seconds": 0.04704809398390353
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rlnc",
+      "insufficient",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.04759599999999764,
+    "wall_seconds": 0.04835043696220964
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rs",
+      "invalid_codeword",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.1443750000000007,
+    "wall_seconds": 0.1461183229694143
+  },
+  {
+    "argv": [
+      "/home/evan/src/valar/zakura.dogwood-docs/docs/experiments/dogwood/build/codec",
+      "32",
+      "0.25",
+      "rlnc",
+      "invalid_codeword",
+      "1",
+      "100",
+      "4"
+    ],
+    "cpu_seconds": 0.13663100000000095,
+    "wall_seconds": 0.13792670500697568
+  }
+]

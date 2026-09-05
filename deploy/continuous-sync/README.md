@@ -33,8 +33,8 @@ v2 stack.
    run-specific trace directory.
 9. Start `zakura.service` with `Restart=no`.
 10. Poll metrics and `/ready` until the node is stably near tip.
-11. Stop the node, post a completion alert to `#zakura-alerts`, and start the
-    next cycle after a short cooldown.
+11. Stop the node, record the completion for the daily audit digest, and start
+    the next cycle after a short cooldown.
 
 The same commit may be tested repeatedly. That is intentional: the fleet is a
 continuous sync canary, not a once-per-SHA CI job.
@@ -137,15 +137,45 @@ days. A run is capped at 48 hours, so that last check cannot be tripped by a
 legitimately long sync. These external audit checks intentionally remain
 independent of the per-host minute monitor.
 
-Each problem pages once when it appears, reminds every six hours while it is
-still unresolved, and posts a recovery when it clears. Continuity is judged on
-the kind of problem, not on the rendered message, because details such as free
-bytes and SSH error text change between samples and would otherwise look like a
-new problem on every cycle. Alert state is carried between workflow runs in the
-Actions cache, so a lost cache entry costs at most one duplicate page. A Slack
-post that fails is not recorded as sent; the next audit retries it. The audit
-job still exits non-zero on every cycle a problem is present, so the workflow
-run history remains an unthrottled signal.
+New problems and changed failures still alert immediately when the audit observes
+them. A confirmed controller delivery receipt suppresses the first duplicate audit
+page only when the run, failure timestamp, reason, and Slack destination match.
+Missing, failed, mismatched, or future-dated receipts do not suppress the audit.
+A new run with the same failure reason remains a separate incident. Older
+controllers without receipts keep their existing audit fallback.
+
+Cached incident delivery is also tied to the Slack destination. After a webhook
+change, the next audit alerts the new destination unless a matching controller
+receipt confirms delivery there. It does not send recoveries for incidents known
+only to the old destination. Cache records without a destination cannot suppress
+an alert without a matching receipt.
+
+Unchanged failures and routine completions share a daily digest, replacing the
+six-hour reminders and individual completion messages. The first digest is due
+24 hours after the audit begins tracking it; subsequent digests follow that
+cadence. New failures and recoveries do not wait for the digest. Completion counts
+include runs since the controller enabled digest reporting, then since the last
+successful digest. An unchanged failure appears only in a digest at least 24 hours
+after its last alert or reminder; a recent alert waits for a later digest.
+Per-run logs and artifacts remain available on each host.
+A lost audit cache may repeat already summarized completions or alerts.
+
+Alert state is carried between workflow runs in the Actions cache. A failed Slack
+post does not advance notification state; the next audit retries it. Targeted
+audits preserve other nodes' incidents and do not send the fleet digest. The audit
+job still exits non-zero whenever an inspected node has a problem, including when
+its notification has already been delivered.
+
+### VCT canary notifications
+
+`canary-notify.py` keeps delivery state per GitHub workflow run. Repeating the
+notification job for the same canary execution and complete diagnostics does not
+send another failure message within 24 hours. A new workflow run, a re-execution
+of the canary, changed diagnostics, or missing diagnostics still alerts. Failures
+from separate executions are not assumed to have the same root cause. A successful
+retry posts one recovery for a previously delivered failure in that workflow run;
+cancelled and skipped results do not clear it. Delivery failure retains the prior
+state, and missing cache state causes another alert rather than suppressing one.
 
 A completely unreachable host cannot run its local minute monitor. Its fallback
 alert therefore comes from the audit, with an expected maximum detection delay

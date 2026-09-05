@@ -74,7 +74,7 @@ jobs:
   alert:
     name: Alert #zakura-alerts
     needs: [handoff]
-    if: ${{ always() && needs.handoff.result == 'failure' && (github.event_name != 'workflow_dispatch' || inputs.notify) }}
+    if: ${{ always() && contains(fromJSON('["failure","success"]'), needs.handoff.result) && (github.event_name != 'workflow_dispatch' || inputs.notify) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -86,39 +86,33 @@ jobs:
       MAX_CHECKPOINT: ${{ needs.handoff.outputs.max_checkpoint }}
       START_HEIGHT: ${{ needs.handoff.outputs.start_height }}
       END_HEIGHT: ${{ needs.handoff.outputs.end_height }}
+      RESULT: ${{ needs.handoff.result }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      EXECUTION_ATTEMPT: ${{ needs.handoff.outputs.execution_attempt }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      - name: Post failure alert
-        env:
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import urllib.request
+      - name: Checkout notification code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
 
-          webhook = os.environ.get("SLACK_WEB_HOOK", "")
-          if not webhook:
-              raise SystemExit("SLACK_WEB_HOOK is not configured")
+      - name: Restore this run's notification state
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .canary-notification
+          key: canary-notification-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            canary-notification-${{ github.run_id }}-
 
-          def value(name):
-              return os.environ.get(name) or "unknown"
+      - name: Report canary transition
+        id: notify
+        run: python3 deploy/continuous-sync/canary-notify.py --state-file .canary-notification/state.json
 
-          text = (
-              ":rotating_light: Zakura VCT handoff canary failed\n"
-              f"phase={value('FAILURE_PHASE')} | mainnet | ref={value('TARGET_REF')} | sha={value('TARGET_SHA')} | "
-              f"C={value('MAX_CHECKPOINT')} | start={value('START_HEIGHT')} | "
-              f"end={value('END_HEIGHT')} | {value('RUN_URL')}"
-          )
-          request = urllib.request.Request(
-              webhook,
-              data=json.dumps({"text": text}).encode(),
-              headers={"Content-Type": "application/json"},
-              method="POST",
-          )
-          with urllib.request.urlopen(request, timeout=8) as response:
-              body = response.read().decode("utf-8", "replace").strip()
-              if response.status < 200 or response.status >= 300 or body != "ok":
-                  raise SystemExit(
-                      f"Slack webhook failed: status={response.status} body={body!r}"
-                  )
-          PY
+      - name: Save confirmed notification state
+        if: steps.notify.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: .canary-notification
+          key: canary-notification-${{ github.run_id }}-${{ github.run_attempt }}

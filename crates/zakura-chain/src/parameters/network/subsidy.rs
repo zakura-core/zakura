@@ -463,9 +463,10 @@ pub const BLOCK_SUBSIDY_FRACTION_NUMERATOR: u128 = 4_126;
 
 /// The denominator of [`BLOCK_SUBSIDY_FRACTION_NUMERATOR`].
 ///
-/// The fraction satisfies `(1 - BLOCK_SUBSIDY_FRACTION) ^ PostBlossomHalvingInterval` is
-/// approximately one half, so a smoothed curve issues about as much over four years as a
-/// halving era does.
+/// At the 75-second post-Blossom target spacing, the fraction satisfies
+/// `(1 - BLOCK_SUBSIDY_FRACTION) ^ PostBlossomHalvingInterval` is approximately
+/// one half. [`smoothed_block_subsidy`] scales it with the target spacing when
+/// ZIP 218 enables 25-second blocks.
 pub const BLOCK_SUBSIDY_FRACTION_DENOMINATOR: u128 = 10_000_000_000;
 
 /// Returns the height at which [ZIP 234] starts to apply on `network`, or `None` if the
@@ -507,19 +508,34 @@ pub fn is_zip234_active(network: &Network, height: Height) -> bool {
 ///
 /// # Consensus
 ///
+/// At the 75-second post-Blossom target spacing:
+///
 /// > BlockSubsidy(height) = ceiling(BLOCK_SUBSIDY_FRACTION * MoneyReserveAfter(height-1))
+///
+/// ZIP 218 triples the block rate. When both features are active, this calculation
+/// multiplies the fraction by `25 / 75` so the curve keeps the same wall-clock rate.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
 fn smoothed_block_subsidy(
+    height: Height,
+    net: &Network,
     money_reserve: Amount<NonNegative>,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
     let money_reserve =
         u128::try_from(i64::from(money_reserve)).map_err(|_| SubsidyError::Underflow)?;
+    let current_spacing =
+        NetworkUpgrade::target_spacing_for_height(net, height).num_seconds() as u128;
+    let post_blossom_spacing = NetworkUpgrade::Blossom.target_spacing().num_seconds() as u128;
 
     let subsidy = money_reserve
         .checked_mul(BLOCK_SUBSIDY_FRACTION_NUMERATOR)
+        .and_then(|amount| amount.checked_mul(current_spacing))
         .ok_or(SubsidyError::Overflow)?
-        .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
+        .div_ceil(
+            BLOCK_SUBSIDY_FRACTION_DENOMINATOR
+                .checked_mul(post_blossom_spacing)
+                .ok_or(SubsidyError::Overflow)?,
+        );
 
     let subsidy = i64::try_from(subsidy).map_err(|_| SubsidyError::Overflow)?;
 
@@ -554,7 +570,7 @@ fn reissuance_bonus(
         return Ok(Amount::zero());
     };
 
-    smoothed_block_subsidy(deficit)
+    smoothed_block_subsidy(height, net, deficit)
 }
 
 /// Returns the total block subsidy the halving schedule issues for blocks `1..=height`.
@@ -679,7 +695,7 @@ pub fn block_subsidy(
 
         if ZIP234_SMOOTHING_ENABLED {
             // The smoothed curve replaces halvings outright.
-            return smoothed_block_subsidy(money_reserve);
+            return smoothed_block_subsidy(height, net, money_reserve);
         }
 
         if ZIP234_HALVINGS_ENABLED {

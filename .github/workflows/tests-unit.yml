@@ -364,7 +364,7 @@ jobs:
             -p zakura-consensus -p zakura-rpc --lib
 
   zip234:
-    name: ZIP 234 feature tests
+    name: ZIP 234 feature tests (${{ matrix.name }})
     needs: changes
     # Compiles its own binaries, because the shared nextest archive is built
     # without these features.
@@ -378,8 +378,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The two issuance options on the NU7 ballot.
-        feature: [zip234, zip234-halvings]
+        # Test both issuance options with both faster-block-time outcomes.
+        include:
+          - name: zip234
+            chain-features: zakura-chain/zip234
+            features: zip234
+          - name: zip234-halvings
+            chain-features: zakura-chain/zip234-halvings
+            features: zip234-halvings
+          - name: zip218 + zip234
+            chain-features: zakura-chain/zip218,zakura-chain/zip234
+            features: zip218,zip234
+          - name: zip218 + zip234-halvings
+            chain-features: zakura-chain/zip218,zakura-chain/zip234-halvings
+            features: zip218,zip234-halvings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
@@ -388,11 +400,11 @@ jobs:
         with:
           toolchain: stable
       - uses: ./.github/actions/setup-zakura-build
-      - name: Test the crates that ${{ matrix.feature }} changes
+      - name: Test the crates that ${{ matrix.name }} changes
         run: |
-          cargo test --locked --features "zakura-chain/${{ matrix.feature }}" \
+          cargo test --locked --features "${{ matrix.chain-features }}" \
             -p zakura-chain --lib
-          cargo test --locked --features "${{ matrix.feature }}" \
+          cargo test --locked --features "${{ matrix.features }}" \
             -p zakura-consensus -p zakura-rpc -p zakura-state --lib
 
   network-dependent:

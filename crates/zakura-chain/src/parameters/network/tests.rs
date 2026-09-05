@@ -458,7 +458,7 @@ fn zip234_issuance() {
     use crate::{
         parameters::{
             subsidy::{cumulative_halving_subsidies_for_tests, zip234_start_height},
-            ZIP234_ENABLED, ZIP234_HALVINGS_ENABLED, ZIP234_SMOOTHING_ENABLED,
+            ZIP218_ENABLED, ZIP234_ENABLED, ZIP234_HALVINGS_ENABLED, ZIP234_SMOOTHING_ENABLED,
         },
         value_balance::ValueBalance,
     };
@@ -528,16 +528,18 @@ fn zip234_issuance() {
     )
     .is_ok());
 
-    // A reserve of 10^12 zatoshi issues ceiling(10^12 * 4126 / 10^10) = 412_600.
+    // A reserve of 10^12 zatoshi issues 412,600 at 75-second spacing. ZIP 218
+    // divides the fraction by three at 25-second spacing, rounded up to 137,534.
     let reserve = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
     let subsidy = block_subsidy(start, &network, Some(reserve)).expect("valid subsidy");
+    let reissuance_subsidy = if ZIP218_ENABLED { 137_534 } else { 412_600 };
 
     let halving_subsidy = halving_block_subsidy(start, &network).expect("valid subsidy");
 
     if ZIP234_SMOOTHING_ENABLED {
         assert_eq!(
             subsidy,
-            Amount::<NonNegative>::try_from(412_600).expect("valid amount")
+            Amount::<NonNegative>::try_from(reissuance_subsidy).expect("valid amount")
         );
 
         // The curve replaces halvings, so an empty reserve issues nothing.
@@ -564,13 +566,14 @@ fn zip234_issuance() {
             "a chain on its own schedule reissues nothing",
         );
 
-        // A chain 10^12 zatoshi behind its schedule reissues 412_600 on top.
+        // A chain 10^12 zatoshi behind its schedule adds the spacing-adjusted
+        // reissuance subsidy.
         let behind = (on_schedule
             + Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount"))
         .expect("valid amount");
         assert_eq!(
             block_subsidy(start, &network, Some(behind)).expect("valid subsidy"),
-            (halving_subsidy + Amount::try_from(412_600).expect("valid amount"))
+            (halving_subsidy + Amount::try_from(reissuance_subsidy).expect("valid amount"))
                 .expect("valid amount"),
         );
     }

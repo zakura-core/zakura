@@ -315,6 +315,8 @@ pub(super) struct PeerRoutine {
     /// Next request identity in this peer-session generation. Exhaustion fails
     /// closed instead of reusing an owner.
     next_request_id: Option<NonZeroU64>,
+    /// Decode-trace sequence, including messages lost by the bounded trace writer.
+    received_message_sequence: u64,
     budget: super::state::ByteBudget,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
@@ -415,6 +417,7 @@ impl PeerRoutine {
             fill_stop_trace_at: BTreeMap::new(),
             generation,
             next_request_id: NonZeroU64::new(1),
+            received_message_sequence: 0,
             budget,
             work,
             registry,
@@ -440,6 +443,7 @@ impl PeerRoutine {
     /// reject. A reject returns `Err(SinkReject::protocol(..))` so the supervised
     /// pipe tears the whole connection down.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
+        self.trace_decode_session_started();
         // Local clones so the `Notified` futures below borrow these handles, not
         // `self` — `self.try_fill()` needs `&mut self` while the notifications are
         // pinned. The clones share the same underlying `Arc`, so the wakes still
@@ -2437,6 +2441,7 @@ impl Drop for PeerRoutine {
     /// The reactor owns entry insert (on connect) and remove (on disconnect/
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {
+        self.trace_decode_session_finished();
         let outstanding_ranges = std::mem::take(&mut self.window.outstanding);
         for outstanding in outstanding_ranges {
             let unreceived: Vec<_> = outstanding
@@ -2487,6 +2492,67 @@ mod tests {
         peer: &ZakuraPeerId,
     ) -> GetBlocksServingSession {
         GetBlocksServingRegulator::new(config.clone()).session(peer.clone(), 0)
+    }
+
+    #[tokio::test]
+    async fn decode_trace_counts_rows_lost_to_backpressure() {
+        let config = ZakuraBlockSyncConfig::default();
+        let peer = ZakuraPeerId::new(vec![7; 32]).unwrap();
+        let cancel = CancellationToken::new();
+        let (out_send, _out_recv) = framed_channel(1);
+        let (_in_send, in_recv) = framed_channel(1);
+        let (sequencer_send, _sequencer_recv) = mpsc::channel(1);
+        let (reactor_send, _reactor_recv) = mpsc::channel(1);
+        let (_view_send, view_recv) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let (trace_send, mut trace_recv) = mpsc::channel(1);
+        let trace = ZakuraTrace::new(zakura_jsonl_trace::JsonlTracer::new(trace_send), "test");
+        let mut routine = PeerRoutine::new(
+            peer.clone(),
+            0,
+            BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone()),
+            in_recv,
+            config.clone(),
+            true,
+            17,
+            ByteBudget::new(1_000_000),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_send,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            reactor_send,
+            test_serving(&config, &peer),
+            view_recv,
+            cancel,
+            trace,
+        );
+        let request = super::BlockSyncMessage::GetBlocks {
+            start_height: block::Height(20),
+            count: 1,
+        };
+        routine.trace_decode_session_started();
+        routine.trace_message_received(&request); // The start row fills the trace queue.
+        let start: serde_json::Value =
+            serde_json::from_slice(&trace_recv.try_recv().unwrap().line).unwrap();
+        assert_eq!(start["message_sequence"], 0);
+        routine.trace_message_received(&request);
+        let received: serde_json::Value =
+            serde_json::from_slice(&trace_recv.try_recv().unwrap().line).unwrap();
+        assert_eq!(received["message_sequence"], 2);
+        assert_eq!(received["session_id"], 17);
+        assert_eq!(received["peer"], start["peer"]);
+        assert_eq!(received["range_start"], 20);
+        assert_eq!(received["range_count"], 1);
+        drop(routine);
+        let finished: serde_json::Value =
+            serde_json::from_slice(&trace_recv.try_recv().unwrap().line).unwrap();
+        assert_eq!(finished["event"], "block_decode_session_finished");
+        assert_eq!(finished["message_sequence"], 2);
     }
 
     fn reference_first_allowed_run(allowed: &[bool]) -> Option<std::ops::Range<usize>> {

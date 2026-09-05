@@ -116,6 +116,7 @@ class ImportTests(unittest.TestCase):
     def test_invalid_or_mismatched_scrapes_are_rejected(self):
         for metrics in [
             b"",
+            b"\xff",
             METRICS.replace(b"one-process", b"different-process"),
             METRICS.replace(b"finished 1", b"finished 0"),
             METRICS.replace(b'kind="get_blocks"} 2', b'kind="get_blocks"} 1'),
@@ -131,6 +132,7 @@ class ImportTests(unittest.TestCase):
     def test_exporter_zero_counters_and_exact_exponent_numbers_are_supported(self):
         metrics = METRICS.replace(b"started 1", b"started 1e0")
         metrics += b'sync_block_capture_decoded_messages{kind="block"} 0\n'
+        metrics += b'sync_block_capture_other_events{phase="query"} 2\n'
         self.assertTrue(load(episode(), metrics)["decode_totals_reconciled"])
 
 

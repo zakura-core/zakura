@@ -28,8 +28,16 @@ def reconcile_decode_totals(metrics, process, sessions, messages):
         r'sync_block_capture_(process_info|sessions_started|sessions_finished|decoded_messages)'
         r'(?:\{(process_trace_id|kind)="([a-zA-Z0-9_-]+)"\})? ([^ ]+)'
     )
-    for line in metrics.decode("utf-8").splitlines():
-        if not line.startswith("sync_block_capture_"):
+    try:
+        lines = metrics.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise IncompleteCapture("capture metrics are not UTF-8") from error
+    names = {"sync_block_capture_" + name for name in (
+        "process_info", "sessions_started", "sessions_finished", "decoded_messages"
+    )}
+    for line in lines:
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        if name not in names:
             continue
         match = pattern.fullmatch(line)
         if match is None:

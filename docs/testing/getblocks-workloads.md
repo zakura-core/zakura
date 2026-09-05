@@ -29,6 +29,12 @@ This first import contains decoded arrivals. The artifact explicitly sets
 `service_lifecycles_complete` and `capture_loss_verified` to false. Per-session
 continuity cannot detect a session whose entire trace disappeared. Process-wide
 event totals and a durable final loss report are needed to close that gap.
+The `sync.block.capture.sessions_started`, `sessions_finished`, and
+`decoded_messages` counters count attempts independently of trace emission;
+the latter is labeled by message kind. A capture controller must reconcile
+their final values with the trace after the clients disconnect and the server
+finishes the observed sessions. The arrival importer does not perform that
+cross-check yet.
 
 A resource replay additionally needs correlated admission, actual state-query
 completion, frame ownership through write completion or drop, and final

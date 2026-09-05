@@ -33,10 +33,12 @@ impl PeerRoutine {
     }
 
     pub(super) fn trace_decode_session_started(&self) {
+        metrics::counter!("sync.block.capture.sessions_started").increment(1);
         self.trace_decode_session_boundary("block_decode_session_started");
     }
 
     pub(super) fn trace_decode_session_finished(&self) {
+        metrics::counter!("sync.block.capture.sessions_finished").increment(1);
         self.trace_decode_session_boundary("block_decode_session_finished");
     }
 
@@ -52,6 +54,11 @@ impl PeerRoutine {
     /// Observe decode after transport or pending-input backpressure.
     /// Sequence gaps or a missing session boundary make this capture incomplete.
     pub(super) fn trace_message_received(&mut self, msg: &BlockSyncMessage) {
+        metrics::counter!(
+            "sync.block.capture.decoded_messages",
+            "kind" => block_sync_message_label(msg)
+        )
+        .increment(1);
         // Advance before attempting emission so a full trace queue leaves a gap.
         // Importers reject a saturated sequence rather than inventing new identities.
         self.received_message_sequence = self.received_message_sequence.saturating_add(1);

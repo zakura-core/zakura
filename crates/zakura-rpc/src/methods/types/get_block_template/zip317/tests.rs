@@ -213,7 +213,7 @@ mod zip218_template_limits {
         },
         transaction::{
             arbitrary::{fake_v5_with_orchard_actions, fake_v5_with_sapling_outputs},
-            Transaction, UnminedTx, VerifiedUnminedTx,
+            ShieldedActionCounts, Transaction, UnminedTx, VerifiedUnminedTx,
         },
     };
 
@@ -268,6 +268,35 @@ mod zip218_template_limits {
             !cfg!(feature = "zip218"),
             "a zip218 build rejects Orchard actions above the per-block limit at NU7"
         );
+    }
+
+    /// A shielded coinbase output consumes the same block capacity as a
+    /// shielded output in any other transaction.
+    #[test]
+    fn the_coinbase_consumes_shielded_capacity() {
+        let network = nu7_activation_testnet(1);
+        let limits = BlockTemplateLimits::remaining_shielded_limits(
+            &network,
+            Height(1),
+            ShieldedActionCounts {
+                sapling_ios: 1,
+                ..Default::default()
+            },
+        );
+
+        let expected_sapling_ios = if cfg!(feature = "zip218") {
+            SAPLING_BLOCK_IO_LIMIT - 1
+        } else {
+            u32::MAX
+        };
+        let expected_cost = if cfg!(feature = "zip218") {
+            GLOBAL_SHIELDED_BUDGET - 1
+        } else {
+            u32::MAX
+        };
+
+        assert_eq!(limits.sapling_ios, expected_sapling_ios);
+        assert_eq!(limits.cost, expected_cost);
     }
 
     fn template_limits(network: &Network, height: Height) -> BlockTemplateLimits {

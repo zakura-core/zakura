@@ -21,7 +21,9 @@ use zakura_chain::{
         SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
     },
     serialization::{CompactSizeMessage, TrustedPreallocate, ZcashDeserializeInto, ZcashSerialize},
-    transaction::{self, zip317::BLOCK_UNPAID_ACTION_LIMIT, VerifiedUnminedTx},
+    transaction::{
+        self, zip317::BLOCK_UNPAID_ACTION_LIMIT, ShieldedActionCounts, VerifiedUnminedTx,
+    },
     work::equihash::Solution,
 };
 use zakura_consensus::MAX_BLOCK_SIGOPS;
@@ -343,24 +345,20 @@ struct BlockTemplateLimits {
 
 impl BlockTemplateLimits {
     /// Returns the initial limits for a block template at `height`, with the
-    /// block overhead and `fake_coinbase_tx` already deducted from the byte and
-    /// sigop limits.
+    /// block overhead and `fake_coinbase_tx` already deducted from every
+    /// applicable limit.
     fn initial(
         network: &Network,
         height: Height,
         fake_coinbase_tx: &TransactionTemplate<amount::NegativeOrZero>,
     ) -> Self {
-        let (orchard_actions, sapling_ios, sprout_joinsplits, shielded_cost) =
-            if NetworkUpgrade::is_zip218_active(network, height) {
-                (
-                    ORCHARD_BLOCK_ACTION_LIMIT,
-                    SAPLING_BLOCK_IO_LIMIT,
-                    SPROUT_BLOCK_JOINSPLIT_LIMIT,
-                    GLOBAL_SHIELDED_BUDGET,
-                )
-            } else {
-                (u32::MAX, u32::MAX, u32::MAX, u32::MAX)
-            };
+        let coinbase: transaction::Transaction = fake_coinbase_tx
+            .data
+            .as_ref()
+            .zcash_deserialize_into()
+            .expect("a generated coinbase template is structurally valid");
+        let shielded_limits =
+            Self::remaining_shielded_limits(network, height, coinbase.shielded_action_counts());
 
         let max_block_bytes: usize = MAX_BLOCK_BYTES.try_into().expect("fits in memory");
         let reserved_block_bytes = block_template_overhead_bytes(network)
@@ -373,10 +371,41 @@ impl BlockTemplateLimits {
                 .expect("the fake coinbase and block overhead fit in a block"),
             remaining_sigops: MAX_BLOCK_SIGOPS - fake_coinbase_tx.sigops,
             remaining_unpaid_actions: BLOCK_UNPAID_ACTION_LIMIT,
-            remaining_orchard_actions: orchard_actions,
-            remaining_sapling_ios: sapling_ios,
-            remaining_sprout_joinsplits: sprout_joinsplits,
-            remaining_shielded_cost: shielded_cost,
+            remaining_orchard_actions: shielded_limits.orchard_actions,
+            remaining_sapling_ios: shielded_limits.sapling_ios,
+            remaining_sprout_joinsplits: shielded_limits.sprout_joinsplits,
+            remaining_shielded_cost: shielded_limits.cost,
+        }
+    }
+
+    /// Returns the ZIP 218 capacity left after the generated coinbase.
+    fn remaining_shielded_limits(
+        network: &Network,
+        height: Height,
+        coinbase: ShieldedActionCounts,
+    ) -> RemainingShieldedLimits {
+        if !NetworkUpgrade::is_zip218_active(network, height) {
+            return RemainingShieldedLimits {
+                orchard_actions: u32::MAX,
+                sapling_ios: u32::MAX,
+                sprout_joinsplits: u32::MAX,
+                cost: u32::MAX,
+            };
+        }
+
+        RemainingShieldedLimits {
+            orchard_actions: ORCHARD_BLOCK_ACTION_LIMIT
+                .checked_sub(coinbase.orchard_actions)
+                .expect("a generated coinbase satisfies the Orchard action limit"),
+            sapling_ios: SAPLING_BLOCK_IO_LIMIT
+                .checked_sub(coinbase.sapling_ios)
+                .expect("a generated coinbase satisfies the Sapling I/O limit"),
+            sprout_joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT
+                .checked_sub(coinbase.sprout_joinsplits)
+                .expect("a generated coinbase satisfies the Sprout JoinSplit limit"),
+            cost: GLOBAL_SHIELDED_BUDGET
+                .checked_sub(coinbase.cost())
+                .expect("a generated coinbase satisfies the global shielded budget"),
         }
     }
 
@@ -423,6 +452,14 @@ impl BlockTemplateLimits {
 
         true
     }
+}
+
+/// ZIP 218 capacity remaining after the generated coinbase transaction.
+struct RemainingShieldedLimits {
+    orchard_actions: u32,
+    sapling_ios: u32,
+    sprout_joinsplits: u32,
+    cost: u32,
 }
 
 /// Choose a transaction from `transactions`, using the previously set up `weighted_index`.

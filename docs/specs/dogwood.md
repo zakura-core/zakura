@@ -106,7 +106,7 @@ publishing `HeaderMeta`. It SHOULD precompute them for the candidate body while
 mining. A change to the body, including its coinbase, invalidates that cached
 encoding. A header-only change does not change the encoded body or part root.
 The signature still binds the root to the final mined block identifier.
-The block-hash-derived portion mapping is computed after mining.
+The block-hash-derived part-mask mapping is computed after mining.
 Bare-header propagation MAY proceed through headerchain while unfinished
 encoding runs; it MUST NOT authorize coded-part processing.
 
@@ -207,27 +207,31 @@ decides whether the block is valid, including whether the body's transaction
 commitments match the admitted header. Coding verification does not establish
 consensus validity and MUST NOT substitute for that validation.
 
-## 3. Portions and route state
+## 3. Part selection and route state
 
-A portion is a persistent subscription class for future parts.
-The profile fixes `P = PORTION_COUNT`. For a given block, sort all indices
+A part is one encoded payload. Persistent subscriptions select parts through a
+fixed-width `PartMask`; block-scoped subscriptions select exact indices.
+The profile fixes `0 < P = PART_MASK_BITS <= MAX_PARTS`.
+For a given block, sort all indices
 `i in [0, n)` by `(H(domain_route || block_id || u32(i)), i)`.
 Let `rank(i)` be the zero-based position:
 
 ```text
-portion(block_id, i) = rank(i) mod P
+mask_bit(block_id, i) = rank(i) mod P
+selected(mask, block_id, i) = mask[mask_bit(block_id, i)]
 ```
 
-This mapping assigns either `floor(n/P)` or `ceil(n/P)` parts to each portion.
-It distributes both data and parity indices. Nodes MUST NOT assume this
-determinism prevents proposer grinding or makes arrival times independent.
+Each enabled mask bit selects either `floor(n/P)` or `ceil(n/P)` parts.
+A mask bit is a selector, not a part index. This mapping distributes both data
+and parity indices. Nodes MUST NOT assume this determinism prevents proposer
+grinding or makes arrival times independent.
 They MUST evaluate actual part placement for failure coverage.
 
 Each node maintains these bounded structures:
 
 ```text
-incoming[scope][peer, portion]    // requests we sent
-outgoing[scope][peer, portion]    // requests peers sent
+incoming[scope][peer, mask_bit]  // requests we sent
+outgoing[scope][peer, mask_bit]  // requests peers sent
 block_incoming[block][peer, i]    // temporary exact-part overrides
 block_outgoing[block][peer, i]
 receive_grants[peer, grant_seq]
@@ -243,6 +247,9 @@ pending_payload[peer]           // local estimate, not sender queue occupancy
 `scope` is `Default` or `Proposer(key)` for persistent routes.
 The logical wire scope also permits `Block(block_id)` for exact-part repair.
 Each proposer has independent incoming and outgoing routes and route statistics.
+A switch between known proposer keys MUST NOT reset these routes or statistics.
+An unfamiliar key uses default routes until the receiver installs overrides.
+Changing congestion or the entry point behind the same key can stale its routes.
 Size and load classes are local measurement contexts, not wire selectors.
 One proposer has only one installed persistent row per peer at a time.
 Connection grants, pending bytes, budgets, and hard limits MUST remain shared
@@ -252,8 +259,8 @@ For a particular peer and block, the effective subscription is the first
 present row in this order:
 
 1. The exact-part `Block(block_id)` row.
-2. The `Proposer(key)` row, expanded through the portion mapping.
-3. The `Default` row, expanded through the portion mapping.
+2. The `Proposer(key)` row, expanded through the part-mask mapping.
+3. The `Default` row, expanded through the part-mask mapping.
 
 An absent row inherits. An empty explicit row disables all its parts.
 Changing an override MUST NOT change the row it overrides.
@@ -263,9 +270,9 @@ their local copies. Senders MUST NOT silently evict an active persistent row.
 Capacity pressure requires rejecting new state or closing the service.
 Block-row retirement MUST follow the block retention rules.
 
-`SubscribePortion` adds bits. When it first creates an override, the handler
+`SubscribeParts` adds bits. When it first creates an override, the handler
 MUST copy the currently inherited row before adding bits. The receiver MUST
-account for those inherited bits when choosing credit. `UnsubscribePortion`
+account for those inherited bits when choosing credit. `UnsubscribeParts`
 can remove bits or remove the entire override to restore inheritance.
 
 A subscriber controls only traffic sent to itself on that connection.
@@ -278,10 +285,10 @@ These are the only five application message families:
 
 ```text
 Scope = Default | Proposer(PublicKey) | Block(Hash)
-Selection = PortionBits | PartRanges
+Selection = PartMask | PartRanges
 UnsubscribeAction = Remove(Selection) | Inherit
 
-SubscribePortion {
+SubscribeParts {
     control_seq: u64,
     scope: Scope,
     selection: Selection,
@@ -291,7 +298,7 @@ SubscribePortion {
     byte_credit: u64,
 }
 
-UnsubscribePortion {
+UnsubscribeParts {
     control_seq: u64,
     scope: Scope,
     action: UnsubscribeAction,
@@ -311,7 +318,7 @@ FullBlock {
 ```
 
 Section 2 defines `HeaderMeta`. All hashes and integer encodings are fixed by
-the selected profile. `PortionBits` has exactly `ceil(P/8)` bytes and zero
+the selected profile. `PartMask` has exactly `ceil(P/8)` bytes and zero
 unused bits. `PartRanges` contains sorted, disjoint, non-adjacent, non-empty
 half-open ranges inside `[0,n)`. Selections MUST be non-empty.
 Only `Block` scope uses `PartRanges`.
@@ -319,7 +326,7 @@ Only `Block` scope uses `PartRanges`.
 Route updates and `FullBlock` MUST share one ordered control stream per
 connection direction.
 Their `control_seq` starts at one and increments without gaps or wraparound.
-The sequence of a `SubscribePortion` also identifies its grant.
+The sequence of a `SubscribeParts` also identifies its grant.
 A connection restart discards its sequence space and every grant.
 
 The sender MUST put `HeaderMeta` before the first part on each ordered block
@@ -331,7 +338,7 @@ Data queues MUST NOT block service of control traffic.
 
 ### Immutable grants
 
-The receiver MUST record a receive grant before sending `SubscribePortion`.
+The receiver MUST record a receive grant before sending `SubscribeParts`.
 The sender MUST reserve response work and record the matching send grant before
 enabling the update. A grant covers the message's selection, scope, height
 interval, part credit, and encoded-byte credit. Grants do not change when
@@ -418,8 +425,8 @@ Neither bound replaces the other.
 | --- | --- |
 | `HeaderMeta` | Bound header, key proof, signature, and verification work. Fully admit the header and authenticate metadata before assembly or forwarding. Cap candidates per height, pending parents, and recent blocks. |
 | `BlockPart` | Match an admitted block and live grant. Check height, scope, index, credit, exact payload length, and proof shape. Consume credit before proof verification. Store and forward only after verification. |
-| `SubscribePortion` | Check sequence, canonical selection, scope, height span, credit arithmetic, and state caps. Reserve maximum response work before atomically adding a grant and route bits. |
-| `UnsubscribePortion` | Check sequence, scope, action, and cadence. Remove bits from the effective row, creating a copy if needed, or remove an override. Cancel queued parts that no longer have an effective route. |
+| `SubscribeParts` | Check sequence, canonical selection, scope, height span, credit arithmetic, and state caps. Reserve maximum response work before atomically adding a grant and route bits. |
+| `UnsubscribeParts` | Check sequence, scope, action, and cadence. Remove bits from the effective row, creating a copy if needed, or remove an override. Cancel queued parts that no longer have an effective route. |
 | `FullBlock` | Require a previously announced, retained block and bounded cadence. Mark this peer complete and cancel its unsent parts for this block. Do not alter future routes. |
 
 Additional obligations:
@@ -537,8 +544,8 @@ transport congestion control separately paces bytes.
 
 The detailed rules below implement this control loop:
 
-1. The receiver SHOULD select a bounded set of suppliers per portion at startup.
-   It MUST NOT enable every portion merely because a peer connected. Additional
+1. The receiver SHOULD select a bounded set of suppliers per part at startup.
+   It MUST NOT enable every part merely because a peer connected. Additional
    subscriptions require a coverage, challenge, or recovery purpose.
 2. The receiver SHOULD retain bounded randomized challenges for each active
    proposer. It MUST compare the same parts under comparable workload.
@@ -573,14 +580,14 @@ MUST NOT describe distinct peer identities as independent physical paths.
 With one supplier per index and no extra routes, tolerance of any one peer
 requires `max_p |A[p]| <= n - k - safety_parts`. If a fast peer exceeds that
 share, the receiver needs extra distinct coverage elsewhere. This permits many
-portions per connection without silently abandoning redundancy.
+parts per connection without silently abandoning redundancy.
 
-The steady-state target SHOULD be one supplier per portion plus bounded
+The steady-state target SHOULD be one supplier per part plus bounded
 challenges and any routes required by this coverage test. Unmeasured default
-or proposer routes SHOULD start with two selected suppliers per portion where
+or proposer routes SHOULD start with two selected suppliers per part where
 available. The receiver SHOULD distribute these assignments across eligible
-peers, subject to byte limits, rather than assigning every portion to the same
-two peers. Two-peer networks may necessarily select both peers for every portion.
+peers, subject to byte limits, rather than assigning every part to the same
+two peers. Two-peer networks may necessarily select both peers for every part.
 The receiver SHOULD remove startup redundancy only after repeated successful
 reconstruction observations.
 
@@ -662,9 +669,12 @@ original context; it still informs recovery and block-outcome reports.
 The policy MUST define what constitutes a material change.
 
 The receiver SHOULD use proposer-specific comparisons when enough recent
-blocks exist in that context. Otherwise it SHOULD fall back to pooled
-comparisons for the same size and load classes, then randomized exploration.
-It MUST age out stale comparisons. Idle periods supply no successful samples.
+blocks exist in that context. Otherwise pooled measurements for the same size
+and load classes MAY guide candidate selection, followed by randomized exploration.
+Pooled measurements MUST NOT supply promotion votes for another proposer or
+replace its learned routes merely because a different proposer published a block.
+The receiver MUST age out stale comparisons. Idle periods supply no successful
+samples.
 One large block MUST NOT count as hundreds of independent block observations.
 The receiver MUST cap contexts, peer pairs, and tracked proposers.
 
@@ -678,7 +688,7 @@ Redundant suppliers each incur their own cost. Define:
 assigned_bytes[p,b] = S[b] * |A[p,b]|
 pending[p,b] = S[b] * count(assigned copies not yet received or retired)
 Q[p] = sum_active_blocks(pending[p,b]) + cancellation_tail[p]
-x[b,j] = S[b] * count(indices in portion j of block b)
+x[b,j] = S[b] * count(indices selected by mask bit j of block b)
 S[b] * floor(n[b]/P) <= x[b,j] <= S[b] * ceil(n[b]/P)
 ```
 
@@ -699,7 +709,7 @@ MUST report degraded service rather than inventing capacity.
 Before a block exists, the controller SHOULD evaluate additions against a
 bounded workload scenario from recent block sizes and burst concurrency.
 For a scenario containing part counts `n_hat[1..m]`, a conservative cost for
-one additional portion is:
+one additional mask bit is:
 
 ```text
 x_hat = sum_r(S * ceil(n_hat[r] / P))
@@ -725,12 +735,92 @@ selector extension; it MUST NOT assume the sender knows receiver-local load.
 
 ### Challenge and move load
 
-At each jittered control epoch, the receiver SHOULD select an incumbent portion
-at random and one alternative peer at random from eligible connections. It
-SHOULD weight incumbent selection by assigned bytes. A challenge adds a second
-supplier before a future block, subject to byte and coverage limits. Ordinary
-same-part duplication MAY supply equivalent observations. The receiver MUST
-retain a bounded nonzero exploration allowance for unmeasured and weak peers.
+A challenge adds a supplier for selected parts before a future block. The
+receiver SHOULD first use comparisons from existing backup subscriptions.
+When it adds demand, it SHOULD choose an incumbent mask bit weighted by assigned
+bytes and an alternative peer uniformly from eligible peers not serving those
+parts. Unmeasured and previously slow peers MUST remain eligible for exploration
+unless independent service or resource constraints exclude them.
+
+#### Challenge frequency
+
+The receiver MUST bound both extra authorized bytes and trial-start frequency.
+A timer alone cannot set a useful rate: it churns routes during idle periods,
+and the same number of trials costs more under larger or concurrent blocks.
+The baseline uses one node-wide exploration balance, not one allowance per key:
+
+```text
+0 < exploration_fraction < 1
+0 <= exploration_initial <= exploration_cap
+E = exploration_initial
+V[b] = n[b] * MAX_PART_MESSAGE_BYTES
+E = min(exploration_cap, E + floor(exploration_fraction * V[b]))
+    on the first reconstruction and consensus acceptance of block b
+E = E - challenge_charge
+    before authorizing extra challenge responses, only if E >= challenge_charge
+```
+
+The receiver MUST use checked arithmetic for balances and charges.
+It MUST credit each relevant block hash at most once across peers,
+proposers, reconnects, and reorganization. It MUST bound the eligible height
+window and deduplication history; retired blocks cannot earn credit again.
+Idle time, duplicate parts, repeated metadata, and proposer-key changes MUST
+NOT replenish or reset `E`. Failed blocks earn no credit; recovery retains its
+separate reserve. This balance adapts the token-bucket idea in
+[RFC 3290, appendix A](https://www.rfc-editor.org/rfc/rfc3290.html#appendix-A)
+to completed block traffic instead of elapsed time.
+
+`challenge_charge` MUST cover the maximum encoded response bytes authorized
+for the trial, including warming, plus bounded subscription-control bytes.
+The receiver SHOULD issue dedicated finite challenge grants. If another live
+grant can authorize additional responses on the trial route, the receiver MUST
+charge those bytes too or isolate the trial from that grant. Forecast demand
+alone is insufficient. Renewals require another charge. Cancellation MUST NOT
+refund the exploration charge: in-flight responses remain authorized.
+Existing backup demand needs no extra charge unless the challenge increases its
+authorized work. With no refunds, cumulative challenge authorization is bounded
+by `exploration_initial + exploration_fraction * sum(V[b])`.
+
+The receiver SHOULD queue at most one pending trial per recently active proposer
+and serve the queue round-robin. New keys join the tail without a fresh budget.
+An eligible waiting trial retains its turn while funds accumulate, provided its
+charge fits `exploration_cap`. Local policy MUST bound the active-proposer window,
+queue size, and waiting time. Expired or infeasible entries leave the queue.
+Sparse proposers get opportunities, not a guaranteed number of observations.
+
+The receiver MUST space node-wide trial starts by at least
+`CHALLENGE_MIN_INTERVAL >= CONTROL_INTERVAL`, with independent bounded jitter.
+It MUST NOT start a new trial merely because an epoch elapsed. Admission also
+requires an active proposer, an alternative peer, sufficient exploration funds,
+connection capacity, and a free trial slot. The baseline SHOULD allow at most
+one active trial per proposer and per challenger connection. A global
+`MAX_CHALLENGES` bounds simultaneous trials and includes warming routes.
+
+A trial SHOULD retain the same pair and selection across blocks so it can
+collect repeated comparable observations. It MUST end on a decision, peer loss,
+credit exhaustion, `CHALLENGE_MAX_BLOCKS` distinct admitted matching blocks, or
+`CHALLENGE_MAX_AGE`, whichever comes first. The block cap includes warming and
+inconclusive observations. Expiry without enough decisive blocks is inconclusive,
+not a challenger loss. Removing the trial MUST preserve pre-existing backup
+demand. Cancellation tails remain subject to the existing bounds. The receiver
+MUST NOT delay `FullBlock` to prolong a trial.
+
+For equal-size blocks, let `f` be the fraction of a block duplicated in one
+trial observation and `rho = exploration_fraction`. Ignoring startup credit,
+proof-size differences, and control bytes, each observation costs about `f/rho`
+completed blocks of budget. At `rho = 1/32`, duplicating one quarter costs about
+eight blocks; three observations cost about 24 blocks. Warming or inconclusive
+observations increase this cost. These are accounting examples, not recommended
+parameters. Smaller selections permit more observations for the same budget.
+More frequent trials cannot create observations for a proposer that rarely mines.
+
+Simulations MUST sweep the byte fraction, minimum interval, selection width,
+and trial lifetime together. They MUST measure adaptation in both elapsed time
+and proposer blocks, including warm-up cost and trials that expire inconclusively.
+The policy MUST retain a positive exploration fraction, but MUST NOT bypass
+hard limits or recovery priority to meet a nominal challenge rate.
+
+#### Compare and promote
 
 For the same part, a valid copy wins if it arrives at least `race_epsilon`
 before the other copy or before a cutoff at which the other is still absent.
@@ -759,7 +849,7 @@ MUST preserve distinct-part coverage at both stages. The temporary overlap
 MUST fit grants and exploration or migration reserves. The controller SHOULD
 observe the winner serving the added load before pruning. It SHOULD limit
 each connection to one unsettled promotion across all proposers, with at most
-`MIGRATION_BYTES` additional forecast bytes. One portion larger than that limit
+`MIGRATION_BYTES` additional forecast bytes. A mask-bit assignment above that limit
 cannot be a routine promotion. The receiver MAY use bounded exact-part recovery
 or retain the existing route until it can afford a larger trial.
 
@@ -812,7 +902,7 @@ comparison supplies no winning alternative in that case.
 
 Transport congestion control MUST pace each connection. Sender queue bounds
 and service budgets MUST remain active even while the controller learns.
-A receiver MUST NOT allocate all portions from raw first-arrival counts or
+A receiver MUST NOT allocate all parts from raw first-arrival counts or
 assume random source distribution eliminates the need for exploration.
 
 This mechanism borrows randomized comparison from
@@ -848,7 +938,7 @@ The profile MUST fix these before implementations claim interoperability:
 | --- | --- |
 | Part payload | 64 KiB default; selected profile fixes the value |
 | Codec and parity schedule | Section 2 fixes systematic Reed–Solomon over GF(2^16), little-endian elements, and `ceil(k/4)` parity parts |
-| Portion count and hash | Balanced mapping in section 3; `P` and `H` `TBD` |
+| Part-mask width and hash | Balanced mapping in section 3; `P` and `H` `TBD` |
 | Proposer authentication | PoW-bound key and signed metadata; chain binding and signature scheme `TBD` |
 | Serialization | Message discriminators, integer encoding, Merkle proof format, and canonical key encoding `TBD` |
 | Resource bounds | Frame and field caps, part count, grants, height span, candidates, selectors, queues, and retention `TBD` |
@@ -863,8 +953,13 @@ safety margin, and retention limits. Controller configuration MUST also define:
   `utilization_threshold`, and acceptable yield.
 - `MIN_RACE_BLOCKS`, `MIN_FAILURE_BLOCKS`, `race_epsilon`, `SWITCH_THRESHOLD`,
   `STABLE_WINDOWS`, and the settling interval.
-- Exploration, migration, recovery, and cancellation-tail byte/time limits,
-  plus global limits on concurrent trials.
+- `exploration_fraction`, `exploration_initial`, `exploration_cap`,
+  `CHALLENGE_MIN_INTERVAL`, its jitter bound, `CHALLENGE_MAX_BLOCKS`,
+  `CHALLENGE_MAX_AGE`, and `MAX_CHALLENGES`. The cap MUST fund at least one
+  minimum trial with control overhead. The block and age caps SHOULD allow
+  warming plus `MIN_RACE_BLOCKS` observations at the expected proposer rate.
+- Active-proposer queue bounds, grant isolation, migration, recovery, and
+  cancellation-tail byte/time limits, plus global limits on concurrent trials.
 
 These controller values require simulation. The control policy is local; peers do not
 negotiate a common estimator or trust each other's measurements.
@@ -882,6 +977,8 @@ The implementation MUST test:
   responses, reordered streams, and parts crossing unsubscribe or completion.
 - Proposer and block inheritance, empty overrides, reconnect cleanup, terminal
   completion, and deduplication across grants and services.
+- Alternating known proposers, preserving their distinct routes and votes,
+  an unfamiliar key using defaults, and changed ingress behind an existing key.
 - Two-peer reciprocal waits, larger isolated cycles, arbitrary block entry
   points, cold proposers, skewed part placement, peer loss, and failed repair.
 - A nearby high-capacity proposer, congestion after route concentration,
@@ -895,9 +992,18 @@ The implementation MUST test:
 - Races censored by `FullBlock` or unsubscribe, local verification overload,
   correlated part arrivals within one block, and peers that perform well only
   during probes. Completion MUST NOT create artificial deadline failures.
+- Challenge funding under idle time, block bursts, duplicate announcements,
+  invalid bodies, reconnects, key churn, and block replay after history eviction.
+  Cumulative charged authorization MUST obey the exploration bound.
+- Challenge responses authorized by overlapping grants, renewal, cancellation,
+  and large blocks exhausting a small trial's credit. A route label alone
+  MUST NOT bypass exploration accounting.
+- Unequal proposer rates, queue fairness, an unaffordable or expired trial,
+  empty mask selections for small blocks, warming without acknowledgements,
+  and inconclusive expiry. Timers MUST NOT generate unbounded trial starts.
 - Budget growth without loaded evidence, repeated failures, simultaneous
-  promotions, one portion exceeding the migration budget, and cancellation
-  tails. No context or key change may create a fresh connection budget.
+  promotions, one mask-bit assignment exceeding the migration budget, and
+  cancellation tails. No context or key change may create a fresh connection budget.
 - A receiver bottleneck shared by every peer, an upstream source stall, and
   other receivers adapting concurrently. The simulator MUST include control
   delay, sender scheduling, and feedback-driven changes to upstream routes.

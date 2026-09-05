@@ -5,7 +5,7 @@ delay increases the orphan rate. We need low latency from any proposer across
 peers with unequal bandwidth.
 
 Dogwood pushes block parts along subscriptions established before the block
-exists. Each node requests different portions from different peers and forwards
+exists. Each node requests different parts from different peers and forwards
 verified parts to its subscribers. It shifts subscriptions toward faster peers.
 Parity lets it reconstruct the block without waiting for every part.
 
@@ -33,9 +33,11 @@ measurements to adjust push routes. It starts with selected suppliers, not the
 whole block from every peer. Subscriptions divide the traffic across connections
 and adapt separately for each proposer.
 
-This favors latency over bandwidth efficiency. A new proposer or a change in
-congestion can make existing routes unsuitable. Recovery must work before the
-controller learns better routes.
+Each node retains learned routes for each proposer. Switching between known proposers
+does not discard those routes. An unfamiliar proposer uses default routes until
+measurements support its own assignments. Congestion or a change in a proposer's
+entry point can still make its routes stale. Recovery handles missing parts
+while the controller adapts.
 
 ## Parts and subscriptions
 
@@ -47,19 +49,19 @@ Any `k` distinct correctly encoded parts reconstruct the body.
 over the parts, and proposer authentication. Each `BlockPart` carries a proof
 against that root. Nodes verify parts before forwarding or decoding them.
 
-The next block's size is unknown when a node subscribes. The subscription names
-a *portion*: one of a fixed number of groups, rather than fixed part indices.
-A block-hash-derived permutation distributes data and parity parts across these
-groups. The same subscription selects more parts when the block is larger.
+A subscription selects parts. For future blocks, it uses a fixed-width part
+mask that maps to indices once the block size and hash are known. Each enabled
+bit selects a share of the encoded parts. For an announced block, a subscription
+can name exact indices. A part always means one payload, not a group of payloads.
 
 Each node chooses its suppliers independently. These choices form overlapping
-directed graphs: different portions follow different paths through the same
+directed graphs: different parts follow different paths through the same
 peers. A node can forward a part as soon as it verifies it. Once it reconstructs
 and checks the encoded body, it can regenerate parts that never reached it.
 
 ### Block-part lifecycle
 
-Node A and Node B already have subscriptions. The diagram follows one part.
+The nodes subscribe before the block exists. The diagram then follows one part.
 Both nodes collect other parts through their own subscriptions.
 
 ```mermaid
@@ -67,6 +69,8 @@ sequenceDiagram
     participant P as Proposer
     participant A as Node A
     participant B as Node B
+    B->>A: SubscribeParts
+    A->>P: SubscribeParts
     P->>A: HeaderMeta
     A->>A: Verify header and metadata
     A->>B: HeaderMeta
@@ -91,8 +95,8 @@ Reconstruction checks do not replace consensus block validation.
 | --- | --- |
 | `HeaderMeta` | Announce the header and authenticated commitment to its encoded body. |
 | `BlockPart` | Send one part with its proof and subscription authorization. |
-| `SubscribePortion` | Request future portions or specific parts of an active block. |
-| `UnsubscribePortion` | Stop a route or restore inherited subscriptions. |
+| `SubscribeParts` | Request parts of future blocks or specific parts of an active block. |
+| `UnsubscribeParts` | Stop a route or restore inherited subscriptions. |
 | `FullBlock` | Report reconstruction and stop receiving parts for this block. |
 
 Subscriptions grant finite part and byte credit over a bounded height range.
@@ -101,14 +105,16 @@ making an authorized in-flight part a protocol violation.
 
 ## Subscription state
 
-Each node keeps two peer-by-portion bitmaps. Incoming bits record what it
-requests from peers. Outgoing bits record what peers request from it.
+Each node keeps incoming and outgoing part masks per peer and proposer.
+Incoming masks record what it requests. Outgoing masks record what peers
+request from it. When a block arrives, the node resolves these masks into
+peer-by-part bitmaps.
 
-A default bitmap serves unfamiliar proposers. At startup, the node selects two
-suppliers per portion where available and distributes them across peers.
-Here, each checkmark enables a subscription:
+Default masks serve unfamiliar proposers. At startup, the node selects two
+suppliers per part where available and distributes them across peers.
+Here, each checkmark shows a requested part of an announced block:
 
-| Incoming peer | Portion 0 | Portion 1 | Portion 2 | Portion 3 |
+| Incoming peer | Part 0 | Part 1 | Part 2 | Part 3 |
 | --- | --- | --- | --- | --- |
 | A | ✓ | — | ✓ | — |
 | B | ✓ | ✓ | — | — |
@@ -119,7 +125,7 @@ The node learns separate routes for each authenticated proposer. A nearby peer
 may provide most of one proposer's block without being the best supplier for
 another. For example, learned primary assignments could look like this:
 
-| Proposer | Portion 0 | Portion 1 | Portion 2 | Portion 3 |
+| Proposer | Part 0 | Part 1 | Part 2 | Part 3 |
 | --- | --- | --- | --- | --- |
 | X | A | A | A | B |
 | Y | C | C | C | A |
@@ -128,7 +134,7 @@ Backup subscriptions supplement these assignments where failure coverage
 requires them. Changing X's routes does not change Y's routes. All routes share
 the connection's byte budget.
 
-Outgoing demand is independent. A can request a portion from B while B requests
+Outgoing demand is independent. A can request a part from B while B requests
 it from A. Either node might receive a part elsewhere first or reconstruct it.
 A node suppresses an echo to the peer that supplied the part. Reciprocal
 subscriptions do not prove that either peer has the data.
@@ -145,18 +151,18 @@ to that connection.
 
 Arrival times alone cannot reveal unused capacity: a peer might be slow because
 it received the part late, or because its connection is congested. The receiver
-instead tests an alternative under load. It requests the same portion from two
+instead tests an alternative under load. It requests the same parts from two
 peers and compares verified arrivals on its own clock. No sender timestamp or
 RTT estimate is needed.
 
 The controller follows five rules:
 
-1. **Compare like with like.** Occasionally add a random challenger for one
-   portion. Compare the same parts from the same proposer under similar block
-   size and concurrent load.
+1. **Compare like with like.** Add a random challenger for selected parts within
+   a traffic-funded exploration budget. Compare the same parts from the same
+   proposer under similar block size and concurrent load.
 2. **Move gradually.** Require repeated wins. Keep the old supplier until the
    replacement delivers. Preserve failure coverage.
-3. **Budget bytes, not portions.** Count active blocks, proposers, backups, and
+3. **Budget bytes across blocks.** Count active blocks, proposers, backups, and
    challenges together per connection. Limit each move and measure its effect
    before adding more demand.
 4. **Adjust the budget from delivery.** Raise it gradually after success under
@@ -165,7 +171,7 @@ The controller follows five rules:
 5. **Recover independently.** Repair a stalled block within a bounded reserve.
    Do not wait for route learning. Do not count canceled copies as failures.
 
-For one portion, a successful challenge changes the route as follows.
+For selected parts, a successful challenge changes the route as follows.
 Arrows show pushed data; subscription requests travel in the opposite direction.
 
 ```text
@@ -177,10 +183,16 @@ After:             Receiver <── B
 The receiver keeps A if it still needs A for failure coverage. Random challenges
 continue so peers can recover from past losses.
 
-A portion's byte cost grows with block size and concurrent block count. With
-four portions and 64 KiB parts, one portion of a 40-part block costs 640 KiB.
+A part mask's byte cost grows with block size and concurrent block count.
+Selecting a quarter of a 40-part block costs 640 KiB at 64 KiB per part.
 Two such blocks cost 1.25 MiB. A win at the first load does not establish capacity
 for the second.
+
+Challenge frequency follows block traffic, not just a timer. The receiver funds
+extra copies from the encoded size of completed, validated blocks. It spaces trial
+starts, shares opportunities across active proposers, and bounds each trial's
+lifetime. Idle time adds no budget. Existing backup deliveries can provide
+comparisons without adding traffic.
 
 Standing subscriptions use an estimated workload. When `HeaderMeta` arrives,
 the receiver checks actual demand and coverage. Corrections take control-message
@@ -193,7 +205,7 @@ whether this controller adapts quickly without oscillating.
 
 ## Redundancy and recovery
 
-The steady-state target is one supplier per portion, plus routes needed for
+The steady-state target is one supplier per part, plus routes needed for
 failure coverage and challenges. Parity covers missing parts without requiring
 a duplicate of each part.
 

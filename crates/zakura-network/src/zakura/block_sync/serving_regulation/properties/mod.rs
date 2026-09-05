@@ -1,5 +1,6 @@
 //! GetBlocks ownership histories with an independent model and concrete JSON replay.
 
+mod defaults;
 mod model;
 mod negative_controls;
 mod production;

@@ -105,6 +105,40 @@ replacement sessions, pending-input backpressure, and local-pressure
 classification. They complement these generated suites; the property suite does
 not claim to generate every reactor terminal path.
 
+### What the defaults allow
+
+`serving_regulation/properties/defaults.rs` uses unmodified configuration and
+independent numeric expectations. The default response count is one block.
+A maximum 2,000,000-byte block uses 2,000,010 payload bytes with its framing
+and terminal, and costs 2,065,546 rate units including fixed work.
+
+| Account | Maximum-block witness | What permits the next request |
+| --- | --- | --- |
+| Peer identity rate | 16 completed responses from a full burst | Refill at 16 MiB/s |
+| Node rate | 64 completed responses shared across five identities | Refill at 64 MiB/s |
+| Node active work | 64 retained requests after rate refill | Release one active owner |
+| Session outstanding bytes | 33 retained full responses | Finish or drop a frame write |
+| Node outstanding bytes | 134 retained full responses across five sessions | Finish or drop a frame write |
+| Pending inputs | 64 per session and 1,024 across sessions | Release a retained input |
+
+The burst witnesses finish writes and release active work, so another account
+cannot explain their rate rejection. The rate tests also check the nanosecond
+immediately before sufficient refill and the first instant that permits retry.
+The active and byte tests refill between admissions to isolate those bounds.
+Failed admissions must leave earlier reservations unchanged.
+
+At these defaults the node active limit is lower than the advertised session
+active limit; the latter is exercised separately with smaller configured bounds.
+The pending witness starts at retained-input ownership. The peer routine's
+separate backpressure tests cover its one decoded input waiting for those slots.
+
+Settlement examples cover no queued output, an empty terminal, a small block,
+and a maximum block. All initially reserve the worst case; only fixed work and
+transferred payload remain spent after the final query owner drops. Frame bytes
+remain outstanding until their transport owner ends. These sizing examples
+transfer real charges without allocating bodies; they do not measure sync
+throughput, total memory, or transport delivery.
+
 ## Reading a failure
 
 Start with the first divergent action and its expected/observed snapshot. There

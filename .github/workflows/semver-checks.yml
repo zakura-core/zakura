@@ -39,7 +39,7 @@ on:
       - "**/Cargo.lock"
       - .github/workflows/semver-checks.yml
       - .github/workflows/scripts/affected_semver_packages.py
-      - .github/workflows/scripts/patch_tinyvec_for_rustdoc.sh
+      - .github/workflows/scripts/patch_registry_for_semver.sh
       - .github/workflows/scripts/test_affected_semver_packages.py
   push:
     branches: [main]
@@ -49,7 +49,7 @@ on:
       - "**/Cargo.lock"
       - .github/workflows/semver-checks.yml
       - .github/workflows/scripts/affected_semver_packages.py
-      - .github/workflows/scripts/patch_tinyvec_for_rustdoc.sh
+      - .github/workflows/scripts/patch_registry_for_semver.sh
       - .github/workflows/scripts/test_affected_semver_packages.py
 
   # Run in the merge queue so queued changes are revalidated against the latest
@@ -204,8 +204,8 @@ jobs:
 
       - uses: ./.github/actions/setup-zakura-build
 
-      - name: Patch tinyvec for alloc-only rustdoc builds
-        run: .github/workflows/scripts/patch_tinyvec_for_rustdoc.sh
+      - name: Patch registry crates for semver rustdoc builds
+        run: .github/workflows/scripts/patch_registry_for_semver.sh
 
       - name: Check package against its stable crates.io baseline
         env:
@@ -257,8 +257,8 @@ jobs:
 
       - uses: ./.github/actions/setup-zakura-build
 
-      - name: Patch tinyvec for alloc-only rustdoc builds
-        run: .github/workflows/scripts/patch_tinyvec_for_rustdoc.sh
+      - name: Patch registry crates for semver rustdoc builds
+        run: .github/workflows/scripts/patch_registry_for_semver.sh
 
       - name: Install nightly rustdoc toolchain
         run: rustup toolchain install nightly --profile minimal
@@ -307,8 +307,8 @@ jobs:
 
       - uses: ./.github/actions/setup-zakura-build
 
-      - name: Patch tinyvec for alloc-only rustdoc builds
-        run: .github/workflows/scripts/patch_tinyvec_for_rustdoc.sh
+      - name: Patch registry crates for semver rustdoc builds
+        run: .github/workflows/scripts/patch_registry_for_semver.sh
 
       - name: Check all crates and warm published release baselines
         id: warm

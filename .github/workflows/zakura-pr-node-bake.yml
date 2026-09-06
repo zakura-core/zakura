@@ -17,6 +17,7 @@ on:
       - .github/workflows/zakura-pr-node-bake.yml
       - .github/workflows/scripts/do_provision.py
       - .github/workflows/scripts/do_seed_approach.py
+      - .github/workflows/scripts/do_snapshot.py
       - .github/workflows/scripts/pr-node-bake.sh
   workflow_dispatch:
     inputs:
@@ -188,16 +189,19 @@ jobs:
           if [ "$REBUILD_APPROACH_FROM_SANDBLAST" != "true" ]; then
             MAINNET_H=$(fetch_height /root/mainnet-state-height)
             TESTNET_H=$(fetch_height /root/testnet-state-height)
-            MAINNET_ID=$(doctl compute volume snapshot "${MAINNET_VOL_ID}" \
-              --snapshot-name "${STATE_PREFIX}-mainnet-${STAMP}-${REGION}-h${MAINNET_H}" --output json | jq -er 'if type == "array" then .[0].id else .id end')
+            MAINNET_ID=$(python3 .github/workflows/scripts/do_snapshot.py \
+              --volume-id "${MAINNET_VOL_ID}" --region "$REGION" \
+              --name "${STATE_PREFIX}-mainnet-${STAMP}-${REGION}-h${MAINNET_H}")
             echo "mainnet_id=$MAINNET_ID" >> "$GITHUB_OUTPUT"
-            TESTNET_ID=$(doctl compute volume snapshot "${TESTNET_VOL_ID}" \
-              --snapshot-name "${STATE_PREFIX}-testnet-${STAMP}-${REGION}-h${TESTNET_H}" --output json | jq -er 'if type == "array" then .[0].id else .id end')
+            TESTNET_ID=$(python3 .github/workflows/scripts/do_snapshot.py \
+              --volume-id "${TESTNET_VOL_ID}" --region "$REGION" \
+              --name "${STATE_PREFIX}-testnet-${STAMP}-${REGION}-h${TESTNET_H}")
             echo "testnet_id=$TESTNET_ID" >> "$GITHUB_OUTPUT"
           fi
           if [ -n "$APPROACH_H" ]; then
-            APPROACH_ID=$(doctl compute volume snapshot "${APPROACH_VOL_ID}" \
-              --snapshot-name "${APPROACH_PREFIX}-mainnet-${STAMP}-${REGION}-h${APPROACH_H}" --output json | jq -er 'if type == "array" then .[0].id else .id end')
+            APPROACH_ID=$(python3 .github/workflows/scripts/do_snapshot.py \
+              --volume-id "${APPROACH_VOL_ID}" --region "$REGION" \
+              --name "${APPROACH_PREFIX}-mainnet-${STAMP}-${REGION}-h${APPROACH_H}")
             echo "approach_id=$APPROACH_ID" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::approach state was not refreshed; retaining the existing pinned snapshot"

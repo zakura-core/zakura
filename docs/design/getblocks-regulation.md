@@ -11,8 +11,8 @@ families do not yet share these accounts.
 | Pending requests | 64 per session, 1,024 per node | Queue entry or admission task; released on admission or cancellation |
 | Active requests | 64 per node; per-session ceiling follows advertised inflight requests | Ledger, state worker, returned result, and pending terminal share ownership; released when their last owner drops |
 | Outstanding response payload | 64 MiB per session, 256 MiB per node | Reserved before the query; actual queued bytes transfer into frame leases, released after the application write completes or drops |
-| Peer work rate | 16 MiB/s; burst 32 MiB + 128 bytes + 9 bytes + 64 KiB | Identity account survives reconnects while retained; fixed work and queued payload consume tokens, unused response allowance is refunded |
-| Node work rate | 64 MiB/s; burst 128 MiB | Shared GetBlocks account with the same settlement rules |
+| Peer work rate | 128 MiB/s; burst 32 MiB + 128 bytes + 9 bytes + 64 KiB | Identity account survives reconnects while retained; fixed work and queued payload consume tokens, unused response allowance is refunded |
+| Node work rate | 256 MiB/s; burst 128 MiB | Shared GetBlocks account with the same settlement rules |
 | Fixed request work | 64 KiB of byte-equivalent work | Committed when the reactor accepts the request, even for an empty response |
 | Query response deadline | 8 seconds | Ends response delivery; underlying state work keeps its charge until completion |
 | Terminal queue deadline | `request_timeout`, 8 seconds by default | Retains the terminal and request ownership while waiting; expiry closes the original session without a misconduct score |
@@ -80,7 +80,8 @@ responses per peer, round-robin, with and without regulation.
 cargo test --locked -p zakura-network --lib serving_fixed_workload_measurement -- --ignored --nocapture
 ```
 
-Observed on the dedicated Mac Studio on 2026-09-04 with a debug build:
+Observed on the dedicated Mac Studio on 2026-09-04 with a debug build and the
+original peer 16 / node 64 MiB/s rates:
 
 | Serialized body bytes | Peers | Total responses | Unregulated ms | Regulated ms |
 | --- | --- | --- | --- | --- |
@@ -102,9 +103,14 @@ three peers. The existing native transport test
 basic download progress and native ordered delivery, not sustained native
 GetBlocks performance.
 
-Defaults remain provisional. This measurement excludes disk reads, a real QUIC
+The rates were subsequently raised to peer 128 / node 256 MiB/s after native
+sync measurements and captured-workload replay showed substantial queueing at
+the original rates. These are byte-equivalent work rates, including the fixed
+request charge, rather than wire-bandwidth limits. Burst capacities and the
+separate pending, active, and outstanding-byte limits remain unchanged.
+
+Defaults remain provisional. This local measurement excludes disk reads, a real QUIC
 GetBlocks exchange, and process memory under sustained pressure. Production
 calibration still needs representative block eras, concurrent serving and
 downloading, constrained readers, and measurements of throughput, queue delay,
-state concurrency, and resident memory. Generated property/load histories remain
-deferred until the production policy is settled.
+state concurrency, and resident memory.

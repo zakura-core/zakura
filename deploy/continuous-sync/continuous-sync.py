@@ -3,8 +3,8 @@
 
 The controller repeatedly builds the configured ref, starts `zakurad` from an
 empty allowlisted state directory, waits until the node is stably ready at tip,
-posts a Slack completion, and starts over. Any failure writes a durable halt
-marker and exits non-zero; operators must explicitly run `resume`.
+records a completion for the audit digest, and starts over. Any failure writes a
+durable halt marker and exits non-zero; operators must explicitly run `resume`.
 """
 
 from __future__ import annotations
@@ -597,24 +597,16 @@ def cleanup_retention(config: Config, active_run: Path | None = None) -> None:
             shutil.rmtree(child, ignore_errors=True)
 
 
-def completion_text(config: Config, run_state: dict[str, Any]) -> str:
-    p = config.policy
-    duration = format_duration(int(run_state["sync_duration_seconds"]))
-    return (
-        f":white_check_mark: Zakura sync complete: {p.hostname} | {policy_mode(p)} | "
-        f"{ssh_target(p)} | sync time: {duration}"
-    )
-
-
 def failure_text(config: Config, run_state: dict[str, Any], reason: str) -> str:
     p = config.policy
     duration = format_duration(int(run_state["time_to_failure_seconds"]))
     height = run_state.get("height")
     height_text = str(height) if isinstance(height, int) else "unknown"
+    run_text = f" | run: {run_state['run_id']}" if run_state.get("run_id") else ""
     return (
         f":rotating_light: Zakura failed: {p.hostname} | {policy_mode(p)} | "
         f"{ssh_target(p)} | time to failure: {duration} | height: {height_text} | "
-        f"reason: {short_reason(reason)}"
+        f"reason: {short_reason(reason)}{run_text}"
     )
 
 
@@ -715,12 +707,16 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
             "last_success_sha": sha,
             "last_success_at": completed_at,
             "last_success_run": run_id,
+            "last_success_duration_seconds": run_state["sync_duration_seconds"],
+            "completion_digest": True,
+            "completion_digest_start_runs": state.get(
+                "completion_digest_start_runs", int(state.get("runs", 0))
+            ),
             "phase": "complete",
             "runs": int(state.get("runs", 0)) + 1,
         }
     )
     save_state(state_path, state)
-    post_slack(config, completion_text(config, run_state))
     cleanup_retention(config)
     return state
 
@@ -753,8 +749,18 @@ def halt(config: Config, state_path: Path, state: dict[str, Any], run_state: dic
             "last_failed_run": run_state.get("run_id"),
         }
     )
+    state.pop("failure_notification", None)
     save_state(state_path, state)
-    post_slack(config, failure_text(config, run_state, reason))
+    if post_slack(config, failure_text(config, run_state, reason)):
+        # Only confirmed delivery to the same destination can silence the audit.
+        state["failure_notification"] = {
+            "run_id": state.get("last_failed_run"),
+            "failed_at": failed_at,
+            "reason": reason,
+            "sent_at": now(),
+            "destination": hashlib.sha256(slack_webhook_url().encode()).hexdigest(),
+        }
+        save_state(state_path, state)
     log(config, f"halted reason={reason}")
 
 

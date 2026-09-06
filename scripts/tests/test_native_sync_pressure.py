@@ -44,6 +44,47 @@ def summary(rows):
 
 
 class PressureTests(unittest.TestCase):
+    def test_memory_limits_are_observed_beyond_the_peak_usage_sample(self):
+        rows = [sample(i * 2_000_000_000, 0) for i in range(3)]
+        for row, usage, high, swap in zip(rows, [900, 800, 700], ["1000", "1100", "max"], [0, 10, 5]):
+            row["cgroup"].update({"memory.current": str(usage), "memory.high": high,
+                                  "memory.max": "1400", "memory.swap.current": str(swap)})
+        result = summary(rows)["cgroup_memory"]
+        self.assertEqual(result["peak_usage_sample"]["memory_high"], "1000")
+        values = result["value_observations"]
+        self.assertEqual(values["memory.high"], {"numeric_samples": 2, "unlimited_samples": 1,
+                         "unavailable_samples": 0, "minimum_bytes": 1000, "maximum_bytes": 1100})
+        self.assertEqual(values["memory.max"]["numeric_samples"], 3)
+        self.assertEqual(values["memory.max"]["minimum_bytes"], 1400)
+        self.assertEqual(values["memory.max"]["maximum_bytes"], 1400)
+        self.assertEqual(values["memory.swap.current"]["maximum_bytes"], 10)
+
+    def test_missing_memory_values_cannot_establish_an_applied_limit(self):
+        rows = [sample(i * 2_000_000_000, 0) for i in range(3)]
+        rows[0]["cgroup"]["memory.high"] = "1000"
+        rows[1]["cgroup"]["memory.high"] = {"error": "unavailable"}
+        values = summary(rows)["cgroup_memory"]["value_observations"]
+        self.assertEqual(values["memory.high"]["numeric_samples"], 1)
+        self.assertEqual(values["memory.high"]["unavailable_samples"], 2)
+        self.assertIsNone(values["memory.swap.current"]["maximum_bytes"])
+        self.assertEqual(values["memory.swap.current"]["unavailable_samples"], 3)
+        empty = summary([])["cgroup_memory"]["value_observations"]["memory.max"]
+        self.assertIsNone(empty["maximum_bytes"])
+        self.assertEqual(empty["numeric_samples"], 0)
+
+    def test_malformed_scalar_memory_values_are_rejected(self):
+        for name in ("memory.current", "memory.high", "memory.max", "memory.swap.current"):
+            for value in ("-1", "1.5", "", "unavailable", "100 200"):
+                row = sample(0, 0)
+                row["cgroup"][name] = value
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    summary([row])
+        for name in ("memory.current", "memory.swap.current"):
+            row = sample(0, 0)
+            row["cgroup"][name] = "max"
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                summary([row])
+
     def test_peak_composition_does_not_combine_different_samples(self):
         rows = [sample(0, 0), sample(2_000_000_000, 1)]
         rows[0]["cgroup"].update({"memory.current": "1000", "memory.stat": "anon 100\nfile 900\ninactive_file 800\n"})

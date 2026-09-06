@@ -45,12 +45,47 @@ def unsigned_counters(text):
     return result or None
 
 
+class MemoryValues:
+    """Summarize scalar reads without treating unlimited or missing as zero."""
+
+    def __init__(self):
+        self.numeric_samples = 0
+        self.unlimited_samples = 0
+        self.unavailable_samples = 0
+        self.minimum = None
+        self.maximum = None
+
+    def add(self, value, *, allow_unlimited=False):
+        if not isinstance(value, str):
+            self.unavailable_samples += 1
+            return None
+        value = value.strip()
+        if allow_unlimited and value == "max":
+            self.unlimited_samples += 1
+            return None
+        if not value.isdigit():
+            raise ValueError("invalid cgroup memory value")
+        value = int(value)
+        self.numeric_samples += 1
+        self.minimum = value if self.minimum is None else min(self.minimum, value)
+        self.maximum = value if self.maximum is None else max(self.maximum, value)
+        return value
+
+    def report(self):
+        return {"numeric_samples": self.numeric_samples,
+                "unlimited_samples": self.unlimited_samples,
+                "unavailable_samples": self.unavailable_samples,
+                "minimum_bytes": self.minimum, "maximum_bytes": self.maximum}
+
+
 class MemoryFootprint:
     """Keep peak compositions and event changes without inferring reclaimability."""
 
     EVENTS = ("low", "high", "max", "oom", "oom_kill", "oom_group_kill")
 
     def __init__(self):
+        self.values = {name: MemoryValues() for name in
+                       ("memory.current", "memory.high", "memory.max", "memory.swap.current")}
         self.peak_usage = None
         self.peak_anon = None
         self.valid_usage_samples = 0
@@ -63,9 +98,9 @@ class MemoryFootprint:
     def add(self, row, identity):
         group = row.get("cgroup", {})
         stat = unsigned_counters(group.get("memory.stat"))
-        raw_usage = group.get("memory.current")
-        usage = (int(raw_usage) if isinstance(raw_usage, str)
-                 and raw_usage.strip().isdigit() else None)
+        usage = self.values["memory.current"].add(group.get("memory.current"))
+        for name in ("memory.high", "memory.max", "memory.swap.current"):
+            self.values[name].add(group.get(name), allow_unlimited=name != "memory.swap.current")
         sample = {"utc_ns": row.get("utc_ns"), "sample_start_ns": row["sample_start_ns"],
                   "sample_end_ns": row["sample_end_ns"], "unit_identity": identity,
                   "boot_id": row.get("boot_id"), "memory_current_bytes": usage,
@@ -108,6 +143,7 @@ class MemoryFootprint:
     def report(self):
         return {"valid_usage_samples": self.valid_usage_samples,
                 "missing_stat_samples": self.missing_stat_samples,
+                "value_observations": {name: values.report() for name, values in self.values.items()},
                 "peak_usage_sample": self.peak_usage, "peak_anon_sample": self.peak_anon,
                 "event_changes": {name: {"observed_change": self.changes[name] if self.intervals[name] else None,
                                          "valid_intervals": self.intervals[name],

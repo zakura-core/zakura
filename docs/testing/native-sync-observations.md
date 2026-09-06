@@ -86,6 +86,14 @@ dirty-page and kernel subcategories overlap. The report preserves their values
 without treating them as guaranteed reclaimable memory or calculating a headroom
 pass from subtraction.
 
+`value_observations` reports numeric ranges and counts for usage, swap usage,
+and the applied high and hard memory limits across all selected active-node
+samples. It counts unlimited (`max`) and unavailable reads separately. A limit
+seen only at peak usage cannot hide a different or missing limit in other
+samples. Matching limits throughout the recording still do not prove the value
+between samples, and zero observed swap usage requires numeric observations;
+missing swap counters cannot establish it.
+
 Limit-event changes are differences between valid adjacent samples of the same
 unit and boot. Initial counter values, missing reads, resets and sampling gaps
 do not contribute; excluded intervals remain explicit. A null change means no

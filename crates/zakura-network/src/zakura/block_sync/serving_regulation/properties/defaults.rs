@@ -115,9 +115,9 @@ async fn default_peer_burst_serves_sixteen_maximum_blocks_then_refills() {
     assert_blocked(&peer, BoundKind::PeerRate);
 
     // The first nanosecond with enough whole credit for request 17, using the
-    // published 16 MiB/s refill, independently of the limiter's retry delay.
+    // published 128 MiB/s refill, independently of the limiter's retry delay.
     let deficit = 17 * CHARGE - PEER_BURST;
-    let nanos = (deficit * 1_000_000_000).div_ceil(16 * 1024 * 1024);
+    let nanos = (deficit * 1_000_000_000).div_ceil(128 * 1024 * 1024);
     tokio::time::advance(Duration::from_nanos(nanos - 1)).await;
     assert_blocked(&peer, BoundKind::PeerRate);
     tokio::time::advance(Duration::from_nanos(1)).await;
@@ -140,7 +140,7 @@ async fn default_node_burst_serves_sixty_four_maximum_blocks_without_active_owne
     assert_blocked(&peers[4], BoundKind::NodeRate);
 
     let deficit = 65 * CHARGE - NODE_BURST;
-    let nanos = (deficit * 1_000_000_000).div_ceil(64 * 1024 * 1024);
+    let nanos = (deficit * 1_000_000_000).div_ceil(256 * 1024 * 1024);
     tokio::time::advance(Duration::from_nanos(nanos - 1)).await;
     assert_blocked(&peers[4], BoundKind::NodeRate);
     tokio::time::advance(Duration::from_nanos(1)).await;

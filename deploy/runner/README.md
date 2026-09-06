@@ -92,8 +92,8 @@ Alerts fire only after a sustained condition:
 
 - `health` is `down` or `rpc_error` for at least 10 minutes
 - one node's height has not advanced for at least 10 minutes
-- every observable node shares one height and block hash for at least 30 minutes,
-  with at least two observable nodes
+- a strict majority of observable nodes shares the highest observed height and
+  block hash for at least 30 minutes, with at least two participating nodes
 - a dashboard endpoint is unreachable, malformed, or serves a stale collector
   snapshot for at least 10 minutes
 
@@ -103,11 +103,23 @@ watchdog therefore uses the same collector snapshot for the stall condition and
 its diagnostics. The diagnostic object contains no per-node history, logs, or
 addresses.
 
-The watchdog coalesces a verifiable shared tip into one fleet alert. A missing
-or different block hash keeps the individual node alerts. Down alerts take
-precedence over stalled alerts, so each node has at most one active alert. The
-watchdog posts only on transitions: first failure after the threshold, then
-recovery. Persistent failures do not post every poll.
+The watchdog coalesces that majority tip into one fleet alert. Nodes at lower
+heights keep their individual stall timers, so a lagging or resyncing node does
+not cause a separate alert for each node at the majority tip. A higher observed
+tip, conflicting hashes at the highest height, a missing height/hash/timer on
+any observable node, or the absence of a strict majority keeps individual alerts.
+Down and starting nodes do not participate in the tip comparison. Down alerts
+take precedence over stalled alerts and retain their own timers.
+
+This comparison is within the monitored fleet, not an independent verification
+of network health. A correlated sync failure can also produce agreement, so the
+30-minute shared warning remains enabled. Existing 10-minute individual stall,
+RPC/down, and dashboard thresholds are unchanged. Testnet uses the same policy.
+
+The watchdog posts only on transitions. Persistent failures do not post every
+poll. A transition to another unhealthy state is labeled as a condition change,
+not a green recovery. Consolidating alerts or changing shared-tip ownership is
+informational; clearing a shared stall after height progress is a recovery.
 
 Slack delivery is **webhook-only**. Set:
 

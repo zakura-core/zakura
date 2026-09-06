@@ -32,7 +32,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/zakura-core/zakura"
 homepage = "https://github.com/zakura-core/zakura"
 keywords = ["zakura", "zcash"]
-rust-version = "1.91"
+rust-version = "1.97"
 edition = "2021"
 
 [workspace.dependencies]
@@ -135,7 +135,13 @@ regex = "1.11"
 reqwest = { version = "0.12", default-features = false }
 ripemd = "0.1"
 rlimit = "0.10"
-rocksdb = { version = "0.24", default-features = false }
+# `bindgen-runtime` makes librocksdb-sys's bindgen load libclang itself. Without
+# it, a build that resolves a second bindgen version elsewhere (for example the
+# fresh placeholder project cargo-semver-checks generates) unifies clang-sys
+# into runtime mode while this bindgen never loads the library, and the
+# librocksdb-sys build script panics with "a `libclang` shared library is not
+# loaded on this thread".
+rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"] }
 secp256k1 = "0.29"
 semver = "1.0.26"
 sentry = { version = "0.47", default-features = false }

@@ -24,7 +24,7 @@ categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
 edition.workspace = true
 
 # Zakura can have a higher MSRV than the other crates since it is a binary.
-rust-version = "1.91"
+rust-version = "1.97"
 
 # Settings that impact runtime behaviour
 

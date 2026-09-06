@@ -44,6 +44,40 @@ def summary(rows):
 
 
 class PressureTests(unittest.TestCase):
+    def test_host_cpu_and_io_stalls_stay_separate_from_memory(self):
+        rows = [sample(0, 0), sample(2_000_000_000, 100_000)]
+        for row, cpu, io in zip(rows, [20, 200_020], [40, 300_040]):
+            row["host"]["pressure/cpu"] = f"some total={cpu}\nfull total=0\n"
+            row["host"]["pressure/io"] = f"some total={io}\nfull total={io // 2}\n"
+        result = summary(rows)
+        host = result["host_pressure"]
+        self.assertEqual(host["cpu"]["some"]["observed_stall_us"], 200_000)
+        self.assertNotIn("full", host["cpu"])
+        self.assertEqual(host["io"]["some"]["observed_stall_us"], 300_000)
+        self.assertEqual(host["io"]["full"]["observed_stall_us"], 150_000)
+        self.assertAlmostEqual(host["io"]["full"]["maximum_interval_percent_upper"], 150 / 19)
+        self.assertEqual(result["memory_pressure"]["host"]["some"]["observed_stall_us"], 100_000)
+
+    def test_host_contention_preserves_missing_resets_boot_changes_and_gaps(self):
+        for resource in ("cpu", "io"):
+            for reason in ("missing_counter", "counter_reset", "host_changed", "clock_or_sampling_gap"):
+                rows = [sample(0, 0), sample(2_000_000_000, 0)]
+                rows[0]["host"]["pressure/" + resource] = "some total=100\n"
+                rows[1]["host"]["pressure/" + resource] = "some total=200\n"
+                if reason == "missing_counter":
+                    rows[1]["host"]["pressure/" + resource] = {"error": "unavailable"}
+                elif reason == "counter_reset":
+                    rows[1]["host"]["pressure/" + resource] = "some total=99\n"
+                elif reason == "host_changed":
+                    rows[1]["boot_id"] = "new-boot"
+                else:
+                    rows[1]["sample_start_ns"] = 20_000_000_000
+                    rows[1]["sample_end_ns"] = 20_100_000_000
+                result = summary(rows)["host_pressure"][resource]["some"]
+                with self.subTest(resource=resource, reason=reason):
+                    self.assertIsNone(result["observed_stall_us"])
+                    self.assertEqual(result["excluded_intervals"], {reason: 1})
+
     def test_absolute_event_counts_preserve_initial_counts_resets_and_missing_reads(self):
         rows = [sample(i * 2_000_000_000, 0) for i in range(4)]
         for row, count in zip(rows, [50, None, 0, 3]):
@@ -264,6 +298,16 @@ class RecordingTests(unittest.TestCase):
         empty_phase = self.reporter.report_recording(self.path, 1, 1)
         self.assertIsNone(empty_phase["cgroup_memory"]["event_observations"]["max"]["maximum_count"])
         self.assertEqual(empty_phase["whole_recording"], result["whole_recording"])
+
+    def test_host_io_pressure_after_workload_remains_in_whole_recording(self):
+        rows = [sample(i * 2_000_000_000, 0) for i in range(4)]
+        for row, total in zip(rows, [0, 0, 500_000, 900_000]):
+            row["host"]["pressure/io"] = f"some total={total}\nfull total={total}\n"
+        rows[-1]["unit"].update(MainPID="0", ActiveState="inactive")
+        self.write(rows)
+        result = self.reporter.report_recording(self.path, 0, 2_000_000_000)
+        self.assertEqual(result["host_pressure"]["io"]["full"]["observed_stall_us"], 0)
+        self.assertEqual(result["whole_recording"]["host_pressure"]["io"]["full"]["observed_stall_us"], 500_000)
 
     def test_deadline_or_truncated_gzip_cannot_be_a_complete_recording(self):
         self.write([sample(0, 0)])

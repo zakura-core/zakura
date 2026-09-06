@@ -78,6 +78,16 @@ in the covered-time bounds and maximum interval percentage. These percentages
 are bounds on observed intervals, not exact instantaneous utilization. Missing
 counters remain null and excluded intervals are counted.
 
+`host_pressure` separately summarizes the recorded CPU and I/O PSI counters,
+using the same interval rules as memory pressure. These cover the entire host,
+including activity outside the node's cgroup. They can identify contention worth
+investigating, but do not attribute a node stall to a particular operation or
+measure CPU utilization, disk latency or disk throughput. CPU, I/O and memory
+stall intervals can overlap; their totals must not be added into one stall time.
+Only CPU `some` is reported. System-wide CPU `full` is undefined even when the
+kernel exports zero for compatibility; see the
+[Linux PSI documentation](https://docs.kernel.org/accounting/psi.html).
+
 The host's estimated available memory includes reclaimable cache. Cgroup file
 memory may be charged to the group that first created those pages, including a
 fixture-preparation group. Neither high cache occupancy nor high estimated

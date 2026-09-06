@@ -1,4 +1,4 @@
-"""Streaming memory-pressure analysis for native node recordings.
+"""Streaming resource-pressure analysis for native node recordings.
 
 PSI totals are microseconds. Sample timestamps bracket several reads, so elapsed
 time and pressure percentages are intervals, not exact instantaneous values.
@@ -7,6 +7,16 @@ Missing counters, restarts and long sampling gaps cannot establish zero pressure
 from collections import Counter
 
 MAX_SAMPLE_BYTES = 4 * 1024 * 1024
+PRESSURE_FIELDS = {
+    "memory": {"host": "pressure/memory", "cgroup": "memory.pressure"},
+    "cpu": {"host": "pressure/cpu"},
+    "io": {"host": "pressure/io"},
+}
+
+
+def pressure_kinds(resource):
+    """System-wide CPU full pressure is undefined; do not interpret its zero."""
+    return ("some",) if resource == "cpu" else ("some", "full")
 
 
 def memory_fields(text):
@@ -177,7 +187,7 @@ class PressureIntervals:
         self.maximum_ns = 0
         self.maximum_percent_upper = None
 
-    def add(self, before, after, scope, kind):
+    def add(self, before, after, resource, scope, kind):
         if scope == "cgroup" and (not before["unit_identity"]
                                   or before["unit_identity"] != after["unit_identity"]):
             self.excluded["unit_changed"] += 1
@@ -185,7 +195,7 @@ class PressureIntervals:
         if before["boot_id"] != after["boot_id"]:
             self.excluded["host_changed"] += 1
             return
-        first, last = before[scope][kind], after[scope][kind]
+        first, last = before[resource][scope][kind], after[resource][scope][kind]
         if first is None or last is None:
             self.excluded["missing_counter"] += 1
             return
@@ -227,8 +237,11 @@ class MemoryPressure:
         self.memory_samples = 0
         self.minimum_available = None
         self.peak_cached = None
-        self.pressure = {scope: {kind: PressureIntervals() for kind in ("some", "full")}
-                         for scope in ("host", "cgroup")}
+        self.pressure = {
+            resource: {scope: {kind: PressureIntervals() for kind in pressure_kinds(resource)}
+                       for scope in fields}
+            for resource, fields in PRESSURE_FIELDS.items()
+        }
 
     def add(self, row):
         for field in ("sample_start_ns", "sample_end_ns"):
@@ -252,13 +265,17 @@ class MemoryPressure:
         self.footprint.add(row, identity)
         current = {"start": row["sample_start_ns"], "end": row["sample_end_ns"],
                    "unit_identity": identity, "boot_id": row.get("boot_id")}
-        for scope, field in (("host", "pressure/memory"), ("cgroup", "memory.pressure")):
-            current[scope] = {kind: pressure_total(row.get(scope, {}).get(field), kind)
-                              for kind in ("some", "full")}
+        for resource, fields in PRESSURE_FIELDS.items():
+            current[resource] = {
+                scope: {kind: pressure_total(row.get(scope, {}).get(field), kind)
+                        for kind in pressure_kinds(resource)}
+                for scope, field in fields.items()
+            }
         if self.previous is not None:
-            for scope, counters in self.pressure.items():
-                for kind, counter in counters.items():
-                    counter.add(self.previous, current, scope, kind)
+            for resource, scopes in self.pressure.items():
+                for scope, counters in scopes.items():
+                    for kind, counter in counters.items():
+                        counter.add(self.previous, current, resource, scope, kind)
         self.previous = current
 
     def report(self):
@@ -269,5 +286,9 @@ class MemoryPressure:
             "host_peak_cached_bytes": self.peak_cached,
             "cgroup_memory": self.footprint.report(),
             "memory_pressure": {scope: {kind: counter.report() for kind, counter in counters.items()}
-                                for scope, counters in self.pressure.items()},
+                                for scope, counters in self.pressure["memory"].items()},
+            "host_pressure": {
+                resource: {kind: counter.report() for kind, counter in self.pressure[resource]["host"].items()}
+                for resource in ("cpu", "io")
+            },
         }

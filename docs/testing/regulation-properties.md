@@ -114,8 +114,8 @@ and terminal, and costs 2,065,546 rate units including fixed work.
 
 | Account | Maximum-block witness | What permits the next request |
 | --- | --- | --- |
-| Peer identity rate | 16 completed responses from a full burst | Refill at 16 MiB/s |
-| Node rate | 64 completed responses shared across five identities | Refill at 64 MiB/s |
+| Peer identity rate | 16 completed responses from a full burst | Refill at 128 MiB/s |
+| Node rate | 64 completed responses shared across five identities | Refill at 256 MiB/s |
 | Node active work | 64 retained requests after rate refill | Release one active owner |
 | Session outstanding bytes | 33 retained full responses | Finish or drop a frame write |
 | Node outstanding bytes | 134 retained full responses across five sessions | Finish or drop a frame write |

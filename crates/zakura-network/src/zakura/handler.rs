@@ -8236,6 +8236,120 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn ordered_write_keeps_capacity_until_transport_completion() -> Result<(), BoxError> {
+        use crate::zakura::regulation::{OutstandingByteBudget, OutstandingByteReservation};
+
+        const ALPN: &[u8] = b"/zakura/testkit/ordered-write-lifetime/0";
+        const FRAME_CAP: u32 = 64 * 1024;
+        let _guard = zakura_test::init();
+
+        for resume_reader in [true, false] {
+            // Small transport windows block a single ordinary frame without a large transfer.
+            let transport = || {
+                let mut config = TransportConfig::default();
+                config
+                    .send_window(1024)
+                    .receive_window(VarInt::from_u32(1024))
+                    .stream_receive_window(VarInt::from_u32(1024));
+                config
+            };
+            let server = LocalEndpointFactory::with_transport_config(transport())
+                .endpoint(176)
+                .await?;
+            let (conn_tx, _conn_rx) = mpsc::channel(1);
+            let (stream_tx, mut stream_rx) = mpsc::channel(2);
+            let router = Router::builder(server)
+                .accept(
+                    ALPN,
+                    CaptureConnection {
+                        connection_tx: conn_tx,
+                        stream_tx,
+                    },
+                )
+                .spawn();
+            let client = LocalEndpointFactory::with_transport_config(transport())
+                .endpoint(177)
+                .await?;
+            let address = router.endpoint().node_addr().initialized().await;
+            client.add_node_addr(address.clone())?;
+            let connection =
+                timeout(Duration::from_secs(10), client.connect(address, ALPN)).await??;
+            let (mut send, _recv) = timeout(Duration::from_secs(5), connection.open_bi()).await??;
+            let payload = vec![0x5a; 16 * 1024];
+            let charged = u64::try_from(payload.len()).expect("the small test payload fits in u64");
+            let budget = OutstandingByteBudget::new(charged);
+            let mut reservation = budget.try_reserve(charged)?.expect("the budget is empty");
+            let (sender, mut receiver) = worker_framed_channel(1);
+            sender
+                .try_send_leased(
+                    Frame {
+                        message_type: 1,
+                        flags: 0,
+                        payload: payload.clone(),
+                    },
+                    || {
+                        OutstandingByteReservation::transfer_to_frame([&mut reservation], charged)
+                            .expect("the reservation covers the frame")
+                    },
+                )
+                .expect("the worker queue is empty");
+            drop(reservation);
+            let queued = receiver.recv().await.expect("the frame is queued");
+            let mut limits = test_connection_limits();
+            limits.max_message_bytes = FRAME_CAP;
+            let writing = tokio::spawn(async move {
+                let result = write_queued_ordered_frame(&mut send, queued, limits, FRAME_CAP).await;
+                (send, result)
+            });
+            let (_server_send, mut server_recv) = timeout(Duration::from_secs(5), stream_rx.recv())
+                .await?
+                .expect("the first frame bytes make the stream visible");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !writing.is_finished(),
+                "the unread stream must block the write"
+            );
+            assert_eq!(budget.reserved(), charged);
+
+            if resume_reader {
+                let received = read_frame(
+                    &mut server_recv,
+                    FRAME_CAP,
+                    Duration::from_secs(5),
+                    Some(Duration::from_secs(5)),
+                )
+                .await?;
+                assert_eq!(received.payload, payload);
+            }
+            let (mut send, result) = timeout(
+                OUTBOUND_STREAM_WRITE_TIMEOUT + Duration::from_secs(5),
+                writing,
+            )
+            .await??;
+            if resume_reader {
+                result?;
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err("the unread frame must time out")
+                        .to_string(),
+                    "Zakura outbound frame write timed out"
+                );
+            }
+            assert_eq!(
+                budget.reserved(),
+                0,
+                "completion must release the frame charge"
+            );
+            let _ = send.reset(VarInt::from_u32(0));
+            connection.close(0u32.into(), b"done");
+            client.close().await;
+            router.shutdown().await?;
+        }
+        Ok(())
+    }
+
     // Regression for `claude-control-payload-late-hard-cap`: the native control
     // hello/ack reads passed the configured `max_control_frame_bytes` (1 MiB
     // default) to `read_control_payload`, so a peer could force allocation/read

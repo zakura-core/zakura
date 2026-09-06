@@ -679,12 +679,12 @@ COMPLETION_DETAIL_LIMIT = 256
 
 def sync_label(node: Node) -> str:
     modes = {
-        "dual": "dual networking",
+        "dual": "Dual networking",
         "zakura": "Zakura networking only",
-        "legacy": "legacy networking only",
+        "legacy": "Legacy networking only",
     }
     mode = modes.get(node.raw.get("p2p_stack"))
-    return f"Mainnet sync — {mode} ({node.name})" if mode else node.name
+    return f"{mode} ({node.name})" if mode else node.name
 
 
 def completion_status(data: dict[str, Any] | None) -> str:
@@ -710,8 +710,25 @@ def completion_details(record: dict[str, Any]) -> list[dict[str, Any]]:
     if "details" in record:
         return list(record["details"])
     if record.get("pending") and record.get("run_id"):
-        return [{"run_id": record["run_id"], "duration": record.get("duration")}]
+        return [{"run_id": record["run_id"], "duration": record.get("duration"),
+                 "end_height": record.get("end_height")}]
     return []
+
+
+def completion_run_text(item: dict[str, Any]) -> str:
+    """Report overall genesis sync throughput only for a confirmed ending height."""
+    duration = item.get("duration")
+    valid_duration = type(duration) is int and duration >= 0
+    timing = (f"{duration // 3600}h {duration % 3600 // 60:02d}m"
+              if valid_duration else "duration unavailable")
+    height = item.get("end_height")
+    if type(height) is not int or not 0 <= height <= 0xFFFFFFFF:
+        return f"{timing} · blocks and BPS unavailable"
+    # Every cycle starts from empty chain state; height zero is genesis.
+    blocks = height + 1
+    count = f"{blocks / 1_000_000:.2f}M" if blocks >= 1_000_000 else f"{blocks:,}"
+    rate = f"{blocks / duration:.0f} blocks/sec" if valid_duration and duration > 0 else "BPS unavailable"
+    return f"{timing} · {count} blocks · {rate}"
 
 
 def completion_updates(
@@ -747,6 +764,7 @@ def completion_updates(
         # Old controllers still provide the latest timing during a staged rollout.
         history[total] = {
             "run_id": run_id, "duration": controller.get("last_success_duration_seconds"),
+            "end_height": controller.get("last_success_end_height"),
         }
         details = completion_details(old) + [history[number] for number in sorted(history)]
         records[name] = {
@@ -754,6 +772,7 @@ def completion_updates(
             "run_id": run_id, "total": total,
             "sha": controller.get("last_success_sha", "unknown"),
             "duration": controller.get("last_success_duration_seconds"),
+            "end_height": controller.get("last_success_end_height"),
             "pending": old.get("pending", 0) + delta,
             "details": details[-COMPLETION_DETAIL_LIMIT:],
         }
@@ -765,20 +784,15 @@ def completion_updates(
         for name in sorted(set(records) | configured):
             record = records.get(name, {})
             pending = record.get("pending", 0)
-            durations = [
-                item["duration"] for item in completion_details(record)
-                if type(item.get("duration")) is int and item["duration"] >= 0
-            ]
-            timings = [f"{seconds // 3600}h {seconds % 3600 // 60:02d}m" for seconds in durations]
-            missing = pending - len(durations)
-            if missing:
-                timings.append(f"{missing} duration(s) unavailable")
+            details = completion_details(record)
             label = (labels or {}).get(name, record.get("label", name))
-            line = f"{label}: {pending} completed"
-            if timings:
-                line += " · " + ", ".join(timings)
-            line += " · " + completion_status(statuses.get(name))
-            lines.append(line)
+            section = [f"*{label} · {pending} completed*"]
+            section.extend(f"• {completion_run_text(item)}" for item in details)
+            missing = pending - len(details)
+            if missing:
+                section.append(f"• {missing} earlier run(s): details unavailable")
+            section.append(completion_status(statuses.get(name)))
+            lines.append("\n".join(section))
             if name not in configured:
                 records.pop(name, None)
             elif name in records:
@@ -829,7 +843,9 @@ def cmd_audit(args: argparse.Namespace) -> int:
     text = audit_message(new_lines, reminder_lines, recovered_lines)
     if completion_lines:
         text += ("\n\n" if text else "") + (
-            ":memo: Mainnet sync summary — since previous digest\n" + "\n".join(completion_lines)
+            ":memo: Mainnet sync summary — since previous digest\n\n"
+            + "\n\n".join(completion_lines)
+            + "\n\nRuns listed oldest first. Each run starts from genesis."
         )
 
     posted = True

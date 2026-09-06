@@ -75,6 +75,28 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertEqual(status["sync.downloads.in_flight"], 17)
         self.assertEqual(status["sync.downloads.verifying"], 4)
 
+    def test_final_ready_sample_supplies_confirmed_height_without_stale_fallback(self):
+        for final_height in (101, None, -1, True, 2**32):
+            with self.subTest(final_height=final_height), tempfile.TemporaryDirectory() as tmp:
+                config = make_config(Path(tmp))
+                run_dir = Path(tmp) / "run"
+                run_dir.mkdir()
+                early = {"ready": True, "height": 100, "zcash_chain_verified_block_height": 100}
+                final = {"ready": True, "height": 105, "height_source": "estimated_tip_minus_distance",
+                         "zcash_chain_verified_block_height": final_height}
+                run_state = {}
+                with (
+                    patch.object(sync, "service_active", return_value=True),
+                    patch.object(sync, "check_free_space"),
+                    patch.object(sync, "now", return_value=1000),
+                    patch.object(sync.time, "sleep"),
+                    patch.object(sync, "sample_status", side_effect=[early] * 5 + [final]),
+                ):
+                    sync.wait_for_completion(config, run_dir, run_state)
+                self.assertEqual(run_state["end_height"], 101 if final_height == 101 else None)
+                # Progress tracking can still use estimates; throughput cannot.
+                self.assertEqual(run_state["height"], 105)
+
     def test_alert_status_falls_back_to_estimated_height(self):
         metrics = "\n".join(
             [
@@ -1362,6 +1384,53 @@ class NotificationTests(unittest.TestCase):
         self.assertNotIn("node", records)
         self.assertEqual(previous["completions"]["node"]["pending"], 2)
 
+    def test_three_mode_summary_shows_one_three_and_one_runs(self):
+        statuses, labels = {}, {}
+        cases = (
+            ("dual", [24000], "Dual networking", [145]),
+            ("zakura", [25800, 25200, 26400], "Zakura networking only", [134, 138, 131]),
+            ("legacy", [28800], "Legacy networking only", [120]),
+        )
+        for mode, durations, label, rates in cases:
+            node = deploy.Node({"name": mode, "p2p_stack": mode})
+            labels[mode] = deploy.sync_label(node)
+            statuses[mode] = {"controller_state": {
+                "phase": "syncing", "completion_digest": True, "completion_digest_start_runs": 0,
+                "runs": len(durations), "last_success_run": f"{mode}-{len(durations)}",
+                "last_success_duration_seconds": durations[-1], "last_success_end_height": 3469999,
+                "completion_history": [
+                    {"number": n, "run_id": f"{mode}-{n}", "duration": duration, "end_height": 3469999}
+                    for n, duration in enumerate(durations, 1)
+                ],
+            }}
+        lines, _ = deploy.completion_updates(statuses, {}, True, labels)
+        self.assertEqual(len(lines), 3)
+        for mode, durations, label, rates in cases:
+            section = next(line for line in lines if f"({mode})" in line)
+            expected = [f"*{label} ({mode}) · {len(durations)} completed*"]
+            expected.extend(
+                f"• {duration // 3600}h {duration % 3600 // 60:02d}m · 3.47M blocks · {rate} blocks/sec"
+                for duration, rate in zip(durations, rates)
+            )
+            expected.append("currently syncing")
+            self.assertEqual(section, "\n".join(expected))
+
+    def test_completion_throughput_requires_valid_height_and_nonzero_duration(self):
+        self.assertEqual(deploy.completion_run_text({"duration": 24000, "end_height": 3469999}),
+                         "6h 40m · 3.47M blocks · 145 blocks/sec")
+        self.assertEqual(deploy.completion_run_text({"duration": 2, "end_height": 3}),
+                         "0h 00m · 4 blocks · 2 blocks/sec")
+        self.assertEqual(deploy.completion_run_text({"duration": 1, "end_height": 0}),
+                         "0h 00m · 1 blocks · 1 blocks/sec")
+        for height in (None, -1, True, "3469999", 2**32):
+            with self.subTest(height=height):
+                self.assertIn("blocks and BPS unavailable",
+                              deploy.completion_run_text({"duration": 3600, "end_height": height}))
+        for duration in (0, None, -1, True, "3600"):
+            with self.subTest(duration=duration):
+                self.assertIn("BPS unavailable",
+                              deploy.completion_run_text({"duration": duration, "end_height": 3469999}))
+
     def test_retired_hosts_deliver_pending_once_then_leave_the_summary(self):
         previous = {"completions": {name: {
             "run_id": name, "total": 2, "pending": pending,
@@ -1373,8 +1442,8 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(waiting, previous["completions"])
         lines, records = deploy.completion_updates({}, previous, True, labels)
         self.assertEqual(len(lines), 2)
-        self.assertIn("retired: 2 completed", lines[1])
-        self.assertIn("Active host: 0 completed", lines[0])
+        self.assertIn("retired · 2 completed", lines[1])
+        self.assertIn("Active host · 0 completed", lines[0])
         self.assertEqual(set(records), {"active"})
         # Failed delivery leaves the input cache intact, so a retry is identical.
         self.assertEqual(json.dumps(previous, sort_keys=True), before)
@@ -1382,7 +1451,7 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(retry, lines)
         later, _ = deploy.completion_updates({}, {"completions": records}, True, labels)
         self.assertEqual(len(later), 1)
-        self.assertIn("Active host: 0 completed", later[0])
+        self.assertIn("Active host · 0 completed", later[0])
 
     def test_digest_preserves_all_timings_across_missed_audits(self):
         controller = {
@@ -1400,8 +1469,10 @@ class NotificationTests(unittest.TestCase):
         _, records = deploy.completion_updates(data, {}, False, {"node": label})
         before = json.dumps(records, sort_keys=True)
         lines, delivered = deploy.completion_updates(data, {"completions": records}, True)
-        self.assertIn("Mainnet sync — Zakura networking only (node)", lines[0])
-        self.assertIn("3 completed · 7h 29m, 7h 08m, 7h 13m", lines[0])
+        self.assertIn("Zakura networking only (node)", lines[0])
+        self.assertIn("3 completed", lines[0])
+        self.assertEqual([line.split(" · ")[0] for line in lines[0].splitlines()[1:4]],
+                         ["• 7h 29m", "• 7h 08m", "• 7h 13m"])
         self.assertIn("currently syncing", lines[0])
         self.assertEqual(json.dumps(records, sort_keys=True), before)
         lines, _ = deploy.completion_updates(data, {"completions": delivered}, True)
@@ -1413,7 +1484,8 @@ class NotificationTests(unittest.TestCase):
             "completion_digest": True, "completion_digest_start_runs": 0,
             "last_success_run": "run-1", "last_success_duration_seconds": 3600,
             "runs": 1, "phase": "syncing",
-            "completion_history": [{"number": 1, "run_id": "run-1", "duration": 3600}],
+            "last_success_end_height": 3599999,
+            "completion_history": [{"number": 1, "run_id": "run-1", "duration": 3600, "end_height": 3599999}],
         }, "disk_free_bytes": 20 * 1024**3,
             "service_active": True, "sample": {"metrics_status": "ok"}}
         with tempfile.TemporaryDirectory() as tmp:
@@ -1422,17 +1494,19 @@ class NotificationTests(unittest.TestCase):
             post.assert_not_called()
             data["controller_state"].update({
                 "last_success_run": "run-3", "last_success_duration_seconds": 10800,
-                "runs": 3,
+                "last_success_end_height": 3779999, "runs": 3,
                 "completion_history": [
-                    {"number": n, "run_id": f"run-{n}", "duration": n * 3600}
-                    for n in range(1, 4)
+                    {"number": n, "run_id": f"run-{n}", "duration": n * 3600, "end_height": blocks - 1}
+                    for n, blocks in enumerate((3600000, 3240000, 3780000), 1)
                 ],
             })
             _, post = self.audit(path, data, 2000)
             post.assert_not_called()
             saved = path.read_text()
             _, post = self.audit(path, data, 87400, posted=False)
-            expected = "3 completed · 1h 00m, 2h 00m, 3h 00m"
+            expected = ("• 1h 00m · 3.60M blocks · 1000 blocks/sec\n"
+                        "• 2h 00m · 3.24M blocks · 450 blocks/sec\n"
+                        "• 3h 00m · 3.78M blocks · 350 blocks/sec")
             self.assertIn(expected, post.call_args.args[0])
             self.assertEqual(path.read_text(), saved)
             _, post = self.audit(path, data, 87460)
@@ -1474,7 +1548,7 @@ class NotificationTests(unittest.TestCase):
             records = deploy.load_audit_state(path)["completions"]
             self.assertEqual(records["node"]["pending"], 1)
             _, post = self.audit(path, data, 173800)
-            self.assertIn("1 completed · 1h 00m", post.call_args.args[0])
+            self.assertIn("1 completed*\n• 1h 00m", post.call_args.args[0])
 
     def test_sync_status_does_not_hide_inactive_service_or_missing_metrics(self):
         for extra, expected in (
@@ -1505,7 +1579,8 @@ class NotificationTests(unittest.TestCase):
                 records = deploy.load_audit_state(path)["completions"]
                 self.assertEqual(records["node"]["pending"], 3)
                 _, post = self.audit(path, data, 87400)
-                self.assertIn("3 completed · 1h 00m, 2 duration(s) unavailable", post.call_args.args[0])
+                self.assertIn("3 completed*\n• 1h 00m", post.call_args.args[0])
+                self.assertIn("2 earlier run(s): details unavailable", post.call_args.args[0])
 
     def test_digest_upgrade_and_retention_report_missing_timings(self):
         previous = {"completions": {"node": {
@@ -1516,7 +1591,9 @@ class NotificationTests(unittest.TestCase):
             "last_success_duration_seconds": 7200,
         }}}
         lines, _ = deploy.completion_updates(data, previous, True)
-        self.assertIn("5 completed · 1h 00m, 2h 00m, 3 duration(s) unavailable", lines[0])
+        self.assertIn("5 completed*\n• 1h 00m", lines[0])
+        self.assertIn("• 2h 00m", lines[0])
+        self.assertIn("3 earlier run(s): details unavailable", lines[0])
         controller = data["node"]["controller_state"]
         controller.update({
             "completion_digest_start_runs": 0, "runs": 300,
@@ -1529,7 +1606,7 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(len(records["node"]["details"]), 256)
         lines, _ = deploy.completion_updates({}, {"completions": records}, True)
         self.assertIn("300 completed", lines[0])
-        self.assertIn("44 duration(s) unavailable", lines[0])
+        self.assertIn("44 earlier run(s): details unavailable", lines[0])
         self.assertIn("status unavailable", lines[0])
 
     def test_digest_lists_zero_completions_with_observed_status(self):
@@ -1541,9 +1618,9 @@ class NotificationTests(unittest.TestCase):
                   for name, mode in (("dual", "dual"), ("legacy", "legacy"), ("new", "zakura"))}
         lines, _ = deploy.completion_updates(data, {}, True, labels)
         self.assertEqual(len(lines), 3)
-        self.assertIn("dual networking (dual): 0 completed · currently syncing", lines[0])
-        self.assertIn("legacy networking only (legacy): 0 completed · halted after failure", lines[1])
-        self.assertIn("Zakura networking only (new): 0 completed · status unavailable", lines[2])
+        self.assertIn("Dual networking (dual) · 0 completed*\ncurrently syncing", lines[0])
+        self.assertIn("Legacy networking only (legacy) · 0 completed*\nhalted after failure", lines[1])
+        self.assertIn("Zakura networking only (new) · 0 completed*\nstatus unavailable", lines[2])
 
     def test_targeted_audit_cannot_recover_unobserved_nodes_or_consume_digest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1570,10 +1647,12 @@ class NotificationTests(unittest.TestCase):
                     config = make_config(Path(tmp))
                     for name in (
                         "preflight", "build_binary", "sha256_file", "install_binary", "stop_service",
-                        "safe_wipe_state", "render_config", "start_service", "wait_for_completion",
+                        "safe_wipe_state", "render_config", "start_service",
                         "archive_run_log", "cleanup_retention",
                     ):
                         stack.enter_context(patch.object(sync, name, return_value="test"))
+                    stack.enter_context(patch.object(sync, "wait_for_completion",
+                        side_effect=lambda _config, _run_dir, run_state: run_state.update(end_height=3469999)))
                     stack.enter_context(patch.object(sync, "resolve_sha", return_value="a" * 40))
                     stack.enter_context(patch.object(sync, "now", return_value=1000))
                     post = stack.enter_context(patch.object(sync, "post_slack"))
@@ -1592,7 +1671,9 @@ class NotificationTests(unittest.TestCase):
                     ))
                     self.assertEqual(history[-1], {
                         "number": 261, "run_id": state["current_run"], "duration": 0,
+                        "end_height": 3469999,
                     })
+                    self.assertEqual(state["last_success_end_height"], 3469999)
                     self.assertEqual(state["completion_digest_start_runs"], 260)
                     self.assertEqual(sync.load_state(path)["last_success_run"], state["current_run"])
 

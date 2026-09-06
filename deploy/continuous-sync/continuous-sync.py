@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 STATE_VERSION = 1
+COMPLETION_HISTORY_LIMIT = 256
 
 
 class ControllerError(Exception):
@@ -708,6 +709,12 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
             "last_success_at": completed_at,
             "last_success_run": run_id,
             "last_success_duration_seconds": run_state["sync_duration_seconds"],
+            # Keep timings independently of run-log retention and audit cadence.
+            "completion_history": (state.get("completion_history", []) + [{
+                "number": int(state.get("runs", 0)) + 1,
+                "run_id": run_id,
+                "duration": run_state["sync_duration_seconds"],
+            }])[-COMPLETION_HISTORY_LIMIT:],
             "completion_digest": True,
             "completion_digest_start_runs": state.get(
                 "completion_digest_start_runs", int(state.get("runs", 0))

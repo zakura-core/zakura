@@ -669,42 +669,100 @@ def audit_message(
     return "\n\n".join(sections)
 
 
-def completion_updates(
-    statuses: dict[str, dict[str, Any]], previous: dict[str, Any], digest_due: bool
-) -> tuple[list[str], dict[str, Any]]:
-    """Accumulate completed runs until a digest is successfully delivered.
+COMPLETION_DETAIL_LIMIT = 256
 
-    A new cache counts from when the controller enabled digests. Missing hosts
-    retain pending counts; a counter reset counts the new success once.
+
+def sync_label(node: Node) -> str:
+    modes = {
+        "dual": "dual networking",
+        "zakura": "Zakura networking only",
+        "legacy": "legacy networking only",
+    }
+    mode = modes.get(node.raw.get("p2p_stack"))
+    return f"Mainnet sync — {mode} ({node.name})" if mode else node.name
+
+
+def completion_status(data: dict[str, Any] | None) -> str:
+    if data is None:
+        return "status unavailable"
+    controller = data.get("controller_state") or {}
+    if controller.get("failed"):
+        return "halted after failure"
+    phase = controller.get("phase")
+    if phase == "syncing":
+        return "currently syncing"
+    if phase == "complete":
+        return "between runs"
+    return f"current phase: {phase}" if phase else "status unavailable"
+
+
+def completion_details(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Upgrade old audit caches without inventing timings for earlier runs."""
+    if "details" in record:
+        return list(record["details"])
+    if record.get("pending") and record.get("run_id"):
+        return [{"run_id": record["run_id"], "duration": record.get("duration")}]
+    return []
+
+
+def completion_updates(
+    statuses: dict[str, dict[str, Any]], previous: dict[str, Any], digest_due: bool,
+    labels: dict[str, str] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    """Accumulate completions until delivery, preserving timings between audits.
+
+    Counters remain authoritative if history is missing or exceeds retention.
+    Missing hosts retain pending completions. Cache migration and counter resets
+    preserve the old counts; unavailable timings are explicitly reported.
     """
-    records = dict(previous.get("completions", {}))
+    records = {name: dict(record) for name, record in previous.get("completions", {}).items()}
+    for name in sorted(set(statuses) | set(labels or {})):
+        record = records.setdefault(name, {})
+        record["label"] = (labels or {}).get(name, record.get("label", name))
     for name, data in statuses.items():
         controller = data.get("controller_state") or {}
         run_id = controller.get("last_success_run")
         total = controller.get("runs")
         if not controller.get("completion_digest") or not run_id or type(total) is not int:
             continue
-        old = records.get(name, {})
+        old = records[name]
         if old.get("run_id") == run_id:
             continue
         baseline = old.get("total", controller.get("completion_digest_start_runs", total - 1))
         delta = max(1, total - baseline) if type(baseline) is int else 1
+        history = {
+            item["number"]: item for item in controller.get("completion_history", [])
+            if isinstance(item, dict) and type(item.get("number")) is int
+            and total - delta < item["number"] <= total and item.get("run_id")
+        }
+        # Old controllers still provide the latest timing during a staged rollout.
+        history[total] = {
+            "run_id": run_id, "duration": controller.get("last_success_duration_seconds"),
+        }
+        details = completion_details(old) + [history[number] for number in sorted(history)]
         records[name] = {
-            "run_id": run_id, "total": total,
+            "label": old["label"], "run_id": run_id, "total": total,
             "pending": old.get("pending", 0) + delta,
-            "sha": controller.get("last_success_sha", "unknown"),
-            "duration": controller.get("last_success_duration_seconds"),
+            "details": details[-COMPLETION_DETAIL_LIMIT:],
         }
     lines = []
     if digest_due:
         for name, record in sorted(records.items()):
-            if record.get("pending", 0):
-                lines.append(
-                    f"{name}: {record['pending']} completed run(s); "
-                    f"latest={record['run_id']} | sha={record['sha']} | "
-                    f"sync time={record['duration']}s"
-                )
-                records[name] = {**record, "pending": 0}
+            pending = record.get("pending", 0)
+            durations = [
+                item["duration"] for item in completion_details(record)
+                if type(item.get("duration")) is int and item["duration"] >= 0
+            ]
+            timings = [f"{seconds // 3600}h {seconds % 3600 // 60:02d}m" for seconds in durations]
+            missing = pending - len(durations)
+            if missing:
+                timings.append(f"{missing} duration(s) unavailable")
+            line = f"{record.get('label', name)}: {pending} completed"
+            if timings:
+                line += " · " + ", ".join(timings)
+            line += " · " + completion_status(statuses.get(name))
+            lines.append(line)
+            records[name] = {**record, "pending": 0, "details": []}
     return lines, records
 
 
@@ -744,12 +802,14 @@ def cmd_audit(args: argparse.Namespace) -> int:
         destination=destination,
     )
     state["problems"].update({k: v for k, v in prior_problems.items() if k not in selected})
-    completion_lines, state["completions"] = completion_updates(statuses, previous, digest_due)
+    completion_lines, state["completions"] = completion_updates(
+        statuses, previous, digest_due, {node.name: sync_label(node) for node in nodes}
+    )
     state["last_digest_at"] = timestamp if digest_due else last_digest
     text = audit_message(new_lines, reminder_lines, recovered_lines)
     if completion_lines:
         text += ("\n\n" if text else "") + (
-            ":memo: Zakura continuous sync digest — completions\n" + "\n".join(completion_lines)
+            ":memo: Mainnet sync summary — since previous digest\n" + "\n".join(completion_lines)
         )
 
     posted = True

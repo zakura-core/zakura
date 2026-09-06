@@ -157,7 +157,18 @@ cadence. New failures and recoveries do not wait for the digest. Completion coun
 include runs since the controller enabled digest reporting, then since the last
 successful digest. An unchanged failure appears only in a digest at least 24 hours
 after its last alert or reminder; a recent alert waits for a later digest.
-Per-run logs and artifacts remain available on each host.
+The summary names each networking mode (dual, Zakura only, or legacy only),
+keeps the host ID for troubleshooting, and includes hosts with zero completions.
+It shows each completed run's sync duration in hours and minutes, oldest first,
+and the currently observed controller phase. Sync duration excludes the build
+and includes the readiness confirmation period. Failures still alert immediately.
+
+Controllers retain the latest 256 completion timings in their state, independently
+of run-log cleanup. Audits accumulate up to 256 timings per host until delivery.
+Older controllers and existing audit caches still contribute their completion
+counts and latest timing. Any missing timings, including those beyond retention,
+are explicitly marked unavailable. Per-run logs and artifacts remain available
+on each host.
 A lost audit cache may repeat already summarized completions or alerts.
 
 Alert state is carried between workflow runs in the Actions cache. A failed Slack

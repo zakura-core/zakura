@@ -1488,6 +1488,25 @@ class NotificationTests(unittest.TestCase):
                 self.assertIn(expected, lines[0])
                 self.assertNotIn("currently syncing", lines[0])
 
+    def test_malformed_controller_history_preserves_counts_and_failure_alerts(self):
+        for history in (None, {}, "bad", 7, [None, {"number": "bad"}]):
+            with self.subTest(history_type=type(history)), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "state.json"
+                data = self.halted_status()
+                del data["controller_state"]["failure_notification"]
+                data["controller_state"].update({
+                    "completion_digest": True, "completion_digest_start_runs": 0,
+                    "runs": 3, "last_success_run": "run-3",
+                    "last_success_duration_seconds": 3600, "completion_history": history,
+                })
+                result, post = self.audit(path, data, 1000)
+                self.assertEqual(result, 1)
+                self.assertIn("controller halted", post.call_args.args[0])
+                records = deploy.load_audit_state(path)["completions"]
+                self.assertEqual(records["node"]["pending"], 3)
+                _, post = self.audit(path, data, 87400)
+                self.assertIn("3 completed · 1h 00m, 2 duration(s) unavailable", post.call_args.args[0])
+
     def test_digest_upgrade_and_retention_report_missing_timings(self):
         previous = {"completions": {"node": {
             "run_id": "old", "total": 4, "pending": 3, "duration": 3600,
@@ -1542,33 +1561,40 @@ class NotificationTests(unittest.TestCase):
             self.assertEqual(loaded["last_digest_at"], 1)
 
     def test_successful_cycle_records_digest_without_sending_routine_message(self):
-        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
-            config = make_config(Path(tmp))
-            for name in (
-                "preflight", "build_binary", "sha256_file", "install_binary", "stop_service",
-                "safe_wipe_state", "render_config", "start_service", "wait_for_completion",
-                "archive_run_log", "cleanup_retention",
-            ):
-                stack.enter_context(patch.object(sync, name, return_value="test"))
-            stack.enter_context(patch.object(sync, "resolve_sha", return_value="a" * 40))
-            stack.enter_context(patch.object(sync, "now", return_value=1000))
-            post = stack.enter_context(patch.object(sync, "post_slack"))
-            path = config.paths.state_dir / "state.json"
-            state = sync.one_cycle(config, path, {
-                "runs": 260, "completion_history": [
-                    {"number": n, "run_id": f"old-{n}", "duration": 100}
-                    for n in range(5, 261)
-                ],
-            })
-            post.assert_not_called()
-            self.assertEqual(state["runs"], 261)
-            history = sync.load_state(path)["completion_history"]
-            self.assertEqual(len(history), sync.COMPLETION_HISTORY_LIMIT)
-            self.assertEqual(history[-1], {
-                "number": 261, "run_id": state["current_run"], "duration": 0,
-            })
-            self.assertEqual(state["completion_digest_start_runs"], 260)
-            self.assertEqual(sync.load_state(path)["last_success_run"], state["current_run"])
+        valid_history = [
+            {"number": n, "run_id": f"old-{n}", "duration": 100} for n in range(5, 261)
+        ]
+        for persisted_history in (valid_history, None, {}, "bad", 7, [None]):
+            with self.subTest(history_type=type(persisted_history)):
+                with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+                    config = make_config(Path(tmp))
+                    for name in (
+                        "preflight", "build_binary", "sha256_file", "install_binary", "stop_service",
+                        "safe_wipe_state", "render_config", "start_service", "wait_for_completion",
+                        "archive_run_log", "cleanup_retention",
+                    ):
+                        stack.enter_context(patch.object(sync, name, return_value="test"))
+                    stack.enter_context(patch.object(sync, "resolve_sha", return_value="a" * 40))
+                    stack.enter_context(patch.object(sync, "now", return_value=1000))
+                    post = stack.enter_context(patch.object(sync, "post_slack"))
+                    path = config.paths.state_dir / "state.json"
+                    state = sync.one_cycle(config, path, {
+                        "runs": 260, "completion_history": persisted_history,
+                    })
+                    post.assert_not_called()
+                    self.assertFalse(state["failed"])
+                    self.assertEqual(state["phase"], "complete")
+                    self.assertEqual(state["runs"], 261)
+                    history = sync.load_state(path)["completion_history"]
+                    self.assertEqual(len(history), min(
+                        len(persisted_history) + 1 if isinstance(persisted_history, list) else 1,
+                        sync.COMPLETION_HISTORY_LIMIT,
+                    ))
+                    self.assertEqual(history[-1], {
+                        "number": 261, "run_id": state["current_run"], "duration": 0,
+                    })
+                    self.assertEqual(state["completion_digest_start_runs"], 260)
+                    self.assertEqual(sync.load_state(path)["last_success_run"], state["current_run"])
 
 
 class CanaryNotificationTests(unittest.TestCase):

@@ -736,8 +736,11 @@ def completion_updates(
             continue
         baseline = old.get("total", controller.get("completion_digest_start_runs", total - 1))
         delta = max(1, total - baseline) if type(baseline) is int else 1
+        raw_history = controller.get("completion_history", [])
+        if not isinstance(raw_history, list):
+            raw_history = []
         history = {
-            item["number"]: item for item in controller.get("completion_history", [])
+            item["number"]: item for item in raw_history
             if isinstance(item, dict) and type(item.get("number")) is int
             and total - delta < item["number"] <= total and item.get("run_id")
         }

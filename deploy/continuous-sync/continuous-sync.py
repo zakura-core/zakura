@@ -702,6 +702,11 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
         }
     )
     write_run_json(run_dir, run_state)
+    completion_history = state.get("completion_history", [])
+    if not isinstance(completion_history, list):
+        # Optional reporting history must not turn a successful sync into a halt.
+        print("invalid completion history; preserving counts and starting new history", file=sys.stderr)
+        completion_history = []
     state.update(
         {
             "failed": False,
@@ -710,7 +715,7 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
             "last_success_run": run_id,
             "last_success_duration_seconds": run_state["sync_duration_seconds"],
             # Keep timings independently of run-log retention and audit cadence.
-            "completion_history": (state.get("completion_history", []) + [{
+            "completion_history": (completion_history + [{
                 "number": int(state.get("runs", 0)) + 1,
                 "run_id": run_id,
                 "duration": run_state["sync_duration_seconds"],

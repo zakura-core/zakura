@@ -192,7 +192,7 @@ jobs:
         env:
           SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
           # Remind about an unresolved failure every 6 hours.
-          REMINDER_INTERVAL: "21600"
+          REMINDER_INTERVAL: "86400"
           # A run is capped at 48h, so only flag a node that has not completed one
           # in four days -- long enough that a legitimately long run cannot trip it.
           MAX_COMPLETION_AGE: "345600"

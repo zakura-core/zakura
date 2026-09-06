@@ -82,3 +82,41 @@ The recorder includes the underlying counters for those separate checks.
 Do not align timestamps from different native trace emitters merely because
 their process identities match. Explain received-body gaps with events from the
 same block-sync emitter or an independently synchronized observer.
+
+## Compare a planned series
+
+After the native experiment controller writes its outcome audits, compare the
+whole frozen plan, including trials whose evidence is not yet available:
+
+```sh
+python3 scripts/report-native-sync-series.py series-plan.json series-report.json
+python3 -m unittest discover -s scripts/tests -p 'test_native_sync_series.py'
+```
+
+This reporter consumes the native lab's existing schema-1 plan and evidence
+layout. The plan lists `first_pair` and indexed `pairs`, with a filename and
+SHA-256 for each baseline and candidate specification. Each completed run needs
+its controller, resources, outcome audit, and per-host archives with their
+audited extracted metadata alongside the plan. It does not launch experiments
+or recreate missing audits. Output is created exclusively.
+
+The reporter checks specification, configuration, resource and archive digests,
+audit/outcome agreement, and matching runtime helpers and host environments.
+Within a pair, only the serving binary, its regulation overrides and capture
+enablement may differ. Across repetitions, each side's conditions must remain
+the same. Companion binaries, targets, resource limits and other settings remain
+part of that comparison. Finite-pause recovery trials are rejected as ordinary
+timing trials. These checks bind existing audited evidence; they do not repeat
+the raw trace audit or independently attest what ran on the remote hosts.
+
+Every planned pair remains in the report. A missing completion audit is
+`unavailable`, which can mean an active run or a failure before an audit was
+written. An audited unsuccessful outcome is `failed`. Neither contributes a
+completion timing. Changed evidence fails reporting instead of silently dropping
+the trial. `all_pairs_complete` requires every planned pair to be complete.
+
+Individual client changes, medians and ranges describe the completed pairs.
+Clients share a server and are not independent repetitions. A partial series,
+or five completed pairs, does not establish p95 performance or production
+readiness. Keep resource pressure, recovery and exact-target evidence with the
+timing report when deciding whether the serving policy is acceptable.

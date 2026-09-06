@@ -54,6 +54,7 @@ use super::{check, Request, Verifier};
 
 #[cfg(test)]
 mod prop;
+mod utxo_lookup;
 
 /// Returns the timeout duration for tests, extended when running under coverage
 /// instrumentation to account for the performance overhead.

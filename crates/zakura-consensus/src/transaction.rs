@@ -61,6 +61,14 @@ mod tests;
 ///     chain in the correct order.)
 const UTXO_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 60);
 
+/// Maximum concurrent state lookups per block transaction.
+///
+/// Bounds the latency overlap and active lookup futures, not aggregate node work.
+/// Each lookup starts its timeout after service readiness, when dispatched within
+/// this window. Missing dependencies can therefore time out together during
+/// out-of-order sync; the existing sync restart recovers them.
+const MAX_CONCURRENT_BLOCK_UTXO_LOOKUPS: usize = 64;
+
 /// A timeout applied to output lookup requests sent to the mempool. This is shorter than the
 /// timeout for the state UTXO lookups because a block is likely to be mined every 75 seconds
 /// after Blossom is active, changing the best chain tip and requiring re-verification of transactions
@@ -793,51 +801,64 @@ where
         // Stores (input_idx, outpoint) for UTXOs not found in the best chain (fetched from mempool later).
         let mut spent_mempool_outpoints: Vec<(usize, transparent::OutPoint)> = Vec::new();
 
-        for (input_idx, input) in inputs.iter().enumerate() {
-            if let transparent::Input::PrevOut { outpoint, .. } = input {
-                tracing::trace!("awaiting outpoint lookup");
-                let utxo = if let Some(output) = known_utxos.get(outpoint) {
-                    tracing::trace!("UXTO in known_utxos, discarding query");
-                    output.utxo.clone()
-                } else if is_mempool {
-                    let query = state
-                        .clone()
-                        .oneshot(zs::Request::UnspentBestChainUtxo(*outpoint));
-
-                    let zakura_state::Response::UnspentBestChainUtxo(utxo) = query
-                        .await
-                        .map_err(|_| TransactionError::TransparentInputNotFound)?
-                    else {
-                        unreachable!("UnspentBestChainUtxo always responds with Option<Utxo>")
-                    };
-
-                    let Some(utxo) = utxo else {
-                        spent_mempool_outpoints.push((input_idx, *outpoint));
-                        continue;
-                    };
-
-                    utxo
-                } else {
-                    let response = state
-                        .clone()
-                        .oneshot(zakura_state::Request::AwaitUtxo(*outpoint))
-                        .await
-                        .map_err(|boxed_error| match boxed_error.downcast::<Elapsed>() {
-                            Ok(_) => TransactionError::TransparentInputNotFound,
-                            Err(boxed_error) => TransactionError::from(boxed_error),
-                        })?;
-
-                    if let zakura_state::Response::Utxo(utxo) = response {
+        // Keep mempool queries serial so best-chain reads and dependency discovery
+        // retain their existing behavior. Block queries can overlap, but their
+        // completion order must not change the outputs committed to by sighashes.
+        let concurrency = if is_mempool {
+            1
+        } else {
+            MAX_CONCURRENT_BLOCK_UTXO_LOOKUPS
+        };
+        let mut lookups = futures::stream::iter(0..inputs.len())
+            .filter_map(move |input_idx| {
+                futures::future::ready(match &tx.inputs()[input_idx] {
+                    transparent::Input::PrevOut { outpoint, .. } => Some((input_idx, *outpoint)),
+                    transparent::Input::Coinbase { .. } => None,
+                })
+            })
+            .map(move |(input_idx, outpoint)| {
+                // Create futures lazily, and own the service clone so ZS needn't be Sync.
+                let state = state.clone();
+                let known_utxo = known_utxos.get(&outpoint).map(|output| output.utxo.clone());
+                async move {
+                    let utxo = if let Some(utxo) = known_utxo {
+                        tracing::trace!("UTXO in known_utxos, discarding query");
+                        Some(utxo)
+                    } else if is_mempool {
+                        let response = state
+                            .oneshot(zs::Request::UnspentBestChainUtxo(outpoint))
+                            .await
+                            .map_err(|_| TransactionError::TransparentInputNotFound)?;
+                        let zs::Response::UnspentBestChainUtxo(utxo) = response else {
+                            unreachable!("UnspentBestChainUtxo always responds with Option<Utxo>")
+                        };
                         utxo
                     } else {
-                        unreachable!("AwaitUtxo always responds with Utxo")
-                    }
-                };
+                        let response = state
+                            .oneshot(zs::Request::AwaitUtxo(outpoint))
+                            .await
+                            .map_err(|boxed_error| match boxed_error.downcast::<Elapsed>() {
+                                Ok(_) => TransactionError::TransparentInputNotFound,
+                                Err(boxed_error) => TransactionError::from(boxed_error),
+                            })?;
+                        let zs::Response::Utxo(utxo) = response else {
+                            unreachable!("AwaitUtxo always responds with Utxo")
+                        };
+                        Some(utxo)
+                    };
+                    Ok::<_, TransactionError>((input_idx, outpoint, utxo))
+                }
+            })
+            .buffer_unordered(concurrency);
+
+        while let Some(lookup) = lookups.next().await {
+            let (input_idx, outpoint, utxo) = lookup?;
+            if let Some(utxo) = utxo {
                 tracing::trace!(?utxo, "got UTXO");
                 spent_outputs[input_idx] = Some(utxo.output.clone());
-                spent_utxos.insert(*outpoint, utxo);
+                spent_utxos.insert(outpoint, utxo);
             } else {
-                continue;
+                spent_mempool_outpoints.push((input_idx, outpoint));
             }
         }
 

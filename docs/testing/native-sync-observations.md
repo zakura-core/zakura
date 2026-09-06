@@ -94,6 +94,13 @@ samples. Matching limits throughout the recording still do not prove the value
 between samples, and zero observed swap usage requires numeric observations;
 missing swap counters cannot establish it.
 
+The recorded `memory.peak` counter also preserves kernel-observed spikes between
+usage samples. It is a cgroup lifetime maximum, so a value read during the workload
+may include an earlier startup peak; it is not an exact peak for that phase.
+Keep it separate from the largest sampled `memory.current` value. A missing peak
+counter cannot rule out spikes, and the recording cannot capture a later peak
+after its final successful read.
+
 Limit-event changes are differences between valid adjacent samples of the same
 unit and boot. Initial counter values, missing reads, resets and sampling gaps
 do not contribute; excluded intervals remain explicit. A null change means no

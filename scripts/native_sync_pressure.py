@@ -85,7 +85,7 @@ class MemoryFootprint:
 
     def __init__(self):
         self.values = {name: MemoryValues() for name in
-                       ("memory.current", "memory.high", "memory.max", "memory.swap.current")}
+                       ("memory.current", "memory.peak", "memory.high", "memory.max", "memory.swap.current")}
         self.peak_usage = None
         self.peak_anon = None
         self.valid_usage_samples = 0
@@ -99,8 +99,8 @@ class MemoryFootprint:
         group = row.get("cgroup", {})
         stat = unsigned_counters(group.get("memory.stat"))
         usage = self.values["memory.current"].add(group.get("memory.current"))
-        for name in ("memory.high", "memory.max", "memory.swap.current"):
-            self.values[name].add(group.get(name), allow_unlimited=name != "memory.swap.current")
+        for name in ("memory.peak", "memory.high", "memory.max", "memory.swap.current"):
+            self.values[name].add(group.get(name), allow_unlimited=name in ("memory.high", "memory.max"))
         sample = {"utc_ns": row.get("utc_ns"), "sample_start_ns": row["sample_start_ns"],
                   "sample_end_ns": row["sample_end_ns"], "unit_identity": identity,
                   "boot_id": row.get("boot_id"), "memory_current_bytes": usage,

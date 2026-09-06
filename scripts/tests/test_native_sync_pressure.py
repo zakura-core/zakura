@@ -44,6 +44,18 @@ def summary(rows):
 
 
 class PressureTests(unittest.TestCase):
+    def test_kernel_peak_is_distinct_from_sampled_current_usage(self):
+        rows = [sample(0, 0), sample(2_000_000_000, 0)]
+        rows[0]["cgroup"].update({"memory.current": "100", "memory.peak": "150"})
+        rows[1]["cgroup"].update({"memory.current": "110", "memory.peak": "200"})
+        result = summary(rows)["cgroup_memory"]
+        self.assertEqual(result["peak_usage_sample"]["memory_current_bytes"], 110)
+        self.assertEqual(result["value_observations"]["memory.peak"]["maximum_bytes"], 200)
+        rows[1]["cgroup"].pop("memory.peak")
+        values = summary(rows)["cgroup_memory"]["value_observations"]["memory.peak"]
+        self.assertEqual(values["maximum_bytes"], 150)
+        self.assertEqual(values["unavailable_samples"], 1)
+
     def test_memory_limits_are_observed_beyond_the_peak_usage_sample(self):
         rows = [sample(i * 2_000_000_000, 0) for i in range(3)]
         for row, usage, high, swap in zip(rows, [900, 800, 700], ["1000", "1100", "max"], [0, 10, 5]):
@@ -73,13 +85,13 @@ class PressureTests(unittest.TestCase):
         self.assertEqual(empty["numeric_samples"], 0)
 
     def test_malformed_scalar_memory_values_are_rejected(self):
-        for name in ("memory.current", "memory.high", "memory.max", "memory.swap.current"):
+        for name in ("memory.current", "memory.peak", "memory.high", "memory.max", "memory.swap.current"):
             for value in ("-1", "1.5", "", "unavailable", "100 200"):
                 row = sample(0, 0)
                 row["cgroup"][name] = value
                 with self.subTest(name=name, value=value), self.assertRaises(ValueError):
                     summary([row])
-        for name in ("memory.current", "memory.swap.current"):
+        for name in ("memory.current", "memory.peak", "memory.swap.current"):
             row = sample(0, 0)
             row["cgroup"][name] = "max"
             with self.subTest(name=name), self.assertRaises(ValueError):

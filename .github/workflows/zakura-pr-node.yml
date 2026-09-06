@@ -81,6 +81,8 @@ on:
         value: ${{ jobs.node.outputs.end_height }}
       failure_phase:
         value: ${{ jobs.node.outputs.failure_phase }}
+      execution_attempt:
+        value: ${{ jobs.node.outputs.execution_attempt }}
       verdict:
         value: ${{ jobs.node.outputs.verdict }}
     secrets:
@@ -158,6 +160,7 @@ jobs:
       end_height: ${{ steps.result.outputs.end_height }}
       verdict: ${{ steps.result.outputs.verdict }}
       failure_phase: ${{ steps.phase.outputs.failure_phase }}
+      execution_attempt: ${{ steps.phase.outputs.execution_attempt }}
     # duration_minutes (<=60 typically) + incremental build + provisioning overhead.
     timeout-minutes: 110
     steps:
@@ -309,6 +312,7 @@ jobs:
           else PHASE=node-execution
           fi
           echo "failure_phase=$PHASE" >> "$GITHUB_OUTPUT"
+          echo "execution_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Collect run outputs
         id: result

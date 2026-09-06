@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import sys
 import unittest
+import threading
+import tempfile
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -601,7 +605,7 @@ class FleetSnapshotTests(unittest.TestCase):
         self.assertEqual(state["nodes"]["testnet/node-a"]["condition"], "ok")
 
 
-class SharedStallTests(unittest.TestCase):
+class WatchdogFixture:
     NOW = 2_000.0
 
     def setUp(self):
@@ -650,6 +654,301 @@ class SharedStallTests(unittest.TestCase):
         ):
             self.instance.run_once(self.state)
 
+
+class FleetBurstTests(WatchdogFixture, unittest.TestCase):
+    NAMES = [
+        "archive-vct-off", "asia-0", "asia-pacific-0", "asia-south-0",
+        "canada-0", "europe-central-0", "europe-west-0", "us-0",
+        "us-east-0", "us-west-0", "zcashd-compat", "zakura-compat",
+    ]
+    HEIGHT = 3_473_559
+
+    def agreed(self, age=542, height=None):
+        health = "healthy" if age < 300 else "stale"
+        return [self.row(name, height or self.HEIGHT, age, health) for name in self.NAMES]
+
+    def arriving(self, elapsed=60, distance=1):
+        rows = self.agreed(542 + elapsed)
+        rows[-1] = self.row("zakura-compat", self.HEIGHT + distance, 5, "healthy", "00bb")
+        rows[-1]["ancestor_hashes"] = {str(distance): "00aa"}
+        if distance == 1:
+            rows[-1]["previous_hash"] = "00aa"
+        return rows
+
+    def test_natural_gap_and_staggered_arrival_send_nothing(self):
+        self.run_snapshot(self.agreed())
+        self.run_snapshot(self.arriving(), now=self.NOW + 60)
+        self.assertEqual(len(self.state["propagation"]["testnet"]), 11)
+        self.run_snapshot(self.agreed(5, self.HEIGHT + 2), now=self.NOW + 120)
+        self.assertEqual(self.posted, [])
+        self.assertEqual(self.state["propagation"]["testnet"], {})
+
+    def test_unclassified_gap_batches_all_eleven_alerts_and_recoveries(self):
+        for missing_hash in (False, True):
+            with self.subTest(missing_hash=missing_hash):
+                self.state = {}
+                self.posted.clear()
+                rows = self.arriving()
+                if missing_hash:
+                    rows[-1] = self.row("zakura-compat", self.HEIGHT, 5, "healthy", "")
+                self.run_snapshot(rows)
+                self.assertEqual(len(self.posted), 1)
+                for name in self.NAMES[:-1]:
+                    self.assertIn(f"`{name}` stalled", self.posted[0])
+                    self.assertTrue(self.state["nodes"][f"testnet/{name}"]["alerting"])
+                self.run_snapshot(self.agreed(5, self.HEIGHT + 2), now=self.NOW + 60)
+                self.assertEqual(len(self.posted), 2)
+                for name in self.NAMES[:-1]:
+                    self.assertIn(f"`{name}` recovered from stalled", self.posted[1])
+
+    def test_persistent_lag_alerts_after_two_minutes_despite_more_blocks_and_restart(self):
+        self.run_snapshot(self.agreed())
+        self.run_snapshot(self.arriving(), now=self.NOW + 60)
+        self.state = json.loads(json.dumps(self.state))
+        self.instance = watchdog.Watchdog([self.fleet], self.args)
+        self.run_snapshot(self.arriving(179, 2), now=self.NOW + 179)
+        self.assertEqual(self.posted, [])
+        self.run_snapshot(self.arriving(180, 2), now=self.NOW + 180)
+        self.assertEqual(len(self.posted), 1)
+        for name in self.NAMES[:-1]:
+            self.assertIn(f"`{name}` stalled", self.posted[0])
+        self.run_snapshot(self.arriving(240, 5), now=self.NOW + 240)
+        self.assertEqual(len(self.posted), 1)
+
+    def test_incomplete_data_or_conflicting_hash_cancels_grace(self):
+        for field, value in (("block_hash", "ffff"), ("height", None), ("seconds_since_advanced", None)):
+            with self.subTest(field=field):
+                self.state = {}
+                self.posted.clear()
+                self.run_snapshot(self.agreed())
+                self.run_snapshot(self.arriving(), now=self.NOW + 60)
+                rows = self.arriving(90)
+                rows[0][field] = value
+                self.run_snapshot(rows, now=self.NOW + 90)
+                self.assertEqual(len(self.posted), 1)
+                self.assertIn("`us-east-0` stalled", self.posted[0])
+                self.assertEqual(self.state["propagation"]["testnet"], {})
+
+    def test_unproven_extension_does_not_grant_grace(self):
+        self.run_snapshot(self.agreed())
+        rows = self.arriving()
+        rows[-1].pop("previous_hash")
+        rows[-1]["ancestor_hashes"] = {"1": "ffff"}
+        self.run_snapshot(rows, now=self.NOW + 60)
+        self.assertEqual(len(self.posted), 1)
+
+    def test_down_deadline_is_preserved_during_propagation(self):
+        down = self.row("offline", None, None, "rpc_error", "")
+        self.run_snapshot(self.agreed() + [down], now=self.NOW - 540)
+        self.run_snapshot(self.agreed() + [down])
+        self.run_snapshot(self.arriving() + [down], now=self.NOW + 60)
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("`offline` down for 10m", self.posted[0])
+        self.assertNotIn("`us-east-0` stalled", self.posted[0])
+
+    def test_long_shared_gap_still_warns_and_recovers_once(self):
+        self.run_snapshot(self.agreed(1801))
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("12 nodes agree", self.posted[0])
+        self.run_snapshot(self.agreed(5, self.HEIGHT + 1), now=self.NOW + 60)
+        self.assertEqual(len(self.posted), 2)
+        self.assertIn("shared stall cleared", self.posted[1])
+
+    def test_failed_batch_retries_after_reload_without_committing_delivery(self):
+        watchdog.post_slack = lambda text, args: (self.posted.append(text), False)[1]
+        self.run_snapshot(self.arriving())
+        self.assertEqual(self.state["nodes"], {})
+        pending = copy.deepcopy(self.state["pending_delivery"])
+        self.state = json.loads(json.dumps(self.state))
+        self.instance = watchdog.Watchdog([self.fleet], self.args)
+        watchdog.post_slack = lambda text, args: (self.posted.append(text), True)[1]
+        self.run_snapshot(self.arriving(120), now=self.NOW + 60)
+        self.assertEqual(self.posted[0], self.posted[1])
+        self.assertEqual(self.posted[1], pending["testnet"]["messages"][0])
+        self.assertFalse(self.state["pending_delivery"])
+        self.assertTrue(self.state["nodes"]["testnet/us-east-0"]["alerting"])
+        self.run_snapshot(self.arriving(180), now=self.NOW + 120)
+        self.assertEqual(len(self.posted), 2)
+
+    def test_recovery_and_new_failure_are_observed_while_delivery_is_pending(self):
+        watchdog.post_slack = lambda text, args: False
+        self.run_snapshot(self.arriving())
+        down = self.row("offline", None, None, "rpc_error", "")
+        self.run_snapshot(self.agreed(5, self.HEIGHT + 1) + [down], now=self.NOW + 60)
+        self.run_snapshot(self.agreed(5, self.HEIGHT + 2) + [down], now=self.NOW + 660)
+        pending = self.state["pending_delivery"]["testnet"]
+        self.assertEqual(len(pending["messages"]), 3)
+        self.assertIn("`us-east-0` recovered", pending["messages"][1])
+        self.assertIn("`offline` down for 10m", pending["messages"][2])
+        watchdog.post_slack = lambda text, args: (self.posted.append(text), True)[1]
+        for elapsed in (720, 780, 840):
+            self.run_snapshot(self.agreed(5, self.HEIGHT + 2) + [down], now=self.NOW + elapsed)
+        self.assertEqual(len(self.posted), 3)
+        self.assertFalse(self.state["pending_delivery"])
+        self.assertTrue(self.state["nodes"]["testnet/offline"]["alerting"])
+        self.assertFalse(self.state["nodes"]["testnet/us-east-0"]["alerting"])
+
+    def test_large_batch_preserves_each_node_and_delivers_one_chunk_per_poll(self):
+        rows = [self.row(f"node-{i:04}-" + "n" * 100, 100 + i, 601) for i in range(250)]
+        self.run_snapshot(rows)
+        self.assertEqual(len(self.posted), 1)
+        self.assertTrue(self.state["pending_delivery"])
+        for i in range(1, 20):
+            if not self.state["pending_delivery"]:
+                break
+            before = len(self.posted)
+            self.run_snapshot(rows, now=self.NOW + i * 60)
+            self.assertEqual(len(self.posted), before + 1)
+        self.assertFalse(self.state["pending_delivery"])
+        for row in rows:
+            self.assertEqual(sum(f"`{row['name']}` stalled" in message for message in self.posted), 1)
+        self.assertTrue(all(len(message) <= watchdog.MAX_SLACK_MESSAGE_CHARS for message in self.posted))
+
+    def test_decision_history_is_bounded_and_explains_rejected_grouping(self):
+        for i in range(40):
+            rows = self.arriving() if i % 2 else self.agreed()
+            self.run_snapshot(rows, now=self.NOW + i * 60)
+        history = self.state["decisions"]["testnet"]
+        self.assertEqual(len(history), watchdog.MAX_DECISION_HISTORY)
+        self.assertEqual(history[-1]["decision"]["reason"], "no strict majority at highest tip")
+        self.assertEqual(history[-1]["rows"][-1]["height"], self.HEIGHT + 1)
+
+    def test_unrelated_higher_tip_cancels_existing_grace(self):
+        self.run_snapshot(self.agreed())
+        self.run_snapshot(self.arriving(), now=self.NOW + 60)
+        rows = self.arriving(90)
+        rows.append(self.row("unrelated", self.HEIGHT + 2, 5, "healthy", "ffff"))
+        self.run_snapshot(rows, now=self.NOW + 90)
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("`us-east-0` stalled", self.posted[0])
+        self.assertEqual(self.state["propagation"]["testnet"], {})
+
+    def test_stale_shared_observation_does_not_grant_grace(self):
+        self.run_snapshot(self.agreed())
+        self.run_snapshot(self.arriving(180), now=self.NOW + 180)
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("`us-east-0` stalled", self.posted[0])
+
+    def test_partial_batch_failure_and_restart_do_not_repeat_acknowledged_chunk(self):
+        rows = [self.row(f"node-{i:04}-" + "n" * 100, 100 + i, 601) for i in range(250)]
+        self.run_snapshot(rows)
+        acknowledged = self.posted[0]
+        watchdog.post_slack = lambda text, args: (self.posted.append(text), False)[1]
+        self.run_snapshot(rows, now=self.NOW + 60)
+        failed = self.posted[-1]
+        self.assertNotEqual(acknowledged, failed)
+        self.state = json.loads(json.dumps(self.state))
+        self.instance = watchdog.Watchdog([self.fleet], self.args)
+        watchdog.post_slack = lambda text, args: (self.posted.append(text), True)[1]
+        self.run_snapshot(rows, now=self.NOW + 120)
+        self.assertEqual(self.posted[-1], failed)
+        self.assertEqual(self.posted.count(acknowledged), 1)
+
+    def test_pending_delivery_and_acknowledgement_are_checkpointed(self):
+        saved = []
+        self.instance.checkpoint = lambda state: saved.append(copy.deepcopy(state))
+
+        def accept(text, args):
+            self.assertTrue(saved[-1]["pending_delivery"])
+            self.assertFalse(saved[-1]["nodes"])
+            return True
+
+        watchdog.post_slack = accept
+        self.run_snapshot(self.arriving())
+        self.assertEqual(len(saved), 2)
+        self.assertFalse(saved[-1]["pending_delivery"])
+        self.assertTrue(saved[-1]["nodes"]["testnet/us-east-0"]["alerting"])
+
+    def test_pending_batch_survives_real_state_file_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            checkpoint = lambda state: watchdog.save_state(path, state)
+            self.instance = watchdog.Watchdog([self.fleet], self.args, checkpoint=checkpoint)
+            watchdog.post_slack = lambda text, args: False
+            self.run_snapshot(self.arriving())
+            self.state = watchdog.load_state(path)
+            self.assertTrue(self.state["pending_delivery"])
+            self.assertEqual(self.state["nodes"], {})
+            self.instance = watchdog.Watchdog([self.fleet], self.args, checkpoint=checkpoint)
+            watchdog.post_slack = lambda text, args: (self.posted.append(text), True)[1]
+            self.run_snapshot(self.arriving(120), now=self.NOW + 60)
+            restored = watchdog.load_state(path)
+            self.assertFalse(restored["pending_delivery"])
+            self.assertTrue(restored["nodes"]["testnet/us-east-0"]["alerting"])
+            self.assertEqual(len(self.posted), 1)
+
+    def test_checkpoint_failure_prevents_sending(self):
+        def fail(state):
+            raise OSError("disk full")
+
+        self.instance.checkpoint = fail
+        with self.assertRaisesRegex(OSError, "disk full"):
+            self.run_snapshot(self.arriving())
+        self.assertEqual(self.posted, [])
+        self.assertTrue(self.state["pending_delivery"])
+        self.assertEqual(self.state["nodes"], {})
+
+    def test_one_fleets_failure_does_not_block_or_overwrite_another_fleet(self):
+        other = watchdog.Fleet("mainnet", "http://mainnet.invalid/data", "http://mainnet.invalid/")
+        self.instance = watchdog.Watchdog([self.fleet, other], self.args)
+        watchdog.post_slack = lambda text, args: "*Zakura testnet*" not in text
+        self.run_snapshot(self.arriving())
+        self.assertIn("testnet", self.state["pending_delivery"])
+        self.assertNotIn("mainnet", self.state["pending_delivery"])
+        self.assertTrue(self.state["nodes"]["mainnet/us-east-0"]["alerting"])
+        watchdog.post_slack = lambda text, args: True
+        self.run_snapshot(self.arriving(120), now=self.NOW + 60)
+        self.assertTrue(self.state["nodes"]["testnet/us-east-0"]["alerting"])
+        self.assertTrue(self.state["nodes"]["mainnet/us-east-0"]["alerting"])
+        self.assertFalse(self.state["pending_delivery"])
+
+    def test_deployment_suppression_defers_pending_delivery(self):
+        watchdog.post_slack = lambda text, args: False
+        self.run_snapshot(self.arriving())
+        watchdog.post_slack = lambda text, args: (self.posted.append(text), True)[1]
+        with patch.object(watchdog, "suppression_until", return_value=self.NOW + 120):
+            self.run_snapshot(self.arriving(120), now=self.NOW + 60)
+        self.assertEqual(self.posted, [])
+        self.assertTrue(self.state["pending_delivery"])
+        self.run_snapshot(self.arriving(180), now=self.NOW + 120)
+        self.assertEqual(len(self.posted), 1)
+
+    def test_loopback_webhook_receives_one_payload_for_each_eleven_node_transition(self):
+        payloads = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                payloads.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        watchdog.post_slack = self._real_post
+        self.args.dry_run = False
+        try:
+            with patch.dict(
+                watchdog.os.environ,
+                {"SLACK_WEB_HOOK": f"http://127.0.0.1:{server.server_port}/"},
+            ):
+                self.run_snapshot(self.arriving())
+                self.run_snapshot(self.agreed(5, self.HEIGHT + 2), now=self.NOW + 60)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[0]["text"].count("stalled for 10m 2s"), 11)
+        self.assertEqual(payloads[1]["text"].count("recovered from stalled"), 11)
+        self.assertFalse(self.state["pending_delivery"])
+
+
+class SharedStallTests(WatchdogFixture, unittest.TestCase):
     def test_matching_height_and_hash_posts_one_fleet_alert(self):
         self.run_snapshot(
             [
@@ -798,7 +1097,7 @@ class SharedStallTests(unittest.TestCase):
                 self.row("reference", 101, 5, "healthy"),
             ]
         )
-        self.assertEqual(len(self.posted), 2)
+        self.assertEqual(len(self.posted), 1)
         for name in ("node-a", "node-b"):
             self.assertTrue(self.state["nodes"][f"testnet/{name}"]["alerting"])
 
@@ -806,7 +1105,7 @@ class SharedStallTests(unittest.TestCase):
         self.run_snapshot(
             [self.row(f"node-{i}", 100 + i // 2, 601) for i in range(4)]
         )
-        self.assertEqual(len(self.posted), 4)
+        self.assertEqual(len(self.posted), 1)
         self.assertTrue(all(entry["alerting"] for entry in self.state["nodes"].values()))
 
     def test_conflicting_highest_hash_prevents_majority_suppression(self):
@@ -817,7 +1116,7 @@ class SharedStallTests(unittest.TestCase):
                 self.row("fork", 100, 601, block_hash="bbbb"),
             ]
         )
-        self.assertEqual(len(self.posted), 3)
+        self.assertEqual(len(self.posted), 1)
         self.assertTrue(all(entry["alerting"] for entry in self.state["nodes"].values()))
 
     def test_incomplete_laggard_observation_prevents_majority_suppression(self):
@@ -869,11 +1168,11 @@ class SharedStallTests(unittest.TestCase):
             self.row("laggard", 90, 601),
         ]
         self.run_snapshot(rows)
-        self.assertEqual(len(self.posted), 2)
+        self.assertEqual(len(self.posted), 1)
         self.state = json.loads(json.dumps(self.state))
         self.instance = watchdog.Watchdog([self.fleet], self.args)
         self.run_snapshot(rows, now=self.NOW + 60)
-        self.assertEqual(len(self.posted), 2)
+        self.assertEqual(len(self.posted), 1)
         self.assertTrue(self.state["shared_stalls"]["testnet"]["alerting"])
         self.assertTrue(self.state["nodes"]["testnet/laggard"]["alerting"])
 
@@ -882,7 +1181,7 @@ class SharedStallTests(unittest.TestCase):
             [self.row(f"node-{i}", 100, 1801) for i in range(3)]
             + [self.row("laggard", 90, 1900, block_hash="bbbb")]
         )
-        self.assertEqual(len(self.posted), 2)
+        self.assertEqual(len(self.posted), 1)
         self.posted.clear()
         self.run_snapshot(
             [
@@ -893,7 +1192,7 @@ class SharedStallTests(unittest.TestCase):
             ],
             now=self.NOW + 60,
         )
-        self.assertEqual(len(self.posted), 3)
+        self.assertEqual(len(self.posted), 1)
         self.assertIn("network height advanced", self.posted[0])
         for name in ("node-1", "node-2", "laggard"):
             self.assertTrue(self.state["nodes"][f"testnet/{name}"]["alerting"])
@@ -909,12 +1208,13 @@ class SharedStallTests(unittest.TestCase):
             self.posted.append(text), "observed tip" not in text
         )[1]
         self.run_snapshot(rows)
-        self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
-        self.assertTrue(self.state["nodes"]["testnet/laggard"]["alerting"])
-        self.assertEqual(len(self.posted), 2)
+        self.assertEqual(self.state["shared_stalls"], {})
+        self.assertEqual(self.state["nodes"], {})
+        self.assertIn("`laggard` stalled", self.posted[0])
+        self.assertEqual(len(self.posted), 1)
         watchdog.post_slack = lambda text, _args: (self.posted.append(text), True)[1]
         self.run_snapshot(rows, now=self.NOW + 60)
-        self.assertEqual(len(self.posted), 3)
+        self.assertEqual(len(self.posted), 2)
         self.assertTrue(self.state["shared_stalls"]["testnet"]["alerting"])
 
     def test_stall_to_rpc_failure_is_a_change_and_still_alerts_when_due(self):
@@ -973,9 +1273,9 @@ class SharedStallTests(unittest.TestCase):
         ]
         self.run_snapshot(diverged, now=self.NOW + 60)
 
-        self.assertEqual(len(self.posted), 2)
+        self.assertEqual(len(self.posted), 1)
         self.assertIn("network height advanced", self.posted[0])
-        self.assertIn("`node-b` stalled", self.posted[1])
+        self.assertIn("`node-b` stalled", self.posted[0])
 
     def test_matching_height_with_different_hashes_keeps_node_alerts(self):
         self.run_snapshot(
@@ -985,7 +1285,7 @@ class SharedStallTests(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(len(self.posted), 2)
+        self.assertEqual(len(self.posted), 1)
         self.assertTrue(all("stalled" in post for post in self.posted))
         self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
 
@@ -997,7 +1297,7 @@ class SharedStallTests(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(len(self.posted), 2)
+        self.assertEqual(len(self.posted), 1)
         self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
 
     def test_fork_closes_shared_alert_before_posting_node_alerts(self):
@@ -1017,10 +1317,11 @@ class SharedStallTests(unittest.TestCase):
             now=self.NOW + 60,
         )
 
-        self.assertEqual(len(self.posted), 3)
+        self.assertEqual(len(self.posted), 1)
         self.assertIn("shared stall tracking changed", self.posted[0])
         self.assertNotIn(":white_check_mark:", self.posted[0])
-        self.assertTrue(all("stalled" in post for post in self.posted[1:]))
+        self.assertIn("`node-a` stalled", self.posted[0])
+        self.assertIn("`node-b` stalled", self.posted[0])
         self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
 
     def test_threshold_skew_never_posts_a_constituent_node_alert(self):
@@ -1306,7 +1607,7 @@ class SharedStallTests(unittest.TestCase):
         self.run_snapshot(rows)
 
         self.assertEqual(len(self.posted), 1)
-        self.assertFalse(self.state["shared_stalls"]["testnet"]["alerting"])
+        self.assertEqual(self.state["shared_stalls"], {})
         self.assertTrue(
             all(not entry["alerting"] for entry in self.state["nodes"].values())
         )

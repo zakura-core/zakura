@@ -107,19 +107,69 @@ The watchdog coalesces that majority tip into one fleet alert. Nodes at lower
 heights keep their individual stall timers, so a lagging or resyncing node does
 not cause a separate alert for each node at the majority tip. A higher observed
 tip, conflicting hashes at the highest height, a missing height/hash/timer on
-any observable node, or the absence of a strict majority keeps individual alerts.
-Down and starting nodes do not participate in the tip comparison. Down alerts
-take precedence over stalled alerts and retain their own timers.
+any observable node, or the absence of a strict majority keeps individual
+incident tracking. Down and starting nodes do not participate in the tip
+comparison. Down alerts take precedence over stalled alerts and retain their
+own timers.
+
+When a shared tip starts advancing, former tip followers get up to two minutes
+for propagation before their individual stall alerts can fire. This requires a
+shared observation within the preceding two minutes, no existing alert for the
+node, complete tip observations, and reported ancestry linking all higher tips
+to the former shared block. Missing evidence or conflicting hashes cancel the
+grace. The grace timer starts when the newer block is first observed and survives
+restarts; more blocks do not extend it. A node that remains stuck then follows
+the existing stall threshold. A new watchdog with no prior shared observation
+uses the conservative fallback.
 
 This comparison is within the monitored fleet, not an independent verification
 of network health. A correlated sync failure can also produce agreement, so the
-30-minute shared warning remains enabled. Existing 10-minute individual stall,
-RPC/down, and dashboard thresholds are unchanged. Testnet uses the same policy.
+30-minute shared warning remains enabled. The existing 10-minute individual
+stall, RPC/down, and dashboard thresholds remain in place. Only the narrow
+propagation grace can defer an otherwise due node stall. Testnet uses the same
+policy.
 
 The watchdog posts only on transitions. Persistent failures do not post every
 poll. A transition to another unhealthy state is labeled as a condition change,
 not a green recovery. Consolidating alerts or changing shared-tip ownership is
 informational; clearing a shared stall after height progress is a recovery.
+
+### Batched delivery
+
+Each fleet sends at most one Slack payload per poll. Simultaneous transitions
+share a message containing the essential lines for each incident and dashboard
+links. Single incidents retain their detailed diagnostics. Eleven simultaneous
+stall alerts and eleven simultaneous recoveries therefore produce two messages,
+even when tip grouping is unavailable. The messages are grouped at the sender;
+they are not Slack thread replies.
+
+Larger batches split at the message size limit without dropping incident
+summaries. Remaining chunks stay in `pending_delivery` in the state file and
+send one per poll, in order. Each payload includes its observation time (except
+a legacy single message that already fills the size limit), so delayed delivery
+is distinguishable from a fresh observation. Polling and incident tracking
+continue while delivery is pending, including recoveries and new failures.
+Deployment suppression defers queued payloads until the suppression expires.
+
+The watchdog checkpoints queued messages before sending and checkpoints each
+successful acknowledgement. Confirmed alert state changes are committed when
+the fleet's pending messages have all been accepted. Failed payloads retry after
+restart; acknowledged chunks are not retried after their checkpoint. Delivery
+is at least once: a timeout after Slack accepts a message, or a crash before the
+acknowledgement checkpoint, can still repeat that payload. Keep the state file
+when upgrading and allow pending delivery to drain before reverting to a
+watchdog version that does not understand the queue. A prolonged Slack outage
+can grow the queue; the watchdog retains those transitions instead of dropping
+them.
+
+### Decision evidence
+
+The `decisions` state bucket retains the last 16 grouping/tip/grace changes per
+fleet, with at most 64 rows per entry. It records observation time, the grouping
+reason, participant names, heights, hashes, and progress ages. It excludes RPC
+credentials, webhook URLs, and arbitrary diagnostics. Row counts identify a
+truncated fleet snapshot. Pending delivery retains its prospective decision
+history until acknowledged.
 
 Slack delivery is **webhook-only**. Set:
 

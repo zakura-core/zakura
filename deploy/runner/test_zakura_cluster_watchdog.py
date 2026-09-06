@@ -733,6 +733,75 @@ class FleetBurstTests(WatchdogFixture, unittest.TestCase):
         self.run_snapshot(self.arriving(240, 5), now=self.NOW + 240)
         self.assertEqual(len(self.posted), 1)
 
+    def sparse_arriving(self, elapsed, distance):
+        def block_hash(offset):
+            return {0: "00aa", 1: "00bb"}.get(offset, f"{offset + 1_000_000:064x}")
+
+        rows = self.arriving(elapsed, distance)
+        rows[-1]["block_hash"] = block_hash(distance)
+        rows[-1]["previous_hash"] = block_hash(distance - 1)
+        rows[-1]["ancestor_hashes"] = {
+            str(depth): block_hash(distance - depth) for depth in (1, 2, 5, 10, 32)
+        }
+        return rows
+
+    def test_sparse_depths_preserve_established_grace_without_extending_it(self):
+        for distance in (3, 4, 6, 8, 33):
+            with self.subTest(distance=distance):
+                self.state = {}
+                self.posted.clear()
+                self.run_snapshot(self.agreed())
+                self.run_snapshot(self.arriving(), now=self.NOW + 60)
+                self.state = json.loads(json.dumps(self.state))
+                self.instance = watchdog.Watchdog([self.fleet], self.args)
+                self.run_snapshot(self.sparse_arriving(90, distance), now=self.NOW + 90)
+                self.assertEqual(self.posted, [])
+                self.run_snapshot(self.sparse_arriving(180, distance), now=self.NOW + 180)
+                self.assertEqual(len(self.posted), 1)
+                self.assertEqual(self.posted[0].count("` stalled"), 11)
+
+    def test_cached_reference_hash_conflict_cancels_grace_at_unsampled_depth(self):
+        self.run_snapshot(self.agreed())
+        self.run_snapshot(self.arriving(), now=self.NOW + 60)
+        rows = self.sparse_arriving(90, 3)
+        rows[-1]["ancestor_hashes"]["2"] = "ffff"
+        self.run_snapshot(rows, now=self.NOW + 90)
+        self.assertEqual(len(self.posted), 1)
+        self.assertEqual(self.state["propagation"]["testnet"], {})
+
+    def test_only_positively_linked_reference_tips_are_retained(self):
+        self.run_snapshot(self.agreed())
+        self.run_snapshot(self.arriving(), now=self.NOW + 60)
+        for elapsed, distance, retained_distance in ((75, 3, 3), (90, 7, 3), (105, 8, 8)):
+            self.run_snapshot(self.sparse_arriving(elapsed, distance), now=self.NOW + elapsed)
+            entry = self.state["propagation"]["testnet"]["us-east-0"]
+            self.assertEqual(entry["references"]["zakura-compat"]["height"],
+                             self.HEIGHT + retained_distance)
+            self.assertEqual(entry["since"], self.NOW + 60)
+        self.assertEqual(self.posted, [])
+
+    def test_reference_rollback_cancels_grace(self):
+        self.run_snapshot(self.agreed())
+        self.run_snapshot(self.arriving(), now=self.NOW + 60)
+        self.run_snapshot(self.sparse_arriving(75, 3), now=self.NOW + 75)
+        self.run_snapshot(self.sparse_arriving(90, 2), now=self.NOW + 90)
+        self.assertEqual(len(self.posted), 1)
+        self.assertEqual(self.state["propagation"]["testnet"], {})
+
+    def test_unknown_initial_ancestry_uses_batched_fallback(self):
+        self.run_snapshot(self.agreed())
+        self.run_snapshot(self.sparse_arriving(60, 3), now=self.NOW + 60)
+        self.assertEqual(len(self.posted), 1)
+        self.assertEqual(self.posted[0].count("` stalled"), 11)
+        self.assertEqual(self.state["propagation"]["testnet"], {})
+
+    def test_sparse_catchup_does_not_create_stall_or_recovery_messages(self):
+        self.run_snapshot(self.agreed())
+        self.run_snapshot(self.arriving(), now=self.NOW + 60)
+        self.run_snapshot(self.sparse_arriving(90, 4), now=self.NOW + 90)
+        self.run_snapshot(self.agreed(5, self.HEIGHT + 4), now=self.NOW + 120)
+        self.assertEqual(self.posted, [])
+
     def test_incomplete_data_or_conflicting_hash_cancels_grace(self):
         for field, value in (("block_hash", "ffff"), ("height", None), ("seconds_since_advanced", None)):
             with self.subTest(field=field):

@@ -113,15 +113,25 @@ comparison. Down alerts take precedence over stalled alerts and retain their
 own timers.
 
 When a shared tip starts advancing, former tip followers get up to two minutes
-for propagation before their individual stall alerts can fire. This requires a
-shared observation within the preceding two minutes, no existing alert for the
-node (a shared fleet warning does not disqualify it), complete tip observations,
-and reported ancestry linking all higher tips
-to the former shared block. Missing evidence or conflicting hashes cancel the
-grace. The grace timer starts when the newer block is first observed and survives
+for propagation before their individual stall alerts can fire. Starting this
+grace requires a shared observation within the preceding two minutes, no
+existing individual alert for the node, complete tip observations, and reported
+ancestry linking all higher tips to the former shared block. A shared fleet
+warning does not disqualify its followers.
+
+The watchdog persists each reference's last positively linked tip. Later
+snapshots can link through that tip when the collector does not sample the
+exact distance to the original shared block. If neither distance is sampled,
+an already proven reference retains only the remainder of the original grace;
+its unproven newer tip is not saved as an ancestry witness. Missing node
+height/hash/timer, conflicting hashes or ancestry, a reference rolling back,
+or an unproven new reference cancels the grace. This adds no collector RPCs.
+
+The grace timer starts when the newer block is first observed and survives
 restarts; more blocks do not extend it. A node that remains stuck then follows
-the existing stall threshold. A new watchdog with no prior shared observation
-uses the conservative fallback.
+the existing stall threshold. A new watchdog with no prior shared observation,
+or an initial extension whose ancestry cannot be established, uses the batched
+fallback.
 
 This comparison is within the monitored fleet, not an independent verification
 of network health. A correlated sync failure can also produce agreement, so the

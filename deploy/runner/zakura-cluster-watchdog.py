@@ -1266,7 +1266,9 @@ class Watchdog:
 
         Each timer stays anchored to the first observed extension, even across
         polls, further blocks, and restarts. Existing alerts are never suppressed.
-        Missing tip evidence or a same-height hash conflict cancels the grace.
+        Missing height/hash/timer or conflicting ancestry cancels the grace.
+        An unsampled ancestry depth alone does not cancel a previously proven
+        reference; it can only use the remainder of the original deadline.
         """
         bucket = state.setdefault("propagation", {})
         pending = bucket.setdefault(fleet.name, {})
@@ -1294,30 +1296,65 @@ class Watchdog:
             and height is not None and bool(block_hash)
         )
 
-        def extensions_match(anchor_height: int, anchor_hash: str) -> bool:
+        def ancestor_at(row: dict[str, Any], ancestor_height: int) -> str | None:
+            distance = coerce_height(row["height"]) - ancestor_height
+            if distance == 0:
+                return validated_block_hash(row["block_hash"])
+            ancestors = row.get("ancestor_hashes")
+            value = ancestors.get(str(distance)) if isinstance(ancestors, dict) else None
+            if distance == 1:
+                value = row.get("previous_hash") or value
+            # Distinguish an unsampled depth from a malformed/conflicting hash.
+            return None if value is None else validated_block_hash(value) or ""
+
+        def extension_references(
+            anchor_height: int, anchor_hash: str, known: dict[str, Any]
+        ) -> dict[str, Any] | None:
             higher_rows = [
                 row for row in observable
                 if coerce_height(row["height"]) > anchor_height
             ]
             if not higher_rows:
-                return False
+                return None
+            confirmed = {}
             for row in higher_rows:
-                distance = coerce_height(row["height"]) - anchor_height
-                ancestors = row.get("ancestor_hashes")
-                ancestor = (
-                    ancestors.get(str(distance)) if isinstance(ancestors, dict) else None
-                )
-                if distance == 1:
-                    ancestor = row.get("previous_hash") or ancestor
-                if validated_block_hash(ancestor) != anchor_hash:
-                    return False
-            return True
+                name = row["name"]
+                direct = ancestor_at(row, anchor_height)
+                if direct is not None and direct != anchor_hash:
+                    return None
+                reference = known.get(name)
+                linked = False
+                if reference:
+                    if coerce_height(row["height"]) < reference["height"]:
+                        return None
+                    ancestor = ancestor_at(row, reference["height"])
+                    if ancestor is not None and ancestor != reference["hash"]:
+                        return None
+                    linked = ancestor == reference["hash"]
+                if direct == anchor_hash or linked:
+                    confirmed[name] = {
+                        "height": coerce_height(row["height"]),
+                        "hash": validated_block_hash(row["block_hash"]),
+                    }
+                elif reference:
+                    # Missing a sampled depth does not revoke an established,
+                    # bounded grace. Retain only the last positively linked tip;
+                    # an unproven newer tip must not become an ancestry witness.
+                    confirmed[name] = reference
+                else:
+                    return None
+            return confirmed
 
-        extension = recent_shared and extensions_match(height, block_hash)
+        references = extension_references(height, block_hash, {}) if recent_shared else None
         for name in list(pending):
             entry = pending[name]
-            if not extensions_match(entry["height"], entry["hash"]):
+            updated = extension_references(
+                entry["height"], entry["hash"], entry.get("references", {})
+            )
+            if updated is None:
                 del pending[name]
+            else:
+                entry["references"] = updated
 
         current = {str(row["name"]): row for row in observable}
         for name in list(pending):
@@ -1329,7 +1366,7 @@ class Watchdog:
                 or validated_block_hash(row["block_hash"]) != entry["hash"]
             ):
                 del pending[name]
-        if extension:
+        if references is not None:
             for name in previous.get("node_names", []):
                 row = current.get(name)
                 old_alert = state.get("nodes", {}).get(f"{fleet.name}/{name}", {})
@@ -1339,7 +1376,10 @@ class Watchdog:
                     and validated_block_hash(row["block_hash"]) == block_hash
                 ):
                     pending.setdefault(
-                        name, {"height": height, "hash": block_hash, "since": now}
+                        name, {
+                            "height": height, "hash": block_hash, "since": now,
+                            "references": references,
+                        }
                     )
         return {
             name for name, entry in pending.items()

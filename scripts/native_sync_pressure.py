@@ -32,6 +32,93 @@ def pressure_total(text, kind):
     return int(totals[0]) if len(totals) == 1 and totals[0].isdigit() else None
 
 
+def unsigned_counters(text):
+    """Preserve missing reads; reject malformed or duplicate cgroup counters."""
+    if not isinstance(text, str):
+        return None
+    result = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[1].isdigit() or fields[0] in result:
+            raise ValueError("invalid cgroup counter row")
+        result[fields[0]] = int(fields[1])
+    return result or None
+
+
+class MemoryFootprint:
+    """Keep peak compositions and event changes without inferring reclaimability."""
+
+    EVENTS = ("low", "high", "max", "oom", "oom_kill", "oom_group_kill")
+
+    def __init__(self):
+        self.peak_usage = None
+        self.peak_anon = None
+        self.valid_usage_samples = 0
+        self.missing_stat_samples = 0
+        self.previous = None
+        self.changes = {name: 0 for name in self.EVENTS}
+        self.intervals = {name: 0 for name in self.EVENTS}
+        self.excluded = {name: Counter() for name in self.EVENTS}
+
+    def add(self, row, identity):
+        group = row.get("cgroup", {})
+        stat = unsigned_counters(group.get("memory.stat"))
+        raw_usage = group.get("memory.current")
+        usage = (int(raw_usage) if isinstance(raw_usage, str)
+                 and raw_usage.strip().isdigit() else None)
+        sample = {"utc_ns": row.get("utc_ns"), "sample_start_ns": row["sample_start_ns"],
+                  "sample_end_ns": row["sample_end_ns"], "unit_identity": identity,
+                  "boot_id": row.get("boot_id"), "memory_current_bytes": usage,
+                  "memory_max": group.get("memory.max"), "memory_high": group.get("memory.high"),
+                  "memory_stat": stat}
+        if usage is not None:
+            self.valid_usage_samples += 1
+            if self.peak_usage is None or usage > self.peak_usage["memory_current_bytes"]:
+                self.peak_usage = sample
+        if stat is None:
+            self.missing_stat_samples += 1
+        elif "anon" in stat and (self.peak_anon is None
+                                  or stat["anon"] > self.peak_anon["memory_stat"]["anon"]):
+            self.peak_anon = sample
+        events = unsigned_counters(group.get("memory.events")) or {}
+        if self.previous is not None:
+            before, old_events = self.previous
+            for name in self.EVENTS:
+                reason = None
+                if not identity or before["unit_identity"] != identity:
+                    reason = "unit_changed"
+                elif before["boot_id"] != sample["boot_id"]:
+                    reason = "host_changed"
+                elif (sample["sample_start_ns"] <= before["sample_end_ns"]
+                      or before["sample_end_ns"] < before["sample_start_ns"]
+                      or sample["sample_end_ns"] < sample["sample_start_ns"]
+                      or sample["sample_end_ns"] - before["sample_start_ns"] > 10_000_000_000):
+                    reason = "clock_or_sampling_gap"
+                elif name not in events or name not in old_events:
+                    reason = "missing_counter"
+                elif events[name] < old_events[name]:
+                    reason = "counter_reset"
+                if reason:
+                    self.excluded[name][reason] += 1
+                else:
+                    self.changes[name] += events[name] - old_events[name]
+                    self.intervals[name] += 1
+        self.previous = sample, events
+
+    def report(self):
+        return {"valid_usage_samples": self.valid_usage_samples,
+                "missing_stat_samples": self.missing_stat_samples,
+                "peak_usage_sample": self.peak_usage, "peak_anon_sample": self.peak_anon,
+                "event_changes": {name: {"observed_change": self.changes[name] if self.intervals[name] else None,
+                                         "valid_intervals": self.intervals[name],
+                                         "excluded_intervals": dict(self.excluded[name])}
+                                  for name in self.EVENTS},
+                "scope": "Peak fields come from the same bracketed read, not an atomic snapshot. "
+                         "Memory categories overlap; do not sum file and LRU fields. "
+                         "Event changes exclude the initial count and unobserved intervals; "
+                         "they are not absolute lifetime totals or a headroom pass."}
+
+
 class PressureIntervals:
     """Accumulate adjacent observations without retaining the recording."""
 
@@ -88,6 +175,7 @@ class MemoryPressure:
 
     def __init__(self):
         self.previous = None
+        self.footprint = MemoryFootprint()
         self.samples = 0
         self.memory_samples = 0
         self.minimum_available = None
@@ -114,6 +202,7 @@ class MemoryPressure:
         identity = (unit.get("MainPID"), unit.get("ControlGroup"))
         if not identity[0] or identity[0] == "0" or not identity[1]:
             identity = None
+        self.footprint.add(row, identity)
         current = {"start": row["sample_start_ns"], "end": row["sample_end_ns"],
                    "unit_identity": identity, "boot_id": row.get("boot_id")}
         for scope, field in (("host", "pressure/memory"), ("cgroup", "memory.pressure")):
@@ -131,6 +220,7 @@ class MemoryPressure:
             "host_memory_samples": self.memory_samples,
             "host_minimum_available_percent": self.minimum_available,
             "host_peak_cached_bytes": self.peak_cached,
+            "cgroup_memory": self.footprint.report(),
             "memory_pressure": {scope: {kind: counter.report() for kind, counter in counters.items()}
                                 for scope, counters in self.pressure.items()},
         }

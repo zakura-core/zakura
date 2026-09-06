@@ -79,6 +79,21 @@ availability alone establishes safe memory headroom. Inspect both host and node
 pressure, memory-limit/OOM events, process memory and actual committed progress.
 The recorder includes the underlying counters for those separate checks.
 
+The `cgroup_memory` section retains the memory composition at the highest sampled
+total usage and, separately, at the highest sampled anonymous usage. Each is one
+bracketed read, not an atomic snapshot or a sum of independent peaks. File, LRU,
+dirty-page and kernel subcategories overlap. The report preserves their values
+without treating them as guaranteed reclaimable memory or calculating a headroom
+pass from subtraction.
+
+Limit-event changes are differences between valid adjacent samples of the same
+unit and boot. Initial counter values, missing reads, resets and sampling gaps
+do not contribute; excluded intervals remain explicit. A null change means no
+valid interval was observed, while zero means valid intervals showed no change.
+These changes are not the unit's absolute lifetime event counts. Keep the raw
+recording and the controller's full-run outcome alongside the selected-phase
+report, particularly when the node reaches a memory limit.
+
 Do not align timestamps from different native trace emitters merely because
 their process identities match. Explain received-body gaps with events from the
 same block-sync emitter or an independently synchronized observer.

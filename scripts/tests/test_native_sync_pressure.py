@@ -44,6 +44,60 @@ def summary(rows):
 
 
 class PressureTests(unittest.TestCase):
+    def test_peak_composition_does_not_combine_different_samples(self):
+        rows = [sample(0, 0), sample(2_000_000_000, 1)]
+        rows[0]["cgroup"].update({"memory.current": "1000", "memory.stat": "anon 100\nfile 900\ninactive_file 800\n"})
+        rows[1]["cgroup"].update({"memory.current": "700", "memory.stat": "anon 200\nfile 500\ninactive_file 400\n"})
+        result = summary(rows)["cgroup_memory"]
+        self.assertEqual(result["peak_usage_sample"]["memory_current_bytes"], 1000)
+        self.assertEqual(result["peak_usage_sample"]["memory_stat"]["anon"], 100)
+        self.assertEqual(result["peak_anon_sample"]["memory_current_bytes"], 700)
+        self.assertEqual(result["peak_anon_sample"]["memory_stat"]["anon"], 200)
+
+    def test_limit_events_report_changes_not_initial_counts(self):
+        rows = [sample(i * 2_000_000_000, 0) for i in range(3)]
+        for row, count in zip(rows, [50, 54, 61]):
+            row["cgroup"]["memory.events"] = f"max {count}\noom 0\n"
+        result = summary(rows)["cgroup_memory"]["event_changes"]
+        self.assertEqual(result["max"]["observed_change"], 11)
+        self.assertEqual(result["max"]["valid_intervals"], 2)
+        self.assertEqual(result["oom"]["observed_change"], 0)
+        self.assertIsNone(result["high"]["observed_change"])
+        self.assertIsNone(summary(rows[:1])["cgroup_memory"]["event_changes"]["max"]["observed_change"])
+
+    def test_missing_and_reset_memory_counters_remain_explicit(self):
+        rows = [sample(i * 2_000_000_000, 0) for i in range(4)]
+        for row, count in zip(rows, [50, None, 52, 0]):
+            row["cgroup"]["memory.events"] = {"error": "unavailable"} if count is None else f"max {count}\n"
+        result = summary(rows)["cgroup_memory"]
+        self.assertIsNone(result["peak_usage_sample"])
+        self.assertEqual(result["missing_stat_samples"], 4)
+        self.assertIsNone(result["event_changes"]["max"]["observed_change"])
+        self.assertEqual(result["event_changes"]["max"]["excluded_intervals"],
+                         {"missing_counter": 2, "counter_reset": 1})
+        rows[1]["unit"]["MainPID"] = "456"
+        self.assertEqual(summary(rows)["cgroup_memory"]["event_changes"]["max"]["excluded_intervals"],
+                         {"unit_changed": 2, "counter_reset": 1})
+
+    def test_malformed_memory_counter_cannot_be_a_zero(self):
+        for value in ("anon -1\n", "anon 1\nanon 2\n", "anon unavailable\n"):
+            row = sample(0, 0)
+            row["cgroup"]["memory.stat"] = value
+            with self.assertRaises(ValueError):
+                summary([row])
+
+    def test_limit_event_changes_exclude_boot_changes_and_sampling_gaps(self):
+        for after, reason in [(sample(20_000_000_000, 0), "clock_or_sampling_gap"),
+                              (sample(2_000_000_000, 0), "host_changed")]:
+            before = sample(0, 0)
+            if reason == "host_changed":
+                after["boot_id"] = "new-boot"
+            before["cgroup"]["memory.events"] = "max 1\n"
+            after["cgroup"]["memory.events"] = "max 2\n"
+            result = summary([before, after])["cgroup_memory"]["event_changes"]["max"]
+            self.assertIsNone(result["observed_change"])
+            self.assertEqual(result["excluded_intervals"], {reason: 1})
+
     def test_microsecond_counter_and_clock_uncertainty(self):
         report = summary([sample(0, 0), sample(2_000_000_000, 100_000)])
         value = report["memory_pressure"]["host"]["some"]

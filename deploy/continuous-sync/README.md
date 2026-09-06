@@ -20,17 +20,16 @@ v2 stack.
 `zakura-continuous-sync.service` runs
 `/usr/local/sbin/zakura-continuous-sync.py` on each host:
 
-1. Fetch `origin/main` in `/root/zakura` and pin the full commit SHA.
+1. Stop the node, prune old artifacts, check disk space, then fetch `origin/main` in `/root/zakura` and pin the full commit SHA.
 2. Build `zakurad` from a detached worktree and cache the binary by SHA.
 3. Atomically install the binary at `/usr/local/bin/zakurad`.
 4. Stop `zakura.service`.
 5. Verify `/var/lib/zakura/.continuous-sync-wipe-ok` exists.
 6. Delete only the configured disposable state entries:
    `/var/lib/zakura/state` and `/var/lib/zakura/non_finalized_state`.
-7. Preserve `/var/lib/zakura/network`, controller state, logs, traces, and build
-   cache.
-8. Render `/etc/zakura/zebrad.toml` with the node's assigned `p2p_stack` and a
-   run-specific trace directory.
+7. Preserve `/var/lib/zakura/network` and controller state.
+8. Render `/etc/zakura/zebrad.toml` with the node's assigned `p2p_stack`.
+   Detailed JSONL traces are enabled for every sync.
 9. Start `zakura.service` with `Restart=no`.
 10. Poll metrics and `/ready` until the node is stably near tip.
 11. Stop the node, record the completion for the daily audit digest, and start
@@ -41,8 +40,9 @@ continuous sync canary, not a once-per-SHA CI job.
 
 ## Failure Semantics
 
-Any build, install, cleanup, startup, sync, stall, timeout, disk, metrics, or
-readiness failure halts the affected node:
+Build, install, cleanup, startup, sync, stall, timeout, metrics, and readiness
+failures halt the affected node. Disk pressure follows the automatic recovery
+policy below. Other failures behave as follows:
 
 - `zakura-continuous-sync.service` exits non-zero.
 - `/var/lib/zakura-continuous-sync/state.json` records `failed = true`.
@@ -50,8 +50,7 @@ readiness failure halts the affected node:
 - a Slack alert is posted with the node mode, SHA, height, SSH target, log path,
   trace path, and monitor log path.
 
-The controller does not automatically retry after failure. Resume is an explicit
-operator action:
+For failures other than disk pressure, resume is an explicit operator action:
 
 ```bash
 python3 deploy/continuous-sync/deploy.py --node temp-zakura-sync-test-2 resume
@@ -238,8 +237,8 @@ a cycle complete. `/ready` checks that the node has live peers, is near the
 estimated network tip, and has a fresh tip. The controller also records
 Prometheus samples in `samples.jsonl` so a completed or failed run has evidence
 for height movement, readiness, legacy pipeline depth, and each active download
-or verification phase. The controller copies the current node log into the run
-directory on both completion and failure.
+or verification phase. The controller saves up to the last 64 MiB of the node
+log in the run directory on completion and failure.
 
 The relevant loopback endpoints are only bound locally:
 
@@ -249,15 +248,45 @@ The relevant loopback endpoints are only bound locally:
 
 ## Retention
 
-Detailed run artifacts live under `/var/log/zakura/runs/`. The controller keeps
-the active run and the two newest prior runs (`retention_runs = 3`), deleting
-older completed or failed run directories when each cycle starts.
+Detailed traces stay enabled so a failure can be investigated without reproducing
+it. The controller keeps up to 10 runs within a 20 GiB retention target, deleting
+successful runs first, oldest first. The current run and the most recent failed
+run are protected, including their traces, metadata, samples, and log tail.
+Protected runs may exceed the target; cleanup never discards them to meet it.
 
-`templates/logrotate` also rotates `/var/log/zakura/zebrad.log` and
-`/var/log/zakura/monitor.log` daily, keeping five compressed rotations.
+During sync, the controller checks trace files with logrotate every polling
+interval (normally 30 seconds). Each stream rotates at 128 MiB and keeps two older
+segments beside the current file. Files can exceed that size between checks.
+This preserves recent detailed history, not necessarily the entire sync.
+`copytruncate` keeps the existing append-only writer working without a restart;
+a small number of records can be lost at the copy/truncate boundary. Only the
+controller rotates traces, so retention cannot race a separate trace cleaner.
 
-The controller checks disk free space before and during sync. If free space falls
-below `min_free_bytes`, it halts and alerts instead of filling the host.
+For example, read `block_sync.jsonl.2`, then `.1`, then `block_sync.jsonl` for
+chronological history. To use tools that expect one file, concatenate those
+segments into a separate analysis directory. The stopped failure's files remain
+unchanged until a newer failure replaces its protected status.
+
+The controller also retains two cached binaries and removes interrupted
+controller build worktrees and temporary binary copies. The cache is reserved
+for controller builds. Unknown names and symlinked child directories are left
+alone; the runs directory itself may point to another volume.
+
+The existing minute monitor rotates node and monitor logs at 64 MiB or daily,
+retaining seven rotations. Each archived run log keeps its final 64 MiB.
+
+Cleanup runs before the initial disk check. During sync the controller checks
+the state, run, and build-cache filesystems. Below 10 GiB free it stops the node,
+records and alerts on the failed attempt, and prunes unprotected history. Once
+all three filesystems have 15 GiB free, it automatically starts a fresh sync.
+Until then it stays failed and rechecks once a minute. If protected evidence or
+unrelated files occupy the remaining space, it waits rather than deleting them.
+Other sync failures remain halted for investigation.
+
+Cleanup never touches chain state or network identity. A fresh attempt uses the
+existing sentinel-protected reset of disposable chain state. Stopping the
+controller also stops automatic recovery. Deployment removes the earlier
+standalone storage timer; `--no-start` does not start the controller.
 
 ## Replacement Node Bootstrap
 
@@ -274,7 +303,7 @@ For a fresh Ubuntu x86_64 host:
    apt-get update
    apt-get install -y \
      build-essential clang cmake git libclang-dev pkg-config \
-     protobuf-compiler python3
+     protobuf-compiler python3 logrotate
    ```
 
 5. Install the Rust toolchain specified by `rust-toolchain.toml`.

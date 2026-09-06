@@ -125,7 +125,7 @@ class ContinuousSyncTests(unittest.TestCase):
 
             self.assertEqual(
                 [call.args[0] for call in which.call_args_list],
-                ["cargo", "git", "systemctl"],
+                ["cargo", "git", "systemctl", "logrotate"],
             )
 
     def test_safe_wipe_state_removes_only_allowlisted_entries(self):
@@ -176,8 +176,8 @@ class ContinuousSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             runs_dir = tmp_path / "runs"
-            active = runs_dir / "active"
-            completed = [runs_dir / f"completed-{index}" for index in range(4)]
+            active = runs_dir / "20260709T000000Z-aaaaaaaaaaaa"
+            completed = [runs_dir / f"2026071{index}T000000Z-aaaaaaaaaaaa" for index in range(4)]
             for path in (*completed, active):
                 path.mkdir(parents=True)
             for index, path in enumerate(completed):
@@ -199,6 +199,205 @@ class ContinuousSyncTests(unittest.TestCase):
             self.assertFalse(completed[1].exists())
             self.assertTrue(completed[2].exists())
             self.assertTrue(completed[3].exists())
+
+    def test_cleanup_preserves_failure_evidence_and_unmanaged_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = make_config(root, policy=sync.Policy(retention_bytes=1))
+            failed = config.paths.runs_dir / "20260709T000000Z-aaaaaaaaaaaa"
+            complete = config.paths.runs_dir / "20260710T000000Z-bbbbbbbbbbbb"
+            unrelated = config.paths.runs_dir / "investigation"
+            for path, phase in ((failed, "failed"), (complete, "complete"), (unrelated, "complete")):
+                (path / "traces").mkdir(parents=True)
+                (path / "traces" / "big.jsonl").write_text("trace")
+                sync.write_run_json(path, {"started_at": path.name, "phase": phase})
+                (path / "samples.jsonl").write_text("height evidence")
+            outside = root / "outside"
+            outside.mkdir()
+            link = config.paths.runs_dir / "20260711T000000Z-cccccccccccc"
+            link.symlink_to(outside)
+            network = root / "network"
+            network.mkdir()
+            (network / "identity").write_text("identity")
+            sync.cleanup_retention(config, recovery=True)
+            self.assertTrue((failed / "run.json").exists())
+            self.assertTrue((failed / "samples.jsonl").exists())
+            self.assertEqual((failed / "traces" / "big.jsonl").read_text(), "trace")
+            self.assertFalse(complete.exists())
+            self.assertTrue((unrelated / "traces" / "big.jsonl").exists())
+            self.assertTrue(link.is_symlink())
+            self.assertTrue((network / "identity").exists())
+
+    def test_retention_discards_successes_before_older_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(retention_runs=2))
+            paths = []
+            for day, phase in ((1, "failed"), (2, "failed"), (3, "complete")):
+                path = config.paths.runs_dir / f"2026070{day}T000000Z-aaaaaaaaaaaa"
+                path.mkdir(parents=True)
+                sync.write_run_json(path, {"phase": phase, "started_at": path.name})
+                paths.append(path)
+            sync.cleanup_retention(config)
+            self.assertEqual([path.exists() for path in paths], [True, True, False])
+
+    @unittest.skipUnless(sync.shutil.which("logrotate"), "logrotate is required on the canaries")
+    def test_trace_rotation_preserves_recent_segments_and_open_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(trace_file_bytes=64))
+            run_dir = config.paths.runs_dir / "current"
+            traces = run_dir / "traces"
+            traces.mkdir(parents=True)
+            trace = traces / "block_sync.jsonl"
+            with trace.open("ab", buffering=0) as writer:
+                inode = trace.stat().st_ino
+                for batch in range(3):
+                    writer.write((json.dumps({"batch": batch, "detail": "x" * 100}) + "\n").encode())
+                    sync.rotate_traces(config, run_dir)
+                    self.assertEqual(trace.stat().st_ino, inode)
+                    self.assertEqual(trace.stat().st_size, 0)
+                writer.write(b'{"batch": 3}\n')
+            history = [json.loads(path.read_text())["batch"] for path in (
+                traces / "block_sync.jsonl.2", traces / "block_sync.jsonl.1", trace,
+            )]
+            self.assertEqual(history, [1, 2, 3])
+            self.assertFalse((traces / "block_sync.jsonl.3").exists())
+
+    def test_cleanup_bounds_binary_cache_and_removes_interrupted_builds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp))
+            cache = config.paths.build_cache_dir
+            cache.mkdir()
+            binaries = [cache / ("zakurad-" + str(i) * 40) for i in range(4)]
+            for index, binary in enumerate(binaries):
+                binary.write_text("binary")
+                binary.with_suffix(".json").write_text("{}")
+                os.utime(binary, (index, index))
+            partial = binaries[0].with_suffix(".tmp")
+            partial.write_text("partial")
+            worktree = cache / "worktree-aaaaaaaaaaaa"
+            worktree.mkdir()
+            (cache / "manual-build").mkdir()
+            with patch.object(sync, "run"):
+                sync.cleanup_retention(config)
+            self.assertFalse(partial.exists())
+            self.assertFalse(worktree.exists())
+            self.assertTrue((cache / "manual-build").exists())
+            for index, binary in enumerate(binaries):
+                self.assertEqual(binary.exists(), index >= 2)
+                self.assertEqual(binary.with_suffix(".json").exists(), index >= 2)
+
+    def test_disk_check_covers_separate_run_volume_and_recovery_headroom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp))
+            config.paths.runs_dir.mkdir()
+            config.paths.build_cache_dir.mkdir()
+            usage = sync.shutil.disk_usage(Path(tmp))
+            def disk_usage(path):
+                free = (12 if path == config.paths.runs_dir else 100) * 1024**3
+                return usage._replace(free=free)
+            with patch.object(sync.shutil, "disk_usage", side_effect=disk_usage):
+                sync.check_free_space(config)
+                with self.assertRaises(sync.DiskPressure):
+                    sync.check_free_space(config, recovery=True)
+
+    def test_cycle_stops_and_prunes_before_preflight(self):
+        events = []
+        config = make_config(Path("/tmp"))
+        with (
+            patch.object(sync, "stop_service", side_effect=lambda _: events.append("stop")),
+            patch.object(sync, "cleanup_retention", side_effect=lambda _: events.append("cleanup")),
+            patch.object(sync, "preflight", side_effect=sync.DiskPressure("low disk")),
+            self.assertRaises(sync.DiskPressure),
+        ):
+            sync.one_cycle(config, Path("/unused"), {})
+        self.assertEqual(events, ["stop", "cleanup"])
+
+    def test_disk_failure_retries_but_sync_failure_stays_halted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp))
+            state_path = config.paths.state_dir / "state.json"
+            failed_run = config.paths.runs_dir / "20260701T000000Z-aaaaaaaaaaaa"
+            def cycle_with_disk_failure(_, __, state):
+                if failed_run.exists():
+                    raise KeyboardInterrupt
+                (failed_run / "traces").mkdir(parents=True)
+                (failed_run / "traces" / "block_sync.jsonl").write_text("failure evidence")
+                sync.write_run_json(failed_run, {"phase": "syncing", "run_id": failed_run.name,
+                                               "run_dir": str(failed_run), "started_at": failed_run.name})
+                state["current_run"] = failed_run.name
+                raise sync.DiskPressure("low disk")
+            with (
+                patch.object(sync, "one_cycle", side_effect=cycle_with_disk_failure),
+                patch.object(sync, "stop_service"),
+                patch.object(sync, "check_free_space"),
+                patch.object(sync, "post_slack", return_value=False),
+                patch.object(sync.time, "sleep"),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                sync.run_loop(config, Path("/unused"))
+            self.assertFalse(sync.load_state(state_path)["failed"])
+            self.assertEqual((failed_run / "traces" / "block_sync.jsonl").read_text(), "failure evidence")
+            self.assertEqual(json.loads((failed_run / "run.json").read_text())["phase"], "failed")
+            with (
+                patch.object(sync, "one_cycle", side_effect=sync.ControllerError("sync stalled")) as cycle,
+                patch.object(sync, "stop_service"),
+                patch.object(sync, "post_slack", return_value=False),
+            ):
+                self.assertEqual(sync.run_loop(config, Path("/unused")), 1)
+                self.assertEqual(sync.run_loop(config, Path("/unused")), 2)
+                self.assertEqual(cycle.call_count, 1)
+            self.assertTrue(sync.load_state(state_path)["failed"])
+
+    def test_old_disk_halt_waits_for_headroom_before_fresh_cycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp))
+            state_path = config.paths.state_dir / "state.json"
+            sync.save_state(state_path, {"failed": True, "failure": "ControllerError: free disk 1 bytes below minimum 2"})
+            with (
+                patch.object(sync, "stop_service"),
+                patch.object(sync, "check_free_space", side_effect=[sync.DiskPressure("low"), None]),
+                patch.object(sync.time, "sleep") as sleep,
+                patch.object(sync, "one_cycle", side_effect=KeyboardInterrupt) as cycle,
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                sync.run_loop(config, Path("/unused"))
+            sleep.assert_called_once_with(60)
+            cycle.assert_called_once()
+            self.assertFalse(sync.load_state(state_path)["failed"])
+
+    def test_archived_log_keeps_only_bounded_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp))
+            run_dir = config.paths.runs_dir / "current"
+            run_dir.mkdir(parents=True)
+            with config.paths.log_file.open("wb") as source:
+                source.write(b"old")
+                source.seek(65 * 1024**2)
+                source.write(b"failure details")
+            sync.archive_run_log(config, run_dir)
+            archived = run_dir / "zebrad.log"
+            self.assertEqual(archived.stat().st_size, 64 * 1024**2)
+            with archived.open("rb") as source:
+                self.assertEqual(source.read(3), b"\0\0\0")
+                source.seek(-15, 2)
+                self.assertEqual(source.read(), b"failure details")
+            self.assertEqual(config.paths.log_file.stat().st_size, 0)
+
+    def test_deployment_retires_old_timer_without_starting_controller(self):
+        node = deploy.load_nodes(DEPLOY_PATH.with_name("nodes.toml"), None)[0]
+        with patch.object(deploy, "run"), patch.object(deploy, "ssh_with_script") as ssh:
+            ssh.return_value.returncode = 0
+            result = deploy.deploy_node(node, argparse.Namespace(dry_run=False, no_start=True))
+        self.assertTrue(result[1])
+        script = ssh.call_args.args[1]
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        self.assertIn("start_controller=0", script)
+        self.assertLess(script.index("systemctl disable --now zakura-storage.timer"),
+                        script.index("install -m 755 /tmp/zakura-continuous-sync.py"))
+        rendered = deploy.render_files(node)
+        self.assertNotIn("zakura-storage.timer", rendered)
+        self.assertIn("logrotate", rendered["zakura-monitor.service"])
+        self.assertIn("maxsize 64M", rendered["logrotate"])
 
     def test_archive_run_log_copies_current_log_and_truncates_source(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -276,6 +475,8 @@ class ContinuousSyncTests(unittest.TestCase):
             with self.subTest(node=node.name):
                 rendered = deploy.render_files(node)
                 config = tomllib.loads(rendered["zakurad.toml.template"])
+                self.assertEqual(config["network"]["zakura"]["trace_dir"], "{{TRACE_DIR}}")
+                self.assertNotIn("debug", config["tracing"]["filter"])
                 self.assertEqual(
                     config["network"]["external_addr"],
                     f"{node.raw['public_ip']}:8233",
@@ -1380,7 +1581,7 @@ class NotificationTests(unittest.TestCase):
             for name in (
                 "preflight", "build_binary", "sha256_file", "install_binary", "stop_service",
                 "safe_wipe_state", "render_config", "start_service", "wait_for_completion",
-                "archive_run_log", "cleanup_retention",
+                "archive_run_log", "cleanup_retention", "rotate_traces",
             ):
                 stack.enter_context(patch.object(sync, name, return_value="test"))
             stack.enter_context(patch.object(sync, "resolve_sha", return_value="a" * 40))

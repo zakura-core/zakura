@@ -246,6 +246,14 @@ controller_service={controller_service}
 node_service={node_service}
 start_controller={start_controller}
 
+# Retire the earlier standalone cleaner before replacing its controller/config.
+if [ -f /etc/systemd/system/zakura-storage.timer ]; then
+  systemctl disable --now zakura-storage.timer
+  systemctl stop zakura-storage.service
+  rm -f /etc/systemd/system/zakura-storage.timer /etc/systemd/system/zakura-storage.service
+fi
+rm -f /usr/local/sbin/zakura_sync_storage.py
+
 install -d -m 755 /usr/local/sbin
 install -d -m 755 "$(dirname "$controller_config")" "$(dirname "$alert_config")" \
   "$(dirname "$config_template")" "$(dirname "$config_path")" "$chain_state_dir" \

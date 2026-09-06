@@ -87,9 +87,33 @@ vary within one pair. Across repetitions each side's full conditions must match.
 def run_evidence(root, spec):
     """Bind completed outcomes to their audited resources and archived bytes."""
     run = spec["run"]
+    attempt = {}
+    failure_path = root / (run + "-supervision-failure.json")
+    if failure_path.exists():
+        failure = read(failure_path)
+        if failure.get("run") != run:
+            raise ValueError("supervision failure names another run")
+        attempt["supervision_failure"] = {"sha256": digest(failure_path), "record": failure}
     audit_path = root / (run + "-outcome-audit.json")
     if not audit_path.exists():
-        return {"status": "unavailable", "reason": "completion audit is missing"}
+        return attempt | {"status": "failed" if attempt else "unavailable",
+                          "reason": "completion audit is missing"}
+    if attempt:
+        resumed_path = root / (run + "-resumption.json")
+        resumed = read(resumed_path)
+        hosts = resumed.get("prepared_hosts", {})
+        cleanup = failure.get("cleanup", {})
+        if (failure.get("step") != "prepare-native-run.py"
+                or resumed.get("run") != run
+                or resumed.get("failure_sha256") != digest(failure_path)
+                or resumed.get("original_controller_absent") is not True
+                or set(hosts) != set(spec["hosts"]) or set(cleanup) != set(hosts)
+                or any(value.get("copy_complete") is not True
+                       or value.get("native_start_absent") is not True for value in hosts.values())
+                or any(value.get("all_run_units_stopped") is not True or value.get("stops") != []
+                       or value.get("recorder_forced_stop") is not False for value in cleanup.values())):
+            raise ValueError("completed run does not prove resumption before native startup")
+        attempt["resumption"] = {"sha256": digest(resumed_path), "record": resumed}
     audit = read(audit_path)
     resources_path = root / (run + "-resources.json")
     resources = read(resources_path)
@@ -118,7 +142,7 @@ def run_evidence(root, spec):
                 or observation["resources"].get("recording_complete") is not True):
             failed.append(host)
     if failed:
-        return {"status": "failed", "hosts": failed, "audit_sha256": digest(audit_path)}
+        return attempt | {"status": "failed", "hosts": failed, "audit_sha256": digest(audit_path)}
     controller_path = root / (run + "-controller.json")
     controller = read(controller_path)
     if controller["run"] != run:
@@ -130,7 +154,7 @@ def run_evidence(root, spec):
             if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
                 raise ValueError("invalid completion duration: " + host)
             clients[host] = seconds
-    return {"status": "complete", "clients": clients,
+    return attempt | {"status": "complete", "clients": clients,
             "resources": resources["hosts"],
             "provenance": {key: controller[key] for key in ("host_environments", "remote_tool_hashes")},
             "sha256": {"audit": digest(audit_path), "resources": digest(resources_path),
@@ -191,6 +215,9 @@ def report_series(plan_path):
     result["pair_counts"] = {status: sum(pair["status"] == status for pair in result["pairs"])
                              for status in ("complete", "failed", "unavailable")}
     result["all_pairs_complete"] = result["pair_counts"]["complete"] == len(planned)
+    result["runs_with_supervision_failures"] = sum(
+        "supervision_failure" in observation for pair in result["pairs"]
+        for observation in pair["observations"].values())
     result["conditions_sha256"] = {label: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
                                    for label, value in reference.items()}
     for host, values in changes.items():

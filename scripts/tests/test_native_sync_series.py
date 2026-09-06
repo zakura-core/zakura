@@ -111,6 +111,36 @@ class SeriesTests(unittest.TestCase):
         self.assertEqual(result["pair_counts"], {"complete": 1, "failed": 1, "unavailable": 0})
         self.assertEqual(result["clients"]["client"]["completed_pairs"], 1)
 
+    def test_preparation_failure_remains_visible_after_verified_resumption(self):
+        run = "candidate-02"
+        audit_path = self.root / (run + "-outcome-audit.json")
+        saved_audit = audit_path.read_bytes()
+        audit_path.unlink()
+        failure_path = self.root / (run + "-supervision-failure.json")
+        write(failure_path, {"run": run, "step": "prepare-native-run.py", "cleanup": {
+            host: {"all_run_units_stopped": True, "stops": [], "recorder_forced_stop": False}
+            for host in self.specs[run]["hosts"]}})
+        report = report_series(self.path)
+        self.assertEqual(report["pair_counts"]["failed"], 1)
+        self.assertEqual(report["runs_with_supervision_failures"], 1)
+        audit_path.write_bytes(saved_audit)
+        with self.assertRaises(FileNotFoundError):
+            report_series(self.path)
+        resumed = {"run": run, "failure_sha256": digest(failure_path),
+                   "original_controller_absent": True, "prepared_hosts": {
+                       host: {"copy_complete": True, "native_start_absent": True}
+                       for host in self.specs[run]["hosts"]}}
+        resumed_path = self.root / (run + "-resumption.json")
+        write(resumed_path, resumed)
+        report = report_series(self.path)
+        self.assertTrue(report["all_pairs_complete"])
+        self.assertEqual(report["runs_with_supervision_failures"], 1)
+        self.assertIn("supervision_failure", report["pairs"][1]["observations"]["candidate"])
+        resumed["prepared_hosts"]["client"]["native_start_absent"] = False
+        write(resumed_path, resumed)
+        with self.assertRaisesRegex(ValueError, "resumption before native startup"):
+            report_series(self.path)
+
     def test_changed_companion_or_unknown_condition_is_rejected(self):
         original = copy.deepcopy(self.specs["candidate-02"])
         for change in ("companion", "network_profile"):

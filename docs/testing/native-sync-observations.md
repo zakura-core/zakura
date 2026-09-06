@@ -126,9 +126,16 @@ the raw trace audit or independently attest what ran on the remote hosts.
 
 Every planned pair remains in the report. A missing completion audit is
 `unavailable`, which can mean an active run or a failure before an audit was
-written. An audited unsuccessful outcome is `failed`. Neither contributes a
+written. A recorded supervision failure or audited unsuccessful outcome is
+`failed`. Neither contributes a
 completion timing. Changed evidence fails reporting instead of silently dropping
 the trial. `all_pairs_complete` requires every planned pair to be complete.
+
+A preparation failure may later have a completed outcome only with a bound
+resumption record showing that no native trial had started and no process needed
+stopping. The failure and its resumption remain visible in the completed run,
+and `runs_with_supervision_failures` still counts it. Repeating a timed trial
+under the same run identifier is not accepted by this exception.
 
 Individual client changes, medians and ranges describe the completed pairs.
 Clients share a server and are not independent repetitions. A partial series,

@@ -1359,8 +1359,30 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(records["node"]["pending"], 3)
         lines, records = deploy.completion_updates({}, {"completions": records}, True)
         self.assertIn("3 completed", lines[0])
-        self.assertEqual(records["node"]["pending"], 0)
+        self.assertNotIn("node", records)
         self.assertEqual(previous["completions"]["node"]["pending"], 2)
+
+    def test_retired_hosts_deliver_pending_once_then_leave_the_summary(self):
+        previous = {"completions": {name: {
+            "run_id": name, "total": 2, "pending": pending,
+            "sha": "abc", "duration": 3600,
+        } for name, pending in (("retired", 2), ("already-delivered", 0), ("active", 0))}}
+        labels = {"active": "Active host"}
+        before = json.dumps(previous, sort_keys=True)
+        _, waiting = deploy.completion_updates({}, previous, False, labels)
+        self.assertEqual(waiting, previous["completions"])
+        lines, records = deploy.completion_updates({}, previous, True, labels)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("retired: 2 completed", lines[1])
+        self.assertIn("Active host: 0 completed", lines[0])
+        self.assertEqual(set(records), {"active"})
+        # Failed delivery leaves the input cache intact, so a retry is identical.
+        self.assertEqual(json.dumps(previous, sort_keys=True), before)
+        retry, _ = deploy.completion_updates({}, previous, True, labels)
+        self.assertEqual(retry, lines)
+        later, _ = deploy.completion_updates({}, {"completions": records}, True, labels)
+        self.assertEqual(len(later), 1)
+        self.assertIn("Active host: 0 completed", later[0])
 
     def test_digest_preserves_all_timings_across_missed_audits(self):
         controller = {

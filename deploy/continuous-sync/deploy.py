@@ -756,7 +756,10 @@ def completion_updates(
         }
     lines = []
     if digest_due:
-        for name in sorted(set(records) | set(statuses) | set(labels or {})):
+        configured = set(labels) if labels is not None else set(statuses)
+        records = {name: record for name, record in records.items()
+                   if name in configured or record.get("pending", 0)}
+        for name in sorted(set(records) | configured):
             record = records.get(name, {})
             pending = record.get("pending", 0)
             durations = [
@@ -773,7 +776,9 @@ def completion_updates(
                 line += " · " + ", ".join(timings)
             line += " · " + completion_status(statuses.get(name))
             lines.append(line)
-            if name in records:
+            if name not in configured:
+                records.pop(name, None)
+            elif name in records:
                 records[name] = {**record, "label": label, "pending": 0, "details": []}
     return lines, records
 

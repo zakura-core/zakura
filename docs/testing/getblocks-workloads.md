@@ -25,6 +25,10 @@ indices. The artifact records the source file's SHA-256.
 
 ## Evidence boundary
 
+Pair captures with [native sync observations](native-sync-observations.md) when
+assessing hardware fit. Ownership replay does not measure process memory,
+kernel cache reclaim or committed sync throughput.
+
 This first import contains decoded arrivals. The artifact explicitly sets
 `service_lifecycles_complete` and `capture_loss_verified` to false. Per-session
 continuity cannot detect a session whose entire trace disappeared. Process-wide

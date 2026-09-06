@@ -159,14 +159,15 @@ successful digest. An unchanged failure appears only in a digest at least 24 hou
 after its last alert or reminder; a recent alert waits for a later digest.
 The summary names each networking mode (dual, Zakura only, or legacy only),
 keeps the host ID for troubleshooting, and includes hosts with zero completions.
-It shows one row per completed run, with duration, block count, and average blocks
+It shows one row per completed run, with duration and average blocks
 per second (BPS), oldest first, plus the currently observed controller phase.
 Sync duration excludes the build and state cleanup; it includes startup, readiness
 confirmation, shutdown, and log archiving. Failures still alert immediately.
 
-Each cycle starts with empty chain state. The block count is the confirmed height
+Each cycle starts with empty chain state. The BPS calculation uses the confirmed height
 from the final readiness sample plus one for genesis, using the committed-block
-height gauge. Average BPS divides that count by the full, unrounded duration in
+height gauge. The block count is retained for calculation but omitted from Slack. Average BPS
+divides that count by the full, unrounded duration in
 seconds. This is overall sync throughput, not instantaneous verifier speed;
 blocks differ in cost and the node may process more blocks during shutdown.
 An estimated tip or an earlier progress sample cannot supply the count. Missing
@@ -176,15 +177,15 @@ For example, a digest can show these illustrative per-run results:
 
 ```text
 Dual networking · 1 completed
-• 6h 40m · 3.47M blocks · 145 blocks/sec
+• 6h 40m · 145 blocks/sec
 
 Zakura networking only · 3 completed
-• 7h 10m · 3.47M blocks · 134 blocks/sec
-• 7h 00m · 3.47M blocks · 138 blocks/sec
-• 7h 20m · 3.47M blocks · 131 blocks/sec
+• 7h 10m · 134 blocks/sec
+• 7h 00m · 138 blocks/sec
+• 7h 20m · 131 blocks/sec
 
 Legacy networking only · 1 completed
-• 8h 00m · 3.47M blocks · 120 blocks/sec
+• 8h 00m · 120 blocks/sec
 ```
 
 The Slack summary also retains host IDs and current status for troubleshooting.
@@ -193,7 +194,7 @@ Controllers retain the latest 256 completion durations and ending heights in the
 state, independently of run-log cleanup. Audits accumulate up to 256 per-run
 records per host until delivery.
 Older controllers and existing audit caches still contribute their completion
-counts and latest timing, with block counts and BPS unavailable for old records.
+counts and latest timing, with BPS unavailable for old records.
 Missing records, including those beyond retention, are explicitly marked unavailable.
 Malformed optional controller history is discarded without failing a successful
 sync; completion counters remain authoritative. Retired hosts leave the summary

@@ -723,12 +723,11 @@ def completion_run_text(item: dict[str, Any]) -> str:
               if valid_duration else "duration unavailable")
     height = item.get("end_height")
     if type(height) is not int or not 0 <= height <= 0xFFFFFFFF:
-        return f"{timing} · blocks and BPS unavailable"
+        return f"{timing} · BPS unavailable"
     # Every cycle starts from empty chain state; height zero is genesis.
     blocks = height + 1
-    count = f"{blocks / 1_000_000:.2f}M" if blocks >= 1_000_000 else f"{blocks:,}"
     rate = f"{blocks / duration:.0f} blocks/sec" if valid_duration and duration > 0 else "BPS unavailable"
-    return f"{timing} · {count} blocks · {rate}"
+    return f"{timing} · {rate}"
 
 
 def completion_updates(

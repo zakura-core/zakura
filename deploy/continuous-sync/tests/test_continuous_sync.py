@@ -1409,7 +1409,7 @@ class NotificationTests(unittest.TestCase):
             section = next(line for line in lines if f"({mode})" in line)
             expected = [f"*{label} ({mode}) · {len(durations)} completed*"]
             expected.extend(
-                f"• {duration // 3600}h {duration % 3600 // 60:02d}m · 3.47M blocks · {rate} blocks/sec"
+                f"• {duration // 3600}h {duration % 3600 // 60:02d}m · {rate} blocks/sec"
                 for duration, rate in zip(durations, rates)
             )
             expected.append("currently syncing")
@@ -1417,14 +1417,14 @@ class NotificationTests(unittest.TestCase):
 
     def test_completion_throughput_requires_valid_height_and_nonzero_duration(self):
         self.assertEqual(deploy.completion_run_text({"duration": 24000, "end_height": 3469999}),
-                         "6h 40m · 3.47M blocks · 145 blocks/sec")
+                         "6h 40m · 145 blocks/sec")
         self.assertEqual(deploy.completion_run_text({"duration": 2, "end_height": 3}),
-                         "0h 00m · 4 blocks · 2 blocks/sec")
+                         "0h 00m · 2 blocks/sec")
         self.assertEqual(deploy.completion_run_text({"duration": 1, "end_height": 0}),
-                         "0h 00m · 1 blocks · 1 blocks/sec")
+                         "0h 00m · 1 blocks/sec")
         for height in (None, -1, True, "3469999", 2**32):
             with self.subTest(height=height):
-                self.assertIn("blocks and BPS unavailable",
+                self.assertIn("BPS unavailable",
                               deploy.completion_run_text({"duration": 3600, "end_height": height}))
         for duration in (0, None, -1, True, "3600"):
             with self.subTest(duration=duration):
@@ -1504,9 +1504,9 @@ class NotificationTests(unittest.TestCase):
             post.assert_not_called()
             saved = path.read_text()
             _, post = self.audit(path, data, 87400, posted=False)
-            expected = ("• 1h 00m · 3.60M blocks · 1000 blocks/sec\n"
-                        "• 2h 00m · 3.24M blocks · 450 blocks/sec\n"
-                        "• 3h 00m · 3.78M blocks · 350 blocks/sec")
+            expected = ("• 1h 00m · 1000 blocks/sec\n"
+                        "• 2h 00m · 450 blocks/sec\n"
+                        "• 3h 00m · 350 blocks/sec")
             self.assertIn(expected, post.call_args.args[0])
             self.assertEqual(path.read_text(), saved)
             _, post = self.audit(path, data, 87460)

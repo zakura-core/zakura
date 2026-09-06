@@ -21,6 +21,9 @@ connection. It is not required for ordinary direct submission.
 
 Status: **Proposed**, September 5, 2026. Not implemented or deployed.
 
+The [companion specification](../specs/wallet-transaction-submission.md) defines
+the wire format, admission contract, and initial wallet defaults.
+
 ## 1. Motivation and scope
 
 Submitting through lightwalletd is a wallet architecture choice, not a Zcash

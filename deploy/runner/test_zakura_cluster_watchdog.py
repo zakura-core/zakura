@@ -683,6 +683,24 @@ class FleetBurstTests(WatchdogFixture, unittest.TestCase):
         self.assertEqual(self.posted, [])
         self.assertEqual(self.state["propagation"]["testnet"], {})
 
+    def test_shared_warning_does_not_prevent_propagation_grace(self):
+        self.run_snapshot(self.agreed(1801))
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("12 nodes agree", self.posted[0])
+        self.run_snapshot(self.arriving(1320), now=self.NOW + 60)
+        self.assertEqual(len(self.posted), 2)
+        self.assertIn("shared stall cleared", self.posted[1])
+        self.assertNotIn("` stalled", self.posted[1])
+        self.run_snapshot(self.agreed(5, self.HEIGHT + 2), now=self.NOW + 120)
+        self.assertEqual(len(self.posted), 2)
+
+    def test_shared_warning_grace_still_expires_for_stuck_followers(self):
+        self.run_snapshot(self.agreed(1801))
+        self.run_snapshot(self.arriving(1320), now=self.NOW + 60)
+        self.run_snapshot(self.arriving(1440, 2), now=self.NOW + 180)
+        self.assertEqual(len(self.posted), 3)
+        self.assertEqual(self.posted[2].count("` stalled"), 11)
+
     def test_unclassified_gap_batches_all_eleven_alerts_and_recoveries(self):
         for missing_hash in (False, True):
             with self.subTest(missing_hash=missing_hash):

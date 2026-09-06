@@ -1288,7 +1288,6 @@ class Watchdog:
         last_seen = coerce_float(previous.get("last_seen"))
         recent_shared = (
             previous.get("condition") == "stalled"
-            and not previous.get("alerting")
             and previous.get("owner") == "shared"
             and last_seen is not None
             and 0 <= now - last_seen <= PROPAGATION_GRACE_SECONDS

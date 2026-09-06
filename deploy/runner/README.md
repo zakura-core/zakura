@@ -115,7 +115,8 @@ own timers.
 When a shared tip starts advancing, former tip followers get up to two minutes
 for propagation before their individual stall alerts can fire. This requires a
 shared observation within the preceding two minutes, no existing alert for the
-node, complete tip observations, and reported ancestry linking all higher tips
+node (a shared fleet warning does not disqualify it), complete tip observations,
+and reported ancestry linking all higher tips
 to the former shared block. Missing evidence or conflicting hashes cancel the
 grace. The grace timer starts when the newer block is first observed and survives
 restarts; more blocks do not extend it. A node that remains stuck then follows

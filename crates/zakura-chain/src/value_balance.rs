@@ -328,7 +328,7 @@ impl ValueBalance<NonNegative> {
     ///
     /// We implement the consensus rules above by constraining the returned value balance to
     /// [`ValueBalance<NonNegative>`]. The sum of all returned pool balances must also fit
-    /// within `MAX_MONEY`, matching Zebra's aggregate monetary-base guard.
+    /// within `MAX_MONEY` as an additional accounting safeguard.
     #[allow(clippy::unwrap_in_result)]
     pub fn add_chain_value_pool_change(
         self,
@@ -341,7 +341,7 @@ impl ValueBalance<NonNegative> {
 
         let chain_value_pool = chain_value_pool.constrain::<NonNegative>()?;
 
-        // Match Zebra's cap on the total monetary base across all chain value pools.
+        // Bound the total monetary base as defence in depth.
         chain_value_pool.total().map_err(ValueBalanceError::Total)?;
 
         Ok(chain_value_pool)

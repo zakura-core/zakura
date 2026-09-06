@@ -71,8 +71,16 @@ of immediate capacity.
 ### 2.2 Request direction
 
 The client opens a fresh bidirectional stream for each operation. The existing
-stream prelude MUST contain a request ID. IDs MUST be unique within the client's
-connection generation; reaching the end of the ID space requires a new connection.
+stream prelude MUST contain a request ID. The client MUST allocate IDs from a
+strictly increasing counter within each connection generation and open a new
+connection before the counter would wrap.
+
+Providers MUST correlate requests by connection and stream, retaining request-ID
+state only for active operations. They MUST NOT retain a history of completed
+IDs or enforce connection-wide ID uniqueness. Independent streams can arrive
+out of order, so a lower ID than one previously received is not a protocol error.
+Reused IDs on different streams MUST NOT combine their responses or accounting.
+Transaction deduplication uses the exact transaction identity under section 5.
 
 Wallet clients MUST reject peer-opened submission requests before decoding
 transaction payloads.
@@ -490,7 +498,8 @@ the following evidence; writing this specification does not claim it exists.
 
 | Area | Required cases |
 | --- | --- |
-| Negotiation (§2) | Wrong chain, unsupported capability/version, duplicate request IDs, peer-opened requests to a wallet, and responses associated with the wrong stream or a replaced connection. |
+| Negotiation (§2) | Wrong chain, unsupported capability/version, and peer-opened requests to a wallet. |
+| Request correlation (§2) | Increasing client IDs without wrap; out-of-order stream arrival; reused IDs on concurrent and later streams without response or accounting crossover; no completed-ID history after operations finish; and responses associated with the wrong stream or a replaced connection. |
 | Discovery (§3) | Submission service filtering, a client without a public self-record, record expiration, unsuitable addresses, bootstrap outage, and bounded fallback. |
 | Encoding (§4) | Canonical field order; empty, truncated, oversized, and trailing payloads; unknown tags/flags; exact response caps; and invalid result/reason combinations. |
 | Identity (§4–5) | Legacy and witnessed vectors; display/wire byte-order differences; matching `txid` with different authorizing commitments; and response identity mismatch. |

@@ -282,7 +282,9 @@ the state, run, and build-cache filesystems. Below 10 GiB free it stops the node
 records and alerts on the failed attempt, and prunes unprotected history. Recovery
 resets the stopped, disposable chain database before checking for 15 GiB free on
 all three filesystems. It then starts a fresh sync and sends a recovery alert
-identifying the failed attempt once the new node service is active.
+identifying the failed attempt once the new node service is active. Failed
+delivery remains pending across controller restarts and retries during sync
+polling; a new sync failure supersedes that pending recovery.
 Until then it stays failed and rechecks once a minute. If protected evidence or
 unrelated files occupy the remaining space, it waits rather than deleting them.
 Other sync failures remain halted for investigation.

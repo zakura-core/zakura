@@ -542,7 +542,9 @@ def rotate_run_logs(config: Config, run_dir: Path) -> None:
          str(rotation_config)], timeout=60)
 
 
-def wait_for_completion(config: Config, run_dir: Path, run_state: dict[str, Any]) -> None:
+def wait_for_completion(
+    config: Config, run_dir: Path, run_state: dict[str, Any], state: dict[str, Any]
+) -> None:
     started = now()
     last_height: int | None = None
     last_progress = started
@@ -557,6 +559,10 @@ def wait_for_completion(config: Config, run_dir: Path, run_state: dict[str, Any]
         if not service_active(config):
             raise ControllerError(f"{config.policy.service_name} exited before sync completion")
 
+        recovered_run = state.get("disk_recovery_run")
+        if recovered_run and post_slack(config, f"{resumed_text(config)} | recovered run: {recovered_run}"):
+            state.pop("disk_recovery_run")
+            save_state(config.paths.state_dir / "state.json", state)
         rotate_run_logs(config, run_dir)
         sample = sample_status(config)
         sample["time"] = utc_stamp(ts)
@@ -744,13 +750,7 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
     save_state(state_path, state)
     try:
         start_service(config)
-        recovered_run = state.pop("disk_recovery_run", None)
-        if recovered_run:
-            if not service_active(config):
-                raise ControllerError(f"{config.policy.service_name} failed to start")
-            post_slack(config, f"{resumed_text(config)} | recovered run: {recovered_run}")
-            save_state(state_path, state)
-        wait_for_completion(config, run_dir, run_state)
+        wait_for_completion(config, run_dir, run_state, state)
     finally:
         state["phase"] = "stopping"
         try:

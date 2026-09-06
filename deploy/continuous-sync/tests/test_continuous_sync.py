@@ -1601,7 +1601,7 @@ class NotificationTests(unittest.TestCase):
                 self.assertIn("resumed", text)
                 return True
             post = stack.enter_context(patch.object(sync, "post_slack", side_effect=observe_message))
-            stack.enter_context(patch.object(sync, "wait_for_completion", side_effect=KeyboardInterrupt))
+            stack.enter_context(patch.object(sync, "sample_status", side_effect=KeyboardInterrupt))
             with self.assertRaises(KeyboardInterrupt):
                 sync.run_loop(config, Path("/unused"))
             post.assert_called_once()
@@ -1609,6 +1609,28 @@ class NotificationTests(unittest.TestCase):
             self.assertTrue((root / "network" / "marker").exists())
             self.assertNotIn("disk_recovery_run", sync.load_state(path))
             self.assertEqual(sync.load_state(path)["phase"], "stopping")
+
+    def test_recovery_delivery_retries_from_persisted_state_until_confirmed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp))
+            run_dir = config.paths.runs_dir / "current"
+            run_dir.mkdir(parents=True)
+            path = config.paths.state_dir / "state.json"
+            sync.save_state(path, {"disk_recovery_run": "failed-run"})
+            with (
+                patch.object(sync, "check_free_space"),
+                patch.object(sync, "service_active", return_value=True),
+                patch.object(sync, "rotate_run_logs"),
+                patch.object(sync, "post_slack", side_effect=[False, True]) as post,
+                patch.object(sync, "sample_status", return_value={"height": 1}),
+                patch.object(sync.time, "sleep", side_effect=KeyboardInterrupt),
+            ):
+                for attempt in range(3):
+                    with self.assertRaises(KeyboardInterrupt):
+                        sync.wait_for_completion(config, run_dir, {}, sync.load_state(path))
+                    self.assertEqual("disk_recovery_run" in sync.load_state(path), attempt == 0)
+            self.assertEqual(post.call_count, 2)
+            self.assertEqual(post.call_args_list[0], post.call_args_list[1])
 
     def test_preflight_failure_receipt_is_accepted_by_audit(self):
         with tempfile.TemporaryDirectory() as tmp:

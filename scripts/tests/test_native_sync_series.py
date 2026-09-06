@@ -100,6 +100,41 @@ class SeriesTests(unittest.TestCase):
         self.assertEqual(result["pair_counts"], {"complete": 1, "failed": 0, "unavailable": 1})
         self.assertEqual(result["clients"]["client"]["completed_pairs"], 1)
 
+    def test_successful_native_pairs_preserve_failed_and_unavailable_captures(self):
+        write(self.root / "candidate-01-capture-import.json", {
+            "run": "candidate-01", "capture_import_ok": False, "returncode": 1,
+            "stderr": "missing decoded messages"})
+        result = report_series(self.path)
+        self.assertTrue(result["all_pairs_complete"])
+        self.assertFalse(result["all_required_captures_imported"])
+        self.assertEqual(result["capture_counts"],
+                         {"complete": 0, "failed": 1, "unavailable": 1, "not_requested": 2})
+        failed = result["pairs"][0]["captures"]["candidate"]
+        self.assertEqual(failed["import_record"]["stderr"], "missing decoded messages")
+
+    def test_successful_capture_requires_unchanged_workload_bytes(self):
+        for run in ("candidate-01", "candidate-02"):
+            profile = self.root / (run + "-workload.json")
+            write(profile, {"fixture": run})
+            write(self.root / (run + "-capture-import.json"), {
+                "run": run, "capture_import_ok": True, "returncode": 0,
+                "profile_sha256": digest(profile)})
+        self.assertTrue(report_series(self.path)["all_required_captures_imported"])
+        profile.write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "workload differs"):
+            report_series(self.path)
+
+    def test_capture_claim_cannot_override_its_run_or_exit_status(self):
+        for record in (
+            {"run": "another-run", "capture_import_ok": False, "returncode": 1},
+            {"run": "candidate-01", "capture_import_ok": True, "returncode": 1},
+            {"run": "candidate-01", "capture_import_ok": False, "returncode": 0},
+            {"run": "candidate-01", "capture_import_ok": "true", "returncode": 0},
+        ):
+            write(self.root / "candidate-01-capture-import.json", record)
+            with self.subTest(record=record), self.assertRaises(ValueError):
+                report_series(self.path)
+
     def test_failed_trial_is_not_a_fast_success(self):
         path = self.root / "candidate-02-outcome-audit.json"
         audit = json.loads(path.read_text())

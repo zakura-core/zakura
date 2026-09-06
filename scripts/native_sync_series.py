@@ -161,6 +161,27 @@ def run_evidence(root, spec):
                        "controller": digest(controller_path), "archives": archive_hashes}}
 
 
+def capture_evidence(root, spec):
+    """Keep capture import separate from native completion and replay success."""
+    if spec.get("capture_application_lifetimes") is not True:
+        return {"status": "not_requested"}
+    path = root / (spec["run"] + "-capture-import.json")
+    if not path.exists():
+        return {"status": "unavailable"}
+    record = read(path)
+    if (record.get("run") != spec["run"] or type(record.get("capture_import_ok")) is not bool
+            or type(record.get("returncode")) is not int
+            or record["capture_import_ok"] != (record["returncode"] == 0)):
+        raise ValueError("capture import outcome differs from its run or exit status")
+    result = {"status": "complete" if record["capture_import_ok"] else "failed",
+              "import_sha256": digest(path), "import_record": record}
+    if record["capture_import_ok"]:
+        profile = root / (spec["run"] + "-workload.json")
+        if digest(profile) != record.get("profile_sha256"):
+            raise ValueError("imported workload differs from its recorded digest")
+    return result
+
+
 def report_series(plan_path):
     """Assess the whole frozen plan; completed subsets remain explicitly partial."""
     root, plan = plan_path.parent, read(plan_path)
@@ -194,7 +215,8 @@ def report_series(plan_path):
         observations = {label: run_evidence(root, spec) for label, spec in specs.items()}
         entry = {"index": pair["index"], "planned_order": pair["order"],
                  "runs": {label: spec["run"] for label, spec in specs.items()},
-                 "observations": observations}
+                 "observations": observations,
+                 "captures": {label: capture_evidence(root, spec) for label, spec in specs.items()}}
         complete = all(item["status"] == "complete" for item in observations.values())
         entry["status"] = "complete" if complete else "failed" if any(
             item["status"] == "failed" for item in observations.values()) else "unavailable"
@@ -215,6 +237,12 @@ def report_series(plan_path):
     result["pair_counts"] = {status: sum(pair["status"] == status for pair in result["pairs"])
                              for status in ("complete", "failed", "unavailable")}
     result["all_pairs_complete"] = result["pair_counts"]["complete"] == len(planned)
+    result["capture_counts"] = {
+        status: sum(capture["status"] == status for pair in result["pairs"] for capture in pair["captures"].values())
+        for status in ("complete", "failed", "unavailable", "not_requested")
+    }
+    required = sum(result["capture_counts"][status] for status in ("complete", "failed", "unavailable"))
+    result["all_required_captures_imported"] = result["capture_counts"]["complete"] == required if required else None
     result["runs_with_supervision_failures"] = sum(
         "supervision_failure" in observation for pair in result["pairs"]
         for observation in pair["observations"].values())

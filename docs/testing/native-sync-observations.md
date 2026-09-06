@@ -167,6 +167,13 @@ written. A recorded supervision failure or audited unsuccessful outcome is
 completion timing. Changed evidence fails reporting instead of silently dropping
 the trial. `all_pairs_complete` requires every planned pair to be complete.
 
+Capture imports are reported separately in each pair's `captures` and the series'
+`capture_counts`. A native sync can complete even when its trace lost rows and
+cannot be replayed. `all_required_captures_imported` is false if any requested
+capture failed or is unavailable, and null when none were requested. Successful
+imports are bound to the saved workload's digest. This checks the existing import
+record, not the raw trace again, and does not establish that replay passed.
+
 A preparation failure may later have a completed outcome only with a bound
 resumption record showing that no native trial had started and no process needed
 stopping. The failure and its resumption remain visible in the completed run,

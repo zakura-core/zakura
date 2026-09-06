@@ -44,6 +44,17 @@ def summary(rows):
 
 
 class PressureTests(unittest.TestCase):
+    def test_absolute_event_counts_preserve_initial_counts_resets_and_missing_reads(self):
+        rows = [sample(i * 2_000_000_000, 0) for i in range(4)]
+        for row, count in zip(rows, [50, None, 0, 3]):
+            if count is not None:
+                row["cgroup"]["memory.events"] = f"max {count}\n"
+        result = summary(rows)["cgroup_memory"]
+        self.assertEqual(result["event_observations"]["max"],
+                         {"numeric_samples": 3, "unavailable_samples": 1, "maximum_count": 50})
+        self.assertEqual(result["event_changes"]["max"]["observed_change"], 3)
+        self.assertIsNone(result["event_observations"]["oom"]["maximum_count"])
+
     def test_kernel_peak_is_distinct_from_sampled_current_usage(self):
         rows = [sample(0, 0), sample(2_000_000_000, 0)]
         rows[0]["cgroup"].update({"memory.current": "100", "memory.peak": "150"})
@@ -235,6 +246,24 @@ class RecordingTests(unittest.TestCase):
         row["unit"].pop("Result")
         self.write([row])
         self.assertIsNone(self.reporter.report_recording(self.path, 0, 0)["unit_success_observed"])
+
+    def test_clean_workload_cannot_hide_later_memory_pressure(self):
+        rows = [sample(i * 2_000_000_000, 0) for i in range(4)]
+        for row, events, usage in zip(rows, [0, 0, 7, 9], [100, 100, 140, 150]):
+            row["cgroup"].update({"memory.events": f"max {events}\noom 0\n",
+                                  "memory.current": str(usage)})
+        rows[-1]["unit"].update(MainPID="0", ActiveState="inactive")
+        self.write(rows)
+        result = self.reporter.report_recording(self.path, 0, 2_000_000_000)
+        phase = result["cgroup_memory"]
+        whole = result["whole_recording"]["cgroup_memory"]
+        self.assertEqual(phase["event_observations"]["max"]["maximum_count"], 0)
+        self.assertEqual(whole["event_observations"]["max"]["maximum_count"], 7)
+        self.assertEqual(whole["peak_usage_sample"]["memory_current_bytes"], 140)
+        self.assertEqual(result["whole_recording"]["samples"], 3)
+        empty_phase = self.reporter.report_recording(self.path, 1, 1)
+        self.assertIsNone(empty_phase["cgroup_memory"]["event_observations"]["max"]["maximum_count"])
+        self.assertEqual(empty_phase["whole_recording"], result["whole_recording"])
 
     def test_deadline_or_truncated_gzip_cannot_be_a_complete_recording(self):
         self.write([sample(0, 0)])

@@ -94,6 +94,8 @@ class MemoryFootprint:
         self.changes = {name: 0 for name in self.EVENTS}
         self.intervals = {name: 0 for name in self.EVENTS}
         self.excluded = {name: Counter() for name in self.EVENTS}
+        self.event_observations = {name: {"numeric_samples": 0, "unavailable_samples": 0,
+                                          "maximum_count": None} for name in self.EVENTS}
 
     def add(self, row, identity):
         group = row.get("cgroup", {})
@@ -116,6 +118,12 @@ class MemoryFootprint:
                                   or stat["anon"] > self.peak_anon["memory_stat"]["anon"]):
             self.peak_anon = sample
         events = unsigned_counters(group.get("memory.events")) or {}
+        for name, observation in self.event_observations.items():
+            if name in events:
+                observation["numeric_samples"] += 1
+                observation["maximum_count"] = max(observation["maximum_count"] or 0, events[name])
+            else:
+                observation["unavailable_samples"] += 1
         if self.previous is not None:
             before, old_events = self.previous
             for name in self.EVENTS:
@@ -145,6 +153,7 @@ class MemoryFootprint:
                 "missing_stat_samples": self.missing_stat_samples,
                 "value_observations": {name: values.report() for name, values in self.values.items()},
                 "peak_usage_sample": self.peak_usage, "peak_anon_sample": self.peak_anon,
+                "event_observations": {name: dict(value) for name, value in self.event_observations.items()},
                 "event_changes": {name: {"observed_change": self.changes[name] if self.intervals[name] else None,
                                          "valid_intervals": self.intervals[name],
                                          "excluded_intervals": dict(self.excluded[name])}
@@ -152,7 +161,9 @@ class MemoryFootprint:
                 "scope": "Peak fields come from the same bracketed read, not an atomic snapshot. "
                          "Memory categories overlap; do not sum file and LRU fields. "
                          "Event changes exclude the initial count and unobserved intervals; "
-                         "they are not absolute lifetime totals or a headroom pass."}
+                         "they are not absolute lifetime totals or a headroom pass. "
+                         "Event observations retain absolute counter maxima, including initial counts; "
+                         "they cannot count events after the last read or sum across counter resets."}
 
 
 class PressureIntervals:

@@ -64,6 +64,12 @@ diagnostic report with `recording_complete=false`; it does not accept a corrupt
 or truncated gzip stream. A recording with no selected active-node samples has
 null pressure and available-memory observations, not a zero-pressure pass.
 
+The separate `whole_recording` section includes all recorded active-node samples,
+including startup and the period after the last client finishes. Keep it beside
+the selected workload results: a server can reach a memory limit during capture
+drain or shutdown even when its sync-phase counters were zero. This summary uses
+the same streaming analysis and does not change the chosen phase boundaries.
+
 ## Interpret the measurements
 
 PSI totals count microseconds of stalls. The analyzer excludes counter resets,
@@ -108,6 +114,11 @@ valid interval was observed, while zero means valid intervals showed no change.
 These changes are not the unit's absolute lifetime event counts. Keep the raw
 recording and the controller's full-run outcome alongside the selected-phase
 report, particularly when the node reaches a memory limit.
+
+`event_observations` separately preserves the maximum absolute counter value
+read, including the first sample. Numeric and unavailable sample counts keep a
+missing counter distinct from observed zero. The maximum is not a sum across
+counter resets or a count of events after the final successful read.
 
 Do not align timestamps from different native trace emitters merely because
 their process identities match. Explain received-body gaps with events from the

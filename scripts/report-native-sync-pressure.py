@@ -15,6 +15,7 @@ def report_recording(path, start_utc_ns, end_utc_ns, *, allow_incomplete=False):
     if not 0 <= start_utc_ns <= end_utc_ns:
         raise ValueError("invalid workload interval")
     pressure = MemoryPressure()
+    whole_recording = MemoryPressure()
     last = None
     rows = 0
     unit_name = None
@@ -34,10 +35,11 @@ def report_recording(path, start_utc_ns, end_utc_ns, *, allow_incomplete=False):
                     raise ValueError("recording mixes different unit names")
                 unit_name = name
                 rows += 1
-                if (start_utc_ns <= row["utc_ns"] <= end_utc_ns
-                        and row["unit"].get("MainPID", "0") != "0"
+                if (row["unit"].get("MainPID", "0") != "0"
                         and row["unit"].get("ControlGroup")):
-                    pressure.add(row)
+                    whole_recording.add(row)
+                    if start_utc_ns <= row["utc_ns"] <= end_utc_ns:
+                        pressure.add(row)
                 last = row
         source.seek(0)
         checksum = hashlib.file_digest(source, "sha256").hexdigest()
@@ -64,6 +66,11 @@ def report_recording(path, start_utc_ns, end_utc_ns, *, allow_incomplete=False):
         "phase_end_unix_ns": end_utc_ns,
         "scope": "Selected workload phase, adjacent same-host sample bounds. "
                  "Missing counters are unknown. Complete recording does not establish sync success.",
+        "whole_recording": {
+            "scope": "All recorded active-node samples, including startup and drain/shutdown. "
+                     "This interval differs from the selected workload phase and ends at the last successful read.",
+            **whole_recording.report(),
+        },
         **pressure.report(),
     }
 

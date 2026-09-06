@@ -237,8 +237,8 @@ a cycle complete. `/ready` checks that the node has live peers, is near the
 estimated network tip, and has a fresh tip. The controller also records
 Prometheus samples in `samples.jsonl` so a completed or failed run has evidence
 for height movement, readiness, legacy pipeline depth, and each active download
-or verification phase. The controller saves up to the last 64 MiB of the node
-log in the run directory on completion and failure.
+or verification phase. Node logs are written directly into the run directory,
+so a failure keeps both the current log and its preceding rotated segment.
 
 The relevant loopback endpoints are only bound locally:
 
@@ -272,19 +272,24 @@ controller build worktrees and temporary binary copies. The cache is reserved
 for controller builds. Unknown names and symlinked child directories are left
 alone; the runs directory itself may point to another volume.
 
-The existing minute monitor rotates node and monitor logs at 64 MiB or daily,
-retaining seven rotations. Each archived run log keeps its final 64 MiB.
+The controller also rotates each run's node log at 64 MiB, keeping the current
+file and one prior segment. `/var/log/zakura/zebrad.log` points to the current
+run's log. The minute monitor retains seven rotations of its own log and handles
+legacy node logs until they are replaced by this symlink.
 
 Cleanup runs before the initial disk check. During sync the controller checks
 the state, run, and build-cache filesystems. Below 10 GiB free it stops the node,
-records and alerts on the failed attempt, and prunes unprotected history. Once
-all three filesystems have 15 GiB free, it automatically starts a fresh sync.
+records and alerts on the failed attempt, and prunes unprotected history. Recovery
+resets the stopped, disposable chain database before checking for 15 GiB free on
+all three filesystems. It then starts a fresh sync and sends a recovery alert
+identifying the failed attempt once the new node service is active.
 Until then it stays failed and rechecks once a minute. If protected evidence or
 unrelated files occupy the remaining space, it waits rather than deleting them.
 Other sync failures remain halted for investigation.
 
-Cleanup never touches chain state or network identity. A fresh attempt uses the
-existing sentinel-protected reset of disposable chain state. Stopping the
+Artifact cleanup preserves chain state. Disk recovery and fresh attempts use the
+existing sentinel-protected reset of disposable chain state, preserving network
+identity and the failed run's diagnostics. Stopping the
 controller also stops automatic recovery. Deployment removes the earlier
 standalone storage timer; `--no-start` does not start the controller.
 

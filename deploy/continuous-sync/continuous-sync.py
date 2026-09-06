@@ -383,7 +383,7 @@ def render_config(config: Config, run_dir: Path) -> None:
     trace_dir.mkdir(parents=True, exist_ok=True)
     substitutions = {
         "TRACE_DIR": str(trace_dir),
-        "LOG_FILE": str(config.paths.log_file),
+        "LOG_FILE": str(run_dir / "zebrad.log"),
         "STATE_CACHE_DIR": str(config.paths.chain_state_dir),
         "P2P_STACK": config.policy.p2p_stack,
         "TRACING_FILTER": config.policy.tracing_filter,
@@ -396,6 +396,8 @@ def render_config(config: Config, run_dir: Path) -> None:
     tmp.write_text(rendered, encoding="utf-8")
     tmp.replace(config.paths.zakurad_config)
     relink(config.paths.trace_link, trace_dir)
+    (run_dir / "zebrad.log").touch()
+    relink(config.paths.log_file, run_dir / "zebrad.log")
 
 
 def relink(link: Path, target: Path) -> None:
@@ -525,13 +527,15 @@ def sample_status(config: Config) -> dict[str, Any]:
     return status
 
 
-def rotate_traces(config: Config, run_dir: Path) -> None:
-    """Bound each append-only trace stream using the host's existing logrotate."""
+def rotate_run_logs(config: Config, run_dir: Path) -> None:
+    """Keep trace and node-log rotations inside the run that produced them."""
     rotation_config = run_dir / ".trace-logrotate.conf"
     rotation_config.write_text(
         f'{json.dumps(str(run_dir / "traces" / "*.jsonl"))} {{\n'
         f"    size {config.policy.trace_file_bytes}\n"
-        "    rotate 2\n    missingok\n    notifempty\n    copytruncate\n    nocompress\n}\n",
+        "    rotate 2\n    missingok\n    notifempty\n    copytruncate\n    nocompress\n}\n"
+        f'{json.dumps(str(run_dir / "zebrad.log"))} {{\n'
+        "    size 64M\n    rotate 1\n    missingok\n    notifempty\n    copytruncate\n    nocompress\n}\n",
         encoding="utf-8",
     )
     run(["logrotate", "--state", str(run_dir / ".trace-logrotate.state"),
@@ -553,7 +557,7 @@ def wait_for_completion(config: Config, run_dir: Path, run_state: dict[str, Any]
         if not service_active(config):
             raise ControllerError(f"{config.policy.service_name} exited before sync completion")
 
-        rotate_traces(config, run_dir)
+        rotate_run_logs(config, run_dir)
         sample = sample_status(config)
         sample["time"] = utc_stamp(ts)
         with samples_path.open("a", encoding="utf-8") as samples:
@@ -588,17 +592,6 @@ def wait_for_completion(config: Config, run_dir: Path, run_state: dict[str, Any]
         else:
             ready_samples = 0
             time.sleep(config.policy.poll_interval_seconds)
-
-
-def archive_run_log(config: Config, run_dir: Path) -> None:
-    if not config.paths.log_file.exists():
-        return
-    dest = run_dir / "zebrad.log"
-    # Keep a useful tail even if an old installation missed log rotation.
-    with config.paths.log_file.open("rb") as source, dest.open("wb") as target:
-        source.seek(max(0, source.seek(0, 2) - 64 * 1024**2))
-        shutil.copyfileobj(source, target)
-    config.paths.log_file.write_text("", encoding="utf-8")
 
 
 def cleanup_retention(
@@ -700,10 +693,11 @@ def short_reason(reason: str, limit: int = 96) -> str:
 
 
 def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[str, Any]:
-    stop_service(config)
-    cleanup_retention(config)
     state.pop("current_run", None)
     state["phase"] = "preflight"
+    save_state(state_path, state)
+    stop_service(config)
+    cleanup_retention(config)
     preflight(config)
     sha = resolve_sha(config)
     started_at = now()
@@ -736,7 +730,6 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
     stop_service(config)
     safe_wipe_state(config)
     render_config(config, run_dir)
-    config.paths.log_file.write_text("", encoding="utf-8")
 
     sync_started_at = now()
     run_state.update(
@@ -751,11 +744,20 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
     save_state(state_path, state)
     try:
         start_service(config)
+        recovered_run = state.pop("disk_recovery_run", None)
+        if recovered_run:
+            if not service_active(config):
+                raise ControllerError(f"{config.policy.service_name} failed to start")
+            post_slack(config, f"{resumed_text(config)} | recovered run: {recovered_run}")
+            save_state(state_path, state)
         wait_for_completion(config, run_dir, run_state)
     finally:
-        stop_service(config)
-    rotate_traces(config, run_dir)
-    archive_run_log(config, run_dir)
+        state["phase"] = "stopping"
+        try:
+            save_state(state_path, state)
+        finally:
+            stop_service(config)
+    rotate_run_logs(config, run_dir)
 
     completed_at_epoch = now()
     completed_at = utc_stamp(completed_at_epoch)
@@ -813,9 +815,10 @@ def halt(config: Config, state_path: Path, state: dict[str, Any], run_state: dic
             "failed_at": failed_at,
             "phase": "failed",
             "last_failed_sha": run_state.get("sha"),
-            "last_failed_run": run_state.get("run_id"),
+            "last_failed_run": run_state.get("run_id") or f"preflight-{time.time_ns()}",
         }
     )
+    state.pop("disk_recovery_run", None)
     state.pop("failure_notification", None)
     save_state(state_path, state)
     if post_slack(config, failure_text(config, run_state, reason)):
@@ -844,13 +847,15 @@ def run_loop(config: Config, config_path: Path) -> int:
                 print(f"controller halted: {reason}", file=sys.stderr)
                 return 2
             stop_service(config)
+            safe_wipe_state(config)
             cleanup_retention(config, recovery=True)
             try:
                 check_free_space(config, recovery=True)
             except DiskPressure:
                 time.sleep(max(60, config.policy.cooldown_seconds))
                 continue
-            state.update({"failed": False, "phase": "resumed", "resumed_at": utc_stamp()})
+            state.update({"failed": False, "phase": "resumed", "resumed_at": utc_stamp(),
+                          "disk_recovery_run": state.get("last_failed_run") or "unknown"})
             state.pop("failure", None)
             save_state(state_path, state)
             log(config, "disk-pressure-recovered; starting a fresh sync")
@@ -874,11 +879,6 @@ def run_loop(config: Config, config_path: Path) -> int:
             if isinstance(error, DiskPressure):
                 cleanup_retention(config, active_run=run_dir, recovery=True)
             halt(config, state_path, state, run_state or state, reason)
-            if run_dir is not None:
-                try:
-                    archive_run_log(config, run_dir)
-                except OSError as archive_error:
-                    log(config, f"failure-log-archive-failed error={archive_error}")
             if not isinstance(error, DiskPressure):
                 return 1
         time.sleep(config.policy.cooldown_seconds)

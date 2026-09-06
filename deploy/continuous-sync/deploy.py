@@ -564,6 +564,11 @@ def load_audit_state(path: Path | None) -> dict[str, Any]:
         not isinstance(record, dict)
         or any(type(record.get(key)) is not int or record[key] < 0 for key in ("total", "pending"))
         or any(key not in record for key in ("run_id", "sha", "duration"))
+        or ("details" in record and (
+            not isinstance(record["details"], list)
+            or len(record["details"]) > COMPLETION_DETAIL_LIMIT
+            or any(not isinstance(item, dict) for item in record["details"])
+        ))
         for record in completions.values()
     ):
         data.pop("completions", None)
@@ -690,6 +695,10 @@ def completion_status(data: dict[str, Any] | None) -> str:
         return "halted after failure"
     phase = controller.get("phase")
     if phase == "syncing":
+        if data.get("service_active") is False:
+            return "node service inactive"
+        if (data.get("sample") or {}).get("metrics_status", "ok") != "ok":
+            return "sync status unavailable (metrics unavailable)"
         return "currently syncing"
     if phase == "complete":
         return "between runs"
@@ -716,16 +725,13 @@ def completion_updates(
     preserve the old counts; unavailable timings are explicitly reported.
     """
     records = {name: dict(record) for name, record in previous.get("completions", {}).items()}
-    for name in sorted(set(statuses) | set(labels or {})):
-        record = records.setdefault(name, {})
-        record["label"] = (labels or {}).get(name, record.get("label", name))
     for name, data in statuses.items():
         controller = data.get("controller_state") or {}
         run_id = controller.get("last_success_run")
         total = controller.get("runs")
         if not controller.get("completion_digest") or not run_id or type(total) is not int:
             continue
-        old = records[name]
+        old = records.get(name, {})
         if old.get("run_id") == run_id:
             continue
         baseline = old.get("total", controller.get("completion_digest_start_runs", total - 1))
@@ -741,13 +747,17 @@ def completion_updates(
         }
         details = completion_details(old) + [history[number] for number in sorted(history)]
         records[name] = {
-            "label": old["label"], "run_id": run_id, "total": total,
+            "label": (labels or {}).get(name, old.get("label", name)),
+            "run_id": run_id, "total": total,
+            "sha": controller.get("last_success_sha", "unknown"),
+            "duration": controller.get("last_success_duration_seconds"),
             "pending": old.get("pending", 0) + delta,
             "details": details[-COMPLETION_DETAIL_LIMIT:],
         }
     lines = []
     if digest_due:
-        for name, record in sorted(records.items()):
+        for name in sorted(set(records) | set(statuses) | set(labels or {})):
+            record = records.get(name, {})
             pending = record.get("pending", 0)
             durations = [
                 item["duration"] for item in completion_details(record)
@@ -757,12 +767,14 @@ def completion_updates(
             missing = pending - len(durations)
             if missing:
                 timings.append(f"{missing} duration(s) unavailable")
-            line = f"{record.get('label', name)}: {pending} completed"
+            label = (labels or {}).get(name, record.get("label", name))
+            line = f"{label}: {pending} completed"
             if timings:
                 line += " · " + ", ".join(timings)
             line += " · " + completion_status(statuses.get(name))
             lines.append(line)
-            records[name] = {**record, "pending": 0, "details": []}
+            if name in records:
+                records[name] = {**record, "label": label, "pending": 0, "details": []}
     return lines, records
 
 

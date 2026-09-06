@@ -1292,7 +1292,10 @@ class NotificationTests(unittest.TestCase):
                     result, post = self.audit(path, data, boundary)
                     self.assertEqual(result, 1)
                     if age < 86400:
-                        post.assert_not_called()
+                        post.assert_called_once()
+                        self.assertIn("0 completed", post.call_args.args[0])
+                        self.assertNotIn("unresolved", post.call_args.args[0])
+                        self.assertNotIn("controller halted: boom", post.call_args.args[0])
                         self.assertEqual(deploy.load_audit_state(path)["problems"]["node"]["last_sent"], sent_at)
                     else:
                         post.assert_called_once()
@@ -1382,6 +1385,86 @@ class NotificationTests(unittest.TestCase):
         lines, _ = deploy.completion_updates(data, {"completions": delivered}, True)
         self.assertIn("0 completed", lines[0])
         self.assertNotIn("7h", lines[0])
+
+    def test_multiple_audits_and_failed_delivery_preserve_each_duration(self):
+        data = {"controller_state": {
+            "completion_digest": True, "completion_digest_start_runs": 0,
+            "last_success_run": "run-1", "last_success_duration_seconds": 3600,
+            "runs": 1, "phase": "syncing",
+            "completion_history": [{"number": 1, "run_id": "run-1", "duration": 3600}],
+        }, "disk_free_bytes": 20 * 1024**3,
+            "service_active": True, "sample": {"metrics_status": "ok"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            _, post = self.audit(path, data, 1000)
+            post.assert_not_called()
+            data["controller_state"].update({
+                "last_success_run": "run-3", "last_success_duration_seconds": 10800,
+                "runs": 3,
+                "completion_history": [
+                    {"number": n, "run_id": f"run-{n}", "duration": n * 3600}
+                    for n in range(1, 4)
+                ],
+            })
+            _, post = self.audit(path, data, 2000)
+            post.assert_not_called()
+            saved = path.read_text()
+            _, post = self.audit(path, data, 87400, posted=False)
+            expected = "3 completed · 1h 00m, 2h 00m, 3h 00m"
+            self.assertIn(expected, post.call_args.args[0])
+            self.assertEqual(path.read_text(), saved)
+            _, post = self.audit(path, data, 87460)
+            self.assertIn(expected, post.call_args.args[0])
+            _, post = self.audit(path, data, 88000)
+            post.assert_not_called()
+            self.assertEqual(deploy.load_audit_state(path)["completions"]["node"]["pending"], 0)
+
+    def test_invalid_cached_details_cannot_break_failure_notifications(self):
+        for details in (None, "bad", [None], [{}] * 257):
+            with self.subTest(details_type=type(details)), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "state.json"
+                deploy.save_audit_state(path, {
+                    "version": deploy.AUDIT_STATE_VERSION, "problems": {},
+                    "completions": {"node": {
+                        "run_id": "old", "total": 1, "pending": 1,
+                        "sha": "abc", "duration": 60, "details": details,
+                    }},
+                })
+                data = self.halted_status()
+                del data["controller_state"]["failure_notification"]
+                result, post = self.audit(path, data, 1000)
+                self.assertEqual(result, 1)
+                self.assertIn("controller halted", post.call_args.args[0])
+
+    def test_zero_completion_summary_does_not_reset_first_completion_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            data = {"controller_state": {"runs": 260, "phase": "complete"},
+                    "disk_free_bytes": 20 * 1024**3}
+            self.audit(path, data, 1000)
+            _, post = self.audit(path, data, 87400)
+            self.assertIn("0 completed", post.call_args.args[0])
+            data["controller_state"].update({
+                "runs": 261, "completion_digest": True, "completion_digest_start_runs": 260,
+                "last_success_run": "new", "last_success_duration_seconds": 3600,
+            })
+            self.audit(path, data, 88000)
+            records = deploy.load_audit_state(path)["completions"]
+            self.assertEqual(records["node"]["pending"], 1)
+            _, post = self.audit(path, data, 173800)
+            self.assertIn("1 completed · 1h 00m", post.call_args.args[0])
+
+    def test_sync_status_does_not_hide_inactive_service_or_missing_metrics(self):
+        for extra, expected in (
+            ({"service_active": False}, "node service inactive"),
+            ({"sample": {"metrics_status": "connection refused"}},
+             "sync status unavailable (metrics unavailable)"),
+        ):
+            with self.subTest(expected=expected):
+                data = {"controller_state": {"phase": "syncing"}, **extra}
+                lines, _ = deploy.completion_updates({"node": data}, {}, True)
+                self.assertIn(expected, lines[0])
+                self.assertNotIn("currently syncing", lines[0])
 
     def test_digest_upgrade_and_retention_report_missing_timings(self):
         previous = {"completions": {"node": {

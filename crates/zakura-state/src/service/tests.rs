@@ -367,6 +367,114 @@ fn prepared_relay_preflight_rejects_a_forged_commitment() {
     ));
 }
 
+/// A full orphan queue must not strand the descendants that are waiting on the very block
+/// that would release them.
+///
+/// The bound only applies to blocks that must wait for an absent parent. When the queue is
+/// filled by descendants of a missing block `B`, `B` itself can extend the chain now, and
+/// rejecting it leaves its descendants indexed under a hash that no drain ever visits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+
+    // Rewrite the early mainnet coinbases as v4, so these blocks can reach the non-finalized
+    // state, and relink each block onto its rewritten parent.
+    let mut chain: Vec<Arc<Block>> = Vec::new();
+    for (_height, block_bytes) in zakura_test::vectors::MAINNET_BLOCKS.range(0..=2) {
+        let mut block = block_bytes
+            .zcash_deserialize_into::<Block>()
+            .expect("the mainnet block vector decodes");
+        block.transactions = vec![Arc::new(transaction_v4_from_coinbase(
+            &block.transactions[0],
+        ))];
+        if let Some(parent) = chain.last() {
+            Arc::make_mut(&mut block.header).previous_block_hash = parent.hash();
+        }
+        chain.push(Arc::new(block));
+    }
+
+    let (mut state_service, _, _, _) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
+
+    // Commit the first two blocks as checkpoint verified blocks, so the finalized tip becomes a
+    // parent that `can_fork_chain_at` accepts.
+    for block in &chain[0..=1] {
+        let result = state_service
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .await;
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "the checkpoint verified block commits: {result:?}",
+        );
+    }
+
+    // `child` extends the finalized tip, so it can be committed as soon as it is queued.
+    // `grandchild` can only be released by `child`.
+    let child = chain[2].clone().prepare();
+    assert_eq!(child.block.header.previous_block_hash, chain[1].hash());
+
+    let mut grandchild_block = (*child.block).clone();
+    Arc::make_mut(&mut grandchild_block.header).previous_block_hash = child.hash;
+    let grandchild = Arc::new(grandchild_block).prepare();
+    let (grandchild_tx, _grandchild_rx) = tokio::sync::oneshot::channel();
+    state_service.non_finalized_state_queued_blocks.queue((
+        grandchild.clone(),
+        grandchild_tx,
+        None,
+    ));
+
+    // Fill the rest of the queue with blocks whose parents this state will never have.
+    let mut orphan_count = 0_u64;
+    while !state_service.non_finalized_state_queued_blocks.is_full() {
+        let mut orphan_block = (*child.block).clone();
+        Arc::make_mut(&mut orphan_block.header)
+            .previous_block_hash
+            .0[..8]
+            .copy_from_slice(&orphan_count.to_le_bytes());
+        let (orphan_tx, _orphan_rx) = tokio::sync::oneshot::channel();
+        state_service.non_finalized_state_queued_blocks.queue((
+            Arc::new(orphan_block).prepare(),
+            orphan_tx,
+            None,
+        ));
+        orphan_count += 1;
+    }
+    assert!(
+        orphan_count > 0,
+        "the queue reaches its bound through blocks with absent parents",
+    );
+
+    // The queue is full, but `child` extends the finalized tip, so it must still be admitted.
+    let admission = BlockAdmission::pending();
+    let _response = state_service
+        .queue_and_commit_to_non_finalized_state(child.clone(), Some(admission.clone()));
+
+    assert!(
+        state_service
+            .non_finalized_block_write_sent_hashes
+            .contains(&child.hash),
+        "a block whose parent is the finalized tip is sent for commit even when the queue is full",
+    );
+    assert!(
+        state_service
+            .non_finalized_block_write_sent_hashes
+            .contains(&grandchild.hash),
+        "the descendants waiting on that block are released with it",
+    );
+    assert!(
+        state_service
+            .non_finalized_state_queued_blocks
+            .get_mut(&grandchild.hash)
+            .is_none(),
+        "the released descendant leaves the queue",
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn descendant_arriving_after_a_local_parent_failure_completes_immediately() {
     let network = Network::Mainnet;

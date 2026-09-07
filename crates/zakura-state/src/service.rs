@@ -54,6 +54,7 @@ use crate::{
     service::{
         block_iter::any_ancestor_blocks,
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
+        check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
         finalized_state::{
             header_chain::{HeaderChainStore, HeaderChainStoreError},
             FinalizedState, ZakuraDb,
@@ -1065,7 +1066,20 @@ impl StateService {
             )
             .into()));
             rsp_rx
-        } else if self.non_finalized_state_queued_blocks.is_full() {
+        } else if self.non_finalized_state_queued_blocks.is_full()
+            && !self.can_fork_chain_at(&parent_hash)
+        {
+            // The bound only applies to blocks that must wait for a parent this state does not
+            // have. A block that can extend a chain now is admitted even when the queue is full,
+            // because the drain below walks forward from `parent_hash`: a block the queue refused
+            // is never the parent that releases its own queued descendants, and nothing else
+            // empties the queue while the chain is stalled, so rejecting it here would strand
+            // them permanently.
+            //
+            // Admitting one costs at most a transient overshoot. In the common case the drain
+            // below removes it in this same call. While the write task still commits checkpoint
+            // blocks it can stay queued, but only a child of the finalized tip qualifies then,
+            // and queuing one is itself a handoff trigger.
             if let Some(admission) = admission {
                 admission.reject();
             }
@@ -3368,8 +3382,13 @@ fn check_prepared_mined_relay_eligibility_for_state(
         commitment.auth_data_root,
     )?;
 
-    let relevant_chain: Vec<_> =
-        any_ancestor_blocks(non_finalized_state, db, parent_hash).collect();
+    // Take only the blocks `block_is_valid_for_recent_chain_data` reads. The
+    // iterator walks to genesis, so collecting it would load every ancestor
+    // block body into memory to check the most recent
+    // `POW_ADJUSTMENT_BLOCK_SPAN` of them.
+    let relevant_chain: Vec<_> = any_ancestor_blocks(non_finalized_state, db, parent_hash)
+        .take(POW_ADJUSTMENT_BLOCK_SPAN)
+        .collect();
     if relevant_chain.is_empty() {
         return Ok(PreparedMinedRelayEligibility::Unavailable);
     }

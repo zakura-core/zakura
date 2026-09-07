@@ -112,11 +112,11 @@ zakura-chain = { path = "../zakura-chain", version = "7.0.0-rc0", features = [
     "json-conversion",
 ] }
 zakura-consensus = { path = "../zakura-consensus", version = "8.0.0" }
-zakura-network = { path = "../zakura-network", version = "7.1.0-rc0" }
-zakura-node-services = { path = "../zakura-node-services", version = "3.2.3-rc0", features = [
+zakura-network = { path = "../zakura-network", version = "7.1.1-rc0" }
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.4-rc0", features = [
     "rpc-client",
 ] }
-zakura-script = { path = "../zakura-script", version = "3.2.2-rc0" }
+zakura-script = { path = "../zakura-script", version = "3.2.3-rc0" }
 zakura-state = { path = "../zakura-state", version = "8.0.0" }
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"] }
@@ -142,7 +142,7 @@ zakura-chain = { path = "../zakura-chain", version = "7.0.0-rc0", features = [
 zakura-consensus = { path = "../zakura-consensus", version = "8.0.0", features = [
     "proptest-impl",
 ] }
-zakura-network = { path = "../zakura-network", version = "7.1.0-rc0", features = [
+zakura-network = { path = "../zakura-network", version = "7.1.1-rc0", features = [
     "proptest-impl",
 ] }
 zakura-state = { path = "../zakura-state", version = "8.0.0", features = [

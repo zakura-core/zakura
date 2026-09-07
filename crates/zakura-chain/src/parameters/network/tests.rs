@@ -11,8 +11,8 @@ use crate::{
     block::Height,
     parameters::{
         subsidy::{
-            block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, funding_stream_address_period,
-            halving, halving_divisor, height_for_halving, ParameterSubsidy as _,
+            block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, halving, halving_divisor,
+            height_for_halving, ParameterSubsidy as _,
         },
         NetworkUpgrade,
     },
@@ -415,7 +415,10 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
 #[test]
 #[cfg(feature = "zip218")]
 fn funding_stream_period_before_anchor_uses_floor_division() -> Result<(), Report> {
-    use crate::parameters::testnet::{self, ConfiguredActivationHeights};
+    use crate::parameters::{
+        subsidy::funding_stream_address_period,
+        testnet::{self, ConfiguredActivationHeights},
+    };
 
     let _init_guard = zakura_test::init();
 

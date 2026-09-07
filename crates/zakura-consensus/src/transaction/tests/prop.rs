@@ -509,6 +509,7 @@ fn validate(
         verifier
             .clone()
             .oneshot(transaction::Request::Block {
+                utxo_resolver: None,
                 transaction_hash,
                 transaction: Arc::new(transaction),
                 known_utxos: Arc::new(known_utxos),

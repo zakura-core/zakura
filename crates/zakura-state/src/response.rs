@@ -1,7 +1,7 @@
 //! State [`tower::Service`] response types.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -102,6 +102,9 @@ pub enum Response {
     /// The response to a `AwaitUtxo` request, from any non-finalized chains, finalized chain,
     /// pending unverified blocks, or blocks received after the request was sent.
     Utxo(transparent::Utxo),
+
+    /// All unique outputs requested by [`Request::AwaitUtxos`].
+    Utxos(HashMap<transparent::OutPoint, transparent::Utxo>),
 
     /// The response to a `FindBlockHashes` request.
     BlockHashes(Vec<block::Hash>),

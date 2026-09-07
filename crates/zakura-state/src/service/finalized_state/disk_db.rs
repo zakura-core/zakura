@@ -82,6 +82,34 @@ pub type DBThreadMode = rocksdb::SingleThreaded;
 /// Also the [`rocksdb::DBAccess`] used by database iterators.
 pub type DB = rocksdb::DBWithThreadMode<DBThreadMode>;
 
+/// Holds one database generation across dependent batches of typed reads.
+pub(super) struct DiskReadSnapshot<'a> {
+    db: &'a DB,
+    snapshot: rocksdb::Snapshot<'a>,
+}
+
+impl DiskReadSnapshot<'_> {
+    /// Reads one column family with RocksDB's pinned, batched MultiGet.
+    pub(super) fn zs_multi_get<K: IntoDisk, V: FromDisk>(
+        &self,
+        cf: &impl rocksdb::AsColumnFamilyRef,
+        keys: &[K],
+    ) -> Vec<Option<V>> {
+        let keys: Vec<_> = keys.iter().map(IntoDisk::as_bytes).collect();
+        let mut options = ReadOptions::default();
+        options.set_snapshot(&self.snapshot);
+        self.db
+            .batched_multi_get_cf_opt(cf, &keys, false, &options)
+            .into_iter()
+            .map(|value| {
+                value
+                    .expect("unexpected database failure")
+                    .map(V::from_bytes)
+            })
+            .collect()
+    }
+}
+
 /// Failure while visiting a raw column family without collecting its rows.
 pub(crate) enum RawVisitError<E> {
     /// RocksDB failed while advancing the iterator.
@@ -1271,6 +1299,14 @@ impl DiskDb {
         // should just be &self. To avoid this restriction, clone the string before passing it to
         // this method. Currently Zebra uses static strings, so this doesn't matter.
         self.db.cf_handle(cf_name)
+    }
+
+    /// Creates a read snapshot without exposing the raw database handle.
+    pub(super) fn read_snapshot(&self) -> DiskReadSnapshot<'_> {
+        DiskReadSnapshot {
+            db: &self.db,
+            snapshot: self.db.snapshot(),
+        }
     }
 
     /// Read raw bytes from one column family without panicking on RocksDB failure.

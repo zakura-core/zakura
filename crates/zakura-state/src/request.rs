@@ -1286,6 +1286,14 @@ pub enum Request {
     /// Outdated requests are pruned on a regular basis.
     AwaitUtxo(transparent::OutPoint),
 
+    /// Resolve at most [`crate::constants::MAX_UTXO_BATCH_SIZE`] outpoints.
+    ///
+    /// This request has the informational semantics of [`Request::AwaitUtxo`].
+    /// The state batches available-output reads under a shared work budget, then
+    /// waits for missing outputs without holding a read permit. Duplicate outpoints
+    /// resolve once. Callers must apply a timeout.
+    AwaitUtxos(Vec<transparent::OutPoint>),
+
     /// Finds the first hash that's in the peer's `known_blocks` and the local best chain.
     /// Returns a list of hashes that follow that intersection, from the best chain.
     ///
@@ -1402,6 +1410,7 @@ impl Request {
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::AwaitUtxo(_) => "await_utxo",
+            Request::AwaitUtxos(_) => "await_utxos",
             Request::Depth(_) => "depth",
             Request::Tip => "tip",
             Request::BlockLocator => "block_locator",
@@ -2049,9 +2058,11 @@ impl TryFrom<Request> for ReadRequest {
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),
 
-            Request::AwaitUtxo(_) => Err("ReadService does not track pending UTXOs. \
+            Request::AwaitUtxo(_) | Request::AwaitUtxos(_) => {
+                Err("ReadService does not track pending UTXOs. \
                      Manually convert the request to ReadRequest::AnyChainUtxo, \
-                     and handle pending UTXOs"),
+                     and handle pending UTXOs")
+            }
 
             Request::KnownBlock(_) => Err("ReadService does not track queued blocks"),
 

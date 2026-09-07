@@ -7795,7 +7795,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "7.0.2-rc0"
+version = "8.0.0-rc0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -8166,7 +8166,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "9.0.1-rc0"
+version = "10.0.0-rc0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8299,7 +8299,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "7.2.0-rc0"
+version = "8.0.0-rc0"
 dependencies = [
  "bincode",
  "chrono",
@@ -8410,7 +8410,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.3-rc0"
+version = "2.2.4-rc0"
 dependencies = [
  "clap",
  "color-eyre",

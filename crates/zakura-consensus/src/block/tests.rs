@@ -739,6 +739,104 @@ fn librustzcash_conversion_test_network(network_upgrade: NetworkUpgrade) -> Netw
         .expect("failed to build configured network")
 }
 
+#[tokio::test]
+async fn block_verification_uses_batched_external_outputs_without_committing_them() {
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let outpoint = transparent::OutPoint {
+        hash: [42; 32].into(),
+        index: 0,
+    };
+    for script_succeeds in [true, false] {
+        let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        block.transactions = vec![
+            Arc::new(v5_coinbase_transaction(
+                NetworkUpgrade::Nu5,
+                Height(1),
+                &network,
+            )),
+            Arc::new(Transaction::V5 {
+                network_upgrade: NetworkUpgrade::Nu5,
+                inputs: vec![transparent::Input::PrevOut {
+                    outpoint,
+                    unlock_script: transparent::Script::new(&[]),
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![transparent::Output {
+                    value: Amount::try_from(1).unwrap(),
+                    lock_script: transparent::Script::new(&[0x51]),
+                }],
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(2),
+                sapling_shielded_data: None,
+                orchard_shielded_data: None,
+            }),
+        ];
+        Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+        let expected_hash = block.hash();
+        let state =
+            tower::service_fn(move |request| async move {
+                Ok::<_, BoxError>(match request {
+                    zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                    zs::Request::AwaitUtxos(outpoints) => {
+                        assert_eq!(outpoints, vec![outpoint]);
+                        zs::Response::Utxos(
+                            [(
+                                outpoint,
+                                transparent::Utxo::new(
+                                    transparent::Output {
+                                        value: Amount::try_from(1).unwrap(),
+                                        lock_script: transparent::Script::new(&[
+                                            if script_succeeds { 0x51 } else { 0x00 },
+                                        ]),
+                                    },
+                                    Height(0),
+                                    false,
+                                ),
+                            )]
+                            .into_iter()
+                            .collect(),
+                        )
+                    }
+                    zs::Request::CheckBlockProposalValidity(prepared) => {
+                        assert!(!prepared.new_outputs.contains_key(&outpoint));
+                        assert_eq!(
+                            prepared.new_outputs,
+                            transparent::new_ordered_outputs(
+                                &prepared.block,
+                                &prepared.transaction_hashes
+                            )
+                        );
+                        zs::Response::ValidBlockProposal
+                    }
+                    _ => panic!("semantic block verification must use the block resolver"),
+                })
+            });
+        let transaction = transaction::Verifier::new_for_tests(&network, state);
+        let transaction = Buffer::new(BoxService::new(transaction), 1);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            SemanticBlockVerifier::new(&network, state, transaction)
+                .oneshot(Request::CheckProposal(Arc::new(block))),
+        )
+        .await
+        .unwrap();
+        if script_succeeds {
+            assert_eq!(result.unwrap(), expected_hash);
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(VerifyBlockError::Transaction(TransactionError::Script(_)))
+                ),
+                "{result:?}"
+            );
+        }
+    }
+}
+
 fn block_with_librustzcash_conversion_failure(
     case: LibrustzcashConversionFailure,
     network: &Network,

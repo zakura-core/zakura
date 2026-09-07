@@ -348,6 +348,8 @@ where
 
             let known_outpoint_hashes: Arc<HashSet<transaction::Hash>> =
                 Arc::new(known_utxos.keys().map(|outpoint| outpoint.hash).collect());
+            let utxo_resolver =
+                tx::BlockUtxos::for_block(&block, &known_utxos, state_service.clone());
             // Keep this guard after `known_outpoint_hashes` so its `Drop` removes the
             // pointer-keyed registration before the `Arc` address can be reused.
             let _block_batch_flush = primitives::register_block_verifier_batch_flush(
@@ -367,6 +369,7 @@ where
                         transaction: transaction.clone(),
                         known_outpoint_hashes: known_outpoint_hashes.clone(),
                         known_utxos: known_utxos.clone(),
+                        utxo_resolver: utxo_resolver.clone(),
                         height,
                         time: block.header.time,
                     });

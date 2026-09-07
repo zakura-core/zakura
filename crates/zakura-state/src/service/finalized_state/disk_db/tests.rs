@@ -46,6 +46,46 @@ fn format_bytes_preserves_decimal_unit_boundaries() {
 }
 
 #[test]
+fn batched_reads_keep_one_snapshot_and_input_order() {
+    use crate::{FromDisk, IntoDisk};
+    use zakura_chain::block::Height;
+
+    let _init_guard = zakura_test::init();
+    let db = DiskDb::new(
+        &Config::ephemeral(),
+        "batch-snapshot-test",
+        &Version::new(1, 0, 0),
+        &Network::Mainnet,
+        ["values".to_owned()],
+        false,
+    )
+    .unwrap();
+    let cf = db.cf_handle("values").unwrap();
+    db.put_cf(cf, Height(1).as_bytes(), Height(10).as_bytes())
+        .unwrap();
+    db.put_cf(cf, Height(2).as_bytes(), Height(20).as_bytes())
+        .unwrap();
+    let snapshot = db.read_snapshot();
+    db.put_cf(cf, Height(1).as_bytes(), Height(100).as_bytes())
+        .unwrap();
+    db.delete_cf(cf, Height(2).as_bytes()).unwrap();
+
+    let keys = [Height(2), Height(1), Height(2), Height(3)];
+    assert_eq!(
+        snapshot.zs_multi_get::<_, Height>(&cf, &keys),
+        vec![Some(Height(20)), Some(Height(10)), Some(Height(20)), None]
+    );
+    assert_eq!(
+        db.read_snapshot().zs_multi_get::<_, Height>(&cf, &keys),
+        vec![None, Some(Height(100)), None, None]
+    );
+    assert_eq!(
+        Height::from_bytes(db.get_cf(cf, Height(1).as_bytes()).unwrap().unwrap()),
+        Height(100)
+    );
+}
+
+#[test]
 fn exporting_metrics_refreshes_cached_disk_size() {
     let _init_guard = zakura_test::init();
     let db = DiskDb::new(

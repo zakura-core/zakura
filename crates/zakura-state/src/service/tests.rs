@@ -582,6 +582,7 @@ async fn test_populated_state_responds_correctly(
 
         // Spec: transactions in the genesis block are ignored.
         if height.0 != 0 {
+            let mut batch_utxos = std::collections::HashMap::new();
             for transaction in &block.transactions {
                 let transaction_hash = transaction.hash();
 
@@ -595,8 +596,25 @@ async fn test_populated_state_responds_correctly(
                         from_coinbase,
                     };
 
+                    batch_utxos.insert(outpoint, utxo.clone());
                     transcript.push((Request::AwaitUtxo(outpoint), Ok(Response::Utxo(utxo))));
                 }
+            }
+            for outpoints in batch_utxos
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+                .chunks(crate::constants::MAX_UTXO_BATCH_SIZE)
+            {
+                transcript.push((
+                    Request::AwaitUtxos(outpoints.to_vec()),
+                    Ok(Response::Utxos(
+                        outpoints
+                            .iter()
+                            .map(|outpoint| (*outpoint, batch_utxos[outpoint].clone()))
+                            .collect(),
+                    )),
+                ));
             }
         }
 

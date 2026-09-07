@@ -46,6 +46,9 @@ use crate::{
 
 use super::super::TypedColumnFamily;
 
+#[cfg(test)]
+mod tests;
+
 /// The name of the transaction hash by spent outpoints column family.
 pub const TX_LOC_BY_SPENT_OUT_LOC: &str = "tx_loc_by_spent_out_loc";
 
@@ -155,6 +158,68 @@ impl ZakuraDb {
         let output_location = self.output_location(outpoint)?;
 
         self.utxo_by_location(output_location)
+    }
+
+    /// Reads a bounded UTXO batch from one finalized database snapshot.
+    ///
+    /// The first MultiGet resolves transaction locations. The second reads outputs.
+    /// Both must use the same snapshot so a rollback cannot reuse a location between reads.
+    pub(crate) fn utxos(
+        &self,
+        outpoints: &[transparent::OutPoint],
+    ) -> HashMap<transparent::OutPoint, transparent::Utxo> {
+        if outpoints.is_empty() {
+            return HashMap::new();
+        }
+        let snapshot = self.db.read_snapshot();
+        let tx_loc_by_hash = self
+            .db
+            .cf_handle("tx_loc_by_hash")
+            .expect("the transaction location column family exists");
+        let utxo_by_out_loc = self
+            .db
+            .cf_handle("utxo_by_out_loc")
+            .expect("the UTXO column family exists");
+        let hashes: Vec<_> = outpoints
+            .iter()
+            .map(|outpoint| outpoint.hash)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let locations: HashMap<_, TransactionLocation> = hashes
+            .iter()
+            .copied()
+            .zip(snapshot.zs_multi_get(&tx_loc_by_hash, &hashes))
+            .filter_map(|(hash, location)| location.map(|location| (hash, location)))
+            .collect();
+        let located: Vec<_> = outpoints
+            .iter()
+            .filter_map(|outpoint| {
+                locations.get(&outpoint.hash).map(|location| {
+                    (
+                        *outpoint,
+                        OutputLocation::from_outpoint(*location, outpoint),
+                    )
+                })
+            })
+            .collect();
+        let keys: Vec<_> = located.iter().map(|(_, location)| *location).collect();
+        located
+            .into_iter()
+            .zip(snapshot.zs_multi_get::<_, transparent::Output>(&utxo_by_out_loc, &keys))
+            .filter_map(|((outpoint, location), output)| {
+                output.map(|output| {
+                    (
+                        outpoint,
+                        transparent::Utxo::from_location(
+                            output,
+                            location.height(),
+                            location.transaction_index().as_usize(),
+                        ),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Returns the [`TransactionLocation`] of the transaction that spent the given

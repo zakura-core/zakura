@@ -81,6 +81,7 @@ mod pending_utxos;
 mod queued_blocks;
 pub(crate) mod read;
 mod traits;
+mod utxo_batch;
 mod write;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -238,6 +239,8 @@ pub(crate) struct StateService {
 /// It allows other async tasks to make progress while concurrently reading data from disk.
 #[derive(Clone, Debug)]
 pub struct ReadStateService {
+    /// Shared across clones; permits live until blocking UTXO reads finish.
+    utxo_read_budget: utxo_batch::UtxoReadBudget,
     // Configuration
     //
     /// The configured Zcash network.
@@ -1328,6 +1331,7 @@ impl ReadStateService {
             finalized_state::embedded_historical_subtrees(&finalized_state.network()).map(Arc::new);
 
         let read_service = Self {
+            utxo_read_budget: utxo_batch::UtxoReadBudget::default(),
             network: finalized_state.network(),
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
@@ -1663,6 +1667,8 @@ impl Service<Request> for StateService {
 
             // Uses pending_utxos and non_finalized_state_queued_blocks in the StateService.
             // If the UTXO isn't in the queued blocks, runs concurrently using the ReadStateService.
+            Request::AwaitUtxos(outpoints) => self.await_utxos(outpoints),
+
             Request::AwaitUtxo(outpoint) => {
                 let timer = CodeTimer::start();
                 // Prepare the AwaitUtxo future from PendingUxtos.

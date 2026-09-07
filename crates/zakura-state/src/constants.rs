@@ -168,3 +168,12 @@ lazy_static! {
     )
     .expect("regex is valid");
 }
+
+/// Maximum outpoints in one batched UTXO request.
+///
+/// This scheduling bound does not change transaction or block validity limits.
+pub const MAX_UTXO_BATCH_SIZE: usize = 64;
+
+/// Maximum batched UTXO read tasks per state instance, shared across service clones.
+/// Missing-output waits do not consume this budget.
+pub const MAX_CONCURRENT_UTXO_BATCH_READS: usize = 4;

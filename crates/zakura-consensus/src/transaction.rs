@@ -44,6 +44,8 @@ use zakura_state as zs;
 use crate::{error::TransactionError, primitives, script, BoxError};
 
 pub mod check;
+mod utxo_resolver;
+pub use utxo_resolver::BlockUtxos;
 #[cfg(test)]
 mod tests;
 
@@ -176,6 +178,9 @@ pub enum Request {
         known_outpoint_hashes: Arc<HashSet<transaction::Hash>>,
         /// Additional UTXOs which are known at the time of verification.
         known_utxos: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
+        /// Shared external-output resolver supplied by the semantic block verifier.
+        /// Standalone transaction verification can use `None` for legacy state lookups.
+        utxo_resolver: Option<BlockUtxos>,
         /// The height of the block containing this transaction.
         height: block::Height,
         /// The time that the block was mined.
@@ -792,6 +797,7 @@ where
         let mut spent_outputs: Vec<Option<transparent::Output>> = vec![None; inputs.len()];
         // Stores (input_idx, outpoint) for UTXOs not found in the best chain (fetched from mempool later).
         let mut spent_mempool_outpoints: Vec<(usize, transparent::OutPoint)> = Vec::new();
+        let mut resolved_utxos = None;
 
         for (input_idx, input) in inputs.iter().enumerate() {
             if let transparent::Input::PrevOut { outpoint, .. } = input {
@@ -817,6 +823,20 @@ where
                     };
 
                     utxo
+                } else if let Request::Block {
+                    utxo_resolver: Some(resolver),
+                    ..
+                } = &req
+                {
+                    if resolved_utxos.is_none() {
+                        resolved_utxos = Some(resolver.resolve().await?);
+                    }
+                    resolved_utxos
+                        .as_ref()
+                        .expect("the resolver completed above")
+                        .get(outpoint)
+                        .ok_or(TransactionError::TransparentInputNotFound)?
+                        .clone()
                 } else {
                     let response = state
                         .clone()

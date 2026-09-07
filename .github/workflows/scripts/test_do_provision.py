@@ -126,6 +126,64 @@ class Selection(unittest.TestCase):
         )
         self.assertEqual(p.select_state([state], "nyc1", "mainnet", "tip"), state)
 
+    def test_publisher_tip_labels_cannot_win_automatic_or_exact_handoff_selection(self):
+        legacy = snapshot(
+            height=3471916, id="legacy", prefix="zakura-pr-state-mainnet-"
+        )
+        verified = snapshot(
+            height=3470916, id="verified", prefix="zakura-pr-state-mainnet-"
+        )
+        verified["name"] = verified["name"].replace("-h", "-finalized-h")
+        approach = snapshot(height=3418306, id="approach")
+        self.assertEqual(
+            p.select_state(
+                [legacy, verified, approach],
+                "nyc1",
+                "mainnet",
+                "pre-checkpoint",
+                3472489,
+            ),
+            verified,
+        )
+        self.assertEqual(
+            p.select_state(
+                [legacy, approach], "nyc1", "mainnet", "pre-checkpoint", 3472489
+            ),
+            approach,
+        )
+        self.assertIsNone(
+            p.select_state(
+                [legacy, verified],
+                "nyc1",
+                "mainnet",
+                "pre-checkpoint",
+                3472489,
+                "legacy",
+            )
+        )
+        self.assertEqual(
+            p.select_state(
+                [legacy],
+                "nyc1",
+                "mainnet",
+                "tip",
+                snapshot_id="legacy",
+            ),
+            legacy,
+        )
+        verified["name"] = "zakura-pr-validation-state-mainnet-finalized-h3470916"
+        self.assertEqual(
+            p.select_state(
+                [verified],
+                "nyc1",
+                "mainnet",
+                "pre-checkpoint",
+                3472489,
+                "verified",
+            ),
+            verified,
+        )
+
     def test_bake_cannot_inflate_root_disk(self):
         sizes = [
             size("c-8"),
@@ -400,6 +458,23 @@ class SnapshotCreation(unittest.TestCase):
 
 
 class Retention(unittest.TestCase):
+    def test_pin_verified_ordinary_fixture_despite_higher_legacy_label(self):
+        states = [
+            snapshot(
+                height=h,
+                id=str(h),
+                prefix="zakura-pr-state-mainnet-",
+                created="2026-09-06T00:00:00Z",
+            )
+            for h in range(200, 206)
+        ]
+        legacy = snapshot(height=99, id="legacy", prefix="zakura-pr-state-mainnet-")
+        verified = snapshot(height=90, id="verified", prefix="zakura-pr-state-mainnet-")
+        verified["name"] = verified["name"].replace("-h", "-finalized-h")
+        kept = retention.retained_ids([], states + [legacy, verified], 100)
+        self.assertIn("verified", kept)
+        self.assertNotIn("legacy", kept)
+
     def test_keep_two_images_in_each_region(self):
         images = [
             image(r, id=f"{r}-{n}", created=f"2026-09-0{n}T00:00:00Z")

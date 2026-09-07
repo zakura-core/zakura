@@ -1,7 +1,14 @@
-//! Owned concurrency permits shared by native Zakura message policies.
+//! Shared admission and ownership for native Zakura message policies.
 //!
-//! Each service declares when work starts and which owners must finish before
-//! its permit is released. The primitive does not select scheduling policy.
+//! Finite request policies supply their codec and response bound. The shared
+//! admission path owns concurrency, rollback, execution, and response lifetimes.
+//! Peer routines retain protocol dispatch and scheduling decisions.
+
+mod request;
+pub(crate) use request::{
+    AcquiredWorkSlot, RequestAdmission, RequestPolicy, RequestSession, ResponsePermit, WorkAttempt,
+    WorkBlocked, WorkBound, WorkLease,
+};
 
 mod slots;
 pub(crate) use slots::{SlotBudget, SlotPermit};

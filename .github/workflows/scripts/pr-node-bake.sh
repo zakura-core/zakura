@@ -186,17 +186,27 @@ fetch_state() {
   echo "Restored $(ls -d "$dest"/state/v*/"$network")"
 }
 
-snapshot_height() {
-  # Snapshot publishers use both JSON numbers and decimal digit strings.
-  jq -er '.height
-    | if type == "string" then
-        select(length > 0 and (test("[^0-9]") | not)) | tonumber
-      else . end
-    | select(type == "number")
-    | select(. >= 0 and floor == .)' || {
-    echo "snapshot height must be a nonnegative integer or decimal digit string" >&2
+read_state_height() {
+  # Use the same offline, finalized-state view as the handoff canary. Publisher
+  # metadata can describe the live tip, including its non-finalized suffix.
+  local cache_dir="$1" network="$2" config output height
+  config=$(mktemp)
+  printf '[state]\nstorage_mode = "pruned"\n' > "$config"
+  if ! output=$(timeout 120 "${CARGO_TARGET_DIR}/release/zakurad" -c "$config" \
+    tip-height --cache-dir "$cache_dir" --network "$network" 2>&1); then
+    rm -f "$config"
+    printf 'could not read restored %s database height:\n%s\n' "$network" "$output" >&2
     return 1
-  }
+  fi
+  rm -f "$config"
+  height=$(printf '%s\n' "$output" | awk '/^[0-9]+$/ { print }')
+  # tip-height can log a read error and still exit zero. Require exactly one
+  # numeric result; neither a log height nor publisher metadata is a fallback.
+  if [[ ! "$height" =~ ^[0-9]+$ ]]; then
+    printf 'restored %s database did not return one numeric height:\n%s\n' "$network" "$output" >&2
+    return 1
+  fi
+  printf '%s\n' "$height"
 }
 
 MAINNET_MNT=/mnt/bake-mainnet
@@ -256,30 +266,12 @@ TOML
     echo "approach sync exited unexpectedly with status $ZAKURAD_STATUS" >&2
     exit "$ZAKURAD_STATUS"
   fi
-  cat > /root/inspect-approach.toml <<TOML
-[state]
-storage_mode = "pruned"
-TOML
-  set +e
-  TIP_OUTPUT=$(
-    /root/cargo-target/release/zakurad -c /root/inspect-approach.toml tip-height \
-      --cache-dir "$APPROACH_MNT/tip" \
-      --network Mainnet 2>&1
-  )
-  TIP_STATUS=$?
-  set -e
-  VERIFIED_APPROACH_H=$(printf '%s\n' "$TIP_OUTPUT" |
-    awk '/^[0-9]+$/ { height=$1 } END { print height }')
-  if [ "$TIP_STATUS" -eq 0 ] && [ -n "$VERIFIED_APPROACH_H" ]; then
-    [ "$VERIFIED_APPROACH_H" = "$APPROACH_H" ] || {
-      echo "approach sync stopped at $VERIFIED_APPROACH_H, expected $APPROACH_H" >&2
-      exit 1
-    }
-  else
-    echo "::warning::tip-height could not reopen the flushed fixture; using the exact configured-stop log height"
-    printf '%s\n' "$TIP_OUTPUT" >&2
-  fi
-  echo "$APPROACH_H" > /root/mainnet-approach-height
+  VERIFIED_APPROACH_H=$(read_state_height "$APPROACH_MNT/tip" Mainnet)
+  [ "$VERIFIED_APPROACH_H" = "$APPROACH_H" ] || {
+    echo "approach sync stopped at $VERIFIED_APPROACH_H, expected $APPROACH_H" >&2
+    exit 1
+  }
+  echo "$VERIFIED_APPROACH_H" > /root/mainnet-approach-height
 else
   echo "Keeping the retained approach snapshot; dispatch with rebuild_approach_from_sandblast=true to replace it"
 
@@ -288,8 +280,9 @@ else
   TIP_URL=$(echo "$TIP_META" | jq -er '.url')
   TIP_SHA=$(echo "$TIP_META" | jq -er '.sha256')
   echo "Mainnet tip: $(echo "$TIP_META" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
-  echo "$TIP_META" | snapshot_height > /root/mainnet-state-height
   fetch_state "$TIP_URL" "$TIP_SHA" "$MAINNET_MNT/tip" mainnet
+  read_state_height "$MAINNET_MNT/tip" Mainnet > /root/mainnet-state-height
+  echo "Verified Mainnet database height: $(cat /root/mainnet-state-height)"
 
   # Testnet tip: newest enabled pruned entry from the snapshots site metadata.
   TESTNET_META=$(curl -fsSL --retry 3 "$TESTNET_SNAPSHOTS_BASE/snapshots.json")
@@ -300,12 +293,13 @@ else
   TN_SHA=$(echo "$ENTRY" | jq -er '.sha256')
   TN_BASE=$(echo "$TESTNET_META" | jq -r '.siteBaseUrl // empty')
   echo "Testnet tip: $(echo "$ENTRY" | jq -r '"\(.file) height=\(.height) db=\(.dbFormat)"')"
-  echo "$ENTRY" | snapshot_height > /root/testnet-state-height
   if [ -n "$TN_BASE" ] && curl -fsIL --retry 2 "${TN_BASE}/files/${TN_FILE}" >/dev/null 2>&1; then
     fetch_state "${TN_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
   else
     fetch_state "${TESTNET_SNAPSHOTS_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
   fi
+  read_state_height "$TESTNET_MNT/tip" Testnet > /root/testnet-state-height
+  echo "Verified Testnet database height: $(cat /root/testnet-state-height)"
 fi
 
 sync

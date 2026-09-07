@@ -84,14 +84,6 @@ nu7-experimental = [
     "zakura-header-chain/nu7-experimental",
 ]
 
-# ZIP 234 with the halving-preserving issuance choice.
-zip234 = [
-    "zakura-chain/zip234",
-    "zakura-consensus/zip234",
-    "zakura-state/zip234",
-    "zakura-rpc/zip234",
-]
-
 # In release builds, don't compile debug logging code, to improve performance.
 default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "sentry", "opentelemetry"]
 

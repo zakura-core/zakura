@@ -264,7 +264,7 @@ pub const POST_BLOSSOM_POW_TARGET_SPACING: u32 = 75;
 pub const ZIP218_ENABLED: bool = cfg!(feature = "nu7-experimental");
 
 /// Whether ZIP 234's halving-preserving issuance is compiled into this build.
-pub const ZIP234_ENABLED: bool = cfg!(feature = "zip234");
+pub const ZIP234_ENABLED: bool = cfg!(feature = "nu7-experimental");
 
 /// The target block spacing after NU7 activation, in seconds.
 ///

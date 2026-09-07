@@ -257,7 +257,7 @@ async fn generated_local_seed_chain_passes_checkpoint_verification() -> Result<(
 }
 
 /// A checkpoint after NU7 must wait for the activation block's parent state.
-#[cfg(feature = "zip234")]
+#[cfg(feature = "nu7-experimental")]
 #[tokio::test(flavor = "multi_thread")]
 async fn checkpoint_sync_crosses_zip234_activation() -> Result<(), Report> {
     use zakura_chain::{

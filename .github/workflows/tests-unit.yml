@@ -356,49 +356,11 @@ jobs:
         with:
           toolchain: stable
       - uses: ./.github/actions/setup-zakura-build
-      - name: Test the crates that ZIP 218 changes
+      - name: Test the crates changed by the candidate NU7 rules
         run: |
           cargo test --locked --features zakura-chain/nu7-experimental \
             -p zakura-chain -p zakura-header-chain --lib
           cargo test --locked --features nu7-experimental \
-            -p zakura-consensus -p zakura-rpc --lib
-
-  zip234:
-    name: ZIP 234 feature tests (${{ matrix.name }})
-    needs: changes
-    # Compiles its own binaries, because the shared nextest archive is built
-    # without these features.
-    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
-    permissions:
-      contents: read
-      id-token: write
-      statuses: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        # Test ZIP 234 with both block-time outcomes.
-        include:
-          - name: zip234
-            chain-features: zakura-chain/zip234
-            features: zip234
-          - name: zip218 + zip234
-            chain-features: zakura-chain/zip218,zakura-chain/zip234
-            features: zip218,zip234
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
-        with:
-          toolchain: stable
-      - uses: ./.github/actions/setup-zakura-build
-      - name: Test the crates that ${{ matrix.name }} changes
-        run: |
-          cargo test --locked --features "${{ matrix.chain-features }}" \
-            -p zakura-chain --lib
-          cargo test --locked --features "${{ matrix.features }}" \
             -p zakura-consensus -p zakura-rpc -p zakura-state --lib
 
   network-dependent:
@@ -530,7 +492,6 @@ jobs:
       - unit-tests
       - zakura-config
       - nu7-experimental
-      - zip234
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
@@ -548,7 +509,7 @@ jobs:
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, nu7-experimental, zip234, publish-graph
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, nu7-experimental, publish-graph
 
   report-nightly-result:
     name: report nightly release test result

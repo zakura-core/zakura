@@ -23,11 +23,6 @@ nu7-experimental = [
     "zakura-header-chain/nu7-experimental",
 ]
 
-# ZIP 234 with the halving-preserving issuance choice.
-zip234 = [
-    "zakura-chain/zip234",
-]
-
 # Production features that activate extra dependencies, or extra features in dependencies
 
 # Exposes narrow internal hooks used by benchmarks.

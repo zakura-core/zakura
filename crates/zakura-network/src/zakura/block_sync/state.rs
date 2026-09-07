@@ -286,7 +286,6 @@ pub(super) struct BlockSyncState {
     /// (per-peer routines); the cross-peer facts the reactor/producer need live in the
     /// [`PeerRegistry`](super::peer_registry).
     pub(super) peers: HashMap<ZakuraPeerId, PeerBlockState>,
-    pub(super) parked_peers: HashSet<ZakuraPeerId>,
     /// Sorted set of needed download heights. Replaces the central
     /// `BlockRangeScheduler`: the per-peer issuance path pulls work in its own
     /// servable range, dedup/covered are `in_flight`, and the floor is GC only.
@@ -324,7 +323,6 @@ impl BlockSyncState {
             best_header_tip: startup.best_header_tip.0,
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
-            parked_peers: HashSet::new(),
             work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
             needed_heights: Vec::new(),

@@ -878,7 +878,6 @@ impl BlockSyncReactor {
                 ?decision,
                 "locally parking Zakura block-sync service session"
             );
-            self.state.parked_peers.insert(peer.clone());
             session.cancel_token().cancel();
             self.registry.remove_session(&peer, session_id);
             self.publish_peer_snapshot();
@@ -887,7 +886,6 @@ impl BlockSyncReactor {
             return;
         }
 
-        self.state.parked_peers.remove(&peer);
         // inverted inbound flow: the per-peer pipe-routine was already spawned by
         // `service::add_peer` (the pipe spawn point), wired with the shared
         // primitives and its registry generation. The reactor keeps only a thin
@@ -926,7 +924,6 @@ impl BlockSyncReactor {
             self.trace_peer_disconnected(&peer, received_status, self.state.peers.len());
         }
         self.registry.remove_session(&peer, session_id);
-        self.state.parked_peers.remove(&peer);
         self.publish_peer_snapshot();
         self.publish_candidate_state();
     }
@@ -1403,9 +1400,6 @@ impl BlockSyncReactor {
                 request,
                 attempt,
             } => {
-                if self.state.parked_peers.contains(&peer) {
-                    return;
-                }
                 let (start_height, count) = request.into_parts();
                 self.handle_get_blocks(peer, start_height, count, attempt)
                     .await;
@@ -1569,8 +1563,8 @@ impl BlockSyncReactor {
         count: u32,
         attempt: AdmissionAttempt,
     ) {
-        // A routine can be superseded after reserving resources but before the
-        // reactor receives its message. Dropping the stale attempt rolls back
+        // A routine can be rejected or superseded after reserving resources but
+        // before the reactor receives its message. Dropping the stale attempt rolls back
         // every reservation without running state work or emitting a frame.
         debug_assert_eq!(attempt.peer(), &peer);
         let session_id = attempt.session_id();

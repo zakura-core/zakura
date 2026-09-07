@@ -6501,7 +6501,8 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
 
 #[tokio::test]
 async fn reactor_lifecycle_events_cannot_replace_or_remove_a_newer_session() {
-    let config = ZakuraBlockSyncConfig::default();
+    let mut config = ZakuraBlockSyncConfig::default();
+    config.peer_limits.max_outbound_peers = 1;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -6513,7 +6514,7 @@ async fn reactor_lifecycle_events_cannot_replace_or_remove_a_newer_session() {
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let registry = &handle
         .routine_wiring
         .as_ref()
@@ -6575,6 +6576,81 @@ async fn reactor_lifecycle_events_cannot_replace_or_remove_a_newer_session() {
     .expect("the reactor rejects the delayed older admission");
     assert!(!newer_cancel.is_cancelled());
     assert_eq!(handle.peer_snapshot().outbound_peers, 1);
+
+    // The service can admit a session before the reactor observes the previous
+    // disconnect. Exercise that full-capacity rejection with several identities.
+    let serving = &handle.routine_wiring.as_ref().unwrap().serving_regulator;
+    for byte in 100..116 {
+        let rejected_peer = peer(byte);
+        let rejected_id = registry
+            .admit_session(
+                &rejected_peer,
+                ServicePeerDirection::Outbound,
+                &config,
+                3,
+                Instant::now(),
+            )
+            .generation();
+        let rejected_serving = serving.session(rejected_peer.clone(), rejected_id);
+        let attempt = rejected_serving.try_admit(1).unwrap();
+        let (send, _recv) = framed_channel(4);
+        let cancelled = CancellationToken::new();
+        handle
+            .peer_lifecycle
+            .send(BlockSyncPeerLifecycleEvent::Connected(
+                BlockSyncPeerSession::for_test_with_session_id(
+                    rejected_peer.clone(),
+                    rejected_id,
+                    send,
+                    cancelled.clone(),
+                ),
+            ))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cancelled.cancelled())
+            .await
+            .unwrap();
+        assert!(!registry.owns_generation(&rejected_peer, rejected_id));
+
+        // A request already queued by the rejected session must roll back even
+        // without retaining that peer's identity in a separate rejection set.
+        handle
+            .routine_wiring
+            .as_ref()
+            .unwrap()
+            .routine_to_reactor
+            .send(RoutineToReactor::ServeGetBlocks {
+                peer: rejected_peer.clone(),
+                request: super::serving_regulation::GetBlocksRequest {
+                    start_height: block::Height(1),
+                    count: 1,
+                },
+                attempt,
+            })
+            .await
+            .unwrap();
+        await_until(
+            "rejected attempt releases its slot",
+            Duration::from_secs(1),
+            || serving.snapshot().node_active == 0,
+        )
+        .await
+        .unwrap();
+        handle
+            .peer_lifecycle
+            .send(BlockSyncPeerLifecycleEvent::Disconnected {
+                peer: rejected_peer,
+                session_id: rejected_id,
+            })
+            .unwrap();
+        assert!(!newer_cancel.is_cancelled());
+        assert_eq!(handle.peer_snapshot().outbound_peers, 1);
+    }
+    while let Ok(action) = actions.try_recv() {
+        assert!(
+            !matches!(action, BlockSyncAction::QueryBlocksByHeightRange { .. }),
+            "rejected sessions must not start serving work"
+        );
+    }
 
     handle
         .peer_lifecycle

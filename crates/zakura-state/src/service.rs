@@ -1066,7 +1066,20 @@ impl StateService {
             )
             .into()));
             rsp_rx
-        } else if self.non_finalized_state_queued_blocks.is_full() {
+        } else if self.non_finalized_state_queued_blocks.is_full()
+            && !self.can_fork_chain_at(&parent_hash)
+        {
+            // The bound only applies to blocks that must wait for a parent this state does not
+            // have. A block that can extend a chain now is admitted even when the queue is full,
+            // because the drain below walks forward from `parent_hash`: a block the queue refused
+            // is never the parent that releases its own queued descendants, and nothing else
+            // empties the queue while the chain is stalled, so rejecting it here would strand
+            // them permanently.
+            //
+            // Admitting one costs at most a transient overshoot. In the common case the drain
+            // below removes it in this same call. While the write task still commits checkpoint
+            // blocks it can stay queued, but only a child of the finalized tip qualifies then,
+            // and queuing one is itself a handoff trigger.
             if let Some(admission) = admission {
                 admission.reject();
             }

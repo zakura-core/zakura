@@ -605,7 +605,7 @@ impl PeerRoutine {
                 if self.received_status {
                     self.retain_serving_request(start_height, count);
                 } else {
-                    self.report_misbehavior(BlockSyncMisbehavior::GetBlocksSpam)
+                    self.report_misbehavior(BlockSyncMisbehavior::GetBlocksBeforeStatus)
                         .await;
                 }
             }
@@ -2365,7 +2365,7 @@ async fn admit_and_forward_get_blocks(
                     bound = blocked.kind().label(),
                     "delaying GetBlocks at the work-admission bound"
                 );
-                acquired_slot = blocked.wait().await;
+                acquired_slot = Some(blocked.wait().await);
                 continue;
             }
         };

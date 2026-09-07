@@ -410,10 +410,8 @@ pub enum BlockSyncMisbehavior {
     MalformedMessage,
     /// A peer sent blocks that were not requested.
     UnsolicitedBlock,
-    /// A peer requested more blocks than this node advertised it can serve.
-    GetBlocksTooLong,
     /// A peer requested blocks before sending its required `Status`.
-    GetBlocksSpam,
+    GetBlocksBeforeStatus,
     /// A peer supplied a body whose payload does not match its requested header.
     BodyPayloadMismatch(zakura_header_chain::BodyPayloadMismatch),
     /// A commitment-matching body deterministically failed consensus.

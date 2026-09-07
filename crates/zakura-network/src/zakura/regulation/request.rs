@@ -129,6 +129,16 @@ pub(crate) enum WorkBound {
     Node,
 }
 
+impl WorkBound {
+    /// Stable resource names used by delay metrics and traces.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Peer => "peer_active",
+            Self::Node => "node_active",
+        }
+    }
+}
+
 /// A fair waiter's capacity, usable only for its original budget.
 #[derive(Debug)]
 pub(crate) struct AcquiredWorkSlot {

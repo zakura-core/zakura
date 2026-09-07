@@ -16285,7 +16285,7 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
     .await
     .expect("probe peer connects");
 
-    // Each `GetBlocks` from a peer that has not sent a Status is `GetBlocksSpam`
+    // Each `GetBlocks` from a peer that has not sent a Status is `GetBlocksBeforeStatus`
     // (formerly a "soft" offense that disconnected at a threshold of 3). Send well
     // past the old threshold.
     for _ in 0..8 {
@@ -16304,7 +16304,7 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let BlockSyncAction::Misbehavior { peer, reason } = next_action(&mut actions).await {
-                if peer == probe && reason == BlockSyncMisbehavior::GetBlocksSpam {
+                if peer == probe && reason == BlockSyncMisbehavior::GetBlocksBeforeStatus {
                     break;
                 }
             }

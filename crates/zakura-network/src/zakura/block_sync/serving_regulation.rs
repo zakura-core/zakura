@@ -11,10 +11,12 @@ use std::sync::Arc;
 #[cfg(test)]
 use super::wire::MAX_BS_BLOCKS_PER_REQUEST;
 use super::{config::*, *};
+#[cfg(test)]
+use crate::zakura::regulation::WorkBound;
 use crate::zakura::{
     regulation::{
         AcquiredWorkSlot, RequestAdmission, RequestSession, ResponsePermit, SlotBudget,
-        WorkAttempt, WorkBlocked, WorkBound, WorkLease,
+        WorkAttempt, WorkBlocked, WorkLease,
     },
     transport::FrameGuard,
 };
@@ -89,11 +91,6 @@ struct RegulatorInner {
     node_active: SlotBudget,
 }
 
-#[derive(Debug)]
-struct SessionResources {
-    work: RequestSession<GetBlocksPolicy>,
-}
-
 impl GetBlocksServingRegulator {
     /// Create the GetBlocks node policy from validated block-sync configuration.
     pub(super) fn new(config: ZakuraBlockSyncConfig) -> Self {
@@ -117,12 +114,11 @@ impl GetBlocksServingRegulator {
     /// Create one session policy within the node admission bounds.
     pub(super) fn session(&self, peer: ZakuraPeerId, session_id: u64) -> GetBlocksServingSession {
         let work = self.inner.admission.session(&peer);
-        let resources = Arc::new(SessionResources { work });
 
         GetBlocksServingSession {
             peer,
             session_id,
-            resources,
+            work,
         }
     }
 
@@ -140,7 +136,7 @@ impl GetBlocksServingRegulator {
 pub(super) struct GetBlocksServingSession {
     peer: ZakuraPeerId,
     session_id: u64,
-    resources: Arc<SessionResources>,
+    work: RequestSession<GetBlocksPolicy>,
 }
 
 impl GetBlocksServingSession {
@@ -149,8 +145,7 @@ impl GetBlocksServingSession {
         &self,
         frame: Frame,
     ) -> Result<BlockSyncMessage, BlockSyncWireError> {
-        self.resources
-            .work
+        self.work
             .decode(frame)
             .map(|request| BlockSyncMessage::GetBlocks {
                 start_height: request.start_height,
@@ -162,21 +157,9 @@ impl GetBlocksServingSession {
     pub(super) fn try_admit_request(
         &self,
         request: &GetBlocksRequest,
-        acquired: Option<AcquiredAdmissionSlot>,
-    ) -> Result<AdmissionAttempt, AdmissionBlocked> {
-        self.admit(request, acquired)
-    }
-
-    fn admit(
-        &self,
-        request: &GetBlocksRequest,
-        acquired: Option<AcquiredAdmissionSlot>,
-    ) -> Result<AdmissionAttempt, AdmissionBlocked> {
-        let work = self
-            .resources
-            .work
-            .try_admit(request, acquired)
-            .map_err(AdmissionBlocked)?;
+        acquired: Option<AcquiredWorkSlot>,
+    ) -> Result<AdmissionAttempt, WorkBlocked> {
+        let work = self.work.try_admit(request, acquired)?;
         Ok(AdmissionAttempt {
             peer: self.peer.clone(),
             session_id: self.session_id,
@@ -185,8 +168,8 @@ impl GetBlocksServingSession {
     }
 
     #[cfg(any(test, feature = "zakura-testkit"))]
-    pub(super) fn try_admit(&self, count: u32) -> Result<AdmissionAttempt, AdmissionBlocked> {
-        self.admit(
+    pub(super) fn try_admit(&self, count: u32) -> Result<AdmissionAttempt, WorkBlocked> {
+        self.try_admit_request(
             &GetBlocksRequest {
                 start_height: block::Height(0),
                 count,
@@ -199,50 +182,15 @@ impl GetBlocksServingSession {
     pub(super) fn try_admit_with_slot(
         &self,
         count: u32,
-        acquired: Option<AcquiredAdmissionSlot>,
-    ) -> Result<AdmissionAttempt, AdmissionBlocked> {
-        self.admit(
+        acquired: Option<AcquiredWorkSlot>,
+    ) -> Result<AdmissionAttempt, WorkBlocked> {
+        self.try_admit_request(
             &GetBlocksRequest {
                 start_height: block::Height(0),
                 count,
             },
             acquired,
         )
-    }
-}
-
-pub(super) type AcquiredAdmissionSlot = AcquiredWorkSlot;
-
-/// The work bound that rejected an otherwise valid request.
-#[derive(Debug)]
-pub(super) struct AdmissionBlocked(WorkBlocked);
-
-/// Stable resource names used by low-cardinality delay observations.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum BoundKind {
-    PeerActive,
-    NodeActive,
-}
-
-impl BoundKind {
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Self::PeerActive => "peer_active",
-            Self::NodeActive => "node_active",
-        }
-    }
-}
-
-impl AdmissionBlocked {
-    pub(super) fn kind(&self) -> BoundKind {
-        match self.0.kind() {
-            WorkBound::Peer => BoundKind::PeerActive,
-            WorkBound::Node => BoundKind::NodeActive,
-        }
-    }
-
-    pub(super) async fn wait(self) -> Option<AcquiredAdmissionSlot> {
-        Some(self.0.wait().await)
     }
 }
 
@@ -376,7 +324,7 @@ mod tests {
             let replacement = regulator.session(peer(8), generation);
             assert_eq!(
                 replacement.try_admit(1).unwrap_err().kind(),
-                BoundKind::PeerActive
+                WorkBound::Peer
             );
             assert_eq!(regulator.snapshot().node_active, 1);
             let other = regulator.session(peer(9), generation);
@@ -508,7 +456,7 @@ mod tests {
         let blocked = waiting_session
             .try_admit(1)
             .expect_err("the active slot is owned");
-        assert_eq!(blocked.kind(), BoundKind::NodeActive);
+        assert_eq!(blocked.kind(), WorkBound::Node);
         let wait = blocked.wait();
         tokio::pin!(wait);
         assert!(poll!(&mut wait).is_pending());
@@ -517,7 +465,7 @@ mod tests {
             .await
             .expect("released capacity reaches its waiter");
         let admitted = waiting_session
-            .try_admit_with_slot(1, acquired)
+            .try_admit_with_slot(1, Some(acquired))
             .expect("the retry retains its assigned slot")
             .commit();
         assert_eq!(regulator.snapshot().node_active, 1);
@@ -583,7 +531,7 @@ mod tests {
         let blocked = session
             .try_admit(1)
             .expect_err("the peer producer is occupied by the first request");
-        assert_eq!(blocked.kind(), BoundKind::PeerActive);
+        assert_eq!(blocked.kind(), WorkBound::Peer);
         assert_eq!(regulator.snapshot(), before);
 
         let independent = other_peer
@@ -627,10 +575,7 @@ mod tests {
         let block = permit.frame_guard(100);
         let terminal = permit.frame_guard(9);
         drop(permit);
-        assert_eq!(
-            session.try_admit(1).unwrap_err().kind(),
-            BoundKind::PeerActive
-        );
+        assert_eq!(session.try_admit(1).unwrap_err().kind(), WorkBound::Peer);
         assert!(other.try_admit(1).is_ok());
         drop(block);
         assert!(session.try_admit(1).is_err());

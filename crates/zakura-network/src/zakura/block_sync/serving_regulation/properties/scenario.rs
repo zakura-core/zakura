@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use super::super::*;
 
 pub(super) const REQUEST_SLOTS: usize = 4;
-pub(super) const INPUT_SLOTS: usize = 4;
 pub(super) const QUEUE_DEPTH: usize = 1;
 pub(super) const RESPONSE_CAP: u64 = 2_000_010;
 
@@ -27,8 +26,6 @@ impl Limit {
         };
         let policy = &mut config.get_blocks_regulation;
         policy.node_active_requests = if self == Self::NodeActive { 1 } else { 8 };
-        policy.peer_pending_requests = 2;
-        policy.node_pending_requests = 3;
         config
     }
 }
@@ -54,8 +51,6 @@ pub(super) enum Action {
     QueueTerminal { request: usize },
     BeginWrite { session: usize },
     EndWrite { session: usize, outcome: WriteEnd },
-    RetainInput { peer: usize, input: usize },
-    DropInput { input: usize },
     Reconnect { peer: usize },
     Advance { millis: u64 },
 }
@@ -74,15 +69,12 @@ pub(super) enum Outcome {
     Admission(Option<Limit>),
     Started(bool),
     Queued(bool),
-    Retained(bool),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Snapshot {
     pub(super) node_active: usize,
     pub(super) session_active: Vec<usize>,
-    pub(super) node_pending: usize,
-    pub(super) session_pending: Vec<usize>,
 }
 
 /// One semantic result and its live resource accounting at a replay checkpoint.

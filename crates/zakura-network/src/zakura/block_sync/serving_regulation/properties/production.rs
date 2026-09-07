@@ -30,7 +30,6 @@ struct Session {
     writing: Option<PendingWrite>,
     // Counter handles keep observations alive without retaining work ownership.
     active: SlotBudget,
-    pending: SlotBudget,
 }
 
 pub(super) struct Production {
@@ -38,7 +37,6 @@ pub(super) struct Production {
     current_sessions: [usize; 2],
     sessions: Vec<Session>,
     requests: [Option<RequestOwners>; REQUEST_SLOTS],
-    inputs: [Option<(usize, PendingGetBlocksRequest)>; INPUT_SLOTS],
     fixture: Arc<block::Block>,
 }
 
@@ -51,7 +49,6 @@ impl Production {
             current_sessions: [0, 1],
             sessions: Vec::new(),
             requests: std::array::from_fn(|_| None),
-            inputs: std::array::from_fn(|_| None),
             fixture,
         };
         production.connect(0);
@@ -75,7 +72,6 @@ impl Production {
             receiver,
             writing: None,
             active: account.resources.active.clone(),
-            pending: account.resources.pending.clone(),
             account: Some(account),
         });
     }
@@ -198,23 +194,6 @@ impl Production {
                 }
                 Outcome::Done
             }
-            Action::RetainInput { peer, input } => {
-                let session = self.current_sessions[peer];
-                let result = self.sessions[session]
-                    .account
-                    .as_ref()
-                    .unwrap()
-                    .try_retain_input(block::Height(1), 1);
-                let admitted = result.is_ok();
-                if let Ok(request) = result {
-                    self.inputs[input] = Some((session, request));
-                }
-                Outcome::Retained(admitted)
-            }
-            Action::DropInput { input } => {
-                drop(self.inputs[input].take());
-                Outcome::Done
-            }
             Action::Reconnect { peer } => {
                 let old = self.current_sessions[peer];
                 self.sessions[old].sender.cancel_token().cancel();
@@ -226,11 +205,6 @@ impl Production {
                 {
                     drop(owners.attempt.take());
                     drop(owners.permit.take());
-                }
-                for input in &mut self.inputs {
-                    if input.as_ref().is_some_and(|(session, _)| *session == old) {
-                        drop(input.take());
-                    }
                 }
                 drop(self.sessions[old].account.take());
                 self.connect(peer);
@@ -262,12 +236,6 @@ impl Production {
                 .sessions
                 .iter()
                 .map(|session| session.active.reserved())
-                .collect(),
-            node_pending: node.node_pending.reserved(),
-            session_pending: self
-                .sessions
-                .iter()
-                .map(|session| session.pending.reserved())
                 .collect(),
         }
     }

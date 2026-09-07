@@ -29,7 +29,6 @@ pub(super) struct Model {
     current_sessions: [usize; 2],
     sessions: Vec<Session>,
     requests: [Option<Request>; REQUEST_SLOTS],
-    inputs: [Option<usize>; INPUT_SLOTS],
     block_payload_bytes: u64,
 }
 
@@ -40,7 +39,6 @@ impl Model {
             current_sessions: [0, 1],
             sessions: vec![Session::default(), Session::default()],
             requests: std::array::from_fn(|_| None),
-            inputs: [None; INPUT_SLOTS],
             block_payload_bytes,
         }
     }
@@ -58,9 +56,6 @@ impl Model {
             for request in 0..REQUEST_SLOTS {
                 actions.push(Action::Admit { peer, request });
             }
-            for input in 0..INPUT_SLOTS {
-                actions.push(Action::RetainInput { peer, input });
-            }
         }
         for request in 0..REQUEST_SLOTS {
             actions.extend([
@@ -72,9 +67,6 @@ impl Model {
                 Action::QueueBlock { request },
                 Action::QueueTerminal { request },
             ]);
-        }
-        for input in 0..INPUT_SLOTS {
-            actions.push(Action::DropInput { input });
         }
         for session in 0..self.sessions.len() {
             actions.push(Action::BeginWrite { session });
@@ -116,10 +108,6 @@ impl Model {
                 .sessions
                 .get(session)
                 .is_some_and(|state| state.writing.is_some()),
-            Action::RetainInput { peer, input } => {
-                peer < 2 && self.inputs.get(input).is_some_and(Option::is_none)
-            }
-            Action::DropInput { input } => self.inputs.get(input).is_some_and(Option::is_some),
             Action::Reconnect { peer } => peer < 2 && self.sessions.len() < 8,
             Action::Advance { millis } => millis <= 10_000,
         }
@@ -212,16 +200,6 @@ impl Model {
                 let request = self.sessions[session].writing.take().unwrap();
                 self.requests[request].as_mut().unwrap().frame_owners -= 1;
             }
-            Action::RetainInput { peer, input } => {
-                let session = self.current_sessions[peer];
-                let state = self.snapshot();
-                let admitted = state.node_pending < 3 && state.session_pending[session] < 2;
-                if admitted {
-                    self.inputs[input] = Some(session);
-                }
-                outcome = Outcome::Retained(admitted);
-            }
-            Action::DropInput { input } => self.inputs[input] = None,
             Action::Reconnect { peer } => {
                 let old = self.current_sessions[peer];
                 for request in self
@@ -231,11 +209,6 @@ impl Model {
                     .filter(|request| request.session == old)
                 {
                     request.ledger = false;
-                }
-                for input in &mut self.inputs {
-                    if *input == Some(old) {
-                        *input = None;
-                    }
                 }
                 self.current_sessions[peer] = self.sessions.len();
                 self.sessions.push(Session::default());
@@ -260,17 +233,11 @@ impl Model {
         let mut state = Snapshot {
             node_active: 0,
             session_active: vec![0; self.sessions.len()],
-            node_pending: 0,
-            session_pending: vec![0; self.sessions.len()],
         };
         for request in self.requests.iter().flatten() {
             state.session_active[request.session] += 1;
         }
-        for session in self.inputs.iter().flatten() {
-            state.session_pending[*session] += 1;
-        }
         state.node_active = state.session_active.iter().sum();
-        state.node_pending = state.session_pending.iter().sum();
         state
     }
 
@@ -283,7 +250,6 @@ impl Model {
                     action,
                     Action::DropLedger { .. }
                         | Action::DropQueryLease { .. }
-                        | Action::DropInput { .. }
                         | Action::BeginWrite { .. }
                         | Action::EndWrite {
                             outcome: WriteEnd::Complete,

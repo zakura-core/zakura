@@ -87,34 +87,3 @@ async fn default_producer_limits_hold_until_writes_finish() {
     drop(frames);
     assert_eq!(regulator.snapshot().node_active, 0);
 }
-
-#[tokio::test(start_paused = true)]
-async fn default_pending_bounds_hold_sixty_four_per_session_and_one_thousand_twenty_four_total() {
-    let regulator = defaults();
-    let peers: Vec<_> = (0..17).map(|id| session(&regulator, id)).collect();
-    let mut inputs = Vec::new();
-    for peer in &peers[..16] {
-        for _ in 0..64 {
-            inputs.push(peer.try_retain_input(block::Height(1), 1).unwrap());
-        }
-        assert_eq!(
-            peer.try_retain_input(block::Height(1), 1).unwrap_err().kind,
-            PendingBoundKind::Session
-        );
-    }
-    assert_eq!(regulator.snapshot().node_pending, 1024);
-    assert_eq!(
-        peers[16]
-            .try_retain_input(block::Height(1), 1)
-            .unwrap_err()
-            .kind,
-        PendingBoundKind::Node
-    );
-    assert_eq!(regulator.snapshot().session_pending, 1024);
-    inputs.pop();
-    inputs.push(peers[16].try_retain_input(block::Height(1), 1).unwrap());
-    assert_eq!(regulator.snapshot().node_pending, 1024);
-    drop(inputs);
-    assert_eq!(regulator.snapshot().node_pending, 0);
-    assert_eq!(regulator.snapshot().session_pending, 0);
-}

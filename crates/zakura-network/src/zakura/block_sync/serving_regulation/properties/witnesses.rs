@@ -11,7 +11,7 @@ fn every_admission_bound_blocks_then_recovers() {
             0
         };
         let mut scenario = Scenario {
-            version: 2,
+            version: 3,
             limit,
             actions: vec![
                 Action::Admit {
@@ -64,42 +64,15 @@ fn replay_preserves_writing_ownership_across_session_replacement() {
 #[test]
 fn replay_rejects_inapplicable_actions_and_unknown_versions() {
     let mut scenario = Scenario {
-        version: 2,
+        version: 3,
         limit: Limit::NodeActive,
         actions: vec![Action::Commit { request: 0 }],
     };
     assert!(replay(&scenario).unwrap_err().contains("invalid action"));
-    scenario.version = 3;
+    scenario.version = 4;
     assert!(replay(&scenario)
         .unwrap_err()
         .contains("unsupported scenario"));
-}
-
-#[test]
-fn pending_bounds_include_both_sessions_and_recover_after_release() {
-    use Action::*;
-    let actions = vec![
-        RetainInput { peer: 0, input: 0 },
-        RetainInput { peer: 0, input: 1 },
-        RetainInput { peer: 0, input: 2 },
-        RetainInput { peer: 1, input: 2 },
-        RetainInput { peer: 1, input: 3 },
-        DropInput { input: 0 },
-        RetainInput { peer: 1, input: 3 },
-        DropInput { input: 1 },
-        DropInput { input: 2 },
-        DropInput { input: 3 },
-    ];
-    let scenario = Scenario {
-        version: 2,
-        limit: Limit::NodeActive,
-        actions,
-    };
-    let observations = replay(&scenario).unwrap();
-    assert_eq!(observations[2].outcome, Outcome::Retained(false));
-    assert_eq!(observations[4].outcome, Outcome::Retained(false));
-    assert_eq!(observations[6].outcome, Outcome::Retained(true));
-    checked_replay(&scenario).unwrap();
 }
 
 #[test]
@@ -136,7 +109,7 @@ fn queue_failure_keeps_ownership_and_query_leases_cannot_execute_twice() {
     }
     actions.extend(model.cleanup());
     let scenario = Scenario {
-        version: 2,
+        version: 3,
         limit: Limit::PeerActive,
         actions,
     };
@@ -176,41 +149,10 @@ proptest! {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn pending_wait_accounts_for_its_partial_session_reservation() {
-    use super::super::GetBlocksServingRegulator;
-    use crate::zakura::ZakuraPeerId;
-    use futures::FutureExt;
-    use zakura_chain::block::Height;
-
-    let regulator = GetBlocksServingRegulator::new(Limit::NodeActive.config());
-    let first = regulator.session(ZakuraPeerId::new(vec![1; 32]).unwrap(), 0);
-    let second = regulator.session(ZakuraPeerId::new(vec![2; 32]).unwrap(), 1);
-    let first_input = first.try_retain_input(Height(1), 1).unwrap();
-    let other_input = first.try_retain_input(Height(2), 1).unwrap();
-    let second_input = second.try_retain_input(Height(3), 1).unwrap();
-    let mut waiting = Box::pin(second.retain_input(Height(4), 1));
-    assert!(waiting.as_mut().now_or_never().is_none());
-    assert_eq!(regulator.snapshot().node_pending, 3);
-    assert_eq!(regulator.snapshot().session_pending, 4);
-    drop(waiting);
-    assert_eq!(regulator.snapshot().session_pending, 3);
-
-    let mut waiting = Box::pin(second.retain_input(Height(4), 1));
-    assert!(waiting.as_mut().now_or_never().is_none());
-    drop(first_input);
-    let admitted = waiting.as_mut().now_or_never().unwrap();
-    assert_eq!(regulator.snapshot().node_pending, 3);
-    assert_eq!(regulator.snapshot().session_pending, 3);
-    drop((admitted, other_input, second_input));
-    assert_eq!(regulator.snapshot().node_pending, 0);
-    assert_eq!(regulator.snapshot().session_pending, 0);
-}
-
 #[test]
 fn concrete_replay_accepts_times_outside_the_generation_distribution() {
     let scenario = Scenario {
-        version: 2,
+        version: 3,
         limit: Limit::NodeActive,
         actions: vec![Action::Advance { millis: 37 }],
     };

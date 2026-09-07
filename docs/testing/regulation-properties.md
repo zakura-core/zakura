@@ -31,7 +31,7 @@ concrete JSON scenario and retain Proptest's normal seed-based reproduction.
 | --- | --- | --- |
 | Primitive | Concurrency slots | Owned permit count |
 | Shared requests | Finite-request admission, rollback, execution and response owners | Independent per-session and node ownership model |
-| Serving | Admission, query lifecycle, encoder, transport queue | Node and session producer/pending counts |
+| Serving | Admission, query lifecycle, encoder, transport queue | Node and session producer counts |
 | Reactor | Peer routine and response queue | Response prefix, terminal, producer lifetime |
 | Driver | Query claim, timeout, cancellation, result handoff | Underlying query and result retain capacity |
 | State | Range response limits | Actual returned body bytes stay within the cap |
@@ -70,7 +70,7 @@ wire bound, not an outstanding-byte budget.
 
 Actions cover provisional admission, commit, query claim and cloning, ledger
 closure, frame queueing, pending writes, write completion/failure/cancellation,
-pending input, reconnects, and time advancement. Only reference-model-enabled
+reconnects, and time advancement. Only reference-model-enabled
 actions are generated. A concrete replay rejects an inapplicable action instead
 of silently skipping it. Cleanup uses the same actions to finish every owner.
 
@@ -116,10 +116,17 @@ responses without advancing time, proving admission does not wait for a refill.
 These tests exercise resource counts without allocating maximum-size block bodies;
 real response encoding and write tests cover the framing boundary separately.
 
+The service tests in the base PR hold one request at admission and verify that
+later frames stay unread until capacity returns. A local timeout closes the
+paused session without scoring the peer. A real QUIC test fills the application
+receive channel and stream window, checks that response writes and a sibling
+stream still progress, then drains the channel to verify recovery and cancellation.
+
 ## Replay and reuse
 
-JSON version 2 records the producer-ownership contract. Version 1 described the
-removed byte budgets and is rejected. The committed reconnect scenario is a
+JSON version 3 records the producer-ownership contract without delayed-input
+queues. Versions 1 and 2 described removed byte budgets or pending-input accounting
+and are rejected. The committed reconnect scenario is a
 human-readable example. Replay observations include per-session attribution, so
 matching aggregate totals cannot hide an ownership error.
 

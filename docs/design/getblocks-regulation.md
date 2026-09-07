@@ -101,3 +101,20 @@ full mainnet sync time. Run the identical test on main and the candidate:
 ZAKURA_COMPARISON_READERS=1 cargo test --locked -p zakura-network --lib getblocks_serving_comparison -- --ignored --nocapture
 ZAKURA_COMPARISON_READERS=4 cargo test --locked -p zakura-network --lib getblocks_serving_comparison -- --ignored --nocapture
 ```
+
+On 2026-09-06, the identical comparison was run on main `58358fa28` and candidate
+`524c34769`, with debug builds and eight Tokio workers on the same Mac. Three runs
+per case alternated main/candidate order. Every reader reached the target, with
+128 serving requests per reader and no retries in these runs.
+
+| Downloading nodes | Main elapsed ms, median (range) | Candidate elapsed ms, median (range) |
+| --- | --- | --- |
+| 1 | 238.6 (236.7–243.6) | 235.4 (234.6–235.6) |
+| 4 | 387.5 (378.6–388.7) | 387.4 (386.1–391.7) |
+
+The existing harness uses a 10,000-message/s transport ceiling, mock storage and
+apply, and loopback links. These short runs show comparable performance in that
+setup; they do not establish production-default throughput, disk concurrency
+performance, or whole-sync parity. The separate slow-reader test deliberately
+reduces QUIC windows so one bounded frame reaches backpressure, and verifies
+that another stream progresses and draining resumes the blocked writer.

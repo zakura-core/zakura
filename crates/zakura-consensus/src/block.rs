@@ -370,6 +370,20 @@ where
                     .record(solved_header_start.elapsed().as_secs_f64());
             }
 
+            // Background template preparation repeats whenever a miner polls, and each poll
+            // carries a fresh random work ID. Reuse the candidate an earlier poll prepared
+            // when the template content is unchanged, so unchanged polling does not re-run
+            // script verification, signature batches and proposal validation for a block the
+            // node has already prepared. The new work ID becomes another alias for it.
+            //
+            // The response only reaches a debug log, so skipping proposal validation here
+            // loses no verdict: a solved block is checked in full on the `CommitMined` path.
+            if request.prepared_candidate_source() == Some(PreparedCandidateSource::ServerTemplate)
+                && prepared_candidates.reuse_server_candidate(&block, request.work_id(), &network)
+            {
+                return Ok(hash);
+            }
+
             // > The block data MUST be validated and checked against the server's usual
             // > acceptance rules (excluding the check for a valid proof-of-work).
             // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>

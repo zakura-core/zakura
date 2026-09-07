@@ -208,6 +208,56 @@ impl PreparedCandidateCache {
         None
     }
 
+    /// Adds `work_id` to an equivalent server candidate that is already prepared, and reports
+    /// whether one was found.
+    ///
+    /// Every `getblocktemplate` response carries a fresh random work ID, so a miner polling an
+    /// unchanged tip and mempool asks the verifier to prepare the same transactions again under
+    /// a new ID. The fingerprint ignores the fields a miner is free to change, so an unchanged
+    /// template matches the candidate an earlier poll already prepared, and the caller can skip
+    /// re-verifying it.
+    ///
+    /// Only the server partition is reused. A client proposal's response is a validity verdict
+    /// the client acts on, so it keeps its own verification.
+    pub(super) fn reuse_server_candidate(
+        &self,
+        block: &Block,
+        work_id: Option<&str>,
+        network: &Network,
+    ) -> bool {
+        let source = PreparedCandidateSource::ServerTemplate;
+        let limits = source.limits();
+
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.prune_expired();
+
+        // Deriving the fingerprint costs a full block serialization, so skip it when the
+        // partition holds no entry that could match.
+        if inner.partition(source).entries.is_empty() {
+            return false;
+        }
+
+        let fingerprint = candidate_fingerprint(block, network);
+        let partition = inner.partition(source);
+        let Some(entry_id) = partition
+            .find_candidate(fingerprint, block)
+            .map(|entry| entry.id)
+        else {
+            return false;
+        };
+
+        partition.touch_candidate(entry_id);
+        if let Some(work_id) = work_id {
+            partition.insert_work_id(work_id, entry_id, source, limits);
+        }
+
+        metrics::counter!("mining.prepared_cache.reuses").increment(1);
+        true
+    }
+
     pub(super) fn insert(
         &self,
         block: &Block,
@@ -396,6 +446,20 @@ impl Partition {
             expires_at: Instant::now() + ENTRY_TTL,
         });
         Some(id)
+    }
+
+    /// Extends an entry's lifetime and makes it the most recently used, without replacing the
+    /// prepared candidate it already holds.
+    fn touch_candidate(&mut self, entry_id: EntryId) {
+        let Some(index) = self.entries.iter().position(|entry| entry.id == entry_id) else {
+            return;
+        };
+        let mut entry = self
+            .entries
+            .remove(index)
+            .expect("entry exists because its index came from the same deque");
+        entry.expires_at = Instant::now() + ENTRY_TTL;
+        self.entries.push_back(entry);
     }
 
     fn refresh_candidate(

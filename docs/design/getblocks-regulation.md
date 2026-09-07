@@ -12,10 +12,10 @@ every message to select every filter.
 
 | Category | Current GetBlocks path |
 | --- | --- |
-| Safe | The codec bounds the start height and request count separately. Serving enforces the advertised response count and body-byte cap, including the encoded framing allowance. |
+| Safe | The codec bounds the request count and checks that the whole requested range fits within the supported heights, on both send and receive. Serving enforces the advertised response count and body-byte cap, including the encoded framing allowance. |
 | Authorized | Serving uses the authenticated session after its initial Status. Reservation checks belong to the Block and terminal responses on the requesting side. |
 | Useful | GetBlocks has no Relevant predicate in the draft. Stale session work is cancelled before dispatch. Completed requests may be legitimate retries; the server does not infer what the requester has stored. |
-| Budgeted | A session owns one response producer. Shared concurrency permits bound state queries, retained results, and writes; each routine holds at most one waiting request. |
+| Budgeted | An authenticated peer owns one response producer across its sessions. Shared concurrency permits bound state queries, retained results, and writes; each routine holds at most one waiting request. |
 
 This implements serving ownership, not complete conformance to the draft. The
 complete filter inventory and its full reservation rules are not introduced here. In particular, the draft prohibits overlapping live GetBlocks

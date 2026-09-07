@@ -5,6 +5,8 @@
 //! when capacity is unavailable. Those decisions stay with each service.
 
 mod outstanding_bytes;
+#[allow(dead_code)]
+// Optional cadence primitive; GetBlocks admission uses completion-based capacity.
 mod rate;
 mod slots;
 

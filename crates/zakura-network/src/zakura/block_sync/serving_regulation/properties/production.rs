@@ -136,7 +136,13 @@ impl Production {
                 let result = if matches!(action, Action::QueueBlock { .. }) {
                     sender.try_send_regulated_block(self.fixture.clone(), permit)
                 } else if owners.sent_block {
-                    sender.try_send_regulated_blocks_done(block::Height(1), 1, permit)
+                    sender.try_send_regulated_message(
+                        BlockSyncMessage::BlocksDone {
+                            start_height: block::Height(1),
+                            returned: 1,
+                        },
+                        permit,
+                    )
                 } else {
                     sender.try_send_regulated_message(
                         BlockSyncMessage::RangeUnavailable {

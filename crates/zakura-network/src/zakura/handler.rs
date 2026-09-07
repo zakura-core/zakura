@@ -148,8 +148,9 @@ pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(300);
 /// resolution (milliseconds) so a genuine race keeps the transcript-tiebreak
 /// winner instead of flapping.
 pub const ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(5);
-/// QUIC stream receive window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
+/// A paused stream may consume at most half the connection receive window,
+/// leaving credit for another service stream.
+pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
 /// QUIC connection receive window used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 /// QUIC send window used by Zakura endpoints.
@@ -4025,20 +4026,12 @@ async fn persistent_stream_worker(
     let context = Arc::new(context);
     let stream_kind = prelude.stream_kind;
 
-    // The inbound reader runs in its own task, not as a `select!` branch racing
-    // the outbound writer below. `read_frame` is NOT cancellation-safe: it
-    // consumes the fixed frame header, then awaits the (multi-packet) payload. If
-    // it shared this `select!` with the outbound arm, an outbound frame becoming
-    // ready mid-read would drop the `read_frame` future and discard the header
-    // bytes it already consumed, desyncing the stream forever -- the next read
-    // decodes body bytes as a header, yielding a garbage multi-GiB `payload_len`,
-    // an `OversizeFrame` error, and a stream reset. Heavy concurrent body-sync
-    // (inbound bodies + outbound `GetBlocks`) made this fire constantly. Reading
-    // in a dedicated task removes the write/read race; the main loop only ever
-    // *receives* fully-read frames over a channel, which is cancellation-safe.
-    let (frame_tx, mut frame_rx) = mpsc::channel::<Result<Frame, ZakuraHandlerError>>(1);
+    // Reading and forwarding may both block. Keep them independent of writes:
+    // admission can pause reads while a response must finish to release capacity.
+    // A dedicated reader also preserves partial frame reads across outbound writes.
+    let (error_tx, mut error_rx) = mpsc::channel::<ZakuraHandlerError>(1);
     let reader_context = Arc::clone(&context);
-    let reader = tokio::spawn(async move {
+    let reader = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
         let mut recv = recv;
         loop {
             let frame = tokio::select! {
@@ -4057,20 +4050,31 @@ async fn persistent_stream_worker(
                     None,
                 ) => frame,
             };
-            // Admit (rate/oversize) at ingress, the instant a frame is read, so
-            // throttling never trails behind the main loop draining queued
-            // outbound writes or forwarding an earlier frame to a service that
-            // might disconnect first. The main loop only ever receives frames
-            // that already cleared admission, plus terminal errors it maps to a
-            // reset code (it owns the send half). Admission is charged exactly
-            // once, here.
-            let message = match frame {
+            // Charge ingress admission once, before forwarding to the service.
+            // A full service channel stops this reader from granting QUIC credit.
+            let error = match frame {
                 Ok(frame) => {
                     let _ = reader_context.freshness_tx.send(Instant::now());
                     match admit_inbound_message(frame.payload.len(), &reader_context, stream_kind) {
-                        InboundMessageAdmission::Admit => Ok(frame),
-                        InboundMessageAdmission::Oversize => Err(ZakuraHandlerError::Oversize),
-                        InboundMessageAdmission::Throttled => Err(ZakuraHandlerError::RateLimited),
+                        InboundMessageAdmission::Admit => {
+                            let forwarded = tokio::select! {
+                                biased;
+                                _ = reader_context.connection_token.cancelled() => break,
+                                _ = reader_context.stream_token.cancelled() => break,
+                                result = inbound_tx.send(frame) => result,
+                            };
+                            if forwarded.is_err() {
+                                break;
+                            }
+                            metrics::gauge!(
+                                "zakura.p2p.queue.depth",
+                                "stream_kind" => stream_kind_label(stream_kind),
+                            )
+                            .set(queue_depth_limit.saturating_sub(inbound_tx.capacity()) as f64);
+                            continue;
+                        }
+                        InboundMessageAdmission::Oversize => ZakuraHandlerError::Oversize,
+                        InboundMessageAdmission::Throttled => ZakuraHandlerError::RateLimited,
                     }
                 }
                 Err(error) => {
@@ -4089,7 +4093,7 @@ async fn persistent_stream_worker(
                             Some(max_frame_bytes),
                         );
                     }
-                    Err(error)
+                    error
                 }
             };
             // Any error is terminal. `Closed` is a clean peer-initiated close;
@@ -4098,19 +4102,15 @@ async fn persistent_stream_worker(
             // map it to a reset code, then cancel the connection ourselves so
             // the disconnect is guaranteed even if the main loop tore the worker
             // down for a stopped outbound write before processing it.
-            let is_terminal = message.is_err();
-            let must_disconnect =
-                matches!(&message, Err(error) if !matches!(error, ZakuraHandlerError::Closed));
-            let forward_failed = frame_tx.send(message).await.is_err();
+            let must_disconnect = !matches!(error, ZakuraHandlerError::Closed);
+            let _ = error_tx.send(error).await;
             if must_disconnect {
                 reader_context.close_cause.record("ordered_read_error");
                 reader_context.connection_token.cancel();
             }
-            if forward_failed || is_terminal {
-                break;
-            }
+            break;
         }
-    });
+    }));
 
     let mut outbound_rx = Some(outbound_rx);
     loop {
@@ -4126,12 +4126,18 @@ async fn persistent_stream_worker(
             } => {
                 match outbound {
                     Some(queued_frame) => {
-                        if let Err(error) = write_queued_ordered_frame(
-                            &mut send,
-                            queued_frame,
-                            context.limits,
-                            context.outbound_frame_cap,
-                        ).await {
+                        let result = tokio::select! {
+                            biased;
+                            _ = context.connection_token.cancelled() => break,
+                            _ = context.stream_token.cancelled() => break,
+                            result = write_queued_ordered_frame(
+                                &mut send,
+                                queued_frame,
+                                context.limits,
+                                context.outbound_frame_cap,
+                            ) => result,
+                        };
+                        if let Err(error) = result {
                             if ordered_stream_write_was_stopped(&error) {
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");
                                 break;
@@ -4148,41 +4154,25 @@ async fn persistent_stream_worker(
                     }
                 }
             }
-            inbound = frame_rx.recv() => {
-                match inbound {
-                    // Frames here already cleared ingress admission in the reader.
-                    Some(Ok(frame)) => {
-                        if inbound_tx.send(frame).await.is_err() {
-                            debug!(
-                                stream_kind,
-                                "closing Zakura ordered stream after local service receiver dropped"
-                            );
-                            break;
-                        }
-                        metrics::gauge!(
-                            "zakura.p2p.queue.depth",
-                            "stream_kind" => stream_kind_label(stream_kind),
-                        )
-                        .set(queue_depth_limit.saturating_sub(inbound_tx.capacity()) as f64);
-                    }
-                    // The reader signalled an oversize message: disconnect it.
-                    Some(Err(ZakuraHandlerError::Oversize)) => {
+            error = error_rx.recv() => {
+                match error {
+                    Some(ZakuraHandlerError::Oversize) => {
                         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
                         context.close_cause.record("ordered_oversize");
                         context.connection_token.cancel();
                         break;
                     }
-                    Some(Err(ZakuraHandlerError::RateLimited)) => {
+                    Some(ZakuraHandlerError::RateLimited) => {
                         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
                         context.close_cause.record("ordered_rate_limited");
                         context.connection_token.cancel();
                         break;
                     }
-                    Some(Err(ZakuraHandlerError::Closed)) | None => {
+                    Some(ZakuraHandlerError::Closed) | None => {
                         break;
                     }
                     // The reader already emitted any oversize-desync diagnostic.
-                    Some(Err(error)) => {
+                    Some(error) => {
                         debug!(?error, "closing Zakura stream worker");
                         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                         context.close_cause.record("ordered_read_error");
@@ -4194,9 +4184,7 @@ async fn persistent_stream_worker(
         }
     }
 
-    // Stop the reader: it also observes the cancellation tokens, but abort
-    // guarantees a prompt exit on the paths that break without cancelling one
-    // (e.g. a peer that stopped receiving, or the local service receiver closing).
+    // Dropping the worker also aborts a reader blocked in application forwarding.
     reader.abort();
 }
 
@@ -7812,6 +7800,185 @@ mod tests {
             ordered_session_reopen_backoff(u32::MAX),
             ORDERED_STREAM_REOPEN_BACKOFF_CAP
         );
+    }
+
+    /// Exercise the production worker with a full application receive channel.
+    /// Sending must stay live, QUIC must eventually stop the bounded sender, and
+    /// another stream must retain connection credit until the application resumes.
+    #[tokio::test]
+    async fn paused_ordered_reads_preserve_writes_and_sibling_credit() -> Result<(), BoxError> {
+        const ALPN: &[u8] = b"/zakura/testkit/paused-reader/0";
+        const FRAME_COUNT: usize = 24;
+        let local = ZakuraLocalLimits::from_config(&Config::default());
+        let server = LocalEndpointFactory::with_transport_config(local.transport_config())
+            .endpoint(52)
+            .await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(2);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx: conn_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        // A small sender buffer makes write completion reflect receiver credit.
+        let mut client_transport = local.transport_config();
+        client_transport.send_window(64 * 1024);
+        let client = LocalEndpointFactory::with_transport_config(client_transport)
+            .endpoint(53)
+            .await?;
+        let address = router.endpoint().node_addr().initialized().await;
+        client.add_node_addr(address.clone())?;
+        let connection = timeout(Duration::from_secs(10), client.connect(address, ALPN)).await??;
+        let (mut sender, mut receiver) = connection.open_bi().await?;
+        let frame = Frame {
+            message_type: 3,
+            flags: 0,
+            payload: vec![0; 1024 * 1024],
+        };
+        let limits = test_connection_limits();
+        let stream = Stream {
+            kind: ZAKURA_STREAM_BLOCK_SYNC,
+            version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            frame_cap: 2_000_009,
+            capability: ZAKURA_CAP_BLOCK_SYNC,
+            mode: StreamMode::Ordered,
+        };
+        let encoded = frame.encode(stream.frame_cap)?;
+        // Opening a QUIC stream becomes visible to the receiver after the first bytes.
+        sender.write_all(&encoded[..1]).await?;
+        let (send, recv) = timeout(Duration::from_secs(5), stream_rx.recv())
+            .await?
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let stream_cancel = cancel.child_token();
+        let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
+        let context = StreamWorkerContext {
+            conn: ZakuraConnTrace::without_peer(1),
+            peer_id: test_peer(52),
+            stream_id: 1,
+            _permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            limits,
+            inbound_frame_cap: stream.frame_cap,
+            outbound_frame_cap: stream.frame_cap,
+            message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
+            connection_token: cancel.clone(),
+            stream_token: stream_cancel.clone(),
+            close_cause: CloseCause::new(),
+            freshness_tx,
+        };
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: stream.kind,
+            stream_version: stream.version,
+            request_id: None,
+            max_frame_bytes: stream.frame_cap,
+        };
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let (outbound_tx, outbound_rx) = worker_framed_channel(1);
+        let mut worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            persistent_stream_worker(send, recv, prelude, context, inbound_tx, outbound_rx, 1),
+        ));
+        let (progress_tx, mut progress_rx) = watch::channel(0);
+        let mut sending = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            sender.write_all(&encoded[1..]).await.unwrap();
+            progress_tx.send_replace(1);
+            for sent in 2..=FRAME_COUNT {
+                sender.write_all(&encoded).await.unwrap();
+                progress_tx.send_replace(sent);
+            }
+            sender
+        }));
+        timeout(Duration::from_secs(10), async {
+            while *progress_rx.borrow_and_update() < 16 {
+                progress_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the sender fills the default stream receive window");
+        assert!(
+            timeout(Duration::from_millis(100), &mut sending)
+                .await
+                .is_err(),
+            "QUIC must stop the sender while application reads are paused"
+        );
+        assert_eq!(inbound_rx.len(), 1);
+
+        let response = Frame {
+            message_type: 4,
+            flags: 0,
+            payload: vec![7; 9],
+        };
+        let producer = crate::zakura::regulation::SlotBudget::new(1).unwrap();
+        let ownership = Arc::new(producer.try_reserve().unwrap());
+        outbound_tx
+            .try_send_guarded(response.clone(), || {
+                crate::zakura::transport::FrameGuard::new(ownership)
+            })
+            .unwrap();
+        let written = timeout(
+            Duration::from_secs(2),
+            read_frame(
+                &mut receiver,
+                stream.frame_cap,
+                Duration::from_secs(2),
+                None,
+            ),
+        )
+        .await??;
+        assert_eq!(written, response);
+        assert_eq!(
+            producer.reserved(),
+            0,
+            "the response write releases serving capacity"
+        );
+
+        let (mut sibling_send, _sibling_recv) = connection.open_bi().await?;
+        timeout(Duration::from_secs(2), sibling_send.write_all(b"sibling")).await??;
+        let (_, mut sibling_read) = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await?
+            .unwrap();
+        let mut bytes = [0; 7];
+        timeout(Duration::from_secs(2), sibling_read.read_exact(&mut bytes)).await??;
+        assert_eq!(&bytes, b"sibling");
+
+        timeout(Duration::from_secs(10), async {
+            for _ in 0..FRAME_COUNT {
+                assert_eq!(inbound_rx.recv().await.unwrap(), frame);
+            }
+        })
+        .await
+        .expect("resuming application reads drains all frames in order");
+        let mut sender = timeout(Duration::from_secs(2), &mut sending).await??;
+        assert_eq!(*progress_rx.borrow(), FRAME_COUNT);
+        // Cancellation must also work while the reader waits on a full channel.
+        let empty = Frame {
+            message_type: 2,
+            flags: 0,
+            payload: vec![0; 9],
+        }
+        .encode(stream.frame_cap)?;
+        sender.write_all(&empty).await?;
+        sender.write_all(&empty).await?;
+        timeout(Duration::from_secs(2), async {
+            while inbound_rx.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        stream_cancel.cancel();
+        timeout(Duration::from_secs(2), &mut worker).await??;
+        assert!(
+            !cancel.is_cancelled(),
+            "local stream cancellation preserves the connection"
+        );
+        connection.close(0u32.into(), b"done");
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

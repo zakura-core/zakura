@@ -14104,7 +14104,6 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
         ..ZakuraBlockSyncConfig::default()
     };
     config.peer_limits.outbound_queue_depth = 16;
-    config.get_blocks_regulation.peer_pending_requests = 1;
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
@@ -14218,7 +14217,7 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
             }
         })
         .await
-        .expect("a full pending queue continues processing completions");
+        .expect("admission resumes without draining later requests");
         assert_ne!(previous, next);
         previous = next;
     }
@@ -14227,7 +14226,16 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
 }
 
 #[tokio::test]
-async fn delayed_serving_keeps_same_stream_block_download_live() {
+async fn delayed_serving_pauses_same_stream_download_until_capacity_returns() {
+    check_delayed_serving(true).await;
+}
+
+#[tokio::test]
+async fn delayed_serving_timeout_closes_locally_without_scoring_peer() {
+    check_delayed_serving(false).await;
+}
+
+async fn check_delayed_serving(resume: bool) {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = ZakuraBlockSyncConfig {
         max_blocks_per_response: 1,
@@ -14237,6 +14245,7 @@ async fn delayed_serving_keeps_same_stream_block_download_live() {
     };
     config.peer_limits.outbound_queue_depth = 16;
     config.get_blocks_regulation.node_active_requests = 1;
+    config.request_timeout = Duration::from_millis(250);
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
@@ -14291,37 +14300,73 @@ async fn delayed_serving_keeps_same_stream_block_download_live() {
     await_until(
         "the serving request waits behind node response ownership",
         Duration::from_secs(1),
-        || wiring.serving_regulator.snapshot().node_pending == 1,
+        || inbound_tx.capacity() == inbound_tx.max_capacity(),
     )
     .await
-    .expect("the serving request reaches its bounded pending state");
+    .expect("the routine consumes the current request before pausing");
 
     send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => {
-                assert_eq!(block.hash(), blocks[1].hash());
-                break;
+    let unexpected = tokio::time::timeout(Duration::from_millis(50), async {
+        loop {
+            match next_action(&mut actions).await {
+                BlockSyncAction::QueryNeededBlocks { .. } => {}
+                action => return action,
             }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            BlockSyncAction::QueryBlocksByHeightRange { .. } => {
-                panic!("serving work ran before the held node budget was released")
-            }
-            action => panic!("unexpected action while proving full-duplex progress: {action:?}"),
         }
+    })
+    .await;
+    assert!(
+        unexpected.is_err(),
+        "later responses wait at the same stream boundary: {unexpected:?}"
+    );
+    assert_eq!(inbound_tx.capacity(), inbound_tx.max_capacity() - 1);
+
+    if !resume {
+        let frame = BlockSyncMessage::Block(blocks[1].clone())
+            .encode_frame()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // The bounded channel fills, then closes when the local delay expires.
+            while inbound_tx.send(frame.clone()).await.is_ok() {}
+        })
+        .await
+        .expect("admission timeout drops the paused receiver");
+        while let Ok(action) = actions.try_recv() {
+            assert!(
+                matches!(action, BlockSyncAction::QueryNeededBlocks { .. }),
+                "local delay must neither dispatch work nor score the peer: {action:?}"
+            );
+        }
+        assert_eq!(wiring.serving_regulator.snapshot().node_active, 1);
+        drop(blocker);
+        assert_eq!(wiring.serving_regulator.snapshot().node_active, 0);
+        reactor_task.abort();
+        return;
     }
 
     drop(blocker);
-    let admitted = loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange {
-                peer, start, count, ..
-            } => break (peer, start, count),
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before delayed serving admission: {action:?}"),
+    let mut served = false;
+    let mut downloaded = false;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !served || !downloaded {
+            match next_action(&mut actions).await {
+                BlockSyncAction::QueryBlocksByHeightRange {
+                    peer, start, count, ..
+                } => {
+                    assert_eq!((peer, start, count), (peer_id.clone(), block::Height(1), 1));
+                    served = true;
+                }
+                BlockSyncAction::SubmitBlock { block, .. } => {
+                    assert_eq!(block.hash(), blocks[1].hash());
+                    downloaded = true;
+                }
+                BlockSyncAction::QueryNeededBlocks { .. } => {}
+                action => panic!("unexpected action after admission resumed: {action:?}"),
+            }
         }
-    };
-    assert_eq!(admitted, (peer_id, block::Height(1), 1));
+    })
+    .await
+    .expect("capacity release resumes serving and reading");
 
     reactor_task.abort();
 }
@@ -14365,9 +14410,10 @@ async fn stale_session_serving_attempt_rolls_back_without_state_work() {
     let stale_session = wiring
         .serving_regulator
         .session(peer_id.clone(), old_generation);
-    let stale_request = stale_session
-        .try_retain_input(block::Height(1), 1)
-        .expect("the stale request owns bounded pending input");
+    let stale_request = super::serving_regulation::GetBlocksRequest {
+        start_height: block::Height(1),
+        count: 1,
+    };
     let stale_attempt = stale_session
         .try_admit(1)
         .expect("the stale session provisionally owns serving work");
@@ -14404,7 +14450,7 @@ async fn stale_session_serving_attempt_rolls_back_without_state_work() {
         Duration::from_secs(1),
         || {
             let snapshot = wiring.serving_regulator.snapshot();
-            snapshot.node_active == 0 && snapshot.node_pending == 0
+            snapshot.node_active == 0
         },
     )
     .await
@@ -15301,9 +15347,7 @@ async fn closed_serving_queue_releases_request_ownership() {
         Duration::from_secs(1),
         || {
             let snapshot = wiring.serving_regulator.snapshot();
-            handle.peer_snapshot().outbound_peers == 0
-                && snapshot.node_active == 0
-                && snapshot.node_pending == 0
+            handle.peer_snapshot().outbound_peers == 0 && snapshot.node_active == 0
         },
     )
     .await

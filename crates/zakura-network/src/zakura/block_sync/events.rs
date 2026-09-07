@@ -458,7 +458,7 @@ pub(super) enum RoutineToReactor {
         /// Peer that requested the range.
         peer: ZakuraPeerId,
         /// Decoded fields and their bounded pending-input ownership.
-        request: super::serving_regulation::PendingGetBlocksRequest,
+        request: super::serving_regulation::GetBlocksRequest,
         /// Provisional resource ownership from the originating peer session.
         attempt: super::serving_regulation::AdmissionAttempt,
     },

@@ -16,13 +16,13 @@ every message to select every filter.
 | Safe | The codec bounds the request count and height range. Serving enforces the advertised response count and body-byte cap, including the encoded framing allowance. |
 | Authorized | Serving uses the authenticated session after its initial Status. Reservation checks belong to the Block and terminal responses on the requesting side. |
 | Useful | GetBlocks has no Relevant predicate in the draft. Stale session work is cancelled before dispatch. Completed requests may be legitimate retries; the server does not infer what the requester has stored. |
-| Budgeted | A session owns one response producer. Shared concurrency permits bound state queries, retained results, and writes; pending request state is bounded separately. |
+| Budgeted | A session owns one response producer. Shared concurrency permits bound state queries, retained results, and writes; each routine holds at most one waiting request. |
 
 This implements serving ownership, not complete conformance to the draft. The
 complete filter inventory and its full reservation rules are not introduced here. In particular, the draft prohibits overlapping live GetBlocks
 ranges, while the current sender has reassignment and late-response behavior
 that needs a coordinated requester/responder change before that rule can be
-enforced. Serial response production does not reject overlapping queued requests.
+enforced. Serial response production does not reject overlapping requests.
 
 ## Shared request admission
 
@@ -41,8 +41,8 @@ prevents an unclaimed execution from starting, while already running work drains
 
 The shared layer does not queue messages, select priorities, or define subscription
 lifetimes. Its callers select capacity pools explicitly; reusing the code does not
-make unrelated message policies share one pool. Existing GetBlocks pending-request
-staging remains separate while its ordered-stream behavior is reviewed.
+make unrelated message policies share one pool. The peer routine applies admission
+backpressure directly to its ordered stream.
 
 A test-only GetPeers adapter uses the production discovery codec and a one-frame
 Peers response to exercise the same admission and write-ownership path. This checks
@@ -68,25 +68,28 @@ releases capacity immediately, without a refill timer.
 
 | Resource | Default | Owner and release point |
 | --- | --- | --- |
-| Pending requests | 64 per session, 1,024 per node | Queue entry or admission task; released on admission or cancellation |
+| Waiting request | 1 per session | Held at admission; further stream reads pause |
 | Response producers | 1 per session, 64 per node | Ledger, query, result, and transport frames; released when the last owner drops |
 | Query response deadline | 8 seconds | Ends response delivery; underlying state work retains its producer until completion |
 | Terminal queue deadline | `request_timeout`, 8 seconds | Retains ownership while waiting; expiry closes the original session without a misconduct score |
-| Full pending queue deadline | `request_timeout`, 8 seconds | Closes the locally backpressured session without a misconduct score |
+| Admission delay deadline | `request_timeout`, 8 seconds | Closes the locally backpressured session without a misconduct score |
 
 The advertised inflight window still permits pipelined requests. One producer
 serializes their execution; it does not turn a waiting request into a protocol
 violation. Admission rolls back partial reservations before waiting. A slot
 waiter uses the permit assigned to it on its next admission attempt.
 
-Bounded request staging lets block responses received on the same ordered stream
-make progress while serving waits for a query or write. Once staging fills, the
-routine holds one additional decoded request and pauses reads. Thus there may be
-one blocked input per live session in addition to the 1,024 node queue slots.
-Completion handling, cancellation, and the queue deadline remain live. This
-staging is an implementation difference from the draft's instruction not to add a
-delayed-request queue; removing it requires preserving same-stream download
-progress, not merely removing a rate limiter.
+When admission waits, the routine holds the current request and stops reading
+further frames. Existing application queues and QUIC receive buffers provide
+backpressure; there is no additional delayed-request queue. Later responses on
+this ordered stream wait too. Outbound writes run independently of inbound
+forwarding so they can release serving capacity while reads are paused.
+
+Download deadlines exclude local admission pauses. The total grace between
+accepted blocks is at most `request_timeout`; a longer pause closes the local
+session without penalizing the peer. Delivery-rate samples still include the
+pause. QUIC uses a 16 MiB stream receive window within the existing 32 MiB
+connection window, leaving credit for another service when one stream pauses.
 
 Ledger closure and the one-time query claim share synchronized state. Closure
 before the claim prevents the read. A claimed read drains after timeout or

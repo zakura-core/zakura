@@ -19,13 +19,9 @@
 //! routine receives inbound traffic from its own `FramedRecv`. Its fill loop,
 //! matched-body path, and unmatched-body paths run in the same task.
 
-use std::{
-    collections::{BTreeMap, VecDeque},
-    num::NonZeroU64,
-    ops::Range,
-};
+use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
 
-use tokio::sync::{futures::Notified, mpsc, oneshot, watch};
+use tokio::sync::{futures::Notified, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::events::RoutineToReactor;
@@ -41,7 +37,7 @@ use super::{
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerView},
-    serving_regulation::{GetBlocksServingSession, PendingGetBlocksRequest, PendingInputBlocked},
+    serving_regulation::{GetBlocksRequest, GetBlocksServingSession},
     state::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
         ThroughputMeter,
@@ -325,21 +321,11 @@ pub(super) struct PeerRoutine {
     /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
     /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
-    /// Completion of the one serving admission task currently waiting to hand
-    /// a request to the reactor.
-    pending_serving: Option<oneshot::Receiver<ServingAdmissionOutcome>>,
-    /// Decoded serving requests held behind `pending_serving`.
-    ///
-    /// Each entry owns its session and node pending-input slots. Once those
-    /// hard bounds fill, the routine holds one decoded request and stops reading
-    /// until capacity returns rather than dropping it or growing this queue.
-    queued_serving: VecDeque<PendingGetBlocksRequest>,
-    /// One decoded request waiting for queue ownership. Further reads pause while
-    /// completions, cancellation, and the local backpressure deadline stay live.
-    pending_input: Option<
-        std::pin::Pin<Box<dyn std::future::Future<Output = PendingGetBlocksRequest> + Send + Sync>>,
-    >,
-    pending_input_deadline: Option<time::Instant>,
+    /// The current request waiting at admission. Further stream reads pause.
+    pending_serving: Option<PendingServing>,
+    /// Cumulative local admission delay since accepted block progress. Bounding
+    /// this grace prevents repeated requests from postponing download liveness forever.
+    admission_delay: Duration,
     serving: GetBlocksServingSession,
     sequencer_view: watch::Receiver<SequencerView>,
     /// Last `reset_epoch` that this routine processed.
@@ -424,9 +410,7 @@ impl PeerRoutine {
             sequencer_input_decoded_attributed_memory_bytes,
             routine_to_reactor,
             pending_serving: None,
-            queued_serving: VecDeque::new(),
-            pending_input: None,
-            pending_input_deadline: None,
+            admission_delay: Duration::ZERO,
             serving,
             sequencer_view,
             last_reset_epoch,
@@ -467,15 +451,17 @@ impl PeerRoutine {
             Notified::enable(available.as_mut());
 
             let retry_filter_deadline =
-                if self.session.outbound_capacity() > 0 && self.pending_input.is_none() {
+                if self.session.outbound_capacity() > 0 && self.pending_serving.is_none() {
                     self.try_fill().await
                 } else {
                     None
                 };
             let outbound_queue_has_capacity = self.session.outbound_capacity() > 0;
             let serving_pending = self.pending_serving.is_some();
-            let input_pending = self.pending_input.is_some();
-            let input_deadline = self.pending_input_deadline;
+            let serving_deadline = self
+                .pending_serving
+                .as_ref()
+                .map(|pending| pending.deadline);
             // Track the start of the current continuous outbound-full stretch so the
             // liveness check can bound the write-congestion grace: a peer that stopped
             // reading holds this full until `outbound_full_since` ages past
@@ -495,40 +481,24 @@ impl PeerRoutine {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
-                // Advance ready serving work before another inbound frame so a
-                // continuous request stream cannot starve the bounded queue.
-                outcome = async {
-                    self.pending_serving
-                        .as_mut()
-                        .expect("serving completion is polled only while pending")
-                        .await
-                }, if serving_pending => {
-                    self.pending_serving = None;
-                    match outcome {
-                        Ok(ServingAdmissionOutcome::Sent) => {
-                            if let Some(request) = self.queued_serving.pop_front() {
-                                self.start_serving_admission(request);
-                            }
-                        }
-                        Ok(ServingAdmissionOutcome::ChannelClosed) => return Ok(()),
-                        Ok(ServingAdmissionOutcome::Cancelled) | Err(_) => return Ok(()),
-                    }
-                }
-                request = async {
-                    self.pending_input.as_mut().expect("the input wait is enabled only while pending").await
-                }, if input_pending => {
-                    self.pending_input = None;
-                    self.pending_input_deadline = None;
-                    self.enqueue_serving_request(request);
-                }
                 () = async {
-                    time::sleep_until(input_deadline.expect("a pending input has a local deadline")).await;
-                }, if input_pending => {
+                    time::sleep_until(serving_deadline.expect("pending admission has a deadline")).await;
+                }, if serving_pending => {
                     metrics::counter!("sync.block.serving.backpressure_timeout").increment(1);
                     tracing::debug!(peer = ?self.peer, "closing locally backpressured block-sync session");
                     return Ok(());
                 }
-                frame = self.recv.recv(), if outbound_queue_has_capacity && !input_pending => {
+                outcome = async {
+                    self.pending_serving.as_mut()
+                        .expect("admission is polled only while pending")
+                        .future.as_mut().await
+                }, if serving_pending => {
+                    match outcome {
+                        ServingAdmissionOutcome::Sent => self.finish_serving_admission(),
+                        ServingAdmissionOutcome::ChannelClosed => return Ok(()),
+                    }
+                }
+                frame = self.recv.recv(), if outbound_queue_has_capacity && !serving_pending => {
                     match frame {
                         // Decode the frame and run the download/serving dispatch
                         // in this same task. A protocol reject propagates out so
@@ -549,7 +519,7 @@ impl PeerRoutine {
                         Err(_) => return Ok(()),
                     }
                 }
-                _ = &mut timeout, if !input_pending => self.handle_deadlines(Instant::now()).await?,
+                _ = &mut timeout, if !serving_pending => self.handle_deadlines(Instant::now()).await?,
                 _ = &mut capacity => {
                     self.trace_wake("budget_capacity");
                 }
@@ -653,64 +623,50 @@ impl PeerRoutine {
         Ok(())
     }
 
-    /// Start the one admission task that owns this request until the reactor
-    /// channel accepts it or the session ends.
-    fn start_serving_admission(&mut self, request: PendingGetBlocksRequest) {
+    /// Hold one request at admission without draining later frames from the stream.
+    fn retain_serving_request(&mut self, start_height: block::Height, count: u32) {
         assert!(
             self.pending_serving.is_none(),
-            "only one GetBlocks admission task may be active per peer routine"
+            "reads pause during admission"
         );
-        let (done, completion) = oneshot::channel();
-        self.pending_serving = Some(completion);
-        tokio::spawn(admit_and_forward_get_blocks(
-            self.serving.clone(),
-            self.routine_to_reactor.clone(),
-            self.peer.clone(),
-            request,
-            self.cancel.clone(),
-            done,
-        ));
-    }
-
-    /// Queue a request or install a bounded wait without suspending the routine.
-    fn retain_serving_request(&mut self, start_height: block::Height, count: u32) {
-        match self.serving.try_retain_input(start_height, count) {
-            Ok(request) => self.enqueue_serving_request(request),
-            Err(blocked) => {
-                self.record_pending_input_delay(&blocked);
-                let serving = self.serving.clone();
-                self.pending_input = Some(Box::pin(async move {
-                    serving.retain_input(start_height, count).await
-                }));
-                self.pending_input_deadline =
-                    Some(time::Instant::now() + self.config.request_timeout);
-            }
+        if self.window.block_liveness_deadline.is_none() {
+            self.admission_delay = Duration::ZERO;
         }
+        let remaining = self
+            .config
+            .request_timeout
+            .saturating_sub(self.admission_delay);
+        self.pending_serving = Some(PendingServing {
+            started: Instant::now(),
+            deadline: time::Instant::now() + remaining,
+            future: Box::pin(admit_and_forward_get_blocks(
+                self.serving.clone(),
+                self.routine_to_reactor.clone(),
+                self.peer.clone(),
+                GetBlocksRequest {
+                    start_height,
+                    count,
+                },
+            )),
+        });
     }
 
-    fn enqueue_serving_request(&mut self, request: PendingGetBlocksRequest) {
-        if self.pending_serving.is_some() {
-            self.queued_serving.push_back(request);
-        } else {
-            debug_assert!(
-                self.queued_serving.is_empty(),
-                "queued requests have an admission owner"
-            );
-            self.start_serving_admission(request);
+    /// Exclude our bounded read pause from download deadlines. Delivery samples
+    /// still include it, so the requesting window observes the slower service.
+    fn finish_serving_admission(&mut self) {
+        let pending = self
+            .pending_serving
+            .take()
+            .expect("admission just completed");
+        let elapsed = pending.started.elapsed();
+        self.admission_delay = self.admission_delay.saturating_add(elapsed);
+        for outstanding in &mut self.window.outstanding {
+            outstanding.deadline += elapsed;
         }
-    }
-
-    fn record_pending_input_delay(&self, blocked: &PendingInputBlocked) {
-        metrics::counter!(
-            "sync.block.serving.delayed",
-            "bound" => blocked.label()
-        )
-        .increment(1);
-        tracing::trace!(
-            peer = ?self.peer,
-            bound = blocked.label(),
-            "delaying GetBlocks at the pending-input bound"
-        );
+        if let Some(deadline) = &mut self.window.block_liveness_deadline {
+            *deadline += elapsed;
+        }
+        self.publish_outstanding();
     }
 
     async fn reserve_body_decode_permit(
@@ -1711,6 +1667,7 @@ impl PeerRoutine {
             Some(request_elapsed_ms),
         );
 
+        self.admission_delay = Duration::ZERO;
         self.window
             .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
         let mut completed = None;
@@ -1928,6 +1885,7 @@ impl PeerRoutine {
         // parked as "silent". Deliberately do NOT feed the BBR RTprop/BtlBw estimators —
         // the originating request is gone, so there's no trustworthy send timestamp and a
         // stale late-delivery interval would corrupt the rate/latency samples.
+        self.admission_delay = Duration::ZERO;
         self.window
             .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
         // Also credit the reliability EWMA: this late body offsets the failure its own
@@ -2204,6 +2162,7 @@ impl PeerRoutine {
     /// the budget again. Count it as block progress since a real wanted body did
     /// arrive on this peer's stream.
     fn accept_already_settled_height(&mut self, index: usize, height: block::Height) {
+        self.admission_delay = Duration::ZERO;
         self.window
             .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
         let completed = self
@@ -2343,27 +2302,26 @@ enum ServingAdmissionOutcome {
     Sent,
     /// The reactor channel closed and the admission rolled back.
     ChannelClosed,
-    /// The peer session ended and the admission rolled back.
-    Cancelled,
 }
 
-/// Wait only on the resource that blocked the preceding admission attempt.
-///
-/// Once every bound is reserved, the attempt remains owned while this waits for
-/// routine-channel capacity. Cancellation or channel closure drops the attempt
-/// and rolls back all provisional resources.
+struct PendingServing {
+    started: Instant,
+    deadline: time::Instant,
+    future:
+        std::pin::Pin<Box<dyn std::future::Future<Output = ServingAdmissionOutcome> + Send + Sync>>,
+}
+
+/// Cancellation drops this future with the routine, releasing provisional slots
+/// and removing any capacity waiter. No separate task or request queue is needed.
 async fn admit_and_forward_get_blocks(
     serving: GetBlocksServingSession,
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
     peer: ZakuraPeerId,
-    request: PendingGetBlocksRequest,
-    cancel: CancellationToken,
-    mut done: oneshot::Sender<ServingAdmissionOutcome>,
-) {
+    request: GetBlocksRequest,
+) -> ServingAdmissionOutcome {
     let mut acquired_slot = None;
     loop {
-        let admission = serving.try_admit_request(&request, acquired_slot.take());
-        let attempt = match admission {
+        let attempt = match serving.try_admit_request(&request, acquired_slot.take()) {
             Ok(attempt) => attempt,
             Err(blocked) => {
                 metrics::counter!(
@@ -2376,52 +2334,20 @@ async fn admit_and_forward_get_blocks(
                     bound = blocked.kind().label(),
                     "delaying GetBlocks at the work-admission bound"
                 );
-                let wait = blocked.wait();
-                tokio::pin!(wait);
-                tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => {
-                        let _ = done.send(ServingAdmissionOutcome::Cancelled);
-                        return;
-                    }
-                    () = done.closed() => return,
-                    slot = &mut wait => {
-                        acquired_slot = slot;
-                        continue;
-                    }
-                }
+                acquired_slot = blocked.wait().await;
+                continue;
             }
         };
-
-        let channel_slot = routine_to_reactor.clone().reserve_owned();
-        tokio::pin!(channel_slot);
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                drop(attempt);
-                let _ = done.send(ServingAdmissionOutcome::Cancelled);
-                return;
-            }
-            () = done.closed() => {
-                drop(attempt);
-                return;
-            }
-            slot = &mut channel_slot => {
-                let Ok(slot) = slot else {
-                    drop(attempt);
-                    let _ = done.send(ServingAdmissionOutcome::ChannelClosed);
-                    return;
-                };
-                debug_assert_eq!(attempt.peer(), &peer);
-                slot.send(RoutineToReactor::ServeGetBlocks {
-                    peer,
-                    request,
-                    attempt,
-                });
-                let _ = done.send(ServingAdmissionOutcome::Sent);
-                return;
-            }
-        }
+        let Ok(slot) = routine_to_reactor.clone().reserve_owned().await else {
+            return ServingAdmissionOutcome::ChannelClosed;
+        };
+        debug_assert_eq!(attempt.peer(), &peer);
+        slot.send(RoutineToReactor::ServeGetBlocks {
+            peer,
+            request,
+            attempt,
+        });
+        return ServingAdmissionOutcome::Sent;
     }
 }
 

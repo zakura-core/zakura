@@ -319,7 +319,7 @@ pub(super) struct PeerRoutine {
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
     /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
-    /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
+    /// Serving waits with reads paused; control notifications use `try_send`.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
     /// The current request waiting at admission. Further stream reads pause.
     pending_serving: Option<PendingServing>,

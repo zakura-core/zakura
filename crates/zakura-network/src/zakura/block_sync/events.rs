@@ -437,9 +437,8 @@ pub enum BlockSyncMisbehavior {
 /// Each per-peer pipe-routine ([`PeerRoutine`](super::peer_routine)) decodes its
 /// own frames and runs the download logic locally; it forwards only the concerns
 /// that need reactor-global state (serving, status advertisement, the producer,
-/// misbehavior aggregation) over this channel. The sender is `try_send`/bounded
-/// so a busy reactor never backpressures a routine's decode loop into stalling
-/// its transport (the only blocking routine send is the Sequencer `AcceptBody`).
+/// misbehavior aggregation) over this channel. Serving waits for channel capacity
+/// with stream reads paused; control notifications use bounded `try_send`.
 #[derive(Debug)]
 pub(super) enum RoutineToReactor {
     /// A routine received a `Status` and updated its own servable/caps + the
@@ -457,7 +456,7 @@ pub(super) enum RoutineToReactor {
     ServeGetBlocks {
         /// Peer that requested the range.
         peer: ZakuraPeerId,
-        /// Decoded fields and their bounded pending-input ownership.
+        /// Decoded fields of the admitted request.
         request: super::serving_regulation::GetBlocksRequest,
         /// Provisional resource ownership from the originating peer session.
         attempt: super::serving_regulation::AdmissionAttempt,

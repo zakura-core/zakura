@@ -43,6 +43,3 @@ pub use zakura_jsonl_trace::JsonlTracer;
 pub fn block_range_query_lease() -> super::BlockRangeQueryLease {
     super::block_sync::query_lease_for_test()
 }
-
-#[cfg(test)]
-pub(crate) use mock_blocksync::{SyntheticBlockCorpus, SyntheticBlockShape};

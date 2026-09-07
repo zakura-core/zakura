@@ -29,17 +29,10 @@ default = []
 # one.
 nu7-experimental = []
 
-# ZIP 234 "Network Sustainability Mechanism: Issuance Smoothing", the "smooth issuance
-# curve" option on the NU7 ballot: each block subsidy becomes a fixed fraction of the
-# money reserve, replacing halvings.
+# ZIP 234 "Network Sustainability Mechanism: Issuance Smoothing", with the
+# halving-preserving issuance choice. Halvings keep issuing new ZEC, and a bonus
+# reissues value removed from circulation.
 zip234 = []
-
-# ZIP 234's "preserve halvings" option on the NU7 ballot: halvings keep issuing new ZEC,
-# and a bonus reissues what has been removed from circulation.
-#
-# Cargo features are additive. This feature enables ZIP 234 and selects the
-# preserve-halvings calculation.
-zip234-halvings = ["zip234"]
 
 # Consensus-critical conversion from JSON to Zcash types
 json-conversion = [

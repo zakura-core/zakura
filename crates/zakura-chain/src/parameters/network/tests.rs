@@ -506,14 +506,13 @@ fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
     Ok(())
 }
 
-/// Checks the ZIP 234 issuance rules: the activation height, the smoothed curve, the
-/// preserve-halvings bonus, and the cumulative schedule the bonus is derived from.
+/// Checks the ZIP 234 activation height, reissuance bonus, and cumulative schedule.
 #[test]
 fn zip234_issuance() {
     use crate::{
         parameters::{
             subsidy::{cumulative_halving_subsidies_for_tests, zip234_start_height},
-            ZIP218_ENABLED, ZIP234_ENABLED, ZIP234_HALVINGS_ENABLED, ZIP234_SMOOTHING_ENABLED,
+            ZIP218_ENABLED, ZIP234_ENABLED,
         },
         value_balance::ValueBalance,
     };
@@ -542,17 +541,7 @@ fn zip234_issuance() {
 
     let start = zip234_start_height(&network).expect("NU7 is configured");
 
-    // # Consensus
-    //
-    // > the lowest height after the second halving following the activation of NU7
-    let nu7_halving = halving(Height(nu7), &network);
-    assert_eq!(halving(start, &network), nu7_halving + 2);
-    assert_eq!(
-        halving(start.previous().expect("start is above genesis"), &network),
-        nu7_halving + 1,
-        "the start height must be the lowest height of its halving era",
-    );
-    assert!(start > Height(nu7));
+    assert_eq!(start, Height(nu7));
 
     // `cumulative_halving_subsidies` walks halving and spacing boundaries rather than
     // every height, so check it against the sum it is standing in for.
@@ -569,10 +558,14 @@ fn zip234_issuance() {
             "cumulative subsidies must match the per-height sum at height {height}",
         );
     }
+    assert_eq!(
+        cumulative_halving_subsidies_for_tests(Height::MAX, &network)
+            .expect("the cumulative subsidy calculation handles the maximum height"),
+        Amount::<NonNegative>::try_from(MAX_MONEY).expect("valid amount"),
+    );
 
     if !ZIP234_ENABLED {
-        // Without either option the subsidy stays on the halving schedule, and passing a
-        // money reserve changes nothing.
+        // Without ZIP 234, the subsidy stays on the halving schedule.
         let reserve = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
         assert_eq!(
             block_subsidy(start, &network, Some(reserve)).expect("valid subsidy"),
@@ -581,8 +574,7 @@ fn zip234_issuance() {
         return;
     }
 
-    // Both options need the money reserve at a ZIP 234 height, and neither wants it
-    // below one.
+    // ZIP 234 needs the money reserve at its activation height.
     assert_eq!(
         block_subsidy(start, &network, None),
         Err(SubsidyError::MissingMoneyReserve),
@@ -594,57 +586,41 @@ fn zip234_issuance() {
     )
     .is_ok());
 
-    // A reserve of 10^12 zatoshi issues 412,600 at 75-second spacing. ZIP 218
-    // divides the fraction by three at 25-second spacing, rounded up to 137,534.
-    let reserve = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
-    let subsidy = block_subsidy(start, &network, Some(reserve)).expect("valid subsidy");
+    // A deficit of 10^12 zatoshi reissues 412,600 at 75-second spacing.
+    // ZIP 218 divides the fraction by three at 25-second spacing.
     let reissuance_subsidy = if ZIP218_ENABLED { 137_534 } else { 412_600 };
-
-    // `start` is the first height of a new halving era, so take the halving schedule's
-    // subsidy at `start` rather than at the height before it.
     let halving_subsidy = halving_block_subsidy(start, &network).expect("valid subsidy");
 
-    if ZIP234_SMOOTHING_ENABLED {
-        assert_eq!(
-            subsidy,
-            Amount::<NonNegative>::try_from(reissuance_subsidy).expect("valid amount")
-        );
+    // A chain on schedule has nothing to reissue.
+    let scheduled = cumulative_halving_subsidies_for_tests(
+        start.previous().expect("start is above genesis"),
+        &network,
+    )
+    .expect("valid cumulative subsidy");
+    let max_money = Amount::<NonNegative>::try_from(MAX_MONEY).expect("valid amount");
+    let on_schedule = (max_money - scheduled).expect("valid amount");
 
-        // The curve replaces halvings, so an empty reserve issues nothing.
-        assert_eq!(
-            block_subsidy(start, &network, Some(Amount::zero())).expect("valid subsidy"),
-            Amount::<NonNegative>::zero(),
-        );
-    }
+    assert_eq!(
+        block_subsidy(start, &network, Some(on_schedule)).expect("valid subsidy"),
+        halving_subsidy,
+    );
 
-    if ZIP234_HALVINGS_ENABLED {
-        // A chain that is exactly on schedule has nothing to reissue, so the subsidy is
-        // the halving schedule alone.
-        let scheduled = cumulative_halving_subsidies_for_tests(
-            start.previous().expect("start is above genesis"),
-            &network,
-        )
-        .expect("valid cumulative subsidy");
-        let max_money = Amount::<NonNegative>::try_from(MAX_MONEY).expect("valid amount");
-        let on_schedule = (max_money - scheduled).expect("valid amount");
+    // A chain behind schedule adds the spacing-adjusted reissuance subsidy.
+    let behind = (on_schedule
+        + Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount"))
+    .expect("valid amount");
+    assert_eq!(
+        block_subsidy(start, &network, Some(behind)).expect("valid subsidy"),
+        (halving_subsidy + Amount::try_from(reissuance_subsidy).expect("valid amount"))
+            .expect("valid amount"),
+    );
 
-        assert_eq!(
-            block_subsidy(start, &network, Some(on_schedule)).expect("valid subsidy"),
-            halving_subsidy,
-            "a chain on its own schedule reissues nothing",
-        );
-
-        // A chain 10^12 zatoshi behind its schedule adds the spacing-adjusted
-        // reissuance subsidy.
-        let behind = (on_schedule
-            + Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount"))
-        .expect("valid amount");
-        assert_eq!(
-            block_subsidy(start, &network, Some(behind)).expect("valid subsidy"),
-            (halving_subsidy + Amount::try_from(reissuance_subsidy).expect("valid amount"))
-                .expect("valid amount"),
-        );
-    }
+    // The subsidy cannot exceed the money reserve.
+    let final_zatoshi = Amount::<NonNegative>::try_from(1).expect("valid amount");
+    assert_eq!(
+        block_subsidy(start, &network, Some(final_zatoshi)).expect("valid subsidy"),
+        final_zatoshi,
+    );
 
     // The money reserve is what has never been issued plus everything removed from
     // circulation.

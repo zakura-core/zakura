@@ -256,6 +256,103 @@ async fn generated_local_seed_chain_passes_checkpoint_verification() -> Result<(
     Ok(())
 }
 
+/// A checkpoint after NU7 must wait for the activation block's parent state.
+#[cfg(feature = "zip234")]
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_sync_crosses_zip234_activation() -> Result<(), Report> {
+    use zakura_chain::{
+        block_info::BlockInfo,
+        parameters::testnet::{ConfiguredActivationHeights, ConfiguredCheckpoints, Parameters},
+    };
+
+    let _init_guard = zakura_test::init();
+    let block0 =
+        Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
+    let block1 = Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..])?;
+    let hash0 = block0.hash();
+    let hash1 = block1.hash();
+    let target_difficulty_limit = block0
+        .header
+        .difficulty_threshold
+        .to_expanded()
+        .expect("genesis difficulty threshold is valid");
+
+    let network = Parameters::build()
+        .with_genesis_hash(hash0)?
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (block::Height(0), hash0),
+            (block::Height(1), hash1),
+        ]))?
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(1),
+            ..Default::default()
+        })?
+        .clear_funding_streams()
+        .with_slow_start_interval(block::Height::MIN)
+        .with_disable_pow(true)
+        .disable_temporary_orchard_disabling_soft_fork()
+        .with_target_difficulty_limit(target_difficulty_limit)?
+        .to_network()?;
+
+    let parent_commit_gate = Arc::new(tokio::sync::Notify::new());
+    let (parent_committed, _) = tokio::sync::watch::channel(false);
+    let state_service = tower::service_fn(move |request: zs::Request| {
+        let parent_commit_gate = parent_commit_gate.clone();
+        let parent_committed = parent_committed.clone();
+        let mut parent_commit_receiver = parent_committed.subscribe();
+
+        async move {
+            match request {
+                zs::Request::CommitCheckpointVerifiedBlock(block)
+                    if block.height == block::Height(0) =>
+                {
+                    parent_commit_gate.notified().await;
+                    parent_committed.send_replace(true);
+                    Ok(zs::Response::Committed(block.hash))
+                }
+                zs::Request::AwaitBlockInfo(hash) => {
+                    assert_eq!(hash, hash0);
+                    parent_commit_gate.notify_one();
+                    while !*parent_commit_receiver.borrow() {
+                        parent_commit_receiver
+                            .changed()
+                            .await
+                            .expect("the test retains the commit sender");
+                    }
+                    Ok(zs::Response::BlockInfo(Some(BlockInfo::default())))
+                }
+                zs::Request::CommitCheckpointVerifiedBlock(block) => {
+                    assert_eq!(block.height, block::Height(1));
+                    assert!(*parent_commit_receiver.borrow());
+                    Ok(zs::Response::Committed(block.hash))
+                }
+                zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                _ => {
+                    unreachable!("checkpoint test uses only commit, parent info, and tip requests")
+                }
+            }
+        }
+    });
+    let mut verifier = CheckpointVerifier::from_list(
+        [(block::Height(0), hash0), (block::Height(1), hash1)],
+        &network,
+        None,
+        state_service,
+    )?;
+
+    let block0_result = verifier.ready().await?.call(block0);
+    let block1_result = verifier.ready().await?.call(block1);
+    let (block0_result, block1_result) = tokio::join!(
+        timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), block0_result),
+        timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), block1_result),
+    );
+
+    assert_eq!(block0_result??, hash0);
+    assert_eq!(block1_result??, hash1);
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn continuous_blockchain_no_restart() -> Result<(), Report> {
     for network in Network::iter() {

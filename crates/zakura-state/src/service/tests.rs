@@ -7,7 +7,7 @@
 use std::{env, sync::Arc, time::Duration};
 
 use tokio::{runtime::Runtime, time::timeout};
-use tower::{buffer::Buffer, util::BoxService};
+use tower::{buffer::Buffer, util::BoxService, ServiceExt};
 
 use zakura_chain::{
     block::{self, Block, CountedHeader, Height},
@@ -38,6 +38,43 @@ use crate::{
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn await_block_info_waits_for_checkpoint_commit() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let state = init_test(&network).await;
+    let block0: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("genesis block deserializes");
+    let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("block 1 deserializes");
+    let block1_hash = block1.hash();
+
+    let wait = tokio::spawn(state.clone().oneshot(Request::AwaitBlockInfo(block1_hash)));
+    tokio::task::yield_now().await;
+    assert!(
+        !wait.is_finished(),
+        "unknown block info must remain pending"
+    );
+
+    for block in [block0, block1] {
+        let response = state
+            .clone()
+            .oneshot(Request::CommitCheckpointVerifiedBlock(block.into()))
+            .await
+            .expect("checkpoint block commits");
+        assert!(matches!(response, Response::Committed(_)));
+    }
+
+    let response = timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("block info wait should finish")
+        .expect("block info task should not panic")
+        .expect("block info lookup should succeed");
+    assert!(matches!(response, Response::BlockInfo(Some(_))));
+}
 
 #[tokio::test]
 async fn descendant_arriving_after_a_local_parent_failure_completes_immediately() {

@@ -589,6 +589,15 @@ impl CheckpointVerifiedBlock {
         self.0.auth_data_root = Some(self.0.block.auth_data_root());
         self
     }
+
+    /// Returns this checkpoint block with its deferred pool balance change.
+    pub fn with_deferred_pool_balance_change(
+        mut self,
+        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    ) -> Self {
+        self.0.deferred_pool_balance_change = deferred_pool_balance_change;
+        self
+    }
 }
 
 impl SemanticallyVerifiedBlock {
@@ -1254,6 +1263,16 @@ pub enum Request {
     /// * [`Response::BlockInfo(None)`](Response::BlockInfo) otherwise.
     BlockInfo(HashOrHeight),
 
+    /// Looks up the [`BlockInfo`] for a block hash.
+    ///
+    /// This request waits until the block commits if needed.
+    ///
+    /// This request checks every non-finalized chain and the finalized state.
+    ///
+    /// Returns [`Response::BlockInfo(Some(block_info))`](Response::BlockInfo) after the block
+    /// commits. The response future remains pending while the block is unknown.
+    AwaitBlockInfo(block::Hash),
+
     /// Looks up a block by hash in any current chain or by height in the current best chain.
     ///
     /// Returns
@@ -1419,6 +1438,7 @@ impl Request {
             Request::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
             Request::Block(_) => "block",
             Request::BlockInfo(_) => "block_info",
+            Request::AwaitBlockInfo(_) => "await_block_info",
             Request::AnyChainBlock(_) => "any_chain_block",
             Request::BlockHeader(_) => "block_header",
             Request::FindBlockHashes { .. } => "find_block_hashes",
@@ -2064,6 +2084,8 @@ impl TryFrom<Request> for ReadRequest {
             Request::AwaitUtxo(_) => Err("ReadService does not track pending UTXOs. \
                      Manually convert the request to ReadRequest::AnyChainUtxo, \
                      and handle pending UTXOs"),
+
+            Request::AwaitBlockInfo(_) => Err("ReadService does not track pending block commits"),
 
             Request::KnownBlock(_) => Err("ReadService does not track queued blocks"),
 

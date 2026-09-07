@@ -330,8 +330,7 @@ where
 
             // ZIP 234 derives the block subsidy from the money reserve after the parent
             // block, so a block at or above the start height needs its parent's chain
-            // value pools. Fetching them is a state round trip, so only do it where the
-            // rules apply.
+            // value pools. Wait for the parent commit if its verification is still running.
             let money_reserve =
                 if zakura_chain::parameters::subsidy::is_zip234_active(&network, height) {
                     let parent_hash = block.header.previous_block_hash;
@@ -340,19 +339,15 @@ where
                         .ready()
                         .await
                         .map_err(|source| VerifyBlockError::Depth { source, hash })?
-                        .call(zs::Request::BlockInfo(parent_hash.into()))
+                        .call(zs::Request::AwaitBlockInfo(parent_hash))
                         .await
                         .map_err(|source| VerifyBlockError::Depth { source, hash })?
                     else {
-                        unreachable!("wrong response to Request::BlockInfo");
+                        unreachable!("wrong response to Request::AwaitBlockInfo");
                     };
 
-                    let parent_info = parent_info.ok_or_else(|| {
-                        BlockError::Other(format!(
-                            "parent block {parent_hash:?} of {hash:?} is in no chain, \
-                             so the ZIP 234 money reserve is unknown"
-                        ))
-                    })?;
+                    let parent_info = parent_info
+                        .expect("AwaitBlockInfo only returns after the parent block commits");
 
                     Some(parent_info.value_pools().money_reserve())
                 } else {

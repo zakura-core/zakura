@@ -19,8 +19,8 @@ use zakura_chain::{
     orchard,
     parameters::{
         subsidy::block_subsidy,
-        testnet::{ConfiguredActivationHeights, Parameters},
-        NetworkUpgrade, Zip234Deployment,
+        testnet::{ConfiguredActivationHeights, ConfiguredCheckpoints, Parameters},
+        NetworkUpgrade,
     },
     primitives::Halo2Proof,
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
@@ -686,6 +686,14 @@ async fn block_rejects_transactions_failing_librustzcash_conversion() {
         let network = librustzcash_conversion_test_network(case.network_upgrade);
         let block = block_with_librustzcash_conversion_failure(case, &network);
         let state_service = zakura_state::init_test(&network).await;
+        let genesis =
+            Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+                .expect("genesis block should deserialize");
+        state_service
+            .clone()
+            .oneshot(zs::Request::CommitCheckpointVerifiedBlock(genesis.into()))
+            .await
+            .expect("genesis block should commit");
         let transaction = transaction::Verifier::new_for_tests(&network, state_service.clone());
         let transaction = Buffer::new(BoxService::new(transaction), 1);
         let block_verifier =
@@ -731,13 +739,19 @@ fn librustzcash_conversion_test_network(network_upgrade: NetworkUpgrade) -> Netw
     };
 
     Parameters::build()
+        .with_genesis_hash(genesis_block.hash())
+        .expect("failed to set genesis hash")
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![(
+            Height(0),
+            genesis_block.hash(),
+        )]))
+        .expect("failed to set genesis checkpoint")
         .with_activation_heights(activation_heights)
         .expect("failed to set test activation heights")
         .clear_funding_streams()
         .with_slow_start_interval(Height::MIN)
         .with_disable_pow(true)
         .disable_temporary_orchard_disabling_soft_fork()
-        .with_zip234_deployment(Zip234Deployment::AtHeight(Height(2)))
         .with_target_difficulty_limit(target_difficulty_limit)
         .expect("failed to set target difficulty limit")
         .to_network()
@@ -752,6 +766,7 @@ fn block_with_librustzcash_conversion_failure(
     let mut block =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .expect("genesis block should deserialize");
+    let parent_hash = block.hash();
 
     block.transactions = vec![
         Arc::new(v5_coinbase_transaction(
@@ -761,7 +776,9 @@ fn block_with_librustzcash_conversion_failure(
         )),
         Arc::new(failing_librustzcash_v5_transaction(case, height)),
     ];
-    Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+    let header = Arc::make_mut(&mut block.header);
+    header.previous_block_hash = parent_hash;
+    header.merkle_root = block.transactions.iter().collect();
 
     block
 }

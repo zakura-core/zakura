@@ -378,20 +378,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Test both issuance options with both faster-block-time outcomes.
+        # Test ZIP 234 with both block-time outcomes.
         include:
           - name: zip234
             chain-features: zakura-chain/zip234
             features: zip234
-          - name: zip234-halvings
-            chain-features: zakura-chain/zip234-halvings
-            features: zip234-halvings
           - name: zip218 + zip234
             chain-features: zakura-chain/zip218,zakura-chain/zip234
             features: zip218,zip234
-          - name: zip218 + zip234-halvings
-            chain-features: zakura-chain/zip218,zakura-chain/zip234-halvings
-            features: zip218,zip234-halvings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:

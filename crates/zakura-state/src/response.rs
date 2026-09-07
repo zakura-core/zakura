@@ -87,7 +87,8 @@ pub enum Response {
     /// Response to [`Request::Block`] with the specified block.
     Block(Option<Arc<Block>>),
 
-    /// Response to [`Request::BlockInfo`] with the specified block's chain value pools.
+    /// Response to [`Request::BlockInfo`] or [`Request::AwaitBlockInfo`] with the specified
+    /// block's chain value pools.
     BlockInfo(Option<BlockInfo>),
 
     /// The response to a `BlockHeader` request.

@@ -58,6 +58,10 @@ split into a precheck and an exact match. The precheck MUST establish decode bou
 allocation. The exact match MUST run before Verify. A fixed-prefix read used by either step MUST NOT
 allocate from a peer-declared value.
 
+Shared resource admission MUST precede each allocation, verification, or state operation it bounds,
+including work on announcements and authorized responses. The final request Work charge does not
+replace these earlier checks. Verifier functions remain stateless; their callers acquire capacity.
+
 ### Common requirements
 
 1. Each message type MUST have exactly one declaration and one handler. Each handler MUST have a
@@ -70,6 +74,9 @@ allocate from a peer-declared value.
    messages, keys, and counts MAY consume that capacity but MUST NOT increase it. The filter MUST
    define its behavior at capacity. The receiver MUST size each capacity so its aggregate across the
    maximum peer count fits the corresponding resource budget.
+   Message declarations MUST use reusable admission logic and shared node-owned resource accounts,
+   with service and peer limits within those accounts. Connecting another peer or opening another
+   service MUST NOT increase the node's capacity.
 3. Every enforced inbound rule MUST have a matching outbound obligation. Local scheduling,
    finality, reorganization, and work reassignment MUST NOT produce a peer violation.
 4. Every non-`Continue` result MUST record the service, message type, filter, direction, peer, key,
@@ -79,6 +86,13 @@ allocate from a peer-declared value.
    another peer's path.
 6. Each peer response path MUST bound queued unsent bytes. Reaching that bound MUST stop new
    response work for that peer without blocking another peer or service stream.
+7. Retained memory and active CPU and storage work MUST have separate shared bounds. All entry
+   points to a shared backend MUST participate in its bound. Admission MUST preserve capacity and
+   scheduling progress for essential chain work under sustained load, including small or empty
+   responses. Per-peer limits and QUIC congestion control alone do not satisfy this requirement.
+8. Resource ownership MUST survive queue transfers, timeouts, and connection closure until the
+   underlying data or work is released. This includes detached verification and state operations.
+   Application and transport buffering MUST fit the node envelope without gaps or double counting.
 
 This specification bounds complete messages. Transport frame progress and stream layout remain out
 of scope. The transport MUST enforce an independent deadline for an incomplete frame.
@@ -87,8 +101,9 @@ of scope. The transport MUST enforce an independent deadline for an incomplete f
 
 A panic in a decoder, verifier, handler, reactor port operation, or per-peer worker is a receiver
 defect. The implementation MUST catch the panic at the affected peer's boundary, release reserved
-resources, and return affected work to the scheduler. The process and other peers' processing paths
-MUST continue. The implementation MUST report `LocalFault` and MAY close the affected connection.
+resources when their underlying data or work is released, and return affected work to the scheduler.
+The process and other peers' processing paths MUST continue. The implementation MUST report
+`LocalFault` and MAY close the affected connection.
 
 ## Safe filters
 
@@ -208,36 +223,41 @@ Cadence {
 
 ### Work
 
-Work bounds how much response work one peer can start. Each `(peer, request_type)` has one token
-bucket and one concurrency bound. The token bucket grants response bandwidth. The concurrency bound
-caps active requests. Work reserves the worst-case charge before dispatch and later refunds unused
-charge.
+Work bounds how much response work one peer can start within the shared node accounts. Each
+`(peer, request_type)` has a response capacity and a concurrency bound. Work reserves the worst-case
+response charge before dispatch and later refunds unused charge. The byte charges below count
+encoded responses; decoded allocations, request state, and backend work require their own bounds.
 
 ```text
-charge = upper_bound_response_bytes + REQUEST_OVERHEAD
+charge = upper_bound_response_bytes
 refund = upper_bound_response_bytes - actual_response_bytes
 ```
 
-- `REQUEST_OVERHEAD` MUST equal 64 KiB. The bucket capacity MUST cover the largest accepted request.
-  Its refill MUST state the granted per-peer response bandwidth.
+- Capacity MUST cover the largest accepted request. Capacity MUST NOT refill with time: used
+  response bytes remain charged through queueing and writing until released or transferred to a
+  separately bounded transport account. An operator MAY configure a separate node-wide bandwidth
+  limit. Per-peer byte-rate buckets and a fixed byte price for request work are not required.
 - Work MUST run after every other selected filter. Immediately before the handler starts, it MUST
   acquire one concurrency slot and apply the computed charge once. The request MUST hold the slot
-  until its terminal response is queued, `LocalFault` occurs, or the connection ends. A subscription
-  update releases its slot when the handler atomically commits the update. Work MUST apply the
+  until its underlying handler and backend work ends. A subscription update releases its slot when
+  the handler atomically commits the update. Work MUST apply the
   computed refund after the terminal response is queued. The refund MUST return unused response
-  capacity without returning `REQUEST_OVERHEAD`. Work MUST release the slot and refund unused
-  response capacity after `LocalFault`.
-- Work MUST return `Disconnect` when a request exceeds the concurrency bound. The sender MUST stay
-  within the advertised concurrency and inflight limits. Token exhaustion alone MUST NOT create a
+  capacity. After `LocalFault`, Work MUST release capacity only as its underlying resources are
+  released; connection closure follows the same rule.
+- Work MUST return `Disconnect` when a request exceeds the advertised concurrency or inflight bound.
+  The sender MUST stay within those limits. Exhaustion of local shared capacity MUST NOT create a
   peer violation.
 - When Work is unavailable, the peer routine MUST return `Delay` and leave the request at the
-  admission boundary. It MUST stop reading that peer's ordered stream until Work becomes available.
-  The existing bounded application and QUIC queues MUST provide backpressure. The implementation
-  MUST NOT add a delayed-request queue or scheduler.
+  admission boundary. It SHOULD use lazy decoding and QUIC backpressure. Stopping ordered reads MUST
+  preserve progress for authorized responses and control messages, including incoming `Block`
+  messages behind `GetBlocks` requests. Any application holding buffer needed for that progress MUST
+  have byte and item bounds within the peer and node accounts.
 - A delayed request MUST hold no shared lock, stream writer, or handler permit. All buffering MUST
   fit the per-peer resource bound. The delay MUST NOT block another peer or service stream. Later
-  messages on the same ordered stream MAY wait. A refund or refill MUST wake the peer routine. The
-  peer routine MUST NOT rerun preceding filters or charge the request again.
+  messages on the same ordered stream MAY wait only within the declared progress bounds. Released
+  capacity MUST wake the peer routine. The peer routine MUST NOT rerun preceding filters or charge
+  the request again. Acquiring multiple resource accounts MUST NOT leave partial work reservations
+  held while waiting for another account.
 
 ## Message declarations
 
@@ -258,7 +278,6 @@ MAX_SERVICE_SUMMARY_BYTES    = 256
 NODE_RECORD_MAX              = 648 bytes
 SERVICE_ENVELOPE_MAX         = 294 bytes
 DISCOVERY_WORK_CAPACITY      = 4 MiB
-DISCOVERY_WORK_REFILL        = 1 MiB/s
 ```
 
 #### `Hello` — Announcement, discriminator 1
@@ -305,9 +324,8 @@ expiry.
   - excluded node IDs are sorted and unique
   - exact consumption
 - **Work**
-  - charge = 2 bytes + limit * 648 bytes + 64 KiB
+  - charge = 2 bytes + limit * 648 bytes
   - capacity = 4 MiB
-  - refill = 1 MiB/s
   - concurrency = 1
   - on_empty = `Delay`
 
@@ -355,9 +373,8 @@ stored records attributed to each source peer.
 - **Work**
   - response_cap = 42 bytes + min(requested service IDs, 8) * 294 bytes
   - an empty request uses eight requested service IDs for this calculation
-  - charge = response_cap + 64 KiB
+  - charge = response_cap
   - capacity = 4 MiB
-  - refill = 1 MiB/s
   - concurrency = 1
   - on_empty = `Delay`
 
@@ -409,8 +426,7 @@ HEADERS_RESPONSE_FIXED_BYTES = 82 bytes
 HEADERS_OUTCOME_BYTES        = 41 bytes
 HS_SENT_CURSOR_RING          = 4,096 sent cursors per subscription
 HS_PUSH_DEADLINE             = 30 seconds
-HS_WORK_CAPACITY             = MAX_HS_PUSH_CREDIT_BYTES + HEADERS_OUTCOME_BYTES + 64 KiB
-HS_WORK_REFILL               = 1 MiB/s
+HS_WORK_CAPACITY             = MAX_HS_PUSH_CREDIT_BYTES + HEADERS_OUTCOME_BYTES
 ```
 
 The cap test pins `HEADERS_RESPONSE_FIXED_BYTES` to the codec. The frame cap already has an
@@ -489,11 +505,10 @@ the sender retains headers.
   - remaining byte credit <= 8 MiB
   - terminal tombstone capacity = 1
 - **Work**
-  - `Open` charge = `added_byte_credit` + `HEADERS_OUTCOME_BYTES` + 64 KiB
-  - `Grant` charge = `added_byte_credit` + 64 KiB
+  - `Open` charge = `added_byte_credit` + `HEADERS_OUTCOME_BYTES`
+  - `Grant` charge = `added_byte_credit`
   - `Close` charge = 0 and cannot `Delay`
   - capacity = `HS_WORK_CAPACITY`
-  - refill = `HS_WORK_REFILL`
   - concurrency = 1
   - on_empty = `Delay`
 
@@ -643,32 +658,21 @@ MAX_BS_RESPONSE_BYTES    = 33,554,432 bytes
 MAX_BS_INFLIGHT_REQUESTS = 32,768
 N                        = local_max_blocks_per_response
 BLOCK_WORK_CAPACITY      >= 9 bytes + N + min(N * MAX_BLOCK_BYTES,
-                           local_max_response_bytes) + 64 KiB
-BLOCK_WORK_REFILL        = local per-peer serving rate, bytes/second
+                           local_max_response_bytes)
 ```
 
 The receiver MUST advertise its actual block count, response body-byte limit, and inflight limit. It
-MUST NOT inherit the header-sync work budget. `BLOCK_WORK_REFILL` is local policy and is not
-advertised.
+MUST NOT inherit the header-sync work budget. Both services consume the shared node accounts.
 
 Block sync already regulates its rate on the requesting side. Each sender sizes its outstanding
 `GetBlocks` work with a per-peer BBR window ([`DownloadWindow`][bs-window]), clamped by the inflight
 limit the receiver advertises and operating at the measured bandwidth-delay product, which is
 normally far below that clamp. That window is the outbound obligation matching this inbound rule.
 
-The two sides meet through `Delay`. A receiver whose Work bucket is empty stops reading further
-frames from that peer's ordered stream until Work becomes available. Its bounded queues apply QUIC
-flow control instead of adding another request scheduler. The delay lengthens the sender's
-round-trip samples, the sender's delay gradient shrinks its window, and the sender settles below the
-rate the receiver serves.
-
-`BLOCK_WORK_REFILL` therefore binds only a sender that ignores its own controller. The receiver MUST
-set the rate from local policy. It MUST NOT derive the rate from a peer-supplied or peer-influenced
-measurement, because a peer able to move that measurement would set its own budget. The receiver
-MUST size the rate so that the rate multiplied by the maximum peer count fits its serving egress
-budget. No configuration key sets this rate today: [`block_sync::config`][bs-config] bounds the
-requesting side (inflight requests, inflight block bytes, look-ahead bytes) and has no serving-rate
-setting. An implementation of this specification MUST add one.
+The two sides meet through `Delay` and the bounded buffering rules above. Local capacity limits
+MUST come from the receiver's resource envelope, not peer-influenced throughput measurements.
+The effect on the sender's controller and sync throughput MUST be measured with competing services;
+an honest sender can also be limited by serving policy.
 
 `MAX_BLOCKS_PER_RESPONSE` and `MAX_BS_RESPONSE_BYTES` both apply to one range response, and the
 smaller one stops it. `MAX_BS_RESPONSE_BYTES` counts encoded block bodies and excludes message
@@ -709,9 +713,8 @@ the connection opens.
   - `N` = min(count, local_max_blocks_per_response)
   - response_cap = 9 bytes + `N` discriminator bytes + min(`N` * 2,000,000 bytes,
     local_max_response_bytes)
-  - charge = response_cap + 64 KiB
+  - charge = response_cap
   - capacity = `BLOCK_WORK_CAPACITY`
-  - refill = `BLOCK_WORK_REFILL`
   - concurrency = local_max_inflight_requests
   - on_empty = `Delay`
 
@@ -802,7 +805,7 @@ below remain candidate values while this specification has first-draft status:
 | Parameters | Evidence required before implementation |
 | --- | --- |
 | Cadence capacities and refill rates | Honest-node traces with connect bursts and scheduling jitter, plus a flood test that reaches `Disconnect` within bounded work |
-| `REQUEST_OVERHEAD`, Work capacities, and Work refill rates | CPU, lock, storage, and egress measurements at the maximum peer count; a liveness test for the largest legal request |
+| Shared memory and execution limits, per-service Work capacities, and essential-work reservations | A combined resource model and CPU, lock, storage, memory, and egress measurements on supported machine profiles; mixed-service progress and largest-legal-request tests |
 | Header credit, cursor-ring size, and `HS_PUSH_DEADLINE` | Model traces for open, grant, close, crossing updates, reorganization, and slow but conformant links |
 | Incomplete-frame deadline and queued-response byte bound | Transport buffer accounting and partial-frame and non-reading-peer tests |
 
@@ -839,19 +842,20 @@ The implementation MUST provide these checks:
    operation. Each test MUST show that the process survives, that other peers' processing paths
    continue, that the affected work returns to the scheduler, and that the result reaches neither
    peer-set ban policy nor the peer-violation count.
-9. Backpressure tests MUST exhaust one request type's Work bucket and show that its handler does not
-   start. They MUST show that application and QUIC buffering stays within the declared bounds, that
-   the peer routine resumes after a refund or refill, and that another peer and service stream make
-   progress within the test's declared scheduling and progress bounds.
+9. Backpressure tests MUST exhaust peer, service, and shared node capacity and show that blocked work
+   does not start. They MUST show that application and QUIC buffering stays within the declared bounds, that
+   the peer routine resumes after capacity is released, and that authorized same-stream responses
+   and essential chain work make progress within the test's declared scheduling and progress bounds.
+   Mixed-service tests MUST include small or empty responses and cleanup while backend work continues.
 10. Bounded model exploration MUST visit every reachable state in the finite model declared by the
     [`GetBlocks` property-testing infrastructure](../design/property-testing-block-sync-infrastructure.md).
     It MUST check reservation, Work, slot, queue, isolation, cleanup, and bounded-progress invariants.
     If a resource limit stops exploration before its frontier is empty, the check MUST report an
     incomplete result instead of an exhaustive result.
 
-Peer-slot selection, message priority, and stream layout are outside this specification. Peer-slot
-selection must remain separate because a conformant peer can waste a slot without violating a
-message rule.
+Peer-slot selection, the scheduling mechanism, and stream layout are outside this specification;
+the shared capacity and essential-progress requirements still apply. Peer-slot selection must remain
+separate because a conformant peer can waste a slot without violating a message rule.
 
 ## Reference implementations
 

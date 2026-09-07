@@ -297,9 +297,9 @@ The stateful suite checks these protocol properties after every action:
 - scheduler reassignment, finality changes, and local interest changes do not remove reservations
 - Work, refunds, outstanding charges, and available capacity satisfy the declared conservation
   equation
-- each concurrency slot has one owner and every terminal path releases that slot once
+- each concurrency slot has one owner and is released once its underlying work ends
 - per-peer filter, reservation, delayed-frame, and queued-response state stays within its declared
-  capacity
+  capacity, and combined usage fits the shared node accounts
 - two runs of the same scenario produce the same observations and final resource state
 
 Metamorphic properties compare related executions without using the reference model:
@@ -310,12 +310,17 @@ Metamorphic properties compare related executions without using the reference mo
 - translating every monotonic timestamp by the same duration preserves verdicts and resource deltas
 
 Each Work implementation defines its conservation equation from the same declaration values that
-compute charges and refunds. A typical form is:
+compute charges and refunds. For each capacity account:
 
 ```text
-initial capacity + refills + refunds
-    = available Work + outstanding charges + consumed Work
+capacity = available + reserved + retained
 ```
+
+Capacity does not refill with time. Unused reservations are refunded; used capacity is released only
+when the underlying data or work is released. Check ownership through queue transfers, writer
+completion, and backend work that outlives its caller. Any optional bandwidth policy has a separate
+rate ledger. Mixed-service tests must check aggregate bounds and essential chain progress, not only
+per-peer isolation.
 
 The suite expresses progress as a bounded property. If another peer or service stream remains
 runnable, and the runner schedules every runnable participant within `N` steps, that participant
@@ -324,7 +329,7 @@ fairness assumption. An unbounded statement such as “one peer never stops anot
 a finite test condition.
 
 The initial stateful model does not need a general task scheduler. It represents only observable
-admission actions: receive a frame or frame fragment, advance monotonic time, refill or refund Work,
+admission actions: receive a frame or frame fragment, advance monotonic time, release or refund Work,
 complete or fail a handler, reassign work, and close a connection. Add explicit task choices when a
 property depends on their order.
 

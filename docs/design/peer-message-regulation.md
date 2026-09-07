@@ -41,8 +41,9 @@ and keys. The filters implement the shared admission behavior. The declaration c
 that differs between messages.
 
 Each peer routine creates the configured admission paths and owns their filter state for one
-connection. It passes each inbound message to its admission path before it calls the message
-handler. `admit` applies the configured filters and returns `Continue`, `Drop`, `Delay`,
+connection. The paths also share node-owned resource accounts, with service and peer limits inside
+those accounts. The routine passes each inbound message to its admission path before it calls the
+message handler. `admit` applies the configured filters and returns `Continue`, `Drop`, `Delay`,
 `Disconnect`, or `LocalFault`. The peer routine dispatches only `Continue` messages and handles
 every other result at the connection boundary.
 
@@ -79,11 +80,16 @@ The admission path applies each filter before the work that it bounds. The exact
 order depend on the message role. The specification defines that order and each filter's
 configuration.
 
-`Delay` does not require another request scheduler. The peer routine keeps the current request at
-the admission boundary and stops reading further frames from that peer's ordered stream until Work
-becomes available. The existing bounded application and QUIC queues then apply flow control to the
-peer. This may delay later messages on the same ordered stream, but it does not block another peer
-or service stream.
+Work bounds retained memory and active CPU and storage work separately. Response bytes alone do not
+bound decoding, verification, or RocksDB work. Capacity stays charged until the data or work it
+accounts for is released, including work that outlives a timeout or connection. Optional node-wide
+bandwidth policy is separate; per-peer byte-rate buckets are not required for resource protection.
+
+`Delay` keeps the request at the admission boundary. Prefer lazy decoding and QUIC backpressure to
+application buffering. Stopping reads must preserve progress for responses and control messages:
+block sync carries incoming blocks behind serving requests on the same ordered stream. Any holding
+buffer needed for that progress must have explicit byte and item bounds. A delayed peer must not
+starve another peer or service, or consume capacity reserved for essential chain progress.
 
 A one-shot reservation has this lifecycle:
 
@@ -164,10 +170,11 @@ Block sync currently destroys reservations when it retires work. Its unmatched-r
 compensate for that error. Preserving reservations removes those exceptions and makes
 unsolicited-response handling unconditional.
 
-Budgets bound inbound work; the outbound direction needs its own bound. The work refund and refill
-regenerate admission tokens, not delivery, so a peer that requests responses and never reads them
-would grow the send buffer without limit. The receiver therefore bounds unsent response bytes per
-peer, blocks only that peer's path at the bound, and may disconnect a peer that stops draining.
+Budgets bound inbound work; the outbound direction needs its own bound. Queueing a terminal response
+does not release the bytes retained by the writer or transport. The receiver therefore bounds unsent
+response bytes per peer and across the node, blocks only that peer's path at its bound, and may
+disconnect a peer that stops draining. Iroh remains the transport; its buffers need separate
+accounting where application ownership ends before delivery.
 
 ## Testing and introspection
 
@@ -207,6 +214,14 @@ fuzz target. The regtest corpus provides the initial fuzz inputs.
 
 ## Adoption order
 
+Before choosing defaults or extending regulation to more messages, check a combined resource model
+for discovery, header sync, block sync, transaction gossip, and future direct transaction submission.
+Include legacy P2P and RPC paths that share verification or storage capacity. Account for transport
+buffers, decoded data, sync and mempool retention, and RocksDB memory alongside serving responses.
+Use bounded mixed-workload tests and small component measurements on supported machine profiles to
+check that essential chain progress fits with headroom. A GetBlocks payload cap is not a node memory
+limit; the aggregate limits and capacity reserved for essential work remain to be validated.
+
 Implement the design in five steps:
 
 1. Define the closed inventory for every current message. Add compile-time declaration closure,
@@ -214,13 +229,13 @@ Implement the design in five steps:
 2. Build one cadence budget per `(peer, message type)` from the message declarations.
 3. Preserve block-sync reservations until a response arrives or the connection ends. Then remove
    the unmatched-response exceptions.
-4. Give each peer an independent processing path. Add Work and `Delay` for discovery and block-sync
-   requests only after that path exists.
+4. Give each peer an independent processing path and connect admission to the shared resource
+   accounts. Add Work and `Delay` for discovery and block-sync requests only after that path exists.
 5. Replace `GetHeaders` with `SubscribeHeaders`. Price each credit grant by its byte credit and add
    the subscription reservation and header-sync Work bound.
 
 Only the final step adds header push and a work bound that Zakura lacks today. The earlier steps
 create the structure needed to enforce both safely.
 
-Message priority and stream layout remain out of scope. They require a separate specification and
-design.
+The scheduling mechanism and stream layout remain separate design decisions. They must satisfy the
+shared capacity and essential-progress requirements before further message integrations.

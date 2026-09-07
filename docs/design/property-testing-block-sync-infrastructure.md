@@ -21,7 +21,7 @@ The prototype requires:
 - a deterministic coverage check for every boundary and violation
 
 The prototype does not claim `GetBlocks` regulation conformance. Production does not yet implement
-the serving Work bucket, `Delay`, or Work refunds. Tests must not model those behaviors as though
+the serving Work capacity, `Delay`, or Work refunds. Tests must not model those behaviors as though
 production enforced them.
 
 ## Stateful expansion
@@ -136,9 +136,11 @@ QueueDepth = 0 | 1 | 2
 Time       = T0 | T1 | T2
 ```
 
-The model uses abstract Work units. A `GetBlocks` request costs one request unit plus one unit per
-requested block. The maximum charge is therefore four units. Each peer stores `available` and
-`outstanding` Work in `0..=4`. The model derives the state for a proposed request as follows:
+The model uses abstract Work units. A `GetBlocks` request reserves one concurrency slot and one unit
+per requested block. The maximum byte charge is therefore three units. Each peer stores `available`
+and `outstanding` Work in `0..=3`, within a shared four-unit account. Capacity returns when its data
+or work is released, not when time advances. The model derives the state for a proposed request as
+follows, using the minimum available peer and shared capacity:
 
 ```text
 Empty      = available == 0
@@ -160,7 +162,7 @@ isolation while keeping exhaustive exploration tractable.
 The model state contains:
 
 - connection state for each peer
-- available and outstanding Work for each peer
+- available and outstanding Work for each peer and the shared account
 - concurrency-slot ownership for each peer
 - admitted inbound `GetBlocks` requests
 - local outbound range reservations and their unconsumed heights
@@ -189,7 +191,6 @@ enum Action {
     ReceiveRangeUnavailable { peer: PeerId, range: BlockRange },
     CompleteHandler { peer: PeerId, outcome: HandlerOutcome },
     DrainQueuedResponse { peer: PeerId },
-    RefillWork { peer: PeerId, units: u8 },
     ReassignLocalWork { range: BlockRange, to: PeerId },
     ChangeFinality,
     AdvanceTime,
@@ -242,11 +243,12 @@ The model and production runner check every safety property after every action:
 - no response consumes the same reservation part twice
 - reassignment and finality changes do not remove a reservation
 - a protocol timeout or connection close removes only the affected peer's reservations
-- available Work, outstanding charges, refunds, and consumed Work satisfy conservation
+- available, reserved, and retained Work satisfy conservation in peer and shared accounts
 - each admitted request owns one concurrency slot
-- every terminal path releases its slot once
+- every slot is released once its underlying work ends, even if the connection closed first
 - each queue and per-peer state collection stays within its capacity
-- a delayed peer does not change another peer's reservation, Work, slot, or queue state
+- a delayed peer does not change another peer's owned reservation, Work, slot, or queue state;
+  competition for shared capacity is checked separately
 - model and production observations agree after every action
 - a replay produces the same observations and final state twice
 

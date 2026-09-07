@@ -111,10 +111,13 @@ async fn committer_repair_replaces_and_then_restores_a_sweep_repair() {
     handle
         .send(Event::VctRepairContextReady {
             owner: sweep_owner,
-            result: VctRepairContextResult::Resolved(zakura_header_chain::VctRepairContext {
-                target: zakura_header_chain::Frontier::new(sweep_height, block::Hash([11; 32])),
-                locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-            }),
+            result: VctRepairContextResult::Resolved(
+                zakura_header_chain::VctRepairContext::unconstrained(
+                    zakura_header_chain::Frontier::new(sweep_height, block::Hash([11; 32])),
+                    zakura_header_chain::HeaderLocator::for_continuation(anchor),
+                    None,
+                ),
+            ),
         })
         .await
         .expect("the late sweep completion reaches the reactor");
@@ -151,7 +154,7 @@ async fn committer_repair_replaces_and_then_restores_a_sweep_repair() {
 }
 
 #[tokio::test]
-async fn vct_repair_restarts_after_state_rejects_an_admitted_replacement() {
+async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic_input() {
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown.clone());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
@@ -197,32 +200,36 @@ async fn vct_repair_restarts_after_state_rejects_an_admitted_replacement() {
         .await
         .expect("the repair supplier connects");
     let _status = outbound.recv().await.expect("the local status is sent");
+    let supplier_status = Status {
+        work_anchor_height: anchor.height,
+        work_anchor_hash: anchor.hash,
+        selected_tip_height: selected_tip.height,
+        selected_tip_hash: selected_tip.hash,
+        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+        oldest_retained_height: anchor.height,
+        max_headers_per_response: 1,
+        max_inflight_requests: 1,
+        max_message_bytes: 2_000_000,
+        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+    };
     handle
         .send(Event::WireMessage {
             peer: peer.clone(),
             session_id: 0,
-            msg: HeaderSyncMessage::Status(Status {
-                work_anchor_height: anchor.height,
-                work_anchor_hash: anchor.hash,
-                selected_tip_height: selected_tip.height,
-                selected_tip_hash: selected_tip.hash,
-                suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
-                oldest_retained_height: anchor.height,
-                max_headers_per_response: 1,
-                max_inflight_requests: 1,
-                max_message_bytes: 2_000_000,
-                tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-            }),
+            msg: HeaderSyncMessage::Status(supplier_status.clone()),
         })
         .await
         .expect("the repair supplier status reaches the reactor");
     handle
         .send(Event::VctRepairContextReady {
             owner,
-            result: VctRepairContextResult::Resolved(zakura_header_chain::VctRepairContext {
-                target: repair_header,
-                locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-            }),
+            result: VctRepairContextResult::Resolved(
+                zakura_header_chain::VctRepairContext::unconstrained(
+                    repair_header,
+                    zakura_header_chain::HeaderLocator::for_continuation(anchor),
+                    Some(selected_tip.hash),
+                ),
+            ),
         })
         .await
         .expect("the exact repair context reaches the reactor");
@@ -240,6 +247,16 @@ async fn vct_repair_restarts_after_state_rejects_an_admitted_replacement() {
     assert_eq!(request.locator_hashes, vec![anchor.hash]);
     assert_eq!(request.max_header_count, 1);
     assert_eq!(request.tree_aux_schema, AuxSchema::V1);
+    let repair_aux = TreeAuxRecordV1 {
+        height: repair_header.height,
+        sapling_root: zakura_chain::sapling::tree::Root::default(),
+        orchard_root: zakura_chain::orchard::tree::Root::default(),
+        ironwood_root: zakura_chain::ironwood::tree::Root::default(),
+        sapling_tx_count: 0,
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
+    };
     handle
         .send(Event::SessionResponse {
             peer: peer.clone(),
@@ -253,18 +270,9 @@ async fn vct_repair_restarts_after_state_rejects_an_admitted_replacement() {
                 complete: true,
                 tree_aux_schema: AuxSchema::V1,
                 entries: vec![HeaderEntry {
-                    header: repair_block_header,
+                    header: repair_block_header.clone(),
                     body_size: 0,
-                    tree_aux: Some(TreeAuxRecordV1 {
-                        height: repair_header.height,
-                        sapling_root: zakura_chain::sapling::tree::Root::default(),
-                        orchard_root: zakura_chain::orchard::tree::Root::default(),
-                        ironwood_root: zakura_chain::ironwood::tree::Root::default(),
-                        sapling_tx_count: 0,
-                        orchard_tx_count: 0,
-                        ironwood_tx_count: 0,
-                        auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
-                    }),
+                    tree_aux: Some(repair_aux),
                 }],
             }),
         })
@@ -275,6 +283,7 @@ async fn vct_repair_restarts_after_state_rejects_an_admitted_replacement() {
         source,
         owner: action_owner,
         target,
+        completion,
         mut entries,
         ..
     } = next_action(&mut actions).await
@@ -283,13 +292,20 @@ async fn vct_repair_restarts_after_state_rejects_an_admitted_replacement() {
     };
     assert_eq!(action_owner.session_id(), 0);
     assert_eq!(target, repair_header);
-    assert!(matches!(
-        purpose,
+    match purpose {
         HeaderTargetPurpose::SelectedAuxiliaryRepair {
+            selected_target, ..
+        } if selected_target == repair_header => {}
+        _ => panic!("the repair purpose must carry the selected target"),
+    };
+    let episode = match completion {
+        zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
             selected_target,
+            episode,
             ..
-        } if selected_target == repair_header
-    ));
+        } if selected_target == repair_header => episode,
+        _ => panic!("the repair completion must carry the selected target and episode"),
+    };
     let entry = entries
         .pop()
         .expect("the exact repair preparation contains one header");
@@ -340,6 +356,7 @@ async fn vct_repair_restarts_after_state_rejects_an_admitted_replacement() {
         completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
             common_ancestor: anchor,
             selected_target: repair_header,
+            episode,
         },
         batch,
         aux: vec![delivery],
@@ -378,6 +395,7 @@ async fn vct_repair_restarts_after_state_rejects_an_admitted_replacement() {
         .state_version
         .checked_next()
         .expect("the fixture state version can advance");
+    let after_delivery_state_version = after_delivery.state_version;
     snapshots_tx
         .send(Some(after_delivery))
         .expect("the committed metadata-only snapshot is observed");
@@ -418,17 +436,52 @@ async fn vct_repair_restarts_after_state_rejects_an_admitted_replacement() {
         action_owner
     );
 
+    let replacement_peer = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID is bounded");
+    let (replacement_send, mut replacement_outbound) = framed_channel(8);
+    handle
+        .send(Event::PeerConnected(PeerSession::from_parts(
+            replacement_peer.clone(),
+            replacement_send,
+            CancellationToken::new(),
+        )))
+        .await
+        .expect("the replacement supplier connects");
+    let _status = replacement_outbound
+        .recv()
+        .await
+        .expect("the replacement supplier receives local status");
+    handle
+        .send(Event::WireMessage {
+            peer: replacement_peer.clone(),
+            session_id: 0,
+            msg: HeaderSyncMessage::Status(supplier_status),
+        })
+        .await
+        .expect("the replacement supplier status reaches the reactor");
+
     handle
         .send(Event::VctRepairContextReady {
             owner: replacement_owner,
-            result: VctRepairContextResult::Resolved(zakura_header_chain::VctRepairContext {
-                target: repair_header,
-                locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-            }),
+            result: VctRepairContextResult::Resolved(
+                zakura_header_chain::VctRepairContext::from_durable_rows(
+                    repair_header,
+                    zakura_header_chain::HeaderLocator::for_continuation(anchor),
+                    after_delivery_state_version,
+                    Some(selected_tip.hash),
+                    true,
+                    &[zakura_header_chain::UntrustedAuxDeliveryRow::new(
+                        delivery,
+                        2,
+                        [Some([0x55; 32]), None],
+                        Some(selected_tip.hash),
+                    )],
+                )
+                .expect("the committed rejection row reconstructs a repair episode"),
+            ),
         })
         .await
         .expect("the replacement generation resolves fresh context");
-    let replacement_request = outbound
+    let replacement_request = replacement_outbound
         .recv()
         .await
         .expect("the replacement generation fetches another delivery");
@@ -439,10 +492,46 @@ async fn vct_repair_restarts_after_state_rejects_an_admitted_replacement() {
     else {
         panic!("the replacement generation uses GetHeaders");
     };
-    assert_ne!(replacement_request.request_id, request.request_id);
     assert_eq!(replacement_request.target_tip_hash, repair_header.hash);
     assert_eq!(replacement_request.max_header_count, 1);
     assert_eq!(replacement_request.tree_aux_schema, AuxSchema::V1);
+
+    handle
+        .send(Event::SessionResponse {
+            peer: replacement_peer,
+            session_id: 0,
+            scope: replacement_owner.header_authority(),
+            msg: HeaderSyncMessage::Headers(Headers {
+                request_id: replacement_request.request_id,
+                target_tip_hash: repair_header.hash,
+                common_ancestor_height: anchor.height,
+                common_ancestor_hash: anchor.hash,
+                complete: true,
+                tree_aux_schema: AuxSchema::V1,
+                entries: vec![HeaderEntry {
+                    header: repair_block_header,
+                    body_size: 0,
+                    tree_aux: Some(repair_aux),
+                }],
+            }),
+        })
+        .await
+        .expect("the repeated semantic input reaches the reactor under a new request");
+    assert!(
+        time::timeout(std::time::Duration::from_millis(20), actions.recv())
+            .await
+            .is_err(),
+        "a rejected semantic input cannot reach state under a new request"
+    );
+    assert!(
+        time::timeout(
+            std::time::Duration::from_millis(1_100),
+            replacement_outbound.recv(),
+        )
+        .await
+        .is_err(),
+        "an unchanged episode cannot clear supplier exclusions and repeat the request"
+    );
 
     drop(snapshots_tx);
     shutdown.cancel();
@@ -512,10 +601,13 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
     handle
         .send(Event::VctRepairContextReady {
             owner,
-            result: VctRepairContextResult::Resolved(zakura_header_chain::VctRepairContext {
-                target: repair_header,
-                locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-            }),
+            result: VctRepairContextResult::Resolved(
+                zakura_header_chain::VctRepairContext::unconstrained(
+                    repair_header,
+                    zakura_header_chain::HeaderLocator::for_continuation(anchor),
+                    Some(selected_tip.hash),
+                ),
+            ),
         })
         .await
         .expect("the exact repair context reaches the reactor");
@@ -651,10 +743,13 @@ async fn repair_awaiting_supplier(
     handle
         .send(Event::VctRepairContextReady {
             owner,
-            result: VctRepairContextResult::Resolved(zakura_header_chain::VctRepairContext {
-                target: repair_header,
-                locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-            }),
+            result: VctRepairContextResult::Resolved(
+                zakura_header_chain::VctRepairContext::unconstrained(
+                    repair_header,
+                    zakura_header_chain::HeaderLocator::for_continuation(anchor),
+                    None,
+                ),
+            ),
         })
         .await
         .expect("the exact repair context reaches the reactor");

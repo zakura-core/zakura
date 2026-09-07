@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import concurrent.futures
+import hashlib
 import json
 import os
 import shlex
@@ -90,9 +91,20 @@ def load_nodes(path: Path, selected: list[str] | None) -> list[Node]:
     for raw_node in data.get("nodes", []):
         merged = dict(defaults)
         merged.update(raw_node)
-        for required in ("name", "ssh_string", "hostname", "mode_label", "p2p_stack"):
+        for required in (
+            "name",
+            "ssh_string",
+            "hostname",
+            "mode_label",
+            "p2p_stack",
+            "public_ip",
+        ):
             if required not in merged:
                 raise DeployError(f"node missing required field {required!r}: {raw_node}")
+        if not str(merged["public_ip"]).strip():
+            raise DeployError(
+                f"node {merged['name']!r} has empty required field 'public_ip'"
+            )
         if merged["name"] in seen:
             raise DeployError(f"duplicate node name: {merged['name']}")
         seen.add(merged["name"])
@@ -163,6 +175,7 @@ def subst_for(node: Node) -> dict[str, str]:
         "MAX_RUN_SECONDS": str(raw["max_run_seconds"]),
         "READY_SAMPLES": str(raw["ready_samples"]),
         "READY_SAMPLE_INTERVAL_SECONDS": str(raw["ready_sample_interval_seconds"]),
+        "HEALTH_MIN_CONNECTED_PEERS": str(raw["health_min_connected_peers"]),
         "MIN_FREE_BYTES": str(raw["min_free_bytes"]),
         "RETENTION_RUNS": str(raw["retention_runs"]),
         "COOLDOWN_SECONDS": str(raw["cooldown_seconds"]),
@@ -232,6 +245,14 @@ monitor_log={monitor_log}
 controller_service={controller_service}
 node_service={node_service}
 start_controller={start_controller}
+
+# Retire the earlier standalone cleaner before replacing its controller/config.
+if [ -f /etc/systemd/system/zakura-storage.timer ]; then
+  systemctl disable --now zakura-storage.timer
+  systemctl stop zakura-storage.service
+  rm -f /etc/systemd/system/zakura-storage.timer /etc/systemd/system/zakura-storage.service
+fi
+rm -f /usr/local/sbin/zakura_sync_storage.py
 
 install -d -m 755 /usr/local/sbin
 install -d -m 755 "$(dirname "$controller_config")" "$(dirname "$alert_config")" \
@@ -402,25 +423,53 @@ def cmd_resume(args: argparse.Namespace) -> int:
 class Problem(NamedTuple):
     """One node's audit failure.
 
-    `kind` is the throttle identity: it must stay byte-identical for as long as
+    `kind` is the failure category: it must stay byte-identical for as long as
     the same underlying failure persists, or every cycle looks like a brand-new
     problem and pages again. `detail` is the line posted to Slack and may embed
     volatile values -- free bytes, SSH stderr, an exception message -- that must
-    therefore stay out of `kind`.
+    therefore stay out of `kind`. `incident_id` distinguishes controller runs;
+    `delivered_at` is set only for a verified controller delivery receipt.
     """
 
     kind: str
     detail: str
+    incident_id: str = ""
+    delivered_at: int | None = None
 
 
-def audit_problem(data: dict[str, Any], max_completion_age: int) -> Problem | None:
+def audit_problem(
+    data: dict[str, Any], max_completion_age: int, destination: str | None = None
+) -> Problem | None:
+    """Classify a node, accepting only a matching delivery receipt to this destination."""
     state = data.get("controller_state") or {}
     sample = data.get("sample") or {}
     if state.get("failed"):
         # The halt reason is latched by the controller, so it is stable while the
         # halt lasts and a genuinely different halt should page again.
         failure = state.get("failure")
-        return Problem(f"controller-halted:{failure}", f"controller halted: {failure}")
+        run_id, failed_at = state.get("last_failed_run"), state.get("failed_at")
+        incident_id = json.dumps([run_id, failed_at]) if run_id and failed_at else ""
+        receipt = state.get("failure_notification")
+        delivered_at = None
+        if (
+            incident_id
+            and destination
+            and isinstance(receipt, dict)
+            and receipt.get("run_id") == run_id
+            and receipt.get("failed_at") == failed_at
+            and receipt.get("reason") == failure
+            and receipt.get("destination") == destination
+            and type(receipt.get("sent_at")) is int
+            and 0 < receipt["sent_at"] <= now()
+        ):
+            delivered_at = receipt["sent_at"]
+        detail = f"controller halted: {failure}"
+        if run_id:
+            detail += f" (run {run_id})"
+        return Problem(
+            f"controller-halted:{failure}", detail,
+            incident_id, delivered_at,
+        )
     if not data.get("service_active") and state.get("phase") == "syncing":
         return Problem(
             "service-inactive", "node service inactive while controller says syncing"
@@ -467,12 +516,16 @@ def format_duration(seconds: int) -> str:
     return f"{hours}h{remainder // 60}m"
 
 
-def post_slack(text: str) -> bool:
-    webhook = (
+def slack_webhook_url() -> str:
+    return (
         os.environ.get("SLACK_WEB_HOOK", "")
         or os.environ.get("SLACK_WEBHOOK_URL", "")
         or os.environ.get("SLACK_WEBHOOK", "")
     )
+
+
+def post_slack(text: str) -> bool:
+    webhook = slack_webhook_url()
     if not webhook:
         print(f"SLACK_WEB_HOOK missing; would post:\n{text}", file=sys.stderr)
         return False
@@ -512,7 +565,22 @@ def load_audit_state(path: Path | None) -> dict[str, Any]:
     problems = data.get("problems")
     if not isinstance(problems, dict):
         return fresh
-    return {"version": AUDIT_STATE_VERSION, "problems": problems}
+    if type(data.get("last_digest_at")) is not int or not 0 <= data["last_digest_at"] <= now():
+        data.pop("last_digest_at", None)
+    completions = data.get("completions", {})
+    if not isinstance(completions, dict) or any(
+        not isinstance(record, dict)
+        or any(type(record.get(key)) is not int or record[key] < 0 for key in ("total", "pending"))
+        or any(key not in record for key in ("run_id", "sha", "duration"))
+        or ("details" in record and (
+            not isinstance(record["details"], list)
+            or len(record["details"]) > COMPLETION_DETAIL_LIMIT
+            or any(not isinstance(item, dict) for item in record["details"])
+        ))
+        for record in completions.values()
+    ):
+        data.pop("completions", None)
+    return {**data, "version": AUDIT_STATE_VERSION, "problems": problems}
 
 
 def save_audit_state(path: Path | None, state: dict[str, Any]) -> None:
@@ -529,15 +597,22 @@ def audit_transitions(
     previous: dict[str, Any],
     reminder_interval: int,
     timestamp: int,
+    *,
+    reminders_due: bool = True,
+    destination: str | None = None,
 ) -> tuple[list[str], list[str], list[str], dict[str, Any]]:
     """Split current problems into new/reminder/recovered lines.
 
-    A problem alerts immediately the first time it is seen, and again only once
-    `reminder_interval` has elapsed, so a node that stays broken reminds on a slow
-    cadence instead of re-paging every audit cycle. Continuity is judged on
-    `Problem.kind`, never on the rendered detail, which changes between samples.
+    New problems alert unless a matching controller receipt already accounts for
+    that first delivery. Changed categories or runs still alert. Unchanged
+    problems remind only when due; volatile message detail does not define the
+    incident. Cached delivery applies only to the same Slack destination. The
+    caller persists the returned state only after successful delivery.
     """
-    prior = previous.get("problems", {})
+    prior = {
+        name: record for name, record in previous.get("problems", {}).items()
+        if isinstance(record, dict) and record.get("destination") == destination
+    }
     new_lines: list[str] = []
     reminder_lines: list[str] = []
     current: dict[str, Any] = {}
@@ -545,27 +620,40 @@ def audit_transitions(
     for name in sorted(problems):
         problem = problems[name]
         record = prior.get(name)
-        if not isinstance(record, dict) or record.get("kind") != problem.kind:
+        had_prior_problem = isinstance(record, dict)
+        if (
+            not isinstance(record, dict)
+            or record.get("kind") != problem.kind
+            or record.get("incident_id", "") != problem.incident_id
+        ):
             # First sighting, or the failure changed to a different one.
-            new_lines.append(f"{name}: {problem.detail}")
-            current[name] = {
+            record = {
+                "destination": destination,
                 "kind": problem.kind,
                 "detail": problem.detail,
-                "first_seen": timestamp,
-                "last_sent": timestamp,
+                "incident_id": problem.incident_id,
+                "first_seen": problem.delivered_at or timestamp,
+                "last_sent": problem.delivered_at or timestamp,
             }
-            continue
+            if problem.delivered_at is None or had_prior_problem:
+                record["first_seen"] = timestamp
+                record["last_sent"] = timestamp
+                new_lines.append(f"{name}: {problem.detail}")
+                current[name] = record
+                continue
         first_seen = int(record.get("first_seen", timestamp))
         last_sent = int(record.get("last_sent", timestamp))
-        if timestamp - last_sent >= reminder_interval:
+        if reminders_due and timestamp - last_sent >= reminder_interval:
             reminder_lines.append(
                 f"{name}: {problem.detail} "
                 f"(unresolved for {format_duration(timestamp - first_seen)})"
             )
             last_sent = timestamp
         current[name] = {
+            "destination": destination,
             "kind": problem.kind,
             "detail": problem.detail,
+            "incident_id": problem.incident_id,
             "first_seen": first_seen,
             "last_sent": last_sent,
         }
@@ -588,15 +676,143 @@ def audit_message(
     if new_lines:
         sections.append(":rotating_light: Zakura continuous sync audit failed\n" + "\n".join(new_lines))
     if reminder_lines:
-        sections.append(":alarm_clock: Zakura continuous sync still failing\n" + "\n".join(reminder_lines))
+        sections.append(":memo: Zakura continuous sync digest — unresolved\n" + "\n".join(reminder_lines))
     if recovered_lines:
         sections.append(":white_check_mark: Zakura continuous sync recovered\n" + "\n".join(recovered_lines))
     return "\n\n".join(sections)
 
 
+COMPLETION_DETAIL_LIMIT = 256
+
+
+def sync_label(node: Node) -> str:
+    modes = {
+        "dual": "Dual networking",
+        "zakura": "Zakura networking only",
+        "legacy": "Legacy networking only",
+    }
+    mode = modes.get(node.raw.get("p2p_stack"))
+    return f"{mode} ({node.name})" if mode else node.name
+
+
+def completion_status(data: dict[str, Any] | None) -> str:
+    if data is None:
+        return "status unavailable"
+    controller = data.get("controller_state") or {}
+    if controller.get("failed"):
+        return "halted after failure"
+    phase = controller.get("phase")
+    if phase == "syncing":
+        if data.get("service_active") is False:
+            return "node service inactive"
+        if (data.get("sample") or {}).get("metrics_status", "ok") != "ok":
+            return "sync status unavailable (metrics unavailable)"
+        return "currently syncing"
+    if phase == "complete":
+        return "between runs"
+    return f"current phase: {phase}" if phase else "status unavailable"
+
+
+def completion_details(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Upgrade old audit caches without inventing timings for earlier runs."""
+    if "details" in record:
+        return list(record["details"])
+    if record.get("pending") and record.get("run_id"):
+        return [{"run_id": record["run_id"], "duration": record.get("duration"),
+                 "end_height": record.get("end_height")}]
+    return []
+
+
+def completion_run_text(item: dict[str, Any]) -> str:
+    """Report overall genesis sync throughput only for a confirmed ending height."""
+    duration = item.get("duration")
+    valid_duration = type(duration) is int and duration >= 0
+    timing = (f"{duration // 3600}h {duration % 3600 // 60:02d}m"
+              if valid_duration else "duration unavailable")
+    height = item.get("end_height")
+    if type(height) is not int or not 0 <= height <= 0xFFFFFFFF:
+        return f"{timing} · BPS unavailable"
+    # Every cycle starts from empty chain state; height zero is genesis.
+    blocks = height + 1
+    rate = f"{blocks / duration:.0f} blocks/sec" if valid_duration and duration > 0 else "BPS unavailable"
+    return f"{timing} · {rate}"
+
+
+def completion_updates(
+    statuses: dict[str, dict[str, Any]], previous: dict[str, Any], digest_due: bool,
+    labels: dict[str, str] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    """Accumulate completions until delivery, preserving timings between audits.
+
+    Counters remain authoritative if history is missing or exceeds retention.
+    Missing hosts retain pending completions. Cache migration and counter resets
+    preserve the old counts; unavailable timings are explicitly reported.
+    """
+    records = {name: dict(record) for name, record in previous.get("completions", {}).items()}
+    for name, data in statuses.items():
+        controller = data.get("controller_state") or {}
+        run_id = controller.get("last_success_run")
+        total = controller.get("runs")
+        if not controller.get("completion_digest") or not run_id or type(total) is not int:
+            continue
+        old = records.get(name, {})
+        if old.get("run_id") == run_id:
+            continue
+        baseline = old.get("total", controller.get("completion_digest_start_runs", total - 1))
+        delta = max(1, total - baseline) if type(baseline) is int else 1
+        raw_history = controller.get("completion_history", [])
+        if not isinstance(raw_history, list):
+            raw_history = []
+        history = {
+            item["number"]: item for item in raw_history
+            if isinstance(item, dict) and type(item.get("number")) is int
+            and total - delta < item["number"] <= total and item.get("run_id")
+        }
+        # Old controllers still provide the latest timing during a staged rollout.
+        history[total] = {
+            "run_id": run_id, "duration": controller.get("last_success_duration_seconds"),
+            "end_height": controller.get("last_success_end_height"),
+        }
+        details = completion_details(old) + [history[number] for number in sorted(history)]
+        records[name] = {
+            "label": (labels or {}).get(name, old.get("label", name)),
+            "run_id": run_id, "total": total,
+            "sha": controller.get("last_success_sha", "unknown"),
+            "duration": controller.get("last_success_duration_seconds"),
+            "end_height": controller.get("last_success_end_height"),
+            "pending": old.get("pending", 0) + delta,
+            "details": details[-COMPLETION_DETAIL_LIMIT:],
+        }
+    lines = []
+    if digest_due:
+        configured = set(labels) if labels is not None else set(statuses)
+        records = {name: record for name, record in records.items()
+                   if name in configured or record.get("pending", 0)}
+        for name in sorted(set(records) | configured):
+            record = records.get(name, {})
+            pending = record.get("pending", 0)
+            details = completion_details(record)
+            label = (labels or {}).get(name, record.get("label", name))
+            section = [f"*{label} · {pending} completed*"]
+            section.extend(f"• {completion_run_text(item)}" for item in details)
+            missing = pending - len(details)
+            if missing:
+                section.append(f"• {missing} earlier run(s): details unavailable")
+            section.append(completion_status(statuses.get(name)))
+            lines.append("\n".join(section))
+            if name not in configured:
+                records.pop(name, None)
+            elif name in records:
+                records[name] = {**record, "label": label, "pending": 0, "details": []}
+    return lines, records
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     nodes = load_nodes(args.config, args.node)
     problems: dict[str, Problem] = {}
+    statuses: dict[str, dict[str, Any]] = {}
+    webhook = slack_webhook_url()
+    destination = hashlib.sha256(webhook.encode()).hexdigest() if webhook else None
     for node in nodes:
         ok, data = remote_json(node, "/usr/local/sbin/zakura-continuous-sync.py status")
         if not ok:
@@ -607,17 +823,37 @@ def cmd_audit(args: argparse.Namespace) -> int:
             )
             continue
         assert isinstance(data, dict)
-        problem = audit_problem(data, args.max_completion_age)
+        statuses[node.name] = data
+        problem = audit_problem(data, args.max_completion_age, destination)
         if problem:
             problems[node.name] = problem
 
     state_file = Path(args.state_file) if args.state_file else None
     previous = load_audit_state(state_file)
     timestamp = now()
+    last_digest = previous.get("last_digest_at", timestamp)
+    digest_due = not args.node and timestamp - last_digest >= args.reminder_interval
+    # A targeted audit cannot recover nodes it did not inspect.
+    selected = {node.name for node in nodes}
+    prior_problems = previous.get("problems", {})
+    scoped_previous = {"problems": {k: v for k, v in prior_problems.items() if k in selected}}
     new_lines, reminder_lines, recovered_lines, state = audit_transitions(
-        problems, previous, args.reminder_interval, timestamp
+        problems, scoped_previous, args.reminder_interval, timestamp,
+        reminders_due=digest_due,
+        destination=destination,
     )
+    state["problems"].update({k: v for k, v in prior_problems.items() if k not in selected})
+    completion_lines, state["completions"] = completion_updates(
+        statuses, previous, digest_due, {node.name: sync_label(node) for node in nodes}
+    )
+    state["last_digest_at"] = timestamp if digest_due else last_digest
     text = audit_message(new_lines, reminder_lines, recovered_lines)
+    if completion_lines:
+        text += ("\n\n" if text else "") + (
+            ":memo: Mainnet sync summary — since previous digest\n\n"
+            + "\n\n".join(completion_lines)
+            + "\n\nRuns listed oldest first. Each run starts from genesis."
+        )
 
     posted = True
     if text:
@@ -694,8 +930,8 @@ def parse_args() -> argparse.Namespace:
     audit.add_argument(
         "--reminder-interval",
         type=int,
-        default=21600,
-        help="re-send an unresolved failure at most this often, in seconds (default 6h)",
+        default=86400,
+        help="digest interval for unresolved failures and completions (default 24h)",
     )
     return parser.parse_args()
 

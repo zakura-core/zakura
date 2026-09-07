@@ -135,6 +135,13 @@ fn event_cases() -> Vec<EventCase> {
     let batch_evidence = EvidenceId::from_digest([13; 32]);
     let repair_delivery_id = EvidenceId::from_digest([14; 32]);
     let repair_delivery = delivery(repair_delivery_id, block::Hash([15; 32]), body_owner.into());
+    let repair_target = Frontier::new(block::Height(1), block::Hash([15; 32]));
+    let repair_episode = crate::VctRepairContext::unconstrained(
+        repair_target,
+        crate::HeaderLocator::for_continuation(parent),
+        None,
+    )
+    .episode;
     let full_state_evidence = EvidenceId::from_digest([16; 32]);
     let body_evidence = EvidenceId::from_digest([17; 32]);
     let operator_evidence = EvidenceId::from_digest([18; 32]);
@@ -194,7 +201,8 @@ fn event_cases() -> Vec<EventCase> {
                 body_owner.into(),
                 TargetCompletion::SelectedAuxiliaryRepair {
                     common_ancestor: parent,
-                    selected_target: Frontier::new(block::Height(1), block::Hash([15; 32])),
+                    selected_target: repair_target,
+                    episode: repair_episode,
                 },
                 vec![repair_delivery],
             ),
@@ -211,7 +219,8 @@ fn event_cases() -> Vec<EventCase> {
                 body_owner.into(),
                 TargetCompletion::SelectedAuxiliaryRepair {
                     common_ancestor: parent,
-                    selected_target: Frontier::new(block::Height(1), block::Hash([15; 32])),
+                    selected_target: repair_target,
+                    episode: repair_episode,
                 },
                 Vec::new(),
             ),

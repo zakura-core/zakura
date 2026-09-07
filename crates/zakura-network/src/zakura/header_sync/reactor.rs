@@ -324,6 +324,7 @@ enum HeaderRequestTerminal {
     Disconnected,
     LocalError,
     MalformedResponse,
+    ExcludedAuxiliaryInput,
     RepairObsolete,
     ResourceStalled,
     SendError,
@@ -358,6 +359,7 @@ impl HeaderRequestTerminal {
             Self::Disconnected => "disconnected",
             Self::LocalError => "local_error",
             Self::MalformedResponse => "malformed_response",
+            Self::ExcludedAuxiliaryInput => "excluded_auxiliary_input",
             Self::RepairObsolete => "repair_obsolete",
             Self::ResourceStalled => "resource_stalled",
             Self::SendError => "send_error",
@@ -375,6 +377,8 @@ impl HeaderRequestTerminal {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum VctRepairRetryAttribution {
     Supplier,
+    ExcludedInput,
+    Stale,
     Local,
 }
 
@@ -401,6 +405,22 @@ impl VctRepairRetry {
             attribution: VctRepairRetryAttribution::Local,
         }
     }
+
+    fn excluded_input(source: zakura_header_chain::SourceId) -> Self {
+        Self {
+            source,
+            terminal: HeaderRequestTerminal::ExcludedAuxiliaryInput,
+            attribution: VctRepairRetryAttribution::ExcludedInput,
+        }
+    }
+
+    fn stale(source: zakura_header_chain::SourceId) -> Self {
+        Self {
+            source,
+            terminal: HeaderRequestTerminal::RepairObsolete,
+            attribution: VctRepairRetryAttribution::Stale,
+        }
+    }
 }
 
 fn vct_error_retry(
@@ -408,6 +428,9 @@ fn vct_error_retry(
     terminal: HeaderRequestTerminal,
     error: &zakura_header_chain::HeaderChainError,
 ) -> VctRepairRetry {
+    if error.category == zakura_header_chain::ErrorCategory::StaleTargetOrGeneration {
+        return VctRepairRetry::stale(source);
+    }
     let attributed_source = match error.attribution {
         zakura_header_chain::Attribution::HeaderPeer(attributed)
         | zakura_header_chain::Attribution::BodyPeer(attributed)
@@ -423,8 +446,9 @@ fn vct_error_retry(
 
 fn vct_send_retry_attribution(error: &OrderedSendError) -> VctRepairRetryAttribution {
     match error {
-        OrderedSendError::Full | OrderedSendError::Closed => VctRepairRetryAttribution::Supplier,
-        OrderedSendError::Encode(_) => VctRepairRetryAttribution::Local,
+        OrderedSendError::Full | OrderedSendError::Closed | OrderedSendError::Encode(_) => {
+            VctRepairRetryAttribution::Local
+        }
     }
 }
 
@@ -460,8 +484,8 @@ fn vct_repair_task(
 fn vct_repair_predecessor(task: &RepairRequirement) -> Option<zakura_header_chain::Frontier> {
     let context = match &task.state {
         RepairPolicyState::Ready { context }
-        | RepairPolicyState::SupplierBackoff { context, .. }
         | RepairPolicyState::LocalBackoff { context, .. }
+        | RepairPolicyState::StateBlocked { context, .. }
         | RepairPolicyState::Assigned { context } => context,
         RepairPolicyState::NeedsContext
         | RepairPolicyState::QueryingContext { .. }
@@ -487,8 +511,12 @@ struct VctSupplierRejections {
     unsupported_schema: u64,
     /// Peers already serving another header request.
     already_serving: u64,
-    /// Peers already tried in the current supplier cycle.
+    /// Peers already tried in the current durable episode.
     already_tried: u64,
+    /// Peers that already supplied a retained rooted payload for this target.
+    retained_source: u64,
+    /// Peers that already returned semantic input excluded by this episode.
+    excluded_input: u64,
     /// Eligible peers whose request could not enter the ordered send queue.
     send_failed: u64,
 }
@@ -500,7 +528,6 @@ enum VctRepairStallOutcome {
     LocalOperationPending,
     LocalSendFailure,
     NoEligibleSupplier,
-    SupplierCycleExhausted,
     SupplierFailure,
     SupplierSendFailure,
 }
@@ -513,7 +540,6 @@ impl VctRepairStallOutcome {
             Self::LocalOperationPending => "local_operation_pending",
             Self::LocalSendFailure => "local_send_failed",
             Self::NoEligibleSupplier => "no_eligible_supplier",
-            Self::SupplierCycleExhausted => "supplier_cycle_exhausted",
             Self::SupplierFailure => "supplier_failure",
             Self::SupplierSendFailure => "supplier_send_failed",
         }
@@ -525,10 +551,9 @@ impl VctRepairStallOutcome {
             | Self::LocalFailure
             | Self::LocalOperationPending
             | Self::LocalSendFailure => "local",
-            Self::NoEligibleSupplier
-            | Self::SupplierCycleExhausted
-            | Self::SupplierFailure
-            | Self::SupplierSendFailure => "supplier",
+            Self::NoEligibleSupplier | Self::SupplierFailure | Self::SupplierSendFailure => {
+                "supplier"
+            }
         }
     }
 }
@@ -577,6 +602,7 @@ impl VctLocalOperation {
         let HeaderTargetPurpose::SelectedAuxiliaryRepair {
             selected_target,
             repair_generation,
+            ..
         } = purpose
         else {
             return None;
@@ -1350,10 +1376,12 @@ impl HeaderSyncReactor {
             response.common_ancestor_height,
             response.common_ancestor_hash,
         );
+        let repair_episode = self.peer_work_queue.repair_episode(active.owner);
         if let HeaderTargetPurpose::SelectedAuxiliaryRepair {
             selected_target, ..
         } = &active.purpose
         {
+            let episode = repair_episode.expect("an active repair binds its evidence episode");
             let exact_shape = response.target_tip_hash == selected_target.hash
                 && active.sent_locator.entries() == [returned_ancestor]
                 && response.entries.len() == 1
@@ -1373,6 +1401,26 @@ impl HeaderSyncReactor {
                     ),
                 );
                 self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
+                return;
+            }
+            let repair_owner = active
+                .owner
+                .body_owner()
+                .expect("an auxiliary repair has body authority");
+            let input = response.entries[0]
+                .tree_aux
+                .expect("the exact repair response has schema-1 auxiliary input");
+            let excluded = self.vct_repair.get(repair_owner).is_some_and(|task| {
+                let RepairPolicyState::Assigned { context } = &task.state else {
+                    return false;
+                };
+                context.target == *selected_target
+                    && context.episode == episode
+                    && (context.excludes(input) || context.retains_payload(input))
+            });
+            if excluded {
+                metrics::counter!("sync.header.vct.repair.excluded_input.total").increment(1);
+                self.retry_vct_repair(repair_owner, VctRepairRetry::excluded_input(active.source));
                 return;
             }
         }
@@ -1480,6 +1528,7 @@ impl HeaderSyncReactor {
                 } => zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                     common_ancestor,
                     selected_target,
+                    episode: repair_episode.expect("an active repair binds its evidence episode"),
                 },
             };
             let repair = matches!(
@@ -1782,21 +1831,58 @@ impl HeaderSyncReactor {
                     metrics::counter!("sync.header.vct.repair.admitted.total").increment(1);
                 }
                 HeaderTargetAdmissionResult::Failed(error) => {
-                    self.retry_vct_repair(
-                        repair_owner,
-                        vct_error_retry(source, HeaderRequestTerminal::TargetRejected, &error),
-                    );
+                    if error.is_auxiliary_capacity_refusal() {
+                        let blocked_at = self
+                            .committed_snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.state_version)
+                            .or_else(|| {
+                                self.vct_repair.get(repair_owner).and_then(|task| {
+                                    let RepairPolicyState::Assigned { context } = &task.state
+                                    else {
+                                        return None;
+                                    };
+                                    Some(context.state_version)
+                                })
+                            });
+                        let blocked = blocked_at.is_some_and(|state_version| {
+                            self.vct_repair.get_mut(repair_owner).is_some_and(|task| {
+                                task.wait_for_state_change(state_version).is_ok()
+                            })
+                        });
+                        if blocked {
+                            if let Some(task) = self.vct_repair.get(repair_owner) {
+                                self.emit_vct_repair_state(
+                                    task,
+                                    "wait",
+                                    Some("auxiliary_capacity"),
+                                );
+                            }
+                        } else {
+                            self.retry_vct_repair(
+                                repair_owner,
+                                VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
+                            );
+                        }
+                        metrics::counter!("sync.header.vct.repair.auxiliary_capacity.total")
+                            .increment(1);
+                    } else {
+                        self.retry_vct_repair(
+                            repair_owner,
+                            vct_error_retry(source, HeaderRequestTerminal::TargetRejected, &error),
+                        );
+                    }
                     self.handle_typed_failure(peer, source, &error);
                 }
-                HeaderTargetAdmissionResult::ResourceStalled(_) => {
-                    // A local resource alarm stalled the commit, so nothing judged the delivery.
-                    // Back the task off instead of dropping it: the committer no longer bumps the
-                    // repair generation while it polls, so a dropped task would wait for an
-                    // unrelated snapshot change that a stalled node has no way to produce.
-                    self.retry_vct_repair(
-                        repair_owner,
-                        VctRepairRetry::local(source, HeaderRequestTerminal::ResourceStalled),
-                    );
+                HeaderTargetAdmissionResult::ResourceStalled(receipt) => {
+                    let blocked = self.vct_repair.get_mut(repair_owner).is_some_and(|task| {
+                        task.wait_for_state_change(receipt.state_version).is_ok()
+                    });
+                    if blocked {
+                        if let Some(task) = self.vct_repair.get(repair_owner) {
+                            self.emit_vct_repair_state(task, "wait", Some("resource_state_change"));
+                        }
+                    }
                     metrics::counter!("sync.header.vct.repair.resource_stalled.total").increment(1);
                 }
             }
@@ -1987,18 +2073,30 @@ impl HeaderSyncReactor {
         if let Some(peer) = peer {
             self.request_deadlines.remove(&peer);
         }
+        if retry.attribution == VctRepairRetryAttribution::Stale {
+            if let Some(task) = self.vct_repair.remove(owner) {
+                self.emit_vct_repair_state(&task, "terminal", Some("stale_episode"));
+            }
+            self.schedule_current_vct_repair();
+            return;
+        }
         let now = Instant::now();
         let retry_scheduled =
             self.vct_repair
                 .get_mut(owner)
                 .is_some_and(|task| match retry.attribution {
                     VctRepairRetryAttribution::Supplier => task.retry(source).is_ok(),
+                    VctRepairRetryAttribution::ExcludedInput => task.exclude_input(source).is_ok(),
+                    VctRepairRetryAttribution::Stale => false,
                     VctRepairRetryAttribution::Local => task
                         .defer_local_retry_until(now + VCT_REPAIR_RETRY_INTERVAL)
                         .is_ok(),
                 });
         if retry_scheduled {
-            if retry.attribution == VctRepairRetryAttribution::Supplier {
+            if matches!(
+                retry.attribution,
+                VctRepairRetryAttribution::Supplier | VctRepairRetryAttribution::ExcludedInput
+            ) {
                 self.rotate_vct_supplier(source);
             }
             if let Some(task) = self.vct_repair.current().cloned() {
@@ -2007,6 +2105,8 @@ impl HeaderSyncReactor {
                     "retry",
                     Some(match retry.attribution {
                         VctRepairRetryAttribution::Supplier => "supplier_retry",
+                        VctRepairRetryAttribution::ExcludedInput => "excluded_input",
+                        VctRepairRetryAttribution::Stale => "stale_episode",
                         VctRepairRetryAttribution::Local => "local_backoff",
                     }),
                 );
@@ -2019,13 +2119,20 @@ impl HeaderSyncReactor {
                             VctRepairRetryAttribution::Supplier => {
                                 VctRepairStallOutcome::SupplierFailure
                             }
+                            VctRepairRetryAttribution::ExcludedInput => {
+                                VctRepairStallOutcome::SupplierFailure
+                            }
+                            VctRepairRetryAttribution::Stale => VctRepairStallOutcome::LocalFailure,
                             VctRepairRetryAttribution::Local => VctRepairStallOutcome::LocalFailure,
                         },
                         now,
                     );
                 }
             }
-            if retry.attribution == VctRepairRetryAttribution::Supplier {
+            if matches!(
+                retry.attribution,
+                VctRepairRetryAttribution::Supplier | VctRepairRetryAttribution::ExcludedInput
+            ) {
                 self.try_assign_vct_repair();
             }
         }
@@ -2147,6 +2254,8 @@ impl HeaderSyncReactor {
                 rejected_schema = record.rejections.unsupported_schema,
                 rejected_busy = record.rejections.already_serving,
                 rejected_tried = record.rejections.already_tried,
+                retained_source = record.rejections.retained_source,
+                excluded_input = record.rejections.excluded_input,
                 send_failed = record.rejections.send_failed,
                 ?stalled_for,
                 "VCT: repair has not completed; the parked checkpoint commit cannot advance"
@@ -2797,6 +2906,7 @@ impl HeaderSyncReactor {
         let now = Instant::now();
         self.committed_snapshot = Some(snapshot);
         self.schedule_current_vct_repair();
+        self.request_vct_repair_context();
         for state in self.peer_state.values_mut() {
             match state.status_publisher.as_mut() {
                 Some(publisher) => publisher.observe(status.clone(), now),
@@ -2931,7 +3041,7 @@ impl HeaderSyncReactor {
     fn request_vct_repair_context(&mut self) {
         let now = Instant::now();
         if let Some(task) = self.vct_repair.current_mut() {
-            task.resume_retry_cycle(now);
+            task.resume_retry(now);
         }
         let Some(task) = self.vct_repair.needs_context() else {
             return;
@@ -2965,6 +3075,10 @@ impl HeaderSyncReactor {
         }
         match result {
             VctRepairContextResult::Resolved(context) => {
+                let current_state_version = self
+                    .committed_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.state_version);
                 if self
                     .vct_repair
                     .get_mut(owner)
@@ -2975,9 +3089,16 @@ impl HeaderSyncReactor {
                     self.vct_repair.remove(owner);
                     return;
                 }
+                if let Some(current_state_version) = current_state_version {
+                    self.vct_repair
+                        .get_mut(owner)
+                        .expect("the resolved repair remains owned")
+                        .observe_state_change(current_state_version);
+                }
                 if let Some(task) = self.vct_repair.get(owner) {
                     self.emit_vct_repair_state(task, "context_resolved", Some("resolved"));
                 }
+                self.request_vct_repair_context();
                 self.try_assign_vct_repair();
             }
             VctRepairContextResult::Stale => {
@@ -3001,8 +3122,11 @@ impl HeaderSyncReactor {
 
     fn try_assign_vct_repair(&mut self) {
         let now = Instant::now();
+        let connected_sources: HashSet<_> =
+            self.peer_state.keys().map(source_id_from_peer).collect();
         if let Some(task) = self.vct_repair.current_mut() {
-            task.resume_retry_cycle(now);
+            task.retain_connected_sources(&connected_sources);
+            task.resume_retry(now);
         }
         let Some(task) = self.vct_repair.ready().cloned() else {
             return;
@@ -3050,26 +3174,19 @@ impl HeaderSyncReactor {
                 continue;
             }
             let source = source_id_from_peer(peer);
+            if context.retains_source(source) {
+                rejections.retained_source += 1;
+                continue;
+            }
+            if task.excluded_input_sources.contains(&source) {
+                rejections.excluded_input += 1;
+                continue;
+            }
             if task.tried_sources.contains(&source) {
                 rejections.already_tried += 1;
                 continue;
             }
             candidates.push((peer.clone(), source, state.session.clone(), status.clone()));
-        }
-        if task.supplier_cycle_exhausted() {
-            self.note_vct_repair_stall(
-                &task,
-                predecessor,
-                rejections,
-                VctRepairStallOutcome::SupplierCycleExhausted,
-                now,
-            );
-            let _ = self
-                .vct_repair
-                .get_mut(task.owner)
-                .expect("the ready repair was cloned above")
-                .defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
-            return;
         }
         if candidates.is_empty() {
             self.note_vct_repair_stall(
@@ -3079,11 +3196,6 @@ impl HeaderSyncReactor {
                 VctRepairStallOutcome::NoEligibleSupplier,
                 now,
             );
-            let _ = self
-                .vct_repair
-                .get_mut(task.owner)
-                .expect("the ready repair was cloned above")
-                .defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL);
             return;
         }
         let mut local_capacity_unavailable = false;
@@ -3109,18 +3221,12 @@ impl HeaderSyncReactor {
                     self.emit_queue_send_failed(&peer, &session, "GetHeaders", &error, None);
                     rejections.send_failed += 1;
                     match vct_send_retry_attribution(&error) {
-                        VctRepairRetryAttribution::Supplier => {
+                        VctRepairRetryAttribution::Supplier
+                        | VctRepairRetryAttribution::ExcludedInput => {
                             if let Some(current) = self.vct_repair.get_mut(task.owner) {
                                 let _ = current.record_failed_source(source);
                             }
                             self.rotate_vct_supplier(source);
-                            if self
-                                .vct_repair
-                                .get(task.owner)
-                                .is_some_and(RepairRequirement::supplier_cycle_exhausted)
-                            {
-                                break;
-                            }
                         }
                         VctRepairRetryAttribution::Local => {
                             let deferred =
@@ -3141,6 +3247,9 @@ impl HeaderSyncReactor {
                             }
                             return;
                         }
+                        VctRepairRetryAttribution::Stale => unreachable!(
+                            "ordered-send failures cannot report a stale state episode"
+                        ),
                     }
                     continue;
                 }
@@ -3179,23 +3288,26 @@ impl HeaderSyncReactor {
                 .peer_work_queue
                 .stage(peer.clone(), target.clone(), PeerWorkPriority::Normal)
                 != QueueWorkResult::NeedsLocator
-                || !self.peer_work_queue.start(ActiveHeaderRequest {
-                    purpose: HeaderTargetPurpose::SelectedAuxiliaryRepair {
-                        selected_target: context.target,
-                        repair_generation: task.repair_generation,
+                || !self.peer_work_queue.start_repair(
+                    ActiveHeaderRequest {
+                        purpose: HeaderTargetPurpose::SelectedAuxiliaryRepair {
+                            selected_target: context.target,
+                            repair_generation: task.repair_generation,
+                        },
+                        peer: peer.clone(),
+                        source,
+                        target,
+                        sent_locator: context.locator.clone(),
+                        request_id,
+                        owner: wire_owner.into(),
+                        common_ancestor: None,
+                        entries: Vec::new(),
+                        phase: HeaderTargetPhase::Receiving,
+                        max_header_count: 1,
+                        tree_aux_schema: AuxSchema::V1,
                     },
-                    peer: peer.clone(),
-                    source,
-                    target,
-                    sent_locator: context.locator.clone(),
-                    request_id,
-                    owner: wire_owner.into(),
-                    common_ancestor: None,
-                    entries: Vec::new(),
-                    phase: HeaderTargetPhase::Receiving,
-                    max_header_count: 1,
-                    tree_aux_schema: AuxSchema::V1,
-                })
+                    context.episode,
+                )
             {
                 session.cancel_request(request_id);
                 self.peer_work_queue.cancel_request_reservation(&peer);
@@ -3217,8 +3329,7 @@ impl HeaderSyncReactor {
             return;
         }
         if let Some(current) = self.vct_repair.get(task.owner).cloned() {
-            let stall_outcome = if rejections.send_failed > 0 || current.supplier_cycle_exhausted()
-            {
+            let stall_outcome = if rejections.send_failed > 0 {
                 Some(VctRepairStallOutcome::SupplierSendFailure)
             } else if local_capacity_unavailable {
                 Some(VctRepairStallOutcome::LocalCapacityUnavailable)
@@ -3229,10 +3340,12 @@ impl HeaderSyncReactor {
                 self.note_vct_repair_stall(&current, predecessor, rejections, stall_outcome, now);
             }
         }
-        let _ = self
-            .vct_repair
-            .get_mut(task.owner)
-            .and_then(|task| task.defer_retry_until(now + VCT_REPAIR_RETRY_INTERVAL).ok());
+        if local_capacity_unavailable {
+            let _ = self.vct_repair.get_mut(task.owner).and_then(|task| {
+                task.defer_local_retry_until(now + VCT_REPAIR_RETRY_INTERVAL)
+                    .ok()
+            });
+        }
     }
 
     fn retire_obsolete_work(&mut self, snapshot: &zakura_header_chain::EngineSnapshot) {
@@ -3299,6 +3412,8 @@ impl HeaderSyncReactor {
             {
                 self.retire_peer_work(&peer, HeaderRequestTerminal::SnapshotObsolete);
             }
+        } else if let Some(task) = self.vct_repair.current_mut() {
+            task.observe_state_change(snapshot.state_version);
         }
         self.completed_targets
             .retain_current(snapshot.header_generation, snapshot.frontiers.finalized);
@@ -4225,15 +4340,24 @@ impl HeaderSyncReactor {
                     completion,
                     entries,
                 } => Box::pin(async move {
-                    if matches!(purpose, HeaderTargetPurpose::SelectedAuxiliaryRepair { .. })
-                        && !matches!(
-                            completion,
+                    if matches!(
+                        &purpose,
+                        HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+                    ) && !matches!(
+                        (&purpose, completion),
+                        (
+                            HeaderTargetPurpose::SelectedAuxiliaryRepair {
+                                selected_target: purpose_target,
+                                ..
+                            },
                             zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                                 selected_target,
                                 ..
-                            } if selected_target == target && entries.len() == 1
-                        )
-                    {
+                            },
+                        ) if *purpose_target == target
+                            && selected_target == target
+                            && entries.len() == 1
+                    ) {
                         let result = HeaderTargetPreparationResult::Failed(std::sync::Arc::new(
                             zakura_header_chain::HeaderChainError::stale_target(
                                 zakura_header_chain::ErrorSubject::Branch(

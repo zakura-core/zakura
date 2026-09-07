@@ -21,7 +21,9 @@ pub use config::{
     MAX_AUX_DELIVERIES_TOTAL_V1, MAX_CANDIDATE_TIPS_V1, MAX_HEADERS_PER_TRANSITION_V1,
     MAX_NON_FINALIZED_NODES_V1, MAX_STAGED_TARGETS_V1,
 };
-pub use discovery::{HeaderLocator, VctRepairContext, MAX_HEADER_LOCATOR_HASHES};
+pub use discovery::{
+    AuxiliaryRequirementEpisode, HeaderLocator, VctRepairContext, MAX_HEADER_LOCATOR_HASHES,
+};
 pub use error::{Attribution, ErrorCategory, ErrorSubject, HeaderChainError, RuleId};
 #[cfg(any(test, feature = "fuzz-impl"))]
 pub use fuzz::{replay_fork_transition_bytes, ForkReplaySummary};
@@ -36,6 +38,7 @@ pub use identity::{
     AuxObservationId, BodyWorkEpoch, BranchId, CounterExhausted, EvidenceId, FinalityEpoch,
     HeaderGeneration, HeaderId, OperatorInvalidationId, SourceId, StateVersion, VerifiedGeneration,
 };
+pub(crate) use transition::semantic_payload_fingerprint;
 pub use transition::*;
 pub use validation::{
     infer_height, prepare_headers, validate_commitment_structure, validate_compact_target,

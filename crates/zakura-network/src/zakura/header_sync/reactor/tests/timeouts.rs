@@ -5,12 +5,11 @@ use std::sync::{
 
 use futures::{FutureExt, StreamExt};
 use tokio::sync::Notify;
+use zakura_header_chain::SourceId;
 use zakura_node_services::header_chain as port;
 
 use super::*;
-use crate::zakura::header_sync::scheduler::{
-    peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, repair::MAX_SUPPLIERS_PER_CYCLE,
-};
+use crate::zakura::header_sync::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1;
 
 #[derive(Debug)]
 struct PendingVctLocalPort {
@@ -168,15 +167,19 @@ fn seed_vct_active_request(
         active.target.status.selected_tip_height,
         active.target.status.selected_tip_hash,
     );
+    let context = zakura_header_chain::VctRepairContext::unconstrained(
+        target,
+        zakura_header_chain::HeaderLocator::for_continuation(snapshot.frontiers.finalized),
+        None,
+    );
     active.purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
         selected_target: target,
         repair_generation: 11,
     };
     active.phase = phase;
-    let context = zakura_header_chain::VctRepairContext {
-        target,
-        locator: zakura_header_chain::HeaderLocator::for_continuation(snapshot.frontiers.finalized),
-    };
+    reactor
+        .peer_work_queue
+        .bind_repair_episode_for_test(owner.into(), context.episode);
     let mut task = RepairRequirement::new(owner, target.height, 11);
     task.state = RepairPolicyState::Assigned {
         context: context.clone(),
@@ -272,6 +275,7 @@ fn prepared_vct_target(
             completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                 common_ancestor: anchor,
                 selected_target: context.target,
+                episode: context.episode,
             },
             batch,
             aux: vec![delivery],
@@ -330,6 +334,7 @@ impl VctLocalFixture {
                 completion: zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                     common_ancestor: self.snapshot.frontiers.finalized,
                     selected_target: self.context.target,
+                    episode: self.context.episode,
                 },
                 entries: active.entries.clone(),
             },
@@ -436,10 +441,11 @@ impl ReadyVctRepairFixture {
             INTERNAL_VCT_REPAIR_SESSION_ID,
             std::num::NonZeroU64::new(1).expect("one is nonzero"),
         );
-        let context = zakura_header_chain::VctRepairContext {
+        let context = zakura_header_chain::VctRepairContext::unconstrained(
             target,
-            locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-        };
+            zakura_header_chain::HeaderLocator::for_continuation(anchor),
+            None,
+        );
         Self {
             _handle: handle,
             reactor,
@@ -701,7 +707,7 @@ fn request_timeout_retires_owned_work_and_wakes_maintenance() {
 }
 
 #[test]
-fn vct_request_timeout_keeps_required_work_and_rotates_the_supplier() {
+fn vct_request_timeout_keeps_required_work_and_releases_a_disconnected_supplier() {
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let snapshot = committed_snapshot(anchor);
@@ -730,10 +736,11 @@ fn vct_request_timeout_keeps_required_work_and_rotates_the_supplier() {
     );
     let mut task = RepairRequirement::new(owner, target.height, 11);
     let deadline = Instant::now();
-    let context = zakura_header_chain::VctRepairContext {
+    let context = zakura_header_chain::VctRepairContext::unconstrained(
         target,
-        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-    };
+        zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        None,
+    );
     task.state = RepairPolicyState::Assigned {
         context: context.clone(),
     };
@@ -746,6 +753,9 @@ fn vct_request_timeout_keeps_required_work_and_rotates_the_supplier() {
         selected_target: target,
         repair_generation: 11,
     };
+    reactor
+        .peer_work_queue
+        .bind_repair_episode_for_test(owner.into(), context.episode);
     reactor
         .peer_work_queue
         .active_mut(&peer)
@@ -762,14 +772,11 @@ fn vct_request_timeout_keeps_required_work_and_rotates_the_supplier() {
         .expect("a timeout cannot discard a current repair requirement");
     assert!(matches!(
         &task.state,
-        RepairPolicyState::SupplierBackoff {
-            context: retained,
-            retry_at,
-        } if retained == &context && *retry_at > deadline
+        RepairPolicyState::Ready { context: retained } if retained == &context
     ));
     assert_eq!(task.attempts, 1);
-    assert!(task.tried_sources.contains(&source));
-    assert!(task.next_deadline().is_some());
+    assert!(!task.tried_sources.contains(&source));
+    assert!(task.next_deadline().is_none());
 }
 
 #[test]
@@ -969,15 +976,12 @@ fn vct_admission_failures_preserve_retry_policy_state() {
             .current()
             .expect("an admission failure cannot recreate the repair task");
         assert_eq!(task.attempts, 2);
-        assert!(task.tried_sources.contains(&prior));
         if supplier_attributed {
-            assert!(task.tried_sources.contains(&source));
+            assert!(!task.tried_sources.contains(&prior));
+            assert!(!task.tried_sources.contains(&source));
             assert!(matches!(
                 &task.state,
-                RepairPolicyState::SupplierBackoff {
-                    context: retained,
-                    ..
-                } if retained == &context
+                RepairPolicyState::Ready { context: retained } if retained == &context
             ));
             assert_eq!(
                 reactor
@@ -987,6 +991,7 @@ fn vct_admission_failures_preserve_retry_policy_state() {
                 VctRepairStallOutcome::NoEligibleSupplier
             );
         } else {
+            assert!(task.tried_sources.contains(&prior));
             assert!(!task.tried_sources.contains(&source));
             assert!(matches!(
                 &task.state,
@@ -1007,19 +1012,182 @@ fn vct_admission_failures_preserve_retry_policy_state() {
 }
 
 #[test]
+fn vct_resource_refusal_waits_for_a_newer_committed_state() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the resource refusal fixture builds");
+    let peer = peer();
+    let (source, owner, context) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Applying,
+    );
+    reactor.handle_header_target_admission_ready(
+        peer.clone(),
+        source,
+        owner,
+        HeaderTargetAdmissionResult::ResourceStalled(zakura_header_chain::CommittedStallReceipt {
+            state_version: snapshot.state_version,
+            alarm_changed: true,
+            attempted_branch: Some(owner.header_authority().branch),
+        }),
+    );
+
+    let task = reactor
+        .vct_repair
+        .current()
+        .expect("the committed refusal keeps the repair requirement");
+    assert_eq!(
+        task.state,
+        RepairPolicyState::StateBlocked {
+            context,
+            state_version: snapshot.state_version,
+        }
+    );
+    assert_eq!(task.attempts, 1);
+    assert!(task.tried_sources.is_empty());
+    assert!(task.next_deadline().is_none());
+    assert!(reactor.peer_work_queue.active(&peer).is_none());
+
+    reactor.try_assign_vct_repair();
+    assert!(reactor.peer_work_queue.active(&peer).is_none());
+}
+
+#[test]
+fn vct_auxiliary_capacity_refusal_waits_without_timed_replay() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, mut actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the capacity refusal fixture builds");
+    let peer = peer();
+    let (source, owner, context) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Applying,
+    );
+    let repair_height = context.target.height;
+
+    reactor.handle_header_target_admission_ready(
+        peer.clone(),
+        source,
+        owner,
+        HeaderTargetAdmissionResult::Failed(std::sync::Arc::new(
+            zakura_header_chain::HeaderChainError::auxiliary_capacity(None),
+        )),
+    );
+
+    let task = reactor
+        .vct_repair
+        .current()
+        .expect("the capacity refusal keeps the repair requirement");
+    assert_eq!(
+        task.state,
+        RepairPolicyState::StateBlocked {
+            context,
+            state_version: snapshot.state_version,
+        }
+    );
+    assert_eq!(task.attempts, 1);
+    assert!(task.tried_sources.is_empty());
+    assert!(task.next_deadline().is_none());
+    assert!(reactor.peer_work_queue.active(&peer).is_none());
+
+    reactor.vct_repair_status = zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: repair_height,
+        },
+        generation: 11,
+    };
+    let mut advanced = snapshot;
+    advanced.state_version = advanced
+        .state_version
+        .checked_next()
+        .expect("the committed state version advances");
+    advanced.frontiers.header_best = zakura_header_chain::Frontier::new(
+        repair_height,
+        owner.header_authority().branch.target_tip_hash,
+    );
+    reactor.observe_latest_committed_snapshot(advanced);
+    let actions: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            HeaderPortOperation::QueryVctRepairContext {
+                owner: query_owner,
+                ..
+            } if *query_owner == owner.body_owner().expect("the repair owner is a body owner")
+        )),
+        "new committed state must query the blocked repair context: {actions:?}; task: {:?}",
+        reactor.vct_repair.current()
+    );
+}
+
+#[test]
 fn vct_send_failures_have_explicit_attribution() {
     assert_eq!(
         vct_send_retry_attribution(&OrderedSendError::Full),
-        VctRepairRetryAttribution::Supplier
+        VctRepairRetryAttribution::Local
     );
     assert_eq!(
         vct_send_retry_attribution(&OrderedSendError::Closed),
-        VctRepairRetryAttribution::Supplier
+        VctRepairRetryAttribution::Local
     );
     assert_eq!(
         vct_send_retry_attribution(&OrderedSendError::Encode("fixture failure".into())),
         VctRepairRetryAttribution::Local
     );
+}
+
+#[test]
+fn stale_vct_episode_discards_the_claim_and_reads_current_state() {
+    let (mut reactor, mut snapshot) = direct_vct_reactor(PendingVctLocalPort::pending(true));
+    let peer = peer();
+    let (source, owner, context) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer,
+        7,
+        HeaderTargetPhase::Applying,
+    );
+    let owner = owner
+        .body_owner()
+        .expect("the seeded auxiliary repair has body authority");
+    snapshot.frontiers.header_best = context.target;
+    snapshot.header_best_score = zakura_header_chain::ChainScore::new(
+        zakura_header_chain::SuffixWork::new(zakura_chain::work::difficulty::U256::from(1_u8)),
+        context.target.hash,
+    );
+    reactor.committed_snapshot = Some(snapshot);
+    reactor.vct_repair_status = zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: context.target.height,
+        },
+        generation: 11,
+    };
+
+    reactor.retry_vct_repair(owner, VctRepairRetry::stale(source));
+
+    let replacement = reactor
+        .vct_repair
+        .current()
+        .expect("the unchanged durable need schedules a fresh context read");
+    assert_eq!(replacement.repair_generation, 11);
+    assert_eq!(replacement.height, context.target.height);
+    assert!(matches!(
+        replacement.state,
+        RepairPolicyState::QueryingContext { .. }
+    ));
 }
 
 #[test]
@@ -1047,10 +1215,11 @@ fn generation_stall_escalation_owns_a_maintenance_deadline() {
         INTERNAL_VCT_REPAIR_SESSION_ID,
         std::num::NonZeroU64::new(1).expect("one is nonzero"),
     );
-    let context = zakura_header_chain::VctRepairContext {
-        target: repair_target,
-        locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-    };
+    let context = zakura_header_chain::VctRepairContext::unconstrained(
+        repair_target,
+        zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        None,
+    );
     let mut task = RepairRequirement::new(owner, repair_target.height, 11);
     task.state = RepairPolicyState::LocalBackoff {
         context,
@@ -1130,12 +1299,12 @@ fn local_capacity_backoff_starts_the_generation_stall_clock() {
         .expect("local capacity backoff keeps the repair");
     assert!(matches!(
         &task.state,
-        RepairPolicyState::SupplierBackoff {
+        RepairPolicyState::LocalBackoff {
             context: retained,
             ..
         } if retained == &fixture.context
     ));
-    assert_eq!(task.attempts, 0);
+    assert_eq!(task.attempts, 1);
     assert!(task.tried_sources.is_empty());
     assert_eq!(
         fixture
@@ -1148,7 +1317,50 @@ fn local_capacity_backoff_starts_the_generation_stall_clock() {
 }
 
 #[test]
-fn bounded_supplier_cycles_rotate_to_the_fourth_supplier() {
+fn retained_rooted_supplier_is_skipped_for_an_untried_supplier() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[1, 2], 7);
+    let retained_source = source_id_from_peer(&peers[0]);
+    let retained = zakura_header_chain::AuxDelivery::new(
+        zakura_header_chain::EvidenceId::from_digest([0x51; 32]),
+        fixture.target.hash,
+        retained_source,
+        fixture.owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(zakura_header_chain::TreeAuxRecordV1 {
+            height: fixture.target.height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 1,
+            orchard_tx_count: 2,
+            ironwood_tx_count: 3,
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0x52; 32]),
+        }),
+    );
+    fixture.context = zakura_header_chain::VctRepairContext::from_durable_rows(
+        fixture.target,
+        zakura_header_chain::HeaderLocator::for_continuation(fixture.anchor),
+        fixture.snapshot.state_version,
+        None,
+        true,
+        &[zakura_header_chain::UntrustedAuxDeliveryRow::new(
+            retained,
+            0,
+            [None, None],
+            None,
+        )],
+    )
+    .expect("the retained rooted payload produces a repair context");
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+
+    assert!(fixture.reactor.peer_work_queue.active(&peers[0]).is_none());
+    assert!(fixture.reactor.peer_work_queue.active(&peers[1]).is_some());
+}
+
+#[test]
+fn supplier_failures_rotate_to_an_untried_fourth_supplier_without_repeating() {
     let mut fixture = ReadyVctRepairFixture::new();
     let (peers, _outbounds) = fixture.connect(&[1, 2, 3, 4], 7);
     fixture.schedule();
@@ -1177,23 +1389,12 @@ fn bounded_supplier_cycles_rotate_to_the_fourth_supplier() {
         );
     }
 
-    assert!(peers
-        .iter()
-        .all(|peer| fixture.reactor.peer_work_queue.active(peer).is_none()));
     let task = fixture
         .reactor
         .vct_repair
         .current()
-        .expect("the bounded cycle keeps the repair requirement");
-    let retry_at = match &task.state {
-        RepairPolicyState::SupplierBackoff {
-            context: retained,
-            retry_at,
-        } if retained == &fixture.context => *retry_at,
-        other => panic!("three supplier failures must back off, got {other:?}"),
-    };
+        .expect("the fourth supplier keeps the repair requirement");
     assert_eq!(task.tried_sources.len(), 3);
-    assert!(task.supplier_cycle_exhausted());
     assert_eq!(
         fixture.reactor.vct_supplier_order,
         [
@@ -1210,19 +1411,11 @@ fn bounded_supplier_cycles_rotate_to_the_fourth_supplier() {
         .vct_repair_stall
         .expect("a complete failed cycle starts the generation stall clock");
 
-    fixture
-        .reactor
-        .vct_repair
-        .current_mut()
-        .expect("the repair remains scheduled")
-        .resume_retry_cycle(retry_at);
-    fixture.reactor.try_assign_vct_repair();
-
     let active = fixture
         .reactor
         .peer_work_queue
         .active(&peers[3])
-        .expect("the next cycle starts after the persistent supplier cursor");
+        .expect("the next untried supplier owns the same episode");
     assert!(matches!(
         active.purpose,
         HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
@@ -1232,7 +1425,7 @@ fn bounded_supplier_cycles_rotate_to_the_fourth_supplier() {
         .vct_repair
         .current()
         .expect("the fourth supplier owns the current repair");
-    assert!(task.tried_sources.is_empty());
+    assert_eq!(task.tried_sources.len(), 3);
     assert_eq!(fixture.reactor.vct_supplier_order.front(), Some(&peers[3]));
     assert_eq!(
         fixture
@@ -1268,16 +1461,6 @@ fn established_supplier_precedes_new_identities_after_adversarial_churn() {
             },
         );
     }
-    let retry_at = match fixture
-        .reactor
-        .vct_repair
-        .current()
-        .expect("the failed cycle keeps the repair")
-        .state
-    {
-        RepairPolicyState::SupplierBackoff { retry_at, .. } => retry_at,
-        ref other => panic!("the bounded cycle must back off, got {other:?}"),
-    };
     for (index, peer) in established[..3].iter().enumerate() {
         fixture.reactor.handle_peer_disconnected(
             peer,
@@ -1298,14 +1481,6 @@ fn established_supplier_precedes_new_identities_after_adversarial_churn() {
         fixture.reactor.vct_supplier_order.len(),
         fixture.reactor.peer_state.len()
     );
-    fixture
-        .reactor
-        .vct_repair
-        .current_mut()
-        .expect("the repair remains scheduled")
-        .resume_retry_cycle(retry_at);
-    fixture.reactor.try_assign_vct_repair();
-
     assert!(fixture
         .reactor
         .peer_work_queue
@@ -1314,6 +1489,52 @@ fn established_supplier_precedes_new_identities_after_adversarial_churn() {
     assert!(churn
         .iter()
         .all(|peer| fixture.reactor.peer_work_queue.active(peer).is_none()));
+    let task = fixture
+        .reactor
+        .vct_repair
+        .current()
+        .expect("the established supplier keeps the repair requirement");
+    assert!(established[..3]
+        .iter()
+        .all(|peer| !task.tried_sources.contains(&source_id_from_peer(peer))));
+}
+
+#[test]
+fn disconnected_supplier_history_cannot_block_a_new_supplier() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    let source = source_id_from_peer(peer);
+    fixture.schedule();
+    {
+        let task = fixture
+            .reactor
+            .vct_repair
+            .current_mut()
+            .expect("the repair requirement is scheduled");
+        let previous_default_capacity = crate::zakura::DEFAULT_SERVICE_MAX_PEERS * 2;
+        for index in 0..previous_default_capacity {
+            let bytes = u64::try_from(index)
+                .expect("the fixture index fits in u64")
+                .to_le_bytes()
+                .repeat(4)
+                .try_into()
+                .expect("four u64 values fill one source digest");
+            task.tried_sources.insert(SourceId::from_digest(bytes));
+        }
+        assert_eq!(task.tried_sources.len(), previous_default_capacity);
+        assert!(!task.tried_sources.contains(&source));
+    }
+
+    fixture.advertise(&peers, 7);
+
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_some());
+    let task = fixture
+        .reactor
+        .vct_repair
+        .current()
+        .expect("the new supplier owns the repair requirement");
+    assert!(task.tried_sources.is_empty());
 }
 
 #[test]
@@ -1348,10 +1569,12 @@ fn replacement_session_keeps_the_authenticated_supplier_identity() {
         fixture.reactor.vct_supplier_order,
         [peer.clone()].into_iter().collect::<VecDeque<_>>()
     );
-    assert!(matches!(
-        task.state,
-        RepairPolicyState::SupplierBackoff { .. }
-    ));
+    assert!(matches!(task.state, RepairPolicyState::Ready { .. }));
+    let status = fixture.status();
+    fixture
+        .reactor
+        .handle_wire_message(peer.clone(), 8, HeaderSyncMessage::Status(status));
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
 }
 
 #[test]
@@ -1424,7 +1647,7 @@ fn replacement_and_disconnect_retain_owned_vct_local_operation() {
 }
 
 #[test]
-fn send_failures_preserve_the_stall_clock_across_bounded_cycles() {
+fn local_send_failures_back_off_without_consuming_a_supplier() {
     let mut fixture = ReadyVctRepairFixture::new();
     let (peers, outbounds) = fixture.connect(&[1, 2, 3, 4], 7);
     fixture.advertise(&peers, 7);
@@ -1433,29 +1656,21 @@ fn send_failures_preserve_the_stall_clock_across_bounded_cycles() {
 
     fixture.reactor.try_assign_vct_repair();
 
-    let first_retry_at = match &fixture
-        .reactor
-        .vct_repair
-        .current()
-        .expect("send failures keep the repair")
-        .state
-    {
-        RepairPolicyState::SupplierBackoff { retry_at, .. } => *retry_at,
-        other => panic!("three send failures must back off, got {other:?}"),
-    };
     let task = fixture
         .reactor
         .vct_repair
         .current()
         .expect("the repair remains");
-    assert_eq!(task.tried_sources.len(), MAX_SUPPLIERS_PER_CYCLE);
+    assert!(matches!(task.state, RepairPolicyState::LocalBackoff { .. }));
+    assert!(task.tried_sources.is_empty());
+    assert_eq!(task.attempts, 1);
     assert_eq!(
         fixture.reactor.vct_supplier_order,
         [
-            peers[3].clone(),
             peers[0].clone(),
             peers[1].clone(),
             peers[2].clone(),
+            peers[3].clone(),
         ]
         .into_iter()
         .collect::<VecDeque<_>>()
@@ -1463,14 +1678,14 @@ fn send_failures_preserve_the_stall_clock_across_bounded_cycles() {
     let stall = fixture
         .reactor
         .vct_repair_stall
-        .expect("send failures start the stall clock");
+        .expect("the local send failure starts the stall clock");
 
     fixture
         .reactor
         .vct_repair
         .current_mut()
         .expect("the repair remains")
-        .resume_retry_cycle(first_retry_at);
+        .resume_retry(Instant::now() + std::time::Duration::from_secs(1));
     fixture.reactor.try_assign_vct_repair();
 
     let task = fixture
@@ -1478,18 +1693,16 @@ fn send_failures_preserve_the_stall_clock_across_bounded_cycles() {
         .vct_repair
         .current()
         .expect("the repair remains");
-    assert!(matches!(
-        task.state,
-        RepairPolicyState::SupplierBackoff { .. }
-    ));
-    assert_eq!(task.tried_sources.len(), MAX_SUPPLIERS_PER_CYCLE);
+    assert!(matches!(task.state, RepairPolicyState::LocalBackoff { .. }));
+    assert!(task.tried_sources.is_empty());
+    assert_eq!(task.attempts, 2);
     assert_eq!(
         fixture.reactor.vct_supplier_order,
         [
-            peers[2].clone(),
-            peers[3].clone(),
             peers[0].clone(),
             peers[1].clone(),
+            peers[2].clone(),
+            peers[3].clone(),
         ]
         .into_iter()
         .collect::<VecDeque<_>>()
@@ -1498,7 +1711,7 @@ fn send_failures_preserve_the_stall_clock_across_bounded_cycles() {
         fixture
             .reactor
             .vct_repair_stall
-            .expect("the next send cycle preserves the stall clock")
+            .expect("the bounded retry preserves the stall clock")
             .since,
         stall.since
     );

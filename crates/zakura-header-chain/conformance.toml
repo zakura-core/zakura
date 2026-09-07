@@ -710,7 +710,7 @@ id = "LC-AUX-03"
 name = "Branch-scoped VCT repair"
 status = "implemented"
 owner = "zakura_network::zakura::header_sync::ActiveHeaderRequest + HeaderTargetPurpose::SelectedAuxiliaryRepair"
-tests = ["AUD-09::generation_change_retires_every_repair_state", "IN-06::vct_repair_restarts_after_state_rejects_an_admitted_replacement", "IN-06::retired_vct_request_response_has_no_actions_or_peer_score", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+tests = ["AUD-09::generation_change_retires_every_repair_state", "IN-06::vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic_input", "IN-06::retired_vct_request_response_has_no_actions_or_peer_score", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -735,6 +735,14 @@ name = "Semantic auxiliary capacity"
 status = "implemented"
 owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
 tests = ["IN-06::auxiliary_admission_preserves_semantic_diversity_under_duplicate_delivery_pressure", "DG-06::projected_auxiliary_rows_cannot_duplicate_a_semantic_payload", "DG-06::projected_per_header_auxiliary_count_must_stay_within_the_plan_limit"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-AUX-07"
+name = "Authoritative repair progress"
+status = "implemented"
+owner = "zakura_state::service::finalized_state::HeaderChainRuntime"
+tests = ["IN-06::repair_context_reconstructs_rejected_input_after_engine_hydration", "IN-06::supplier_failures_rotate_to_an_untried_fourth_supplier_without_repeating", "IN-06::local_send_failures_back_off_without_consuming_a_supplier", "IN-06::retained_rooted_supplier_is_skipped_for_an_untried_supplier", "IN-06::supplier_history_releases_disconnected_sources_without_clearing_the_episode", "IN-06::disconnected_supplier_history_cannot_block_a_new_supplier", "IN-06::context_without_admission_capacity_waits_without_a_wire_attempt", "IN-06::vct_auxiliary_capacity_refusal_waits_without_timed_replay", "IN-06::vct_resource_refusal_waits_for_a_newer_committed_state"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

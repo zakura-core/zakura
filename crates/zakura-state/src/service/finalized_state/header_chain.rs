@@ -388,6 +388,11 @@ pub(crate) fn select_vct_auxiliary_delivery(deliveries: Vec<AuxDelivery>) -> Opt
         })
 }
 
+/// Match durable base data and any outcome that the live engine still treats as authoritative.
+///
+/// Recovery deliberately demotes durable outcome claims to unauthenticated engine state. The
+/// durable row still constrains repair input, so a recovered unauthenticated delivery accepts a
+/// structurally validated outcome claim here.
 fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDeliveryRow) -> bool {
     let expected_base = AuxDelivery::new(
         authoritative.delivery_id,
@@ -397,10 +402,51 @@ fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDelive
         authoritative.body_size,
         authoritative.tree_aux,
     );
+    let authoritative_status = if authoritative.is_unauthenticated() {
+        0
+    } else if authoritative.is_authenticated() {
+        1
+    } else if authoritative.is_rejected() {
+        2
+    } else {
+        3
+    };
+    let authoritative_observations = authoritative
+        .observation_ids()
+        .map(|observation| observation.map(|observation| observation.digest()));
     row.delivery() == expected_base
-        && row.outcome_status_code() == 0
-        && row.observation_digests() == [None, None]
-        && row.outcome_boundary_hash().is_none()
+        && row.has_valid_outcome()
+        && (authoritative.is_unauthenticated()
+            || (row.outcome_status_code() == authoritative_status
+                && row.observation_digests() == authoritative_observations
+                && row.outcome_boundary_hash() == authoritative.outcome_boundary_hash()))
+}
+
+fn auxiliary_rows_are_coherent(
+    indexed_ids: &[EvidenceId],
+    deliveries: &[AuxDelivery],
+    durable_rows: &[UntrustedAuxDeliveryRow],
+) -> bool {
+    let indexed: BTreeSet<_> = indexed_ids.iter().copied().collect();
+    let stored: BTreeSet<_> = deliveries
+        .iter()
+        .map(|delivery| delivery.delivery_id)
+        .collect();
+    let durable: BTreeSet<_> = durable_rows
+        .iter()
+        .map(|row| row.delivery().delivery_id)
+        .collect();
+    indexed.len() == indexed_ids.len()
+        && stored.len() == deliveries.len()
+        && durable.len() == durable_rows.len()
+        && indexed == stored
+        && indexed == durable
+        && durable_rows.iter().all(|row| {
+            deliveries
+                .iter()
+                .find(|delivery| delivery.delivery_id == row.delivery().delivery_id)
+                .is_some_and(|delivery| untrusted_aux_row_matches(*delivery, *row))
+        })
 }
 
 /// Failure at the durable header-chain boundary.
@@ -1207,27 +1253,7 @@ impl HeaderChainReader {
             .aux_deliveries(hash)
             .to_vec();
         let durable = self.store.untrusted_aux_deliveries(hash)?;
-        let indexed: BTreeSet<_> = aux_delivery_ids.iter().copied().collect();
-        let stored: BTreeSet<_> = deliveries
-            .iter()
-            .map(|delivery| delivery.delivery_id)
-            .collect();
-        let durable_ids: BTreeSet<_> = durable
-            .iter()
-            .map(|row| row.delivery().delivery_id)
-            .collect();
-        if indexed.len() != aux_delivery_ids.len()
-            || stored.len() != deliveries.len()
-            || durable_ids.len() != durable.len()
-            || indexed != stored
-            || indexed != durable_ids
-            || durable.iter().any(|row| {
-                deliveries
-                    .iter()
-                    .find(|delivery| delivery.delivery_id == row.delivery().delivery_id)
-                    .is_none_or(|delivery| !untrusted_aux_row_matches(*delivery, *row))
-            })
-        {
+        if !auxiliary_rows_are_coherent(aux_delivery_ids, &deliveries, &durable) {
             return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
                 "retained node and auxiliary delivery index disagree",
             )));
@@ -1732,10 +1758,46 @@ impl HeaderChainReader {
             .into());
         }
         let parent = Frontier::new(parent_height, target.parent_hash);
-        Ok(Some(zakura_header_chain::VctRepairContext {
-            target: Frontier::new(height, target_hash),
-            locator: HeaderLocator::for_continuation(parent),
-        }))
+        let selected_target = Frontier::new(height, target_hash);
+        let boundary_hash =
+            if height < snapshot.frontiers.header_best.height {
+                let successor_height = height.next().map_err(|_| {
+                    StoreError::Incoherent("VCT repair successor height overflowed")
+                })?;
+                let successor = self.coherent_selected_node(successor_height)?.ok_or(
+                    StoreError::Incoherent("VCT repair successor is absent from the selected path"),
+                )?;
+                if successor.parent_hash != target_hash {
+                    return Err(StoreError::Incoherent(
+                        "VCT repair successor does not extend its selected target",
+                    )
+                    .into());
+                }
+                Some(successor.hash)
+            } else {
+                None
+            };
+        let deliveries = self.coherent_aux_deliveries(&target)?;
+        let durable_rows = self.store.untrusted_aux_deliveries(target_hash)?;
+        let total_delivery_count = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .aux_delivery_count();
+        let admission_capacity_available = deliveries.len()
+            < self.config.limits.max_aux_deliveries_per_header.get()
+            && total_delivery_count < self.config.limits.max_aux_deliveries_total.get()
+            && !snapshot.alarms.resource_stalled;
+        Ok(Some(
+            zakura_header_chain::VctRepairContext::from_durable_rows(
+                selected_target,
+                HeaderLocator::for_continuation(parent),
+                snapshot.state_version,
+                boundary_hash,
+                admission_capacity_available,
+                &durable_rows,
+            )?,
+        ))
     }
 
     /// Commit a lease only if the branch has not moved since the caller read its snapshot.
@@ -2948,6 +3010,171 @@ impl HeaderChainRuntime {
             .map(HeaderSyncWorkOwner::header_authority)
             .map(|authority| authority.branch)
             .or_else(|| request.event.body_owner().map(|owner| owner.branch));
+        if let TransitionEvent::InsertHeaders(insert) = &request.event {
+            let mut selected_repair_boundary = None;
+            if let zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor,
+                selected_target,
+                episode,
+            } = insert.completion
+            {
+                let selected = transition_engine.selected_projection();
+                let selected_index = selected
+                    .binary_search_by_key(&selected_target.height, |frontier| frontier.height)
+                    .ok()
+                    .filter(|index| selected[*index] == selected_target);
+                let Some(selected_index) = selected_index else {
+                    return Ok(ApplyResult::Stale(StaleReceipt {
+                        current_version: before.state_version,
+                        branch,
+                    }));
+                };
+                let boundary_hash = selected
+                    .get(selected_index.saturating_add(1))
+                    .map(|successor| {
+                        let expected_height = selected_target.height.next().map_err(|_| {
+                            StoreError::Incoherent("VCT repair successor height overflowed")
+                        })?;
+                        let successor_node = transition_engine
+                            .graph()
+                            .header_node(successor.hash)
+                            .ok_or(StoreError::Incoherent(
+                                "selected VCT repair successor is absent from the graph",
+                            ))?;
+                        if successor.height != expected_height
+                            || successor_node.height != successor.height
+                            || successor_node.parent_hash != selected_target.hash
+                        {
+                            return Err(StoreError::Incoherent(
+                                "selected VCT repair successor is not contiguous",
+                            ));
+                        }
+                        Ok(successor.hash)
+                    })
+                    .transpose()?;
+                selected_repair_boundary = Some(boundary_hash);
+                let durable_rows = self.store.untrusted_aux_deliveries(selected_target.hash)?;
+                let target_node = transition_engine
+                    .graph()
+                    .header_node(selected_target.hash)
+                    .ok_or(StoreError::Incoherent(
+                        "selected VCT repair target is absent from the graph",
+                    ))?;
+                let live_deliveries = transition_engine.aux_deliveries(selected_target.hash);
+                if !auxiliary_rows_are_coherent(
+                    &target_node.aux_delivery_ids,
+                    live_deliveries,
+                    &durable_rows,
+                ) {
+                    return Err(StoreError::Incoherent(
+                        "retained node and auxiliary delivery index disagree",
+                    )
+                    .into());
+                }
+                let current = zakura_header_chain::VctRepairContext::from_durable_rows(
+                    selected_target,
+                    HeaderLocator::for_continuation(common_ancestor),
+                    before.state_version,
+                    boundary_hash,
+                    live_deliveries.len()
+                        < context.config.limits.max_aux_deliveries_per_header.get()
+                        && transition_engine.aux_delivery_count()
+                            < context.config.limits.max_aux_deliveries_total.get()
+                        && !before.alarms.resource_stalled,
+                    &durable_rows,
+                )?;
+                if current.episode != episode {
+                    return Ok(ApplyResult::Stale(StaleReceipt {
+                        current_version: before.state_version,
+                        branch,
+                    }));
+                }
+                for delivery in insert.aux.iter().filter(|delivery| {
+                    delivery.header_hash == selected_target.hash && delivery.tree_aux.is_some()
+                }) {
+                    let repeats_retained_payload = live_deliveries.iter().any(|retained| {
+                        retained.semantic_fingerprint() == delivery.semantic_fingerprint()
+                    });
+                    if repeats_retained_payload || current.retains_source(delivery.source) {
+                        return Ok(ApplyResult::Stale(StaleReceipt {
+                            current_version: before.state_version,
+                            branch,
+                        }));
+                    }
+                }
+            }
+
+            let supplied_boundaries: HashMap<_, _> = insert
+                .batch
+                .headers()
+                .iter()
+                .enumerate()
+                .map(|(index, header)| {
+                    let target = Frontier::new(header.height, header.hash);
+                    let boundary_hash = selected_repair_boundary.unwrap_or_else(|| {
+                        insert
+                            .batch
+                            .headers()
+                            .get(index.saturating_add(1))
+                            .map(|successor| successor.hash)
+                            .or_else(|| {
+                                let selected = transition_engine.selected_projection();
+                                selected
+                                    .binary_search_by_key(&target.height, |frontier| {
+                                        frontier.height
+                                    })
+                                    .ok()
+                                    .filter(|selected_index| selected[*selected_index] == target)
+                                    .and_then(|selected_index| {
+                                        selected
+                                            .get(selected_index.saturating_add(1))
+                                            .map(|successor| successor.hash)
+                                    })
+                            })
+                    });
+                    (header.hash, (target, boundary_hash))
+                })
+                .collect();
+            for delivery in &insert.aux {
+                let Some(input) = delivery.tree_aux else {
+                    continue;
+                };
+                let Some((target, boundary_hash)) =
+                    supplied_boundaries.get(&delivery.header_hash).copied()
+                else {
+                    continue;
+                };
+                let durable_rows = self.store.untrusted_aux_deliveries(target.hash)?;
+                if let Some(target_node) = transition_engine.graph().header_node(target.hash) {
+                    if !auxiliary_rows_are_coherent(
+                        &target_node.aux_delivery_ids,
+                        transition_engine.aux_deliveries(target.hash),
+                        &durable_rows,
+                    ) {
+                        return Err(StoreError::Incoherent(
+                            "retained node and auxiliary delivery index disagree",
+                        )
+                        .into());
+                    }
+                } else if !durable_rows.is_empty() {
+                    return Err(StoreError::Incoherent(
+                        "auxiliary delivery rows exist without a retained header",
+                    )
+                    .into());
+                }
+                if zakura_header_chain::VctRepairContext::durable_rows_exclude(
+                    target,
+                    boundary_hash,
+                    &durable_rows,
+                    input,
+                )? {
+                    return Ok(ApplyResult::Stale(StaleReceipt {
+                        current_version: before.state_version,
+                        branch,
+                    }));
+                }
+            }
+        }
         let input = self.build_transition_input(request, &before, base_context.config.network())?;
         let validation_leases = input
             .header_validation_facts()

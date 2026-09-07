@@ -53,56 +53,59 @@ in that test.
 
 ## Backpressure and ownership
 
-A request acquires a producer before dispatching its state query. The ledger,
-state worker, returned result, and queued frames share the same permit. Dequeuing
-a frame does not release it: the transport retains the frame's guard through
-`write_ordered_frame`. A pending QUIC write therefore keeps the producer occupied
-and prevents the next query for that session. This does not wait for a remote
-application acknowledgement; QUIC may retain bytes after accepting a write.
+Backpressure means making the sender wait when we have no room for more work.
+Ownership means keeping a request's slots held until its work is done.
 
-There is at most one response being produced or written per live session. Its
-payload cap is
-`min(count * MAX_BLOCK_BYTES, advertised_max_response_bytes) + count + 9`.
-Each queued frame shares the producer without acquiring additional capacity.
-The final owner releases capacity immediately.
+The request, block query, returned blocks, and queued messages share the same
+slots. Taking a message out of the send queue does not free those slots: its write
+may still be waiting for QUIC. The slots return when the request, query, and all
+writes have finished or been discarded. QUIC may still hold bytes after accepting
+a write; we don't wait for the peer to confirm it has read them.
 
-| Resource | Default | Owner and release point |
+For example, if one response is stuck waiting to be written, the next GetBlocks
+request on that session waits for its slot. We stop reading that stream. As its
+buffers fill, QUIC makes the sender wait too. Messages behind the waiting request,
+including responses to our own downloads, also wait. Outgoing writes keep running
+so the first response can finish and free its slots.
+
+A peer may send requests ahead of time within the advertised request limit. A
+request waiting for room is not a peer fault. If we cannot take both required
+slots, we return any slot already taken before waiting. Once the wait gives us a
+slot, we use that same slot when trying again.
+
+| Limit | Default | What happens at the limit |
 | --- | --- | --- |
-| Waiting request | 1 per session | Held at admission; further stream reads pause |
-| Response producers | 1 per session, 64 per node | Ledger, query, result, and transport frames; released when the last owner drops |
-| Query response deadline | 8 seconds | Ends response delivery; underlying state work retains its producer until completion |
-| Terminal queue deadline | `request_timeout`, 8 seconds | Retains ownership while waiting; expiry closes the original session without a misconduct score |
-| Admission delay deadline | `request_timeout`, 8 seconds | Closes the locally backpressured session without a misconduct score |
+| Waiting requests | 1 per session | Pause reading that stream |
+| Active responses | 1 per session, 64 per node | Wait for the previous work and writes to release their slots |
+| Waiting for a query result | 8 seconds | Stop waiting for the result; the query keeps its slots until it ends |
+| Waiting to queue the ending message | `request_timeout`, 8 seconds | Close the session without scoring the peer for misconduct |
+| Waiting to admit a request | `request_timeout`, 8 seconds | Close the session without scoring the peer for misconduct |
 
-The advertised inflight window still permits pipelined requests. One producer
-serializes their execution; it does not turn a waiting request into a protocol
-violation. Admission rolls back partial reservations before waiting. A slot
-waiter uses the permit assigned to it on its next admission attempt.
+If we cancel a request before its query starts, the query won't run. Starting the
+query and checking cancellation happen together. A query that has already started
+keeps its slots until it ends, even after a timeout or disconnect. A query that
+never ends keeps those slots; the timeout cannot stop the storage work. Reconnecting
+does not free slots still held by the old session.
 
-When admission waits, the routine holds the current request and stops reading
-further frames. Existing application queues and QUIC receive buffers provide
-backpressure. Later responses on this ordered stream wait too.
-Outbound writes run independently of inbound
-forwarding so they can release serving capacity while reads are paused.
+If the send queue fills partway through a response, we send only the blocks already
+queued, followed by an ending message. That ending message waits for queue space
+without blocking other reactor work. It keeps the response's slots held and stays
+tied to the original session. Cancellation, shutdown, a closed queue, or the time
+limit ends the wait. Once queued, the message keeps holding the slots through its
+write.
 
-Download deadlines exclude local admission pauses. The total grace between
-accepted blocks is at most `request_timeout`; a longer pause closes the local
-session without penalizing the peer. Delivery-rate samples still include the
-pause. QUIC uses a 16 MiB stream receive window within the existing 32 MiB
-connection window, leaving credit for another service when one stream pauses.
+We extend download deadlines by the time spent waiting at admission, up to
+`request_timeout` in total between accepted blocks. A longer wait closes the session
+without blaming the peer. Download speed measurements still include the wait.
+Each QUIC stream has a 16 MiB receive window within the connection's 32 MiB window,
+leaving room for another service when one stream pauses.
 
-Ledger closure and the one-time query claim share synchronized state. Closure
-before the claim prevents the read. A claimed read drains after timeout or
-disconnect because dropping its awaiter does not stop blocking state work. A read
-that never completes retains capacity; the timeout cannot terminate the storage
-operation. Old session owners remain counted until they finish even after a
-replacement session connects.
-
-A full outbound queue can truncate a response to the prefix already queued. Its
-terminal response waits independently of other reactor work, tied to the original
-session and retaining its producer. Cancellation, queue closure, shutdown, or the
-local deadline ends that wait. Successful enqueue retains ownership through the
-application write.
+Each response also has a size limit. For the block count we allow in that response,
+its maximum payload size is
+`min(count * MAX_BLOCK_BYTES, advertised_max_response_bytes) + count + 9`.
+The extra `count` allows one message tag per block; the final 9 bytes allow the
+ending message. All messages in a response share its slots rather than taking a
+new slot for each message.
 
 ## Resource boundary
 

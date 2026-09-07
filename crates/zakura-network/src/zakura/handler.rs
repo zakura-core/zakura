@@ -1588,6 +1588,7 @@ struct StreamWorkerContext {
     _permit: OwnedSemaphorePermit,
     limits: ZakuraConnectionLimits,
     inbound_frame_cap: u32,
+    message_payload_limits: &'static [(u16, usize)],
     outbound_frame_cap: u32,
     message_bucket: SharedMessageBucket,
     connection_token: CancellationToken,
@@ -2859,6 +2860,7 @@ impl ZakuraProtocolHandler {
                                     &connection,
                                     limits,
                                     stream,
+                                    self.registry.message_payload_limits(stream),
                                     request_id,
                                     message_type,
                                     flags,
@@ -2964,6 +2966,7 @@ impl ZakuraProtocolHandler {
             _permit: permit,
             limits,
             inbound_frame_cap: prelude.max_frame_bytes,
+            message_payload_limits: self.registry.message_payload_limits(stream),
             outbound_frame_cap: application_frame_cap(&limits, stream),
             message_bucket,
             connection_token,
@@ -3161,6 +3164,7 @@ impl ZakuraProtocolHandler {
             _permit: permit,
             limits: admission.limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&admission.limits, stream),
+            message_payload_limits: self.registry.message_payload_limits(stream),
             outbound_frame_cap: peer_accepted_frame_cap(
                 &admission.limits,
                 stream,
@@ -4041,6 +4045,7 @@ async fn persistent_stream_worker(
                 frame = read_frame(
                     &mut recv,
                     reader_context.inbound_frame_cap,
+                    reader_context.message_payload_limits,
                     reader_context.limits.idle_timeout,
                     // A persistent ordered stream is legitimately quiet between
                     // frames; do not let an inter-frame gap time out and cancel
@@ -4218,6 +4223,7 @@ async fn request_stream_worker(
         frame = read_frame(
             &mut recv,
             context.inbound_frame_cap,
+            context.message_payload_limits,
             context.limits.idle_timeout,
             // A request stream carries its request frame immediately after the
             // prelude, so a peer that opens one and then goes silent is treated
@@ -4389,6 +4395,7 @@ async fn read_stream_prelude(
 async fn read_frame(
     recv: &mut RecvStream,
     max_frame_bytes: u32,
+    message_payload_limits: &[(u16, usize)],
     read_timeout: Duration,
     first_byte_timeout: Option<Duration>,
 ) -> Result<Frame, ZakuraHandlerError> {
@@ -4423,6 +4430,14 @@ async fn read_frame(
         .expect("u32 payload lengths fit usize on supported targets");
     let max_frame_bytes =
         usize::try_from(max_frame_bytes).expect("u32 frame cap fits usize on supported targets");
+    // A service may declare a tighter limit for this message. Apply it before
+    // allocating the payload; it can never enlarge the negotiated stream cap.
+    let max_frame_bytes = message_payload_limits
+        .iter()
+        .find(|(kind, _)| *kind == message_type)
+        .map_or(max_frame_bytes, |(_, max_payload_bytes)| {
+            max_frame_bytes.min(max_payload_bytes.saturating_add(FRAME_HEADER_BYTES))
+        });
     let frame_len = FRAME_HEADER_BYTES.saturating_add(payload_len);
     if frame_len > max_frame_bytes {
         metrics::counter!("zakura.p2p.ratelimit.frame.oversize").increment(1);
@@ -4531,10 +4546,12 @@ async fn write_queued_ordered_frame(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_outbound_request_frame(
     connection: &Connection,
     limits: ZakuraConnectionLimits,
     stream: Stream,
+    message_payload_limits: &'static [(u16, usize)],
     request_id: u64,
     message_type: u16,
     flags: u16,
@@ -4546,6 +4563,7 @@ async fn write_outbound_request_frame(
             connection,
             limits,
             stream,
+            message_payload_limits,
             request_id,
             message_type,
             flags,
@@ -4556,10 +4574,12 @@ async fn write_outbound_request_frame(
     .map_err(|_| OutboundRequestError::Local("Zakura outbound request/response timed out".into()))?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_outbound_request_frame_inner(
     connection: &Connection,
     limits: ZakuraConnectionLimits,
     stream: Stream,
+    message_payload_limits: &'static [(u16, usize)],
     request_id: u64,
     message_type: u16,
     flags: u16,
@@ -4613,6 +4633,7 @@ async fn write_outbound_request_frame_inner(
         match read_frame(
             &mut recv,
             inbound_frame_cap,
+            message_payload_limits,
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
             // the responder streams its frames promptly, so a silent gap before
@@ -7866,6 +7887,7 @@ mod tests {
             _permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
             limits,
             inbound_frame_cap: stream.frame_cap,
+            message_payload_limits: &[],
             outbound_frame_cap: stream.frame_cap,
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
             connection_token: cancel.clone(),
@@ -7927,6 +7949,7 @@ mod tests {
             read_frame(
                 &mut receiver,
                 stream.frame_cap,
+                &[],
                 Duration::from_secs(2),
                 None,
             ),
@@ -8065,6 +8088,7 @@ mod tests {
             _permit: permit,
             limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
+            message_payload_limits: &[],
             outbound_frame_cap: application_frame_cap(&limits, stream),
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
             connection_token: connection_token.clone(),
@@ -8272,6 +8296,7 @@ mod tests {
                 _permit: permit,
                 limits,
                 inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
+                message_payload_limits: &[],
                 outbound_frame_cap: application_frame_cap(&limits, stream),
                 message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
                     limits.message_rate_per_second,
@@ -8551,6 +8576,141 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn message_payload_limits_apply_before_payload_reads() -> Result<(), BoxError> {
+        use crate::zakura::{BlockSyncMessage, BlockSyncService, ZakuraBlockSyncConfig};
+        use zakura_chain::{block, serialization::ZcashDeserializeInto};
+
+        let service = Arc::new(BlockSyncService::new(ZakuraBlockSyncConfig::default()));
+        let stream = service.streams()[0];
+        let registry = ServiceRegistry::new(vec![service])?;
+        let payload_limits = registry.message_payload_limits(stream);
+        assert_eq!(payload_limits, &[(2, 9)]);
+        assert!(registry
+            .message_payload_limits(Stream {
+                version: stream.version + 1,
+                ..stream
+            })
+            .is_empty());
+        assert!(registry
+            .message_payload_limits(Stream {
+                kind: u16::MAX,
+                ..stream
+            })
+            .is_empty());
+        assert!(NoopService.message_payload_limits(stream).is_empty());
+
+        const ALPN: &[u8] = b"/zakura/testkit/message-payload-limits/0";
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(79).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(8);
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx: conn_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(80).await?;
+        let server_addr = router.endpoint().node_addr().initialized().await;
+        client.add_node_addr(server_addr.clone())?;
+
+        // Only send headers and keep the send sides open. The reader must reject
+        // before waiting for a payload that the peer has not supplied.
+        for (message_type, payload_len, frame_cap, expected_cap) in [
+            // Eight frame-header bytes plus the nine-byte GetBlocks payload cap.
+            (2u16, 10u32, stream.frame_cap, 17usize),
+            (2, u32::MAX, stream.frame_cap, 17),
+            // A tighter stream cap still applies to an otherwise legal request.
+            (2, 9, 16, 16),
+            // Block has no message-specific cap yet; its stream cap still applies.
+            (3, 100, 107, 107),
+        ] {
+            let connection = timeout(
+                Duration::from_secs(5),
+                client.connect(server_addr.clone(), ALPN),
+            )
+            .await??;
+            let (mut send, _recv) = timeout(Duration::from_secs(2), connection.open_bi()).await??;
+            let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
+            header.extend_from_slice(&message_type.to_le_bytes());
+            header.extend_from_slice(&0u16.to_le_bytes());
+            header.extend_from_slice(&payload_len.to_le_bytes());
+            timeout(Duration::from_secs(2), send.write_all(&header)).await??;
+            let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+                .await?
+                .unwrap();
+            let result = timeout(
+                Duration::from_secs(1),
+                read_frame(
+                    &mut recv,
+                    frame_cap,
+                    payload_limits,
+                    Duration::from_secs(5),
+                    Some(Duration::from_secs(5)),
+                ),
+            )
+            .await
+            .expect("an oversized header is rejected without waiting for payload bytes");
+            assert!(
+                matches!(result, Err(ZakuraHandlerError::OversizeFrame { max_frame_bytes, .. }) if max_frame_bytes == expected_cap)
+            );
+        }
+
+        // The GetBlocks limit must not shrink the allowance for Block responses
+        // on the same stream. Both real message encodings must still round-trip.
+        let connection =
+            timeout(Duration::from_secs(5), client.connect(server_addr, ALPN)).await??;
+        let (mut send, _recv) = timeout(Duration::from_secs(2), connection.open_bi()).await??;
+        let messages = [
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1,
+            },
+            BlockSyncMessage::Block(
+                zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?,
+            ),
+        ];
+        let first = messages[0].encode_frame()?;
+        timeout(
+            Duration::from_secs(2),
+            send.write_all(&first.encode(stream.frame_cap)?),
+        )
+        .await??;
+        let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await?
+            .unwrap();
+        for (index, message) in messages.into_iter().enumerate() {
+            if index > 0 {
+                let frame = message.encode_frame()?;
+                assert!(frame.payload.len() > 9);
+                timeout(
+                    Duration::from_secs(2),
+                    send.write_all(&frame.encode(stream.frame_cap)?),
+                )
+                .await??;
+            }
+            let frame = timeout(
+                Duration::from_secs(2),
+                read_frame(
+                    &mut recv,
+                    stream.frame_cap,
+                    payload_limits,
+                    Duration::from_secs(2),
+                    Some(Duration::from_secs(2)),
+                ),
+            )
+            .await??;
+            assert_eq!(BlockSyncMessage::decode_frame(frame)?, message);
+        }
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
     // claude-late-message-cap-allocation: read_frame checks only
     // frame_len > max_frame_bytes before `vec![0; payload_len]`, while the smaller
     // max_message_bytes is enforced later in admit_inbound_message. A peer can
@@ -8650,6 +8810,7 @@ mod tests {
         let rejected = read_frame(
             &mut s1_recv,
             inbound_cap,
+            &[],
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -8683,6 +8844,7 @@ mod tests {
         let allocated = read_frame(
             &mut s2_recv,
             raw_cap,
+            &[],
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -8721,6 +8883,7 @@ mod tests {
         let frame = read_frame(
             &mut s3_recv,
             inbound_cap,
+            &[],
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )

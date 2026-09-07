@@ -367,6 +367,15 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     /// Streams this service owns.
     fn streams(&self) -> &[Stream];
 
+    /// Payload size limits for this stream, as `(message_type, maximum_bytes)` pairs.
+    ///
+    /// The reader checks these limits before allocating a payload. Limits exclude
+    /// the frame header and may only tighten the stream's existing cap. Unlisted
+    /// message types keep that cap; message validity is checked by the codec.
+    fn message_payload_limits(&self, _stream: Stream) -> &'static [(u16, usize)] {
+        &[]
+    }
+
     /// Return the transport-owned opening and re-admission policy for `kind`.
     ///
     /// The default preserves the legacy one-shot initiator-opens behavior.

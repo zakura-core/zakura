@@ -24,6 +24,11 @@ use crate::zakura::{
 mod policy;
 use policy::GetBlocksPolicy;
 
+/// Header-level size limits from the implemented message policies.
+pub(super) fn message_payload_limits() -> &'static [(u16, usize)] {
+    GetBlocksPolicy::PAYLOAD_LIMITS
+}
+
 /// One decoded request held at the admission boundary until work is available.
 #[derive(Debug)]
 pub(super) struct GetBlocksRequest {

@@ -21,6 +21,7 @@ pub(crate) struct SlotBudgetCapacityError {
 /// admitted item makes ordinary drop and cancellation release capacity.
 #[derive(Clone, Debug)]
 pub(crate) struct SlotBudget {
+    #[cfg(test)]
     capacity: usize,
     permits: Arc<Semaphore>,
 }
@@ -36,19 +37,20 @@ impl SlotBudget {
         }
 
         Ok(Self {
+            #[cfg(test)]
             capacity,
             permits: Arc::new(Semaphore::new(capacity)),
         })
     }
 
     /// Return the maximum number of owned slots.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
 
     /// Return the number of currently owned slots.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn reserved(&self) -> usize {
         self.capacity
             .saturating_sub(self.permits.available_permits())

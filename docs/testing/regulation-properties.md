@@ -45,6 +45,11 @@ writer. Dequeue alone must not release a producer. Controlled writes exercise
 completion, failure, and cancellation. The base PR also tests a real QUIC write
 blocked by stream credit while another stream makes progress.
 
+A header-only QUIC test checks that an oversized GetBlocks request is rejected
+before payload reading begins. It verifies the service's declared cap, tighter
+stream caps, and valid GetBlocks and Block messages on the same stream. The
+profile also checks the existing negotiated message-size limit before allocation.
+
 ## Shared request histories
 
 The shared `RequestAdmission` layer is exercised with a test-only GetPeers policy

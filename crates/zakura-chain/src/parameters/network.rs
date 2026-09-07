@@ -344,12 +344,17 @@ impl Network {
 
     /// Returns the first height at which version 4 transactions are invalid.
     ///
-    /// [ZIP 2003] deprecates version 4 transactions at NU7. A network that does
-    /// not activate NU7 keeps accepting them.
+    /// [ZIP 2003] deprecates version 4 transactions at NU7. The
+    /// `nu7-experimental` feature must be enabled. A network that does not
+    /// activate NU7 keeps accepting them.
     ///
     /// [ZIP 2003]: https://zips.z.cash/zip-2003
     pub fn v4_deprecation_height(&self) -> Option<Height> {
-        NetworkUpgrade::Nu7.activation_height(self)
+        if cfg!(feature = "nu7-experimental") {
+            NetworkUpgrade::Nu7.activation_height(self)
+        } else {
+            None
+        }
     }
 
     /// Returns whether version 4 transactions are invalid at `height` on this network.

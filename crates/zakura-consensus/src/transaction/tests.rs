@@ -3964,19 +3964,29 @@ fn v4_deprecation_boundary() {
         .to_network()
         .expect("failed to build configured network");
 
-    assert_eq!(at_nu7.v4_deprecation_height(), Some(nu7));
+    assert_eq!(
+        at_nu7.v4_deprecation_height(),
+        cfg!(feature = "nu7-experimental").then_some(nu7)
+    );
     assert!(
         verify_v4_at(&at_nu7, &tx, nu7.previous().expect("height")).is_ok(),
         "a V4 transaction must be valid below the deprecation height",
     );
-    assert_eq!(
-        verify_v4_at(&at_nu7, &tx, nu7),
-        Err(TransactionError::UnsupportedByNetworkUpgrade(
-            4,
-            NetworkUpgrade::Nu7
-        )),
-        "a V4 transaction must be invalid at the deprecation height",
-    );
+    if cfg!(feature = "nu7-experimental") {
+        assert_eq!(
+            verify_v4_at(&at_nu7, &tx, nu7),
+            Err(TransactionError::UnsupportedByNetworkUpgrade(
+                4,
+                NetworkUpgrade::Nu7
+            )),
+            "a V4 transaction must be invalid at the deprecation height",
+        );
+    } else {
+        assert!(
+            verify_v4_at(&at_nu7, &tx, nu7).is_ok(),
+            "a default build must keep accepting V4 transactions",
+        );
+    }
 
     // A network without NU7 keeps accepting V4 transactions.
     let no_nu7 = Parameters::build()

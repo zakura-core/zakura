@@ -799,7 +799,7 @@ where
         let mut spent_outputs: Vec<Option<transparent::Output>> = vec![None; inputs.len()];
         // Stores (input_idx, outpoint) for UTXOs not found in the best chain (fetched from mempool later).
         let mut spent_mempool_outpoints: Vec<(usize, transparent::OutPoint)> = Vec::new();
-        let mut block_outpoints = Vec::new();
+        let mut block_outpoints_to_lookup = Vec::new();
 
         for (input_idx, input) in inputs.iter().enumerate() {
             if let transparent::Input::PrevOut { outpoint, .. } = input {
@@ -826,7 +826,7 @@ where
 
                     utxo
                 } else {
-                    block_outpoints.push((input_idx, *outpoint));
+                    block_outpoints_to_lookup.push((input_idx, *outpoint));
                     continue;
                 };
                 tracing::trace!(?utxo, "got UTXO");
@@ -837,10 +837,10 @@ where
             }
         }
 
-        if !block_outpoints.is_empty() {
-            let single_lookup = block_outpoints.len() == 1;
-            let lookups =
-                futures::stream::iter(block_outpoints).map(move |(input_idx, outpoint)| {
+        if !block_outpoints_to_lookup.is_empty() {
+            let single_lookup = block_outpoints_to_lookup.len() == 1;
+            let lookups = futures::stream::iter(block_outpoints_to_lookup).map(
+                move |(input_idx, outpoint)| {
                     let state = state.clone();
                     async move {
                         let response = state
@@ -856,7 +856,8 @@ where
                         };
                         Ok::<_, TransactionError>((input_idx, outpoint, utxo))
                     }
-                });
+                },
+            );
             // A single lookup cannot overlap another lookup, so skip the concurrency queue.
             let lookups = if single_lookup {
                 lookups.then(std::convert::identity).left_stream()

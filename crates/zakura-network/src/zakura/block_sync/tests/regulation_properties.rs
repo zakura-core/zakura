@@ -156,22 +156,7 @@ async fn check_response_writes(
         reactor_barrier(&handle).await;
 
         let returned = if empty { 0 } else { count.min(queue_depth) };
-        let waiting_terminal = returned == queue_depth;
-        let snapshot = regulator.snapshot();
-        assert_eq!(snapshot.node_active, usize::from(waiting_terminal));
-        let payloads: Vec<u64> = blocks
-            .iter()
-            .take(returned)
-            .map(|block| u64::from(block_size(block)) + 1)
-            .collect();
-        let expected_bytes = if waiting_terminal {
-            (u64::from(count_u32) * 2_000_000).min(u64::from(response_byte_cap))
-                + u64::from(count_u32)
-                + 9
-        } else {
-            payloads.iter().sum::<u64>() + 9
-        };
-        assert_eq!(snapshot.node_outstanding, expected_bytes);
+        assert_eq!(regulator.snapshot().node_active, 1);
         assert!(
             !cancelled.is_cancelled(),
             "queue pressure is not protocol misconduct"
@@ -182,7 +167,7 @@ async fn check_response_writes(
                 .await
                 .unwrap()
                 .unwrap();
-            let before_write = regulator.snapshot().node_outstanding;
+            let before_write = regulator.snapshot().node_active;
             let (finish, completion) = oneshot::channel();
             let expected_block = blocks.get(index).cloned();
             let mut write = Box::pin(queued.write_with(|frame| async move {
@@ -215,19 +200,18 @@ async fn check_response_writes(
             }));
             assert!(write.as_mut().now_or_never().is_none());
             assert_eq!(
-                regulator.snapshot().node_outstanding,
+                regulator.snapshot().node_active,
                 before_write,
-                "dequeue and a pending write must preserve the charge"
+                "dequeue and a pending write must retain the producer"
             );
             finish.send(()).unwrap();
-            let written = write.await;
+            let _written = write.await;
             assert_eq!(
-                regulator.snapshot().node_outstanding,
-                before_write - written
+                regulator.snapshot().node_active,
+                usize::from(index < returned)
             );
         }
         assert_eq!(regulator.snapshot().node_active, 0);
-        assert_eq!(regulator.snapshot().node_outstanding, 0);
         assert!(!cancelled.is_cancelled());
     }
     cancelled.cancel();
@@ -236,7 +220,7 @@ async fn check_response_writes(
 }
 
 #[test]
-fn every_response_shape_retains_bytes_through_application_write() {
+fn every_response_shape_retains_producer_through_application_write() {
     for count in 1..=3 {
         for depth in 1..=3 {
             for empty in [false, true] {
@@ -257,7 +241,7 @@ fn every_response_shape_retains_bytes_through_application_write() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn minimum_response_cap_serves_a_large_block_with_charged_writes() {
+async fn minimum_response_cap_serves_a_large_block_with_guarded_writes() {
     let mut blocks = mainnet_blocks_1_to_3();
     // A serialization boundary fixture; consensus validity is tested elsewhere.
     blocks[0] = Arc::new(zakura_chain::block::tests::generate::large_multi_transaction_block());

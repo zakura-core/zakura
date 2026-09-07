@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "limit": "node_bytes",
+  "version": 2,
+  "limit": "node_active",
   "actions": [
     {"action": "admit", "peer": 0, "request": 0},
     {"action": "commit", "request": 0},
@@ -9,6 +9,7 @@
     {"action": "queue_block", "request": 0},
     {"action": "queue_terminal", "request": 0},
     {"action": "begin_write", "session": 0},
+    {"action": "queue_terminal", "request": 0},
     {"action": "reconnect", "peer": 0},
     {"action": "admit", "peer": 1, "request": 1},
     {"action": "end_write", "session": 0, "outcome": "complete"},

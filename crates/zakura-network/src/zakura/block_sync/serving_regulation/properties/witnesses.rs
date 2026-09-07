@@ -5,13 +5,13 @@ use super::*;
 #[test]
 fn every_admission_bound_blocks_then_recovers() {
     for limit in Limit::ALL {
-        let peer = if matches!(limit, Limit::NodeActive | Limit::NodeBytes) {
+        let peer = if matches!(limit, Limit::NodeActive) {
             1
         } else {
             0
         };
         let mut scenario = Scenario {
-            version: 1,
+            version: 2,
             limit,
             actions: vec![
                 Action::Admit {
@@ -35,7 +35,7 @@ fn every_admission_bound_blocks_then_recovers() {
             "a cancelled running read still owns capacity"
         );
         assert_eq!(observations[7].outcome, Outcome::Admission(None));
-        assert_eq!(observations.last().unwrap().resources.node_bytes, 0);
+        assert_eq!(observations.last().unwrap().resources.node_active, 0);
         checked_replay(&scenario).unwrap();
         // A provisional rollback must restore the original balances too.
         scenario.actions = vec![
@@ -50,27 +50,26 @@ fn every_admission_bound_blocks_then_recovers() {
 }
 
 #[test]
-fn replay_preserves_writing_bytes_across_session_replacement() {
+fn replay_preserves_writing_ownership_across_session_replacement() {
     let scenario: Scenario =
         serde_json::from_str(include_str!("writing_after_reconnect.json")).unwrap();
     let observations = replay(&scenario).unwrap();
-    let retained = &observations[7].resources;
-    assert_eq!(retained.node_active, 0);
-    assert_eq!(retained.node_bytes, block_payload_bytes() + 9);
-    assert_eq!(retained.session_bytes[0], retained.node_bytes);
-    assert_eq!(retained.session_bytes[2], 0);
+    let retained = &observations[8].resources;
+    assert_eq!(retained.node_active, 1);
+    assert_eq!(retained.session_active[0], 1);
+    assert_eq!(retained.session_active[2], 0);
     checked_replay(&scenario).unwrap();
 }
 
 #[test]
 fn replay_rejects_inapplicable_actions_and_unknown_versions() {
     let mut scenario = Scenario {
-        version: 1,
+        version: 2,
         limit: Limit::NodeActive,
         actions: vec![Action::Commit { request: 0 }],
     };
     assert!(replay(&scenario).unwrap_err().contains("invalid action"));
-    scenario.version = 2;
+    scenario.version = 3;
     assert!(replay(&scenario)
         .unwrap_err()
         .contains("unsupported scenario"));
@@ -92,7 +91,7 @@ fn pending_bounds_include_both_sessions_and_recover_after_release() {
         DropInput { input: 3 },
     ];
     let scenario = Scenario {
-        version: 1,
+        version: 2,
         limit: Limit::NodeActive,
         actions,
     };
@@ -104,7 +103,7 @@ fn pending_bounds_include_both_sessions_and_recover_after_release() {
 }
 
 #[test]
-fn queue_failure_spends_nothing_and_query_leases_cannot_execute_twice() {
+fn queue_failure_keeps_ownership_and_query_leases_cannot_execute_twice() {
     use Action::*;
     let mut model = Model::new(Limit::PeerActive, block_payload_bytes());
     let mut actions = vec![
@@ -118,6 +117,8 @@ fn queue_failure_spends_nothing_and_query_leases_cannot_execute_twice() {
         ClaimQuery { request: 0 },
         QueueBlock { request: 0 },
         QueueTerminal { request: 0 },
+        BeginWrite { session: 0 },
+        QueueTerminal { request: 0 },
         DropLedger { request: 0 },
         DropQueryLease { request: 0 },
         DropQueryLease { request: 0 },
@@ -125,10 +126,6 @@ fn queue_failure_spends_nothing_and_query_leases_cannot_execute_twice() {
             peer: 0,
             request: 1,
         },
-        Commit { request: 1 },
-        QueueBlock { request: 1 },
-        BeginWrite { session: 0 },
-        QueueBlock { request: 1 },
         EndWrite {
             session: 0,
             outcome: WriteEnd::Fail,
@@ -139,16 +136,20 @@ fn queue_failure_spends_nothing_and_query_leases_cannot_execute_twice() {
     }
     actions.extend(model.cleanup());
     let scenario = Scenario {
-        version: 1,
+        version: 2,
         limit: Limit::PeerActive,
         actions,
     };
     let observations = replay(&scenario).unwrap();
     assert_eq!(observations[3].outcome, Outcome::Started(true));
     assert_eq!(observations[4].outcome, Outcome::Started(false));
-    assert_eq!(observations[12].outcome, Outcome::Queued(false));
-    assert_eq!(observations[11].resources, observations[12].resources);
-    assert_eq!(observations[14].outcome, Outcome::Queued(true));
+    assert_eq!(observations[6].outcome, Outcome::Queued(false));
+    assert_eq!(observations[5].resources, observations[6].resources);
+    assert_eq!(observations[8].outcome, Outcome::Queued(true));
+    assert_eq!(
+        observations[12].outcome,
+        Outcome::Admission(Some(Limit::PeerActive))
+    );
     checked_replay(&scenario).unwrap();
 }
 
@@ -209,7 +210,7 @@ async fn pending_wait_accounts_for_its_partial_session_reservation() {
 #[test]
 fn concrete_replay_accepts_times_outside_the_generation_distribution() {
     let scenario = Scenario {
-        version: 1,
+        version: 2,
         limit: Limit::NodeActive,
         actions: vec![Action::Advance { millis: 37 }],
     };

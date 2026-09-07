@@ -15,6 +15,7 @@ struct RequestOwners {
     permit: Option<GetBlocksServingPermit>,
     query_leases: Vec<BlockRangeQueryLease>,
     sent_block: bool,
+    lifetime: Option<std::sync::Weak<StdMutex<ServingResources>>>,
 }
 
 struct PendingWrite {
@@ -28,8 +29,7 @@ struct Session {
     receiver: FramedWorkerRecv,
     writing: Option<PendingWrite>,
     // Counter handles keep observations alive without retaining a permit,
-    // SessionResources, or the identity account used by cache eviction.
-    outstanding: OutstandingByteBudget,
+    // SessionResources.
     active: SlotBudget,
     pending: SlotBudget,
 }
@@ -75,7 +75,6 @@ impl Production {
             ),
             receiver,
             writing: None,
-            outstanding: account.resources.outstanding.clone(),
             active: account.resources.active.clone(),
             pending: account.resources.pending.clone(),
             account: Some(account),
@@ -99,20 +98,20 @@ impl Production {
                             permit: None,
                             query_leases: Vec::new(),
                             sent_block: false,
+                            lifetime: None,
                         });
                         Outcome::Admission(None)
                     }
                     Err(blocked) => Outcome::Admission(Some(match blocked.kind() {
                         BoundKind::PeerActive => Limit::PeerActive,
                         BoundKind::NodeActive => Limit::NodeActive,
-                        BoundKind::PeerOutstanding => Limit::PeerBytes,
-                        BoundKind::NodeOutstanding => Limit::NodeBytes,
                     })),
                 }
             }
             Action::Commit { request } => {
                 let owners = self.requests[request].as_mut().unwrap();
                 let permit = owners.attempt.take().unwrap().commit();
+                owners.lifetime = Some(Arc::downgrade(&permit.resources));
                 owners.query_leases.push(permit.query_lease());
                 owners.permit = Some(permit);
                 Outcome::Done
@@ -245,6 +244,10 @@ impl Production {
                 owners.attempt.is_none()
                     && owners.permit.is_none()
                     && owners.query_leases.is_empty()
+                    && owners
+                        .lifetime
+                        .as_ref()
+                        .is_none_or(|owner| owner.upgrade().is_none())
             }) {
                 *owners = None;
             }
@@ -255,12 +258,6 @@ impl Production {
     pub(super) fn snapshot(&self) -> Snapshot {
         let node = &self.regulator.inner;
         Snapshot {
-            node_bytes: node.node_outstanding.reserved(),
-            session_bytes: self
-                .sessions
-                .iter()
-                .map(|session| session.outstanding.reserved())
-                .collect(),
             node_active: node.node_active.reserved(),
             session_active: self
                 .sessions

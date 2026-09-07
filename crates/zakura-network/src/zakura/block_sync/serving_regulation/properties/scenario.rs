@@ -6,7 +6,7 @@ use super::super::*;
 
 pub(super) const REQUEST_SLOTS: usize = 4;
 pub(super) const INPUT_SLOTS: usize = 4;
-pub(super) const QUEUE_DEPTH: usize = 2;
+pub(super) const QUEUE_DEPTH: usize = 1;
 pub(super) const RESPONSE_CAP: u64 = 2_000_010;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -14,17 +14,10 @@ pub(super) const RESPONSE_CAP: u64 = 2_000_010;
 pub(super) enum Limit {
     PeerActive,
     NodeActive,
-    PeerBytes,
-    NodeBytes,
 }
 
 impl Limit {
-    pub(super) const ALL: [Self; 4] = [
-        Self::PeerActive,
-        Self::NodeActive,
-        Self::PeerBytes,
-        Self::NodeBytes,
-    ];
+    pub(super) const ALL: [Self; 2] = [Self::PeerActive, Self::NodeActive];
 
     pub(super) fn config(self) -> ZakuraBlockSyncConfig {
         let mut config = ZakuraBlockSyncConfig {
@@ -33,8 +26,6 @@ impl Limit {
             ..Default::default()
         };
         let policy = &mut config.get_blocks_regulation;
-        policy.peer_outstanding_bytes = RESPONSE_CAP * if self == Self::PeerBytes { 1 } else { 8 };
-        policy.node_outstanding_bytes = RESPONSE_CAP * if self == Self::NodeBytes { 1 } else { 16 };
         policy.node_active_requests = if self == Self::NodeActive { 1 } else { 8 };
         policy.peer_pending_requests = 2;
         policy.node_pending_requests = 3;
@@ -88,8 +79,6 @@ pub(super) enum Outcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Snapshot {
-    pub(super) node_bytes: u64,
-    pub(super) session_bytes: Vec<u64>,
     pub(super) node_active: usize,
     pub(super) session_active: Vec<usize>,
     pub(super) node_pending: usize,

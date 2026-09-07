@@ -29,8 +29,8 @@ fn missing_write_ownership_reduces_to_a_concrete_replay() {
         let observations = replay(&scenario).map_err(TestCaseError::fail)?;
         let expected = resources_after_reconnect(&scenario, &observations);
         let mut missing_write = expected.clone();
-        missing_write.node_bytes = 0;
-        prop_assert_ne!(expected.node_bytes, 0);
+        missing_write.node_active = 0;
+        prop_assert_ne!(expected.node_active, 0);
         // This is the same structural equality used by the model comparison.
         // The deliberately incomplete ledger must be rejected even after all
         // unrelated time advances have been shrunk away.
@@ -52,17 +52,17 @@ fn observation_comparison_rejects_compensating_and_wrong_session_errors() {
     let observations = replay(&scenario).unwrap();
     let expected = resources_after_reconnect(&scenario, &observations);
     let mut wrong_session = expected.clone();
-    wrong_session.session_bytes.swap(0, 2);
-    assert_eq!(wrong_session.node_bytes, expected.node_bytes);
+    wrong_session.session_active.swap(0, 2);
+    assert_eq!(wrong_session.node_active, expected.node_active);
     assert_ne!(
         wrong_session, *expected,
         "a correct aggregate cannot hide wrong ownership"
     );
-    let mut duplicate_refund = expected.clone();
-    duplicate_refund.node_bytes -= 1;
+    let mut duplicate_release = expected.clone();
+    duplicate_release.node_active -= 1;
     assert_ne!(
-        duplicate_refund, *expected,
-        "a one-unit duplicate refund must be visible"
+        duplicate_release, *expected,
+        "a one-unit duplicate release must be visible"
     );
 }
 

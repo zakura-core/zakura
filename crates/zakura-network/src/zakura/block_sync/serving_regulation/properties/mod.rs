@@ -33,7 +33,7 @@ fn block_payload_bytes() -> u64 {
 
 /// Replay requires concrete applicable actions; it never reconstructs choices.
 fn replay(scenario: &Scenario) -> Result<Vec<Observation>, String> {
-    if scenario.version != 1 {
+    if scenario.version != 2 {
         return Err(format!("unsupported scenario version {}", scenario.version));
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -94,7 +94,7 @@ fn materialize(limit: Limit, choices: &[usize]) -> Scenario {
     }
     actions.extend(model.cleanup());
     Scenario {
-        version: 1,
+        version: 2,
         limit,
         actions,
     }
@@ -116,7 +116,7 @@ fn checked_replay(scenario: &Scenario) -> Result<(), String> {
     }
     if let Some(observation) = first.last() {
         let state = &observation.resources;
-        if state.node_bytes != 0 || state.node_active != 0 || state.node_pending != 0 {
+        if state.node_active != 0 || state.node_pending != 0 {
             return Err(format!("unfinished ownership:\n{json}"));
         }
     }

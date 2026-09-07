@@ -11,6 +11,3 @@ mod tests;
 
 #[cfg(test)]
 mod properties;
-
-#[cfg(test)]
-pub(crate) mod test_support;

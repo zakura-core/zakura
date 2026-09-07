@@ -14,12 +14,13 @@ struct Request {
     sent_block: bool,
     sent_terminal: bool,
     transferred: u64,
+    frame_owners: usize,
 }
 
 #[derive(Clone, Debug, Default)]
 struct Session {
-    queue: VecDeque<u64>,
-    writing: Option<u64>,
+    queue: VecDeque<usize>,
+    writing: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -142,22 +143,10 @@ impl Model {
                 let config = self.limit.config();
                 let policy = config.get_blocks_regulation;
                 let blocked = [
-                    (
-                        state.session_active[session]
-                            >= usize::try_from(config.max_inflight_requests).unwrap(),
-                        Limit::PeerActive,
-                    ),
+                    (state.session_active[session] >= 1, Limit::PeerActive),
                     (
                         state.node_active >= policy.node_active_requests,
                         Limit::NodeActive,
-                    ),
-                    (
-                        state.node_bytes + RESPONSE_CAP > policy.node_outstanding_bytes,
-                        Limit::NodeBytes,
-                    ),
-                    (
-                        state.session_bytes[session] + RESPONSE_CAP > policy.peer_outstanding_bytes,
-                        Limit::PeerBytes,
                     ),
                 ]
                 .into_iter()
@@ -172,6 +161,7 @@ impl Model {
                         sent_block: false,
                         sent_terminal: false,
                         transferred: 0,
+                        frame_owners: 0,
                     });
                 }
                 outcome = Outcome::Admission(blocked);
@@ -208,7 +198,8 @@ impl Model {
                         state.sent_terminal = true;
                         9
                     };
-                    queue.push_back(bytes);
+                    queue.push_back(request);
+                    state.frame_owners += 1;
                     state.transferred += bytes;
                     assert!(state.transferred <= RESPONSE_CAP);
                 }
@@ -217,7 +208,10 @@ impl Model {
             Action::BeginWrite { session } => {
                 self.sessions[session].writing = self.sessions[session].queue.pop_front()
             }
-            Action::EndWrite { session, .. } => self.sessions[session].writing = None,
+            Action::EndWrite { session, .. } => {
+                let request = self.sessions[session].writing.take().unwrap();
+                self.requests[request].as_mut().unwrap().frame_owners -= 1;
+            }
             Action::RetainInput { peer, input } => {
                 let session = self.current_sessions[peer];
                 let state = self.snapshot();
@@ -255,7 +249,7 @@ impl Model {
     fn settle_unowned(&mut self) {
         for state in &mut self.requests {
             let Some(request) = state else { continue };
-            if request.ledger || request.query_owners > 0 {
+            if request.ledger || request.query_owners > 0 || request.frame_owners > 0 {
                 continue;
             }
             *state = None;
@@ -264,25 +258,17 @@ impl Model {
 
     pub(super) fn snapshot(&self) -> Snapshot {
         let mut state = Snapshot {
-            node_bytes: 0,
-            session_bytes: vec![0; self.sessions.len()],
             node_active: 0,
             session_active: vec![0; self.sessions.len()],
             node_pending: 0,
             session_pending: vec![0; self.sessions.len()],
         };
         for request in self.requests.iter().flatten() {
-            state.session_bytes[request.session] += RESPONSE_CAP - request.transferred;
             state.session_active[request.session] += 1;
-        }
-        for (session, output) in self.sessions.iter().enumerate() {
-            state.session_bytes[session] +=
-                output.queue.iter().sum::<u64>() + output.writing.unwrap_or(0);
         }
         for session in self.inputs.iter().flatten() {
             state.session_pending[*session] += 1;
         }
-        state.node_bytes = state.session_bytes.iter().sum();
         state.node_active = state.session_active.iter().sum();
         state.node_pending = state.session_pending.iter().sum();
         state

@@ -1,212 +1,127 @@
 # Regulation property tests
 
-The suite checks that serving work stops at its resource limits and resumes
-when capacity is released. It exercises the production accounting code with an
-independent expected-state model. GetBlocks is the first policy; the shared
-primitive properties also apply to future regulated messages.
+These tests check who owns admitted work and when capacity returns. They exercise
+production admission, response encoding, queueing, and write ownership against an
+independent model. They do not establish complete conformance to the peer-message
+regulation draft or whole-node overload protection.
 
-## Start here
+## Running the tests
 
-Run the focused suite from the repository root:
-
-```sh
-cargo nextest run --locked --profile regulation-properties \
-  -p zakura-network -p zakura-state -p zakura --lib
-```
-
-For a reproducible extended run:
+The ordinary unit-test lanes include these tests. The dedicated profile allows
+longer local exploration without changing production limits:
 
 ```sh
-PROPTEST_CASES=2048 PROPTEST_RNG_SEED=892 cargo nextest run --locked \
-  --profile regulation-properties -p zakura-network -p zakura-state \
-  -p zakura --lib
+cargo nextest run --locked --profile regulation-properties
 ```
 
-The ordinary unit-test profiles include these tests. Their regulation overrides
-and the focused profile use zero retries. The focused suite also runs the
-serving policy's lifecycle tests, including concurrent claim and
-cancellation checks. PR CI also runs a fixed seed;
-scheduled and manual CI runs explore more cases with the CI run ID as their
-seed. Stacked PRs on `adam/**` receive the same Rust CI entrypoints as other
-development bases.
+For a focused network run:
 
-## What each layer establishes
+```sh
+cargo test --locked -p zakura-network --lib serving_regulation
+cargo test --locked -p zakura-network --lib regulation_properties
+cargo test --locked -p zakura-network --lib regulation::properties
+```
 
-| Layer | Production path | Independent expectation |
+Increase `PROPTEST_CASES` for additional generated histories. Failures print a
+concrete JSON scenario and retain Proptest's normal seed-based reproduction.
+
+## Test boundaries
+
+| Layer | Production path exercised | Observation |
 | --- | --- | --- |
-| Primitives | Rate, byte, and slot budgets | Balance and owner totals |
-| GetBlocks | Admission, sender, writer | Logical resource ledger |
-| Reactor | Peer routine and response queue | Prefix, terminal, leases |
-| Driver | Actual state worker | Read lifetime and waiting peer |
-| Storage | Bounded range collector | Prefix sum and lookup sequence |
+| Primitive | Concurrency slots | Owned permit count |
+| Serving | Admission, query lifecycle, encoder, transport queue | Node and session producer/pending counts |
+| Reactor | Peer routine and response queue | Response prefix, terminal, producer lifetime |
+| Driver | Query claim, timeout, cancellation, result handoff | Underlying query and result retain capacity |
+| State | Range response limits | Actual returned body bytes stay within the cap |
 
-The ownership model does not call production cost, admission, transfer, or
-refund helpers. It shares configuration inputs, not state transitions. The separate
-rate-primitive oracle represents fractional units directly, rather than copying production's
-separate whole-token and remainder fields. Credit discarded at burst capacity
-is not available for later spending.
+The model tracks ledger, query, and frame owners independently. It does not use
+production counters or release helpers to calculate expected state. Production
+observations are compared after every action, including failed admission.
 
-The transport adapter uses `worker_framed_channel` and
-`QueuedFrame::write_with`. The ordinary synthetic receiver unwraps frames at
-dequeue, so it cannot establish that bytes remain charged during an unfinished
-application write. Read-only budget handles observe retired sessions without
-keeping their permits alive.
+Transport witnesses use the same `QueuedFrame::write_with` boundary as the real
+writer. Dequeue alone must not release a producer. Controlled writes exercise
+completion, failure, and cancellation. The base PR also tests a real QUIC write
+blocked by stream credit while another stream makes progress.
 
-## GetBlocks contract and witnesses
+## Generated histories
 
-The ownership scenario uses two identities, up to eight session generations,
-four request slots, four input slots, and output queues of depth two. Each
-request allows one block, using the committed mainnet height-one fixture. Its
-allowance is 2,000,010 payload bytes plus configured fixed work. It is a
-reservation; the test does not allocate that many bytes to fill a budget.
+The ownership model uses two peer identities, at most eight session generations,
+four request slots, four input slots, and a one-frame output queue per session.
+Requests contain one committed mainnet block fixture or an empty terminal. The
+independently calculated maximum response payload is 2,000,010 bytes; this is a
+wire bound, not an outstanding-byte budget.
 
-Accepted local response caps must fit one maximum-sized block. Cost properties
-check its block and terminal reservation; storage properties require a nonempty
-prefix when valid-sized blocks are available. A fixed reactor witness uses the
-minimum accepted cap to serve a near-limit serialization fixture and retain its
-charge through the application write. That fixture checks size and ownership,
-not consensus validity.
+Actions cover provisional admission, commit, query claim and cloning, ledger
+closure, frame queueing, pending writes, write completion/failure/cancellation,
+pending input, reconnects, and time advancement. Only reference-model-enabled
+actions are generated. A concrete replay rejects an inapplicable action instead
+of silently skipping it. Cleanup uses the same actions to finish every owner.
 
-Separate cost properties vary legal counts and byte caps. Reactor histories use
-one to three committed blocks and queue depths one to three. These deliberately
-small capacities reach full queues and resource limits with bounded
-allocations.
+Deterministic witnesses ensure these boundaries are reached independently of
+random coverage:
 
-- **Admission before work and transactional rollback.** Each of the four
-  peer/node slot and byte limits blocks admission; releasing ownership
-  permits the retry without advancing time.
-- **Bounded pending input.** Session and node bounds are reached separately; an
-  async node-slot waiter owns its partial session reservation and returns it on
-  cancellation.
-- **One active ownership group.** Read clones cannot start another execution;
-  removing the ledger retains the shared charge until all read/result owners
-  drop.
-- **Bytes survive request settlement.** The saved reconnect scenario retains
-  queued/writing bytes under the old session after its active request owner
-  ends.
-- **Exact spending.** A full output queue changes no byte balance;
-  successful enqueue transfers the actual payload reservation to the writer;
-  provisional rollback refunds everything.
-- **Terminal completion.** The reactor exercises full, partial, and empty
-  responses through small queues and verifies their terminal and actual written
-  prefix.
-- **State lifetime and recovery.** Success, error, panic, timeout, cancellation
-  before start, and cancellation while running; the waiting second peer
-  proceeds after the read completes.
-- **Replay and checker sensitivity.** Saved JSON replays twice; incompatible
-  inputs fail; deliberately faulty observations are rejected and irrelevant
-  history shrinks away.
+- **Admission and rollback:** both session and node producer limits block, then
+  recover when ownership ends. Failed admission returns any earlier slot.
+- **Pending input:** session and node limits block independently, including the
+  partial session reservation held while waiting for a node slot.
+- **One execution:** cloned query leases cannot claim a second state read.
+  Ledger closure prevents a queued read from starting.
+- **Write backpressure:** a queued or writing response keeps its session producer
+  occupied after the ledger and query owners drop. Failed queue admission changes
+  no ownership and can be retried after capacity becomes available.
+- **Reconnects:** old query and frame owners remain counted under the old session.
+  Replacing the session does not release their node capacity.
+- **Response boundaries:** separate properties vary legal counts and response
+  caps; real reactor histories cover empty, partial, and complete responses with
+  queues of depth one through three.
+- **Checker sensitivity:** deliberately missing write ownership, wrong-session
+  attribution, and duplicate releases fail comparison. Shrinking removes
+  irrelevant time advances while preserving a concrete failing observation.
 
-Existing block-sync regression tests remain part of ordinary CI. They
-additionally cover stale admission, terminal timeout, queue closure, shutdown,
-replacement sessions, pending-input backpressure, and local-pressure
-classification. They complement these generated suites; the property suite does
-not claim to generate every reactor terminal path.
+The real reactor's existing timeout, shutdown, full-queue, stale-session, and
+same-stream download tests complement the generated histories. The generator
+is not claimed to cover every reactor terminal path.
 
-### What the defaults allow
+## Production defaults
 
-`serving_regulation/properties/defaults.rs` uses unmodified configuration and
-independent numeric expectations. The default response count is one block.
-A maximum 2,000,000-byte block uses 2,000,010 payload bytes with its framing
-and terminal. There is no fixed request price or byte-rate allowance.
+The default advertisement permits one block per response. One maximum-size body
+plus its discriminator and terminal is 2,000,010 payload bytes. There is no fixed
+request price, serving byte-rate allowance, or outstanding-byte balance.
 
-| Account | Maximum-block witness | What permits the next request |
+| Boundary | Default witness | Recovery |
 | --- | --- | --- |
-| Node active work | 64 retained requests | Release one active owner |
-| Session outstanding bytes | 33 retained full responses | Finish or drop a frame write |
-| Node outstanding bytes | 134 retained full responses across five sessions | Finish or drop a frame write |
-| Pending inputs | 64 per session and 1,024 across sessions | Release a retained input |
+| Session producer | One query/result/response shared by all its owners | Last owner finishes |
+| Node producers | 64 sessions retaining responses | One producer finishes |
+| Pending inputs | 64 per session, 1,024 across sessions | One retained input releases its slots |
 
-A completion witness serves 4,096 maximum-size response reservations across five
-sessions without advancing time, draining each frame before admitting the next
-request. Active and byte witnesses retain their owners while time advances to
-show that elapsed time alone cannot release capacity.
-Failed admissions must leave earlier reservations unchanged.
+Time advancement never frees owned capacity. A separate witness completes 4,096
+responses without advancing time, proving admission does not wait for a refill.
+These tests exercise resource counts without allocating maximum-size block bodies;
+real response encoding and write tests cover the framing boundary separately.
 
-At these defaults the node active limit is lower than the advertised session
-active limit; the latter is exercised separately with smaller configured bounds.
-The pending witness starts at retained-input ownership. The peer routine's
-separate backpressure tests cover its one decoded input waiting for those slots.
+## Replay and reuse
 
-Settlement examples cover no queued output, an empty terminal, a small block,
-and a maximum block. All initially reserve the worst case; unused capacity returns
-after the final query owner drops. Transferred frame bytes remain outstanding
-until their transport owner ends. These sizing examples
-transfer real charges without allocating bodies; they do not measure sync
-throughput, total memory, or transport delivery.
+JSON version 2 records the producer-ownership contract. Version 1 described the
+removed byte budgets and is rejected. The committed reconnect scenario is a
+human-readable example. Replay observations include per-session attribution, so
+matching aggregate totals cannot hide an ownership error.
 
-## Reading a failure
+For another message family:
 
-Start with the first divergent action and its expected/observed snapshot. GetBlocks uses two kinds of account:
+1. Declare its actual rules and work unit; do not assume it needs byte accounting.
+2. Identify admission and every owner that can outlive the handler, including
+   state work, results, and transport writes where applicable.
+3. Write an independent ownership model and concrete replay actions.
+4. Add deterministic witnesses for each limit, release path, and legal retry.
+5. Exercise the real handler, encoder, and transport boundaries against those
+   expectations, including cancellation and session replacement.
 
-- Outstanding bytes do not refill. They belong to the reservation remainder,
-  queued frames, or pending application writes.
-- Slots belong to provisional admission or a shared active ownership group.
-  Multiple references to that group do not multiply its charge.
+Reuse the slot properties where the contract is identical. Extract additional
+helpers only when a second message demonstrates common behavior. Keep message
+semantics and fixtures explicit so a reviewer can understand what is tested.
 
-A cancelled read may still own capacity. A settled request may still have
-writing bytes. Therefore final cleanup must end workers, results, and writes
-too. Every pending slot, active slot, and retained response byte must be released.
-
-The generated ownership suite prints a concrete JSON scenario on failure and
-also uses Proptest's seed persistence. The JSON version fixes its fixture and
-model bounds; its actions contain logical slots and session generations. Replay
-checks action preconditions independently of the generator's distribution.
-Changing that distribution does not reinterpret a saved scenario.
-
-Keep a confirmed minimized scenario next to `writing_after_reconnect.json` and
-add a named replay test with the specific intermediate assertion. The existing
-JSON is a deterministic boundary witness, not a claim of a historic production
-failure. Negative controls alter test observations only; production limits are
-never disabled.
-
-The component runner explicitly advances paused Tokio time and compares two
-replays. The reactor adapter uses production timers, including its output-queue
-poll, and waits for channel acknowledgements and frames under virtual
-deadlines. It compares resource and response semantics, not identical task
-schedules or wall-clock timestamps. The lifecycle unit tests also exercise
-overlapping claims and cancellation on real threads. Either operation may win; no second claim may succeed, and the
-remaining lease must retain its resources. These runs do not exhaust thread
-schedules. No general scheduler or model-checking engine is involved.
-
-## Adding another regulated message
-
-Write a short resource contract before its property tests:
-
-1. State its role and which work must be preceded by admission.
-2. Name the session, identity, node, and transport accounts it uses.
-3. Define worst-case reservation, actual spending, refund, and each release
-   point.
-4. Specify behavior at capacity and distinguish local overload from misconduct.
-5. Supply deterministic boundary witnesses and an independent lifecycle model
-   against the production boundary that owns those resources.
-6. State progress assumptions, unsupported scenarios, and costs outside the
-   bound.
-
-Reuse the primitive properties, including the rational rate oracle for messages
-that declare a cadence. Keep message actions
-and production adapters near their message policy. Extract further shared
-helpers when a second implementation demonstrates identical behavior; do not
-give future messages a GetBlocks-shaped action interface.
-
-Requests need reservation and response ownership tests. Announcements need
-cadence and bounded verification/storage effects. Responses need authorization,
-credit consumption, and retained-data ownership. A message's tests are
-incomplete if the generator can avoid its limit or if only a separate model is
-exercised.
-
-## Limits of the evidence
-
-These are finite generated tests, not an exhaustive proof. The suite begins at
-resource admission or decoded messages; it does not establish raw-frame
-allocation safety, incomplete-frame deadlines, consensus validity, or total
-RSS.
-
-Decoded blocks, temporary serialization, a fetched boundary block, and QUIC
-data after application handoff are outside this serialized-payload account.
-GetBlocks node accounts do not yet cover other message families. Pricing and
-production capacity still require representative measurements.
-
-Progress assumes the needed capacity and dependencies become available. An
-indefinitely stalled read may keep the active budget occupied. The combined
-budgets do not promise strict fairness under continuous competing arrivals.
+These are finite generated histories, not exhaustive state exploration. They do
+not measure RocksDB capacity, consensus scheduling, or full sync performance.
+The local real-Iroh comparison and its limitations are documented in
+[GetBlocks serving regulation](../design/getblocks-regulation.md).

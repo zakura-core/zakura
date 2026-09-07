@@ -838,8 +838,9 @@ where
         }
 
         if !block_outpoints.is_empty() {
-            let mut lookups = futures::stream::iter(block_outpoints)
-                .map(move |(input_idx, outpoint)| {
+            let single_lookup = block_outpoints.len() == 1;
+            let lookups =
+                futures::stream::iter(block_outpoints).map(move |(input_idx, outpoint)| {
                     let state = state.clone();
                     async move {
                         let response = state
@@ -855,8 +856,16 @@ where
                         };
                         Ok::<_, TransactionError>((input_idx, outpoint, utxo))
                     }
-                })
-                .buffer_unordered(MAX_CONCURRENT_UTXO_LOOKUPS);
+                });
+            // A single lookup cannot overlap another lookup, so skip the concurrency queue.
+            let lookups = if single_lookup {
+                lookups.then(std::convert::identity).left_stream()
+            } else {
+                lookups
+                    .buffer_unordered(MAX_CONCURRENT_UTXO_LOOKUPS)
+                    .right_stream()
+            };
+            futures::pin_mut!(lookups);
 
             while let Some(result) = lookups.next().await {
                 let (input_idx, outpoint, utxo) = result?;

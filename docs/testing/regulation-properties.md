@@ -79,8 +79,6 @@ random coverage:
 
 - **Admission and rollback:** both session and node producer limits block, then
   recover when ownership ends. Failed admission returns any earlier slot.
-- **Pending input:** session and node limits block independently, including the
-  partial session reservation held while waiting for a node slot.
 - **One execution:** cloned query leases cannot claim a second state read.
   Ledger closure prevents a queued read from starting.
 - **Write backpressure:** a queued or writing response keeps its session producer
@@ -109,7 +107,6 @@ request price, serving byte-rate allowance, or outstanding-byte balance.
 | --- | --- | --- |
 | Session producer | One query/result/response shared by all its owners | Last owner finishes |
 | Node producers | 64 sessions retaining responses | One producer finishes |
-| Pending inputs | 64 per session, 1,024 across sessions | One retained input releases its slots |
 
 Time advancement never frees owned capacity. A separate witness completes 4,096
 responses without advancing time, proving admission does not wait for a refill.
@@ -117,10 +114,13 @@ These tests exercise resource counts without allocating maximum-size block bodie
 real response encoding and write tests cover the framing boundary separately.
 
 The service tests in the base PR hold one request at admission and verify that
-later frames stay unread until capacity returns. A local timeout closes the
-paused session without scoring the peer. A real QUIC test fills the application
-receive channel and stream window, checks that response writes and a sibling
-stream still progress, then drains the channel to verify recovery and cancellation.
+later frames stay unread until capacity returns. A long pause returns unreceived
+downloads to the scheduler and keeps the stream open. Tests also check that the
+floor watchdog respects this pause and that the final response survives a long
+queue wait. A real QUIC test fills the application receive channel and stream
+window, checks that response writes and a sibling stream still progress, then
+drains the channel to verify recovery. Cancellation during a blocked write must
+finish the current frame before closing the stream.
 
 ## Replay and reuse
 

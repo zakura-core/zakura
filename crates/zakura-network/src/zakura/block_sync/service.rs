@@ -224,23 +224,6 @@ impl BlockSyncPeerSession {
         self.try_send_regulated_message(BlockSyncMessage::Block(block), permit)
     }
 
-    /// Queue a regulated successful-response terminator.
-    #[cfg(test)]
-    pub(super) fn try_send_regulated_blocks_done(
-        &self,
-        start_height: block::Height,
-        returned: u32,
-        permit: &mut super::serving_regulation::GetBlocksServingPermit,
-    ) -> Result<(), OrderedSendError> {
-        self.try_send_regulated_message(
-            BlockSyncMessage::BlocksDone {
-                start_height,
-                returned,
-            },
-            permit,
-        )
-    }
-
     /// Share response ownership only when a transport queue slot is available.
     pub(super) fn try_send_regulated_message(
         &self,

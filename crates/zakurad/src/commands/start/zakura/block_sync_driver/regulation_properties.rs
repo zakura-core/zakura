@@ -71,7 +71,7 @@ async fn check_read_lifetime(delivery: DeliveryEnd, read_end: ReadEnd, delay_ms:
     );
     let (handle, mut actions, reactor) = spawn_block_sync_reactor(startup);
     let peers = SyntheticBlockSyncPeers::new(config, handle.clone(), 8);
-    let peer = peers
+    let mut peer = peers
         .add_peer(
             ZakuraPeerId::new(vec![81; 32]).unwrap(),
             BlockSyncStatus {
@@ -201,6 +201,29 @@ async fn check_read_lifetime(delivery: DeliveryEnd, read_end: ReadEnd, delay_ms:
         complete.send(()).unwrap();
         assert!(worker.as_mut().now_or_never().is_some());
         assert_eq!(finished.load(Ordering::SeqCst), 1);
+        if matches!(delivery, DeliveryEnd::Complete | DeliveryEnd::Timeout) {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1), next_serving_query(&mut actions))
+                    .await
+                    .is_err(),
+                "finishing storage does not release the producer while its terminal is unread"
+            );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Some(BlockSyncMessage::RangeUnavailable {
+                        start_height,
+                        count,
+                    }) = peer.recv().await.unwrap()
+                    {
+                        assert_eq!(start_height, tip.0);
+                        assert_eq!(count, 1);
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("the empty response reaches its original peer");
+        }
         let resumed =
             tokio::time::timeout(Duration::from_secs(1), next_serving_query(&mut actions))
                 .await

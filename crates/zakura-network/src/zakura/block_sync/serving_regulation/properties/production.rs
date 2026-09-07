@@ -15,7 +15,7 @@ struct RequestOwners {
     permit: Option<GetBlocksServingPermit>,
     query_leases: Vec<BlockRangeQueryLease>,
     sent_block: bool,
-    lifetime: Option<std::sync::Weak<StdMutex<ServingResources>>>,
+    lifetime: Option<std::sync::Weak<ServingResources>>,
 }
 
 struct PendingWrite {

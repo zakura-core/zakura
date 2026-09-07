@@ -11,6 +11,16 @@ Zakura must fully utilize each p2p connection without letting a peer overwhelm t
 bounds attacker-controlled CPU, memory, disk, lock, and response work. It maps those costs to
 cadence, response-byte, concurrency, and reservation bounds for each message role.
 
+High throughput is a design requirement. Prefer QUIC flow control, congestion control, and transport
+fairness together with the message protections below. Ideally, Zakura adds no application-level
+byte-rate limits. Frame sizes, buffered bytes, and outstanding response credit still need bounds;
+those bounds limit resource commitments, not bytes transferred per second. Any proposed byte-rate
+limit must identify a measured resource cost that these mechanisms cannot bound. The byte-denominated
+Work bucket in this draft remains a proposal to validate against that requirement.
+
+We will design message prioritization separately later. Do not add prioritization as part of message
+regulation, and do not depend on future prioritization to make the current protections safe.
+
 Before Zakura handles an inbound message, it applies every filter required by that message's role:
 
 1. **Safe** — Frame checks precede allocation, and bounded decoding precedes expensive verification.
@@ -81,9 +91,15 @@ configuration.
 
 `Delay` does not require another request scheduler. The peer routine keeps the current request at
 the admission boundary and stops reading further frames from that peer's ordered stream until Work
-becomes available. The existing bounded application and QUIC queues then apply flow control to the
-peer. This may delay later messages on the same ordered stream, but it does not block another peer
-or service stream.
+becomes available. Pausing application reads must stop draining the QUIC receive buffer. Once the
+peer exhausts its existing flow-control credit, QUIC prevents it from sending more data on that
+stream. Already authorized data may still arrive. This makes the QUIC receive buffer an important
+admission mechanism; continuously draining it into application queues would defeat backpressure.
+See [QUIC flow control](https://www.rfc-editor.org/rfc/rfc9000.html#section-4.1).
+
+This may delay later messages on the same ordered stream. The implementation must size stream and
+connection receive windows so a paused stream cannot exhaust the credit needed by other service
+streams. Other peers must keep progressing independently.
 
 A one-shot reservation has this lifecycle:
 

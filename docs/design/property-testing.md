@@ -202,6 +202,12 @@ small-state coverage, controlled concurrency, and transport confidence.
 | Controlled system tests | Exercise production protocol logic under generated failures and action orders |
 | Real transport checks | Validate the production adapter, transport boundary, backpressure, and runtime behavior |
 
+Real transport checks must show that paused application reads stop draining the QUIC receive buffer
+and eventually block further stream data after the peer consumes existing credit. They must also
+show that reads resume and other peers and service streams keep progressing. Throughput checks must
+detect unnecessary byte-rate caps when resources remain available. These checks cover the current
+message protections without adding or assuming future message prioritization.
+
 ## Regulation properties
 
 The regulation suite separates conformant scenarios from adversarial scenarios. A conformant

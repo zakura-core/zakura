@@ -6,6 +6,23 @@
 
 ## Filter model
 
+### Throughput and scope
+
+Message regulation MUST preserve high throughput. Implementations SHOULD rely on QUIC flow control,
+congestion control, transport fairness, and the message protections in this specification.
+Implementations SHOULD NOT add application-level byte-rate limits. Any exception MUST identify a
+measured resource cost that these mechanisms cannot bound. Frame, buffer, concurrency, and
+reservation bounds remain required.
+
+The byte-denominated Work bucket below is provisional. Its refill rates and serving-rate policy
+MUST satisfy this requirement before adoption; the draft does not authorize a fixed bandwidth cap
+merely to divide capacity among peers.
+
+We will specify message prioritization separately later. Implementations MUST NOT add prioritization
+as part of this work or rely on future prioritization for the safety of message regulation.
+
+### Roles and results
+
 Each message has one role. The role selects the bound on the work caused by that message.
 
 | Role | Work bound | Budget verdict |
@@ -234,6 +251,10 @@ refund = upper_bound_response_bytes - actual_response_bytes
   admission boundary. It MUST stop reading that peer's ordered stream until Work becomes available.
   The existing bounded application and QUIC queues MUST provide backpressure. The implementation
   MUST NOT add a delayed-request queue or scheduler.
+- Pausing reads MUST propagate to the QUIC receive buffer. The transport MUST stop granting further
+  stream credit as that buffer fills, so the peer cannot send more stream data after it exhausts
+  existing credit. The resource bound MUST include already authorized data. The implementation MUST
+  preserve enough connection credit for other service streams to make progress.
 - A delayed request MUST hold no shared lock, stream writer, or handler permit. All buffering MUST
   fit the per-peer resource bound. The delay MUST NOT block another peer or service stream. Later
   messages on the same ordered stream MAY wait. A refund or refill MUST wake the peer routine. The
@@ -662,13 +683,14 @@ flow control instead of adding another request scheduler. The delay lengthens th
 round-trip samples, the sender's delay gradient shrinks its window, and the sender settles below the
 rate the receiver serves.
 
-`BLOCK_WORK_REFILL` therefore binds only a sender that ignores its own controller. The receiver MUST
-set the rate from local policy. It MUST NOT derive the rate from a peer-supplied or peer-influenced
-measurement, because a peer able to move that measurement would set its own budget. The receiver
-MUST size the rate so that the rate multiplied by the maximum peer count fits its serving egress
-budget. No configuration key sets this rate today: [`block_sync::config`][bs-config] bounds the
-requesting side (inflight requests, inflight block bytes, look-ahead bytes) and has no serving-rate
-setting. An implementation of this specification MUST add one.
+`BLOCK_WORK_REFILL` can also limit an honest sender, so its use requires the evidence stated in
+[Throughput and scope](#throughput-and-scope). Prefer transport fairness and backpressure over a
+fixed per-peer share of egress capacity. If measurements justify a Work refill rate, the receiver
+MUST set it from local resource policy. It MUST NOT let a peer set its own budget through
+peer-supplied or peer-influenced measurements. No configuration key sets this rate today:
+[`block_sync::config`][bs-config] bounds the requesting side (inflight requests, inflight block bytes,
+look-ahead bytes) and has no serving-rate setting. This draft does not require adding that setting
+before validating the need for a byte-rate limit.
 
 `MAX_BLOCKS_PER_RESPONSE` and `MAX_BS_RESPONSE_BYTES` both apply to one range response, and the
 smaller one stops it. `MAX_BS_RESPONSE_BYTES` counts encoded block bodies and excludes message

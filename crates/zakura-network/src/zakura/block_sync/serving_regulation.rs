@@ -1,9 +1,9 @@
 //! Resource admission for serving inbound `GetBlocks` requests.
 //!
 //! This module turns the generic regulation primitives into one message policy.
-//! A decoded request first owns bounded pending state. Its admission task then
-//! acquires a response producer before the state query starts. The query, result,
-//! and queued frames share that producer until the last owner drops. A blocked
+//! Each routine holds at most one decoded request while waiting for admission.
+//! Admission acquires a response producer before the state query starts. The query,
+//! result, and queued frames share that producer until the last owner drops. A blocked
 //! transport writer therefore prevents another query for the same session.
 
 use std::sync::Arc;
@@ -13,14 +13,27 @@ use super::wire::MAX_BS_BLOCKS_PER_REQUEST;
 use super::{config::*, *};
 use crate::zakura::{
     regulation::{
-        AcquiredWorkSlot, RequestAdmission, RequestSession, ResponsePermit, SlotBudget, SlotPermit,
+        AcquiredWorkSlot, RequestAdmission, RequestSession, ResponsePermit, SlotBudget,
         WorkAttempt, WorkBlocked, WorkBound, WorkLease,
     },
     transport::FrameGuard,
 };
 
 mod policy;
-use policy::{GetBlocksPolicy, GetBlocksRequest};
+use policy::GetBlocksPolicy;
+
+/// One decoded request held at the admission boundary until work is available.
+#[derive(Debug)]
+pub(super) struct GetBlocksRequest {
+    pub(super) start_height: block::Height,
+    pub(super) count: u32,
+}
+
+impl GetBlocksRequest {
+    pub(super) fn into_parts(self) -> (block::Height, u32) {
+        (self.start_height, self.count)
+    }
+}
 
 /// The bounded work declaration for one decoded request.
 #[cfg(test)]
@@ -56,32 +69,11 @@ pub(super) fn validate_config(config: &ZakuraBlockSyncConfig) -> Result<(), &'st
     if regulation.node_active_requests > tokio::sync::Semaphore::MAX_PERMITS {
         return Err("get_blocks_regulation.node_active_requests exceeds Tokio's semaphore limit");
     }
-    if regulation.peer_pending_requests == 0 {
-        return Err("get_blocks_regulation.peer_pending_requests must be greater than zero");
-    }
-    if regulation.peer_pending_requests > tokio::sync::Semaphore::MAX_PERMITS {
-        return Err("get_blocks_regulation.peer_pending_requests exceeds Tokio's semaphore limit");
-    }
-    if regulation.node_pending_requests == 0 {
-        return Err("get_blocks_regulation.node_pending_requests must be greater than zero");
-    }
-    if regulation.node_pending_requests > tokio::sync::Semaphore::MAX_PERMITS {
-        return Err("get_blocks_regulation.node_pending_requests exceeds Tokio's semaphore limit");
-    }
     if regulation.query_timeout < Duration::from_millis(1) {
         return Err("get_blocks_regulation.query_timeout must be at least 1ms");
     }
 
-    if regulation.node_pending_requests < regulation.peer_pending_requests {
-        return Err("get_blocks_regulation.node_pending_requests must cover one session queue");
-    }
-
     Ok(())
-}
-
-/// Pending requests retained by one stream while its oldest request waits for work.
-pub(super) fn pending_input_capacity_per_session(config: &ZakuraBlockSyncConfig) -> usize {
-    config.get_blocks_regulation.peer_pending_requests
 }
 
 /// Node-owned GetBlocks resources shared by every peer routine.
@@ -95,15 +87,12 @@ struct RegulatorInner {
     admission: RequestAdmission<GetBlocksPolicy>,
     #[cfg(test)]
     node_active: SlotBudget,
-    node_pending: SlotBudget,
-    session_pending_capacity: usize,
     #[cfg(test)]
-    sessions: StdMutex<Vec<(SlotBudget, SlotBudget)>>,
+    sessions: StdMutex<Vec<SlotBudget>>,
 }
 
 #[derive(Debug)]
 struct SessionResources {
-    pending: SlotBudget,
     work: RequestSession<GetBlocksPolicy>,
     #[cfg(test)]
     active: SlotBudget,
@@ -114,7 +103,6 @@ impl GetBlocksServingRegulator {
     pub(super) fn new(config: ZakuraBlockSyncConfig) -> Self {
         debug_assert!(validate_config(&config).is_ok());
         let regulation = &config.get_blocks_regulation;
-        let session_pending_capacity = pending_input_capacity_per_session(&config);
         let node_active = SlotBudget::new(regulation.node_active_requests)
             .expect("GetBlocks configuration validates the active-request capacity");
         Self {
@@ -126,9 +114,6 @@ impl GetBlocksServingRegulator {
                 ),
                 #[cfg(test)]
                 node_active,
-                node_pending: SlotBudget::new(regulation.node_pending_requests)
-                    .expect("GetBlocks configuration validates the pending-request capacity"),
-                session_pending_capacity,
                 #[cfg(test)]
                 sessions: StdMutex::new(Vec::new()),
             }),
@@ -139,8 +124,6 @@ impl GetBlocksServingRegulator {
     pub(super) fn session(&self, peer: ZakuraPeerId, session_id: u64) -> GetBlocksServingSession {
         let work = self.inner.admission.session();
         let resources = Arc::new(SessionResources {
-            pending: SlotBudget::new(self.inner.session_pending_capacity)
-                .expect("GetBlocks configuration validates the pending-request capacity"),
             #[cfg(test)]
             active: work.session_budget().clone(),
             work,
@@ -150,10 +133,9 @@ impl GetBlocksServingRegulator {
             .sessions
             .lock()
             .expect("GetBlocks session-resource mutex should not be poisoned")
-            .push((resources.active.clone(), resources.pending.clone()));
+            .push(resources.active.clone());
 
         GetBlocksServingSession {
-            regulator: self.clone(),
             peer,
             session_id,
             resources,
@@ -167,75 +149,23 @@ impl GetBlocksServingRegulator {
             .sessions
             .lock()
             .expect("GetBlocks session-resource mutex should not be poisoned");
-        let mut session_active = 0usize;
-        let mut session_pending = 0usize;
-        for (active, pending) in sessions.iter() {
-            session_active += active.reserved();
-            session_pending = session_pending.saturating_add(pending.reserved());
-        }
         ServingRegulationSnapshot {
             node_active: self.inner.node_active.reserved(),
-            node_pending: self.inner.node_pending.reserved(),
-            session_active,
-            session_pending,
+            session_active: sessions.iter().map(SlotBudget::reserved).sum(),
         }
     }
 }
 
-/// Per-session entry point for pending ownership and work admission.
+/// Per-session entry point for decoding and work admission.
 #[derive(Clone, Debug)]
 pub(super) struct GetBlocksServingSession {
-    regulator: GetBlocksServingRegulator,
     peer: ZakuraPeerId,
     session_id: u64,
     resources: Arc<SessionResources>,
 }
 
 impl GetBlocksServingSession {
-    /// Reserve bounded memory for one decoded request before retaining it.
-    pub(super) fn try_retain_input(
-        &self,
-        start_height: block::Height,
-        count: u32,
-    ) -> Result<PendingGetBlocksRequest, PendingInputBlocked> {
-        let session = self
-            .resources
-            .pending
-            .try_reserve()
-            .ok_or_else(PendingInputBlocked::session)?;
-        let node = self
-            .regulator
-            .inner
-            .node_pending
-            .try_reserve()
-            .ok_or_else(PendingInputBlocked::node)?;
-        Ok(PendingGetBlocksRequest {
-            start_height,
-            count,
-            _session: session,
-            _node: node,
-            _resources: self.resources.clone(),
-        })
-    }
-
-    /// Wait for pending ownership while the routine continues processing completions.
-    pub(super) async fn retain_input(
-        &self,
-        start_height: block::Height,
-        count: u32,
-    ) -> PendingGetBlocksRequest {
-        let session = self.resources.pending.reserve().await;
-        let node = self.regulator.inner.node_pending.reserve().await;
-        PendingGetBlocksRequest {
-            start_height,
-            count,
-            _session: session,
-            _node: node,
-            _resources: self.resources.clone(),
-        }
-    }
-
-    /// Apply the declared codec before retaining or admitting an inbound request.
+    /// Apply the declared codec before admitting an inbound request.
     pub(super) fn decode_request(
         &self,
         frame: Frame,
@@ -252,16 +182,10 @@ impl GetBlocksServingSession {
     /// Admit an already decoded, retained request before dispatching its state work.
     pub(super) fn try_admit_request(
         &self,
-        request: &PendingGetBlocksRequest,
+        request: &GetBlocksRequest,
         acquired: Option<AcquiredAdmissionSlot>,
     ) -> Result<AdmissionAttempt, AdmissionBlocked> {
-        self.admit(
-            &GetBlocksRequest {
-                start_height: request.start_height,
-                count: request.count,
-            },
-            acquired,
-        )
+        self.admit(request, acquired)
     }
 
     fn admit(
@@ -309,61 +233,6 @@ impl GetBlocksServingSession {
 }
 
 pub(super) type AcquiredAdmissionSlot = AcquiredWorkSlot;
-
-/// The pending bound currently delaying one decoded request.
-#[derive(Clone, Debug)]
-pub(super) struct PendingInputBlocked {
-    kind: PendingBoundKind,
-}
-
-/// Scope of a retained-request capacity delay.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum PendingBoundKind {
-    /// This session has retained its advertised request window.
-    Session,
-    /// All sessions together have reached the node's decoded-request bound.
-    Node,
-}
-
-impl PendingInputBlocked {
-    fn session() -> Self {
-        Self {
-            kind: PendingBoundKind::Session,
-        }
-    }
-
-    fn node() -> Self {
-        Self {
-            kind: PendingBoundKind::Node,
-        }
-    }
-
-    /// Stable low-cardinality label for metrics and traces.
-    pub(super) fn label(&self) -> &'static str {
-        match self.kind {
-            PendingBoundKind::Session => "session_pending",
-            PendingBoundKind::Node => "node_pending",
-        }
-    }
-}
-
-/// One decoded request plus the memory slots that permit retaining it.
-#[derive(Debug)]
-#[must_use = "a retained GetBlocks request must be forwarded or explicitly dropped"]
-pub(super) struct PendingGetBlocksRequest {
-    start_height: block::Height,
-    count: u32,
-    _session: SlotPermit,
-    _node: SlotPermit,
-    _resources: Arc<SessionResources>,
-}
-
-impl PendingGetBlocksRequest {
-    /// End pending ownership and return the validated request fields.
-    pub(super) fn into_parts(self) -> (block::Height, u32) {
-        (self.start_height, self.count)
-    }
-}
 
 /// The work bound that rejected an otherwise valid request.
 #[derive(Debug)]
@@ -501,9 +370,7 @@ pub(crate) fn query_lease_for_test() -> BlockRangeQueryLease {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct ServingRegulationSnapshot {
     pub(super) node_active: usize,
-    pub(super) node_pending: usize,
     pub(super) session_active: usize,
-    pub(super) session_pending: usize,
 }
 
 #[cfg(test)]
@@ -786,13 +653,6 @@ mod tests {
             Err("get_blocks_regulation.node_active_requests must be greater than zero"),
         );
 
-        let mut no_pending_slots = base.clone();
-        no_pending_slots.get_blocks_regulation.node_pending_requests = 0;
-        assert_eq!(
-            validate_config(&no_pending_slots),
-            Err("get_blocks_regulation.node_pending_requests must be greater than zero"),
-        );
-
         let mut no_query_time = base;
         no_query_time.get_blocks_regulation.query_timeout = Duration::ZERO;
         assert_eq!(
@@ -866,37 +726,6 @@ mod tests {
         drop(terminal);
         assert_eq!(regulator.snapshot().node_active, 0);
         assert!(session.try_admit(1).is_ok());
-    }
-
-    #[test]
-    fn pending_requests_are_bounded_per_session_and_node() {
-        let mut config = ZakuraBlockSyncConfig::default();
-        config.get_blocks_regulation.peer_pending_requests = 1;
-        config.get_blocks_regulation.node_pending_requests = 2;
-        let regulator = GetBlocksServingRegulator::new(config);
-        let first_session = regulator.session(peer(4), 4);
-        let second_session = regulator.session(peer(5), 5);
-        let third_session = regulator.session(peer(6), 6);
-
-        let first = first_session
-            .try_retain_input(block::Height(1), 1)
-            .expect("the first request fits");
-        let second = second_session
-            .try_retain_input(block::Height(2), 1)
-            .expect("the second request fits the node");
-        assert_eq!(regulator.snapshot().node_pending, 2);
-        assert_eq!(regulator.snapshot().session_pending, 2);
-        let blocked = first_session
-            .try_retain_input(block::Height(3), 1)
-            .expect_err("the session pending capacity is full");
-        assert_eq!(blocked.label(), "session_pending");
-        let blocked = third_session
-            .try_retain_input(block::Height(3), 1)
-            .expect_err("the node pending capacity is full");
-        assert_eq!(blocked.label(), "node_pending");
-
-        drop((first, second));
-        assert_eq!(regulator.snapshot().node_pending, 0);
     }
 }
 

@@ -3,13 +3,6 @@
 use super::*;
 use crate::zakura::regulation::RequestPolicy;
 
-/// A request accepted by the existing GetBlocks codec.
-#[derive(Debug)]
-pub(super) struct GetBlocksRequest {
-    pub(super) start_height: block::Height,
-    pub(super) count: u32,
-}
-
 /// GetBlocks uses bounded decoding and one finite response producer per session.
 /// Session authorization remains at the peer boundary before work admission.
 /// Completed ranges may be retried; this policy does not infer peer chain state.

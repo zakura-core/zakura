@@ -106,8 +106,6 @@ pub const MAX_BS_RESPONSE_BYTES: u32 = DEFAULT_BS_MAX_RESPONSE_BYTES;
 /// Encoded payload bytes in either terminal GetBlocks response message.
 pub const GET_BLOCKS_TERMINAL_PAYLOAD_BYTES: u64 = 9;
 
-const DEFAULT_GET_BLOCKS_PEER_PENDING_REQUESTS: usize = 64;
-const DEFAULT_GET_BLOCKS_NODE_PENDING_REQUESTS: usize = 1024;
 const DEFAULT_GET_BLOCKS_NODE_ACTIVE_REQUESTS: usize = 64;
 const DEFAULT_GET_BLOCKS_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -337,11 +335,6 @@ pub struct ZakuraBlockSyncConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetBlocksRegulationConfig {
-    /// Decoded GetBlocks requests retained while one peer waits for admission.
-    pub peer_pending_requests: usize,
-    /// Fully retained GetBlocks queue entries across all peers. A full queue
-    /// additionally permits one blocked decoded input per live session.
-    pub node_pending_requests: usize,
     /// State queries and responses that may remain active across all peers.
     pub node_active_requests: usize,
     /// Response deadline for a state query. Timed-out reads keep their resource
@@ -353,8 +346,6 @@ pub struct GetBlocksRegulationConfig {
 impl Default for GetBlocksRegulationConfig {
     fn default() -> Self {
         Self {
-            peer_pending_requests: DEFAULT_GET_BLOCKS_PEER_PENDING_REQUESTS,
-            node_pending_requests: DEFAULT_GET_BLOCKS_NODE_PENDING_REQUESTS,
             node_active_requests: DEFAULT_GET_BLOCKS_NODE_ACTIVE_REQUESTS,
             query_timeout: DEFAULT_GET_BLOCKS_QUERY_TIMEOUT,
         }

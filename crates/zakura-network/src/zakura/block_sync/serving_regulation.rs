@@ -4,7 +4,7 @@
 //! Each routine holds at most one decoded request while waiting for admission.
 //! Admission acquires a response producer before the state query starts. The query,
 //! result, and queued frames share that producer until the last owner drops. A blocked
-//! transport writer therefore prevents another query for the same session.
+//! transport writer therefore prevents another query for the same peer, including after reconnect.
 
 use std::sync::Arc;
 
@@ -87,15 +87,11 @@ struct RegulatorInner {
     admission: RequestAdmission<GetBlocksPolicy>,
     #[cfg(test)]
     node_active: SlotBudget,
-    #[cfg(test)]
-    sessions: StdMutex<Vec<SlotBudget>>,
 }
 
 #[derive(Debug)]
 struct SessionResources {
     work: RequestSession<GetBlocksPolicy>,
-    #[cfg(test)]
-    active: SlotBudget,
 }
 
 impl GetBlocksServingRegulator {
@@ -110,30 +106,18 @@ impl GetBlocksServingRegulator {
                 admission: RequestAdmission::new(
                     GetBlocksPolicy::new(&config),
                     node_active.clone(),
-                    GetBlocksPolicy::SESSION_PRODUCERS,
+                    GetBlocksPolicy::PEER_PRODUCERS,
                 ),
                 #[cfg(test)]
                 node_active,
-                #[cfg(test)]
-                sessions: StdMutex::new(Vec::new()),
             }),
         }
     }
 
     /// Create one session policy within the node admission bounds.
     pub(super) fn session(&self, peer: ZakuraPeerId, session_id: u64) -> GetBlocksServingSession {
-        let work = self.inner.admission.session();
-        let resources = Arc::new(SessionResources {
-            #[cfg(test)]
-            active: work.session_budget().clone(),
-            work,
-        });
-        #[cfg(test)]
-        self.inner
-            .sessions
-            .lock()
-            .expect("GetBlocks session-resource mutex should not be poisoned")
-            .push(resources.active.clone());
+        let work = self.inner.admission.session(&peer);
+        let resources = Arc::new(SessionResources { work });
 
         GetBlocksServingSession {
             peer,
@@ -144,14 +128,9 @@ impl GetBlocksServingRegulator {
 
     #[cfg(test)]
     pub(super) fn snapshot(&self) -> ServingRegulationSnapshot {
-        let sessions = self
-            .inner
-            .sessions
-            .lock()
-            .expect("GetBlocks session-resource mutex should not be poisoned");
         ServingRegulationSnapshot {
             node_active: self.inner.node_active.reserved(),
-            session_active: sessions.iter().map(SlotBudget::reserved).sum(),
+            peer_active: self.inner.admission.reserved_by_peers(),
         }
     }
 }
@@ -257,7 +236,7 @@ impl BoundKind {
 impl AdmissionBlocked {
     pub(super) fn kind(&self) -> BoundKind {
         match self.0.kind() {
-            WorkBound::Session => BoundKind::PeerActive,
+            WorkBound::Peer => BoundKind::PeerActive,
             WorkBound::Node => BoundKind::NodeActive,
         }
     }
@@ -370,7 +349,7 @@ pub(crate) fn query_lease_for_test() -> BlockRangeQueryLease {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct ServingRegulationSnapshot {
     pub(super) node_active: usize,
-    pub(super) session_active: usize,
+    pub(super) peer_active: usize,
 }
 
 #[cfg(test)]
@@ -379,6 +358,37 @@ mod tests {
 
     fn peer(byte: u8) -> ZakuraPeerId {
         ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds")
+    }
+
+    #[test]
+    fn reconnects_share_the_peer_limit_until_old_reads_finish() {
+        let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
+        let original = regulator.session(peer(8), 1);
+        let permit = original.try_admit(1).unwrap().commit();
+        let query = permit.query_lease();
+        assert!(query.try_start());
+        drop(permit);
+        drop(original);
+
+        // Neither dropping the old session nor replacing it repeatedly releases
+        // the work still owned by its running storage read.
+        for generation in 2..=65 {
+            let replacement = regulator.session(peer(8), generation);
+            assert_eq!(
+                replacement.try_admit(1).unwrap_err().kind(),
+                BoundKind::PeerActive
+            );
+            assert_eq!(regulator.snapshot().node_active, 1);
+            let other = regulator.session(peer(9), generation);
+            assert!(other.try_admit(1).is_ok(), "another peer can still serve");
+        }
+        let replacement = regulator.session(peer(8), 66);
+        drop(query);
+        assert!(
+            replacement.try_admit(1).is_ok(),
+            "completion frees this peer's slot"
+        );
+        assert_eq!(regulator.snapshot().node_active, 0);
     }
 
     #[test]

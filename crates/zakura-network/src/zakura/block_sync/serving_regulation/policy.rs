@@ -16,8 +16,8 @@ pub(super) struct GetBlocksPolicy {
 }
 
 impl GetBlocksPolicy {
-    /// Allow one response at a time per session, until its query and writes finish.
-    pub(super) const SESSION_PRODUCERS: usize = 1;
+    /// Allow one response per authenticated peer, including work from old sessions.
+    pub(super) const PEER_PRODUCERS: usize = 1;
     /// One message tag, a four-byte start height, and a four-byte block count.
     const REQUEST_PAYLOAD_BYTES: usize = 9;
 

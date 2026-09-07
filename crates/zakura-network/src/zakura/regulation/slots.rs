@@ -1,6 +1,6 @@
 //! Owned permits for bounded collections of retained or active work.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -56,6 +56,15 @@ impl SlotBudget {
             .saturating_sub(self.permits.available_permits())
     }
 
+    /// Track this pool without retaining it after sessions and permits are gone.
+    pub(super) fn downgrade(&self) -> WeakSlotBudget {
+        WeakSlotBudget {
+            #[cfg(test)]
+            capacity: self.capacity,
+            permits: Arc::downgrade(&self.permits),
+        }
+    }
+
     /// Whether two handles draw from the same capacity pool.
     pub(super) fn same_budget(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.permits, &other.permits)
@@ -91,4 +100,26 @@ impl SlotBudget {
 #[must_use = "dropping a slot permit releases its capacity"]
 pub(crate) struct SlotPermit {
     _permit: OwnedSemaphorePermit,
+}
+
+/// An identity entry that doesn't keep a departed peer's capacity alive.
+#[derive(Debug)]
+pub(super) struct WeakSlotBudget {
+    #[cfg(test)]
+    capacity: usize,
+    permits: Weak<Semaphore>,
+}
+
+impl WeakSlotBudget {
+    pub(super) fn is_alive(&self) -> bool {
+        self.permits.strong_count() > 0
+    }
+
+    pub(super) fn upgrade(&self) -> Option<SlotBudget> {
+        Some(SlotBudget {
+            #[cfg(test)]
+            capacity: self.capacity,
+            permits: self.permits.upgrade()?,
+        })
+    }
 }

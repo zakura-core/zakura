@@ -31,7 +31,7 @@ one active response.
 For GetBlocks, the steps are:
 
 1. Check the request's fields and that the session has sent its initial `Status`.
-2. Take a slot from both the session and the node's GetBlocks pool. If either is
+2. Take a slot from both the peer and the node's GetBlocks pool. If either is
    full, return any slot already taken and pause reading this stream until room
    opens.
 3. Check that the session is still current, then start reading the blocks.
@@ -76,7 +76,7 @@ slot, we use that same slot when trying again.
 | Limit | Default | What happens at the limit |
 | --- | --- | --- |
 | Waiting requests | 1 per session | Pause reading that stream |
-| Active responses | 1 per session, 64 per node | Wait for the previous work and writes to release their slots |
+| Active responses | 1 per authenticated peer, 64 per node | Wait for the previous work and writes to release their slots |
 | Waiting for a query result | 8 seconds | Stop waiting for the result; the query keeps its slots until it ends |
 | Waiting to queue the ending message | Until queue space or cancellation | Keep the response slots held; the transport write timeout bounds a stopped reader |
 | Waiting to admit a request | Until capacity or cancellation | Keep reading paused on this stream |
@@ -86,7 +86,9 @@ If we cancel a request before its query starts, the query won't run. Starting th
 query and checking cancellation happen together. A query that has already started
 keeps its slots until it ends, even after a timeout or disconnect. A query that
 never ends keeps those slots; the timeout cannot stop the storage work. Reconnecting
-does not free slots still held by the old session.
+does not reset the peer limit: the new session shares its slot with any reads or
+writes still running for that identity. Once those owners finish, the new session
+can use the slot. Entries for departed peers are pruned as sessions connect.
 
 If the send queue fills partway through a response, we send only the blocks already
 queued, followed by an ending message. That ending message waits for queue space

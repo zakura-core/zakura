@@ -978,10 +978,7 @@ where
         //
         // https://zips.z.cash/zip-2003
         //
-        // ZIP 2003 deprecates V4 transactions at NU7, which is what
-        // `V4Deprecation::AtNu7` does. A network can instead name a later height, or keep
-        // accepting V4 transactions, so the deprecation date is chosen independently of
-        // the NU7 activation height.
+        // ZIP 2003 deprecates V4 transactions at NU7.
         if network.is_v4_deprecated(height) {
             return Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),

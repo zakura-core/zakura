@@ -25,7 +25,7 @@ use zakura_chain::{
     orchard::{Action, AuthorizedAction, Flags},
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters},
-        Network, NetworkUpgrade, V4Deprecation,
+        Network, NetworkUpgrade,
     },
     primitives::{ed25519, x25519, Groth16Proof},
     sapling,
@@ -3931,17 +3931,12 @@ async fn v5_with_duplicate_orchard_action() {
     }
 }
 
-/// Checks the ZIP 2003 version 4 deprecation boundary: a V4 transaction is valid below
-/// the deprecation height and invalid at and above it, the default deprecation is the NU7
-/// activation height, a network can name a later height, and a network can keep accepting
-/// V4 transactions.
+/// Checks that ZIP 2003 accepts V4 transactions below NU7 and rejects them from NU7.
 #[test]
 fn v4_deprecation_boundary() {
     let _init_guard = zakura_test::init();
 
     let nu7 = Height(2_000_000);
-    let later = Height(2_500_000);
-
     let tx = test_transactions(&Network::Mainnet)
         .map(|(_, tx)| tx)
         .find(|tx| matches!(**tx, Transaction::V4 { .. }))
@@ -3962,7 +3957,6 @@ fn v4_deprecation_boundary() {
         nu7: Some(nu7.0),
     };
 
-    // A network on the ZIP 2003 default rejects V4 transactions from NU7 onwards.
     let at_nu7 = Parameters::build()
         .with_activation_heights(activation_heights)
         .expect("activation heights are valid")
@@ -3984,41 +3978,7 @@ fn v4_deprecation_boundary() {
         "a V4 transaction must be invalid at the deprecation height",
     );
 
-    // A network can deprecate V4 transactions after NU7 activates.
-    let at_height = Parameters::build()
-        .with_activation_heights(activation_heights)
-        .expect("activation heights are valid")
-        .clear_funding_streams()
-        .with_v4_deprecation(V4Deprecation::AtHeight(later))
-        .to_network()
-        .expect("failed to build configured network");
-
-    assert_eq!(at_height.v4_deprecation_height(), Some(later));
-    assert!(
-        verify_v4_at(&at_height, &tx, nu7).is_ok(),
-        "a V4 transaction must stay valid at NU7 when deprecation is configured later",
-    );
-    assert!(
-        verify_v4_at(&at_height, &tx, later).is_err(),
-        "a V4 transaction must be invalid at the configured deprecation height",
-    );
-
-    // A network can keep accepting V4 transactions at every height.
-    let never = Parameters::build()
-        .with_activation_heights(activation_heights)
-        .expect("activation heights are valid")
-        .clear_funding_streams()
-        .with_v4_deprecation(V4Deprecation::Never)
-        .to_network()
-        .expect("failed to build configured network");
-
-    assert_eq!(never.v4_deprecation_height(), None);
-    assert!(
-        verify_v4_at(&never, &tx, later).is_ok(),
-        "a V4 transaction must stay valid on a network that never deprecates it",
-    );
-
-    // A network without NU7 keeps accepting V4 transactions on the ZIP 2003 default.
+    // A network without NU7 keeps accepting V4 transactions.
     let no_nu7 = Parameters::build()
         .to_network()
         .expect("failed to build configured network");

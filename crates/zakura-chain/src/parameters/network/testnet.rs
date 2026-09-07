@@ -31,7 +31,7 @@ use crate::{
     work::difficulty::{ExpandedDifficulty, U256},
 };
 
-use super::{magic::Magic, V4Deprecation};
+use super::magic::Magic;
 
 /// Reserved network names that should not be allowed for configured Testnets.
 pub const RESERVED_NETWORK_NAMES: [&str; 6] = [
@@ -636,8 +636,6 @@ pub struct ParametersBuilder {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
-    /// When this network stops accepting version 4 transactions, see ZIP 2003
-    v4_deprecation: V4Deprecation,
 }
 
 impl Default for ParametersBuilder {
@@ -678,7 +676,6 @@ impl Default for ParametersBuilder {
             temporary_orchard_disabling_soft_fork_height: Some(
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
             ),
-            v4_deprecation: V4Deprecation::AtNu7,
         }
     }
 }
@@ -999,12 +996,6 @@ impl ParametersBuilder {
         self
     }
 
-    /// Sets when this network stops accepting version 4 transactions, see ZIP 2003.
-    pub fn with_v4_deprecation(mut self, v4_deprecation: V4Deprecation) -> Self {
-        self.v4_deprecation = v4_deprecation;
-        self
-    }
-
     /// Converts the builder to a [`Parameters`] struct
     fn finish(self) -> Parameters {
         // The builder defaults to public Testnet consensus parameters, so an unset
@@ -1030,7 +1021,6 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
-            v4_deprecation,
         } = self;
         Parameters {
             network_name,
@@ -1049,7 +1039,6 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
-            v4_deprecation,
         }
     }
 
@@ -1105,7 +1094,6 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
-            v4_deprecation,
         } = Self::default();
 
         self.activation_heights == activation_heights
@@ -1121,9 +1109,6 @@ impl ParametersBuilder {
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
-            // A network that keeps accepting version 4 transactions past the height where
-            // the default Testnet rejects them is on a different consensus rule.
-            && self.v4_deprecation == v4_deprecation
     }
 }
 
@@ -1189,8 +1174,6 @@ pub struct Parameters {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
-    /// When this network stops accepting version 4 transactions, see ZIP 2003
-    v4_deprecation: V4Deprecation,
 }
 
 impl Default for Parameters {
@@ -1296,9 +1279,6 @@ impl Parameters {
             lockbox_disbursements: _,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
-            // Version 4 deprecation follows the configurable Regtest activation heights,
-            // so it is not part of Regtest's identity.
-            v4_deprecation: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1410,11 +1390,6 @@ impl Parameters {
     /// transactions activates.
     pub fn temporary_orchard_disabling_soft_fork_height(&self) -> Option<Height> {
         self.temporary_orchard_disabling_soft_fork_height
-    }
-
-    /// Returns when this network stops accepting version 4 transactions, see ZIP 2003.
-    pub fn v4_deprecation(&self) -> V4Deprecation {
-        self.v4_deprecation
     }
 }
 

@@ -173,8 +173,8 @@ unsolicited-response handling unconditional.
 Budgets bound inbound work; the outbound direction needs its own bound. Queueing a terminal response
 does not release the bytes retained by the writer or transport. The receiver therefore bounds unsent
 response bytes per peer and across the node, blocks only that peer's path at its bound, and may
-disconnect a peer that stops draining. Iroh remains the transport; its buffers need separate
-accounting where application ownership ends before delivery.
+disconnect a peer that stops draining. Transport buffers need their own bound where application
+ownership ends before delivery.
 
 ## Testing and introspection
 
@@ -219,8 +219,8 @@ for discovery, header sync, block sync, transaction gossip, and future direct tr
 Include legacy P2P and RPC paths that share verification or storage capacity. Account for transport
 buffers, decoded data, sync and mempool retention, and RocksDB memory alongside serving responses.
 Use bounded mixed-workload tests and small component measurements on supported machine profiles to
-check that essential chain progress fits with headroom. A GetBlocks payload cap is not a node memory
-limit; the aggregate limits and capacity reserved for essential work remain to be validated.
+check that essential chain progress fits with headroom. The aggregate limits and capacity reserved
+for essential work remain to be validated.
 
 Implement the design in five steps:
 

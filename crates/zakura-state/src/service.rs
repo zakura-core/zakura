@@ -54,6 +54,7 @@ use crate::{
     service::{
         block_iter::any_ancestor_blocks,
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
+        check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
         finalized_state::{
             header_chain::{HeaderChainStore, HeaderChainStoreError},
             FinalizedState, ZakuraDb,
@@ -3368,8 +3369,13 @@ fn check_prepared_mined_relay_eligibility_for_state(
         commitment.auth_data_root,
     )?;
 
-    let relevant_chain: Vec<_> =
-        any_ancestor_blocks(non_finalized_state, db, parent_hash).collect();
+    // Take only the blocks `block_is_valid_for_recent_chain_data` reads. The
+    // iterator walks to genesis, so collecting it would load every ancestor
+    // block body into memory to check the most recent
+    // `POW_ADJUSTMENT_BLOCK_SPAN` of them.
+    let relevant_chain: Vec<_> = any_ancestor_blocks(non_finalized_state, db, parent_hash)
+        .take(POW_ADJUSTMENT_BLOCK_SPAN)
+        .collect();
     if relevant_chain.is_empty() {
         return Ok(PreparedMinedRelayEligibility::Unavailable);
     }

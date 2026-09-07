@@ -1,21 +1,27 @@
-//! GetBlocks' finite-request declaration: its codec, response bound, and work scope.
+//! Rules for reading a GetBlocks request and limiting the response we may send.
 
 use super::*;
 use crate::zakura::regulation::RequestPolicy;
 
-/// GetBlocks uses bounded decoding and one finite response producer per session.
-/// Session authorization remains at the peer boundary before work admission.
-/// Completed ranges may be retried; this policy does not infer peer chain state.
+/// Checks request fields and sets response limits. The peer routine checks the
+/// session's initial Status before allowing work to start. A peer may request a
+/// completed range again because we don't know which blocks it has kept.
 #[derive(Clone, Debug)]
 pub(super) struct GetBlocksPolicy {
+    /// Maximum number of blocks we may send in one response.
     max_count: u32,
+    /// Maximum total block bytes we may send in one response.
+    /// Message tags and the ending message are counted separately.
     max_response_bytes: u64,
 }
 
 impl GetBlocksPolicy {
+    /// Allow one response at a time per session, until its query and writes finish.
     pub(super) const SESSION_PRODUCERS: usize = 1;
+    /// One message tag, a four-byte start height, and a four-byte block count.
     const REQUEST_PAYLOAD_BYTES: usize = 9;
 
+    /// Use the same response limits that we advertise to peers.
     pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
         Self {
             max_count: inbound_get_blocks_count_limit(config),
@@ -23,11 +29,14 @@ impl GetBlocksPolicy {
         }
     }
 
+    /// Maximum response payload bytes, including message tags and the ending message.
     pub(super) fn response_cap_for_count(&self, requested_count: u32) -> Result<u64, &'static str> {
+        // A peer may ask for more blocks than we send in one response.
         let count = requested_count.min(self.max_count);
         let block_bytes = u64::from(count)
             .checked_mul(block::MAX_BLOCK_BYTES)
             .ok_or("GetBlocks response-cap multiplication overflowed")?;
+        // Cap the block bytes, then allow one tag per block and the ending message.
         let response_cap = GET_BLOCKS_TERMINAL_PAYLOAD_BYTES
             .checked_add(u64::from(count))
             .and_then(|bytes| bytes.checked_add(block_bytes.min(self.max_response_bytes)))
@@ -40,6 +49,7 @@ impl RequestPolicy for GetBlocksPolicy {
     type Request = GetBlocksRequest;
     type Error = BlockSyncWireError;
 
+    /// Read the requested height and count, rejecting invalid fields or extra data.
     fn decode(&self, frame: Frame) -> Result<GetBlocksRequest, BlockSyncWireError> {
         if frame.payload.len() > Self::REQUEST_PAYLOAD_BYTES {
             return Err(BlockSyncWireError::OversizedPayload {
@@ -47,6 +57,7 @@ impl RequestPolicy for GetBlocksPolicy {
                 max: Self::REQUEST_PAYLOAD_BYTES,
             });
         }
+        // The existing decoder checks the fields, flags, and matching message tags.
         match BlockSyncMessage::decode_frame(frame)? {
             BlockSyncMessage::GetBlocks {
                 start_height,
@@ -61,6 +72,7 @@ impl RequestPolicy for GetBlocksPolicy {
         }
     }
 
+    /// Give shared regulation the size limit it must enforce while we queue frames.
     fn response_cap(&self, request: &GetBlocksRequest) -> u64 {
         self.response_cap_for_count(request.count)
             .expect("validated GetBlocks limits bound response arithmetic")

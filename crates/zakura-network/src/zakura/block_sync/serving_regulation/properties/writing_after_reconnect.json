@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "limit": "node_active",
   "actions": [
     {"action": "admit", "peer": 0, "request": 0},

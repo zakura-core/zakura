@@ -6,6 +6,7 @@ use super::scenario::*;
 
 #[derive(Clone, Debug)]
 struct Request {
+    peer: usize,
     session: usize,
     provisional: bool,
     ledger: bool,
@@ -131,7 +132,7 @@ impl Model {
                 let config = self.limit.config();
                 let policy = config.get_blocks_regulation;
                 let blocked = [
-                    (state.session_active[session] >= 1, Limit::PeerActive),
+                    (state.peer_active[peer] >= 1, Limit::PeerActive),
                     (
                         state.node_active >= policy.node_active_requests,
                         Limit::NodeActive,
@@ -141,6 +142,7 @@ impl Model {
                 .find_map(|(full, limit)| full.then_some(limit));
                 if blocked.is_none() {
                     self.requests[request] = Some(Request {
+                        peer,
                         session,
                         provisional: true,
                         ledger: true,
@@ -232,10 +234,12 @@ impl Model {
     pub(super) fn snapshot(&self) -> Snapshot {
         let mut state = Snapshot {
             node_active: 0,
+            peer_active: [0; 2],
             session_active: vec![0; self.sessions.len()],
         };
         for request in self.requests.iter().flatten() {
             state.session_active[request.session] += 1;
+            state.peer_active[request.peer] += 1;
         }
         state.node_active = state.session_active.iter().sum();
         state

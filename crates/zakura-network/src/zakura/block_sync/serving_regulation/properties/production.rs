@@ -71,7 +71,7 @@ impl Production {
             ),
             receiver,
             writing: None,
-            active: account.resources.active.clone(),
+            active: account.work.peer_budget().clone(),
             account: Some(account),
         });
     }
@@ -89,17 +89,17 @@ impl Production {
                     Ok(attempt) => {
                         self.requests[request] = Some(RequestOwners {
                             session,
+                            lifetime: Some(attempt.work.weak_resources()),
                             attempt: Some(attempt),
                             permit: None,
                             query_leases: Vec::new(),
                             sent_block: false,
-                            lifetime: None,
                         });
                         Outcome::Admission(None)
                     }
                     Err(blocked) => Outcome::Admission(Some(match blocked.kind() {
-                        BoundKind::PeerActive => Limit::PeerActive,
-                        BoundKind::NodeActive => Limit::NodeActive,
+                        WorkBound::Peer => Limit::PeerActive,
+                        WorkBound::Node => Limit::NodeActive,
                     })),
                 }
             }
@@ -236,13 +236,24 @@ impl Production {
 
     pub(super) fn snapshot(&self) -> Snapshot {
         let node = &self.regulator.inner;
+        let mut session_active = vec![0; self.sessions.len()];
+        // Observe each real allocation through a weak handle. Reconnected sessions
+        // share a peer counter, so reading that counter twice would double-count.
+        for owners in self.requests.iter().flatten() {
+            if owners
+                .lifetime
+                .as_ref()
+                .is_some_and(|owner| owner.upgrade().is_some())
+            {
+                session_active[owners.session] += 1;
+            }
+        }
         Snapshot {
             node_active: node.node_active.reserved(),
-            session_active: self
-                .sessions
-                .iter()
-                .map(|session| session.active.reserved())
-                .collect(),
+            peer_active: self
+                .current_sessions
+                .map(|session| self.sessions[session].active.reserved()),
+            session_active,
         }
     }
 }

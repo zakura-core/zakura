@@ -11,7 +11,7 @@ fn every_admission_bound_blocks_then_recovers() {
             0
         };
         let mut scenario = Scenario {
-            version: 3,
+            version: 4,
             limit,
             actions: vec![
                 Action::Admit {
@@ -64,12 +64,12 @@ fn replay_preserves_writing_ownership_across_session_replacement() {
 #[test]
 fn replay_rejects_inapplicable_actions_and_unknown_versions() {
     let mut scenario = Scenario {
-        version: 3,
+        version: 4,
         limit: Limit::NodeActive,
         actions: vec![Action::Commit { request: 0 }],
     };
     assert!(replay(&scenario).unwrap_err().contains("invalid action"));
-    scenario.version = 4;
+    scenario.version = 3;
     assert!(replay(&scenario)
         .unwrap_err()
         .contains("unsupported scenario"));
@@ -109,7 +109,7 @@ fn queue_failure_keeps_ownership_and_query_leases_cannot_execute_twice() {
     }
     actions.extend(model.cleanup());
     let scenario = Scenario {
-        version: 3,
+        version: 4,
         limit: Limit::PeerActive,
         actions,
     };
@@ -152,9 +152,90 @@ proptest! {
 #[test]
 fn concrete_replay_accepts_times_outside_the_generation_distribution() {
     let scenario = Scenario {
-        version: 3,
+        version: 4,
         limit: Limit::NodeActive,
         actions: vec![Action::Advance { millis: 37 }],
     };
     checked_replay(&scenario).unwrap();
+}
+
+#[test]
+fn reconnect_cannot_bypass_old_query_or_write_ownership() {
+    use Action::*;
+    // Cover a storage read alone, and each way an in-progress write can end.
+    for write_end in [
+        None,
+        Some(WriteEnd::Complete),
+        Some(WriteEnd::Fail),
+        Some(WriteEnd::Cancel),
+    ] {
+        let mut actions = vec![
+            Admit {
+                peer: 0,
+                request: 0,
+            },
+            Commit { request: 0 },
+            ClaimQuery { request: 0 },
+        ];
+        if write_end.is_some() {
+            actions.extend([
+                DropQueryLease { request: 0 },
+                QueueBlock { request: 0 },
+                BeginWrite { session: 0 },
+            ]);
+        }
+        actions.push(Reconnect { peer: 0 });
+        let blocked_step = actions.len();
+        actions.extend([
+            Admit {
+                peer: 0,
+                request: 1,
+            },
+            Admit {
+                peer: 1,
+                request: 2,
+            },
+            DropLedger { request: 2 },
+        ]);
+        actions.push(match write_end {
+            Some(outcome) => EndWrite {
+                session: 0,
+                outcome,
+            },
+            None => DropQueryLease { request: 0 },
+        });
+        let recovered_step = actions.len();
+        actions.extend([
+            Admit {
+                peer: 0,
+                request: 1,
+            },
+            DropLedger { request: 1 },
+        ]);
+        let scenario = Scenario {
+            version: 4,
+            limit: Limit::PeerActive,
+            actions,
+        };
+        let observations = replay(&scenario).unwrap();
+        assert_eq!(
+            observations[blocked_step].outcome,
+            Outcome::Admission(Some(Limit::PeerActive))
+        );
+        assert_eq!(observations[blocked_step].resources.peer_active, [1, 0]);
+        assert_eq!(
+            observations[blocked_step].resources.session_active,
+            vec![1, 0, 0]
+        );
+        assert_eq!(
+            observations[blocked_step + 1].outcome,
+            Outcome::Admission(None)
+        );
+        assert_eq!(
+            observations[recovered_step].outcome,
+            Outcome::Admission(None)
+        );
+        assert_eq!(observations.last().unwrap().resources.node_active, 0);
+        checked_replay(&scenario).unwrap();
+    }
 }

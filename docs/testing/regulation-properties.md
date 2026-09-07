@@ -31,7 +31,7 @@ concrete JSON scenario and retain Proptest's normal seed-based reproduction.
 | --- | --- | --- |
 | Primitive | Concurrency slots | Owned permit count |
 | Shared requests | Finite-request admission, rollback, execution and response owners | Independent per-session and node ownership model |
-| Serving | Admission, query lifecycle, encoder, transport queue | Node and session producer counts |
+| Serving | Admission, query lifecycle, encoder, transport queue | Peer and node slot counts, plus ownership by original session |
 | Reactor | Peer routine and response queue | Response prefix, terminal, producer lifetime |
 | Driver | Query claim, timeout, cancellation, result handoff | Underlying query and result retain capacity |
 | State | Range response limits | Actual returned body bytes stay within the cap |
@@ -57,13 +57,13 @@ from the model. Failures include the concrete action history and the Proptest se
 The shared model checks ownership with frame guards directly. A separate witness
 encodes a real Peers response and retains ownership through the production queued
 write boundary. It also checks partial-admission rollback and that a fair waiter's
-permit cannot be reused for another session's capacity pool. These tests do not
+permit cannot be reused for another peer's capacity pool. These tests do not
 enable discovery regulation or claim its complete protocol conformance.
 
 ## Generated GetBlocks histories
 
 The ownership model uses two peer identities, at most eight session generations,
-four request slots, four input slots, and a one-frame output queue per session.
+four request slots, and a one-frame output queue per session.
 Requests contain one committed mainnet block fixture or an empty terminal. The
 independently calculated maximum response payload is 2,000,010 bytes; this is a
 wire bound, not an outstanding-byte budget.
@@ -77,15 +77,16 @@ of silently skipping it. Cleanup uses the same actions to finish every owner.
 Deterministic witnesses ensure these boundaries are reached independently of
 random coverage:
 
-- **Admission and rollback:** both session and node producer limits block, then
+- **Admission and rollback:** both peer and node producer limits block, then
   recover when ownership ends. Failed admission returns any earlier slot.
 - **One execution:** cloned query leases cannot claim a second state read.
   Ledger closure prevents a queued read from starting.
-- **Write backpressure:** a queued or writing response keeps its session producer
+- **Write backpressure:** a queued or writing response keeps its peer producer
   occupied after the ledger and query owners drop. Failed queue admission changes
   no ownership and can be retried after capacity becomes available.
 - **Reconnects:** old query and frame owners remain counted under the old session.
-  Replacing the session does not release their node capacity.
+  Replacing the session shares the same peer limit until those owners finish.
+  Another peer can still start work while the replacement waits.
 - **Response boundaries:** separate properties vary legal counts and response
   caps; real reactor histories cover empty, partial, and complete responses with
   queues of depth one through three.
@@ -124,11 +125,11 @@ finish the current frame before closing the stream.
 
 ## Replay and reuse
 
-JSON version 3 records the producer-ownership contract without delayed-input
-queues. Versions 1 and 2 described removed byte budgets or pending-input accounting
-and are rejected. The committed reconnect scenario is a
-human-readable example. Replay observations include per-session attribution, so
-matching aggregate totals cannot hide an ownership error.
+JSON version 4 records one active response per authenticated peer, including old
+work that survives a reconnect. Earlier versions are rejected because they describe
+different admission contracts. The committed reconnect scenario is a human-readable
+example. Replay checks peer capacity and attributes each retained request to its
+original session, so matching node totals cannot hide an ownership error.
 
 For another message family:
 

@@ -78,7 +78,7 @@ proptest! {
     ) {
         let node = SlotBudget::new(node_capacity).unwrap();
         let admission = RequestAdmission::new(GetPeersPolicy, node.clone(), 1);
-        let sessions = [admission.session(), admission.session()];
+        let sessions = [admission.session(&ZakuraPeerId::new(vec![1; 32]).unwrap()), admission.session(&ZakuraPeerId::new(vec![2; 32]).unwrap())];
         let requests = [sessions[0].decode(frame(1)).unwrap(), sessions[1].decode(frame(1)).unwrap()];
         let mut models = [Model::default(), Model::default()];
         let mut owners = [Owners::default(), Owners::default()];
@@ -142,7 +142,7 @@ proptest! {
                 }
             }
             for i in 0..2 {
-                prop_assert_eq!(sessions[i].session_budget().reserved(), usize::from(models[i].owns_work()), "{:?}", history);
+                prop_assert_eq!(sessions[i].peer_budget().reserved(), usize::from(models[i].owns_work()), "{:?}", history);
                 for lease in &owners[i].leases {
                     prop_assert_eq!(lease.is_cancelled(), models[i].cancelled, "{:?}", history);
                 }
@@ -151,6 +151,6 @@ proptest! {
         }
         drop(owners);
         prop_assert_eq!(node.reserved(), 0);
-        for session in sessions { prop_assert_eq!(session.session_budget().reserved(), 0); }
+        for session in sessions { prop_assert_eq!(session.peer_budget().reserved(), 0); }
     }
 }

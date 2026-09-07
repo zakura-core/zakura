@@ -72,14 +72,8 @@ async fn default_producer_limits_hold_until_writes_finish() {
     tokio::time::advance(Duration::from_secs(60)).await;
     let before = regulator.snapshot();
     assert_eq!(before.node_active, 64);
-    assert_eq!(
-        peers[0].try_admit(1).unwrap_err().kind(),
-        BoundKind::PeerActive
-    );
-    assert_eq!(
-        peers[64].try_admit(1).unwrap_err().kind(),
-        BoundKind::NodeActive
-    );
+    assert_eq!(peers[0].try_admit(1).unwrap_err().kind(), WorkBound::Peer);
+    assert_eq!(peers[64].try_admit(1).unwrap_err().kind(), WorkBound::Node);
     assert_eq!(regulator.snapshot(), before);
     frames.pop();
     frames.push(queued_response(&peers[64]));

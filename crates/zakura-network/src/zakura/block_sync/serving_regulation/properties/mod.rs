@@ -33,7 +33,7 @@ fn block_payload_bytes() -> u64 {
 
 /// Replay requires concrete applicable actions; it never reconstructs choices.
 fn replay(scenario: &Scenario) -> Result<Vec<Observation>, String> {
-    if scenario.version != 3 {
+    if scenario.version != 4 {
         return Err(format!("unsupported scenario version {}", scenario.version));
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -94,7 +94,7 @@ fn materialize(limit: Limit, choices: &[usize]) -> Scenario {
     }
     actions.extend(model.cleanup());
     Scenario {
-        version: 3,
+        version: 4,
         limit,
         actions,
     }

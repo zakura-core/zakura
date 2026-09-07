@@ -74,6 +74,7 @@ pub(super) enum Outcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Snapshot {
     pub(super) node_active: usize,
+    pub(super) peer_active: [usize; 2],
     pub(super) session_active: Vec<usize>,
 }
 

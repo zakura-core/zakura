@@ -4126,10 +4126,13 @@ async fn persistent_stream_worker(
             } => {
                 match outbound {
                     Some(queued_frame) => {
+                        // Finish this frame before a stream-local close. Dropping
+                        // a partial write makes the peer see a truncated payload
+                        // and close the whole connection. The write still has its
+                        // normal timeout, and connection shutdown can interrupt it.
                         let result = tokio::select! {
                             biased;
                             _ = context.connection_token.cancelled() => break,
-                            _ = context.stream_token.cancelled() => break,
                             result = write_queued_ordered_frame(
                                 &mut send,
                                 queued_frame,
@@ -7987,7 +7990,12 @@ mod tests {
         const ALPN: &[u8] = b"/zakura/testkit/stream-cancel/0";
 
         let _guard = zakura_test::init();
-        let server = LocalEndpointFactory::new().endpoint(50).await?;
+        let mut server_transport =
+            ZakuraLocalLimits::from_config(&Config::default()).transport_config();
+        server_transport.send_window(64 * 1024);
+        let server = LocalEndpointFactory::with_transport_config(server_transport)
+            .endpoint(50)
+            .await?;
         let (conn_tx, mut conn_rx) = mpsc::channel(1);
         let (stream_tx, mut stream_rx) = mpsc::channel(2);
         let router = Router::builder(server)
@@ -7999,7 +8007,12 @@ mod tests {
                 },
             )
             .spawn();
-        let client = LocalEndpointFactory::new().endpoint(51).await?;
+        let mut client_transport =
+            ZakuraLocalLimits::from_config(&Config::default()).transport_config();
+        client_transport.stream_receive_window(VarInt::from_u32(64 * 1024));
+        let client = LocalEndpointFactory::with_transport_config(client_transport)
+            .endpoint(51)
+            .await?;
         let server_addr = router.endpoint().node_addr().initialized().await;
         client.add_node_addr(server_addr.clone())?;
 
@@ -8011,7 +8024,7 @@ mod tests {
             .expect("server connection is captured")
             .expect("capture handler sends the accepted connection");
         drop(server_conn);
-        let (mut client_send, _client_recv) =
+        let (mut client_send, mut client_recv) =
             timeout(Duration::from_secs(1), client_conn.open_bi())
                 .await
                 .expect("client opens the worker stream")?;
@@ -8031,7 +8044,7 @@ mod tests {
 
         let mut limits = test_connection_limits();
         limits.idle_timeout = Duration::from_millis(50);
-        let stream_kind = DISCOVERY_STREAM_KIND;
+        let stream_kind = ZAKURA_STREAM_BLOCK_SYNC;
         let connection_token = CancellationToken::new();
         let stream_token = connection_token.child_token();
         let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
@@ -8041,8 +8054,8 @@ mod tests {
         let stream = Stream {
             kind: stream_kind,
             version: ZAKURA_STREAM_VERSION_1,
-            frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
-            capability: ZAKURA_CAP_DISCOVERY,
+            frame_cap: 2_000_009,
+            capability: ZAKURA_CAP_BLOCK_SYNC,
             mode: StreamMode::Ordered,
         };
         let context = StreamWorkerContext {
@@ -8080,7 +8093,33 @@ mod tests {
             ordered_session_exit_tx,
         );
 
+        let response = Frame {
+            message_type: 3,
+            flags: 0,
+            payload: vec![7; 1024 * 1024],
+        };
+        admitted.send.try_send(response.clone()).unwrap();
+        // Reading the header proves the write has started. The much smaller
+        // QUIC windows keep the remaining payload blocked until we drain it.
+        let mut header = [0; FRAME_HEADER_BYTES];
+        timeout(Duration::from_secs(2), client_recv.read_exact(&mut header)).await??;
+        assert_eq!(
+            &header[..],
+            &response.encode(stream.frame_cap)?[..FRAME_HEADER_BYTES]
+        );
         admitted.cancel_token.cancel();
+        assert!(
+            timeout(Duration::from_millis(50), ordered_session_exit_rx.recv())
+                .await
+                .is_err(),
+            "stream cancellation must finish the current frame before reporting exit"
+        );
+        let mut payload = vec![0; response.payload.len()];
+        timeout(Duration::from_secs(2), client_recv.read_exact(&mut payload)).await??;
+        assert_eq!(
+            payload, response.payload,
+            "the peer must receive a complete frame"
+        );
         // The exit must be reported, or the connection loop never prunes the dead
         // generation and never reopens the stream.
         let exited = timeout(Duration::from_secs(1), ordered_session_exit_rx.recv())

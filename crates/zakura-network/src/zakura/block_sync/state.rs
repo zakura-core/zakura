@@ -825,7 +825,7 @@ pub(super) struct ServingBlockRequest {
     original_count: u32,
     requested_count: u32,
     started: Instant,
-    /// Linear ownership of this request's rate and outstanding-byte charges.
+    /// Shared serving capacity retained through this request's query and writes.
     permit: super::serving_regulation::GetBlocksServingPermit,
 }
 

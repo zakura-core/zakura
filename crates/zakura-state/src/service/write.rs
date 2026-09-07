@@ -539,6 +539,7 @@ impl HeaderChainWriter {
         let store = HeaderChainStore::new(finalized_state.db.header_chain_disk_db());
         store.migrate_to_current(&config)?;
         let runtime = if store.is_initialized()? {
+            store.backfill_validation_context(&finalized_state.db)?;
             let persisted_finalized = store.snapshot()?.frontiers.finalized;
             let (full_state_height, full_state_hash) = finalized_state
                 .db

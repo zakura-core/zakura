@@ -254,6 +254,82 @@ impl HeaderChainStore {
         Ok(true)
     }
 
+    /// Add validation context that an older build did not retain.
+    ///
+    /// The authenticated full-state header index supplies the additional rows.
+    /// This step runs before the startup audit because that audit requires the
+    /// complete context for the current build.
+    pub(in crate::service) fn backfill_validation_context(
+        &self,
+        source: &ZakuraDb,
+    ) -> Result<usize, HeaderChainInitializationError> {
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let metadata = self
+            .metadata_row()?
+            .ok_or(HeaderChainStoreError::Incoherent(
+                "validation-context backfill requires initialized metadata",
+            ))?;
+        if metadata.mode != EngineMode::Integrated {
+            return Ok(0);
+        }
+
+        let anchor = metadata.frontiers.finalized;
+        let (_, anchor_header) = finalized_header_by_height(source, anchor.height)
+            .filter(|(hash, header)| *hash == anchor.hash && header.hash() == anchor.hash)
+            .ok_or(HeaderChainInitializationError::AnchorMismatch)?;
+        let expected = validation_context(source, anchor, anchor_header.previous_block_hash)?;
+
+        let mut retained = Vec::new();
+        self.audit_snapshot()
+            .map_err(HeaderChainStoreError::Store)?
+            .visit_validation_context_records(
+                zakura_header_chain::RowLimit::new(
+                    zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN,
+                ),
+                &mut |record| {
+                    retained.push(record);
+                    Ok(())
+                },
+            )
+            .map_err(HeaderChainStoreError::Store)?;
+        retained.sort_unstable_by_key(|record| record.height);
+
+        if retained.len() >= expected.len() {
+            return Ok(0);
+        }
+
+        let expected_suffix = &expected[expected.len() - retained.len()..];
+        if !retained
+            .iter()
+            .zip(expected_suffix)
+            .all(|(retained, expected)| {
+                retained.height == expected.height && retained.header == expected.header
+            })
+        {
+            return Err(HeaderChainStoreError::Incoherent(
+                "retained validation context is not an authenticated suffix",
+            )
+            .into());
+        }
+
+        let missing = expected.len() - retained.len();
+        let mut batch = DiskWriteBatch::new();
+        for context in expected.into_iter().take(missing) {
+            self.put_value(
+                &mut batch,
+                HEADER_VALIDATION_CONTEXT,
+                context.header.hash().0,
+                &context,
+            )?;
+        }
+        self.db.write(batch)?;
+
+        Ok(missing)
+    }
+
     fn stage_v1_aux_deliveries(
         &self,
         config: &EngineConfig,

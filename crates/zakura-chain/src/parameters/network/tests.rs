@@ -420,6 +420,17 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
         POST_BLOSSOM_HALVING_INTERVAL * i64::from(NU7_POW_TARGET_SPACING_RATIO);
     let next_halving = (nu7_height + post_nu7_halving_interval).unwrap();
     assert_eq!(4, halving(next_halving, &network));
+    assert_eq!(Some(next_halving), height_for_halving(4, &network));
+    assert_eq!(
+        3,
+        halving(
+            height_for_halving(4, &network)
+                .expect("the fourth halving has a height")
+                .previous()
+                .expect("the fourth halving is above genesis"),
+            &network,
+        )
+    );
     assert_eq!(16, halving_divisor(next_halving, &network).unwrap());
     assert_eq!(
         Amount::<NonNegative>::try_from(13_020_833)?,

@@ -32,6 +32,8 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `GetBlocksRegulationConfig::query_timeout` | `crates/zakura-network/src/zakura/block_sync/config.rs` | `30 s` (shared driver timeout) → `8 s` | [#892](https://github.com/zakura-core/zakura/pull/892) | Give GetBlocks its own response deadline. A timed-out query retains its active slots until the underlying state work finishes. |
+| `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` | `crates/zakura-network/src/zakura/handler.rs` | `32 MiB` → `16 MiB` | [#892](https://github.com/zakura-core/zakura/pull/892) | Leave connection receive credit for another service while one stream's application reads are paused. |
 | `get_blocks_regulation.*` defaults | `crates/zakura-network/src/zakura/block_sync/config.rs` | new → per-session producers `1`; node producers `64`; state timeout `8 s` | [#892](https://github.com/zakura-core/zakura/pull/892) | Hold response producers through queries and transport writes; use transport backpressure without serving byte budgets. |
 | `LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE` | `crates/zakurad/src/commands/start/zakura/coordinator.rs` | new → `30 min` | [#831](https://github.com/zakura-core/zakura/pull/831) | Terminate the node when native block applies prevent legacy fallback from acquiring exclusive ownership, instead of leaving the fallback handoff pending forever. |
 | `MAX_CANDIDATE_TIPS_V1` | `crates/zakura-header-chain/src/config.rs` | `10` → `11` | [#831](https://github.com/zakura-core/zakura/pull/831) | Retain ten full-state fork tips plus one independent selected header tip, so header candidate pressure cannot evict a branch that full state still owns. |

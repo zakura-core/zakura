@@ -286,7 +286,6 @@ pub(super) struct BlockSyncState {
     /// (per-peer routines); the cross-peer facts the reactor/producer need live in the
     /// [`PeerRegistry`](super::peer_registry).
     pub(super) peers: HashMap<ZakuraPeerId, PeerBlockState>,
-    pub(super) parked_peers: HashSet<ZakuraPeerId>,
     /// Sorted set of needed download heights. Replaces the central
     /// `BlockRangeScheduler`: the per-peer issuance path pulls work in its own
     /// servable range, dedup/covered are `in_flight`, and the floor is GC only.
@@ -324,7 +323,6 @@ impl BlockSyncState {
             best_header_tip: startup.best_header_tip.0,
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
-            parked_peers: HashSet::new(),
             work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
             needed_heights: Vec::new(),
@@ -743,13 +741,10 @@ impl DownloadWindow {
         }
     }
 
-    /// Reset per-view no-progress accounting after a destructive view reset. The reset
-    /// returned this peer's outstanding to the queue on *our* initiative (a reorg/rollback,
-    /// not the peer's fault), so the in-flight probe streak must not stay charged against
-    /// it: clearing `requests_without_block_progress` lets an unproven peer probe again
-    /// instead of wedging at its one-probe cap forever (the reset also cleared its liveness
-    /// deadline, so nothing would disconnect it). Proof state (`last_block_at`) is preserved.
-    pub(super) fn note_view_reset(&mut self) {
+    /// Clear the probe streak after we return requests on our own initiative,
+    /// such as a view reset or a long local read pause. Keep proof of earlier
+    /// progress, but let even an unproven peer receive work again when we resume.
+    pub(super) fn note_locally_returned_requests(&mut self) {
         self.requests_without_block_progress = 0;
         self.clear_liveness_if_idle();
     }

@@ -12,7 +12,7 @@ every message to select every filter.
 
 | Category | Current GetBlocks path |
 | --- | --- |
-| Safe | The codec bounds the request count and height range. Serving enforces the advertised response count and body-byte cap, including the encoded framing allowance. |
+| Safe | The codec bounds the start height and request count separately. Serving enforces the advertised response count and body-byte cap, including the encoded framing allowance. |
 | Authorized | Serving uses the authenticated session after its initial Status. Reservation checks belong to the Block and terminal responses on the requesting side. |
 | Useful | GetBlocks has no Relevant predicate in the draft. Stale session work is cancelled before dispatch. Completed requests may be legitimate retries; the server does not infer what the requester has stored. |
 | Budgeted | A session owns one response producer. Shared concurrency permits bound state queries, retained results, and writes; each routine holds at most one waiting request. |
@@ -78,8 +78,9 @@ slot, we use that same slot when trying again.
 | Waiting requests | 1 per session | Pause reading that stream |
 | Active responses | 1 per session, 64 per node | Wait for the previous work and writes to release their slots |
 | Waiting for a query result | 8 seconds | Stop waiting for the result; the query keeps its slots until it ends |
-| Waiting to queue the ending message | `request_timeout`, 8 seconds | Close the session without scoring the peer for misconduct |
-| Waiting to admit a request | `request_timeout`, 8 seconds | Close the session without scoring the peer for misconduct |
+| Waiting to queue the ending message | Until queue space or cancellation | Keep the response slots held; the transport write timeout bounds a stopped reader |
+| Waiting to admit a request | Until capacity or cancellation | Keep reading paused on this stream |
+| Local pause of our own downloads | `request_timeout`, 8 seconds between accepted blocks | Return unreceived downloads to the scheduler and keep the stream open |
 
 If we cancel a request before its query starts, the query won't run. Starting the
 query and checking cancellation happen together. A query that has already started
@@ -90,13 +91,16 @@ does not free slots still held by the old session.
 If the send queue fills partway through a response, we send only the blocks already
 queued, followed by an ending message. That ending message waits for queue space
 without blocking other reactor work. It keeps the response's slots held and stays
-tied to the original session. Cancellation, shutdown, a closed queue, or the time
-limit ends the wait. Once queued, the message keeps holding the slots through its
-write.
+tied to the original session. Cancellation, shutdown, or a closed queue ends the
+wait. Once queued, the message keeps holding the slots through its write. A local
+stream close lets the current frame finish under the existing write timeout, so
+the peer receives a complete frame.
 
-We extend download deadlines by the time spent waiting at admission, up to
-`request_timeout` in total between accepted blocks. A longer wait closes the session
-without blaming the peer. Download speed measurements still include the wait.
+We allow up to `request_timeout` of local read pauses between accepted blocks.
+Both the routine and the floor watchdog include this grace in download deadlines.
+If the pause lasts longer, we return our unreceived downloads so another peer can
+fetch them. The stream stays open and the incoming request keeps waiting for
+capacity. Download speed measurements still include the wait.
 Each QUIC stream has a 16 MiB receive window within the connection's 32 MiB window,
 leaving room for another service when one stream pauses.
 

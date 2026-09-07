@@ -743,13 +743,10 @@ impl DownloadWindow {
         }
     }
 
-    /// Reset per-view no-progress accounting after a destructive view reset. The reset
-    /// returned this peer's outstanding to the queue on *our* initiative (a reorg/rollback,
-    /// not the peer's fault), so the in-flight probe streak must not stay charged against
-    /// it: clearing `requests_without_block_progress` lets an unproven peer probe again
-    /// instead of wedging at its one-probe cap forever (the reset also cleared its liveness
-    /// deadline, so nothing would disconnect it). Proof state (`last_block_at`) is preserved.
-    pub(super) fn note_view_reset(&mut self) {
+    /// Clear the probe streak after we return requests on our own initiative,
+    /// such as a view reset or a long local read pause. Keep proof of earlier
+    /// progress, but let even an unproven peer receive work again when we resume.
+    pub(super) fn note_locally_returned_requests(&mut self) {
         self.requests_without_block_progress = 0;
         self.clear_liveness_if_idle();
     }

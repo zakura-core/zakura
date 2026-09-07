@@ -1372,7 +1372,7 @@ fn view_reset_reclears_probe_streak_so_unproven_peer_can_reprobe() {
     // A destructive reset returns the peer's outstanding to the queue on our
     // initiative, then runs the reset hook.
     window.outstanding.clear();
-    window.note_view_reset();
+    window.note_locally_returned_requests();
 
     // The peer can probe again (streak below the cap) and is not left as a zombie
     // (liveness cleared, so `check_liveness` is `Ok`, and proof state is untouched).
@@ -1410,7 +1410,7 @@ fn view_reset_preserves_proof_but_reclears_streak() {
     assert_eq!(window.no_progress_request_cap(), 8);
 
     window.outstanding.clear();
-    window.note_view_reset();
+    window.note_locally_returned_requests();
 
     assert_eq!(window.requests_without_block_progress, 0);
     assert!(
@@ -14231,7 +14231,7 @@ async fn delayed_serving_pauses_same_stream_download_until_capacity_returns() {
 }
 
 #[tokio::test]
-async fn delayed_serving_timeout_closes_locally_without_scoring_peer() {
+async fn delayed_serving_returns_downloads_without_closing_stream() {
     check_delayed_serving(false).await;
 }
 
@@ -14331,33 +14331,38 @@ async fn check_delayed_serving(resume: bool) {
     assert_eq!(inbound_tx.capacity(), inbound_tx.max_capacity() - 1);
 
     if !resume {
-        let frame = BlockSyncMessage::Block(blocks[1].clone())
-            .encode_frame()
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            // The bounded channel fills, then closes when the local delay expires.
-            while inbound_tx.send(frame.clone()).await.is_ok() {}
-        })
-        .await
-        .expect("admission timeout drops the paused receiver");
-        while let Ok(action) = actions.try_recv() {
-            assert!(
-                matches!(action, BlockSyncAction::QueryNeededBlocks { .. }),
-                "local delay must neither dispatch work nor score the peer: {action:?}"
-            );
-        }
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        inbound_tx
+            .try_send(
+                BlockSyncMessage::BlocksDone {
+                    start_height: block::Height(2),
+                    returned: 1,
+                }
+                .encode_frame()
+                .unwrap(),
+            )
+            .expect("local admission pressure must not close the remote peer's stream");
+        assert!(!wiring.registry.has_outstanding_height(block::Height(2)));
+        assert!(wiring.work.pending_contains(block::Height(2)));
+        assert_eq!(wiring.budget.reserved(), 0);
         assert_eq!(wiring.serving_regulator.snapshot().node_active, 1);
-        drop(blocker);
-        assert_eq!(wiring.serving_regulator.snapshot().node_active, 0);
-        reactor_task.abort();
-        return;
+        assert_eq!(
+            wiring.registry.peer_park_deadline(&peer_id, Instant::now()),
+            None
+        );
+        assert_eq!(
+            inbound_tx.capacity(),
+            inbound_tx.max_capacity() - 2,
+            "later frames remain at the paused stream boundary"
+        );
+    } else {
+        tokio::time::sleep_until((original_floor_deadline + Duration::from_millis(20)).into())
+            .await;
+        assert!(
+            wiring.registry.has_outstanding_height(block::Height(2)),
+            "the floor watchdog must keep the claim while our own reads are paused"
+        );
     }
-
-    tokio::time::sleep_until((original_floor_deadline + Duration::from_millis(20)).into()).await;
-    assert!(
-        wiring.registry.has_outstanding_height(block::Height(2)),
-        "the floor watchdog must keep the claim while our own reads are paused"
-    );
     drop(blocker);
     let mut served = false;
     let mut downloaded = false;
@@ -15006,7 +15011,7 @@ async fn reactor_full_serving_queue_retains_partial_response_terminal() {
 #[derive(Clone, Copy)]
 enum TerminalWaitEnd {
     Drain,
-    Timeout,
+    DelayedDrain,
     Reconnect,
     Shutdown,
     CloseQueue,
@@ -15153,13 +15158,15 @@ async fn check_empty_terminal_wait(end: TerminalWaitEnd, driver_failed: bool) {
             ));
             assert!(!cancel.is_cancelled());
         }
-        TerminalWaitEnd::Timeout => {
+        TerminalWaitEnd::DelayedDrain => {
             tokio::time::advance(config.request_timeout + Duration::from_millis(1)).await;
-            await_until("local terminal deadline", Duration::from_secs(1), || {
-                cancel.is_cancelled()
-            })
-            .await
-            .expect("the local deadline closes the session");
+            // Let both the routine and the terminal waiter observe the elapsed time.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(
+                !cancel.is_cancelled(),
+                "queue pressure must not close the stream"
+            );
+            assert_eq!(wiring.serving_regulator.snapshot().node_active, 1);
             assert!(matches!(
                 next_outbound_message(&mut outbound_rx).await,
                 BlockSyncMessage::BlocksDone {
@@ -15167,6 +15174,14 @@ async fn check_empty_terminal_wait(end: TerminalWaitEnd, driver_failed: bool) {
                     ..
                 }
             ));
+            assert!(matches!(
+                next_outbound_message(&mut outbound_rx).await,
+                BlockSyncMessage::RangeUnavailable {
+                    start_height: block::Height(1),
+                    count: 1
+                }
+            ));
+            assert!(!cancel.is_cancelled());
         }
         TerminalWaitEnd::Reconnect => {
             let (_, _replacement_inbound, mut replacement_outbound) = connect_peer_with_status(
@@ -15256,8 +15271,8 @@ async fn full_serving_queue_eventually_sends_empty_response() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn full_serving_queue_terminal_deadline_releases_ownership() {
-    check_empty_terminal_wait(TerminalWaitEnd::Timeout, false).await;
+async fn full_serving_queue_keeps_terminal_after_download_grace() {
+    check_empty_terminal_wait(TerminalWaitEnd::DelayedDrain, false).await;
 }
 
 #[tokio::test(start_paused = true)]

@@ -2246,19 +2246,16 @@ impl BlockSyncReactor {
                 }
                 self.trace_message_sent(peer, &message, "waiting", started.elapsed());
                 // A terminal message is required even after a partial response.
-                // Keep the permit until queue admission, cancellation, or the
-                // local deadline; never resolve this wait through a newer session.
+                // Keep the permit until queue admission or cancellation; never
+                // resolve this wait through a newer session. The transport's write
+                // timeout handles a reader that stops draining. Local queue pressure
+                // must not close the stream with the peer's response unfinished.
                 let peer = peer.clone();
                 let cancelled = session.cancel_token();
-                let deadline = time::Instant::now() + self.startup.config.request_timeout;
                 self.pending_serving_terminals.push(Box::pin(async move {
                     let outcome = tokio::select! {
                         biased;
                         _ = cancelled.cancelled() => "cancelled",
-                        _ = time::sleep_until(deadline) => {
-                            cancelled.cancel();
-                            "timeout"
-                        }
                         result = session.send_regulated_message(message.clone(), &mut permit) => {
                             match result {
                                 Ok(()) => "queued",
@@ -2269,13 +2266,6 @@ impl BlockSyncReactor {
                             }
                         }
                     };
-                    if outcome == "timeout" {
-                        metrics::counter!("sync.block.terminal.queue_timeout").increment(1);
-                        tracing::debug!(
-                            ?peer,
-                            "timed out waiting to queue a GetBlocks terminal response"
-                        );
-                    }
                     ServingTerminalResult {
                         peer,
                         message,

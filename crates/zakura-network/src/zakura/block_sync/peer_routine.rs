@@ -458,10 +458,10 @@ impl PeerRoutine {
                 };
             let outbound_queue_has_capacity = self.session.outbound_capacity() > 0;
             let serving_pending = self.pending_serving.is_some();
-            let serving_deadline = self
+            let download_grace_deadline = self
                 .pending_serving
                 .as_ref()
-                .map(|pending| pending.deadline);
+                .and_then(|pending| pending.download_grace_deadline);
             // Track the start of the current continuous outbound-full stretch so the
             // liveness check can bound the write-congestion grace: a peer that stopped
             // reading holds this full until `outbound_full_since` ages past
@@ -482,11 +482,14 @@ impl PeerRoutine {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
                 () = async {
-                    time::sleep_until(serving_deadline.expect("pending admission has a deadline")).await;
-                }, if serving_pending => {
-                    metrics::counter!("sync.block.serving.backpressure_timeout").increment(1);
-                    tracing::debug!(peer = ?self.peer, "closing locally backpressured block-sync session");
-                    return Ok(());
+                    time::sleep_until(download_grace_deadline.expect("download grace timer is enabled")).await;
+                }, if download_grace_deadline.is_some() => {
+                    // Reads are paused on our initiative. Let another peer fetch
+                    // these bodies, while this request keeps waiting for capacity.
+                    self.return_unreceived_requests("serving_admission_grace");
+                    self.window.note_locally_returned_requests();
+                    self.publish_outstanding();
+                    self.pending_serving.as_mut().expect("admission is pending").download_grace_deadline = None;
                 }
                 outcome = async {
                     self.pending_serving.as_mut()
@@ -623,6 +626,24 @@ impl PeerRoutine {
         Ok(())
     }
 
+    /// Return only unreceived work still owned by this routine. A body already
+    /// handed to the sequencer keeps its ownership and cannot be requeued here.
+    fn return_unreceived_requests(&mut self, reason: &'static str) {
+        let outstanding_ranges = std::mem::take(&mut self.window.outstanding);
+        for outstanding in outstanding_ranges {
+            let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
+            let outcome = self
+                .work
+                .release_reserved_and_return_items_detailed_for_owner(
+                    outstanding.request.owner,
+                    unreceived.iter().copied(),
+                );
+            self.budget.release(outcome.released_bytes);
+            self.trace_work_returned(reason, &outstanding, unreceived.len(), outcome);
+        }
+        self.registry.clear_outstanding(&self.peer, self.generation);
+    }
+
     /// Hold one request at admission without draining later frames from the stream.
     fn retain_serving_request(&mut self, start_height: block::Height, count: u32) {
         assert!(
@@ -648,7 +669,7 @@ impl PeerRoutine {
         self.pending_serving = Some(PendingServing {
             started: Instant::now(),
             grace: remaining,
-            deadline: time::Instant::now() + remaining,
+            download_grace_deadline: Some(time::Instant::now() + remaining),
             future: Box::pin(admit_and_forward_get_blocks(
                 self.serving.clone(),
                 self.routine_to_reactor.clone(),
@@ -769,18 +790,7 @@ impl PeerRoutine {
         // dropped successor heights. Return our unreceived outstanding to
         // `work.pending` (a no-op for heights already dropped from `in_flight` by
         // `reset_above`) and release their reservations exactly once.
-        let outstanding = std::mem::take(&mut self.window.outstanding);
-        for outstanding in outstanding {
-            let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
-            let outcome = self
-                .work
-                .release_reserved_and_return_items_detailed_for_owner(
-                    outstanding.request.owner,
-                    unreceived.iter().copied(),
-                );
-            self.budget.release(outcome.released_bytes);
-            self.trace_work_returned("view_reset", &outstanding, unreceived.len(), outcome);
-        }
+        self.return_unreceived_requests("view_reset");
         self.retry_avoid.clear();
         // Clear our (now-empty) registry outstanding and refresh slot diagnostics.
         self.publish_outstanding();
@@ -788,7 +798,7 @@ impl PeerRoutine {
         // no-progress probe streak must not stay charged: reset it (and clear the idle
         // liveness deadline) so an unproven peer whose only probe was in flight at the
         // reset can probe again instead of wedging at its cap.
-        self.window.note_view_reset();
+        self.window.note_locally_returned_requests();
         // Ping the producer immediately: `reset_above` emptied `pending`, and the
         // reactor's post-reset query may have run while our (now cleared) outstanding
         // still inflated the low-water gate. Without this ping a routine that then
@@ -2325,7 +2335,9 @@ struct PendingServing {
     started: Instant,
     /// Download deadline extension already published while admission waits.
     grace: Duration,
-    deadline: time::Instant,
+    /// When to return paused downloads. None after that work has been returned;
+    /// admission continues waiting until capacity arrives or the session closes.
+    download_grace_deadline: Option<time::Instant>,
     future:
         std::pin::Pin<Box<dyn std::future::Future<Output = ServingAdmissionOutcome> + Send + Sync>>,
 }
@@ -2385,25 +2397,7 @@ impl Drop for PeerRoutine {
     /// The reactor owns entry insert (on connect) and remove (on disconnect/
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {
-        let outstanding_ranges = std::mem::take(&mut self.window.outstanding);
-        for outstanding in outstanding_ranges {
-            let unreceived: Vec<_> = outstanding
-                .request
-                .expected_blocks
-                .iter()
-                .filter(|expected| !outstanding.has_received(expected.height))
-                .map(|expected| expected.height)
-                .collect();
-            let outcome = self
-                .work
-                .release_reserved_and_return_items_detailed_for_owner(
-                    outstanding.request.owner,
-                    unreceived.iter().copied(),
-                );
-            self.budget.release(outcome.released_bytes);
-            self.trace_work_returned("peer_routine_drop", &outstanding, unreceived.len(), outcome);
-        }
-        self.registry.clear_outstanding(&self.peer, self.generation);
+        self.return_unreceived_requests("peer_routine_drop");
     }
 }
 

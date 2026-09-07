@@ -279,3 +279,55 @@ fn dequeue_descendants_removes_the_complete_failed_subtree() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn fork_outputs_survive_queue_and_sent_removal() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
+    let first = block.prepare();
+    let mut second = first.clone();
+    second.hash = [42; 32].into();
+    second.height = (first.height + 1).unwrap();
+    Arc::make_mut(&mut Arc::make_mut(&mut second.block).header).previous_block_hash =
+        [43; 32].into();
+    let outpoint = *first.new_outputs.keys().next().unwrap();
+    for ordered in second.new_outputs.values_mut() {
+        ordered.utxo.height = second.height;
+    }
+    for prune in [false, true] {
+        let mut queue = QueuedBlocks::default();
+        queue.queue((first.clone(), oneshot::channel().0));
+        queue.queue((second.clone(), oneshot::channel().0));
+        if prune {
+            queue.prune_by_height(first.height);
+        } else {
+            queue.dequeue_children(first.block.header.previous_block_hash);
+        }
+        assert_eq!(
+            queue.utxo(&outpoint),
+            Some(second.new_outputs[&outpoint].utxo.clone())
+        );
+        queue.prune_by_height(second.height);
+        assert!(queue.utxo(&outpoint).is_none());
+    }
+
+    for prune in [false, true] {
+        let mut sent = SentHashes::default();
+        sent.add(&first);
+        sent.add(&second);
+        sent.add(&second);
+        if prune {
+            sent.prune_by_height(first.height);
+        } else {
+            sent.remove(&first.hash);
+        }
+        assert_eq!(
+            sent.utxo(&outpoint),
+            Some(second.new_outputs[&outpoint].utxo.clone())
+        );
+        sent.remove(&second.hash);
+        assert!(sent.utxo(&outpoint).is_none());
+    }
+    Ok(())
+}

@@ -1345,11 +1345,23 @@ pub async fn test_mining_rpcs<State, ReadState>(
             ..Default::default()
         }));
 
-    let mock_block_verifier_router_request_handler = async move {
-        mock_block_verifier_router
+    let mock_block_verifier_router_request_handler = async {
+        let response = mock_block_verifier_router
             .expect_request_that(|req| matches!(req, zakura_consensus::Request::CheckProposal(_)))
+            .await;
+
+        let busy = rpc_mock_state_verifier
+            .clone()
+            .get_block_template(Some(GetBlockTemplateParameters {
+                mode: GetBlockTemplateRequestMode::Proposal,
+                data: Some(HexData(BLOCK_MAINNET_1_BYTES.to_vec())),
+                ..Default::default()
+            }))
             .await
-            .respond(Hash::from([0; 32]));
+            .expect_err("a pending proposal occupies the shared slot");
+        assert_eq!(busy.message(), "block proposal validation is busy");
+
+        response.respond(Hash::from([0; 32]));
     };
 
     let (get_block_template, ..) = tokio::join!(
@@ -1361,6 +1373,15 @@ pub async fn test_mining_rpcs<State, ReadState>(
         get_block_template.expect("unexpected error in getblocktemplate RPC call");
 
     snapshot_rpc_getblocktemplate("proposal", get_block_template, None, &settings);
+
+    rpc_mock_state_verifier
+        .get_block_template(Some(GetBlockTemplateParameters {
+            mode: GetBlockTemplateRequestMode::Proposal,
+            data: Some(HexData(Vec::new())),
+            ..Default::default()
+        }))
+        .await
+        .expect("completed proposal releases the slot for the next request");
 
     // These RPC snapshots use the populated state
 

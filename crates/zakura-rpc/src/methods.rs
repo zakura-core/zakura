@@ -52,7 +52,7 @@ use jsonrpsee_types::{ErrorCode, ErrorObject};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::{
-    sync::{broadcast, mpsc, watch},
+    sync::{broadcast, mpsc, watch, Semaphore},
     task::JoinHandle,
 };
 use tower::{Service, ServiceExt};
@@ -1016,6 +1016,9 @@ where
 
     /// Handler for the `getblocktemplate` RPC.
     gbt: GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
+
+    /// RPC clones share one proposal slot to bound verification work without proof of work.
+    proposal_limit: Arc<Semaphore>,
 }
 
 /// A type alias for the last event logged by the server.
@@ -1113,6 +1116,7 @@ where
             address_book,
             last_warn_error_log_rx,
             gbt,
+            proposal_limit: Arc::new(Semaphore::new(1)),
         };
 
         // run the process queue
@@ -2552,6 +2556,10 @@ where
             .as_ref()
             .and_then(GetBlockTemplateParameters::block_proposal_data)
         {
+            let _permit = self.proposal_limit.try_acquire().map_err(|_| {
+                ErrorObject::owned(0, "block proposal validation is busy", None::<()>)
+            })?;
+
             return validate_block_proposal(
                 self.gbt.block_verifier_router(),
                 block_proposal_bytes,

@@ -32,6 +32,8 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `MAX_CACHED_UTXO_SCRIPT_BYTES` | `crates/zakura-consensus/src/transaction/utxo_resolver.rs` | unbounded → `8 MiB` per block resolver | [#919](https://github.com/zakura-core/zakura/pull/919) | Fall back to individual lookups under the shared deadline when historical scripts exceed the cache budget. |
+| `proposal_limit` | `crates/zakura-rpc/src/methods.rs` | unbounded → `1` concurrent proposal per RPC server | [#919](https://github.com/zakura-core/zakura/pull/919) | Reject excess proposal requests before verification instead of accumulating work without proof of work. |
 | `MAX_UTXO_BATCH_SIZE` | `crates/zakura-state/src/constants.rs` | one outpoint per request → at most `64` per batch | [#919](https://github.com/zakura-core/zakura/pull/919) | Bound request work while using native database MultiGet. |
 | `MAX_CONCURRENT_UTXO_BATCH_READS` | `crates/zakura-state/src/constants.rs` | no shared block-lookup read cap → `4` batch-read tasks per state instance | [#919](https://github.com/zakura-core/zakura/pull/919) | Bound running batched reads across blocks; missing-output waits release read permits. |
 | `MAX_IN_FLIGHT_UTXO_BATCHES` | `crates/zakura-consensus/src/transaction/utxo_resolver.rs` | per-transaction lookups → at most `4` pending batches per block | [#919](https://github.com/zakura-core/zakura/pull/919) | Bound each block's outstanding state requests, including dependency waits. |

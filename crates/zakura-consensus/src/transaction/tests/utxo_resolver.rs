@@ -334,3 +334,145 @@ async fn block_resolver_preserves_inner_state_timeout_errors() {
         TransactionError::TransparentInputNotFound
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn block_resolver_falls_back_without_losing_large_outputs() {
+    use super::super::utxo_resolver::MAX_CACHED_UTXO_SCRIPT_BYTES;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    for exceeds_limit in [false, true] {
+        let (block, known, mut expected) = fixture(1024, 0);
+        let script = vec![0x51; MAX_CACHED_UTXO_SCRIPT_BYTES / 1024 + usize::from(exceeds_limit)];
+        for utxo in expected.values_mut() {
+            utxo.output.lock_script = transparent::Script::new(&script);
+        }
+        let expected = Arc::new(expected);
+        let single_requests = Arc::new(AtomicUsize::new(0));
+        let stall = Arc::new(AtomicBool::new(false));
+        let state = tower::service_fn({
+            let expected = expected.clone();
+            let stall = stall.clone();
+            let single_requests = single_requests.clone();
+            move |req| {
+                let response = match req {
+                    zakura_state::Request::AwaitUtxos(outpoints) => {
+                        if outpoints.len() == 1 {
+                            single_requests.fetch_add(1, Ordering::SeqCst);
+                        }
+                        zakura_state::Response::Utxos(
+                            outpoints
+                                .into_iter()
+                                .map(|outpoint| (outpoint, expected[&outpoint].clone()))
+                                .collect(),
+                        )
+                    }
+                    _ => panic!("unexpected state request"),
+                };
+                let stall = stall.load(Ordering::SeqCst);
+                async move {
+                    if stall {
+                        futures::future::pending::<()>().await;
+                    }
+                    Ok::<_, BoxError>(response)
+                }
+            }
+        });
+        let resolver = BlockUtxos::for_block(&block, &known, state.clone());
+        for tx in &block.transactions {
+            let (utxos, outputs, _) = Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                tx.clone(),
+                request(tx.clone(), Arc::new(known.clone()), resolver.clone()),
+                tower::timeout::Timeout::new(state.clone(), super::super::UTXO_LOOKUP_TIMEOUT),
+                None,
+            )
+            .await
+            .unwrap();
+            for (index, outpoint) in tx.spent_outpoints().enumerate() {
+                assert_eq!(utxos[&outpoint], expected[&outpoint]);
+                assert_eq!(outputs[index], expected[&outpoint].output);
+            }
+        }
+        assert_eq!(
+            single_requests.load(Ordering::SeqCst),
+            if exceeds_limit { 1024 } else { 0 }
+        );
+        if exceeds_limit {
+            stall.store(true, Ordering::SeqCst);
+            tokio::time::advance(
+                super::super::UTXO_LOOKUP_TIMEOUT - std::time::Duration::from_secs(1),
+            )
+            .await;
+            let start = tokio::time::Instant::now();
+            let tx = block.transactions[0].clone();
+            let error = Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                tx.clone(),
+                request(tx, Arc::new(known), resolver),
+                tower::timeout::Timeout::new(state, super::super::UTXO_LOOKUP_TIMEOUT),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, TransactionError::TransparentInputNotFound);
+            assert_eq!(start.elapsed(), std::time::Duration::from_secs(1));
+        }
+    }
+}
+
+#[tokio::test]
+async fn block_resolver_script_size_check_matches_interpreter() {
+    let (mut block, known, expected) = fixture(2, 0);
+    block.transactions.truncate(1);
+    let outpoint = block.transactions[0].spent_outpoints().next().unwrap();
+    let mut script = Vec::new();
+    // Push and drop 520-byte items without exceeding the stack or opcode limits.
+    for _ in 0..19 {
+        script.extend([0x4d, 0x08, 0x02]);
+        script.extend([0; 520]);
+        script.push(0x75);
+    }
+    script.push(41);
+    script.extend([0; 41]);
+    script.extend([0x75, 0x51]);
+    assert_eq!(script.len(), 10_000);
+    for too_large in [false, true] {
+        if too_large {
+            script.push(0x61);
+        }
+        let mut utxo = expected[&outpoint].clone();
+        utxo.output.lock_script = transparent::Script::new(&script);
+        let verifier = zakura_script::CachedFfiTransaction::new(
+            block.transactions[0].clone(),
+            Arc::new(vec![utxo.output.clone()]),
+            NetworkUpgrade::Nu5,
+        )
+        .unwrap();
+        assert_eq!(verifier.is_valid(0).is_err(), too_large);
+        let state = tower::service_fn(move |_| {
+            let utxo = utxo.clone();
+            async move {
+                Ok::<_, BoxError>(zakura_state::Response::Utxos(HashMap::from([(
+                    outpoint, utxo,
+                )])))
+            }
+        });
+        let resolver = BlockUtxos::for_block(&block, &known, state).unwrap();
+        let result = resolver.resolve().await;
+        if too_large {
+            assert_eq!(
+                result.unwrap_err(),
+                TransactionError::Script(zakura_script::Error::ScriptInvalid)
+            );
+        } else {
+            assert!(matches!(
+                result.unwrap(),
+                super::super::utxo_resolver::ResolvedUtxos::Cached(_)
+            ));
+        }
+    }
+}

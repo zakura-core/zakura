@@ -41,7 +41,7 @@ pub struct QueuedBlocks {
     /// Hashes from `queued_blocks`, indexed by block height.
     by_height: BTreeMap<block::Height, HashSet<block::Hash>>,
     /// Known UTXOs.
-    known_utxos: HashMap<transparent::OutPoint, transparent::Utxo>,
+    known_utxos: HashMap<transparent::OutPoint, HashMap<block::Hash, transparent::Utxo>>,
 }
 
 impl QueuedBlocks {
@@ -64,7 +64,9 @@ impl QueuedBlocks {
         // Track known UTXOs in queued blocks.
         for (outpoint, ordered_utxo) in new.0.new_outputs.iter() {
             self.known_utxos
-                .insert(*outpoint, ordered_utxo.utxo.clone());
+                .entry(*outpoint)
+                .or_default()
+                .insert(new_hash, ordered_utxo.utxo.clone());
         }
 
         self.blocks.insert(new_hash, new);
@@ -115,10 +117,8 @@ impl QueuedBlocks {
                 }
             }
 
-            // TODO: only remove UTXOs if there are no queued blocks with that UTXO
-            //       (known_utxos is best-effort, so this is ok for now)
             for outpoint in queued.0.new_outputs.keys() {
-                self.known_utxos.remove(outpoint);
+                remove_utxo_owner(&mut self.known_utxos, outpoint, &queued.0.hash);
             }
         }
 
@@ -189,10 +189,8 @@ impl QueuedBlocks {
             )
             .into()));
 
-            // TODO: only remove UTXOs if there are no queued blocks with that UTXO
-            //       (known_utxos is best-effort, so this is ok for now)
             for outpoint in expired_block.new_outputs.keys() {
-                self.known_utxos.remove(outpoint);
+                remove_utxo_owner(&mut self.known_utxos, outpoint, &expired_block.hash);
             }
 
             let parent_list = self
@@ -247,7 +245,7 @@ impl QueuedBlocks {
     /// Try to look up this UTXO in any queued block.
     #[instrument(skip(self))]
     pub fn utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Utxo> {
-        self.known_utxos.get(outpoint).cloned()
+        self.known_utxos.get(outpoint)?.values().next().cloned()
     }
 
     /// Clears known_utxos, by_parent, and by_height, then drains blocks.
@@ -279,7 +277,7 @@ pub(crate) struct SentHashes {
     pub sent: HashMap<block::Hash, Vec<transparent::OutPoint>>,
 
     /// Known UTXOs.
-    known_utxos: HashMap<transparent::OutPoint, transparent::Utxo>,
+    known_utxos: HashMap<transparent::OutPoint, HashMap<block::Hash, transparent::Utxo>>,
 
     /// Whether the hashes in this struct can be used check if the chain can be forked.
     /// This is set to false until all checkpoint-verified block hashes have been pruned.
@@ -310,13 +308,18 @@ impl SentHashes {
     /// Assumes that blocks are added in the order of their height between `finish_batch` calls
     /// for efficient pruning.
     pub fn add(&mut self, block: &SemanticallyVerifiedBlock) {
+        if self.sent.contains_key(&block.hash) {
+            return;
+        }
         // Track known UTXOs in sent blocks.
         let outpoints = block
             .new_outputs
             .iter()
             .map(|(outpoint, ordered_utxo)| {
                 self.known_utxos
-                    .insert(*outpoint, ordered_utxo.utxo.clone());
+                    .entry(*outpoint)
+                    .or_default()
+                    .insert(block.hash, ordered_utxo.utxo.clone());
                 outpoint
             })
             .cloned()
@@ -339,13 +342,18 @@ impl SentHashes {
     ///
     /// For more details see `add()`.
     pub fn add_finalized(&mut self, block: &CheckpointVerifiedBlock) {
+        if self.sent.contains_key(&block.hash) {
+            return;
+        }
         // Track known UTXOs in sent blocks.
         let outpoints = block
             .new_outputs
             .iter()
             .map(|(outpoint, ordered_utxo)| {
                 self.known_utxos
-                    .insert(*outpoint, ordered_utxo.utxo.clone());
+                    .entry(*outpoint)
+                    .or_default()
+                    .insert(block.hash, ordered_utxo.utxo.clone());
                 outpoint
             })
             .cloned()
@@ -360,7 +368,7 @@ impl SentHashes {
     /// Try to look up this UTXO in any sent block.
     #[instrument(skip(self))]
     pub fn utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Utxo> {
-        self.known_utxos.get(outpoint).cloned()
+        self.known_utxos.get(outpoint)?.values().next().cloned()
     }
 
     /// Finishes the current block batch, and stores it for efficient pruning.
@@ -387,10 +395,8 @@ impl SentHashes {
                     buf.push_front((hash, height));
                     return true;
                 } else if let Some(expired_outpoints) = self.sent.remove(&hash) {
-                    // TODO: only remove UTXOs if there are no queued blocks with that UTXO
-                    //       (known_utxos is best-effort, so this is ok for now)
                     for outpoint in expired_outpoints.iter() {
-                        self.known_utxos.remove(outpoint);
+                        remove_utxo_owner(&mut self.known_utxos, outpoint, &hash);
                     }
                 }
             }
@@ -422,7 +428,7 @@ impl SentHashes {
         };
 
         for outpoint in &outpoints {
-            self.known_utxos.remove(outpoint);
+            remove_utxo_owner(&mut self.known_utxos, outpoint, hash);
         }
 
         self.curr_buf.retain(|(h, _)| h != hash);
@@ -472,5 +478,19 @@ impl SentHashes {
             .set(batch_iter().flatten().count() as f64);
 
         metrics::gauge!("state.memory.sent.cache.batch.count").set(batch_iter().count() as f64);
+    }
+}
+
+/// Remove only the departing block's output metadata.
+fn remove_utxo_owner(
+    cache: &mut HashMap<transparent::OutPoint, HashMap<block::Hash, transparent::Utxo>>,
+    outpoint: &transparent::OutPoint,
+    owner: &block::Hash,
+) {
+    if let std::collections::hash_map::Entry::Occupied(mut entry) = cache.entry(*outpoint) {
+        entry.get_mut().remove(owner);
+        if entry.get().is_empty() {
+            entry.remove();
+        }
     }
 }

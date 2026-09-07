@@ -834,9 +834,8 @@ where
                     resolved_utxos
                         .as_ref()
                         .expect("the resolver completed above")
-                        .get(outpoint)
-                        .ok_or(TransactionError::TransparentInputNotFound)?
-                        .clone()
+                        .get(*outpoint, state.clone())
+                        .await?
                 } else {
                     let response = state
                         .clone()

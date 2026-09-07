@@ -21,7 +21,18 @@ use crate::{error::TransactionError, BoxError};
 /// The state separately bounds running database reads across all blocks.
 const MAX_IN_FLIGHT_UTXO_BATCHES: usize = 4;
 
-type ResolvedUtxos = Arc<HashMap<transparent::OutPoint, transparent::Utxo>>;
+// This bounds retained script bytes without introducing a consensus limit.
+// Larger dependency sets use individual lookups under the same deadline.
+pub(super) const MAX_CACHED_UTXO_SCRIPT_BYTES: usize = 8 * 1024 * 1024;
+
+// Both zcash script interpreters reject scripts above MAX_SCRIPT_SIZE before execution.
+const MAX_SPENDABLE_SCRIPT_BYTES: usize = 10_000;
+
+#[derive(Clone, Debug)]
+pub(super) enum ResolvedUtxos {
+    Cached(Arc<HashMap<transparent::OutPoint, transparent::Utxo>>),
+    Individual(tokio::time::Instant),
+}
 
 /// A block-owned lookup shared by its transactions.
 ///
@@ -67,6 +78,7 @@ impl BlockUtxos {
         }
 
         let lookup = async move {
+            let deadline = tokio::time::Instant::now() + super::UTXO_LOOKUP_TIMEOUT;
             let resolve = async move {
                 let mut batches = futures::stream::iter(outpoints)
                     .chunks(zs::constants::MAX_UTXO_BATCH_SIZE)
@@ -98,14 +110,24 @@ impl BlockUtxos {
                     })
                     .buffer_unordered(MAX_IN_FLIGHT_UTXO_BATCHES);
                 let mut resolved = HashMap::new();
+                let mut script_bytes = 0usize;
                 while let Some(batch) = batches.next().await {
-                    resolved.extend(batch?);
+                    let batch = batch?;
+                    for utxo in batch.values() {
+                        check_script_size(utxo)?;
+                        script_bytes = script_bytes
+                            .saturating_add(utxo.output.lock_script.as_raw_bytes().len());
+                    }
+                    if script_bytes > MAX_CACHED_UTXO_SCRIPT_BYTES {
+                        return Ok(ResolvedUtxos::Individual(deadline));
+                    }
+                    resolved.extend(batch);
                 }
-                Ok(Arc::new(resolved))
+                Ok(ResolvedUtxos::Cached(Arc::new(resolved)))
             };
             // One deadline covers admission, reads, and dependency waits for this block.
             // Unlike serial per-input deadlines, later batches do not get extra time.
-            tokio::time::timeout(super::UTXO_LOOKUP_TIMEOUT, resolve)
+            tokio::time::timeout_at(deadline, resolve)
                 .await
                 .map_err(|_| TransactionError::TransparentInputNotFound)?
         };
@@ -114,5 +136,55 @@ impl BlockUtxos {
 
     pub(super) async fn resolve(&self) -> Result<ResolvedUtxos, TransactionError> {
         self.0.as_ref().clone().await
+    }
+}
+
+/// Reject outputs that the script interpreter cannot spend before copying their scripts.
+fn check_script_size(utxo: &transparent::Utxo) -> Result<(), TransactionError> {
+    if utxo.output.lock_script.as_raw_bytes().len() > MAX_SPENDABLE_SCRIPT_BYTES {
+        return Err(zakura_script::Error::ScriptInvalid.into());
+    }
+    Ok(())
+}
+
+impl ResolvedUtxos {
+    pub(super) async fn get<S>(
+        &self,
+        outpoint: transparent::OutPoint,
+        state: S,
+    ) -> Result<transparent::Utxo, TransactionError>
+    where
+        S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+        S::Future: Send + 'static,
+    {
+        let deadline = match self {
+            Self::Cached(utxos) => {
+                return utxos
+                    .get(&outpoint)
+                    .cloned()
+                    .ok_or(TransactionError::TransparentInputNotFound)
+            }
+            Self::Individual(deadline) => deadline,
+        };
+        let response = tokio::time::timeout_at(
+            *deadline,
+            state.oneshot(zs::Request::AwaitUtxos(vec![outpoint])),
+        )
+        .await
+        .map_err(|_| TransactionError::TransparentInputNotFound)?
+        .map_err(
+            |error| match error.downcast::<tower::timeout::error::Elapsed>() {
+                Ok(_) => TransactionError::TransparentInputNotFound,
+                Err(error) => TransactionError::from(error),
+            },
+        )?;
+        let zs::Response::Utxos(mut utxos) = response else {
+            unreachable!("AwaitUtxos returns Utxos")
+        };
+        let utxo = utxos
+            .remove(&outpoint)
+            .ok_or(TransactionError::TransparentInputNotFound)?;
+        check_script_size(&utxo)?;
+        Ok(utxo)
     }
 }

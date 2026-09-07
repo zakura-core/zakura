@@ -348,6 +348,20 @@ where
 
             let known_outpoint_hashes: Arc<HashSet<transaction::Hash>> =
                 Arc::new(known_utxos.keys().map(|outpoint| outpoint.hash).collect());
+            // Reject cross-transaction double spends before cloning historical outputs.
+            let mut spent_outpoints = HashSet::new();
+            for outpoint in block
+                .transactions
+                .iter()
+                .flat_map(|tx| tx.spent_outpoints())
+            {
+                if !spent_outpoints.insert(outpoint) {
+                    return Err(crate::error::TransactionError::DuplicateTransparentSpend(
+                        outpoint,
+                    )
+                    .into());
+                }
+            }
             let utxo_resolver =
                 tx::BlockUtxos::for_block(&block, &known_utxos, state_service.clone());
             // Keep this guard after `known_outpoint_hashes` so its `Drop` removes the

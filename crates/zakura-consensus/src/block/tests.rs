@@ -747,7 +747,7 @@ async fn block_verification_uses_batched_external_outputs_without_committing_the
         hash: [42; 32].into(),
         index: 0,
     };
-    for script_succeeds in [true, false] {
+    for (script_succeeds, duplicate_spend) in [(true, false), (false, false), (true, true)] {
         let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
             .zcash_deserialize_into()
             .unwrap();
@@ -774,6 +774,14 @@ async fn block_verification_uses_batched_external_outputs_without_committing_the
                 orchard_shielded_data: None,
             }),
         ];
+        if duplicate_spend {
+            let mut duplicate = (*block.transactions[1]).clone();
+            let Transaction::V5 { expiry_height, .. } = &mut duplicate else {
+                unreachable!()
+            };
+            *expiry_height = Height(3);
+            block.transactions.push(Arc::new(duplicate));
+        }
         Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
         let expected_hash = block.hash();
         let state =
@@ -781,6 +789,10 @@ async fn block_verification_uses_batched_external_outputs_without_committing_the
                 Ok::<_, BoxError>(match request {
                     zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
                     zs::Request::AwaitUtxos(outpoints) => {
+                        assert!(
+                            !duplicate_spend,
+                            "reject duplicate spends before reading outputs"
+                        );
                         assert_eq!(outpoints, vec![outpoint]);
                         zs::Response::Utxos(
                             [(
@@ -823,7 +835,13 @@ async fn block_verification_uses_batched_external_outputs_without_committing_the
         )
         .await
         .unwrap();
-        if script_succeeds {
+        if duplicate_spend {
+            assert!(
+                matches!(result, Err(VerifyBlockError::Transaction(
+                TransactionError::DuplicateTransparentSpend(found))) if found == outpoint),
+                "{result:?}"
+            );
+        } else if script_succeeds {
             assert_eq!(result.unwrap(), expected_hash);
         } else {
             assert!(

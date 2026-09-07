@@ -2249,6 +2249,8 @@ impl WriteBlockWorkerTask {
                 },
             ) {
                 Ok((finalized, note_commitment_trees)) => {
+                    // Wake informational UTXO reads that ran before this commit became visible.
+                    non_finalized_state_sender.send_modify(|_| {});
                     // Whether this successful commit consumed header-carried
                     // tree-aux roots to skip the note-commitment frontier rebuild.
                     if next_block_took_vct_path {

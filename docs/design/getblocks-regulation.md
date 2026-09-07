@@ -2,8 +2,7 @@
 
 GetBlocks admits bounded state work and holds its response producer until the
 query, result, and application writes finish. QUIC flow and congestion control
-provide transport backpressure. There is no serving byte-rate bucket or separate
-peer/node outstanding-byte budget.
+provide transport backpressure.
 
 ## Message rules
 
@@ -62,9 +61,8 @@ application acknowledgement; QUIC may retain bytes after accepting a write.
 There is at most one response being produced or written per live session. Its
 payload cap is
 `min(count * MAX_BLOCK_BYTES, advertised_max_response_bytes) + count + 9`.
-This is the response's wire bound, not a shared byte balance. Each queued frame
-shares the producer without acquiring additional capacity. The final owner
-releases capacity immediately, without a refill timer.
+Each queued frame shares the producer without acquiring additional capacity.
+The final owner releases capacity immediately.
 
 | Resource | Default | Owner and release point |
 | --- | --- | --- |
@@ -81,8 +79,8 @@ waiter uses the permit assigned to it on its next admission attempt.
 
 When admission waits, the routine holds the current request and stops reading
 further frames. Existing application queues and QUIC receive buffers provide
-backpressure; there is no additional delayed-request queue. Later responses on
-this ordered stream wait too. Outbound writes run independently of inbound
+backpressure. Later responses on this ordered stream wait too.
+Outbound writes run independently of inbound
 forwarding so they can release serving capacity while reads are paused.
 
 Download deadlines exclude local admission pauses. The total grace between

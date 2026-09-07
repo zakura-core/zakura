@@ -1,26 +1,10 @@
-//! Reusable resource accounting for native Zakura services.
+//! Owned concurrency permits shared by native Zakura message policies.
 //!
-//! This facade provides the ownership mechanics shared by message-specific
-//! policies. It does not decide what a message costs or what should happen
-//! when capacity is unavailable. Those decisions stay with each service.
+//! Each service declares when work starts and which owners must finish before
+//! its permit is released. The primitive does not select scheduling policy.
 
-mod outstanding_bytes;
-#[allow(dead_code)]
-// Optional cadence primitive; GetBlocks admission uses completion-based capacity.
-mod rate;
 mod slots;
-
-#[allow(unused_imports)] // the facade keeps configuration and transition errors discoverable
-pub(crate) use outstanding_bytes::{
-    FrameLease, OutstandingByteBudget, OutstandingByteReservation, OutstandingCapacityError,
-};
-#[allow(unused_imports)] // the facade keeps configuration and transition errors discoverable
-pub(crate) use rate::{
-    CommittedRateReservation, RateBudget, RateBudgetConfigError, RateReservation,
-    RateReservationError, RateReservationSpendError,
-};
-#[allow(unused_imports)] // the facade keeps configuration errors discoverable
-pub(crate) use slots::{SlotBudget, SlotBudgetCapacityError, SlotPermit};
+pub(crate) use slots::{SlotBudget, SlotPermit};
 
 #[cfg(test)]
 mod tests;

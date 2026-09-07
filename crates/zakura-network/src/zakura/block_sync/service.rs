@@ -215,7 +215,7 @@ impl BlockSyncPeerSession {
         .await
     }
 
-    /// Queue one block response and transfer its accounted bytes to transport.
+    /// Queue one block response and retain its producer through the transport write.
     pub(super) fn try_send_regulated_block(
         &self,
         block: Arc<block::Block>,
@@ -241,7 +241,7 @@ impl BlockSyncPeerSession {
         )
     }
 
-    /// Transfer response bytes only when a transport queue slot is available.
+    /// Share response ownership only when a transport queue slot is available.
     pub(super) fn try_send_regulated_message(
         &self,
         msg: BlockSyncMessage,
@@ -249,14 +249,14 @@ impl BlockSyncPeerSession {
     ) -> Result<(), OrderedSendError> {
         let (frame, accounted_bytes) = Self::encode_regulated_message(msg, permit)?;
         self.send
-            .try_send_leased(frame, || permit.transfer_frame(accounted_bytes))
+            .try_send_guarded(frame, || permit.frame_guard(accounted_bytes))
             .map_err(|error| {
                 let send_error = if error.is_full() {
                     OrderedSendError::Full
                 } else if error.is_closed() {
                     OrderedSendError::Closed
                 } else {
-                    // Compatibility senders do not support attaching leases.
+                    // Compatibility senders do not support attaching guards.
                     OrderedSendError::Closed
                 };
                 drop(error.into_frame());
@@ -272,7 +272,7 @@ impl BlockSyncPeerSession {
     ) -> Result<(), OrderedSendError> {
         let (frame, accounted_bytes) = Self::encode_regulated_message(msg, permit)?;
         self.send
-            .send_leased(frame, || permit.transfer_frame(accounted_bytes))
+            .send_guarded(frame, || permit.frame_guard(accounted_bytes))
             .await
             .map_err(|_| OrderedSendError::Closed)
     }

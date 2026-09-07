@@ -106,9 +106,6 @@ pub const MAX_BS_RESPONSE_BYTES: u32 = DEFAULT_BS_MAX_RESPONSE_BYTES;
 /// Encoded payload bytes in either terminal GetBlocks response message.
 pub const GET_BLOCKS_TERMINAL_PAYLOAD_BYTES: u64 = 9;
 
-const MIB: u64 = 1024 * 1024;
-const DEFAULT_GET_BLOCKS_PEER_OUTSTANDING_BYTES: u64 = 64 * MIB;
-const DEFAULT_GET_BLOCKS_NODE_OUTSTANDING_BYTES: u64 = 256 * MIB;
 const DEFAULT_GET_BLOCKS_PEER_PENDING_REQUESTS: usize = 64;
 const DEFAULT_GET_BLOCKS_NODE_PENDING_REQUESTS: usize = 1024;
 const DEFAULT_GET_BLOCKS_NODE_ACTIVE_REQUESTS: usize = 64;
@@ -335,15 +332,11 @@ pub struct ZakuraBlockSyncConfig {
 
 /// Node and peer bounds applied before GetBlocks state work starts.
 ///
-/// Outstanding-byte budgets do not refill; capacity returns when the last ledger, query, or result owner
-/// drops, or when its queued frame leaves the application-owned transport path.
+/// Each session has one response producer, held through state work and transport
+/// writes. Node capacity returns when the last query, result, or frame owner drops.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetBlocksRegulationConfig {
-    /// Reserved and queued response bytes allowed for one live peer session.
-    pub peer_outstanding_bytes: u64,
-    /// Admitted GetBlocks response bytes not yet handed off by the transport.
-    pub node_outstanding_bytes: u64,
     /// Decoded GetBlocks requests retained while one peer waits for admission.
     pub peer_pending_requests: usize,
     /// Fully retained GetBlocks queue entries across all peers. A full queue
@@ -360,8 +353,6 @@ pub struct GetBlocksRegulationConfig {
 impl Default for GetBlocksRegulationConfig {
     fn default() -> Self {
         Self {
-            peer_outstanding_bytes: DEFAULT_GET_BLOCKS_PEER_OUTSTANDING_BYTES,
-            node_outstanding_bytes: DEFAULT_GET_BLOCKS_NODE_OUTSTANDING_BYTES,
             peer_pending_requests: DEFAULT_GET_BLOCKS_PEER_PENDING_REQUESTS,
             node_pending_requests: DEFAULT_GET_BLOCKS_NODE_PENDING_REQUESTS,
             node_active_requests: DEFAULT_GET_BLOCKS_NODE_ACTIVE_REQUESTS,

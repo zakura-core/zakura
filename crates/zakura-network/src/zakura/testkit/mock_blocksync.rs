@@ -1152,3 +1152,107 @@ async fn zakura_mock_blocksync_throughput() -> Result<(), BoxError> {
 
     Ok(())
 }
+
+/// Bounded serving comparison: real Iroh and block sync, synthetic state and apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "local serving comparison; run explicitly with --ignored --nocapture"]
+#[allow(clippy::print_stdout)]
+async fn getblocks_serving_comparison() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let readers = env_usize("ZAKURA_COMPARISON_READERS", 1).clamp(1, 4);
+    let config = HarnessConfig {
+        seeds: readers,
+        blocks: 128,
+        max_blocks_per_response: 1,
+        max_inflight: 64,
+        shape: SyntheticBlockShape {
+            target_block_bytes: Some(64_000),
+        },
+        trace_dir: None,
+    };
+    let corpus = SyntheticBlockCorpus::generate(config.blocks, SYNTHETIC_CORPUS_SEED, config.shape);
+    let mut cluster = ZakuraTestCluster::new();
+    let mut trace = HarnessTrace::new(None);
+    let mut tasks = Vec::new();
+    let server = spawn_mock_node(
+        &mut cluster,
+        91_000,
+        BlockSyncFrontiers {
+            finalized_height: corpus.target_height(),
+            verified_block_tip: corpus.target_height(),
+            verified_block_hash: corpus.tip_hash(),
+        },
+        &corpus,
+        &config,
+        &mut trace,
+    )
+    .await?;
+    let serving = ThroughputStats::default();
+    tasks.push(drain_header_sync_actions(cluster.node(server)).await);
+    tasks.push(
+        drive_mock_block_sync_actions(
+            cluster.node(server),
+            corpus.clone(),
+            None,
+            corpus.target_height(),
+            serving.clone(),
+            None,
+        )
+        .await,
+    );
+    let (gate, wait) = watch::channel(false);
+    let mut clients = Vec::new();
+    for index in 0..readers {
+        let node = spawn_mock_node(
+            &mut cluster,
+            91_001 + u64::try_from(index).unwrap(),
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: mainnet_genesis_hash(),
+            },
+            &corpus,
+            &config,
+            &mut trace,
+        )
+        .await?;
+        let stats = ThroughputStats::default();
+        tasks.push(drain_header_sync_actions(cluster.node(node)).await);
+        tasks.push(
+            drive_mock_block_sync_actions(
+                cluster.node(node),
+                corpus.clone(),
+                Some(MockApplyFrontier::new(corpus.clone())),
+                block::Height(0),
+                stats.clone(),
+                Some(wait.clone()),
+            )
+            .await,
+        );
+        connect_leecher_to_seeds(&cluster, 1, node).await?;
+        clients.push(stats);
+    }
+    let started = Instant::now();
+    gate.send(true)?;
+    let result = await_until(
+        "all local readers reach the target",
+        Duration::from_secs(40),
+        || {
+            clients
+                .iter()
+                .all(|stats| stats.final_frontier() == corpus.target_height())
+        },
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let summary = serving.summary();
+    println!("getblocks_comparison readers={readers} blocks_per_reader={} elapsed_ms={:.3} served_requests={} complete={}",
+        config.blocks, elapsed.as_secs_f64() * 1000.0, summary.request_count, result.is_ok());
+    cluster.shutdown().await;
+    for task in tasks {
+        task.abort();
+    }
+    trace.shutdown().await;
+    result?;
+    Ok(())
+}

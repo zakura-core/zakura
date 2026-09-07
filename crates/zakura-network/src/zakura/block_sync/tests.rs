@@ -14245,7 +14245,8 @@ async fn check_delayed_serving(resume: bool) {
     };
     config.peer_limits.outbound_queue_depth = 16;
     config.get_blocks_regulation.node_active_requests = 1;
-    config.request_timeout = Duration::from_millis(250);
+    config.request_timeout = Duration::from_secs(1);
+    config.floor_rescue_timeout = Duration::from_millis(20);
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
@@ -14284,6 +14285,14 @@ async fn check_delayed_serving(resume: bool) {
         .routine_wiring
         .as_ref()
         .expect("a spawned reactor exposes test wiring");
+    let original_floor_deadline = wiring
+        .registry
+        .earliest_outstanding_deadline_at(block::Height(2))
+        .unwrap();
+    assert!(
+        original_floor_deadline.saturating_duration_since(Instant::now())
+            < Duration::from_millis(500)
+    );
     let blocker_session = wiring.serving_regulator.session(peer(0xee), u64::MAX);
     let blocker = blocker_session
         .try_admit(1)
@@ -14344,6 +14353,11 @@ async fn check_delayed_serving(resume: bool) {
         return;
     }
 
+    tokio::time::sleep_until((original_floor_deadline + Duration::from_millis(20)).into()).await;
+    assert!(
+        wiring.registry.has_outstanding_height(block::Height(2)),
+        "the floor watchdog must keep the claim while our own reads are paused"
+    );
     drop(blocker);
     let mut served = false;
     let mut downloaded = false;

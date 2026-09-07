@@ -636,8 +636,18 @@ impl PeerRoutine {
             .config
             .request_timeout
             .saturating_sub(self.admission_delay);
+        // Publish the grace before reads pause, so the reactor's floor watchdog
+        // uses it too. Completion removes the unused part of this grace.
+        for outstanding in &mut self.window.outstanding {
+            outstanding.deadline += remaining;
+        }
+        if let Some(deadline) = &mut self.window.block_liveness_deadline {
+            *deadline += remaining;
+        }
+        self.publish_outstanding();
         self.pending_serving = Some(PendingServing {
             started: Instant::now(),
+            grace: remaining,
             deadline: time::Instant::now() + remaining,
             future: Box::pin(admit_and_forward_get_blocks(
                 self.serving.clone(),
@@ -658,14 +668,16 @@ impl PeerRoutine {
             .pending_serving
             .take()
             .expect("admission just completed");
-        let elapsed = pending.started.elapsed();
+        let elapsed = pending.started.elapsed().min(pending.grace);
+        let unused = pending.grace - elapsed;
         self.admission_delay = self.admission_delay.saturating_add(elapsed);
         for outstanding in &mut self.window.outstanding {
-            outstanding.deadline += elapsed;
+            outstanding.deadline -= unused;
         }
         if let Some(deadline) = &mut self.window.block_liveness_deadline {
-            *deadline += elapsed;
+            *deadline -= unused;
         }
+        self.gc_obsolete_outstanding();
         self.publish_outstanding();
     }
 
@@ -2193,7 +2205,12 @@ impl PeerRoutine {
             BTreeMap::new();
         for outstanding in &self.window.outstanding {
             for expected in &outstanding.request.expected_blocks {
-                if !outstanding.has_received(expected.height) {
+                // A scheduler or reset may retire a height while this routine
+                // waits. Publish only work that still belongs to this request.
+                if !outstanding.has_received(expected.height)
+                    && self.work.owner_for_height(expected.height)
+                        == Some(outstanding.request.owner)
+                {
                     map.insert(
                         expected.height,
                         super::peer_registry::OutstandingMeta {
@@ -2306,6 +2323,8 @@ enum ServingAdmissionOutcome {
 
 struct PendingServing {
     started: Instant,
+    /// Download deadline extension already published while admission waits.
+    grace: Duration,
     deadline: time::Instant,
     future:
         std::pin::Pin<Box<dyn std::future::Future<Output = ServingAdmissionOutcome> + Send + Sync>>,
@@ -2672,8 +2691,130 @@ mod tests {
         );
     }
 
-    /// Routine teardown must not release or requeue a height already received
-    /// through first-completion-wins.
+    /// Local admission pauses share one grace with the floor watchdog.
+    #[tokio::test]
+    async fn serving_pause_updates_watchdog_before_waiting_and_does_not_restore_retired_work() {
+        let config = ZakuraBlockSyncConfig::default();
+
+        // Ample budget so the floor take reserves directly (no funding round-trip)
+        // and sends a real request, creating the outstanding claim.
+        let budget = ByteBudget::new(1_000_000);
+        let mut budget_probe = budget.clone();
+
+        // Height 1 is the floor (download floor is 0) and this peer's only work item.
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        assert_eq!(
+            work.extend(
+                super::super::test_work_scope(),
+                [(
+                    block::Height(1),
+                    block::Hash([1; 32]),
+                    BlockSizeEstimate::Advertised(1_000),
+                )]
+            ),
+            1,
+        );
+
+        let cancel = CancellationToken::new();
+        let (out_send, _out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![9u8; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let serving = test_serving(&config, &peer);
+
+        let registry = Arc::new(PeerRegistry::new());
+        let generation = registry
+            .admit_session(
+                &peer,
+                crate::zakura::ServicePeerDirection::Outbound,
+                &config,
+                0,
+                Instant::now(),
+            )
+            .generation();
+        let mut routine = PeerRoutine::new(
+            peer,
+            0,
+            session,
+            in_recv,
+            config,
+            true,
+            generation,
+            budget,
+            Arc::clone(&work),
+            registry.clone(),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            routine_to_reactor_tx,
+            serving,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+        routine.received_status = true;
+        routine.servable_low = block::Height(1);
+        routine.servable_high = block::Height(10);
+
+        // One fill pass: the routine reserves height 1's estimate and sends its
+        // request, creating an outstanding claim for a still-reserved height.
+        let _ = timeout(Duration::from_secs(5), routine.try_fill())
+            .await
+            .expect("try_fill completes");
+        assert!(
+            work.in_flight_contains(block::Height(1)),
+            "height 1 is reserved and outstanding after the fill"
+        );
+        assert!(!work.pending_contains(block::Height(1)));
+        assert_eq!(budget_probe.reserved(), 1_000);
+        assert_eq!(routine.window.outstanding.len(), 1);
+
+        let height = block::Height(1);
+        let original_deadline = registry.earliest_outstanding_deadline_at(height).unwrap();
+        routine.retain_serving_request(height, 1);
+        assert_eq!(
+            registry.earliest_outstanding_deadline_at(height),
+            Some(original_deadline + routine.config.request_timeout),
+            "the watchdog must see the grace before the routine stops reading"
+        );
+
+        // Finish after part of the grace. Only the time actually paused stays
+        // excluded from the deadline, so a short pause cannot grant a full grace.
+        routine.pending_serving.as_mut().unwrap().started = Instant::now() - Duration::from_secs(3);
+        routine.finish_serving_admission();
+        let resumed_deadline = registry.earliest_outstanding_deadline_at(height).unwrap();
+        assert!(resumed_deadline >= original_deadline + Duration::from_secs(3));
+        assert!(resumed_deadline < original_deadline + Duration::from_secs(4));
+        routine.retain_serving_request(height, 1);
+        assert_eq!(
+            registry.earliest_outstanding_deadline_at(height),
+            Some(original_deadline + routine.config.request_timeout),
+            "repeated pauses share one grace between accepted blocks"
+        );
+
+        // A reset or another scheduler path may retire this request while the
+        // routine waits. Resuming must not publish the old claim again.
+        let owner = routine.window.outstanding[0].request.owner;
+        assert!(registry.clear_outstanding_height_for_owner(&routine.peer, height, owner));
+        let released = work.release_reserved_and_return_items_detailed_for_owner(owner, [height]);
+        budget_probe.release(released.released_bytes);
+        routine.finish_serving_admission();
+        assert_eq!(registry.earliest_outstanding_deadline_at(height), None);
+        assert!(routine.window.outstanding.is_empty());
+        assert!(work.pending_contains(height));
+        assert_eq!(budget_probe.reserved(), 0);
+    }
+
     #[tokio::test]
     async fn routine_drop_leaves_a_body_won_by_another_peer_to_the_sequencer() {
         let config = ZakuraBlockSyncConfig::default();

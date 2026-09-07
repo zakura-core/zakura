@@ -50,6 +50,11 @@ before payload reading begins. It verifies the service's declared cap, tighter
 stream caps, and valid GetBlocks and Block messages on the same stream. The
 profile also checks the existing negotiated message-size limit before allocation.
 
+A GetBlocks decoding property mixes structured requests with arbitrary short
+payloads, flags, and message tags. An independent wire-rule check requires exact
+length and valid fields, checks the decoded values, and catches both invalid
+acceptance and valid rejection. Decoder panics fail and shrink the generated case.
+
 ## Shared request histories
 
 The shared `RequestAdmission` layer is exercised with a test-only GetPeers policy

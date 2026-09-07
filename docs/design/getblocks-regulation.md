@@ -25,29 +25,31 @@ enforced. Serial response production does not reject overlapping requests.
 
 ## Shared request admission
 
-`GetBlocksPolicy` declares the request codec, encoded response bound, and one
-response producer per session. The peer routine uses this declaration to decode
-GetBlocks with the existing codec before retaining it. The session still checks
-its initial Status before admission; block ranges, query dispatch, and terminal
-responses stay in block sync.
+Admission means deciding whether a request can start work now. A slot is room for
+one active response.
 
-`RequestAdmission` applies a finite request policy to session and node capacity.
-It acquires all required slots or rolls back partial acquisition, and a delayed
-caller can reuse the permit supplied by its original capacity pool. Committing
-admission creates a `ResponsePermit`. Execution leases and transport frame guards
-share its work capacity until their last owner finishes. Closing the response
-prevents an unclaimed execution from starting, while already running work drains.
+For GetBlocks, the steps are:
 
-The shared layer does not queue messages, select priorities, or define subscription
-lifetimes. Its callers select capacity pools explicitly; reusing the code does not
-make unrelated message policies share one pool. The peer routine applies admission
-backpressure directly to its ordered stream.
+1. Check the request's fields and that the session has sent its initial `Status`.
+2. Take a slot from both the session and the node's GetBlocks pool. If either is
+   full, return any slot already taken and pause reading this stream until room
+   opens.
+3. Check that the session is still current, then start reading the blocks.
+4. Keep the slots held until the block query ends and the response is written to
+   the transport or discarded. Then another request can use them.
 
-A test-only GetPeers adapter uses the production discovery codec and a one-frame
-Peers response to exercise the same admission and write-ownership path. This checks
-the finite-request abstraction against another message; it does not enable or
-qualify discovery regulation. The complete declaration/filter inventory in the
-draft remains future work.
+If the request is cancelled before its query starts, the query won't run. If the
+query has already started, it keeps its slots until it finishes.
+
+The shared code handles taking, holding, and returning slots. Each message
+supplies its own rules for reading the request and limiting its response.
+GetBlocks supplies those rules through `GetBlocksPolicy`; block sync still reads
+the blocks and sends them. Each message's setup chooses its slot pool. GetBlocks
+currently has its own node pool.
+
+This shared code supports requests whose responses end. A GetPeers test checks
+that a second message can use the same code. GetPeers regulation is only enabled
+in that test.
 
 ## Backpressure and ownership
 

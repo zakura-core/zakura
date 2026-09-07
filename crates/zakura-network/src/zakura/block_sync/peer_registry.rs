@@ -597,8 +597,8 @@ impl PeerRegistry {
 
     /// Remove a peer only if this session is still current.
     ///
-    /// If session 10 disconnects after the peer reconnects as session 11,
-    /// cleanup for session 10 must leave session 11 in the registry.
+    /// For example, if session 10 disconnects after the peer reconnects as
+    /// session 11, cleanup for session 10 must leave session 11 in the registry.
     pub(super) fn remove_session(&self, peer: &ZakuraPeerId, session_id: u64) {
         let mut peers = self.lock();
         if peers

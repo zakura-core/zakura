@@ -595,7 +595,10 @@ impl PeerRegistry {
         }
     }
 
-    /// Remove a peer only when the event still owns its current session.
+    /// Remove a peer only if this session is still current.
+    ///
+    /// If session 10 disconnects after the peer reconnects as session 11,
+    /// cleanup for session 10 must leave session 11 in the registry.
     pub(super) fn remove_session(&self, peer: &ZakuraPeerId, session_id: u64) {
         let mut peers = self.lock();
         if peers
@@ -606,15 +609,18 @@ impl PeerRegistry {
         }
     }
 
-    /// Remove a peer's entry for a public, ownerless test or driver event.
+    /// Remove a peer without checking its session ID.
+    /// Used by public test or driver events that don't carry a session ID.
+    /// Session cleanup must use `remove_session` to protect a newer connection.
     pub(super) fn remove(&self, peer: &ZakuraPeerId) {
         self.lock().remove(peer);
     }
 
-    /// Return whether this exact routine generation still owns the peer entry.
+    /// Check whether this is still the peer's current session.
     ///
-    /// Serving admission uses this immediately before committing resources, so
-    /// a superseded session cannot start work through its replacement.
+    /// A generation is the session ID assigned when a peer joins the registry.
+    /// Serving checks it before accepting work, so a request from an old session
+    /// cannot be accepted through a newer connection to the same peer.
     pub(super) fn owns_generation(&self, peer: &ZakuraPeerId, generation: u64) -> bool {
         self.lock()
             .get(peer)
@@ -622,6 +628,7 @@ impl PeerRegistry {
     }
 
     #[cfg(test)]
+    /// Read the current session ID so tests can check reconnect handling.
     pub(super) fn generation_for_test(&self, peer: &ZakuraPeerId) -> Option<u64> {
         self.lock().get(peer).map(|entry| entry.generation)
     }

@@ -265,8 +265,8 @@ mod zip218_template_limits {
         let mut post_activation = template_limits(&network, Height(2));
         assert_eq!(
             post_activation.try_add(&over_limit_tx),
-            !cfg!(feature = "zip218"),
-            "a zip218 build rejects Orchard actions above the per-block limit at NU7"
+            !cfg!(feature = "nu7-experimental"),
+            "an experimental NU7 build rejects Orchard actions above the per-block limit at NU7"
         );
     }
 
@@ -284,12 +284,12 @@ mod zip218_template_limits {
             },
         );
 
-        let expected_sapling_ios = if cfg!(feature = "zip218") {
+        let expected_sapling_ios = if cfg!(feature = "nu7-experimental") {
             SAPLING_BLOCK_IO_LIMIT - 1
         } else {
             u32::MAX
         };
-        let expected_cost = if cfg!(feature = "zip218") {
+        let expected_cost = if cfg!(feature = "nu7-experimental") {
             GLOBAL_SHIELDED_BUDGET - 1
         } else {
             u32::MAX

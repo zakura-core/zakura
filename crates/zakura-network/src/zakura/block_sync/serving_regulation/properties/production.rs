@@ -15,7 +15,7 @@ struct RequestOwners {
     permit: Option<GetBlocksServingPermit>,
     query_leases: Vec<BlockRangeQueryLease>,
     sent_block: bool,
-    lifetime: Option<std::sync::Weak<ServingResources>>,
+    lifetime: Option<std::sync::Weak<crate::zakura::regulation::WorkResources>>,
 }
 
 struct PendingWrite {
@@ -28,8 +28,7 @@ struct Session {
     sender: BlockSyncPeerSession,
     receiver: FramedWorkerRecv,
     writing: Option<PendingWrite>,
-    // Counter handles keep observations alive without retaining a permit,
-    // SessionResources.
+    // Counter handles keep observations alive without retaining work ownership.
     active: SlotBudget,
     pending: SlotBudget,
 }
@@ -111,7 +110,7 @@ impl Production {
             Action::Commit { request } => {
                 let owners = self.requests[request].as_mut().unwrap();
                 let permit = owners.attempt.take().unwrap().commit();
-                owners.lifetime = Some(Arc::downgrade(&permit.resources));
+                owners.lifetime = Some(permit.response.weak_resources());
                 owners.query_leases.push(permit.query_lease());
                 owners.permit = Some(permit);
                 Outcome::Done

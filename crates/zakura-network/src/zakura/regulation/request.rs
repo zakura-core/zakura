@@ -279,3 +279,6 @@ impl WorkLease {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod properties;

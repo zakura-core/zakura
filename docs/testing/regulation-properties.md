@@ -30,6 +30,7 @@ concrete JSON scenario and retain Proptest's normal seed-based reproduction.
 | Layer | Production path exercised | Observation |
 | --- | --- | --- |
 | Primitive | Concurrency slots | Owned permit count |
+| Shared requests | Finite-request admission, rollback, execution and response owners | Independent per-session and node ownership model |
 | Serving | Admission, query lifecycle, encoder, transport queue | Node and session producer/pending counts |
 | Reactor | Peer routine and response queue | Response prefix, terminal, producer lifetime |
 | Driver | Query claim, timeout, cancellation, result handoff | Underlying query and result retain capacity |
@@ -44,7 +45,22 @@ writer. Dequeue alone must not release a producer. Controlled writes exercise
 completion, failure, and cancellation. The base PR also tests a real QUIC write
 blocked by stream credit while another stream makes progress.
 
-## Generated histories
+## Shared request histories
+
+The shared `RequestAdmission` layer is exercised with a test-only GetPeers policy
+that calls the production discovery codec. Generated histories use two sessions,
+one or two node slots, and at most two execution leases per request. An independent
+model tracks provisional admission, response ownership, execution claims,
+cancellation, and frame ownership after every action. Action availability comes
+from the model. Failures include the concrete action history and the Proptest seed.
+
+The shared model checks ownership with frame guards directly. A separate witness
+encodes a real Peers response and retains ownership through the production queued
+write boundary. It also checks partial-admission rollback and that a fair waiter's
+permit cannot be reused for another session's capacity pool. These tests do not
+enable discovery regulation or claim its complete protocol conformance.
+
+## Generated GetBlocks histories
 
 The ownership model uses two peer identities, at most eight session generations,
 four request slots, four input slots, and a one-frame output queue per session.
@@ -117,9 +133,13 @@ For another message family:
 5. Exercise the real handler, encoder, and transport boundaries against those
    expectations, including cancellation and session replacement.
 
-Reuse the slot properties where the contract is identical. Extract additional
-helpers only when a second message demonstrates common behavior. Keep message
-semantics and fixtures explicit so a reviewer can understand what is tested.
+For finite requests, reuse `RequestPolicy`, `RequestAdmission`, and the shared
+execution/response ownership properties. Supply the actual codec and response
+bound, then exercise the message's handler and transport integration separately.
+Keep announcements, response reservations, and subscription semantics explicit;
+they do not all have the lifetime of a finite request. GetBlocks' range, terminal,
+state-driver, reconnect, and JSON replay properties remain independent coverage of
+its integration.
 
 These are finite generated histories, not exhaustive state exploration. They do
 not measure RocksDB capacity, consensus scheduling, or full sync performance.

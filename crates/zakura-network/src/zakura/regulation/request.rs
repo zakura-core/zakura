@@ -3,12 +3,16 @@
 //! Policies supply the codec and response bound. Peer routines own waiting and
 //! dispatch, so this layer neither queues messages nor chooses scheduling policy.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use tokio_util::sync::CancellationToken;
 
-use super::{SlotBudget, SlotPermit};
+use super::{slots::WeakSlotBudget, SlotBudget, SlotPermit};
 use crate::zakura::transport::{Frame, FrameGuard};
+use crate::zakura::ZakuraPeerId;
 
 /// Message-specific rules used by request admission.
 ///
@@ -28,36 +32,65 @@ pub(crate) trait RequestPolicy {
 pub(crate) struct RequestAdmission<P> {
     policy: P,
     node: SlotBudget,
-    session_capacity: usize,
+    peer_capacity: usize,
+    peers: Arc<Mutex<HashMap<ZakuraPeerId, WeakSlotBudget>>>,
 }
 
 impl<P: RequestPolicy + Clone> RequestAdmission<P> {
-    pub(crate) fn new(policy: P, node: SlotBudget, session_capacity: usize) -> Self {
+    pub(crate) fn new(policy: P, node: SlotBudget, peer_capacity: usize) -> Self {
         // Validate before a session is created rather than panicking on ingress.
-        SlotBudget::new(session_capacity).expect("request session capacity is validated");
+        SlotBudget::new(peer_capacity).expect("request peer capacity is validated");
         Self {
             policy,
             node,
-            session_capacity,
+            peer_capacity,
+            peers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub(crate) fn session(&self) -> RequestSession<P> {
+    /// Reconnects share the authenticated peer's capacity with its old work.
+    pub(crate) fn session(&self, peer: &ZakuraPeerId) -> RequestSession<P> {
+        let mut peers = self
+            .peers
+            .lock()
+            .expect("peer budget registry is not poisoned");
+        // Permits keep their semaphore alive even after the old session closes.
+        // Remove expired identities on each connection so churn cannot grow the map.
+        peers.retain(|_, budget| budget.is_alive());
+        let budget = peers
+            .get(peer)
+            .and_then(WeakSlotBudget::upgrade)
+            .unwrap_or_else(|| {
+                let budget = SlotBudget::new(self.peer_capacity)
+                    .expect("request peer capacity was validated at construction");
+                peers.insert(peer.clone(), budget.downgrade());
+                budget
+            });
         RequestSession {
             policy: self.policy.clone(),
             node: self.node.clone(),
-            session: SlotBudget::new(self.session_capacity)
-                .expect("request session capacity was validated at construction"),
+            peer: budget,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserved_by_peers(&self) -> usize {
+        self.peers
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(WeakSlotBudget::upgrade)
+            .map(|budget| budget.reserved())
+            .sum()
     }
 }
 
-/// One session's request policy and work capacity.
+/// One session's request policy, sharing capacity with the peer's other sessions.
 #[derive(Clone, Debug)]
 pub(crate) struct RequestSession<P> {
     policy: P,
     node: SlotBudget,
-    session: SlotBudget,
+    peer: SlotBudget,
 }
 
 impl<P: RequestPolicy> RequestSession<P> {
@@ -72,11 +105,11 @@ impl<P: RequestPolicy> RequestSession<P> {
         request: &P::Request,
         mut acquired: Option<AcquiredWorkSlot>,
     ) -> Result<WorkAttempt, WorkBlocked> {
-        let session = reserve_slot(WorkBound::Session, &self.session, &mut acquired)?;
+        let peer = reserve_slot(WorkBound::Peer, &self.peer, &mut acquired)?;
         let node = reserve_slot(WorkBound::Node, &self.node, &mut acquired)?;
         Ok(WorkAttempt {
             resources: Arc::new(WorkResources {
-                _session: session,
+                _peer: peer,
                 _node: node,
             }),
             response_cap: self.policy.response_cap(request),
@@ -84,15 +117,15 @@ impl<P: RequestPolicy> RequestSession<P> {
     }
 
     #[cfg(test)]
-    pub(crate) fn session_budget(&self) -> &SlotBudget {
-        &self.session
+    pub(crate) fn peer_budget(&self) -> &SlotBudget {
+        &self.peer
     }
 }
 
 /// Scope of the work capacity that delayed a request.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum WorkBound {
-    Session,
+    Peer,
     Node,
 }
 
@@ -166,7 +199,7 @@ impl WorkAttempt {
 
 #[derive(Debug)]
 pub(crate) struct WorkResources {
-    _session: SlotPermit,
+    _peer: SlotPermit,
     _node: SlotPermit,
 }
 

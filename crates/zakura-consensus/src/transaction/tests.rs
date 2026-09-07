@@ -211,6 +211,62 @@ async fn block_utxo_lookups_are_bounded_and_preserve_input_order() {
 }
 
 #[tokio::test]
+async fn block_utxo_lookups_wait_for_readiness_once_per_transaction() {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
+
+    #[derive(Clone)]
+    struct PendingState(Arc<AtomicUsize>);
+
+    impl Service<zakura_state::Request> for PendingState {
+        type Response = zakura_state::Response;
+        type Error = BoxError;
+        type Future = futures::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Poll::Pending
+        }
+
+        fn call(&mut self, _: zakura_state::Request) -> Self::Future {
+            panic!("state has not admitted a request")
+        }
+    }
+
+    for transaction_count in [1, 4, 16] {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut lookups = Vec::new();
+        for index in 0..transaction_count {
+            let (request, _) = block_lookup_fixture_from(129, 0, index * 129);
+            let Request::Block { transaction, .. } = &request else {
+                unreachable!()
+            };
+            lookups.push(Box::pin(Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                transaction.clone(),
+                request,
+                tower::timeout::Timeout::new(
+                    PendingState(polls.clone()),
+                    super::UTXO_LOOKUP_TIMEOUT,
+                ),
+                None,
+            )));
+        }
+        for lookup in &mut lookups {
+            assert!(futures::poll!(lookup).is_pending());
+        }
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            usize::try_from(transaction_count).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
 async fn block_utxo_aggregate_windows_are_independent_and_cancel_together() {
     for transaction_count in [2, 8, 16] {
         let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();

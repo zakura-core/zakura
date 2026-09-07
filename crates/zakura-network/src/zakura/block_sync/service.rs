@@ -584,6 +584,15 @@ impl Service for BlockSyncService {
         block_sync_streams()
     }
 
+    fn message_payload_limits(&self, stream: Stream) -> &'static [(u16, usize)] {
+        match (stream.kind, stream.version) {
+            (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_BLOCK_SYNC_STREAM_VERSION) => {
+                serving_regulation::message_payload_limits()
+            }
+            _ => &[],
+        }
+    }
+
     fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
         OrderedStreamPolicy {
             opening: OrderedStreamOpening::EitherSide,

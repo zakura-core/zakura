@@ -21,6 +21,15 @@ impl GetBlocksPolicy {
     /// One message tag, a four-byte start height, and a four-byte block count.
     const REQUEST_PAYLOAD_BYTES: usize = 9;
 
+    /// The transport and decoder use the same GetBlocks payload limit.
+    pub(super) const PAYLOAD_LIMITS: &'static [(u16, usize)] = &[
+        // Every u8 discriminator fits in the frame header's u16 message type.
+        (
+            super::super::wire::MSG_BS_GET_BLOCKS as u16,
+            Self::REQUEST_PAYLOAD_BYTES,
+        ),
+    ];
+
     /// Use the same response limits that we advertise to peers.
     pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
         Self {

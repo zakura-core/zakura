@@ -12,7 +12,7 @@ every message to select every filter.
 
 | Category | Current GetBlocks path |
 | --- | --- |
-| Safe | The codec bounds the request count and checks that the whole requested range fits within the supported heights, on both send and receive. Serving enforces the advertised response count and body-byte cap, including the encoded framing allowance. |
+| Safe | The frame reader rejects GetBlocks payloads above 9 bytes before allocation. The codec bounds the request count and checks that the whole requested range fits within the supported heights, on both send and receive. Serving enforces the advertised response count and body-byte cap, including the encoded framing allowance. |
 | Authorized | Serving uses the authenticated session after its initial Status. Reservation checks belong to the Block and terminal responses on the requesting side. |
 | Useful | GetBlocks has no Relevant predicate in the draft. Stale session work is cancelled before dispatch. Completed requests may be legitimate retries; the server does not infer what the requester has stored. |
 | Budgeted | An authenticated peer owns one response producer across its sessions. Shared concurrency permits bound state queries, retained results, and writes; each routine holds at most one waiting request. |
@@ -105,6 +105,12 @@ fetch them. The stream stays open and the incoming request keeps waiting for
 capacity. Download speed measurements still include the wait.
 Each QUIC stream has a 16 MiB receive window within the connection's 32 MiB window,
 leaving room for another service when one stream pauses.
+
+Services supply message-specific payload limits through `Service::message_payload_limits`.
+The shared frame reader applies the tighter of that limit and the stream's existing
+limit before allocating or reading a payload. GetBlocks declares 9 bytes in its
+policy; messages without a declaration retain the stream limit. Discovery and
+header-sync policies can supply their own limits through the same interface.
 
 Each response also has a size limit. For the block count we allow in that response,
 its maximum payload size is

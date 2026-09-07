@@ -141,6 +141,13 @@ impl ServiceRegistry {
             .map(|index| Arc::clone(&self.services[*index]))
     }
 
+    /// Local message limits supplied by the service that owns this stream.
+    pub(crate) fn message_payload_limits(&self, stream: Stream) -> &'static [(u16, usize)] {
+        self.service_for_kind(stream.kind)
+            .map(|service| service.message_payload_limits(stream))
+            .unwrap_or(&[])
+    }
+
     /// Lookup the declared stream for `kind`.
     pub fn stream_for_kind(&self, kind: u16) -> Option<Stream> {
         let service = self.service_for_kind(kind)?;

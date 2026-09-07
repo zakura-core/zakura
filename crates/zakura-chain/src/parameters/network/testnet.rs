@@ -315,7 +315,7 @@ fn num_funding_stream_addresses_required_for_height_range(
     height_range: &std::ops::Range<Height>,
     network: &Network,
 ) -> usize {
-    1u32.checked_add(funding_stream_address_period(
+    1i64.checked_add(funding_stream_address_period(
         height_range
             .end
             .previous()
@@ -324,7 +324,9 @@ fn num_funding_stream_addresses_required_for_height_range(
     ))
     .expect("no overflow should happen in this sum")
     .checked_sub(funding_stream_address_period(height_range.start, network))
-    .expect("no overflow should happen in this sub") as usize
+    .expect("no overflow should happen in this sub")
+    .try_into()
+    .expect("a funding stream height range must not have a negative number of periods")
 }
 
 /// Checks that the provided [`FundingStreams`] has sufficient recipient addresses for the

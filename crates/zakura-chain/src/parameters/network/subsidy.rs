@@ -279,24 +279,19 @@ impl ParameterSubsidy for Network {
 /// as described in [protocol specification §7.10][7.10]
 ///
 /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#fundingstreams
-pub fn funding_stream_address_period<N: ParameterSubsidy>(height: Height, network: &N) -> u32 {
+pub fn funding_stream_address_period<N: ParameterSubsidy>(
+    height: Height,
+    network: &N,
+) -> HeightDiff {
     // Spec equation: `address_period = floor((height - (height_for_halving(1) - post_blossom_halving_interval))/funding_stream_address_change_interval)`,
     // <https://zips.z.cash/protocol/protocol.pdf#fundingstreams>
     //
     // Note that the brackets make it so the post blossom halving interval is added to the total.
     //
-    // In Rust, "integer division rounds towards zero":
-    // <https://doc.rust-lang.org/stable/reference/expressions/operator-expr.html#arithmetic-and-logical-binary-operators>
-    // This is the same as `floor()`, because these numbers are all positive.
-
     let height_after_first_halving = height - network.height_for_first_halving();
 
-    let address_period = (height_after_first_halving + network.post_blossom_halving_interval())
-        / network.funding_stream_address_change_interval();
-
-    address_period
-        .try_into()
-        .expect("all values are positive and smaller than the input height")
+    (height_after_first_halving + network.post_blossom_halving_interval())
+        .div_euclid(network.funding_stream_address_change_interval())
 }
 
 /// The first block height of the halving at the provided halving index for a network.
@@ -309,26 +304,24 @@ pub fn height_for_halving(halving: u32, network: &Network) -> Option<Height> {
         return Some(Height(0));
     }
 
-    let slow_start_shift = i64::from(network.slow_start_shift().0);
-    let blossom_height = i64::from(NetworkUpgrade::Blossom.activation_height(network)?.0);
-    let pre_blossom_halving_interval = network.pre_blossom_halving_interval();
-    let halving_index = i64::from(halving);
+    if self::halving(Height::MAX, network) < halving {
+        return None;
+    }
 
-    let unscaled_height = halving_index.checked_mul(pre_blossom_halving_interval)?;
+    // `halving` is monotonic. Search its complete height domain so this inverse
+    // automatically includes every target-spacing era.
+    let mut low = Height::MIN.0;
+    let mut high = Height::MAX.0;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if self::halving(Height(middle), network) < halving {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
 
-    let pre_blossom_height = unscaled_height
-        .min(blossom_height)
-        .checked_add(slow_start_shift)?;
-
-    let post_blossom_height = 0
-        .max(unscaled_height - blossom_height)
-        .checked_mul(i64::from(BLOSSOM_POW_TARGET_SPACING_RATIO))?
-        .checked_add(slow_start_shift)?;
-
-    let height = pre_blossom_height.checked_add(post_blossom_height)?;
-
-    let height = u32::try_from(height).ok()?;
-    height.try_into().ok()
+    Some(Height(low))
 }
 
 /// Returns the `fs.Value(height)` for each stream receiver

@@ -11,8 +11,8 @@ use crate::{
     block::Height,
     parameters::{
         subsidy::{
-            block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, halving, halving_divisor,
-            height_for_halving, ParameterSubsidy as _,
+            block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, funding_stream_address_period,
+            halving, halving_divisor, height_for_halving, ParameterSubsidy as _,
         },
         NetworkUpgrade,
     },
@@ -391,10 +391,62 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
         POST_BLOSSOM_HALVING_INTERVAL * i64::from(NU7_POW_TARGET_SPACING_RATIO);
     let next_halving = (nu7_height + post_nu7_halving_interval).unwrap();
     assert_eq!(4, halving(next_halving, &network));
+    assert_eq!(Some(next_halving), height_for_halving(4, &network));
+    assert_eq!(
+        3,
+        halving(
+            height_for_halving(4, &network)
+                .expect("the fourth halving has a height")
+                .previous()
+                .expect("the fourth halving is above genesis"),
+            &network,
+        )
+    );
     assert_eq!(16, halving_divisor(next_halving, &network).unwrap());
     assert_eq!(
         Amount::<NonNegative>::try_from(13_020_833)?,
         block_subsidy(next_halving, &network)?,
+    );
+
+    Ok(())
+}
+
+/// Tests funding stream periods before the first period anchor on a configured Testnet.
+#[test]
+#[cfg(feature = "zip218")]
+fn funding_stream_period_before_anchor_uses_floor_division() -> Result<(), Report> {
+    use crate::parameters::testnet::{self, ConfiguredActivationHeights};
+
+    let _init_guard = zakura_test::init();
+
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(4),
+            canopy: Some(6),
+            nu7: Some(11),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let first_period_height = (network.height_for_first_halving()
+        - network.post_blossom_halving_interval())
+    .expect("the first period starts above genesis");
+
+    assert_eq!(
+        0,
+        funding_stream_address_period(first_period_height, &network)
+    );
+    assert_eq!(
+        -1,
+        funding_stream_address_period(
+            first_period_height
+                .previous()
+                .expect("the height before the first period exists"),
+            &network,
+        )
     );
 
     Ok(())

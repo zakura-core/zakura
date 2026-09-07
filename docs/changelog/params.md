@@ -1,20 +1,24 @@
 # Changelog: Parameters
 
-A focused ledger of deliberate changes to **tunable parameters** in this fork —
+A focused ledger of deliberate changes to **node tunable parameters** in this fork —
 constants, config defaults, timeouts, window/limit sizes, and congestion-control
 coefficients.
 
 This complements the root `CHANGELOG.md`. The changelog records user-visible behavior in
-prose; this file is a compact table of every parameter value we have re-tuned, so
+prose; this file is a compact table of node parameter values we have re-tuned, so
 reviewers and operators can see — at a glance — what changed, where it lives, and
 why.
 
 ## How to use this file
 
-When a PR changes a tunable parameter, add a row to the table below **in the same
-PR**. A "tunable parameter" is any value chosen for behavior or performance rather
+When a PR changes a node tunable parameter, add a row to the table below **in the same
+PR**. A "tunable parameter" is any value chosen for node behavior or performance rather
 than correctness — a constant, a `Config` default, a timeout, a window or limit,
 or a backoff/growth coefficient.
+
+Infrastructure, CI, deployment, and notification settings are outside this
+ledger's scope. Document those changes in the relevant infrastructure or operator
+documentation instead.
 
 Keep entries **newest-first**. Each row records:
 

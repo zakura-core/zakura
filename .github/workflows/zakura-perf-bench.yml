@@ -159,6 +159,8 @@ jobs:
         id: droplet
         uses: ./.github/actions/do-droplet
         with:
+          policy: fixed
+          regions: nyc1
           name: zakura-perf-${{ matrix.leg.leg }}-${{ github.run_id }}
           size: ${{ inputs.droplet_size || 'c-16' }}
           ssh_fingerprint: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
@@ -226,6 +228,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p leg-out
+          cp /tmp/out/provisioning.json leg-out/provisioning.json
           scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
             "root@${IP}:/root/out/." leg-out/ || true
           if [ -f leg-out/leg-summary.md ]; then

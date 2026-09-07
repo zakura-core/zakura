@@ -12,6 +12,59 @@ use crate::{AuxObservationId, EvidenceId, HeaderSyncWorkOwner, SourceId};
 
 use super::error::TransitionTypeError;
 
+pub(crate) fn semantic_payload_fingerprint(
+    header_hash: block::Hash,
+    tree_aux: Option<TreeAuxRecordV1>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-header-aux-semantic-v1");
+    hasher.update(header_hash.0);
+    let Some(aux) = tree_aux else {
+        hasher.update([0]);
+        return hasher.finalize().into();
+    };
+    hasher.update([1]);
+    hasher.update(aux.height.0.to_le_bytes());
+    hasher.update(<[u8; 32]>::from(aux.sapling_root));
+    hasher.update(<[u8; 32]>::from(aux.orchard_root));
+    hasher.update(<[u8; 32]>::from(aux.ironwood_root));
+    hasher.update(aux.sapling_tx_count.to_le_bytes());
+    hasher.update(aux.orchard_tx_count.to_le_bytes());
+    hasher.update(aux.ironwood_tx_count.to_le_bytes());
+    hasher.update(<[u8; 32]>::from(aux.auth_data_root));
+    hasher.finalize().into()
+}
+
+/// Supplier-independent identity of one VCT auxiliary input.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct AuxiliaryInputFingerprint([u8; 32]);
+
+impl AuxiliaryInputFingerprint {
+    /// Bind one semantic payload and its authentication boundary without transport identity.
+    pub(crate) fn new(
+        header_hash: block::Hash,
+        record: TreeAuxRecordV1,
+        boundary_hash: Option<block::Hash>,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-vct-auxiliary-input-v1");
+        hasher.update(semantic_payload_fingerprint(header_hash, Some(record)));
+        match boundary_hash {
+            Some(boundary_hash) => {
+                hasher.update([1]);
+                hasher.update(boundary_hash.0);
+            }
+            None => hasher.update([0]),
+        }
+        Self(hasher.finalize().into())
+    }
+
+    /// Return the opaque semantic input digest.
+    pub(crate) const fn digest(self) -> [u8; 32] {
+        self.0
+    }
+}
+
 /// Bounded advisory body-size metadata.
 /// Body-size metadata cannot allocate or grant admission credit.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -206,23 +259,7 @@ impl AuxDelivery {
 
     /// Return the semantic payload identity without transport ownership or body-size metadata.
     pub fn semantic_fingerprint(self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(b"zakura-header-aux-semantic-v1");
-        hasher.update(self.header_hash.0);
-        let Some(aux) = self.tree_aux else {
-            hasher.update([0]);
-            return hasher.finalize().into();
-        };
-        hasher.update([1]);
-        hasher.update(aux.height.0.to_le_bytes());
-        hasher.update(<[u8; 32]>::from(aux.sapling_root));
-        hasher.update(<[u8; 32]>::from(aux.orchard_root));
-        hasher.update(<[u8; 32]>::from(aux.ironwood_root));
-        hasher.update(aux.sapling_tx_count.to_le_bytes());
-        hasher.update(aux.orchard_tx_count.to_le_bytes());
-        hasher.update(aux.ironwood_tx_count.to_le_bytes());
-        hasher.update(<[u8; 32]>::from(aux.auth_data_root));
-        hasher.finalize().into()
+        semantic_payload_fingerprint(self.header_hash, self.tree_aux)
     }
 
     /// Return the engine-derived outcome.
@@ -361,6 +398,17 @@ impl UntrustedAuxDeliveryRow {
     /// Return the raw durable outcome boundary.
     pub const fn outcome_boundary_hash(self) -> Option<block::Hash> {
         self.outcome_boundary_hash
+    }
+
+    /// Return whether the raw outcome fields form one valid recovered outcome.
+    pub fn has_valid_outcome(self) -> bool {
+        self.delivery
+            .promote_recovered_outcome(
+                self.outcome_status_code,
+                self.observation_digests,
+                self.outcome_boundary_hash,
+            )
+            .is_some()
     }
 
     pub(crate) const fn into_parts(

@@ -742,12 +742,33 @@ where
                 "unexpected state response: {response:?}"
             )))),
         )),
+        Err(error) if error_chain_contains_auxiliary_capacity_refusal(error.as_ref()) => {
+            Err(Arc::new(
+                zakura_header_chain::HeaderChainError::auxiliary_capacity(Some(error)),
+            ))
+        }
         Err(error) => Err(header_target_apply_failure(
             owner,
             "state_error",
             Some(error),
         )),
     }
+}
+
+fn error_chain_contains_auxiliary_capacity_refusal(
+    error: &(dyn std::error::Error + 'static),
+) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if matches!(
+            error.downcast_ref::<zakura_header_chain::TransitionFailure>(),
+            Some(zakura_header_chain::TransitionFailure::AuxiliaryLimitExceeded)
+        ) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 async fn wait_for_header_target_apply<F>(
@@ -1815,6 +1836,34 @@ mod tests {
                 .to_string(),
             "fixture state apply failure"
         );
+    }
+
+    #[test]
+    fn driver_recognizes_auxiliary_capacity_through_the_state_error_chain() {
+        #[derive(Debug)]
+        struct Wrapped(zakura_header_chain::TransitionFailure);
+
+        impl std::fmt::Display for Wrapped {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "wrapped state error")
+            }
+        }
+
+        impl std::error::Error for Wrapped {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let refusal = zakura_header_chain::TransitionFailure::AuxiliaryLimitExceeded;
+        assert!(error_chain_contains_auxiliary_capacity_refusal(&refusal));
+
+        let wrapped = Wrapped(refusal);
+        assert!(error_chain_contains_auxiliary_capacity_refusal(&wrapped));
+
+        let classified =
+            zakura_header_chain::HeaderChainError::auxiliary_capacity(Some(Box::new(wrapped)));
+        assert!(classified.is_auxiliary_capacity_refusal());
     }
 
     #[test]

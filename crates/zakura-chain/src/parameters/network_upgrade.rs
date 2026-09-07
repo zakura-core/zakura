@@ -260,8 +260,8 @@ pub const POST_BLOSSOM_POW_TARGET_SPACING: u32 = 75;
 /// feature enabled follows today's consensus on any network without an NU7
 /// activation height.
 ///
-/// Enabled by the `zip218` feature.
-pub const ZIP218_ENABLED: bool = cfg!(feature = "zip218");
+/// Enabled by the `nu7-experimental` feature.
+pub const ZIP218_ENABLED: bool = cfg!(feature = "nu7-experimental");
 
 /// The target block spacing after NU7 activation, in seconds.
 ///
@@ -581,7 +581,7 @@ impl NetworkUpgrade {
 
     /// Returns the post-NU7 target spacing in seconds for this build.
     ///
-    /// Without the `zip218` feature, NU7 keeps the post-Blossom spacing.
+    /// Without the `nu7-experimental` feature, NU7 keeps the post-Blossom spacing.
     fn post_nu7_target_spacing_seconds() -> i64 {
         if ZIP218_ENABLED {
             POST_NU7_POW_TARGET_SPACING.into()

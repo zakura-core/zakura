@@ -336,8 +336,8 @@ jobs:
       - name: Check generated zakurad config compatibility
         run: cargo nextest run --profile zakura-config --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --no-fail-fast
 
-  zip218:
-    name: ZIP 218 feature tests
+  nu7-experimental:
+    name: Experimental NU7 feature tests
     needs: changes
     # Compiles its own binaries, because the shared nextest archive is built
     # without this feature.
@@ -358,9 +358,9 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       - name: Test the crates that ZIP 218 changes
         run: |
-          cargo test --locked --features zakura-chain/zip218 \
+          cargo test --locked --features zakura-chain/nu7-experimental \
             -p zakura-chain -p zakura-header-chain --lib
-          cargo test --locked --features zip218 \
+          cargo test --locked --features nu7-experimental \
             -p zakura-consensus -p zakura-rpc --lib
 
   network-dependent:
@@ -491,7 +491,7 @@ jobs:
       - build-tests
       - unit-tests
       - zakura-config
-      - zip218
+      - nu7-experimental
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
@@ -509,7 +509,7 @@ jobs:
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, zip218, publish-graph
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, nu7-experimental, publish-graph
 
   report-nightly-result:
     name: report nightly release test result

@@ -11,7 +11,7 @@ pub const POW_MEDIAN_BLOCK_SPAN: usize = 11;
 /// > ActualTimespan(height : N) := MedianTime(height) − MedianTime(height − PoWAveragingWindow)
 ///
 /// ZIP 218 widens `PoWAveragingWindow` at NU7, so this span covers the largest
-/// window the build can use at any height. A `zip218` build therefore carries
+/// window the build can use at any height. An experimental NU7 build therefore carries
 /// this wider context from genesis onwards and ignores the entries beyond the
 /// window in force at the candidate height.
 pub const POW_ADJUSTMENT_BLOCK_SPAN: usize = MAX_POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN;

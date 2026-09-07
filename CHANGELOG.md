@@ -11,6 +11,16 @@ independently.
 
 ## [Unreleased]
 
+## [1.4.0-rc0] - 2026-09-07
+
+### Changed
+
+- Raised the minimum supported Rust version to 1.97 for `zakurad` and the
+  internal crates ([#903](https://github.com/zakura-core/zakura/pull/903)).
+- Shortened the end-of-support window to 24 days so v1.4.0-rc0 halts at block
+  3,504,731 — the same halt block and date (~2026-10-03) as v1.3.2
+  ([#915](https://github.com/zakura-core/zakura/pull/915)).
+
 ## [1.3.2] - 2026-09-05
 
 ### Added

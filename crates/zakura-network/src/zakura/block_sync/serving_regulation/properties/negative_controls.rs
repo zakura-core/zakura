@@ -59,7 +59,7 @@ fn observation_comparison_rejects_compensating_and_wrong_session_errors() {
         "a correct aggregate cannot hide wrong ownership"
     );
     let mut duplicate_refund = expected.clone();
-    duplicate_refund.node_rate += 1;
+    duplicate_refund.node_bytes -= 1;
     assert_ne!(
         duplicate_refund, *expected,
         "a one-unit duplicate refund must be visible"

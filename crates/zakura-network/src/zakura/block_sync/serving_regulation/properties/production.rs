@@ -103,8 +103,6 @@ impl Production {
                         Outcome::Admission(None)
                     }
                     Err(blocked) => Outcome::Admission(Some(match blocked.kind() {
-                        BoundKind::PeerRate => Limit::PeerRate,
-                        BoundKind::NodeRate => Limit::NodeRate,
                         BoundKind::PeerActive => Limit::PeerActive,
                         BoundKind::NodeActive => Limit::NodeActive,
                         BoundKind::PeerOutstanding => Limit::PeerBytes,
@@ -257,14 +255,6 @@ impl Production {
     pub(super) fn snapshot(&self) -> Snapshot {
         let node = &self.regulator.inner;
         Snapshot {
-            node_rate: node.node_rate.available(),
-            peer_rates: std::array::from_fn(|peer| {
-                self.sessions[self.current_sessions[peer]]
-                    .account
-                    .as_ref()
-                    .unwrap()
-                    .peer_rate_available()
-            }),
             node_bytes: node.node_outstanding.reserved(),
             session_bytes: self
                 .sessions

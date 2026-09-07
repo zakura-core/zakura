@@ -41,8 +41,8 @@ development bases.
 | Storage | Bounded range collector | Prefix sum and lookup sequence |
 
 The ownership model does not call production cost, admission, transfer, or
-refund helpers. It shares configuration inputs, not state transitions. The rate
-oracle represents fractional units directly, rather than copying production's
+refund helpers. It shares configuration inputs, not state transitions. The separate
+rate-primitive oracle represents fractional units directly, rather than copying production's
 separate whole-token and remainder fields. Credit discarded at burst capacity
 is not available for later spending.
 
@@ -50,7 +50,7 @@ The transport adapter uses `worker_framed_channel` and
 `QueuedFrame::write_with`. The ordinary synthetic receiver unwraps frames at
 dequeue, so it cannot establish that bytes remain charged during an unfinished
 application write. Read-only budget handles observe retired sessions without
-keeping their permits or identity accounts alive.
+keeping their permits alive.
 
 ## GetBlocks contract and witnesses
 
@@ -72,9 +72,9 @@ one to three committed blocks and queue depths one to three. These deliberately
 small capacities reach full queues and resource limits with bounded
 allocations.
 
-- **Admission before work and transactional rollback.** Each of the six
-  peer/node rate, slot, and byte limits blocks admission; releasing ownership
-  and refilling permits the retry.
+- **Admission before work and transactional rollback.** Each of the four
+  peer/node slot and byte limits blocks admission; releasing ownership
+  permits the retry without advancing time.
 - **Bounded pending input.** Session and node bounds are reached separately; an
   async node-slot waiter owns its partial session reservation and returns it on
   cancellation.
@@ -84,17 +84,15 @@ allocations.
 - **Bytes survive request settlement.** The saved reconnect scenario retains
   queued/writing bytes under the old session after its active request owner
   ends.
-- **Exact spending.** A full output queue changes no rate or byte balance;
-  successful enqueue spends the actual payload; provisional rollback refunds
-  everything.
+- **Exact spending.** A full output queue changes no byte balance;
+  successful enqueue transfers the actual payload reservation to the writer;
+  provisional rollback refunds everything.
 - **Terminal completion.** The reactor exercises full, partial, and empty
   responses through small queues and verifies their terminal and actual written
   prefix.
 - **State lifetime and recovery.** Success, error, panic, timeout, cancellation
   before start, and cancellation while running; the waiting second peer
   proceeds after the read completes.
-- **Identity retention.** Creating inactive accounts stays bounded without
-  evicting a live request's identity deficit.
 - **Replay and checker sensitivity.** Saved JSON replays twice; incompatible
   inputs fail; deliberately faulty observations are rejected and irrelevant
   history shrinks away.
@@ -110,21 +108,19 @@ not claim to generate every reactor terminal path.
 `serving_regulation/properties/defaults.rs` uses unmodified configuration and
 independent numeric expectations. The default response count is one block.
 A maximum 2,000,000-byte block uses 2,000,010 payload bytes with its framing
-and terminal, and costs 2,065,546 rate units including fixed work.
+and terminal. There is no fixed request price or byte-rate allowance.
 
 | Account | Maximum-block witness | What permits the next request |
 | --- | --- | --- |
-| Peer identity rate | 16 completed responses from a full burst | Refill at 128 MiB/s |
-| Node rate | 64 completed responses shared across five identities | Refill at 256 MiB/s |
-| Node active work | 64 retained requests after rate refill | Release one active owner |
+| Node active work | 64 retained requests | Release one active owner |
 | Session outstanding bytes | 33 retained full responses | Finish or drop a frame write |
 | Node outstanding bytes | 134 retained full responses across five sessions | Finish or drop a frame write |
 | Pending inputs | 64 per session and 1,024 across sessions | Release a retained input |
 
-The burst witnesses finish writes and release active work, so another account
-cannot explain their rate rejection. The rate tests also check the nanosecond
-immediately before sufficient refill and the first instant that permits retry.
-The active and byte tests refill between admissions to isolate those bounds.
+A completion witness serves 4,096 maximum-size response reservations across five
+sessions without advancing time, draining each frame before admitting the next
+request. Active and byte witnesses retain their owners while time advances to
+show that elapsed time alone cannot release capacity.
 Failed admissions must leave earlier reservations unchanged.
 
 At these defaults the node active limit is lower than the advertised session
@@ -133,19 +129,16 @@ The pending witness starts at retained-input ownership. The peer routine's
 separate backpressure tests cover its one decoded input waiting for those slots.
 
 Settlement examples cover no queued output, an empty terminal, a small block,
-and a maximum block. All initially reserve the worst case; only fixed work and
-transferred payload remain spent after the final query owner drops. Frame bytes
-remain outstanding until their transport owner ends. These sizing examples
+and a maximum block. All initially reserve the worst case; unused capacity returns
+after the final query owner drops. Transferred frame bytes remain outstanding
+until their transport owner ends. These sizing examples
 transfer real charges without allocating bodies; they do not measure sync
 throughput, total memory, or transport delivery.
 
 ## Reading a failure
 
-Start with the first divergent action and its expected/observed snapshot. There
-are three different kinds of account:
+Start with the first divergent action and its expected/observed snapshot. GetBlocks uses two kinds of account:
 
-- Rate tokens refill with time. Fixed work and successfully queued payload stay
-  spent; unused allowance is refunded subject to the burst cap.
 - Outstanding bytes do not refill. They belong to the reservation remainder,
   queued frames, or pending application writes.
 - Slots belong to provisional admission or a shared active ownership group.
@@ -153,8 +146,7 @@ are three different kinds of account:
 
 A cancelled read may still own capacity. A settled request may still have
 writing bytes. Therefore final cleanup must end workers, results, and writes
-too. Rate balances need not return to full, and the bounded idle identity cache
-may remain.
+too. Every pending slot, active slot, and retained response byte must be released.
 
 The generated ownership suite prints a concrete JSON scenario on failure and
 also uses Proptest's seed persistence. The JSON version fixes its fixture and
@@ -191,7 +183,8 @@ Write a short resource contract before its property tests:
 6. State progress assumptions, unsupported scenarios, and costs outside the
    bound.
 
-Reuse the primitive properties and rational rate oracle. Keep message actions
+Reuse the primitive properties, including the rational rate oracle for messages
+that declare a cadence. Keep message actions
 and production adapters near their message policy. Extract further shared
 helpers when a second implementation demonstrates identical behavior; do not
 give future messages a GetBlocks-shaped action interface.

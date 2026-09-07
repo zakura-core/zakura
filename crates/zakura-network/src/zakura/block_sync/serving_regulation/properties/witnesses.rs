@@ -5,10 +5,7 @@ use super::*;
 #[test]
 fn every_admission_bound_blocks_then_recovers() {
     for limit in Limit::ALL {
-        let peer = if matches!(
-            limit,
-            Limit::NodeRate | Limit::NodeActive | Limit::NodeBytes
-        ) {
+        let peer = if matches!(limit, Limit::NodeActive | Limit::NodeBytes) {
             1
         } else {
             0
@@ -26,7 +23,7 @@ fn every_admission_bound_blocks_then_recovers() {
                 Action::Admit { peer, request: 1 },
                 Action::DropLedger { request: 0 },
                 Action::DropQueryLease { request: 0 },
-                Action::Advance { millis: 1001 },
+                Action::Advance { millis: 0 },
                 Action::Admit { peer, request: 1 },
                 Action::DropLedger { request: 1 },
             ],
@@ -161,22 +158,18 @@ proptest! {
         requested in 1u32..=128,
         advertised_count in 1u32..=128,
         body_cap in 2_000_000u32..=33_554_432,
-        overhead in 1u64..=1_000_000,
     ) {
-        let mut config = super::super::ZakuraBlockSyncConfig {
+        let config = super::super::ZakuraBlockSyncConfig {
             max_blocks_per_response: advertised_count,
             max_response_bytes: body_cap,
             ..Default::default()
         };
-        config.get_blocks_regulation.request_overhead_bytes = overhead;
-        config.get_blocks_regulation.peer_rate_capacity_bytes = 64 * 1024 * 1024;
         prop_assert_eq!(config.validate(), Ok(()));
         let count = requested.min(advertised_count);
         let payload = (u64::from(count) * 2_000_000).min(u64::from(body_cap)) + u64::from(count) + 9;
         let actual = super::super::serving_cost(&config, requested).unwrap();
         prop_assert_eq!(actual.count, count);
         prop_assert_eq!(actual.response_cap, payload);
-        prop_assert_eq!(actual.charge, payload + overhead);
         prop_assert!(actual.response_cap >= 2_000_000 + 1 + 9,
             "every accepted configuration reserves room for any first block and its terminal");
     }
@@ -211,35 +204,6 @@ async fn pending_wait_accounts_for_its_partial_session_reservation() {
     drop((admitted, other_input, second_input));
     assert_eq!(regulator.snapshot().node_pending, 0);
     assert_eq!(regulator.snapshot().session_pending, 0);
-}
-
-#[tokio::test(start_paused = true)]
-async fn identity_cache_evicts_inactive_accounts_but_preserves_live_work() {
-    use super::super::GetBlocksServingRegulator;
-    use crate::zakura::ZakuraPeerId;
-
-    let mut config = Limit::PeerActive.config();
-    config.peer_limits.max_inbound_peers = 1;
-    config.peer_limits.max_outbound_peers = 1;
-    let regulator = GetBlocksServingRegulator::new(config);
-    let identity = ZakuraPeerId::new(vec![1; 32]).unwrap();
-    let session = regulator.session(identity.clone(), 0);
-    let held = session.try_admit(1).unwrap().commit();
-    let expected = session.peer_rate_available();
-    drop(session);
-    for id in 2u8..16 {
-        let session = regulator.session(ZakuraPeerId::new(vec![id; 32]).unwrap(), u64::from(id));
-        drop(session.try_admit(1).unwrap().commit());
-        drop(session);
-        assert!(
-            regulator.inner.peer_rates.lock().unwrap().len() <= 3,
-            "the cache holds the live owner and at most two inactive accounts after insertion"
-        );
-    }
-    let replacement = regulator.session(identity, 16);
-    assert_eq!(replacement.peer_rate_available(), expected);
-    drop(held);
-    assert_eq!(regulator.snapshot().node_active, 0);
 }
 
 #[test]

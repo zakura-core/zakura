@@ -1,9 +1,8 @@
 //! Expected ownership, derived from the resource contract rather than production fields.
 
-use std::{collections::VecDeque, time::Duration};
+use std::collections::VecDeque;
 
 use super::scenario::*;
-use crate::zakura::regulation::test_support::RateModel;
 
 #[derive(Clone, Debug)]
 struct Request {
@@ -19,7 +18,6 @@ struct Request {
 
 #[derive(Clone, Debug, Default)]
 struct Session {
-    peer: usize,
     queue: VecDeque<u64>,
     writing: Option<u64>,
 }
@@ -27,8 +25,6 @@ struct Session {
 #[derive(Clone, Debug)]
 pub(super) struct Model {
     limit: Limit,
-    node_rate: RateModel,
-    peer_rates: [RateModel; 2],
     current_sessions: [usize; 2],
     sessions: Vec<Session>,
     requests: [Option<Request>; REQUEST_SLOTS],
@@ -38,31 +34,10 @@ pub(super) struct Model {
 
 impl Model {
     pub(super) fn new(limit: Limit, block_payload_bytes: u64) -> Self {
-        let config = limit.config();
-        let policy = config.get_blocks_regulation;
         Self {
             limit,
-            node_rate: RateModel::new(
-                policy.node_rate_capacity_bytes,
-                policy.node_rate_bytes_per_second,
-            ),
-            peer_rates: std::array::from_fn(|_| {
-                RateModel::new(
-                    policy.peer_rate_capacity_bytes,
-                    policy.peer_rate_bytes_per_second,
-                )
-            }),
             current_sessions: [0, 1],
-            sessions: vec![
-                Session {
-                    peer: 0,
-                    ..Default::default()
-                },
-                Session {
-                    peer: 1,
-                    ..Default::default()
-                },
-            ],
+            sessions: vec![Session::default(), Session::default()],
             requests: std::array::from_fn(|_| None),
             inputs: [None; INPUT_SLOTS],
             block_payload_bytes,
@@ -167,8 +142,6 @@ impl Model {
                 let config = self.limit.config();
                 let policy = config.get_blocks_regulation;
                 let blocked = [
-                    (state.peer_rates[peer] < CHARGE, Limit::PeerRate),
-                    (state.node_rate < CHARGE, Limit::NodeRate),
                     (
                         state.session_active[session]
                             >= usize::try_from(config.max_inflight_requests).unwrap(),
@@ -190,8 +163,6 @@ impl Model {
                 .into_iter()
                 .find_map(|(full, limit)| full.then_some(limit));
                 if blocked.is_none() {
-                    assert!(self.node_rate.reserve(CHARGE));
-                    assert!(self.peer_rates[peer].reserve(CHARGE));
                     self.requests[request] = Some(Request {
                         session,
                         provisional: true,
@@ -273,18 +244,9 @@ impl Model {
                     }
                 }
                 self.current_sessions[peer] = self.sessions.len();
-                self.sessions.push(Session {
-                    peer,
-                    ..Default::default()
-                });
+                self.sessions.push(Session::default());
             }
-            Action::Advance { millis } => {
-                let elapsed = Duration::from_millis(millis);
-                self.node_rate.advance(elapsed);
-                for rate in &mut self.peer_rates {
-                    rate.advance(elapsed);
-                }
-            }
+            Action::Advance { .. } => {}
         }
         self.settle_unowned();
         outcome
@@ -296,21 +258,12 @@ impl Model {
             if request.ledger || request.query_owners > 0 {
                 continue;
             }
-            let refund = if request.provisional {
-                CHARGE
-            } else {
-                RESPONSE_CAP - request.transferred
-            };
-            self.node_rate.refund(refund);
-            self.peer_rates[self.sessions[request.session].peer].refund(refund);
             *state = None;
         }
     }
 
     pub(super) fn snapshot(&self) -> Snapshot {
         let mut state = Snapshot {
-            node_rate: self.node_rate.available(),
-            peer_rates: std::array::from_fn(|peer| self.peer_rates[peer].available()),
             node_bytes: 0,
             session_bytes: vec![0; self.sessions.len()],
             node_active: 0,

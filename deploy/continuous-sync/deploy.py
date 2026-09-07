@@ -246,6 +246,14 @@ controller_service={controller_service}
 node_service={node_service}
 start_controller={start_controller}
 
+# Retire the earlier standalone cleaner before replacing its controller/config.
+if [ -f /etc/systemd/system/zakura-storage.timer ]; then
+  systemctl disable --now zakura-storage.timer
+  systemctl stop zakura-storage.service
+  rm -f /etc/systemd/system/zakura-storage.timer /etc/systemd/system/zakura-storage.service
+fi
+rm -f /usr/local/sbin/zakura_sync_storage.py
+
 install -d -m 755 /usr/local/sbin
 install -d -m 755 "$(dirname "$controller_config")" "$(dirname "$alert_config")" \
   "$(dirname "$config_template")" "$(dirname "$config_path")" "$chain_state_dir" \
@@ -564,6 +572,11 @@ def load_audit_state(path: Path | None) -> dict[str, Any]:
         not isinstance(record, dict)
         or any(type(record.get(key)) is not int or record[key] < 0 for key in ("total", "pending"))
         or any(key not in record for key in ("run_id", "sha", "duration"))
+        or ("details" in record and (
+            not isinstance(record["details"], list)
+            or len(record["details"]) > COMPLETION_DETAIL_LIMIT
+            or any(not isinstance(item, dict) for item in record["details"])
+        ))
         for record in completions.values()
     ):
         data.pop("completions", None)
@@ -669,15 +682,73 @@ def audit_message(
     return "\n\n".join(sections)
 
 
-def completion_updates(
-    statuses: dict[str, dict[str, Any]], previous: dict[str, Any], digest_due: bool
-) -> tuple[list[str], dict[str, Any]]:
-    """Accumulate completed runs until a digest is successfully delivered.
+COMPLETION_DETAIL_LIMIT = 256
 
-    A new cache counts from when the controller enabled digests. Missing hosts
-    retain pending counts; a counter reset counts the new success once.
+
+def sync_label(node: Node) -> str:
+    modes = {
+        "dual": "Dual networking",
+        "zakura": "Zakura networking only",
+        "legacy": "Legacy networking only",
+    }
+    mode = modes.get(node.raw.get("p2p_stack"))
+    return f"{mode} ({node.name})" if mode else node.name
+
+
+def completion_status(data: dict[str, Any] | None) -> str:
+    if data is None:
+        return "status unavailable"
+    controller = data.get("controller_state") or {}
+    if controller.get("failed"):
+        return "halted after failure"
+    phase = controller.get("phase")
+    if phase == "syncing":
+        if data.get("service_active") is False:
+            return "node service inactive"
+        if (data.get("sample") or {}).get("metrics_status", "ok") != "ok":
+            return "sync status unavailable (metrics unavailable)"
+        return "currently syncing"
+    if phase == "complete":
+        return "between runs"
+    return f"current phase: {phase}" if phase else "status unavailable"
+
+
+def completion_details(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Upgrade old audit caches without inventing timings for earlier runs."""
+    if "details" in record:
+        return list(record["details"])
+    if record.get("pending") and record.get("run_id"):
+        return [{"run_id": record["run_id"], "duration": record.get("duration"),
+                 "end_height": record.get("end_height")}]
+    return []
+
+
+def completion_run_text(item: dict[str, Any]) -> str:
+    """Report overall genesis sync throughput only for a confirmed ending height."""
+    duration = item.get("duration")
+    valid_duration = type(duration) is int and duration >= 0
+    timing = (f"{duration // 3600}h {duration % 3600 // 60:02d}m"
+              if valid_duration else "duration unavailable")
+    height = item.get("end_height")
+    if type(height) is not int or not 0 <= height <= 0xFFFFFFFF:
+        return f"{timing} · BPS unavailable"
+    # Every cycle starts from empty chain state; height zero is genesis.
+    blocks = height + 1
+    rate = f"{blocks / duration:.0f} blocks/sec" if valid_duration and duration > 0 else "BPS unavailable"
+    return f"{timing} · {rate}"
+
+
+def completion_updates(
+    statuses: dict[str, dict[str, Any]], previous: dict[str, Any], digest_due: bool,
+    labels: dict[str, str] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    """Accumulate completions until delivery, preserving timings between audits.
+
+    Counters remain authoritative if history is missing or exceeds retention.
+    Missing hosts retain pending completions. Cache migration and counter resets
+    preserve the old counts; unavailable timings are explicitly reported.
     """
-    records = dict(previous.get("completions", {}))
+    records = {name: dict(record) for name, record in previous.get("completions", {}).items()}
     for name, data in statuses.items():
         controller = data.get("controller_state") or {}
         run_id = controller.get("last_success_run")
@@ -689,22 +760,50 @@ def completion_updates(
             continue
         baseline = old.get("total", controller.get("completion_digest_start_runs", total - 1))
         delta = max(1, total - baseline) if type(baseline) is int else 1
+        raw_history = controller.get("completion_history", [])
+        if not isinstance(raw_history, list):
+            raw_history = []
+        history = {
+            item["number"]: item for item in raw_history
+            if isinstance(item, dict) and type(item.get("number")) is int
+            and total - delta < item["number"] <= total and item.get("run_id")
+        }
+        # Old controllers still provide the latest timing during a staged rollout.
+        history[total] = {
+            "run_id": run_id, "duration": controller.get("last_success_duration_seconds"),
+            "end_height": controller.get("last_success_end_height"),
+        }
+        details = completion_details(old) + [history[number] for number in sorted(history)]
         records[name] = {
+            "label": (labels or {}).get(name, old.get("label", name)),
             "run_id": run_id, "total": total,
-            "pending": old.get("pending", 0) + delta,
             "sha": controller.get("last_success_sha", "unknown"),
             "duration": controller.get("last_success_duration_seconds"),
+            "end_height": controller.get("last_success_end_height"),
+            "pending": old.get("pending", 0) + delta,
+            "details": details[-COMPLETION_DETAIL_LIMIT:],
         }
     lines = []
     if digest_due:
-        for name, record in sorted(records.items()):
-            if record.get("pending", 0):
-                lines.append(
-                    f"{name}: {record['pending']} completed run(s); "
-                    f"latest={record['run_id']} | sha={record['sha']} | "
-                    f"sync time={record['duration']}s"
-                )
-                records[name] = {**record, "pending": 0}
+        configured = set(labels) if labels is not None else set(statuses)
+        records = {name: record for name, record in records.items()
+                   if name in configured or record.get("pending", 0)}
+        for name in sorted(set(records) | configured):
+            record = records.get(name, {})
+            pending = record.get("pending", 0)
+            details = completion_details(record)
+            label = (labels or {}).get(name, record.get("label", name))
+            section = [f"*{label} · {pending} completed*"]
+            section.extend(f"• {completion_run_text(item)}" for item in details)
+            missing = pending - len(details)
+            if missing:
+                section.append(f"• {missing} earlier run(s): details unavailable")
+            section.append(completion_status(statuses.get(name)))
+            lines.append("\n".join(section))
+            if name not in configured:
+                records.pop(name, None)
+            elif name in records:
+                records[name] = {**record, "label": label, "pending": 0, "details": []}
     return lines, records
 
 
@@ -744,12 +843,16 @@ def cmd_audit(args: argparse.Namespace) -> int:
         destination=destination,
     )
     state["problems"].update({k: v for k, v in prior_problems.items() if k not in selected})
-    completion_lines, state["completions"] = completion_updates(statuses, previous, digest_due)
+    completion_lines, state["completions"] = completion_updates(
+        statuses, previous, digest_due, {node.name: sync_label(node) for node in nodes}
+    )
     state["last_digest_at"] = timestamp if digest_due else last_digest
     text = audit_message(new_lines, reminder_lines, recovered_lines)
     if completion_lines:
         text += ("\n\n" if text else "") + (
-            ":memo: Zakura continuous sync digest — completions\n" + "\n".join(completion_lines)
+            ":memo: Mainnet sync summary — since previous digest\n\n"
+            + "\n\n".join(completion_lines)
+            + "\n\nRuns listed oldest first. Each run starts from genesis."
         )
 
     posted = True

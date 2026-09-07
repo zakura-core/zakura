@@ -10,6 +10,7 @@ Only the Python stdlib is used.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -22,11 +23,15 @@ import datetime
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 DOWN_HEALTH = {"down", "rpc_error"}
 STATE_VERSION = 1
+PROPAGATION_GRACE_SECONDS = 120
+MAX_DECISION_HISTORY = 16
+MAX_DECISION_ROWS = 64
+BATCH_SEPARATOR = "\n\n---\n\n"
 MAX_SHARED_DIAGNOSTIC_ROWS = 8
 MAX_NODE_DETAIL_CHARS = 512
 MAX_ALERT_NAME_CHARS = 128
@@ -665,7 +670,14 @@ def update_alert_state(
     args: argparse.Namespace,
     height: float | None = None,
     log_suppressed: bool = True,
+    notify: Callable[[str, argparse.Namespace], bool] | None = None,
 ) -> None:
+    """Advance an incident only when its notifier accepts the transition.
+
+    A planning notifier may accept into prospective state; the caller must then
+    checkpoint and deliver that plan before committing the incident state.
+    """
+    notify = notify or post_slack
     entry = state_bucket.get(key, {"condition": "ok", "alerting": False})
     was_alerting = bool(entry.get("alerting"))
 
@@ -684,7 +696,7 @@ def update_alert_state(
                         entry["event_height"] = height
                 state_bucket[key] = entry
                 return
-            if post_slack(recovery_text, args):
+            if notify(recovery_text, args):
                 state_bucket[key] = {"condition": "ok", "alerting": False}
             return
 
@@ -721,7 +733,7 @@ def update_alert_state(
         if suppressed:
             if log_suppressed:
                 print(f"suppressed alert for {key}: {condition} for {format_duration(age)}")
-        elif post_slack(alert_text, args):
+        elif notify(alert_text, args):
             next_entry["alerting"] = True
             next_entry["last_alert_at"] = now
             if condition == "stalled" and height is not None:
@@ -994,13 +1006,112 @@ def release_state_recovery_text(target: ReleaseState, previous: dict[str, Any]) 
     )
 
 
+def batch_messages(messages: list[str], now: float) -> list[str]:
+    """Pack transitions without dropping incident summaries or exceeding Slack's cap."""
+    if not messages:
+        return []
+    observed_at = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+    prefix = f"*Fleet status updates* — observed {observed_at}\n\n"
+    # Keep detailed diagnostics for a single incident; a batch shows the essential
+    # lines for every event and links to the dashboard for the full node details.
+    events = []
+    for message in messages:
+        if len(messages) == 1:
+            events.append(message)
+            continue
+        lines = message.splitlines()
+        summary = lines[:SLACK_ESSENTIAL_PREFIX_LINES]
+        link = next(
+            (line for line in reversed(lines) if line.startswith(("dashboard:", "endpoint:"))),
+            "",
+        )
+        if link and link not in summary:
+            summary.append(link)
+        events.append("\n".join(summary))
+    chunks: list[str] = []
+    chunk = prefix
+    for event in events:
+        event = bounded_slack_message(event)
+        # An individual legacy message may already fill the limit. Keep it intact
+        # as a separate payload rather than cutting off another incident.
+        if len(prefix) + len(event) > MAX_SLACK_MESSAGE_CHARS:
+            if chunk != prefix:
+                chunks.append(chunk)
+                chunk = prefix
+            chunks.append(event)
+            continue
+        separator = BATCH_SEPARATOR if chunk != prefix else ""
+        if len(chunk) + len(separator) + len(event) > MAX_SLACK_MESSAGE_CHARS:
+            chunks.append(chunk)
+            chunk = prefix
+            separator = ""
+        chunk += separator + event
+    if chunk != prefix:
+        chunks.append(chunk)
+    return chunks
+
+
+def record_decision(
+    state: dict[str, Any], fleet: Fleet, rows: list[dict[str, Any]],
+    common: SharedTip | None, grace: set[str], now: float,
+) -> None:
+    """Retain bounded, credential-free evidence when grouping or grace changes."""
+    observed = [row for row in rows if tip_is_observable(row)]
+    if any(not tip_is_verifiable(row) for row in observed):
+        reason = "incomplete tip evidence"
+    elif len(observed) < 2:
+        reason = "fewer than two observable nodes"
+    elif common is not None:
+        reason = "shared highest tip"
+    else:
+        highest = max(coerce_height(row["height"]) for row in observed)
+        tips = [row for row in observed if coerce_height(row["height"]) == highest]
+        reason = (
+            "conflicting highest hashes"
+            if len({validated_block_hash(row["block_hash"]) for row in tips}) > 1
+            else "no strict majority at highest tip"
+        )
+    decision = {
+        "reason": reason,
+        "shared_nodes": [
+            bounded_text(name, MAX_ALERT_NAME_CHARS)
+            for name in common.node_names[:MAX_DECISION_ROWS]
+        ] if common else [],
+        "grace_nodes": [
+            bounded_text(name, MAX_ALERT_NAME_CHARS)
+            for name in sorted(grace)[:MAX_DECISION_ROWS]
+        ],
+        "tips": [
+            [coerce_height(row.get("height")), validated_block_hash(row.get("block_hash"))]
+            for row in rows[:MAX_DECISION_ROWS]
+        ],
+    }
+    history = state.setdefault("decisions", {}).setdefault(fleet.name, [])
+    if history and history[-1]["decision"] == decision:
+        return
+    history.append({
+        "at": now, "decision": decision, "total_rows": len(rows),
+        "rows": [{
+            "name": bounded_text(row.get("name"), MAX_ALERT_NAME_CHARS),
+            "health": bounded_text(row.get("health"), MAX_ALERT_STATUS_CHARS),
+            "height": coerce_height(row.get("height")),
+            "block_hash": validated_block_hash(row.get("block_hash")),
+            "seconds_since_advanced": coerce_float(row.get("seconds_since_advanced")),
+        } for row in rows[:MAX_DECISION_ROWS]],
+    })
+    del history[:-MAX_DECISION_HISTORY]
+
+
 class Watchdog:
     def __init__(
         self,
         fleets: list[Fleet],
         args: argparse.Namespace,
         release_state: list[ReleaseState] | None = None,
+        checkpoint: Callable[[dict[str, Any]], None] | None = None,
     ):
+        self.notify = lambda text, args: post_slack(text, args)
+        self.checkpoint = checkpoint or (lambda state: None)
         self.fleets = fleets
         self.release_state = release_state or []
         self.args = args
@@ -1013,75 +1124,267 @@ class Watchdog:
         suppressed = suppressed_until is not None and suppressed_until > now
 
         for fleet in self.fleets:
+            pending = state.setdefault("pending_delivery", {})
+            candidate = (
+                copy.deepcopy(pending[fleet.name]["state"])
+                if fleet.name in pending else self.fleet_state(state, fleet)
+            )
+            messages: list[str] = []
+            self.notify = lambda text, _args: (messages.append(text), True)[1]
             try:
-                snapshot = fetch_json(fleet.url, self.args.request_timeout)
-                node_rows = validated_fleet_rows(snapshot)
-                last_poll = snapshot_last_poll(snapshot)
-            except Exception as error:
-                self.handle_fleet_error(state, fleet, error, now, suppressed)
-                continue
-
-            if (
-                last_poll is not None
-                and now - last_poll >= self.args.dashboard_down_after
-            ):
-                age = now - last_poll
-                error = ValueError(
-                    "dashboard snapshot is stale: last poll was "
-                    f"{format_duration(age)} ago"
-                )
-                self.handle_fleet_error(
-                    state,
-                    fleet,
-                    error,
-                    now,
-                    suppressed,
-                    bad_since=last_poll,
-                )
-                continue
-
-            if not self.handle_fleet_recovered(state, fleet, now):
-                continue
-            grace_since = max(
-                self.started_at, self.fetch_recovered_at.get(fleet.name, 0)
-            )
-            observations = classify_node_observations(
-                node_rows, now, grace_since, self.args
-            )
-            common_stall = shared_stall_candidate(node_rows, now)
-            if not self.reconcile_obsolete_node_alerts(
-                state, fleet, observations
-            ):
-                continue
-            if not self.reconcile_duplicate_owners(
-                state, fleet, observations, common_stall
-            ):
-                continue
-            reconciled, shared_nodes = self.reconcile_shared_stall(
-                state,
-                fleet,
-                node_rows,
-                observations,
-                common_stall,
-                now,
-                suppressed,
-            )
-            if not reconciled:
-                continue
-
-            for observation in observations:
-                self.handle_node_observation(
-                    state,
-                    fleet,
-                    observation,
-                    now,
-                    suppressed,
-                    observation.condition == "stalled"
-                    and observation.name in shared_nodes,
-                )
+                self.observe_fleet(candidate, fleet, now, suppressed)
+            finally:
+                self.notify = lambda text, args: post_slack(text, args)
+            if messages or fleet.name in pending:
+                delivery = pending.setdefault(fleet.name, {"messages": [], "state": {}})
+                delivery["messages"].extend(batch_messages(messages, now))
+                delivery["state"] = candidate
+                if not suppressed:
+                    self.deliver_batch(state, fleet)
+            else:
+                self.commit_fleet_state(state, fleet, candidate)
 
         for target in self.release_state:
             self.handle_release_state(state, target, now, suppressed)
+
+    @staticmethod
+    def fleet_state(state: dict[str, Any], fleet: Fleet) -> dict[str, Any]:
+        """Copy only this fleet's state so delivery cannot overwrite another fleet."""
+        result = {}
+        for bucket in ("nodes", "fleets", "shared_stalls", "propagation", "decisions"):
+            entries = state.get(bucket, {})
+            result[bucket] = copy.deepcopy({
+                key: value for key, value in entries.items()
+                if (key.startswith(f"{fleet.name}/") if bucket == "nodes" else key == fleet.name)
+            })
+        return result
+
+    @staticmethod
+    def commit_fleet_state(
+        state: dict[str, Any], fleet: Fleet, candidate: dict[str, Any]
+    ) -> None:
+        for bucket, entries in candidate.items():
+            target = state.setdefault(bucket, {})
+            for key in list(target):
+                if (key.startswith(f"{fleet.name}/") if bucket == "nodes" else key == fleet.name):
+                    del target[key]
+            target.update(entries)
+
+    def deliver_batch(self, state: dict[str, Any], fleet: Fleet) -> None:
+        """Send at most one payload per fleet per poll; commit after all chunks succeed.
+
+        Checkpoint the pending payload before sending, then checkpoint each
+        acknowledgement. A crash after Slack accepts a message but
+        before that checkpoint can still repeat it (webhooks have no receipt ID).
+        """
+        pending = state["pending_delivery"][fleet.name]
+        self.checkpoint(state)
+        if not post_slack(pending["messages"][0], self.args):
+            return
+        pending["messages"].pop(0)
+        if not pending["messages"]:
+            self.commit_fleet_state(state, fleet, pending["state"])
+            del state["pending_delivery"][fleet.name]
+        self.checkpoint(state)
+
+    def observe_fleet(
+        self, state: dict[str, Any], fleet: Fleet, now: float, suppressed: bool
+    ) -> None:
+        try:
+            snapshot = fetch_json(fleet.url, self.args.request_timeout)
+            node_rows = validated_fleet_rows(snapshot)
+            last_poll = snapshot_last_poll(snapshot)
+        except Exception as error:
+            self.handle_fleet_error(state, fleet, error, now, suppressed)
+            return
+
+        if (
+            last_poll is not None
+            and now - last_poll >= self.args.dashboard_down_after
+        ):
+            age = now - last_poll
+            error = ValueError(
+                "dashboard snapshot is stale: last poll was "
+                f"{format_duration(age)} ago"
+            )
+            self.handle_fleet_error(
+                state,
+                fleet,
+                error,
+                now,
+                suppressed,
+                bad_since=last_poll,
+            )
+            return
+
+        if not self.handle_fleet_recovered(state, fleet, now):
+            return
+        grace_since = max(
+            self.started_at, self.fetch_recovered_at.get(fleet.name, 0)
+        )
+        observations = classify_node_observations(
+            node_rows, now, grace_since, self.args
+        )
+        common_stall = shared_stall_candidate(node_rows, now)
+        propagation_nodes = self.propagation_grace(state, fleet, node_rows, now)
+        record_decision(state, fleet, node_rows, common_stall, propagation_nodes, now)
+        if not self.reconcile_obsolete_node_alerts(
+            state, fleet, observations
+        ):
+            return
+        if not self.reconcile_duplicate_owners(
+            state, fleet, observations, common_stall
+        ):
+            return
+        reconciled, shared_nodes = self.reconcile_shared_stall(
+            state,
+            fleet,
+            node_rows,
+            observations,
+            common_stall,
+            now,
+            suppressed,
+        )
+        if not reconciled:
+            return
+
+        for observation in observations:
+            self.handle_node_observation(
+                state,
+                fleet,
+                observation,
+                now,
+                suppressed,
+                observation.condition == "stalled"
+                and observation.name in (shared_nodes | propagation_nodes),
+            )
+
+    def propagation_grace(
+        self, state: dict[str, Any], fleet: Fleet, rows: list[dict[str, Any]], now: float
+    ) -> set[str]:
+        """Briefly protect unchanged former tip followers during proven tip extension.
+
+        Each timer stays anchored to the first observed extension, even across
+        polls, further blocks, and restarts. Existing alerts are never suppressed.
+        Missing height/hash/timer or conflicting ancestry cancels the grace.
+        An unsampled ancestry depth alone does not cancel a previously proven
+        reference; it can only use the remainder of the original deadline.
+        """
+        bucket = state.setdefault("propagation", {})
+        pending = bucket.setdefault(fleet.name, {})
+        observable = [row for row in rows if tip_is_observable(row)]
+        hashes: dict[int, set[str]] = {}
+        for row in observable:
+            if not tip_is_verifiable(row):
+                pending.clear()
+                return set()
+            hashes.setdefault(coerce_height(row["height"]), set()).add(
+                validated_block_hash(row["block_hash"])
+            )
+        if any(len(values) != 1 for values in hashes.values()):
+            pending.clear()
+            return set()
+
+        previous = state.get("shared_stalls", {}).get(fleet.name, {})
+        height, block_hash = self.shared_event_identity(previous)
+        last_seen = coerce_float(previous.get("last_seen"))
+        recent_shared = (
+            previous.get("condition") == "stalled"
+            and previous.get("owner") == "shared"
+            and last_seen is not None
+            and 0 <= now - last_seen <= PROPAGATION_GRACE_SECONDS
+            and height is not None and bool(block_hash)
+        )
+
+        def ancestor_at(row: dict[str, Any], ancestor_height: int) -> str | None:
+            distance = coerce_height(row["height"]) - ancestor_height
+            if distance == 0:
+                return validated_block_hash(row["block_hash"])
+            ancestors = row.get("ancestor_hashes")
+            value = ancestors.get(str(distance)) if isinstance(ancestors, dict) else None
+            if distance == 1:
+                value = row.get("previous_hash") or value
+            # Distinguish an unsampled depth from a malformed/conflicting hash.
+            return None if value is None else validated_block_hash(value) or ""
+
+        def extension_references(
+            anchor_height: int, anchor_hash: str, known: dict[str, Any]
+        ) -> dict[str, Any] | None:
+            higher_rows = [
+                row for row in observable
+                if coerce_height(row["height"]) > anchor_height
+            ]
+            if not higher_rows:
+                return None
+            confirmed = {}
+            for row in higher_rows:
+                name = row["name"]
+                direct = ancestor_at(row, anchor_height)
+                if direct is not None and direct != anchor_hash:
+                    return None
+                reference = known.get(name)
+                linked = False
+                if reference:
+                    if coerce_height(row["height"]) < reference["height"]:
+                        return None
+                    ancestor = ancestor_at(row, reference["height"])
+                    if ancestor is not None and ancestor != reference["hash"]:
+                        return None
+                    linked = ancestor == reference["hash"]
+                if direct == anchor_hash or linked:
+                    confirmed[name] = {
+                        "height": coerce_height(row["height"]),
+                        "hash": validated_block_hash(row["block_hash"]),
+                    }
+                elif reference:
+                    # Missing a sampled depth does not revoke an established,
+                    # bounded grace. Retain only the last positively linked tip;
+                    # an unproven newer tip must not become an ancestry witness.
+                    confirmed[name] = reference
+                else:
+                    return None
+            return confirmed
+
+        references = extension_references(height, block_hash, {}) if recent_shared else None
+        for name in list(pending):
+            entry = pending[name]
+            updated = extension_references(
+                entry["height"], entry["hash"], entry.get("references", {})
+            )
+            if updated is None:
+                del pending[name]
+            else:
+                entry["references"] = updated
+
+        current = {str(row["name"]): row for row in observable}
+        for name in list(pending):
+            entry = pending[name]
+            row = current.get(name)
+            if (
+                row is None
+                or coerce_height(row["height"]) != entry["height"]
+                or validated_block_hash(row["block_hash"]) != entry["hash"]
+            ):
+                del pending[name]
+        if references is not None:
+            for name in previous.get("node_names", []):
+                row = current.get(name)
+                old_alert = state.get("nodes", {}).get(f"{fleet.name}/{name}", {})
+                if (
+                    row and not old_alert.get("alerting")
+                    and coerce_height(row["height"]) == height
+                    and validated_block_hash(row["block_hash"]) == block_hash
+                ):
+                    pending.setdefault(
+                        name, {
+                            "height": height, "hash": block_hash, "since": now,
+                            "references": references,
+                        }
+                    )
+        return {
+            name for name, entry in pending.items()
+            if 0 <= now - entry["since"] < PROPAGATION_GRACE_SECONDS
+        }
 
     def handle_release_state(
         self,
@@ -1129,6 +1432,7 @@ class Watchdog:
             now,
             suppressed,
             self.args,
+            notify=self.notify,
         )
         bucket.setdefault(key, {})["height"] = height
 
@@ -1162,6 +1466,7 @@ class Watchdog:
             now,
             suppressed,
             self.args,
+            notify=self.notify,
         )
 
     def handle_fleet_recovered(
@@ -1187,6 +1492,7 @@ class Watchdog:
             now,
             False,
             self.args,
+            notify=self.notify,
         )
         return not (
             previous.get("alerting")
@@ -1230,7 +1536,7 @@ class Watchdog:
                 continue
             if self.node_alert_matches_observation(previous, observation):
                 continue
-            if not post_slack(
+            if not self.notify(
                 node_recovery_text(fleet, observation.row, previous), self.args
             ):
                 return False
@@ -1313,7 +1619,7 @@ class Watchdog:
                 shared_hash,
             )
             if node_owners:
-                if not post_slack(
+                if not self.notify(
                     shared_stall_recovery_text(
                         fleet,
                         shared_height,
@@ -1349,7 +1655,7 @@ class Watchdog:
                 owner.name,
                 common_stall.height,
             )
-            if not post_slack(text, self.args):
+            if not self.notify(text, self.args):
                 return False
             bucket[f"{fleet.name}/{duplicate.name}"] = {
                 "condition": "ok",
@@ -1396,7 +1702,7 @@ class Watchdog:
                 and common_stall.height > previous_height
                 else "shared tip changed"
             )
-            if previous.get("alerting") and not post_slack(
+            if previous.get("alerting") and not self.notify(
                 shared_stall_recovery_text(
                     fleet, common_stall.height, recovery_detail
                 ),
@@ -1475,7 +1781,7 @@ class Watchdog:
                     age,
                     participant_rows,
                 )
-                if post_slack(alert_text, self.args):
+                if self.notify(alert_text, self.args):
                     next_entry["alerting"] = True
                     next_entry["last_alert_at"] = now
                     next_entry["alert_height"] = common_stall.height
@@ -1520,7 +1826,7 @@ class Watchdog:
             }
             return True, owned_nodes
 
-        if not post_slack(
+        if not self.notify(
             shared_stall_recovery_text(fleet, current_height, detail), self.args
         ):
             return False, set()
@@ -1580,6 +1886,7 @@ class Watchdog:
             self.args,
             observation.height,
             log_suppressed=not coalesced,
+            notify=self.notify,
         )
         if observation.condition == "stalled":
             entry = bucket.get(key, {})
@@ -1655,7 +1962,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     fleets = load_fleets(args.config)
-    watchdog = Watchdog(fleets, args, load_release_state(args.config))
+    watchdog = Watchdog(
+        fleets, args, load_release_state(args.config),
+        checkpoint=lambda state: save_state(args.state_file, state),
+    )
 
     while True:
         state = load_state(args.state_file)

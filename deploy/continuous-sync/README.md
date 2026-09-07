@@ -20,17 +20,16 @@ v2 stack.
 `zakura-continuous-sync.service` runs
 `/usr/local/sbin/zakura-continuous-sync.py` on each host:
 
-1. Fetch `origin/main` in `/root/zakura` and pin the full commit SHA.
+1. Stop the node, prune old artifacts, check disk space, then fetch `origin/main` in `/root/zakura` and pin the full commit SHA.
 2. Build `zakurad` from a detached worktree and cache the binary by SHA.
 3. Atomically install the binary at `/usr/local/bin/zakurad`.
 4. Stop `zakura.service`.
 5. Verify `/var/lib/zakura/.continuous-sync-wipe-ok` exists.
 6. Delete only the configured disposable state entries:
    `/var/lib/zakura/state` and `/var/lib/zakura/non_finalized_state`.
-7. Preserve `/var/lib/zakura/network`, controller state, logs, traces, and build
-   cache.
-8. Render `/etc/zakura/zebrad.toml` with the node's assigned `p2p_stack` and a
-   run-specific trace directory.
+7. Preserve `/var/lib/zakura/network` and controller state.
+8. Render `/etc/zakura/zebrad.toml` with the node's assigned `p2p_stack`.
+   Detailed JSONL traces are enabled for every sync.
 9. Start `zakura.service` with `Restart=no`.
 10. Poll metrics and `/ready` until the node is stably near tip.
 11. Stop the node, record the completion for the daily audit digest, and start
@@ -41,8 +40,9 @@ continuous sync canary, not a once-per-SHA CI job.
 
 ## Failure Semantics
 
-Any build, install, cleanup, startup, sync, stall, timeout, disk, metrics, or
-readiness failure halts the affected node:
+Build, install, cleanup, startup, sync, stall, timeout, metrics, and readiness
+failures halt the affected node. Disk pressure follows the automatic recovery
+policy below. Other failures behave as follows:
 
 - `zakura-continuous-sync.service` exits non-zero.
 - `/var/lib/zakura-continuous-sync/state.json` records `failed = true`.
@@ -50,8 +50,7 @@ readiness failure halts the affected node:
 - a Slack alert is posted with the node mode, SHA, height, SSH target, log path,
   trace path, and monitor log path.
 
-The controller does not automatically retry after failure. Resume is an explicit
-operator action:
+For failures other than disk pressure, resume is an explicit operator action:
 
 ```bash
 python3 deploy/continuous-sync/deploy.py --node temp-zakura-sync-test-2 resume
@@ -157,7 +156,49 @@ cadence. New failures and recoveries do not wait for the digest. Completion coun
 include runs since the controller enabled digest reporting, then since the last
 successful digest. An unchanged failure appears only in a digest at least 24 hours
 after its last alert or reminder; a recent alert waits for a later digest.
-Per-run logs and artifacts remain available on each host.
+The summary names each networking mode (dual, Zakura only, or legacy only),
+keeps the host ID for troubleshooting, and includes hosts with zero completions.
+It shows one row per completed run, with duration and average blocks
+per second (BPS), oldest first, plus the currently observed controller phase.
+Sync duration excludes the build and state cleanup; it includes startup, readiness
+confirmation, shutdown, and log archiving. Failures still alert immediately.
+
+Each cycle starts with empty chain state. The BPS calculation uses the confirmed height
+from the final readiness sample plus one for genesis, using the committed-block
+height gauge. The block count is retained for calculation but omitted from Slack. Average BPS
+divides that count by the full, unrounded duration in
+seconds. This is overall sync throughput, not instantaneous verifier speed;
+blocks differ in cost and the node may process more blocks during shutdown.
+An estimated tip or an earlier progress sample cannot supply the count. Missing
+heights and zero or missing durations produce an unavailable rate.
+
+For example, a digest can show these illustrative per-run results:
+
+```text
+Dual networking · 1 completed
+• 6h 40m · 145 blocks/sec
+
+Zakura networking only · 3 completed
+• 7h 10m · 134 blocks/sec
+• 7h 00m · 138 blocks/sec
+• 7h 20m · 131 blocks/sec
+
+Legacy networking only · 1 completed
+• 8h 00m · 120 blocks/sec
+```
+
+The Slack summary also retains host IDs and current status for troubleshooting.
+
+Controllers retain the latest 256 completion durations and ending heights in their
+state, independently of run-log cleanup. Audits accumulate up to 256 per-run
+records per host until delivery.
+Older controllers and existing audit caches still contribute their completion
+counts and latest timing, with BPS unavailable for old records.
+Missing records, including those beyond retention, are explicitly marked unavailable.
+Malformed optional controller history is discarded without failing a successful
+sync; completion counters remain authoritative. Retired hosts leave the summary
+after any pending completions have been delivered. Per-run logs and artifacts remain available
+on each host.
 A lost audit cache may repeat already summarized completions or alerts.
 
 Alert state is carried between workflow runs in the Actions cache. A failed Slack
@@ -238,8 +279,8 @@ a cycle complete. `/ready` checks that the node has live peers, is near the
 estimated network tip, and has a fresh tip. The controller also records
 Prometheus samples in `samples.jsonl` so a completed or failed run has evidence
 for height movement, readiness, legacy pipeline depth, and each active download
-or verification phase. The controller copies the current node log into the run
-directory on both completion and failure.
+or verification phase. Node logs are written directly into the run directory,
+so a failure keeps both the current log and its preceding rotated segment.
 
 The relevant loopback endpoints are only bound locally:
 
@@ -249,15 +290,52 @@ The relevant loopback endpoints are only bound locally:
 
 ## Retention
 
-Detailed run artifacts live under `/var/log/zakura/runs/`. The controller keeps
-the active run and the two newest prior runs (`retention_runs = 3`), deleting
-older completed or failed run directories when each cycle starts.
+Detailed traces stay enabled so a failure can be investigated without reproducing
+it. The controller keeps up to 10 runs within a 20 GiB retention target, deleting
+successful runs first, oldest first. The current run and the most recent failed
+run are protected, including their traces, metadata, samples, and log tail.
+Protected runs may exceed the target; cleanup never discards them to meet it.
 
-`templates/logrotate` also rotates `/var/log/zakura/zebrad.log` and
-`/var/log/zakura/monitor.log` daily, keeping five compressed rotations.
+During sync, the controller checks trace files with logrotate every polling
+interval (normally 30 seconds). Each stream rotates at 128 MiB and keeps two older
+segments beside the current file. Files can exceed that size between checks.
+This preserves recent detailed history, not necessarily the entire sync.
+`copytruncate` keeps the existing append-only writer working without a restart;
+a small number of records can be lost at the copy/truncate boundary. Only the
+controller rotates traces, so retention cannot race a separate trace cleaner.
 
-The controller checks disk free space before and during sync. If free space falls
-below `min_free_bytes`, it halts and alerts instead of filling the host.
+For example, read `block_sync.jsonl.2`, then `.1`, then `block_sync.jsonl` for
+chronological history. To use tools that expect one file, concatenate those
+segments into a separate analysis directory. The stopped failure's files remain
+unchanged until a newer failure replaces its protected status.
+
+The controller also retains two cached binaries and removes interrupted
+controller build worktrees and temporary binary copies. The cache is reserved
+for controller builds. Unknown names and symlinked child directories are left
+alone; the runs directory itself may point to another volume.
+
+The controller also rotates each run's node log at 64 MiB, keeping the current
+file and one prior segment. `/var/log/zakura/zebrad.log` points to the current
+run's log. The minute monitor retains seven rotations of its own log and handles
+legacy node logs until they are replaced by this symlink.
+
+Cleanup runs before the initial disk check. During sync the controller checks
+the state, run, and build-cache filesystems. Below 10 GiB free it stops the node,
+records and alerts on the failed attempt, and prunes unprotected history. Recovery
+resets the stopped, disposable chain database before checking for 15 GiB free on
+all three filesystems. It then starts a fresh sync and sends a recovery alert
+identifying the failed attempt once the new node service is active. Failed
+delivery remains pending across controller restarts and retries during sync
+polling; a new sync failure supersedes that pending recovery.
+Until then it stays failed and rechecks once a minute. If protected evidence or
+unrelated files occupy the remaining space, it waits rather than deleting them.
+Other sync failures remain halted for investigation.
+
+Artifact cleanup preserves chain state. Disk recovery and fresh attempts use the
+existing sentinel-protected reset of disposable chain state, preserving network
+identity and the failed run's diagnostics. Stopping the
+controller also stops automatic recovery. Deployment removes the earlier
+standalone storage timer; `--no-start` does not start the controller.
 
 ## Replacement Node Bootstrap
 
@@ -274,7 +352,7 @@ For a fresh Ubuntu x86_64 host:
    apt-get update
    apt-get install -y \
      build-essential clang cmake git libclang-dev pkg-config \
-     protobuf-compiler python3
+     protobuf-compiler python3 logrotate
    ```
 
 5. Install the Rust toolchain specified by `rust-toolchain.toml`.

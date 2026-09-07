@@ -12,8 +12,7 @@ use std::sync::Weak;
 
 use super::{config::*, wire::MAX_BS_BLOCKS_PER_REQUEST, *};
 use crate::zakura::regulation::{
-    CommittedRateReservation, FrameLease, OutstandingByteBudget, OutstandingByteReservation,
-    RateBudget, RateReservation, SlotBudget, SlotPermit,
+    FrameLease, OutstandingByteBudget, OutstandingByteReservation, SlotBudget, SlotPermit,
 };
 
 /// The bounded work declaration for one decoded request.
@@ -23,8 +22,6 @@ pub(super) struct GetBlocksServingCost {
     pub(super) count: u32,
     /// Worst-case encoded response payload owned until settlement or transport handoff.
     pub(super) response_cap: u64,
-    /// Response capacity plus fixed byte-equivalent request work.
-    pub(super) charge: u64,
 }
 
 /// Compute the worst-case work a valid request can cause using checked arithmetic.
@@ -41,14 +38,9 @@ pub(super) fn serving_cost(
         .checked_add(u64::from(count))
         .and_then(|bytes| bytes.checked_add(bounded_block_bytes))
         .ok_or("GetBlocks response-cap addition overflowed")?;
-    let charge = response_cap
-        .checked_add(config.get_blocks_regulation.request_overhead_bytes)
-        .ok_or("GetBlocks serving charge overflowed")?;
-
     Ok(GetBlocksServingCost {
         count,
         response_cap,
-        charge,
     })
 }
 
@@ -58,15 +50,6 @@ pub(super) fn validate_config(config: &ZakuraBlockSyncConfig) -> Result<(), &'st
         return Err("max_response_bytes must cover one maximum-size block");
     }
     let regulation = &config.get_blocks_regulation;
-    if regulation.request_overhead_bytes == 0 {
-        return Err("get_blocks_regulation.request_overhead_bytes must be greater than zero");
-    }
-    if regulation.peer_rate_bytes_per_second == 0 {
-        return Err("get_blocks_regulation.peer_rate_bytes_per_second must be greater than zero");
-    }
-    if regulation.node_rate_bytes_per_second == 0 {
-        return Err("get_blocks_regulation.node_rate_bytes_per_second must be greater than zero");
-    }
     if regulation.node_active_requests == 0 {
         return Err("get_blocks_regulation.node_active_requests must be greater than zero");
     }
@@ -94,16 +77,6 @@ pub(super) fn validate_config(config: &ZakuraBlockSyncConfig) -> Result<(), &'st
     }
 
     let largest = serving_cost(config, MAX_BS_BLOCKS_PER_REQUEST)?;
-    if regulation.peer_rate_capacity_bytes < largest.charge {
-        return Err(
-            "get_blocks_regulation.peer_rate_capacity_bytes must cover the largest legal request",
-        );
-    }
-    if regulation.node_rate_capacity_bytes < largest.charge {
-        return Err(
-            "get_blocks_regulation.node_rate_capacity_bytes must cover the largest legal request",
-        );
-    }
     if regulation.peer_outstanding_bytes < largest.response_cap {
         return Err(
             "get_blocks_regulation.peer_outstanding_bytes must cover the largest legal response",
@@ -132,20 +105,12 @@ pub(super) struct GetBlocksServingRegulator {
 #[derive(Debug)]
 struct RegulatorInner {
     config: ZakuraBlockSyncConfig,
-    node_rate: RateBudget,
     node_outstanding: OutstandingByteBudget,
     node_active: SlotBudget,
     node_pending: SlotBudget,
     session_pending_capacity: usize,
-    peer_rates: StdMutex<HashMap<ZakuraPeerId, Arc<PeerRateAccount>>>,
-    inactive_peer_limit: usize,
     #[cfg(test)]
     sessions: StdMutex<Vec<Weak<SessionResources>>>,
-}
-
-#[derive(Debug)]
-struct PeerRateAccount {
-    budget: RateBudget,
 }
 
 #[derive(Debug)]
@@ -158,21 +123,11 @@ struct SessionResources {
 impl GetBlocksServingRegulator {
     /// Create the GetBlocks node policy from validated block-sync configuration.
     pub(super) fn new(config: ZakuraBlockSyncConfig) -> Self {
-        let inactive_peer_limit = config
-            .peer_limits
-            .max_inbound_peers
-            .saturating_add(config.peer_limits.max_outbound_peers)
-            .max(1);
         debug_assert!(validate_config(&config).is_ok());
         let regulation = &config.get_blocks_regulation;
         let session_pending_capacity = pending_input_capacity_per_session(&config);
         Self {
             inner: Arc::new(RegulatorInner {
-                node_rate: RateBudget::new(
-                    regulation.node_rate_capacity_bytes,
-                    regulation.node_rate_bytes_per_second,
-                )
-                .expect("GetBlocks configuration validates the node rate budget"),
                 node_outstanding: OutstandingByteBudget::new(regulation.node_outstanding_bytes),
                 node_active: SlotBudget::new(regulation.node_active_requests)
                     .expect("GetBlocks configuration validates the active-request capacity"),
@@ -180,39 +135,14 @@ impl GetBlocksServingRegulator {
                     .expect("GetBlocks configuration validates the pending-request capacity"),
                 session_pending_capacity,
                 config,
-                peer_rates: StdMutex::new(HashMap::new()),
-                inactive_peer_limit,
                 #[cfg(test)]
                 sessions: StdMutex::new(Vec::new()),
             }),
         }
     }
 
-    /// Create one session policy while reusing a bounded identity rate account.
+    /// Create one session policy within the node admission bounds.
     pub(super) fn session(&self, peer: ZakuraPeerId, session_id: u64) -> GetBlocksServingSession {
-        let peer_rate = {
-            let mut accounts = self
-                .inner
-                .peer_rates
-                .lock()
-                .expect("GetBlocks peer-rate mutex should not be poisoned");
-            prune_refilled_inactive_accounts(&mut accounts);
-            if let Some(account) = accounts.get(&peer) {
-                account.clone()
-            } else {
-                evict_inactive_accounts(&mut accounts, self.inner.inactive_peer_limit);
-                let regulation = &self.inner.config.get_blocks_regulation;
-                let account = Arc::new(PeerRateAccount {
-                    budget: RateBudget::new(
-                        regulation.peer_rate_capacity_bytes,
-                        regulation.peer_rate_bytes_per_second,
-                    )
-                    .expect("GetBlocks configuration validates the peer rate budget"),
-                });
-                accounts.insert(peer.clone(), account.clone());
-                account
-            }
-        };
         let resources = Arc::new(SessionResources {
             outstanding: OutstandingByteBudget::new(
                 self.inner
@@ -239,7 +169,6 @@ impl GetBlocksServingRegulator {
             regulator: self.clone(),
             peer,
             session_id,
-            peer_rate,
             resources,
         }
     }
@@ -266,7 +195,6 @@ impl GetBlocksServingRegulator {
             true
         });
         ServingRegulationSnapshot {
-            node_rate_available: self.inner.node_rate.available(),
             node_outstanding: self.inner.node_outstanding.reserved(),
             node_active: self.inner.node_active.reserved(),
             node_pending: self.inner.node_pending.reserved(),
@@ -277,47 +205,12 @@ impl GetBlocksServingRegulator {
     }
 }
 
-fn prune_refilled_inactive_accounts(accounts: &mut HashMap<ZakuraPeerId, Arc<PeerRateAccount>>) {
-    accounts.retain(|_, account| {
-        Arc::strong_count(account) > 1 || account.budget.available() < account.budget.capacity()
-    });
-}
-
-/// Bound reconnect-persistent identities without evicting live sessions or permits.
-fn evict_inactive_accounts(
-    accounts: &mut HashMap<ZakuraPeerId, Arc<PeerRateAccount>>,
-    inactive_limit: usize,
-) {
-    while accounts
-        .values()
-        .filter(|account| Arc::strong_count(account) == 1)
-        .count()
-        >= inactive_limit
-    {
-        let candidate = accounts
-            .iter()
-            .filter(|(_, account)| Arc::strong_count(account) == 1)
-            .min_by_key(|(_, account)| {
-                account
-                    .budget
-                    .capacity()
-                    .saturating_sub(account.budget.available())
-            })
-            .map(|(peer, _)| peer.clone());
-        let Some(peer) = candidate else {
-            break;
-        };
-        accounts.remove(&peer);
-    }
-}
-
 /// Per-session entry point for pending ownership and work admission.
 #[derive(Clone, Debug)]
 pub(super) struct GetBlocksServingSession {
     regulator: GetBlocksServingRegulator,
     peer: ZakuraPeerId,
     session_id: u64,
-    peer_rate: Arc<PeerRateAccount>,
     resources: Arc<SessionResources>,
 }
 
@@ -385,12 +278,6 @@ impl GetBlocksServingSession {
                 "GetBlocks serving arithmetic remains valid after configuration validation: {error}"
             ),
         };
-        let peer_rate = reserve_rate(BoundKind::PeerRate, &self.peer_rate.budget, cost.charge)?;
-        let node_rate = reserve_rate(
-            BoundKind::NodeRate,
-            &self.regulator.inner.node_rate,
-            cost.charge,
-        )?;
         let peer_active =
             reserve_slot(BoundKind::PeerActive, &self.resources.active, &mut acquired)?;
         let node_active = reserve_slot(
@@ -412,27 +299,13 @@ impl GetBlocksServingSession {
         Ok(AdmissionAttempt {
             peer: self.peer.clone(),
             session_id: self.session_id,
-            request_overhead: self
-                .regulator
-                .inner
-                .config
-                .get_blocks_regulation
-                .request_overhead_bytes,
             response_cap: cost.response_cap,
-            peer_rate,
-            node_rate,
             node_outstanding,
             peer_outstanding,
             _peer_active: peer_active,
             _node_active: node_active,
-            _peer_rate_account: self.peer_rate.clone(),
             _session_resources: self.resources.clone(),
         })
-    }
-
-    #[cfg(test)]
-    pub(super) fn peer_rate_available(&self) -> u64 {
-        self.peer_rate.budget.available()
     }
 }
 
@@ -457,17 +330,6 @@ fn reserve_slot(
     budget
         .try_reserve()
         .ok_or_else(|| AdmissionBlocked::slot(kind, budget.clone()))
-}
-
-fn reserve_rate(
-    kind: BoundKind,
-    budget: &RateBudget,
-    bytes: u64,
-) -> Result<RateReservation, AdmissionBlocked> {
-    budget.try_reserve(bytes).map_err(|error| {
-        debug_assert!(error.retry_after().is_some());
-        AdmissionBlocked::rate(kind, budget.clone(), bytes)
-    })
 }
 
 fn reserve_outstanding(
@@ -552,8 +414,6 @@ pub(super) struct AdmissionBlocked {
 /// Stable resource names used by low-cardinality delay observations.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum BoundKind {
-    PeerRate,
-    NodeRate,
     PeerActive,
     NodeActive,
     NodeOutstanding,
@@ -563,8 +423,6 @@ pub(super) enum BoundKind {
 impl BoundKind {
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::PeerRate => "peer_rate",
-            Self::NodeRate => "node_rate",
             Self::PeerActive => "peer_active",
             Self::NodeActive => "node_active",
             Self::NodeOutstanding => "node_outstanding",
@@ -575,10 +433,6 @@ impl BoundKind {
 
 #[derive(Clone, Debug)]
 enum AdmissionWait {
-    Rate {
-        budget: RateBudget,
-        bytes: u64,
-    },
     Outstanding {
         budget: OutstandingByteBudget,
         bytes: u64,
@@ -587,13 +441,6 @@ enum AdmissionWait {
 }
 
 impl AdmissionBlocked {
-    fn rate(kind: BoundKind, budget: RateBudget, bytes: u64) -> Self {
-        Self {
-            kind,
-            wait: AdmissionWait::Rate { budget, bytes },
-        }
-    }
-
     fn outstanding(kind: BoundKind, budget: OutstandingByteBudget, bytes: u64) -> Self {
         Self {
             kind,
@@ -615,10 +462,6 @@ impl AdmissionBlocked {
     /// Wait only for the bound that blocked the previous atomic attempt.
     pub(super) async fn wait(self) -> Option<AcquiredAdmissionSlot> {
         match self.wait {
-            AdmissionWait::Rate { budget, bytes } => budget
-                .wait_for(bytes)
-                .await
-                .expect("validated GetBlocks work fits the rate budget"),
             AdmissionWait::Outstanding { budget, bytes } => budget
                 .wait_for(bytes)
                 .await
@@ -640,15 +483,11 @@ impl AdmissionBlocked {
 pub(super) struct AdmissionAttempt {
     peer: ZakuraPeerId,
     session_id: u64,
-    request_overhead: u64,
     response_cap: u64,
-    peer_rate: RateReservation,
-    node_rate: RateReservation,
     node_outstanding: OutstandingByteReservation,
     peer_outstanding: OutstandingByteReservation,
     _peer_active: SlotPermit,
     _node_active: SlotPermit,
-    _peer_rate_account: Arc<PeerRateAccount>,
     _session_resources: Arc<SessionResources>,
 }
 
@@ -661,21 +500,8 @@ impl AdmissionAttempt {
         self.session_id
     }
 
-    /// Commit fixed request work after the reactor accepts this exact session.
+    /// Transfer admitted resources to the reactor ledger for this exact session.
     pub(super) fn commit(self) -> GetBlocksServingPermit {
-        debug_assert_eq!(
-            self.peer_rate.reserved(),
-            self.response_cap.saturating_add(self.request_overhead)
-        );
-        debug_assert_eq!(self.node_rate.reserved(), self.peer_rate.reserved());
-        let peer_rate = self
-            .peer_rate
-            .commit(self.request_overhead)
-            .expect("validated GetBlocks charge contains its request overhead");
-        let node_rate = self
-            .node_rate
-            .commit(self.request_overhead)
-            .expect("validated GetBlocks charge contains its request overhead");
         metrics::counter!("sync.block.serving.admitted").increment(1);
         GetBlocksServingPermit {
             query: Arc::new(QueryLifecycle::default()),
@@ -683,16 +509,12 @@ impl AdmissionAttempt {
                 peer: self.peer,
                 session_id: self.session_id,
                 request_id: None,
-                request_overhead: self.request_overhead,
                 response_cap: self.response_cap,
                 transferred: 0,
-                peer_rate,
-                node_rate,
                 node_outstanding: self.node_outstanding,
                 peer_outstanding: self.peer_outstanding,
                 _peer_active: self._peer_active,
                 _node_active: self._node_active,
-                _peer_rate_account: self._peer_rate_account,
                 _session_resources: self._session_resources,
             })),
         }
@@ -712,16 +534,12 @@ struct ServingResources {
     peer: ZakuraPeerId,
     session_id: u64,
     request_id: Option<BlockRangeRequestId>,
-    request_overhead: u64,
     response_cap: u64,
     transferred: u64,
-    peer_rate: CommittedRateReservation,
-    node_rate: CommittedRateReservation,
     node_outstanding: OutstandingByteReservation,
     peer_outstanding: OutstandingByteReservation,
     _peer_active: SlotPermit,
     _node_active: SlotPermit,
-    _peer_rate_account: Arc<PeerRateAccount>,
     _session_resources: Arc<SessionResources>,
 }
 
@@ -736,10 +554,7 @@ impl ServingResources {
 
     /// Return whether an encoded response frame fits every remaining balance.
     pub(super) fn can_transfer_frame(&self, bytes: u64) -> bool {
-        self.peer_rate.refundable() >= bytes
-            && self.node_rate.refundable() >= bytes
-            && self.node_outstanding.remaining() >= bytes
-            && self.peer_outstanding.remaining() >= bytes
+        self.node_outstanding.remaining() >= bytes && self.peer_outstanding.remaining() >= bytes
     }
 
     /// Transfer actual response bytes into a transport-owned frame lease.
@@ -753,12 +568,6 @@ impl ServingResources {
             bytes,
         )
         .expect("prechecked response bytes fit both outstanding reservations");
-        self.peer_rate
-            .spend(bytes)
-            .expect("prechecked response bytes fit the peer rate reservation");
-        self.node_rate
-            .spend(bytes)
-            .expect("prechecked response bytes fit the node rate reservation");
         self.transferred = self
             .transferred
             .checked_add(bytes)
@@ -780,7 +589,6 @@ impl Drop for ServingResources {
             peer = ?self.peer,
             session_id = self.session_id,
             request_id = ?self.request_id,
-            request_overhead = self.request_overhead,
             queued_bytes = self.transferred,
             refunded_bytes = refunded,
             "settled regulated GetBlocks request"
@@ -919,7 +727,6 @@ pub(crate) fn query_lease_for_test() -> BlockRangeQueryLease {
 #[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct ServingRegulationSnapshot {
-    pub(super) node_rate_available: u64,
     pub(super) node_outstanding: u64,
     pub(super) node_active: usize,
     pub(super) node_pending: usize,
@@ -1169,14 +976,13 @@ mod tests {
     }
 
     #[test]
-    fn cost_includes_block_discriminators_terminal_and_configured_overhead() {
+    fn cost_includes_block_discriminators_and_terminal() {
         let mut config = ZakuraBlockSyncConfig {
             max_blocks_per_response: 2,
             max_response_bytes: u32::try_from(block::MAX_BLOCK_BYTES * 2)
                 .expect("two maximum block bodies fit u32"),
             ..ZakuraBlockSyncConfig::default()
         };
-        config.get_blocks_regulation.request_overhead_bytes = 17;
 
         let cost = serving_cost(&config, 2).expect("the default bounds do not overflow");
         assert_eq!(cost.count, 2);
@@ -1184,7 +990,6 @@ mod tests {
             cost.response_cap,
             block::MAX_BLOCK_BYTES * 2 + 2 + GET_BLOCKS_TERMINAL_PAYLOAD_BYTES
         );
-        assert_eq!(cost.charge, cost.response_cap + 17);
 
         config.max_blocks_per_response = 3;
         config.max_response_bytes = u32::try_from(block::MAX_BLOCK_BYTES).unwrap();
@@ -1228,15 +1033,6 @@ mod tests {
     #[test]
     fn config_rejects_nonprogressing_or_unbounded_admission_settings() {
         let base = ZakuraBlockSyncConfig::default();
-
-        let mut no_peer_refill = base.clone();
-        no_peer_refill
-            .get_blocks_regulation
-            .peer_rate_bytes_per_second = 0;
-        assert_eq!(
-            validate_config(&no_peer_refill),
-            Err("get_blocks_regulation.peer_rate_bytes_per_second must be greater than zero"),
-        );
 
         let mut no_active_slots = base.clone();
         no_active_slots.get_blocks_regulation.node_active_requests = 0;
@@ -1285,26 +1081,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn committed_request_spends_overhead_and_refunds_unused_response_work() {
-        let mut config = ZakuraBlockSyncConfig::default();
-        config.get_blocks_regulation.request_overhead_bytes = 11;
-        let cost = serving_cost(&config, 1).expect("the default cost is representable");
-        let regulator = GetBlocksServingRegulator::new(config.clone());
+    async fn completed_requests_release_capacity_without_waiting_for_time() {
+        let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
         let session = regulator.session(peer(2), 2);
-        let full_node_rate = regulator.snapshot().node_rate_available;
-        let full_peer_rate = session.peer_rate_available();
-
-        let permit = session.try_admit(1).expect("the request fits").commit();
-        assert_eq!(permit.refunded_response_bytes(), cost.response_cap);
-        drop(permit);
-
+        let now = time::Instant::now();
+        for _ in 0..4096 {
+            let mut permit = session
+                .try_admit(1)
+                .expect("released capacity admits work")
+                .commit();
+            let reserved = regulator.snapshot().node_outstanding;
+            let frame = permit.transfer_frame(GET_BLOCKS_TERMINAL_PAYLOAD_BYTES);
+            assert_eq!(
+                permit.refunded_response_bytes(),
+                reserved - GET_BLOCKS_TERMINAL_PAYLOAD_BYTES
+            );
+            drop(permit);
+            assert_eq!(
+                regulator.snapshot().node_outstanding,
+                GET_BLOCKS_TERMINAL_PAYLOAD_BYTES
+            );
+            drop(frame);
+            assert_eq!(regulator.snapshot().node_outstanding, 0);
+            assert_eq!(regulator.snapshot().node_active, 0);
+        }
         assert_eq!(
-            regulator.snapshot().node_rate_available,
-            full_node_rate - 11
+            time::Instant::now(),
+            now,
+            "admission has no bandwidth refill timer"
         );
-        assert_eq!(session.peer_rate_available(), full_peer_rate - 11);
-        assert_eq!(regulator.snapshot().node_outstanding, 0);
-        assert_eq!(regulator.snapshot().node_active, 0);
     }
 
     #[test]
@@ -1355,22 +1160,6 @@ mod tests {
 
         drop((first, second));
         assert_eq!(regulator.snapshot().node_pending, 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn peer_rate_deficit_survives_a_reconnect() {
-        let mut config = ZakuraBlockSyncConfig::default();
-        config.get_blocks_regulation.request_overhead_bytes = 13;
-        let regulator = GetBlocksServingRegulator::new(config);
-        let identity = peer(6);
-        let session = regulator.session(identity.clone(), 6);
-        let full = session.peer_rate_available();
-        drop(session.try_admit(1).expect("the request fits").commit());
-        assert_eq!(session.peer_rate_available(), full - 13);
-        drop(session);
-
-        let replacement = regulator.session(identity, 7);
-        assert_eq!(replacement.peer_rate_available(), full - 13);
     }
 }
 

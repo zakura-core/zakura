@@ -35,11 +35,11 @@ ready_samples = 6
 ready_sample_interval_seconds = 30
 health_min_connected_peers = 1
 min_free_bytes = 10737418240
-retention_runs = 3
+retention_runs = 10
 cooldown_seconds = 60
 wipe_entries = ["state", "non_finalized_state"]
 preserve_entries = ["network"]
-tracing_filter = "info,zakura_network::zakura=debug,zakura_network::zakura::transport::guard=error,zebrad::commands::start::zakura=debug,iroh=error,iroh::magicsock=error,iroh_quinn_udp=error"
+tracing_filter = "info,iroh=error,iroh::magicsock=error,iroh_quinn_udp=error"
 
 # Public mainnet Zakura peers used by today's temporary nodes.
 bootstrap_peers = [

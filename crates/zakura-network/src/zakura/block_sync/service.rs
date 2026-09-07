@@ -290,7 +290,7 @@ impl BlockSyncPeerSession {
                 "block-sync frame payload length does not fit in u64",
             )))
         })?;
-        if !permit.can_transfer_frame(accounted_bytes) {
+        if !permit.can_queue_frame(accounted_bytes) {
             return Err(OrderedSendError::Encode(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "encoded GetBlocks response exceeded its admitted byte cap",

@@ -421,14 +421,13 @@ impl AdmissionAttempt {
         metrics::counter!("sync.block.serving.admitted").increment(1);
         GetBlocksServingPermit {
             query: Arc::new(QueryLifecycle::default()),
-            resources: Arc::new(StdMutex::new(ServingResources {
-                request_id: None,
-                response_cap: self.response_cap,
-                transferred: 0,
+            response_cap: self.response_cap,
+            queued_payload_bytes: 0,
+            resources: Arc::new(ServingResources {
                 _peer_active: self._peer_active,
                 _node_active: self._node_active,
                 _session_resources: self._session_resources,
-            })),
+            }),
         }
     }
 }
@@ -438,64 +437,31 @@ impl AdmissionAttempt {
 #[must_use = "the serving ledger must retain this permit until request settlement"]
 pub(super) struct GetBlocksServingPermit {
     query: Arc<QueryLifecycle>,
-    resources: Arc<StdMutex<ServingResources>>,
+    resources: Arc<ServingResources>,
+    response_cap: u64,
+    queued_payload_bytes: u64,
 }
 
 #[derive(Debug)]
 struct ServingResources {
-    request_id: Option<BlockRangeRequestId>,
-    response_cap: u64,
-    transferred: u64,
     _peer_active: SlotPermit,
     _node_active: SlotPermit,
     _session_resources: Arc<SessionResources>,
 }
 
-impl ServingResources {
-    /// Bind the reactor request identity exactly once for diagnostics.
-    pub(super) fn bind_request_id(&mut self, request_id: BlockRangeRequestId) {
-        assert!(
-            self.request_id.replace(request_id).is_none(),
-            "a GetBlocks serving permit is bound to one request"
-        );
-    }
-
-    /// Return whether an encoded response frame fits every remaining balance.
-    pub(super) fn can_transfer_frame(&self, bytes: u64) -> bool {
-        bytes <= self.response_cap.saturating_sub(self.transferred)
-    }
-
-    /// Account encoded payload against this request's advertised response cap.
-    fn record_frame(&mut self, bytes: u64) {
-        assert!(
-            self.can_transfer_frame(bytes),
-            "encoded response fits its declared cap"
-        );
-        self.transferred += bytes;
-    }
-}
-
 impl GetBlocksServingPermit {
-    pub(super) fn bind_request_id(&mut self, request_id: BlockRangeRequestId) {
-        self.resources
-            .lock()
-            .expect("a panic in serving accounting invalidates its balances")
-            .bind_request_id(request_id);
-    }
-
-    pub(super) fn can_transfer_frame(&self, bytes: u64) -> bool {
-        self.resources
-            .lock()
-            .expect("a panic in serving accounting invalidates its balances")
-            .can_transfer_frame(bytes)
+    /// Check the encoded payload against this request's declared response cap.
+    pub(super) fn can_queue_frame(&self, bytes: u64) -> bool {
+        bytes <= self.response_cap.saturating_sub(self.queued_payload_bytes)
     }
 
     /// Keep the response producer occupied through the transport write.
     pub(super) fn frame_guard(&mut self, bytes: u64) -> FrameGuard {
-        self.resources
-            .lock()
-            .expect("response accounting is not poisoned")
-            .record_frame(bytes);
+        assert!(
+            self.can_queue_frame(bytes),
+            "encoded response fits its declared cap"
+        );
+        self.queued_payload_bytes += bytes;
         FrameGuard::new(self.resources.clone())
     }
 
@@ -556,7 +522,7 @@ impl QueryLifecycle {
 /// but resources return only after the last ledger, worker, and result owner drops.
 #[derive(Clone, Debug)]
 pub struct BlockRangeQueryLease {
-    _resources: Arc<StdMutex<ServingResources>>,
+    _resources: Arc<ServingResources>,
     query: Arc<QueryLifecycle>,
 }
 

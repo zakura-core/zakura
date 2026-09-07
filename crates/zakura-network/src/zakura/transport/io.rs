@@ -521,4 +521,107 @@ mod tests {
 
         assert_eq!(budget.reserved(), 0);
     }
+    #[tokio::test]
+    async fn quic_backpressure_holds_producer_and_preserves_another_stream() {
+        use crate::zakura::testkit::LocalEndpointFactory;
+        use iroh::{
+            endpoint::{Connection, TransportConfig, VarInt},
+            protocol::{AcceptError, ProtocolHandler, Router},
+        };
+        use std::time::Duration;
+
+        #[derive(Debug)]
+        struct AcceptConnection(mpsc::Sender<Connection>);
+        impl ProtocolHandler for AcceptConnection {
+            async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+                let _ = self.0.send(connection).await;
+                Ok(())
+            }
+        }
+
+        const ALPN: &[u8] = b"/zakura/test/producer-backpressure";
+        // Scale down the windows so a single bounded frame reaches flow control.
+        let transport_config = || {
+            let mut config = TransportConfig::default();
+            config
+                .stream_receive_window(VarInt::from_u32(16 * 1024))
+                .receive_window(VarInt::from_u32(128 * 1024))
+                .send_window(128 * 1024);
+            config
+        };
+        let server = LocalEndpointFactory::with_transport_config(transport_config())
+            .endpoint(92_001)
+            .await
+            .unwrap();
+        let client = LocalEndpointFactory::with_transport_config(transport_config())
+            .endpoint(92_002)
+            .await
+            .unwrap();
+        let (accepted, mut incoming) = mpsc::channel(1);
+        let router = Router::builder(server)
+            .accept(ALPN, AcceptConnection(accepted))
+            .spawn();
+        let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
+        let connection = client.connect(address, ALPN).await.unwrap();
+        let remote = tokio::time::timeout(Duration::from_secs(5), incoming.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut send, _recv) = connection.open_bi().await.unwrap();
+        let producer = SlotBudget::new(1).unwrap();
+        let owner = Arc::new(producer.try_reserve().unwrap());
+        let (queue, mut writer) = worker_framed_channel(1);
+        queue
+            .try_send_guarded(
+                Frame {
+                    message_type: 1,
+                    flags: 0,
+                    payload: vec![0; 2_000_001],
+                },
+                || FrameGuard::new(owner.clone()),
+            )
+            .unwrap();
+        drop(owner);
+        let queued = writer.recv().await.unwrap();
+        let mut write = tokio::spawn(queued.write_with(move |frame| async move {
+            send.write_all(&frame.payload).await.unwrap();
+            send.finish().unwrap();
+        }));
+        let (_remote_send, mut slow_read) =
+            tokio::time::timeout(Duration::from_secs(5), remote.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut write)
+            .await
+            .is_err());
+        assert!(
+            producer.try_reserve().is_none(),
+            "a pending QUIC write retains the producer"
+        );
+
+        let (mut other_send, _other_recv) = connection.open_bi().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            other_send.write_all(b"progress").await.unwrap();
+            other_send.finish().unwrap();
+            let (_send, mut recv) = remote.accept_bi().await.unwrap();
+            assert_eq!(recv.read_to_end(8).await.unwrap(), b"progress");
+        })
+        .await
+        .expect("the blocked stream does not consume all connection credit");
+        assert!(producer.try_reserve().is_none());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            assert_eq!(
+                slow_read.read_to_end(2_000_001).await.unwrap().len(),
+                2_000_001
+            );
+            write.await.unwrap();
+        })
+        .await
+        .expect("draining the peer resumes the write");
+        assert!(producer.try_reserve().is_some());
+        connection.close(0u32.into(), b"done");
+        client.close().await;
+        router.shutdown().await.unwrap();
+    }
 }

@@ -1592,7 +1592,7 @@ impl BlockSyncReactor {
             return;
         }
 
-        let mut permit = attempt.commit();
+        let permit = attempt.commit();
         let Some(request_id) = self.next_serving_request_id else {
             self.send_range_unavailable(&peer, start_height, count, permit);
             return;
@@ -1603,7 +1603,6 @@ impl BlockSyncReactor {
             .and_then(BlockRangeRequestId::new);
 
         let requested_count = self.clamp_served_block_count(start_height, count);
-        permit.bind_request_id(request_id);
         let query_lease = permit.query_lease();
         let started_serving = self
             .state

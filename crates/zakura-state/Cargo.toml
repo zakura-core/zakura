@@ -80,7 +80,7 @@ tracing = { workspace = true }
 sapling-crypto = { workspace = true }
 
 zakura-assets = { workspace = true }
-zakura-node-services = { path = "../zakura-node-services", version = "3.2.3-rc0" }
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.3" }
 zakura-chain = { path = "../zakura-chain", version = "7.0.0-rc0", features = ["async-error"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "2.0.1" }
 

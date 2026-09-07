@@ -4,7 +4,7 @@
 import argparse
 from datetime import datetime, timedelta, timezone
 
-from do_provision import REGIONS, doctl, height, newest, output
+from do_provision import REGIONS, doctl, handoff_height, height, newest, output
 
 
 def retained_ids(images, snapshots, checkpoint):
@@ -37,7 +37,9 @@ def retained_ids(images, snapshots, checkpoint):
                 if region in s["regions"] and s["name"].startswith(prefix)
             ]
             before = [
-                s for s in items if height(s) is not None and height(s) < checkpoint
+                s
+                for s in items
+                if handoff_height(s) is not None and handoff_height(s) < checkpoint
             ]
             if before:
                 keep.add(

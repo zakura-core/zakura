@@ -80,6 +80,15 @@ def height(snapshot):
     return int(match[1]) if match else None
 
 
+def handoff_height(snapshot):
+    """Return a database-measured height, excluding old publisher-tip labels."""
+    if re.search(r"-finalized-h\d+$", snapshot["name"]) or snapshot["name"].startswith(
+        "zakura-vct-approach-mainnet-"
+    ):
+        return height(snapshot)
+    return None
+
+
 def newest(items):
     return sorted(
         items, key=lambda item: (item.get("created_at", ""), item["name"]), reverse=True
@@ -94,8 +103,8 @@ def select_state(snapshots, region, network, mode, checkpoint=None, snapshot_id=
         if selected and mode == "pre-checkpoint":
             if (
                 not checkpoint
-                or height(selected) is None
-                or height(selected) >= checkpoint
+                or handoff_height(selected) is None
+                or handoff_height(selected) >= checkpoint
             ):
                 return None
         return selected
@@ -112,8 +121,13 @@ def select_state(snapshots, region, network, mode, checkpoint=None, snapshot_id=
         states += [
             s for s in regional if s["name"].startswith("zakura-vct-approach-mainnet-")
         ]
-    candidates = [s for s in states if height(s) is not None and height(s) < checkpoint]
-    # Unknown-height legacy fixtures remain usable for tip/sandblast runs only.
+    candidates = [
+        s
+        for s in states
+        if handoff_height(s) is not None and handoff_height(s) < checkpoint
+    ]
+    # Old ordinary snapshots have unverified publisher-tip labels. Keep them
+    # usable for tip/sandblast runs, but never prefer them for a handoff.
     return max(
         candidates, key=lambda s: (height(s), s.get("created_at", "")), default=None
     )

@@ -11,6 +11,7 @@ from unittest.mock import patch
 import do_artifact_retention as retention
 import do_provision as p
 import do_seed_approach as seed
+import do_snapshot as snapshots
 
 
 def size(slug, regions=("nyc1",), disk=100, price=0.25, cpu=8, memory=16384):
@@ -124,6 +125,64 @@ class Selection(unittest.TestCase):
             p.select_state([state], "nyc1", "mainnet", "pre-checkpoint", 100)
         )
         self.assertEqual(p.select_state([state], "nyc1", "mainnet", "tip"), state)
+
+    def test_publisher_tip_labels_cannot_win_automatic_or_exact_handoff_selection(self):
+        legacy = snapshot(
+            height=3471916, id="legacy", prefix="zakura-pr-state-mainnet-"
+        )
+        verified = snapshot(
+            height=3470916, id="verified", prefix="zakura-pr-state-mainnet-"
+        )
+        verified["name"] = verified["name"].replace("-h", "-finalized-h")
+        approach = snapshot(height=3418306, id="approach")
+        self.assertEqual(
+            p.select_state(
+                [legacy, verified, approach],
+                "nyc1",
+                "mainnet",
+                "pre-checkpoint",
+                3472489,
+            ),
+            verified,
+        )
+        self.assertEqual(
+            p.select_state(
+                [legacy, approach], "nyc1", "mainnet", "pre-checkpoint", 3472489
+            ),
+            approach,
+        )
+        self.assertIsNone(
+            p.select_state(
+                [legacy, verified],
+                "nyc1",
+                "mainnet",
+                "pre-checkpoint",
+                3472489,
+                "legacy",
+            )
+        )
+        self.assertEqual(
+            p.select_state(
+                [legacy],
+                "nyc1",
+                "mainnet",
+                "tip",
+                snapshot_id="legacy",
+            ),
+            legacy,
+        )
+        verified["name"] = "zakura-pr-validation-state-mainnet-finalized-h3470916"
+        self.assertEqual(
+            p.select_state(
+                [verified],
+                "nyc1",
+                "mainnet",
+                "pre-checkpoint",
+                3472489,
+                "verified",
+            ),
+            verified,
+        )
 
     def test_bake_cannot_inflate_root_disk(self):
         sizes = [
@@ -331,7 +390,91 @@ class Lifecycle(unittest.TestCase):
         self.assertFalse(p.volume_names(first) & p.volume_names(second))
 
 
+class SnapshotCreation(unittest.TestCase):
+    def snapshot(self, **changes):
+        return (
+            dict(
+                id="snapshot-id",
+                name="fixture",
+                resource_id="volume-id",
+                regions=["nyc1"],
+            )
+            | changes
+        )
+
+    @patch.object(snapshots.time, "sleep")
+    @patch.object(p.subprocess, "run")
+    def test_empty_create_output_and_delayed_listing(self, run, sleep):
+        other_volume = self.snapshot(resource_id="other-volume")
+        other_region = self.snapshot(regions=["sfo3"])
+        other_name = self.snapshot(name="other-name")
+        run.side_effect = [
+            subprocess.CompletedProcess("doctl", 0, stdout=output, stderr="")
+            for output in (
+                "[]",
+                "",
+                json.dumps([other_volume, other_region, other_name]),
+                json.dumps([self.snapshot()]),
+            )
+        ]
+        self.assertEqual(
+            snapshots.create_snapshot("volume-id", "fixture", "nyc1"), "snapshot-id"
+        )
+        creates = [
+            call.args[0]
+            for call in run.call_args_list
+            if call.args[0][2:4] == ["volume", "snapshot"]
+        ]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0][-1], "0")
+        sleep.assert_called_once()
+
+    @patch.object(snapshots, "doctl")
+    def test_existing_snapshot_does_not_create_another(self, api):
+        api.return_value = [self.snapshot()]
+        with self.assertRaisesRegex(RuntimeError, "already exists"):
+            snapshots.create_snapshot("volume-id", "fixture", "nyc1")
+        api.assert_called_once()
+
+    @patch.object(snapshots, "doctl")
+    def test_duplicate_matches_are_not_arbitrarily_selected(self, api):
+        api.side_effect = [[], None, [self.snapshot(), self.snapshot(id="second")]]
+        with self.assertRaisesRegex(RuntimeError, "multiple snapshots"):
+            snapshots.create_snapshot("volume-id", "fixture", "nyc1")
+
+    @patch.object(snapshots, "doctl")
+    def test_missing_snapshot_times_out_without_recreating(self, api):
+        api.side_effect = [[], None, []]
+        with self.assertRaisesRegex(TimeoutError, "not listed"):
+            snapshots.create_snapshot("volume-id", "fixture", "nyc1", timeout=0)
+        self.assertEqual(api.call_count, 3)
+
+    @patch.object(snapshots, "doctl")
+    def test_ambiguous_create_is_not_retried(self, api):
+        api.side_effect = [[], subprocess.TimeoutExpired("doctl", 180)]
+        with self.assertRaises(subprocess.TimeoutExpired):
+            snapshots.create_snapshot("volume-id", "fixture", "nyc1")
+        self.assertEqual(api.call_count, 2)
+
+
 class Retention(unittest.TestCase):
+    def test_pin_verified_ordinary_fixture_despite_higher_legacy_label(self):
+        states = [
+            snapshot(
+                height=h,
+                id=str(h),
+                prefix="zakura-pr-state-mainnet-",
+                created="2026-09-06T00:00:00Z",
+            )
+            for h in range(200, 206)
+        ]
+        legacy = snapshot(height=99, id="legacy", prefix="zakura-pr-state-mainnet-")
+        verified = snapshot(height=90, id="verified", prefix="zakura-pr-state-mainnet-")
+        verified["name"] = verified["name"].replace("-h", "-finalized-h")
+        kept = retention.retained_ids([], states + [legacy, verified], 100)
+        self.assertIn("verified", kept)
+        self.assertNotIn("legacy", kept)
+
     def test_keep_two_images_in_each_region(self):
         images = [
             image(r, id=f"{r}-{n}", created=f"2026-09-0{n}T00:00:00Z")

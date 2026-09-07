@@ -8,7 +8,7 @@
 use tokio::sync::mpsc;
 
 use super::Frame;
-use crate::zakura::regulation::FrameLease;
+use std::sync::Arc;
 
 /// Receive half for bounded, rate-admitted Zakura frames.
 #[derive(Debug)]
@@ -94,46 +94,46 @@ impl FramedSend {
         }
     }
 
-    /// Reserve a queue slot before attaching an outstanding-byte lease.
+    /// Reserve a queue slot before attaching a response ownership guard.
     ///
-    /// `make_lease` is called only after the transport owns a queue slot. This
+    /// `make_guard` is called only after the transport owns a queue slot. This
     /// prevents accounting from moving to the transport when the queue is full
     /// or closed.
-    pub(crate) fn try_send_leased(
+    pub(crate) fn try_send_guarded(
         &self,
         frame: Frame,
-        make_lease: impl FnOnce() -> FrameLease,
-    ) -> Result<(), LeasedSendError> {
+        make_guard: impl FnOnce() -> FrameGuard,
+    ) -> Result<(), GuardedSendError> {
         let FramedSender::Queued(sender) = &self.sender else {
-            return Err(LeasedSendError::Unsupported(frame));
+            return Err(GuardedSendError::Unsupported(frame));
         };
 
         match sender.try_reserve() {
             Ok(slot) => {
-                slot.send(QueuedFrame::leased(frame, make_lease()));
+                slot.send(QueuedFrame::guarded(frame, make_guard()));
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Full(())) => Err(LeasedSendError::Full(frame)),
-            Err(mpsc::error::TrySendError::Closed(())) => Err(LeasedSendError::Closed(frame)),
+            Err(mpsc::error::TrySendError::Full(())) => Err(GuardedSendError::Full(frame)),
+            Err(mpsc::error::TrySendError::Closed(())) => Err(GuardedSendError::Closed(frame)),
         }
     }
 
-    /// Wait for a queue slot before attaching an outstanding-byte lease.
-    /// Cancelling this wait leaves the lease with the caller.
-    pub(crate) async fn send_leased(
+    /// Wait for a queue slot before attaching a response ownership guard.
+    /// Cancelling this wait leaves the guard with the caller.
+    pub(crate) async fn send_guarded(
         &self,
         frame: Frame,
-        make_lease: impl FnOnce() -> FrameLease,
-    ) -> Result<(), LeasedSendError> {
+        make_guard: impl FnOnce() -> FrameGuard,
+    ) -> Result<(), GuardedSendError> {
         let FramedSender::Queued(sender) = &self.sender else {
-            return Err(LeasedSendError::Unsupported(frame));
+            return Err(GuardedSendError::Unsupported(frame));
         };
         match sender.reserve().await {
             Ok(slot) => {
-                slot.send(QueuedFrame::leased(frame, make_lease()));
+                slot.send(QueuedFrame::guarded(frame, make_guard()));
                 Ok(())
             }
-            Err(_) => Err(LeasedSendError::Closed(frame)),
+            Err(_) => Err(GuardedSendError::Closed(frame)),
         }
     }
 
@@ -154,18 +154,18 @@ impl FramedSend {
     }
 }
 
-/// Failure to queue a leased frame.
+/// Failure to queue a guarded frame.
 #[derive(Debug)]
-pub(crate) enum LeasedSendError {
+pub(crate) enum GuardedSendError {
     /// The bounded transport queue has no free slot.
     Full(Frame),
     /// The transport worker has closed its receive half.
     Closed(Frame),
-    /// This handle wraps a compatibility channel without lease support.
+    /// This handle wraps a compatibility channel without guard support.
     Unsupported(Frame),
 }
 
-impl LeasedSendError {
+impl GuardedSendError {
     /// Recover the frame that was not queued.
     pub(crate) fn into_frame(self) -> Frame {
         match self {
@@ -184,42 +184,53 @@ impl LeasedSendError {
     }
 }
 
-/// Frame plus optional byte ownership retained through its transport write.
+/// Shared service ownership held until a frame finishes its application write.
+///
+/// This is a completion guard, not a byte budget or acknowledgement of delivery.
+/// QUIC owns its own bounded send buffers after the write accepts the frame.
+#[derive(Clone, Debug)]
+pub(crate) struct FrameGuard {
+    _owner: Arc<dyn std::fmt::Debug + Send + Sync>,
+}
+
+impl FrameGuard {
+    /// Share an existing work owner without acquiring more capacity.
+    pub(crate) fn new<T: std::fmt::Debug + Send + Sync + 'static>(owner: Arc<T>) -> Self {
+        Self { _owner: owner }
+    }
+}
+
+/// Frame plus optional response ownership retained through its transport write.
 #[derive(Debug)]
 pub(crate) struct QueuedFrame {
     frame: Frame,
-    lease: Option<FrameLease>,
+    guard: Option<FrameGuard>,
 }
 
 impl QueuedFrame {
     fn plain(frame: Frame) -> Self {
-        Self { frame, lease: None }
+        Self { frame, guard: None }
     }
 
-    fn leased(frame: Frame, lease: FrameLease) -> Self {
-        debug_assert_eq!(
-            u64::try_from(frame.payload.len()).ok(),
-            Some(lease.accounted_bytes()),
-            "a frame lease accounts for its exact payload bytes"
-        );
+    fn guarded(frame: Frame, guard: FrameGuard) -> Self {
         Self {
             frame,
-            lease: Some(lease),
+            guard: Some(guard),
         }
     }
 
-    /// Split the frame from its lease while retaining both in the caller.
-    pub(crate) fn into_parts(self) -> (Frame, Option<FrameLease>) {
-        (self.frame, self.lease)
+    /// Split the frame from its guard while retaining both in the caller.
+    pub(crate) fn into_parts(self) -> (Frame, Option<FrameGuard>) {
+        (self.frame, self.guard)
     }
 
-    /// Run the transport write while retaining this frame's lease.
+    /// Run the transport write while retaining this frame's guard.
     pub(crate) async fn write_with<T, F, Fut>(self, write: F) -> T
     where
         F: FnOnce(Frame) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
-        let (frame, _lease) = self.into_parts();
+        let (frame, _guard) = self.into_parts();
         write(frame).await
     }
 }
@@ -270,7 +281,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::zakura::regulation::{OutstandingByteBudget, OutstandingByteReservation};
+    use crate::zakura::regulation::SlotBudget;
 
     fn frame(message_type: u16) -> Frame {
         Frame {
@@ -325,45 +336,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_frame_holds_lease_until_transport_consumes_it() {
+    async fn queued_frame_holds_guard_until_transport_consumes_it() {
         let (sender, mut receiver) = worker_framed_channel(1);
-        let budget = OutstandingByteBudget::new(10);
-        let mut reservation = budget
-            .try_reserve(10)
-            .expect("the frame fits the budget")
-            .expect("the budget has capacity");
+        let budget = SlotBudget::new(1).unwrap();
+        let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
 
         sender
-            .try_send_leased(frame(1), || {
-                OutstandingByteReservation::transfer_to_frame([&mut reservation], 10)
-                    .expect("the reservation covers the frame")
-            })
+            .try_send_guarded(frame(1), || FrameGuard::new(reservation.clone()))
             .expect("the worker queue has a slot");
         drop(reservation);
-        assert_eq!(budget.reserved(), 10);
+        assert_eq!(budget.reserved(), 1);
 
         let queued = receiver.recv().await.expect("worker receives the frame");
-        let (received, lease) = queued.into_parts();
+        let (received, guard) = queued.into_parts();
         assert_eq!(received, frame(1));
-        assert_eq!(budget.reserved(), 10);
+        assert_eq!(budget.reserved(), 1);
 
-        drop(lease);
+        drop(guard);
         assert_eq!(budget.reserved(), 0);
     }
 
     #[tokio::test]
-    async fn queued_frame_holds_lease_while_write_is_pending() {
+    async fn queued_frame_holds_guard_while_write_is_pending() {
         let (sender, mut receiver) = worker_framed_channel(1);
-        let budget = OutstandingByteBudget::new(10);
-        let mut reservation = budget
-            .try_reserve(10)
-            .expect("the frame fits the budget")
-            .expect("the budget has capacity");
+        let budget = SlotBudget::new(1).unwrap();
+        let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
         sender
-            .try_send_leased(frame(1), || {
-                OutstandingByteReservation::transfer_to_frame([&mut reservation], 10)
-                    .expect("the reservation covers the frame")
-            })
+            .try_send_guarded(frame(1), || FrameGuard::new(reservation.clone()))
             .expect("the worker queue has a slot");
         drop(reservation);
         let queued = receiver.recv().await.expect("worker receives the frame");
@@ -375,7 +374,7 @@ mod tests {
             let _ = finish_rx.await;
         }));
         started_rx.await.expect("the write reaches its wait point");
-        assert_eq!(budget.reserved(), 10);
+        assert_eq!(budget.reserved(), 1);
 
         let _ = finish_tx.send(());
         write.await.expect("the write task should not panic");
@@ -383,18 +382,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_pending_write_releases_lease() {
+    async fn cancelling_pending_write_releases_guard() {
         let (sender, mut receiver) = worker_framed_channel(1);
-        let budget = OutstandingByteBudget::new(10);
-        let mut reservation = budget
-            .try_reserve(10)
-            .expect("the frame fits the budget")
-            .expect("the budget has capacity");
+        let budget = SlotBudget::new(1).unwrap();
+        let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
         sender
-            .try_send_leased(frame(1), || {
-                OutstandingByteReservation::transfer_to_frame([&mut reservation], 10)
-                    .expect("the reservation covers the frame")
-            })
+            .try_send_guarded(frame(1), || FrameGuard::new(reservation.clone()))
             .expect("the worker queue has a slot");
         drop(reservation);
         let queued = receiver.recv().await.expect("worker receives the frame");
@@ -405,7 +398,7 @@ mod tests {
             std::future::pending::<()>().await;
         }));
         started_rx.await.expect("the write reaches its wait point");
-        assert_eq!(budget.reserved(), 10);
+        assert_eq!(budget.reserved(), 1);
 
         write.abort();
         assert!(write
@@ -416,128 +409,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waiting_leased_send_transfers_only_after_capacity_and_holds_through_write() {
+    async fn waiting_guarded_send_transfers_only_after_capacity_and_holds_through_write() {
         let (sender, mut receiver) = worker_framed_channel(1);
         sender.try_send(frame(1)).expect("filler fits");
-        let budget = OutstandingByteBudget::new(10);
-        let mut reservation = budget
-            .try_reserve(10)
-            .expect("valid amount")
-            .expect("capacity");
+        let budget = SlotBudget::new(1).unwrap();
+        let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
         let called = AtomicBool::new(false);
-        let mut send = Box::pin(sender.send_leased(frame(2), || {
+        let mut send = Box::pin(sender.send_guarded(frame(2), || {
             called.store(true, Ordering::SeqCst);
-            OutstandingByteReservation::transfer_to_frame([&mut reservation], 10)
-                .expect("the reservation covers the frame")
+            FrameGuard::new(reservation.clone())
         }));
         assert!(futures::poll!(&mut send).is_pending());
         assert!(!called.load(Ordering::SeqCst));
-        assert_eq!(budget.reserved(), 10);
+        assert_eq!(budget.reserved(), 1);
         drop(receiver.recv().await.expect("filler queued"));
         send.await.expect("the freed slot admits the frame");
         assert!(called.load(Ordering::SeqCst));
         drop(reservation);
-        assert_eq!(budget.reserved(), 10);
-        let queued = receiver.recv().await.expect("leased frame queued");
+        assert_eq!(budget.reserved(), 1);
+        let queued = receiver.recv().await.expect("guarded frame queued");
         let mut write = Box::pin(queued.write_with(|received| async move {
             assert_eq!(received, frame(2));
             std::future::pending::<()>().await;
         }));
         assert!(futures::poll!(&mut write).is_pending());
-        assert_eq!(budget.reserved(), 10);
+        assert_eq!(budget.reserved(), 1);
         drop(write);
         assert_eq!(budget.reserved(), 0);
     }
 
     #[tokio::test]
-    async fn cancelling_or_closing_a_leased_queue_wait_keeps_the_callers_reservation() {
+    async fn cancelling_or_closing_a_guarded_queue_wait_keeps_the_callers_reservation() {
         let (sender, mut receiver) = worker_framed_channel(1);
         sender.try_send(frame(1)).expect("filler fits");
-        let budget = OutstandingByteBudget::new(10);
-        let mut reservation = budget
-            .try_reserve(10)
-            .expect("valid amount")
-            .expect("capacity");
+        let budget = SlotBudget::new(1).unwrap();
+        let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
         let called = AtomicBool::new(false);
-        let mut send = Box::pin(sender.send_leased(frame(2), || {
+        let mut send = Box::pin(sender.send_guarded(frame(2), || {
             called.store(true, Ordering::SeqCst);
-            OutstandingByteReservation::transfer_to_frame([&mut reservation], 10)
-                .expect("the reservation covers the frame")
+            FrameGuard::new(reservation.clone())
         }));
         assert!(futures::poll!(&mut send).is_pending());
         drop(send);
         drop(receiver.recv().await.expect("filler queued"));
         assert!(!called.load(Ordering::SeqCst));
-        assert_eq!(budget.reserved(), 10);
+        assert_eq!(budget.reserved(), 1);
         drop(receiver);
         let result = sender
-            .send_leased(frame(2), || {
+            .send_guarded(frame(2), || {
                 called.store(true, Ordering::SeqCst);
-                OutstandingByteReservation::transfer_to_frame([&mut reservation], 10)
-                    .expect("the reservation covers the frame")
+                FrameGuard::new(reservation.clone())
             })
             .await;
-        assert!(matches!(result, Err(LeasedSendError::Closed(_))));
+        assert!(matches!(result, Err(GuardedSendError::Closed(_))));
         assert!(!called.load(Ordering::SeqCst));
-        assert_eq!(budget.reserved(), 10);
+        assert_eq!(budget.reserved(), 1);
         drop(reservation);
         assert_eq!(budget.reserved(), 0);
     }
 
     #[test]
-    fn failed_leased_send_does_not_create_a_lease() {
+    fn failed_guarded_send_does_not_create_a_guard() {
         let (sender, _receiver) = worker_framed_channel(1);
         sender.try_send(frame(1)).expect("the queue slot is free");
         let full_called = Arc::new(AtomicBool::new(false));
         let called_by_factory = full_called.clone();
 
-        let result = sender.try_send_leased(frame(2), move || {
+        let result = sender.try_send_guarded(frame(2), move || {
             called_by_factory.store(true, Ordering::SeqCst);
-            FrameLease::empty_for_test()
+            FrameGuard::new(Arc::new(()))
         });
 
-        assert!(matches!(result, Err(LeasedSendError::Full(_))));
+        assert!(matches!(result, Err(GuardedSendError::Full(_))));
         assert!(!full_called.load(Ordering::SeqCst));
 
         let (sender, receiver) = worker_framed_channel(1);
         drop(receiver);
         let closed_called = Arc::new(AtomicBool::new(false));
         let called_by_factory = closed_called.clone();
-        let result = sender.try_send_leased(frame(3), move || {
+        let result = sender.try_send_guarded(frame(3), move || {
             called_by_factory.store(true, Ordering::SeqCst);
-            FrameLease::empty_for_test()
+            FrameGuard::new(Arc::new(()))
         });
-        assert!(matches!(result, Err(LeasedSendError::Closed(_))));
+        assert!(matches!(result, Err(GuardedSendError::Closed(_))));
         assert!(!closed_called.load(Ordering::SeqCst));
 
         let (raw_sender, _raw_receiver) = mpsc::channel(1);
         let sender = FramedSend::new(raw_sender);
         let unsupported_called = Arc::new(AtomicBool::new(false));
         let called_by_factory = unsupported_called.clone();
-        let result = sender.try_send_leased(frame(4), move || {
+        let result = sender.try_send_guarded(frame(4), move || {
             called_by_factory.store(true, Ordering::SeqCst);
-            FrameLease::empty_for_test()
+            FrameGuard::new(Arc::new(()))
         });
-        assert!(matches!(result, Err(LeasedSendError::Unsupported(_))));
+        assert!(matches!(result, Err(GuardedSendError::Unsupported(_))));
         assert!(!unsupported_called.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn dropping_worker_queue_releases_queued_lease() {
+    fn dropping_worker_queue_releases_queued_guard() {
         let (sender, receiver) = worker_framed_channel(1);
-        let budget = OutstandingByteBudget::new(10);
-        let mut reservation = budget
-            .try_reserve(10)
-            .expect("the frame fits the budget")
-            .expect("the budget has capacity");
+        let budget = SlotBudget::new(1).unwrap();
+        let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
         sender
-            .try_send_leased(frame(1), || {
-                OutstandingByteReservation::transfer_to_frame([&mut reservation], 10)
-                    .expect("the reservation covers the frame")
-            })
+            .try_send_guarded(frame(1), || FrameGuard::new(reservation.clone()))
             .expect("the worker queue has a slot");
         drop(reservation);
-        assert_eq!(budget.reserved(), 10);
+        assert_eq!(budget.reserved(), 1);
 
         drop(receiver);
 

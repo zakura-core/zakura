@@ -1,99 +1,103 @@
 # GetBlocks serving regulation
 
-GetBlocks uses the shared regulation primitives to reserve work before a state
-read starts. These accounts cover GetBlocks across the node. Other message
-families do not yet share these accounts.
+GetBlocks admits bounded state work and holds its response producer until the
+query, result, and application writes finish. QUIC flow and congestion control
+provide transport backpressure. There is no serving byte-rate bucket or separate
+peer/node outstanding-byte budget.
 
-## Message filters
+## Message rules
 
-- **Safe:** the transport and codec enforce frame, count, height, and response
-  bounds before state work starts.
-- **Authorized:** serving requires the current authenticated session and its
-  initial status. Downloaded blocks follow the existing range reservations.
-- **Useful:** stale session work is cancelled before dispatch. A repeated completed
-  request can be a legitimate retry; serving does not infer what the requester
-  has stored or keep an unbounded history of requested blocks.
-- **Budgeted:** reusable slot and outstanding-byte primitives bound pending,
-  active, and retained response work. Capacity follows ownership until release.
+The GetBlocks declaration in the peer-message regulation draft selects Frame,
+Decode, and Work. The four categories organize message rules; they do not require
+every message to select every filter.
 
-QUIC supplies transport flow and congestion control. The pending queue also handles
-state-query and outstanding-response pressure; it is not a rate-limiting queue.
-A bounded amount of request staging lets incoming block responses on the same
-ordered stream make progress. Once staging fills, reads pause and transport
-backpressure applies. Message prioritization is outside this change.
+| Category | Current GetBlocks path |
+| --- | --- |
+| Safe | The codec bounds the request count and height range. Serving enforces the advertised response count and body-byte cap, including the encoded framing allowance. |
+| Authorized | Serving uses the authenticated session after its initial Status. Reservation checks belong to the Block and terminal responses on the requesting side. |
+| Useful | GetBlocks has no Relevant predicate in the draft. Stale session work is cancelled before dispatch. Completed requests may be legitimate retries; the server does not infer what the requester has stored. |
+| Budgeted | A session owns one response producer. Shared concurrency permits bound state queries, retained results, and writes; pending request state is bounded separately. |
 
-## Ownership and defaults
+This implements serving ownership, not complete conformance to the draft. The
+common message-declaration framework and its full reservation rules are not
+introduced here. In particular, the draft prohibits overlapping live GetBlocks
+ranges, while the current sender has reassignment and late-response behavior
+that needs a coordinated requester/responder change before that rule can be
+enforced. Serial response production does not reject overlapping queued requests.
+
+## Backpressure and ownership
+
+A request acquires a producer before dispatching its state query. The ledger,
+state worker, returned result, and queued frames share the same permit. Dequeuing
+a frame does not release it: the transport retains the frame's guard through
+`write_ordered_frame`. A pending QUIC write therefore keeps the producer occupied
+and prevents the next query for that session. This does not wait for a remote
+application acknowledgement; QUIC may retain bytes after accepting a write.
+
+There is at most one response being produced or written per live session. Its
+payload cap is
+`min(count * MAX_BLOCK_BYTES, advertised_max_response_bytes) + count + 9`.
+This is the response's wire bound, not a shared byte balance. Each queued frame
+shares the producer without acquiring additional capacity. The final owner
+releases capacity immediately, without a refill timer.
 
 | Resource | Default | Owner and release point |
 | --- | --- | --- |
 | Pending requests | 64 per session, 1,024 per node | Queue entry or admission task; released on admission or cancellation |
-| Active requests | 64 per node; per-session ceiling follows advertised inflight requests | Ledger, state worker, returned result, and pending terminal share ownership; released when their last owner drops |
-| Outstanding response payload | 64 MiB per session, 256 MiB per node | Reserved before the query; actual queued bytes transfer into frame leases, released after the application write completes or drops |
-| Query response deadline | 8 seconds | Ends response delivery; underlying state work keeps its charge until completion |
-| Terminal queue deadline | `request_timeout`, 8 seconds by default | Retains the terminal and request ownership while waiting; expiry closes the original session without a misconduct score |
-| Full pending queue deadline | `request_timeout`, 8 seconds by default | Closes the locally backpressured session without a peer misconduct score |
+| Response producers | 1 per session, 64 per node | Ledger, query, result, and transport frames; released when the last owner drops |
+| Query response deadline | 8 seconds | Ends response delivery; underlying state work retains its producer until completion |
+| Terminal queue deadline | `request_timeout`, 8 seconds | Retains ownership while waiting; expiry closes the original session without a misconduct score |
+| Full pending queue deadline | `request_timeout`, 8 seconds | Closes the locally backpressured session without a misconduct score |
 
-For a request clamped to `count` blocks, the reserved payload is
-`min(count * MAX_BLOCK_BYTES, advertised_max_response_bytes) + count + 9`.
-The extra bytes cover each Block discriminator and the terminal response.
-The default advertisement serves one block per response; the 32 MiB range byte ceiling also supports larger
-configured ranges. Configuration validation requires each capacity to fit the
-largest request allowed by that configuration. The local `max_response_bytes`
-setting must be at least `MAX_BLOCK_BYTES` (2,000,000 bytes), so an available
-valid first block can fit. Smaller settings fail configuration loading instead
-of producing an empty response for larger blocks.
+The advertised inflight window still permits pipelined requests. One producer
+serializes their execution; it does not turn a waiting request into a protocol
+violation. Admission rolls back partial reservations before waiting. A slot
+waiter uses the permit assigned to it on its next admission attempt.
 
-Admission rolls back partial reservations before waiting. A slot waiter retains
-the permit assigned to it and uses that permit in its next admission attempt.
-There is no strict fairness guarantee across the combined slot and byte accounts.
+Bounded request staging lets block responses received on the same ordered stream
+make progress while serving waits for a query or write. Once staging fills, the
+routine holds one additional decoded request and pauses reads. Thus there may be
+one blocked input per live session in addition to the 1,024 node queue slots.
+Completion handling, cancellation, and the queue deadline remain live. This
+staging is an implementation difference from the draft's instruction not to add a
+delayed-request queue; removing it requires preserving same-stream download
+progress, not merely removing a rate limiter.
 
-When the pending queue fills, the peer routine holds one additional decoded
-request and pauses stream reads. Completion processing, cancellation, and the
-local queue deadline remain live. Thus the 1,024 node slots bound fully retained
-queue entries; there can also be one blocked input per live session. That input
-may own a session slot while waiting for a node slot.
+Ledger closure and the one-time query claim share synchronized state. Closure
+before the claim prevents the read. A claimed read drains after timeout or
+disconnect because dropping its awaiter does not stop blocking state work. A read
+that never completes retains capacity; the timeout cannot terminate the storage
+operation. Old session owners remain counted until they finish even after a
+replacement session connects.
 
-The query lease follows the dispatched action, the underlying state future, and
-the returned blocks. Dropping request ownership cancels delivery. Ledger closure and the one-time
-query claim share a synchronized state. Closure before the claim prevents the
-read; a successful claim retains capacity even if closure immediately follows.
-A claimed read drains even after timeout or disconnect,
-because dropping its awaiter would not stop blocking state work. Each lease
-authorizes at most one query. A read that never completes keeps its capacity;
-the timeout cannot promise to terminate the underlying storage operation.
+A full outbound queue can truncate a response to the prefix already queued. Its
+terminal response waits independently of other reactor work, tied to the original
+session and retaining its producer. Cancellation, queue closure, shutdown, or the
+local deadline ends that wait. Successful enqueue retains ownership through the
+application write.
 
-A full outbound queue can truncate a block response to the prefix already
-queued, but its `BlocksDone` or `RangeUnavailable` is retained until queue space
-is available. Each terminal wait owns the request's active slot and remaining
-reservations, so at most the configured active-request limit can wait. These
-waits run independently of other reactor work and stay tied to the original
-session. Cancellation, queue closure, reactor shutdown, or the local deadline
-ends the wait. Successful enqueue transfers terminal bytes to the transport;
-those bytes remain charged until the application write completes or drops.
+## Resource boundary
 
-## Memory boundary
+The response wire bound does not measure decoded block memory or total process
+RSS. State decoding, serialization temporaries, and a block fetched while finding
+the range boundary can add memory. At defaults, each response contains at most
+one 2,000,000-byte block plus framing; larger configured ranges remain capped by
+32 MiB of bodies. The transport separately allows a 32 MiB send window per
+connection. Connection limits and existing decode bounds remain relevant.
 
-The outstanding-byte limit counts serialized response payload reservations,
-not total process resident memory. Decoded blocks, temporary serialization
-buffers, and a block fetched while discovering the range byte boundary can add
-memory outside that count. Queued frames retain their payload leases through
-the application write, but QUIC can retain data after that handoff. Its separate
-send window is 32 MiB per connection, not a node-wide GetBlocks memory budget.
-Peer/session limits therefore remain part of the resource envelope.
+Message prioritization is outside this change. These controls do not establish
+consensus progress under every combined CPU, storage, and network workload.
 
-## Fixed local measurement
+## Local comparison
 
-An ignored measurement exercises admission, serialization, frame leases, and
-immediate draining of an in-memory transport. It reuses committed mainnet
-fixtures plus an existing fixed-shape near-limit serialization fixture. The
-synthetic fixture is not a consensus-valid chain. Each case sends 32 one-block
-responses per peer, round-robin, with and without regulation.
+The ignored `getblocks_serving_comparison` test uses real local Iroh connections,
+a single server, and one or four downloading nodes. Each downloads 128 synthetic
+64,000-byte blocks through the production block-sync path. The existing harness
+uses mock storage and apply operations, a 64-request window, and bounded transport
+queues. This measures serving and transport behavior, not RocksDB throughput or
+full mainnet sync time. Run the identical test on main and the candidate:
 
 ```sh
-cargo test --locked -p zakura-network --lib serving_fixed_workload_measurement -- --ignored --nocapture
+ZAKURA_COMPARISON_READERS=1 cargo test --locked -p zakura-network --lib getblocks_serving_comparison -- --ignored --nocapture
+ZAKURA_COMPARISON_READERS=4 cargo test --locked -p zakura-network --lib getblocks_serving_comparison -- --ignored --nocapture
 ```
-
-This measurement excludes disk reads and real QUIC flow control. Use it to check
-application overhead and ownership cleanup, not to choose a serving bandwidth cap.
-Admission has no byte-rate allowance or refill timer: completed work and drained
-frames release capacity for the next request.

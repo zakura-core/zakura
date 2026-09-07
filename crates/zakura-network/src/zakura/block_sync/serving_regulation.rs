@@ -2,17 +2,20 @@
 //!
 //! This module turns the generic regulation primitives into one message policy.
 //! A decoded request first owns bounded pending state. Its admission task then
-//! reserves worst-case peer and node work before the state query starts. Unused
-//! response capacity is refunded, while bytes actually queued for a peer remain
-//! owned by transport frame leases until their writes finish or are dropped.
+//! acquires a response producer before the state query starts. The query, result,
+//! and queued frames share that producer until the last owner drops. A blocked
+//! transport writer therefore prevents another query for the same session.
 
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Weak;
 
-use super::{config::*, wire::MAX_BS_BLOCKS_PER_REQUEST, *};
-use crate::zakura::regulation::{
-    FrameLease, OutstandingByteBudget, OutstandingByteReservation, SlotBudget, SlotPermit,
+#[cfg(test)]
+use super::wire::MAX_BS_BLOCKS_PER_REQUEST;
+use super::{config::*, *};
+use crate::zakura::{
+    regulation::{SlotBudget, SlotPermit},
+    transport::FrameGuard,
 };
 
 /// The bounded work declaration for one decoded request.
@@ -76,18 +79,6 @@ pub(super) fn validate_config(config: &ZakuraBlockSyncConfig) -> Result<(), &'st
         return Err("get_blocks_regulation.node_pending_requests must cover one session queue");
     }
 
-    let largest = serving_cost(config, MAX_BS_BLOCKS_PER_REQUEST)?;
-    if regulation.peer_outstanding_bytes < largest.response_cap {
-        return Err(
-            "get_blocks_regulation.peer_outstanding_bytes must cover the largest legal response",
-        );
-    }
-    if regulation.node_outstanding_bytes < largest.response_cap {
-        return Err(
-            "get_blocks_regulation.node_outstanding_bytes must cover the largest legal response",
-        );
-    }
-
     Ok(())
 }
 
@@ -105,7 +96,6 @@ pub(super) struct GetBlocksServingRegulator {
 #[derive(Debug)]
 struct RegulatorInner {
     config: ZakuraBlockSyncConfig,
-    node_outstanding: OutstandingByteBudget,
     node_active: SlotBudget,
     node_pending: SlotBudget,
     session_pending_capacity: usize,
@@ -115,7 +105,6 @@ struct RegulatorInner {
 
 #[derive(Debug)]
 struct SessionResources {
-    outstanding: OutstandingByteBudget,
     pending: SlotBudget,
     active: SlotBudget,
 }
@@ -128,7 +117,6 @@ impl GetBlocksServingRegulator {
         let session_pending_capacity = pending_input_capacity_per_session(&config);
         Self {
             inner: Arc::new(RegulatorInner {
-                node_outstanding: OutstandingByteBudget::new(regulation.node_outstanding_bytes),
                 node_active: SlotBudget::new(regulation.node_active_requests)
                     .expect("GetBlocks configuration validates the active-request capacity"),
                 node_pending: SlotBudget::new(regulation.node_pending_requests)
@@ -144,19 +132,11 @@ impl GetBlocksServingRegulator {
     /// Create one session policy within the node admission bounds.
     pub(super) fn session(&self, peer: ZakuraPeerId, session_id: u64) -> GetBlocksServingSession {
         let resources = Arc::new(SessionResources {
-            outstanding: OutstandingByteBudget::new(
-                self.inner
-                    .config
-                    .get_blocks_regulation
-                    .peer_outstanding_bytes,
-            ),
             pending: SlotBudget::new(self.inner.session_pending_capacity)
                 .expect("GetBlocks configuration validates the pending-request capacity"),
-            active: SlotBudget::new(
-                usize::try_from(self.inner.config.advertised_max_inflight_requests())
-                    .expect("the GetBlocks in-flight limit fits supported targets"),
-            )
-            .expect("the clamped GetBlocks in-flight limit fits Tokio's semaphore"),
+            // One producer keeps response generation behind this session's writer.
+            // The advertised inflight window still permits pipelined requests.
+            active: SlotBudget::new(1).expect("one producer fits the semaphore"),
         });
         #[cfg(test)]
         self.inner
@@ -180,26 +160,21 @@ impl GetBlocksServingRegulator {
             .sessions
             .lock()
             .expect("GetBlocks session-resource mutex should not be poisoned");
-        let mut peer_outstanding = 0u64;
-        let mut max_peer_outstanding = 0u64;
+        let mut session_active = 0usize;
         let mut session_pending = 0usize;
         sessions.retain(|session| {
             let Some(session) = session.upgrade() else {
                 return false;
             };
-            let outstanding = session.outstanding.reserved();
+            session_active += session.active.reserved();
             let pending = session.pending.reserved();
-            peer_outstanding = peer_outstanding.saturating_add(outstanding);
-            max_peer_outstanding = max_peer_outstanding.max(outstanding);
             session_pending = session_pending.saturating_add(pending);
             true
         });
         ServingRegulationSnapshot {
-            node_outstanding: self.inner.node_outstanding.reserved(),
             node_active: self.inner.node_active.reserved(),
             node_pending: self.inner.node_pending.reserved(),
-            peer_outstanding,
-            max_peer_outstanding,
+            session_active,
             session_pending,
         }
     }
@@ -285,23 +260,10 @@ impl GetBlocksServingSession {
             &self.regulator.inner.node_active,
             &mut acquired,
         )?;
-        let node_outstanding = reserve_outstanding(
-            BoundKind::NodeOutstanding,
-            &self.regulator.inner.node_outstanding,
-            cost.response_cap,
-        )?;
-        let peer_outstanding = reserve_outstanding(
-            BoundKind::PeerOutstanding,
-            &self.resources.outstanding,
-            cost.response_cap,
-        )?;
-
         Ok(AdmissionAttempt {
             peer: self.peer.clone(),
             session_id: self.session_id,
             response_cap: cost.response_cap,
-            node_outstanding,
-            peer_outstanding,
             _peer_active: peer_active,
             _node_active: node_active,
             _session_resources: self.resources.clone(),
@@ -330,18 +292,6 @@ fn reserve_slot(
     budget
         .try_reserve()
         .ok_or_else(|| AdmissionBlocked::slot(kind, budget.clone()))
-}
-
-fn reserve_outstanding(
-    kind: BoundKind,
-    budget: &OutstandingByteBudget,
-    bytes: u64,
-) -> Result<OutstandingByteReservation, AdmissionBlocked> {
-    match budget.try_reserve(bytes) {
-        Ok(Some(reservation)) => Ok(reservation),
-        Ok(None) => Err(AdmissionBlocked::outstanding(kind, budget.clone(), bytes)),
-        Err(error) => panic!("validated GetBlocks response fits its outstanding budget: {error}"),
-    }
 }
 
 /// The pending bound currently delaying one decoded request.
@@ -408,7 +358,7 @@ impl PendingGetBlocksRequest {
 #[derive(Clone, Debug)]
 pub(super) struct AdmissionBlocked {
     kind: BoundKind,
-    wait: AdmissionWait,
+    budget: SlotBudget,
 }
 
 /// Stable resource names used by low-cardinality delay observations.
@@ -416,8 +366,6 @@ pub(super) struct AdmissionBlocked {
 pub(super) enum BoundKind {
     PeerActive,
     NodeActive,
-    NodeOutstanding,
-    PeerOutstanding,
 }
 
 impl BoundKind {
@@ -425,34 +373,13 @@ impl BoundKind {
         match self {
             Self::PeerActive => "peer_active",
             Self::NodeActive => "node_active",
-            Self::NodeOutstanding => "node_outstanding",
-            Self::PeerOutstanding => "peer_outstanding",
         }
     }
-}
-
-#[derive(Clone, Debug)]
-enum AdmissionWait {
-    Outstanding {
-        budget: OutstandingByteBudget,
-        bytes: u64,
-    },
-    Slot(SlotBudget),
 }
 
 impl AdmissionBlocked {
-    fn outstanding(kind: BoundKind, budget: OutstandingByteBudget, bytes: u64) -> Self {
-        Self {
-            kind,
-            wait: AdmissionWait::Outstanding { budget, bytes },
-        }
-    }
-
     fn slot(kind: BoundKind, budget: SlotBudget) -> Self {
-        Self {
-            kind,
-            wait: AdmissionWait::Slot(budget),
-        }
+        Self { kind, budget }
     }
 
     pub(super) fn kind(&self) -> BoundKind {
@@ -461,19 +388,10 @@ impl AdmissionBlocked {
 
     /// Wait only for the bound that blocked the previous atomic attempt.
     pub(super) async fn wait(self) -> Option<AcquiredAdmissionSlot> {
-        match self.wait {
-            AdmissionWait::Outstanding { budget, bytes } => budget
-                .wait_for(bytes)
-                .await
-                .expect("validated GetBlocks response fits the outstanding budget"),
-            AdmissionWait::Slot(budget) => {
-                return Some(AcquiredAdmissionSlot {
-                    kind: self.kind,
-                    permit: budget.reserve().await,
-                })
-            }
-        }
-        None
+        Some(AcquiredAdmissionSlot {
+            kind: self.kind,
+            permit: self.budget.reserve().await,
+        })
     }
 }
 
@@ -484,8 +402,6 @@ pub(super) struct AdmissionAttempt {
     peer: ZakuraPeerId,
     session_id: u64,
     response_cap: u64,
-    node_outstanding: OutstandingByteReservation,
-    peer_outstanding: OutstandingByteReservation,
     _peer_active: SlotPermit,
     _node_active: SlotPermit,
     _session_resources: Arc<SessionResources>,
@@ -506,13 +422,9 @@ impl AdmissionAttempt {
         GetBlocksServingPermit {
             query: Arc::new(QueryLifecycle::default()),
             resources: Arc::new(StdMutex::new(ServingResources {
-                peer: self.peer,
-                session_id: self.session_id,
                 request_id: None,
                 response_cap: self.response_cap,
                 transferred: 0,
-                node_outstanding: self.node_outstanding,
-                peer_outstanding: self.peer_outstanding,
                 _peer_active: self._peer_active,
                 _node_active: self._node_active,
                 _session_resources: self._session_resources,
@@ -531,13 +443,9 @@ pub(super) struct GetBlocksServingPermit {
 
 #[derive(Debug)]
 struct ServingResources {
-    peer: ZakuraPeerId,
-    session_id: u64,
     request_id: Option<BlockRangeRequestId>,
     response_cap: u64,
     transferred: u64,
-    node_outstanding: OutstandingByteReservation,
-    peer_outstanding: OutstandingByteReservation,
     _peer_active: SlotPermit,
     _node_active: SlotPermit,
     _session_resources: Arc<SessionResources>,
@@ -554,45 +462,16 @@ impl ServingResources {
 
     /// Return whether an encoded response frame fits every remaining balance.
     pub(super) fn can_transfer_frame(&self, bytes: u64) -> bool {
-        self.node_outstanding.remaining() >= bytes && self.peer_outstanding.remaining() >= bytes
+        bytes <= self.response_cap.saturating_sub(self.transferred)
     }
 
-    /// Transfer actual response bytes into a transport-owned frame lease.
-    pub(super) fn transfer_frame(&mut self, bytes: u64) -> FrameLease {
+    /// Account encoded payload against this request's advertised response cap.
+    fn record_frame(&mut self, bytes: u64) {
         assert!(
             self.can_transfer_frame(bytes),
-            "encoded GetBlocks response bytes stay within the admitted cap"
+            "encoded response fits its declared cap"
         );
-        let lease = OutstandingByteReservation::transfer_to_frame(
-            [&mut self.node_outstanding, &mut self.peer_outstanding],
-            bytes,
-        )
-        .expect("prechecked response bytes fit both outstanding reservations");
-        self.transferred = self
-            .transferred
-            .checked_add(bytes)
-            .expect("transferred bytes cannot exceed the validated response cap");
-        lease
-    }
-
-    #[cfg(test)]
-    pub(super) fn refunded_response_bytes(&self) -> u64 {
-        self.response_cap.saturating_sub(self.transferred)
-    }
-}
-
-impl Drop for ServingResources {
-    fn drop(&mut self) {
-        let refunded = self.response_cap.saturating_sub(self.transferred);
-        metrics::counter!("sync.block.serving.refunded_bytes").increment(refunded);
-        tracing::trace!(
-            peer = ?self.peer,
-            session_id = self.session_id,
-            request_id = ?self.request_id,
-            queued_bytes = self.transferred,
-            refunded_bytes = refunded,
-            "settled regulated GetBlocks request"
-        );
+        self.transferred += bytes;
     }
 }
 
@@ -611,11 +490,13 @@ impl GetBlocksServingPermit {
             .can_transfer_frame(bytes)
     }
 
-    pub(super) fn transfer_frame(&mut self, bytes: u64) -> FrameLease {
+    /// Keep the response producer occupied through the transport write.
+    pub(super) fn frame_guard(&mut self, bytes: u64) -> FrameGuard {
         self.resources
             .lock()
-            .expect("a panic in serving accounting invalidates its balances")
-            .transfer_frame(bytes)
+            .expect("response accounting is not poisoned")
+            .record_frame(bytes);
+        FrameGuard::new(self.resources.clone())
     }
 
     /// Share capacity with the dispatched query and its response, without charging twice.
@@ -624,14 +505,6 @@ impl GetBlocksServingPermit {
             _resources: self.resources.clone(),
             query: self.query.clone(),
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn refunded_response_bytes(&self) -> u64 {
-        self.resources
-            .lock()
-            .expect("test accounting is not poisoned")
-            .refunded_response_bytes()
     }
 }
 
@@ -727,11 +600,9 @@ pub(crate) fn query_lease_for_test() -> BlockRangeQueryLease {
 #[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct ServingRegulationSnapshot {
-    pub(super) node_outstanding: u64,
     pub(super) node_active: usize,
     pub(super) node_pending: usize,
-    pub(super) peer_outstanding: u64,
-    pub(super) max_peer_outstanding: u64,
+    pub(super) session_active: usize,
     pub(super) session_pending: usize,
 }
 
@@ -758,16 +629,15 @@ mod tests {
             "cloning a query never authorizes another read"
         );
         let result = query.clone();
-        let charged = regulator.snapshot().node_outstanding;
+
         drop(permit);
         assert!(query.is_cancelled());
         assert_eq!(regulator.snapshot().node_active, 1);
-        assert_eq!(regulator.snapshot().node_outstanding, charged);
+
         drop(query);
-        assert_eq!(regulator.snapshot().node_outstanding, charged);
+
         drop(result);
         assert_eq!(regulator.snapshot().node_active, 0);
-        assert_eq!(regulator.snapshot().node_outstanding, 0);
     }
 
     #[test]
@@ -813,7 +683,7 @@ mod tests {
             let session = regulator.session(peer(9), 9);
             let permit = session.try_admit(1).unwrap().commit();
             let lease = permit.query_lease();
-            let charged = regulator.snapshot().node_outstanding;
+
             let barrier = Barrier::new(4);
 
             thread::scope(|scope| {
@@ -842,10 +712,9 @@ mod tests {
                 "ledger closure permanently prevents new claims"
             );
             assert_eq!(regulator.snapshot().node_active, 1);
-            assert_eq!(regulator.snapshot().node_outstanding, charged);
+
             drop(lease);
             assert_eq!(regulator.snapshot().node_active, 0);
-            assert_eq!(regulator.snapshot().node_outstanding, 0);
         }
     }
 
@@ -858,7 +727,10 @@ mod tests {
         let regulator = GetBlocksServingRegulator::new(config);
         let session = regulator.session(peer(10), 10);
         let owner = session.try_admit(1).expect("one request fits").commit();
-        let blocked = session.try_admit(1).expect_err("the active slot is owned");
+        let waiting_session = regulator.session(peer(11), 11);
+        let blocked = waiting_session
+            .try_admit(1)
+            .expect_err("the active slot is owned");
         assert_eq!(blocked.kind(), BoundKind::NodeActive);
         let wait = blocked.wait();
         tokio::pin!(wait);
@@ -867,7 +739,7 @@ mod tests {
         let acquired = tokio::time::timeout(Duration::from_secs(1), wait)
             .await
             .expect("released capacity reaches its waiter");
-        let admitted = session
+        let admitted = waiting_session
             .try_admit_with_slot(1, acquired)
             .expect("the retry retains its assigned slot")
             .commit();
@@ -967,7 +839,7 @@ mod tests {
                         }
                     }
                     let elapsed = started.elapsed();
-                    assert_eq!(regulator.snapshot().node_outstanding, 0);
+
                     assert_eq!(regulator.snapshot().node_active, 0);
                     eprintln!("serving_measurement block={label} body_bytes={} peers={peers} responses={} regulated={regulated} elapsed_ms={:.3}", body_bytes, u32::from(peers) * 32, elapsed.as_secs_f64() * 1000.0);
                 }
@@ -1004,33 +876,6 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_a_bound_that_cannot_admit_the_largest_request() {
-        let mut config = ZakuraBlockSyncConfig::default();
-        let largest = serving_cost(&config, MAX_BS_BLOCKS_PER_REQUEST)
-            .expect("the default cost is representable");
-        config.get_blocks_regulation.node_outstanding_bytes = largest.response_cap - 1;
-
-        assert_eq!(
-            validate_config(&config),
-            Err("get_blocks_regulation.node_outstanding_bytes must cover the largest legal response")
-        );
-
-        let mut small_response = ZakuraBlockSyncConfig {
-            max_response_bytes: u32::try_from(block::MAX_BLOCK_BYTES).unwrap(),
-            ..ZakuraBlockSyncConfig::default()
-        };
-        let largest = serving_cost(&small_response, MAX_BS_BLOCKS_PER_REQUEST)
-            .expect("the minimum response policy is representable");
-        small_response.get_blocks_regulation.peer_outstanding_bytes = largest.response_cap;
-        small_response.get_blocks_regulation.node_outstanding_bytes = largest.response_cap;
-        assert_eq!(
-            validate_config(&small_response),
-            Ok(()),
-            "the minimum response cap and its framing allowance admit any single block",
-        );
-    }
-
-    #[test]
     fn config_rejects_nonprogressing_or_unbounded_admission_settings() {
         let base = ZakuraBlockSyncConfig::default();
 
@@ -1058,23 +903,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn provisional_admission_rolls_back_every_earlier_reservation() {
-        let mut config = ZakuraBlockSyncConfig::default();
-        let cost = serving_cost(&config, 1).expect("the default cost is representable");
-        config.get_blocks_regulation.peer_outstanding_bytes = cost.response_cap;
-        let regulator = GetBlocksServingRegulator::new(config.clone());
+        let config = ZakuraBlockSyncConfig::default();
+        let regulator = GetBlocksServingRegulator::new(config);
         let session = regulator.session(peer(1), 1);
         let other_peer = regulator.session(peer(7), 1);
         let first = session.try_admit(1).expect("the first request fits");
         let before = regulator.snapshot();
         let blocked = session
             .try_admit(1)
-            .expect_err("the peer outstanding budget is occupied by the first request");
-        assert_eq!(blocked.kind(), BoundKind::PeerOutstanding);
+            .expect_err("the peer producer is occupied by the first request");
+        assert_eq!(blocked.kind(), BoundKind::PeerActive);
         assert_eq!(regulator.snapshot(), before);
 
         let independent = other_peer
             .try_admit(1)
-            .expect("one peer's outstanding bound does not consume another peer's capacity");
+            .expect("one peer's producer does not consume another peer's capacity");
         assert_eq!(regulator.snapshot().node_active, 2);
         drop(independent);
         drop(first);
@@ -1090,19 +933,11 @@ mod tests {
                 .try_admit(1)
                 .expect("released capacity admits work")
                 .commit();
-            let reserved = regulator.snapshot().node_outstanding;
-            let frame = permit.transfer_frame(GET_BLOCKS_TERMINAL_PAYLOAD_BYTES);
-            assert_eq!(
-                permit.refunded_response_bytes(),
-                reserved - GET_BLOCKS_TERMINAL_PAYLOAD_BYTES
-            );
+            let frame = permit.frame_guard(GET_BLOCKS_TERMINAL_PAYLOAD_BYTES);
             drop(permit);
-            assert_eq!(
-                regulator.snapshot().node_outstanding,
-                GET_BLOCKS_TERMINAL_PAYLOAD_BYTES
-            );
+            assert_eq!(regulator.snapshot().node_active, 1);
             drop(frame);
-            assert_eq!(regulator.snapshot().node_outstanding, 0);
+
             assert_eq!(regulator.snapshot().node_active, 0);
         }
         assert_eq!(
@@ -1113,22 +948,24 @@ mod tests {
     }
 
     #[test]
-    fn frame_lease_keeps_actual_bytes_outstanding_after_request_settlement() {
-        let config = ZakuraBlockSyncConfig::default();
-        let regulator = GetBlocksServingRegulator::new(config);
+    fn frames_keep_the_producer_until_the_last_write_finishes() {
+        let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
         let session = regulator.session(peer(3), 3);
-        let mut permit = session.try_admit(1).expect("the request fits").commit();
-        let lease = permit.transfer_frame(9);
+        let other = regulator.session(peer(4), 4);
+        let mut permit = session.try_admit(1).unwrap().commit();
+        let block = permit.frame_guard(100);
+        let terminal = permit.frame_guard(9);
         drop(permit);
-
-        let snapshot = regulator.snapshot();
-        assert_eq!(snapshot.node_outstanding, 9);
-        assert_eq!(snapshot.peer_outstanding, 9);
-        assert_eq!(snapshot.max_peer_outstanding, 9);
-        assert_eq!(snapshot.node_active, 0);
-
-        drop(lease);
-        assert_eq!(regulator.snapshot().node_outstanding, 0);
+        assert_eq!(
+            session.try_admit(1).unwrap_err().kind(),
+            BoundKind::PeerActive
+        );
+        assert!(other.try_admit(1).is_ok());
+        drop(block);
+        assert!(session.try_admit(1).is_err());
+        drop(terminal);
+        assert_eq!(regulator.snapshot().node_active, 0);
+        assert!(session.try_admit(1).is_ok());
     }
 
     #[test]

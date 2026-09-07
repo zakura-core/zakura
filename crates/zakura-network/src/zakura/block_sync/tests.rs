@@ -14236,9 +14236,7 @@ async fn delayed_serving_keeps_same_stream_block_download_live() {
         ..ZakuraBlockSyncConfig::default()
     };
     config.peer_limits.outbound_queue_depth = 16;
-    let serving_cost = serving_regulation::serving_cost(&config, 1)
-        .expect("one-block serving work is representable");
-    config.get_blocks_regulation.node_outstanding_bytes = serving_cost.response_cap;
+    config.get_blocks_regulation.node_active_requests = 1;
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
@@ -14406,9 +14404,7 @@ async fn stale_session_serving_attempt_rolls_back_without_state_work() {
         Duration::from_secs(1),
         || {
             let snapshot = wiring.serving_regulator.snapshot();
-            snapshot.node_active == 0
-                && snapshot.node_outstanding == 0
-                && snapshot.node_pending == 0
+            snapshot.node_active == 0 && snapshot.node_pending == 0
         },
     )
     .await
@@ -14920,7 +14916,6 @@ async fn reactor_full_serving_queue_retains_partial_response_terminal() {
         saturated.node_active, 1,
         "the pending terminal retains its active slot"
     );
-    assert!(saturated.node_outstanding > 0);
 
     for expected in &blocks[..2] {
         assert_eq!(
@@ -14940,7 +14935,7 @@ async fn reactor_full_serving_queue_retains_partial_response_terminal() {
     );
     await_until("terminal ownership settles", Duration::from_secs(1), || {
         let snapshot = wiring.serving_regulator.snapshot();
-        snapshot.node_active == 0 && snapshot.node_outstanding == 0
+        snapshot.node_active == 0
     })
     .await
     .expect("all response ownership returns after the queue drains");
@@ -15180,7 +15175,7 @@ async fn check_empty_terminal_wait(end: TerminalWaitEnd, driver_failed: bool) {
         Duration::from_secs(1),
         || {
             let snapshot = wiring.serving_regulator.snapshot();
-            snapshot.node_active == 0 && snapshot.node_outstanding == 0
+            snapshot.node_active == 0
         },
     )
     .await
@@ -15308,7 +15303,6 @@ async fn closed_serving_queue_releases_request_ownership() {
             let snapshot = wiring.serving_regulator.snapshot();
             handle.peer_snapshot().outbound_peers == 0
                 && snapshot.node_active == 0
-                && snapshot.node_outstanding == 0
                 && snapshot.node_pending == 0
         },
     )

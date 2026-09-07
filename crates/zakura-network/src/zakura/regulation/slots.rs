@@ -54,6 +54,11 @@ impl SlotBudget {
             .saturating_sub(self.permits.available_permits())
     }
 
+    /// Whether two handles draw from the same capacity pool.
+    pub(super) fn same_budget(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.permits, &other.permits)
+    }
+
     /// Reserve one slot without waiting.
     pub(crate) fn try_reserve(&self) -> Option<SlotPermit> {
         self.permits

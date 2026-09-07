@@ -595,25 +595,31 @@ impl PeerRoutine {
         };
         // Measured here, on the per-peer task, so the body size never has to be
         // recomputed by re-serializing the block on another thread (A1).
-        let (msg, raw_block_payload) =
-            match BlockSyncMessage::decode_frame_with_raw_block_payload(frame) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    // A malformed frame is `MalformedMessage` misbehavior AND a fatal
-                    // protocol reject for the whole connection. Report via the shared
-                    // channel, then reject; the report is best-effort and never blocks.
-                    let protocol_error =
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
-                    tracing::debug!(peer = ?self.peer, ?error, "malformed Zakura block-sync frame");
-                    let _ = self
-                        .routine_to_reactor
-                        .try_send(RoutineToReactor::Misbehavior {
-                            peer: self.peer.clone(),
-                            reason: BlockSyncMisbehavior::MalformedMessage,
-                        });
-                    return Err(SinkReject::protocol(protocol_error));
-                }
-            };
+        let decoded = if frame.message_type == u16::from(super::wire::MSG_BS_GET_BLOCKS) {
+            self.serving
+                .decode_request(frame)
+                .map(|message| (message, None))
+        } else {
+            BlockSyncMessage::decode_frame_with_raw_block_payload(frame)
+        };
+        let (msg, raw_block_payload) = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                // A malformed frame is `MalformedMessage` misbehavior AND a fatal
+                // protocol reject for the whole connection. Report via the shared
+                // channel, then reject; the report is best-effort and never blocks.
+                let protocol_error =
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
+                tracing::debug!(peer = ?self.peer, ?error, "malformed Zakura block-sync frame");
+                let _ = self
+                    .routine_to_reactor
+                    .try_send(RoutineToReactor::Misbehavior {
+                        peer: self.peer.clone(),
+                        reason: BlockSyncMisbehavior::MalformedMessage,
+                    });
+                return Err(SinkReject::protocol(protocol_error));
+            }
+        };
         let body_wire_bytes = msg.block_body_wire_bytes(frame_payload_bytes);
         self.trace_message_received(&msg);
 
@@ -2356,10 +2362,7 @@ async fn admit_and_forward_get_blocks(
 ) {
     let mut acquired_slot = None;
     loop {
-        let admission = match acquired_slot.take() {
-            Some(slot) => serving.try_admit_with_slot(request.count(), Some(slot)),
-            None => serving.try_admit(request.count()),
-        };
+        let admission = serving.try_admit_request(&request, acquired_slot.take());
         let attempt = match admission {
             Ok(attempt) => attempt,
             Err(blocked) => {

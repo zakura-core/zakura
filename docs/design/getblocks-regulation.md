@@ -19,11 +19,36 @@ every message to select every filter.
 | Budgeted | A session owns one response producer. Shared concurrency permits bound state queries, retained results, and writes; pending request state is bounded separately. |
 
 This implements serving ownership, not complete conformance to the draft. The
-common message-declaration framework and its full reservation rules are not
-introduced here. In particular, the draft prohibits overlapping live GetBlocks
+complete filter inventory and its full reservation rules are not introduced here. In particular, the draft prohibits overlapping live GetBlocks
 ranges, while the current sender has reassignment and late-response behavior
 that needs a coordinated requester/responder change before that rule can be
 enforced. Serial response production does not reject overlapping queued requests.
+
+## Shared request admission
+
+`GetBlocksPolicy` declares the request codec, encoded response bound, and one
+response producer per session. The peer routine uses this declaration to decode
+GetBlocks with the existing codec before retaining it. The session still checks
+its initial Status before admission; block ranges, query dispatch, and terminal
+responses stay in block sync.
+
+`RequestAdmission` applies a finite request policy to session and node capacity.
+It acquires all required slots or rolls back partial acquisition, and a delayed
+caller can reuse the permit supplied by its original capacity pool. Committing
+admission creates a `ResponsePermit`. Execution leases and transport frame guards
+share its work capacity until their last owner finishes. Closing the response
+prevents an unclaimed execution from starting, while already running work drains.
+
+The shared layer does not queue messages, select priorities, or define subscription
+lifetimes. Its callers select capacity pools explicitly; reusing the code does not
+make unrelated message policies share one pool. Existing GetBlocks pending-request
+staging remains separate while its ordered-stream behavior is reviewed.
+
+A test-only GetPeers adapter uses the production discovery codec and a one-frame
+Peers response to exercise the same admission and write-ownership path. This checks
+the finite-request abstraction against another message; it does not enable or
+qualify discovery regulation. The complete declaration/filter inventory in the
+draft remains future work.
 
 ## Backpressure and ownership
 

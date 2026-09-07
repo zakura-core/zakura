@@ -84,8 +84,12 @@ impl BlockSyncMessage {
             Self::GetBlocks {
                 start_height,
                 count,
+            } => {
+                validate_get_blocks_range(*start_height, *count)?;
+                write_height(&mut bytes, *start_height)?;
+                bytes.write_u32::<LittleEndian>(*count)?;
             }
-            | Self::RangeUnavailable {
+            Self::RangeUnavailable {
                 start_height,
                 count,
             } => {
@@ -122,7 +126,7 @@ impl BlockSyncMessage {
             MSG_BS_GET_BLOCKS => {
                 let start_height = read_height(&mut reader)?;
                 let count = reader.read_u32::<LittleEndian>()?;
-                validate_block_count(count)?;
+                validate_get_blocks_range(start_height, count)?;
                 Self::GetBlocks {
                     start_height,
                     count,
@@ -225,6 +229,23 @@ impl BlockSyncMessage {
                 .unwrap_or(u64::MAX)
         })
     }
+}
+
+/// Every requested height must fit, even if serving later selects a shorter prefix.
+fn validate_get_blocks_range(
+    start_height: block::Height,
+    count: u32,
+) -> Result<(), BlockSyncWireError> {
+    validate_block_count(count)?;
+    // Count is nonzero after validation; the range includes its starting height.
+    let end_height = start_height
+        .0
+        .checked_add(count - 1)
+        .ok_or(BlockSyncWireError::NumericOverflow("GetBlocks range end"))?;
+    if end_height > block::Height::MAX.0 {
+        return Err(BlockSyncWireError::HeightOutOfRange(end_height));
+    }
+    Ok(())
 }
 
 pub(super) fn validate_block_count(count: u32) -> Result<(), BlockSyncWireError> {

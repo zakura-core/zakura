@@ -110,6 +110,52 @@ mod tests {
     }
 
     #[test]
+    fn get_blocks_range_accepts_the_last_supported_height() {
+        let policy = GetBlocksPolicy::new(&ZakuraBlockSyncConfig::default());
+        for count in 1..=MAX_BS_BLOCKS_PER_REQUEST {
+            let start_height = block::Height(block::Height::MAX.0 - (count - 1));
+            let request = policy.decode(frame(start_height, count)).unwrap();
+            assert_eq!(request.start_height, start_height);
+            assert_eq!(request.count, count);
+        }
+    }
+
+    #[test]
+    fn get_blocks_range_rejects_an_end_above_the_supported_height() {
+        let policy = GetBlocksPolicy::new(&ZakuraBlockSyncConfig::default());
+        for count in 2..=MAX_BS_BLOCKS_PER_REQUEST {
+            let valid_start = block::Height(block::Height::MAX.0 - (count - 1));
+            let invalid_start = block::Height(valid_start.0 + 1);
+            // Shift a legal range forward one height without using the encoder
+            // to build the invalid input. The start still fits; its end does not.
+            let mut invalid = frame(valid_start, count);
+            invalid.payload[1..5].copy_from_slice(&invalid_start.0.to_le_bytes());
+            assert!(matches!(
+                policy.decode(invalid),
+                Err(BlockSyncWireError::HeightOutOfRange(height))
+                    if height == block::Height::MAX.0 + 1
+            ));
+            assert!(matches!(
+                BlockSyncMessage::GetBlocks { start_height: invalid_start, count }.encode_frame(),
+                Err(BlockSyncWireError::HeightOutOfRange(height))
+                    if height == block::Height::MAX.0 + 1
+            ));
+        }
+    }
+
+    #[test]
+    fn get_blocks_range_encoder_rejects_arithmetic_overflow() {
+        assert!(matches!(
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(u32::MAX),
+                count: 2
+            }
+            .encode_frame(),
+            Err(BlockSyncWireError::NumericOverflow(_))
+        ));
+    }
+
+    #[test]
     fn declaration_rejects_noncanonical_or_invalid_requests() {
         let policy = GetBlocksPolicy::new(&ZakuraBlockSyncConfig::default());
         let valid = frame(block::Height(42), 1);

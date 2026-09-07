@@ -7895,7 +7895,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "2.0.1-rc0"
+version = "2.0.2-rc0"
 dependencies = [
  "chrono",
  "criterion",
@@ -7961,7 +7961,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "7.1.0-rc0"
+version = "7.1.1-rc0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -8007,7 +8007,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "3.2.3-rc0"
+version = "3.2.4-rc0"
 dependencies = [
  "jsonrpsee-types",
  "reqwest 0.12.28",
@@ -8269,7 +8269,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "3.2.2-rc0"
+version = "3.2.3-rc0"
 dependencies = [
  "hex",
  "lazy_static",
@@ -8410,7 +8410,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.3-rc0"
+version = "2.2.4-rc0"
 dependencies = [
  "clap",
  "color-eyre",

@@ -1,6 +1,6 @@
 [package]
 name = "zakura-network"
-version = "7.1.0-rc0"
+version = "7.1.1-rc0"
 authors.workspace = true
 description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal
@@ -83,9 +83,9 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
 zakura-chain = { path = "../zakura-chain", version = "7.0.0-rc0", features = ["async-error"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "2.0.1-rc0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "2.0.2-rc0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "3.2.3-rc0" }
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.4-rc0" }
 
 [dev-dependencies]
 proptest = { workspace = true }

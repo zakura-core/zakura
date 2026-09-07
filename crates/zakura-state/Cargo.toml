@@ -75,7 +75,7 @@ sapling-crypto = { workspace = true }
 
 zakura-assets = { workspace = true }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.3-rc0" }
-zakura-chain = { path = "../zakura-chain", version = "6.3.0-rc0", features = ["async-error"] }
+zakura-chain = { path = "../zakura-chain", version = "7.0.0-rc0", features = ["async-error"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "2.0.1-rc0" }
 
 # prod feature progress-bar
@@ -108,7 +108,7 @@ orchard = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-chain = { path = "../zakura-chain", version = "6.3.0-rc0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "7.0.0-rc0", features = ["proptest-impl"] }
 zakura-test = { path = "../zakura-test/", version = "2.1.0" }
 
 [lints]

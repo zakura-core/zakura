@@ -1,15 +1,18 @@
 use super::{config::*, events::*, peer_registry::SessionAdmission, wire::*, *};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError,
-    OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer, PeerStreamSession,
-    Service, ServicePeerSnapshot, SinkReject, Stream, StreamMode, ZakuraBlockSyncCandidateState,
-    ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, transport::GuardedReserveError, FramedRecv,
+    FramedSend, OrderedSendError, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy,
+    Peer, PeerStreamSession, Service, ServicePeerSnapshot, SinkReject, Stream, StreamMode,
+    ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
 use tokio::sync::Notify;
+
+#[cfg(test)]
+mod tests;
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
@@ -230,34 +233,34 @@ impl BlockSyncPeerSession {
         msg: BlockSyncMessage,
         permit: &mut super::serving_regulation::GetBlocksServingPermit,
     ) -> Result<(), OrderedSendError> {
+        let slot = self
+            .send
+            .try_reserve_guarded()
+            .map_err(|error| match error {
+                GuardedReserveError::Full => OrderedSendError::Full,
+                GuardedReserveError::Closed | GuardedReserveError::Unsupported => {
+                    OrderedSendError::Closed
+                }
+            })?;
         let (frame, accounted_bytes) = Self::encode_regulated_message(msg, permit)?;
-        self.send
-            .try_send_guarded(frame, || permit.frame_guard(accounted_bytes))
-            .map_err(|error| {
-                let send_error = if error.is_full() {
-                    OrderedSendError::Full
-                } else if error.is_closed() {
-                    OrderedSendError::Closed
-                } else {
-                    // Compatibility senders do not support attaching guards.
-                    OrderedSendError::Closed
-                };
-                drop(error.into_frame());
-                send_error
-            })
+        slot.send(frame, permit.frame_guard(accounted_bytes));
+        Ok(())
     }
 
-    /// Wait for transport capacity without releasing the request's reservations.
+    /// Wait for transport capacity without encoding or sharing response ownership.
     pub(super) async fn send_regulated_message(
         &self,
         msg: BlockSyncMessage,
         permit: &mut super::serving_regulation::GetBlocksServingPermit,
     ) -> Result<(), OrderedSendError> {
-        let (frame, accounted_bytes) = Self::encode_regulated_message(msg, permit)?;
-        self.send
-            .send_guarded(frame, || permit.frame_guard(accounted_bytes))
+        let slot = self
+            .send
+            .reserve_guarded()
             .await
-            .map_err(|_| OrderedSendError::Closed)
+            .map_err(|_| OrderedSendError::Closed)?;
+        let (frame, accounted_bytes) = Self::encode_regulated_message(msg, permit)?;
+        slot.send(frame, permit.frame_guard(accounted_bytes));
+        Ok(())
     }
 
     fn encode_regulated_message(

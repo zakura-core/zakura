@@ -436,7 +436,7 @@ pub enum BlockSyncMisbehavior {
 /// own frames and runs the download logic locally; it forwards only the concerns
 /// that need reactor-global state (serving, status advertisement, the producer,
 /// misbehavior aggregation) over this channel. Serving waits for channel capacity
-/// with stream reads paused; control notifications use bounded `try_send`.
+/// independently of stream reads; control notifications use bounded `try_send`.
 #[derive(Debug)]
 pub(super) enum RoutineToReactor {
     /// A routine received a `Status` and updated its own servable/caps + the

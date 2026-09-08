@@ -1578,7 +1578,6 @@ impl BlockSyncReactor {
             return;
         }
 
-        let local_inflight_cap = self.startup.config.advertised_max_inflight_requests();
         // The routine performs this cheap protocol check before regulation.
         // Rechecking here protects against a superseded or removed registry
         // entry without treating local scheduling races as peer misbehavior.
@@ -1603,14 +1602,7 @@ impl BlockSyncReactor {
             .peers
             .get_mut(&peer)
             .expect("the peer was checked before this non-awaiting admission path")
-            .try_start_serving_blocks(
-                local_inflight_cap,
-                request_id,
-                start_height,
-                count,
-                requested_count,
-                permit,
-            );
+            .try_start_serving_blocks(request_id, start_height, count, requested_count, permit);
         if let Err(permit) = started_serving {
             self.send_range_unavailable(&peer, start_height, count, permit);
             return;

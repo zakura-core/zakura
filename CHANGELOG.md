@@ -11,6 +11,56 @@ independently.
 
 ## [Unreleased]
 
+## [1.4.0-rc1] - 2026-09-08
+
+### Added
+
+- Zakura now advertises prepared mined blocks after expected-work validation and state admission
+  ([#748](https://github.com/zakura-core/zakura/pull/748)).
+- Zakura now reuses prepared mining candidates through `workid`
+  ([#748](https://github.com/zakura-core/zakura/pull/748)).
+
+### Changed
+
+- Updated the Zakura Common (`zakura-core/common`) crates from `1.1.0` to
+  `1.2.0`
+  ([#925](https://github.com/zakura-core/zakura/pull/925)).
+- Shortened the end-of-support window to 22 days so v1.4.0-rc1 halts at block
+  3,504,731 — the same halt block and date (~2026-10-03) as v1.4.0-rc0 and
+  v1.3.2
+  ([#927](https://github.com/zakura-core/zakura/pull/927)).
+
+### Fixed
+
+- Zakura withdraws rejected mining templates, stops affected internal mining work, and
+  validates empty-template recovery before returning a replacement
+  ([#748](https://github.com/zakura-core/zakura/pull/748)).
+
+- Zakura bounds mined submissions and contextual writes, and returns `inconclusive` when a mined
+  block must wait for its parent or verification capacity
+  ([#748](https://github.com/zakura-core/zakura/pull/748)).
+- Zakura blocks optimistic relay while earlier contextual writes or operator changes can move
+  the selected tip ([#748](https://github.com/zakura-core/zakura/pull/748)).
+- Zakura avoids duplicate all-peer inventory delivery
+  ([#748](https://github.com/zakura-core/zakura/pull/748)).
+- Header sync now repairs contiguous ranges of missing VCT roots in one
+  request. Checkpoint commits now resume immediately after a header-chain
+  commit instead of polling every 500 ms. A parked checkpoint also clears a
+  resource-stall alarm itself, so it can no longer wait for an insertion that
+  the alarm would refuse. These changes improve checkpoint catch-up for
+  retained states with large missing-root gaps
+  ([#893](https://github.com/zakura-core/zakura/pull/893)).
+- The stalled-height diagnostic now measures the parked block's complete wait,
+  so a changing missing height no longer postpones the operator error or clears
+  the gauge before the block commits
+  ([#893](https://github.com/zakura-core/zakura/pull/893)).
+- A repair supplier that refuses or withholds its response no longer ends the
+  scheduling round for the remaining candidates, and an unresponsive supplier
+  is now charged like any other timed-out peer
+  ([#893](https://github.com/zakura-core/zakura/pull/893)).
+- Added a check on the combined chain value-pool balance as defence in depth
+  ([#911](https://github.com/zakura-core/zakura/pull/911)).
+
 ## [1.4.0-rc0] - 2026-09-07
 
 ### Changed

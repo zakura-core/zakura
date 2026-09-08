@@ -742,17 +742,15 @@ impl DownloadWindow {
     }
 
     /// Clear the probe streak after we return requests on our own initiative,
-    /// such as a view reset or a long local read pause. Keep proof of earlier
+    /// such as a view reset. Keep proof of earlier
     /// progress, but let even an unproven peer receive work again when we resume.
     pub(super) fn note_locally_returned_requests(&mut self) {
         self.requests_without_block_progress = 0;
         self.clear_liveness_if_idle();
     }
 
-    /// Push the block-liveness deadline out by `timeout` when a would-be park is
-    /// attributable to *local* outbound backpressure, not the peer: while our outbound queue
-    /// is full the routine stops draining inbound, so a useful body may be sitting unread.
-    /// Avoids punishing the peer for our own write-side congestion.
+    /// Give a briefly congested writer time to deliver our queued request before
+    /// parking the peer for not answering it. The caller bounds this grace.
     pub(super) fn extend_liveness_deadline(&mut self, now: Instant, timeout: Duration) {
         self.block_liveness_deadline = Some(now + timeout);
     }
@@ -809,7 +807,8 @@ pub(super) struct PeerBlockState {
     /// `status_reply_meter`; this half stays reactor-side because the reactor owns
     /// serving-tip advertisement.
     pub(super) refresh_meter: RateMeter,
-    served_block_requests: VecDeque<ServingBlockRequest>,
+    // Admission allows one response producer per peer.
+    serving_request: Option<ServingBlockRequest>,
 }
 
 /// Ledger entry for one admitted inbound `GetBlocks` request.
@@ -856,26 +855,23 @@ impl PeerBlockState {
             direction: session.direction(),
             session,
             refresh_meter: RateMeter::new(config.status_refresh_interval),
-            served_block_requests: VecDeque::new(),
+            serving_request: None,
         }
     }
 
-    /// Insert a request and its permit, or return the permit if the peer cap is full.
+    /// Store the request, or return its permit if the peer already has one.
     pub(super) fn try_start_serving_blocks(
         &mut self,
-        local_inflight_cap: u32,
         request_id: BlockRangeRequestId,
         start_height: block::Height,
         original_count: u32,
         requested_count: u32,
         permit: super::serving_regulation::GetBlocksServingPermit,
     ) -> Result<(), super::serving_regulation::GetBlocksServingPermit> {
-        if self.served_block_requests.len()
-            >= usize::try_from(local_inflight_cap).unwrap_or(usize::MAX)
-        {
+        if self.serving_request.is_some() {
             return Err(permit);
         }
-        self.served_block_requests.push_back(ServingBlockRequest {
+        self.serving_request = Some(ServingBlockRequest {
             id: request_id,
             start_height,
             original_count,
@@ -892,10 +888,8 @@ impl PeerBlockState {
         request_id: BlockRangeRequestId,
         start_height: block::Height,
     ) -> Option<ServingBlockRequest> {
-        self.served_block_requests
-            .iter()
-            .position(|request| request.id == request_id && request.start_height == start_height)
-            .and_then(|index| self.served_block_requests.remove(index))
+        self.serving_request
+            .take_if(|request| request.id == request_id && request.start_height == start_height)
     }
 }
 
@@ -1017,12 +1011,12 @@ const _: () = assert!(MAX_BS_BLOCKS_PER_REQUEST <= RECEIVED_TRACKER_OFFSET_CAPAC
 #[derive(Clone, Debug, Default)]
 pub(super) struct ReceivedBlockTracker {
     bits: u128,
-    count: usize,
 }
 
 impl ReceivedBlockTracker {
     pub(super) fn len(&self) -> usize {
-        self.count
+        // At most 128 set bits fit in usize on every supported target.
+        self.bits.count_ones() as usize
     }
 
     fn contains_offset(&self, offset: u32) -> bool {
@@ -1037,7 +1031,6 @@ impl ReceivedBlockTracker {
             return false;
         }
         self.bits |= bit;
-        self.count = self.count.saturating_add(1);
         true
     }
 

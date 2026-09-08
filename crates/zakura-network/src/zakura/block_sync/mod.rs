@@ -5,7 +5,7 @@
 //! commit pipeline, the registry, and the reactor.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     io::{self, Cursor, Read, Write},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},

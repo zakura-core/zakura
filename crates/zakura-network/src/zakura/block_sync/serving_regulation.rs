@@ -1,7 +1,8 @@
 //! Resource admission for serving inbound `GetBlocks` requests.
 //!
 //! This module turns the generic regulation primitives into one message policy.
-//! Each routine holds at most one decoded request while waiting for admission.
+//! Each routine queues compact requests within its advertised in-flight limit.
+//! One admission waiter starts work in arrival order while stream reads continue.
 //! Admission acquires a response producer before the state query starts. The query,
 //! result, and queued frames share that producer until the last owner drops. A blocked
 //! transport writer therefore prevents another query for the same peer, including after reconnect.

@@ -251,8 +251,8 @@ refund = upper_bound_response_bytes - actual_response_bytes
   admission boundary. It MUST stop reading that peer's ordered stream until Work becomes available.
   The existing bounded application and QUIC queues MUST provide backpressure. The implementation
   MUST NOT add a delayed-request queue or scheduler.
-  The GetBlocks rule below is an exception to these read-pause and queue requirements, because
-  requests and responses share the same ordered stream.
+  Pausing reads MUST NOT prevent either peer from completing an active response. The bounded
+  GetBlocks queue defined below is an exception to the read-pause and no-queue requirements.
 - Pausing reads MUST propagate to the QUIC receive buffer. The transport MUST stop granting further
   stream credit as that buffer fills, so the peer cannot send more stream data after it exhausts
   existing credit. The resource bound MUST include already authorized data. The implementation MUST
@@ -679,8 +679,10 @@ Block sync already regulates its rate on the requesting side. Each sender sizes 
 limit the receiver advertises and operating at the measured bandwidth-delay product, which is
 normally far below that clamp. That window is the outbound obligation matching this inbound rule.
 
-The two sides meet through `Delay`. A receiver whose Work is unavailable delays starting the
-request, but MUST continue reading so responses to its own downloads can progress. It MUST retain
+The two sides meet through `Delay`. GetBlocks requests can arrive ahead of responses on the same
+ordered stream. If both peers pause reading while their response writers are blocked, neither side
+can finish. A receiver whose Work is unavailable therefore delays starting the request, but MUST
+continue reading. It MUST retain
 waiting GetBlocks requests in arrival order, storing only their request fields. The waiting queue
 and its single admission waiter together MUST NOT exceed the receiver's advertised inflight limit.
 Only the oldest waiting request competes for Work; the active response retains its Work ownership.

@@ -1574,6 +1574,9 @@ impl DiskDb {
         // This improves Zebra's initial sync speed slightly, as of April 2022.
         opts.optimize_level_style_compaction(Self::MEMTABLE_RAM_CACHE_MEGABYTES * ONE_MEGABYTE);
 
+        // Benchmark whether additional compaction capacity reduces sync write stalls.
+        opts.set_max_background_jobs(4);
+
         // Bound WAL growth so heavy sync cannot accumulate tens of GiB of logs
         // that must be replayed before Zebra can restart.
         opts.set_max_total_wal_size(Self::MAX_TOTAL_WAL_SIZE_BYTES);

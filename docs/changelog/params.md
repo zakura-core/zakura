@@ -32,6 +32,8 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Reserved header-serving lease lifetime | `crates/zakura-state/src/service/finalized_state/header_chain.rs` | renewable 30-second idle deadline → fixed 30-second lifetime when using the reserve | [#931](https://github.com/zakura-core/zakura/pull/931) | Release reserved capacity even if a requester keeps paging. |
+| `MAX_BOUNDED_HEADER_RESPONSE_BYTES` | `crates/zakura-header-chain/src/config.rs` | implicit per-page bounds → 8 MiB total allowance, charged at 2,048 bytes per header | [#931](https://github.com/zakura-core/zakura/pull/931) | Bound reserved responses independently of target storage, including metadata and one-header page framing. |
 | `MAX_MINED_SUBMISSIONS` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | unbounded → `16` submissions | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound detached verification work across RPC cancellation. |
 | `non_finalized_write_slots` | `crates/zakura-state/src/service.rs` | unbounded → `1,000` contextual writes | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound writer block bodies using the existing orphan queue capacity. |
 | `LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE` | `crates/zakurad/src/commands/start/zakura/coordinator.rs` | new → `30 min` | [#831](https://github.com/zakura-core/zakura/pull/831) | Terminate the node when native block applies prevent legacy fallback from acquiring exclusive ownership, instead of leaving the fallback handoff pending forever. |

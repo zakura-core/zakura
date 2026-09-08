@@ -109,6 +109,15 @@ impl PendingBlockSignal {
         !matches!(*self.0.borrow(), PendingStatus::Failed)
     }
 
+    /// Returns a signal for a block that never fails, so tests in other crates can build an
+    /// early mined-block event without owning a registry entry.
+    #[cfg(feature = "proptest-impl")]
+    pub fn valid_for_tests() -> Self {
+        // Dropping the sender leaves the signal reading `Waiting`, so it stays valid and its
+        // failure future never resolves.
+        Self(watch::channel(PendingStatus::Waiting).1)
+    }
+
     /// Resolves when contextual verification rejects the block.
     pub async fn wait_for_failure(&mut self) {
         loop {

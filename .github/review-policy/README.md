@@ -90,19 +90,18 @@ Codex for another review.
 
 ## Administrator setup
 
-Keep `CODEX_APPROVAL_ENABLED` unset or `false` until setup and validation finish.
+After this PR is merged, keep `CODEX_APPROVAL_ENABLED` unset or `false` while
+configuring the credentials. No GitHub environment or review-rule changes are
+needed.
 
-1. Merge this PR through human review and inspect read-only audit results.
-2. Create a dedicated GitHub App and install it only on `zakura-core/zakura`.
-   Grant repository **Pull requests: read and write** and the mandatory metadata
-   access. It needs no webhook, contents write, administration, Actions write, or
-   ruleset bypass. Do not reuse a release App or a person's token.
-3. Create the `codex-approval` environment, restricted to the `main` branch.
-   Keep the App key in Infisical with a dedicated service scope, and sync it to
-   the environment secret `CODEX_APPROVAL_APP_PRIVATE_KEY`. Required environment
-   reviewers would make each adapter execution manual, so leave them unset for
-   normal automatic operation.
-4. Set these repository variables from the App metadata:
+1. Create a dedicated GitHub App with repository **Pull requests: read and write**
+   permission and webhooks disabled. Install it only on `zakura-core/zakura` and
+   generate a private key. The App needs no additional permissions beyond the
+   mandatory metadata access; do not grant administration access or ruleset bypass.
+2. Under repository **Settings → Secrets and variables → Actions**, add the
+   repository secret `CODEX_APPROVAL_APP_PRIVATE_KEY` with the full PEM key
+   contents. Keep the key in a dedicated Infisical scope and sync it here.
+3. On the **Variables** tab, add these repository variables:
 
    | Variable | Value |
    | --- | --- |
@@ -110,14 +109,21 @@ Keep `CODEX_APPROVAL_ENABLED` unset or `false` until setup and validation finish
    | `CODEX_APPROVAL_APP_ID` | Its numeric App ID |
    | `CODEX_APPROVAL_BOT_ID` | Numeric ID of its `[bot]` account |
 
-5. Leave the current `main` ruleset unchanged: one required approval, the required
-   `test success` check, and no bypass actors. The adapter does not require
-   dismissing stale approvals or approval of the most recent reviewable push.
-   Preserve existing reviewer and code-owner requirements; no dedicated team or
-   path-based reviewer rule is needed. Release and other excluded changes get
-   no adapter approval and follow the normal approval process.
-6. Run the validation below with disposable PRs before enabling normal use.
-   Finally set `CODEX_APPROVAL_ENABLED=true`.
+   To get the bot ID, replace `APP_SLUG` with the App's actual slug:
+
+   ```sh
+   gh api 'users/APP_SLUG[bot]' --jq '.id'
+   ```
+
+4. Set repository variable `CODEX_APPROVAL_ENABLED=true` and run the live
+   validation below. Confirm that a clean eligible PR receives an App approval
+   and an excluded PR does not. Set the variable back to `false` if validation
+   fails. Personal Codex settings and the normal review process stay unchanged.
+
+The key is a repository Actions secret, so no environment approval or branch
+restriction gates access to it. The adapter still checks out trusted `main`.
+The existing `main` ruleset already supplies the one required approval,
+`test success` check, and empty bypass list; leave those settings unchanged.
 
 The writer independently rereads the ruleset and checks its approval requirement
 and required test check before every approval. Missing or

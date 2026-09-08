@@ -12,6 +12,17 @@ jq -e 'length == 2 and ([.[].leg] | sort == ["baseline", "primary"])' \
 ORDER=(primary baseline)
 [[ "$HOST_LEG" == baseline ]] && ORDER=(baseline primary)
 export FRESH_STATE_COPY=true
+if [[ "${HISTORICAL_PRUNED:-false}" == true ]]; then
+  # Warm up the baseline once, then clone that exact stopped state for both refs.
+  CONFIG=$(jq -ec '.[] | select(.leg == "baseline")' <<<"$BENCH_LEGS_JSON")
+  LEG=baseline SHA=$(jq -er '.sha' <<<"$CONFIG") \
+    P2P_STACK=$(jq -r '.p2p_stack' <<<"$CONFIG") \
+    VCT_FAST_SYNC=$(jq -er '.vct_fast_sync' <<<"$CONFIG") \
+    ENABLE_TRACES=false PROFILE=off PREPARE_ONLY=true OUT_DIR=/root/out/preparation \
+    bash /root/perf-bench-run.sh
+  export COMMON_PREPARATION_DIR=/root/out/preparation
+  export PREPARED_STATE_DIR=/mnt/snapshots/perf-prepared-common
+fi
 for LEG in "${ORDER[@]}"; do
   CONFIG=$(jq -ec --arg leg "$LEG" '.[] | select(.leg == $leg)' <<<"$BENCH_LEGS_JSON")
   SHA=$(jq -er '.sha' <<<"$CONFIG")

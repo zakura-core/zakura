@@ -57,6 +57,11 @@ VCT_FAST_SYNC="${VCT_FAST_SYNC:-auto}"
 ENABLE_TRACES="${ENABLE_TRACES:-true}"
 COMPARISON="${COMPARISON:-refs}"
 HISTORICAL_PRUNED="${HISTORICAL_PRUNED:-false}"
+PREPARE_ONLY="${PREPARE_ONLY:-false}"
+PREPARATION_MODE=per_invocation
+PREPARATION_SHA=""
+PREPARATION_MANIFEST_SHA=""
+case "$PREPARE_ONLY" in true|false) ;; *) exit 1 ;; esac
 case "$HISTORICAL_PRUNED" in true|false) ;; *) exit 1 ;; esac
 case "$VCT_FAST_SYNC" in auto|true|false) ;; *) exit 1 ;; esac
 case "$ENABLE_TRACES" in true|false) ;; *) exit 1 ;; esac
@@ -148,10 +153,22 @@ else
 fi
 STATE_CACHE_DIR="/mnt/snapshots/${SNAPSHOT_MODE}"
 [ -d "$STATE_CACHE_DIR" ] || die "no ${SNAPSHOT_MODE}/ state on the volume"
+if [[ -n "${PREPARED_STATE_DIR:-}" ]]; then
+  [[ "$HISTORICAL_PRUNED" == true && "$PREPARE_ONLY" == false ]] \
+    || die "shared preparation requires a measured pruned historical leg"
+  [[ -d "$PREPARED_STATE_DIR" && -s "$COMMON_PREPARATION_DIR/state.sha256" ]] \
+    || die "the common prepared state or its digest manifest is missing"
+  STATE_CACHE_DIR="$PREPARED_STATE_DIR"
+fi
+if [[ "$PREPARE_ONLY" == true ]]; then
+  [[ "$HISTORICAL_PRUNED" == true && "${FRESH_STATE_COPY:-false}" == true ]] \
+    || die "preparation-only requires a disposable pruned historical copy"
+fi
 if [[ "${FRESH_STATE_COPY:-false}" == true ]]; then
   [[ "$WORKLOAD" == historical_sync && "$LEG" =~ ^(primary|baseline)$ ]] \
     || die "fresh state copies require a historical comparison leg"
   COPY_DIR="/mnt/snapshots/perf-fresh-${LEG}"
+  [[ "$PREPARE_ONLY" == true ]] && COPY_DIR=/mnt/snapshots/perf-prepared-common
   [[ ! -e "$COPY_DIR" ]] || die "fresh state destination already exists"
   REQUIRED_BYTES=$(du -s -B1 "$STATE_CACHE_DIR" | awk '{print $1}')
   AVAILABLE_BYTES=$(df -B1 --output=avail /mnt/snapshots | tail -n1)
@@ -325,7 +342,21 @@ cp "$CFG" "$OUT_DIR/bench-config.toml"
 sha256sum "$ZAKURAD_BIN" > "$OUT_DIR/binary.sha256"
 lscpu -J > "$OUT_DIR/cpu.json"
 
-if [[ "$HISTORICAL_PRUNED" == true ]]; then
+if [[ -n "${PREPARED_STATE_DIR:-}" ]]; then
+  # Validate every copied file before opening the DB. The common source is never run again.
+  (cd "$STATE_CACHE_DIR" && sha256sum --check "$COMMON_PREPARATION_DIR/state.sha256") \
+    > "$OUT_DIR/state-copy-verification.log" || die "prepared state copy differs"
+  for artifact in migration.log warmup.log prune-preparation.log preparation.json state.sha256; do
+    cp "$COMMON_PREPARATION_DIR/$artifact" "$OUT_DIR/$artifact"
+  done
+  PREPARATION_SHA=$(jq -er '.sha' "$OUT_DIR/preparation.json")
+  PREPARATION_MANIFEST_SHA=$(sha256sum "$OUT_DIR/state.sha256" | awk '{print $1}')
+  START_HEIGHT=$(jq -er '.warmup_height' "$OUT_DIR/preparation.json")
+  (( STOP_HEIGHT > START_HEIGHT )) || die "stop height must exceed common warmup"
+  PREPARATION_MODE=common_snapshot
+  sync
+  echo 3 > /proc/sys/vm/drop_caches
+elif [[ "$HISTORICAL_PRUNED" == true ]]; then
   # Preparation runs only against this invocation's disposable state copy.
   # Normal startup migrates the baked format before the strict offline prune CLI.
   # A second sync drains the remaining retention window before timing.
@@ -354,6 +385,17 @@ if [[ "$HISTORICAL_PRUNED" == true ]]; then
 fi
 
 [[ "$WORKLOAD" == live_head ]] && SNAPSHOT_HEIGHT=""
+
+if [[ "$PREPARE_ONLY" == true ]]; then
+  (cd "$STATE_CACHE_DIR" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) \
+    > "$OUT_DIR/state.sha256"
+  [[ -s "$OUT_DIR/state.sha256" ]] || die "prepared state digest manifest is empty"
+  jq -n --arg sha "$SHA" --argjson warmup_height "$START_HEIGHT" \
+    --arg binary "$(awk '{print $1}' "$OUT_DIR/binary.sha256")" \
+    '{sha: $sha, binary: $binary, warmup_height: $warmup_height}' > "$OUT_DIR/preparation.json"
+  log "common preparation complete at $START_HEIGHT; no measured node was launched"
+  exit 0
+fi
 
 LOGF="$OUT_DIR/node.log"
 log "starting zakurad ($SHA), workload=$WORKLOAD leg=$LEG verify_mode=$VERIFY_MODE p2p_stack=$P2P_STACK cap=${WALL_CAP}s peers=${FEED_PEER:-DNS-seeders}/${PEERSET_SIZE}"
@@ -894,6 +936,8 @@ json.dump({
     "comparison": "$COMPARISON", "vct_fast_sync": "$VCT_FAST_SYNC",
     "traces": "$ENABLE_TRACES", "storage_mode": "$STORAGE_MODE",
     "historical_pruned_preparation": "$HISTORICAL_PRUNED",
+    "preparation_mode": "$PREPARATION_MODE", "preparation_sha": "$PREPARATION_SHA",
+    "preparation_manifest_sha256": "$PREPARATION_MANIFEST_SHA",
     "stop_height": $STOP_HEIGHT,
     "snapshot_height": ${SNAPSHOT_HEIGHT:-$START_HEIGHT},
     "start_height": $START_HEIGHT, "end_height": $END_HEIGHT,

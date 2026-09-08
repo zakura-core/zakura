@@ -14308,14 +14308,20 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
 
 #[tokio::test]
 async fn delayed_serving_keeps_reading_same_stream_downloads() {
+    check_delayed_serving_response_progress(32, 32, 16).await;
+}
+
+async fn check_delayed_serving_response_progress(limit: u32, requests: u32, queue_depth: usize) {
+    assert!((1..=limit).contains(&requests));
     let blocks = mainnet_blocks_1_to_3();
     let mut config = ZakuraBlockSyncConfig {
         max_blocks_per_response: 1,
+        max_inflight_requests: limit,
         max_response_bytes: u32::try_from(block::MAX_BLOCK_BYTES)
             .expect("the maximum block size fits the wire cap"),
         ..ZakuraBlockSyncConfig::default()
     };
-    config.peer_limits.outbound_queue_depth = 16;
+    config.peer_limits.outbound_queue_depth = queue_depth;
     config.get_blocks_regulation.node_active_requests = 1;
     config.request_timeout = Duration::from_secs(1);
     config.floor_rescue_timeout = Duration::from_millis(20);
@@ -14334,8 +14340,8 @@ async fn delayed_serving_keeps_reading_same_stream_downloads() {
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(64);
-    let (inbound_tx, inbound_rx) = framed_channel(16);
-    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let (inbound_tx, inbound_rx) = framed_channel(queue_depth);
+    let (outbound_tx, mut outbound_rx) = framed_channel(queue_depth);
     service.add_peer(Peer::new_with_direction(
         peer_id.clone(),
         None,
@@ -14380,7 +14386,7 @@ async fn delayed_serving_keeps_reading_same_stream_downloads() {
     // These requests must wait for the node slot. The response behind them must
     // still reach our downloader, even while the serving slot remains occupied.
     tokio::time::timeout(Duration::from_millis(500), async {
-        for height in 1..=32 {
+        for height in 1..=requests {
             send_inbound(
                 &inbound_tx,
                 BlockSyncMessage::GetBlocks {
@@ -14594,8 +14600,12 @@ async fn bidirectional_serving_drains_requests_ahead_of_responses() {
 
 #[tokio::test]
 async fn waiting_getblocks_overflow_closes_only_the_local_stream() {
+    check_waiting_getblocks_overflow(2).await;
+}
+
+async fn check_waiting_getblocks_overflow(limit: u32) {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_requests: 2,
+        max_inflight_requests: limit,
         ..ZakuraBlockSyncConfig::default()
     };
     config.get_blocks_regulation.node_active_requests = 1;
@@ -14630,9 +14640,9 @@ async fn waiting_getblocks_overflow_closes_only_the_local_stream() {
     ));
     wait_for_outbound_status(&mut outbound_rx).await;
     send_inbound(&inbound_tx, BlockSyncMessage::Status(status())).await;
-    // The first request waits for the occupied node slot, the second queues,
-    // and the third exceeds the advertised allowance. No query can start.
-    for height in 1..=3 {
+    // Every request waits for the occupied node slot. One beyond our advertised
+    // waiting allowance must close this stream without starting a query.
+    for height in 1..=limit + 1 {
         send_inbound(
             &inbound_tx,
             BlockSyncMessage::GetBlocks {

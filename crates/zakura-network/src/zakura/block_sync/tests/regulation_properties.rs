@@ -263,3 +263,21 @@ proptest! {
             ));
     }
 }
+
+proptest! {
+    #[test]
+    fn waiting_requests_preserve_response_progress(
+        limit_and_burst in (1u32..65).prop_flat_map(|limit| (Just(limit), 1..=limit)),
+        queue_depth in 1usize..17,
+    ) {
+        let (limit, requests) = limit_and_burst;
+        tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap()
+            .block_on(check_delayed_serving_response_progress(limit, requests, queue_depth));
+    }
+
+    #[test]
+    fn waiting_request_overflow_preserves_connection_and_releases_work(limit in 1u32..65) {
+        tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap()
+            .block_on(check_waiting_getblocks_overflow(limit));
+    }
+}

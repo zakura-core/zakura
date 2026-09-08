@@ -124,14 +124,19 @@ responses without advancing time, proving admission does not wait for a refill.
 These tests exercise resource counts without allocating maximum-size block bodies;
 real response encoding and write tests cover the framing boundary separately.
 
-The service tests in the base PR hold one request at admission and verify that
-later frames stay unread until capacity returns. A long pause returns unreceived
-downloads to the scheduler and keeps the stream open. Tests also check that the
-floor watchdog respects this pause and that the final response survives a long
-queue wait. A real QUIC test fills the application receive channel and stream
-window, checks that response writes and a sibling stream still progress, then
-drains the channel to verify recovery. Cancellation during a blocked write must
-finish the current frame before closing the stream.
+Generated service cases vary the advertised waiting limit, request burst, and
+channel depth. They hold the node producer and fill the outbound queue, then
+require a matched download response behind the waiting requests to reach the
+reactor. Releasing capacity must start the oldest waiting request. Another
+property sends one request beyond the waiting limit and checks that only the
+block-sync stream closes, with no connection penalty or leaked producer.
+
+The base PR also tests both peers serving large responses over real QUIC, beyond
+the receive windows and application queues. Separate tests check queue admission
+before encoding, encoding failure, cancellation, and delayed terminal delivery.
+Waiting to serve does not extend download deadlines because reads continue.
+A paused-reader transport witness checks sibling-stream credit and recovery;
+cancellation during a blocked write must finish the current frame before closing.
 
 ## Replay and reuse
 

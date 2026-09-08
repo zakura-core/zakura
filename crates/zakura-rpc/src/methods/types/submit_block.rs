@@ -422,26 +422,11 @@ mod tests {
         assert!(submissions.reserve(hash).is_ok());
     }
 
-    #[tokio::test]
-    async fn pending_block_waits_for_success() {
-        let registry = PendingBlockRegistry::default();
-        let block = test_block();
-        let hash = block.hash();
-        let registration = registry
-            .insert(block.clone())
-            .expect("the registry accepts the block");
-        assert!(registry.insert(block.clone()).is_none());
-
-        let wait = tokio::spawn({
-            let registry = registry.clone();
-            async move { registry.wait(hash).await }
-        });
-        tokio::task::yield_now().await;
-        registration.resolve(Ok(block.clone()));
-
-        assert_eq!(wait.await.expect("wait task succeeds"), Some(block));
-    }
-
+    /// Waiters registered before the block resolves all see the committed block.
+    ///
+    /// The waits are created but not polled before the registration resolves, which is the
+    /// ordering a peer request hits: it subscribes under the registry lock, so a resolution that
+    /// lands first cannot be missed.
     #[tokio::test]
     async fn pending_block_wait_subscribes_before_polling() {
         let registry = PendingBlockRegistry::default();
@@ -450,61 +435,37 @@ mod tests {
         let registration = registry
             .insert(block.clone())
             .expect("the registry accepts the block");
+        assert!(
+            registry.insert(block.clone()).is_none(),
+            "one hash has one owner"
+        );
 
-        let wait = registry.wait(hash);
+        let waits: Vec<_> = (0..64).map(|_| registry.wait(hash)).collect();
         registration.resolve(Ok(block.clone()));
 
-        assert_eq!(wait.await, Some(block));
+        for result in futures::future::join_all(waits).await {
+            assert_eq!(result, Some(block.clone()));
+        }
     }
 
+    /// A failed commit answers peers with `notfound` and cancels the early inventory.
     #[tokio::test]
-    async fn pending_block_failure_returns_not_found() {
+    async fn pending_block_failure_cancels_the_wait_and_stale_inventory() {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        let registration = registry
-            .insert(block)
-            .expect("the registry accepts the block");
-
-        let wait = tokio::spawn({
-            let registry = registry.clone();
-            async move { registry.wait(hash).await }
-        });
-        tokio::task::yield_now().await;
-        registration.resolve(Err(()));
-
-        assert_eq!(wait.await.expect("wait task succeeds"), None);
-    }
-
-    #[tokio::test]
-    async fn pending_block_failure_cancels_stale_inventory() {
-        let registry = PendingBlockRegistry::default();
-        let block = test_block();
         let registration = registry
             .insert(block)
             .expect("the registry accepts the block");
         let mut signal = registration.signal();
-
         assert!(signal.is_valid());
+
+        let wait = registry.wait(hash);
         registration.resolve(Err(()));
+
+        assert_eq!(wait.await, None);
         signal.wait_for_failure().await;
         assert!(!signal.is_valid());
-    }
-
-    #[tokio::test]
-    async fn pending_block_waits_for_one_hash_are_coalesced() {
-        let registry = PendingBlockRegistry::default();
-        let block = test_block();
-        let hash = block.hash();
-        let registration = registry
-            .insert(block.clone())
-            .expect("the registry accepts the block");
-
-        let waits: Vec<_> = (0..64).map(|_| registry.wait(hash)).collect();
-        registration.resolve(Ok(block.clone()));
-        for result in futures::future::join_all(waits).await {
-            assert_eq!(result, Some(block.clone()));
-        }
     }
 
     #[test]

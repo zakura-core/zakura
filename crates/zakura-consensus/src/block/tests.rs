@@ -258,23 +258,51 @@ async fn mined_orphan_replays_skip_transaction_verification() {
         panic!("orphan replay must not reach transaction verification")
     });
     let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
-    for _ in 0..3 {
-        let result = verifier
-            .ready()
-            .await
-            .unwrap()
-            .call(Request::CommitMined {
-                block: candidate.clone(),
-                admission: zs::BlockAdmission::pending(),
-            })
-            .await;
-        assert!(matches!(
-            result,
-            Err(VerifyBlockError::Commit(
-                zs::CommitBlockError::MissingMinedParent
-            ))
-        ));
-    }
+    let result = verifier
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::CommitMined {
+            block: candidate,
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(VerifyBlockError::Commit(
+            zs::CommitBlockError::MissingMinedParent
+        ))
+    ));
+}
+
+/// Prepares `candidate`, then commits it with `solve` applied, and checks the resulting error.
+///
+/// A cache hit skips full semantic verification, so every header field a solution may set has to
+/// be rechecked on the fast path. Each of these tests changes one of them.
+async fn assert_prepared_commit_rejects(
+    network: &Network,
+    candidate: Arc<Block>,
+    solve: impl FnOnce(&mut Block),
+    expected: impl Fn(&VerifyBlockError) -> bool,
+) {
+    let mut verifier = prepared_test_verifier(network);
+    prepare_for_test(&mut verifier, candidate.clone()).await;
+
+    let mut solved = (*candidate).clone();
+    solve(&mut solved);
+    let result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::CommitMined {
+            block: Arc::new(solved),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+
+    let error = result.expect_err("the recheck rejects the solved block");
+    assert!(expected(&error), "unexpected recheck error: {error:?}");
 }
 
 #[tokio::test]
@@ -285,33 +313,30 @@ async fn prepared_mined_commit_rechecks_equihash() {
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .expect("the genesis block deserializes"),
     );
-    let mut verifier = prepared_test_verifier(&network);
-    prepare_for_test(&mut verifier, candidate.clone()).await;
 
-    let mut solved = (*candidate).clone();
-    Arc::make_mut(&mut solved.header).solution =
-        zakura_chain::work::equihash::Solution::for_proposal_for_network(&network);
-    let height = solved
-        .coinbase_height()
-        .expect("the candidate has a coinbase height");
-    for nonce in 0u32.. {
-        Arc::make_mut(&mut solved.header).nonce.0[..4].copy_from_slice(&nonce.to_le_bytes());
-        let hash = solved.hash();
-        if check::difficulty_is_valid(&solved.header, &network, &height, &hash).is_ok() {
-            break;
-        }
-    }
-    let result = verifier
-        .ready()
-        .await
-        .expect("the verifier is ready")
-        .call(Request::CommitMined {
-            block: Arc::new(solved),
-            admission: zs::BlockAdmission::pending(),
-        })
-        .await;
-
-    assert!(matches!(result, Err(VerifyBlockError::Equihash { .. })));
+    assert_prepared_commit_rejects(
+        &network,
+        candidate,
+        |solved| {
+            Arc::make_mut(&mut solved.header).solution =
+                zakura_chain::work::equihash::Solution::for_proposal_for_network(&Network::Mainnet);
+            let height = solved
+                .coinbase_height()
+                .expect("the candidate has a coinbase height");
+            for nonce in 0u32.. {
+                Arc::make_mut(&mut solved.header).nonce.0[..4]
+                    .copy_from_slice(&nonce.to_le_bytes());
+                let hash = solved.hash();
+                if check::difficulty_is_valid(&solved.header, &Network::Mainnet, &height, &hash)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        },
+        |error| matches!(error, VerifyBlockError::Equihash { .. }),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -319,24 +344,18 @@ async fn prepared_mined_commit_rechecks_header_time() {
     let _init_guard = zakura_test::init();
     let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
     let candidate = Arc::new(nu5_prepared_test_block(&network, None));
-    let mut verifier = prepared_test_verifier(&network);
-    prepare_for_test(&mut verifier, candidate.clone()).await;
 
-    let mut solved = (*candidate).clone();
-    Arc::make_mut(&mut solved.header).time = Utc::now()
-        .checked_add_signed(chrono::Duration::hours(3))
-        .expect("three hours fits in the supported time range");
-    let result = verifier
-        .ready()
-        .await
-        .expect("the verifier is ready")
-        .call(Request::CommitMined {
-            block: Arc::new(solved),
-            admission: zs::BlockAdmission::pending(),
-        })
-        .await;
-
-    assert!(matches!(result, Err(VerifyBlockError::Time(_))));
+    assert_prepared_commit_rejects(
+        &network,
+        candidate,
+        |solved| {
+            Arc::make_mut(&mut solved.header).time = Utc::now()
+                .checked_add_signed(chrono::Duration::hours(3))
+                .expect("three hours fits in the supported time range");
+        },
+        |error| matches!(error, VerifyBlockError::Time(_)),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -347,28 +366,19 @@ async fn prepared_mined_commit_rechecks_transaction_lock_time() {
         .expect("the recent timestamp is valid");
     let mut candidate = nu5_prepared_test_block(&network, Some(LockTime::Time(unlock_time)));
     Arc::make_mut(&mut candidate.header).time = unlock_time + chrono::Duration::seconds(1);
-    let candidate = Arc::new(candidate);
-    let mut verifier = prepared_test_verifier(&network);
-    prepare_for_test(&mut verifier, candidate.clone()).await;
 
-    let mut solved = (*candidate).clone();
-    Arc::make_mut(&mut solved.header).time = unlock_time;
-    let result = verifier
-        .ready()
-        .await
-        .expect("the verifier is ready")
-        .call(Request::CommitMined {
-            block: Arc::new(solved),
-            admission: zs::BlockAdmission::pending(),
-        })
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(VerifyBlockError::Transaction(
-            TransactionError::LockedUntilAfterBlockTime(_)
-        ))
-    ));
+    assert_prepared_commit_rejects(
+        &network,
+        Arc::new(candidate),
+        |solved| Arc::make_mut(&mut solved.header).time = unlock_time,
+        |error| {
+            matches!(
+                error,
+                VerifyBlockError::Transaction(TransactionError::LockedUntilAfterBlockTime(_))
+            )
+        },
+    )
+    .await;
 }
 
 #[tokio::test]

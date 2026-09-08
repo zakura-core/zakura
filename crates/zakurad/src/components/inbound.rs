@@ -204,6 +204,9 @@ async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<bl
 }
 
 /// Returns a committed block from any active chain.
+///
+/// Peers ask for blocks by hash, including hashes on a chain this node does not consider best,
+/// so this query deliberately spans every active chain rather than the best one.
 async fn block_by_hash(
     mut state: State,
     hash: block::Hash,

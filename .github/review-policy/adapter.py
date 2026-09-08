@@ -364,11 +364,36 @@ class Adapter:
         require("release-readiness" not in content.casefold(),
                 "Changelog release-policy directives require human review")
 
+    def check_author(self, pull):
+        """Require the PR author's current write-level access to the base repository."""
+        author = pull.get("user") or {}
+        require(author.get("type") == "User" and isinstance(author.get("id"), int)
+                and isinstance(author.get("login"), str) and bool(author["login"]),
+                "PR author must be an identifiable human account")
+        login = urllib.parse.quote(author["login"], safe="")
+        access = self.api.request(f"{self.prefix}/collaborators/{login}/permission")
+        require((access.get("user") or {}).get("id") == author["id"],
+                "Permission lookup does not match the PR author")
+        # GitHub maps Maintain to write and Triage to read, including custom roles.
+        require(access.get("permission") in ("write", "admin"),
+                "PR author needs Write, Maintain, or Admin access to this repository")
+
+    def author_gate(self):
+        """Skip the writer for outsiders, retaining cleanup of our existing approvals."""
+        try:
+            self.check_author(self.api.request(self.pull_path))
+            return {"reconcile": True, "reason": "PR author has write-level access"}
+        except (Ineligible, APIError, KeyError, TypeError) as exc:
+            cleanup = self.bot_id > 0 and any(
+                r["state"] == "APPROVED" for r in self.owned_reviews())
+            return {"reconcile": bool(cleanup), "reason": str(exc)}
+
     def evaluate(self, enforce_rules=True):
         pull = self.api.request(self.pull_path)
         require(pull["state"] == "open" and not pull["draft"], "PR is closed or a draft")
         require(pull["base"]["repo"]["full_name"] == self.repo
                 and pull["base"]["ref"] == self.policy.data["base_branch"], "Unsupported base branch")
+        self.check_author(pull)
         files = self.api.pages(self.pull_path + "/files")
         fragment = self.policy.check_files(files, pull["changed_files"], self.number)
         if fragment:
@@ -515,7 +540,10 @@ def target_numbers(api, policy, event):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pr", type=int)
-    parser.add_argument("--apply", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true")
+    mode.add_argument("--check-authors", action="store_true",
+                      help="Read-only permission preflight for the approval job")
     parser.add_argument("--event", type=Path)
     parser.add_argument("--wait-seconds", type=int, default=0, choices=range(0, 61), metavar="0..60")
     args = parser.parse_args()
@@ -548,7 +576,9 @@ def main():
                           trusted_sha=os.environ.get("TRUSTED_SHA"))
         for attempt in range(2):
             try:
-                if writer:
+                if args.check_authors:
+                    result = adapter.author_gate()
+                elif writer:
                     result = adapter.reconcile()
                 else:
                     receipt = adapter.evaluate(enforce_rules=False)
@@ -567,6 +597,9 @@ def main():
                 break
         results.append({"pr": number, **result})
         print(json.dumps(results[-1], sort_keys=True), flush=True)
+    if args.check_authors and os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write("run_reconcile=" + str(any(r.get("reconcile") for r in results)).lower() + "\n")
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
             output.write("### Codex approval adapter\n\n```json\n"

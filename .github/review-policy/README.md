@@ -7,6 +7,13 @@ audit mode. Merging this implementation does not enable approval writes.
 
 ## Contributor flow
 
+Bot approval is available only when the person who opened the PR currently has
+Write, Maintain, or Admin access to `zakura-core/zakura`. Authors with Read,
+Triage, or no repository access use the normal human review process, even if someone with
+more access requests Codex review on their PR. Bot-authored PRs also use normal
+review. This check uses the author's live repository permissions, including team
+and organization grants; membership labels and the event sender do not qualify.
+
 Use the normal automatic Codex review, or comment exactly `@codex review`.
 After a clean review of the current commit, eligible PRs receive an approval from
 the adapter App. The contributor can merge when GitHub's other requirements pass.
@@ -83,12 +90,23 @@ or incomplete pagination withholds approval. The public integration does not
 provide a versioned machine verdict or a run ID tying a manual request to its
 result, so this adapter is deliberately conservative about observable evidence.
 It does not treat comment text as a cryptographic attestation of review coverage.
+In particular, deleting a scoped manual request can make its result appear to
+belong to an older ordinary request. This limitation is accepted for PRs opened
+by trusted authors; the author permission gate restricts eligible PRs but does
+not prove which comment triggered a native review. Normal `@codex review` remains
+supported without a separate request journal.
 
 Comment and PR metadata events trigger evaluation. Because reactions have no
 webhook event, a completion event gets one short retry for the thumbs-up. Hourly
 reconciliation catches missed events, removed reactions, changed policy, and
 interrupted runners. Manual dispatch on `main` rechecks evidence without asking
 Codex for another review.
+
+A read-only permission preflight skips the App job when no target PR has an
+authorized author. The exception is cleanup: a PR with an existing App approval
+still reaches the writer so it can withdraw that approval if access was revoked
+or cannot be verified. The writer independently checks the author's access on
+every evaluation before and after approval, including scheduled runs.
 
 ## Administrator setup
 
@@ -149,6 +167,9 @@ renamed into an eligible directory. The App's review must count for the eligible
 PR while excluded paths receive no adapter approval and need normal review.
 Test an eligible change accompanied by its own new changelog fragment, plus
 rejections for another PR's fragment and a fragment containing a release waiver.
+Verify that Write, Maintain, and Admin authors qualify, while Read, Triage, and
+outside authors do not, regardless of who requested review. Also verify that
+revoking an author's access withdraws an existing App approval on reconciliation.
 
 Verify that the adapter withholds a new approval when Codex reviewed an older
 commit, and withdraws an existing approval after detecting a push. The adapter

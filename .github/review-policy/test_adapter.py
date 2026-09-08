@@ -6,6 +6,8 @@ import base64
 import http.client
 import json
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -393,6 +395,7 @@ class FragmentTests(unittest.TestCase):
             {"filename": "docs/changelog/unreleased/123.md", "status": "added"},
         ]
         self.worker.check_fragment = Mock(side_effect=adapter.Ineligible("Release waiver"))
+        self.worker.check_author = Mock()
         self.worker.evidence = Mock()
         with self.assertRaisesRegex(adapter.Ineligible, "Release waiver"):
             self.worker.evaluate(enforce_rules=False)
@@ -406,6 +409,124 @@ def rules_fixture():
                             "dismiss_stale_reviews_on_push": False, "require_last_push_approval": False}},
             {"type": "required_status_checks",
              "parameters": {"required_status_checks": [{"context": "test success"}]}}]
+
+
+class AuthorTests(unittest.TestCase):
+    def setUp(self):
+        self.author = {"id": 900, "login": "contributor", "type": "User"}
+        self.pull = {"state": "open", "draft": False, "head": {"sha": HEAD},
+                     "changed_files": 1, "user": self.author,
+                     "base": {"ref": "main", "sha": BASE,
+                              "repo": {"full_name": POLICY.data["repository"]}}}
+        self.access = {"permission": "write", "role_name": "write", "user": self.author.copy()}
+        self.api, self.writer = Mock(), Mock()
+        self.worker = adapter.Adapter(self.api, POLICY, 123, writer=self.writer,
+                                      app_id=APP_ID, bot_id=BOT_ID, trusted_sha=BASE)
+        self.api.request.side_effect = self.request
+        self.reviews = []
+        self.api.pages.side_effect = lambda path: (
+            [{"filename": "deploy/a.py", "status": "modified"}] if path.endswith("/files")
+            else self.reviews)
+        self.worker.evidence = Mock(return_value=receipt())
+        self.writer.request.return_value = {"id": 500, "user": {"id": BOT_ID, "type": "Bot"}}
+
+    def request(self, path):
+        if path == self.worker.pull_path:
+            return self.pull
+        if path.endswith("/collaborators/contributor/permission"):
+            return self.access
+        if path.endswith("/rules/branches/main"):
+            return rules_fixture()
+        if path.endswith("/rulesets/1"):
+            return {"enforcement": "active", "bypass_actors": []}
+        if path.endswith("/commits/main"):
+            return {"sha": BASE}
+        raise AssertionError(path)
+
+    def test_write_maintain_admin_and_custom_write_roles_qualify(self):
+        for permission, role in (("write", "write"), ("write", "maintain"),
+                                 ("admin", "admin"), ("write", "custom-developer")):
+            with self.subTest(role=role):
+                self.access.update(permission=permission, role_name=role)
+                self.assertTrue(self.worker.author_gate()["reconcile"])
+                self.assertEqual(self.worker.evaluate()["head"], HEAD)
+
+    def test_outsider_read_triage_and_unknown_roles_cannot_approve(self):
+        for permission in ("read", "none", "triage", "maintain", "unknown", None):
+            with self.subTest(permission=permission):
+                self.access["permission"] = permission
+                # Neither organization association nor an admin event sender is authorization.
+                self.pull.update(author_association="MEMBER", sender={"login": "admin"})
+                self.assertFalse(self.worker.author_gate()["reconcile"])
+                self.assertFalse(self.worker.reconcile()["approved"])
+                self.worker.evidence.assert_not_called()
+                self.writer.request.assert_not_called()
+
+    def test_permission_response_must_match_author_immutable_id(self):
+        self.access["user"]["id"] = 901
+        with self.assertRaisesRegex(adapter.Ineligible, "does not match"):
+            self.worker.evaluate()
+
+    def test_author_gate_preserves_automatic_and_ordinary_manual_reviews(self):
+        for trigger in ("New commits", "Manual request"):
+            with self.subTest(trigger=trigger):
+                self.setUp()
+                data = evidence(trigger)
+                if trigger == "Manual request":
+                    data["comments"].append(command())
+                self.worker.evidence.side_effect = lambda _: adapter.check_evidence(**data)
+                self.assertTrue(self.worker.reconcile()["approved"])
+                self.writer.reset_mock()
+                self.access["permission"] = "read"
+                self.assertFalse(self.worker.reconcile()["approved"])
+                self.writer.request.assert_not_called()
+
+    def test_bots_and_deleted_authors_cannot_qualify(self):
+        for author in (None, {}, {**self.author, "type": "Bot"}):
+            self.pull["user"] = author
+            self.assertFalse(self.worker.author_gate()["reconcile"])
+
+    def test_unavailable_permissions_never_qualify(self):
+        self.api.request.side_effect = adapter.APIError("GitHub GET failed with HTTP 404")
+        self.assertFalse(self.worker.author_gate()["reconcile"])
+        self.assertFalse(self.worker.reconcile()["approved"])
+        self.writer.request.assert_not_called()
+
+    def test_revoked_author_keeps_cleanup_job_and_withdraws_approval(self):
+        self.reviews = [owned_review()]
+        self.access["permission"] = "read"
+        self.assertTrue(self.worker.author_gate()["reconcile"])
+        self.assertEqual(self.worker.reconcile()["dismissed"], 1)
+        self.assertEqual([c.args[1] for c in self.writer.request.call_args_list], ["PUT"])
+
+    def test_unavailable_permissions_keep_cleanup_of_existing_approval(self):
+        self.reviews = [owned_review()]
+        self.api.request.side_effect = adapter.APIError("Unavailable")
+        self.assertTrue(self.worker.author_gate()["reconcile"])
+        self.assertEqual(self.worker.reconcile()["dismissed"], 1)
+
+    def test_preflight_does_not_authorize_a_later_approval(self):
+        self.assertTrue(self.worker.author_gate()["reconcile"])
+        self.access["permission"] = "none"
+        self.assertFalse(self.worker.reconcile()["approved"])
+        self.writer.request.assert_not_called()
+
+    def test_revocation_during_evaluation_prevents_approval(self):
+        def evidence(_):
+            self.access["permission"] = "none"
+            return receipt()
+        self.worker.evidence.side_effect = evidence
+        self.assertFalse(self.worker.reconcile()["approved"])
+        self.writer.request.assert_not_called()
+
+    def test_revocation_during_post_withdraws_new_approval(self):
+        def post(*_):
+            self.access["permission"] = "none"
+            return {"id": 500, "user": {"id": BOT_ID, "type": "Bot"}}
+        self.writer.request.side_effect = post
+        with self.assertRaises(adapter.Ineligible):
+            self.worker.reconcile()
+        self.assertEqual([c.args[1] for c in self.writer.request.call_args_list], ["POST", "PUT"])
 
 
 class RulesTests(unittest.TestCase):
@@ -667,6 +788,23 @@ class APITests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_author_preflight_gates_single_and_scheduled_batches_without_writer(self):
+        for decisions, expected in (([False], "false"), ([True], "true"),
+                                    ([False, True], "true"), ([False, False], "false"), ([], "false")):
+            with self.subTest(decisions=decisions), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "output"
+                with (patch.dict(os.environ, {"GH_TOKEN": "unused", "GITHUB_OUTPUT": str(output)}, clear=True),
+                      patch("sys.argv", ["adapter.py", "--check-authors"]),
+                      patch("adapter.GitHub") as github,
+                      patch("adapter.target_numbers", return_value=list(range(1, len(decisions) + 1))),
+                      patch("adapter.Adapter") as worker, patch("builtins.print")):
+                    worker.return_value.author_gate.side_effect = [{"reconcile": d} for d in decisions]
+                    self.assertEqual(adapter.main(), 0)
+                    self.assertEqual(output.read_text(), f"run_reconcile={expected}\n")
+                    self.assertEqual(github.call_count, 1)
+                    worker.return_value.reconcile.assert_not_called()
+                    worker.return_value.evaluate.assert_not_called()
+
     def test_default_mode_never_constructs_writer_or_reconciles(self):
         with (patch.dict(os.environ, {"GH_TOKEN": "unused"}, clear=True),
               patch("sys.argv", ["adapter.py", "--pr", "1"]),

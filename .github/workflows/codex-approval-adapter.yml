@@ -39,12 +39,20 @@ jobs:
       (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      run_reconcile: ${{ steps.authors.outputs.run_reconcile }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           ref: main
           persist-credentials: false
           sparse-checkout: .github/review-policy
+      - name: Check PR authors' repository access
+        id: authors
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEX_APPROVAL_BOT_ID: ${{ vars.CODEX_APPROVAL_BOT_ID }}
+        run: python3 .github/review-policy/adapter.py --check-authors --event "$GITHUB_EVENT_PATH"
       - name: Inspect native Codex evidence
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,6 +62,7 @@ jobs:
     needs: audit
     if: >-
       !cancelled() && needs.audit.result != 'skipped' &&
+      needs.audit.outputs.run_reconcile == 'true' &&
       vars.CODEX_APPROVAL_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20

@@ -393,7 +393,7 @@ class FragmentTests(unittest.TestCase):
 def rules_fixture():
     return [{"type": "pull_request", "ruleset_id": 1, "ruleset_source_type": "Repository",
              "parameters": {"required_approving_review_count": 1,
-                            "dismiss_stale_reviews_on_push": True, "require_last_push_approval": True}},
+                            "dismiss_stale_reviews_on_push": False, "require_last_push_approval": False}},
             {"type": "required_status_checks",
              "parameters": {"required_status_checks": [{"context": "test success"}]}}]
 
@@ -408,18 +408,21 @@ class RulesTests(unittest.TestCase):
     def test_normal_approval_rules_work_without_a_reviewer_team(self):
         adapter.check_rules(self.api, POLICY)
 
-    def test_current_live_rule_configuration_cannot_enable_adapter(self):
-        self.rules[0]["parameters"]["dismiss_stale_reviews_on_push"] = False
-        with self.assertRaises(adapter.Ineligible):
-            adapter.check_rules(self.api, POLICY)
+    def test_stale_review_settings_are_not_required_fields(self):
+        del self.rules[0]["parameters"]["dismiss_stale_reviews_on_push"]
+        del self.rules[0]["parameters"]["require_last_push_approval"]
+        adapter.check_rules(self.api, POLICY)
 
-    def test_each_freshness_switch_is_required(self):
-        for key in ("dismiss_stale_reviews_on_push", "require_last_push_approval"):
-            with self.subTest(key=key):
-                self.rules = rules_fixture()
-                self.rules[0]["parameters"][key] = False
-                with self.assertRaises(adapter.Ineligible):
+    def test_existing_stale_review_preferences_are_accepted_and_preserved(self):
+        for dismiss in (False, True):
+            for last_push in (False, True):
+                with self.subTest(dismiss=dismiss, last_push=last_push):
+                    self.rules = rules_fixture()
+                    self.rules[0]["parameters"]["dismiss_stale_reviews_on_push"] = dismiss
+                    self.rules[0]["parameters"]["require_last_push_approval"] = last_push
+                    before = deepcopy(self.rules)
                     adapter.check_rules(self.api, POLICY)
+                    self.assertEqual(self.rules, before)
 
     def test_existing_reviewer_rules_are_preserved(self):
         self.rules[0]["parameters"]["required_reviewers"] = [

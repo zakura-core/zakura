@@ -253,7 +253,7 @@ def check_evidence(policy, pull, comments, summary, reactions, reviews, threads,
 
 
 def check_rules(api, policy):
-    """Check approval freshness without changing the repository's reviewer policy."""
+    """Verify existing approval and CI requirements without changing review policy."""
     repo = policy.data["repository"]
     branch = urllib.parse.quote(policy.data["base_branch"], safe="")
     rules = api.request(f"/repos/{repo}/rules/branches/{branch}")
@@ -265,9 +265,7 @@ def check_rules(api, policy):
         if rule["type"] != "pull_request":
             continue
         parameters = rule["parameters"]
-        if not (parameters.get("required_approving_review_count", 0) >= 1
-                and parameters.get("dismiss_stale_reviews_on_push")
-                and parameters.get("require_last_push_approval")):
+        if parameters.get("required_approving_review_count", 0) < 1:
             continue
         require(rule.get("ruleset_source_type") == "Repository",
                 "Expected a repository ruleset")
@@ -275,7 +273,7 @@ def check_rules(api, policy):
         require(full.get("enforcement") == "active" and not full.get("bypass_actors"),
                 "Review ruleset must be active without bypass actors")
         return
-    raise Ineligible("Required approval and stale-review protections are not active")
+    raise Ineligible("The required approval rule is not active")
 
 
 class Adapter:

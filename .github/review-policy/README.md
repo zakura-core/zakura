@@ -110,19 +110,17 @@ Keep `CODEX_APPROVAL_ENABLED` unset or `false` until setup and validation finish
    | `CODEX_APPROVAL_APP_ID` | Its numeric App ID |
    | `CODEX_APPROVAL_BOT_ID` | Numeric ID of its `[bot]` account |
 
-5. Update the active `main` repository ruleset. Retain the global one-approval
-   requirement and the existing required `test success` check. Enable both
-   **Dismiss stale pull request approvals when new commits are pushed** and
-   **Require approval of the most recent reviewable push**. Keep the ruleset
-   active with no bypass actors. Preserve existing reviewer and code-owner
-   requirements; do not add a dedicated team or path-based reviewer rule for
-   this adapter. Release and other excluded changes get no adapter approval and
-   follow the normal approval process.
+5. Leave the current `main` ruleset unchanged: one required approval, the required
+   `test success` check, and no bypass actors. The adapter does not require
+   dismissing stale approvals or approval of the most recent reviewable push.
+   Preserve existing reviewer and code-owner requirements; no dedicated team or
+   path-based reviewer rule is needed. Release and other excluded changes get
+   no adapter approval and follow the normal approval process.
 6. Run the validation below with disposable PRs before enabling normal use.
    Finally set `CODEX_APPROVAL_ENABLED=true`.
 
-The writer independently rereads the ruleset and checks its approval requirement,
-freshness controls, and required test check before every approval. Missing or
+The writer independently rereads the ruleset and checks its approval requirement
+and required test check before every approval. Missing or
 weakened configuration prevents new approvals. A trusted `main` checkout is used
 in both jobs; PR code, artifacts, and commands never execute with the App token.
 Keep GitHub Actions' general permission to approve PRs disabled; this workflow
@@ -144,13 +142,17 @@ PR while excluded paths receive no adapter approval and need normal review.
 Test an eligible change accompanied by its own new changelog fragment, plus
 rejections for another PR's fragment and a fragment containing a release waiver.
 
-Specifically delay an approval request until after a new commit is pushed and
-confirm GitHub will not permit merging based on that old-commit review. The
-review API has no atomic expected-current-head precondition. The adapter submits
-the full reviewed `commit_id`, rereads state before and after approval, and
-withdraws its approval when those reads disagree; GitHub's native freshness
-rules must enforce the merge boundary. Mocked tests cannot establish that server
-behavior. Do not activate this adapter if that disposable-PR check fails.
+Verify that the adapter withholds a new approval when Codex reviewed an older
+commit, and withdraws an existing approval after detecting a push. The adapter
+submits the full reviewed `commit_id` and rereads state before and after approval.
+The review API has no atomic expected-current-head precondition, so these checks
+and later withdrawal do not create a synchronous merge restriction.
+
+The existing repository policy intentionally permits approval to remain valid
+after changes. For example, after the App approves commit A, a contributor may
+push commit B and merge before the adapter detects it and withdraws its approval.
+Enabling GitHub's stale-review settings is not a prerequisite for this adapter;
+their behavior remains the maintainer's existing choice.
 
 Only this App's marked approvals are withdrawn. An explicit dismissal of an
 episode is respected until a fresh clean Codex review supplies a new receipt.

@@ -181,6 +181,60 @@ fn sapling_with_spends() -> BoxedStrategy<sapling::ShieldedData<sapling::SharedA
         .boxed()
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn v5_serialized_size_rejects_reserved_orchard_flags(mut data in any::<orchard::ShieldedData>()) {
+        data.flags.insert(orchard::Flags::ENABLE_CROSS_ADDRESS);
+        let tx = Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::Height(Height(0)),
+            expiry_height: Height(0),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: Some(data),
+        };
+        prop_assert!(tx.zcash_serialize_to_vec().is_err());
+        prop_assert!(std::panic::catch_unwind(|| tx.zcash_serialized_size()).is_err());
+    }
+
+    #[test]
+    fn v5_serialized_size_covers_sapling_compact_size_boundaries(
+        bundle in sapling_with_spends(),
+        output in any::<sapling::Output>(),
+    ) {
+        let spend = bundle.spends().next().expect("the strategy includes a spend").clone();
+        let anchor = bundle.shared_anchor().expect("a V5 spend has a shared anchor");
+        for (spends, outputs) in [(0, 252), (0, 253), (252, 0), (253, 0), (252, 253), (253, 252)] {
+            let mut data = bundle.clone();
+            data.transfers = if spends == 0 {
+                sapling::TransferData::JustOutputs {
+                    outputs: vec![output.clone(); outputs].try_into().expect("these output counts are nonzero"),
+                }
+            } else {
+                sapling::TransferData::SpendsAndMaybeOutputs {
+                    shared_anchor: anchor,
+                    spends: vec![spend.clone(); spends].try_into().expect("these spend counts are nonzero"),
+                    maybe_outputs: vec![output.clone(); outputs],
+                }
+            };
+            let tx = Transaction::V5 {
+                network_upgrade: NetworkUpgrade::Nu5,
+                lock_time: LockTime::Height(Height(0)),
+                expiry_height: Height(0),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                sapling_shielded_data: Some(data),
+                orchard_shielded_data: None,
+            };
+            let encoded = tx.zcash_serialize_to_vec().expect("the boundary fixture serializes");
+            prop_assert_eq!(tx.zcash_serialized_size(), encoded.len());
+        }
+    }
+}
+
 fn orchard_with_multiple_actions() -> BoxedStrategy<orchard::ShieldedData> {
     any::<orchard::ShieldedData>()
         .prop_filter("Orchard bundle with multiple actions", |orchard| {
@@ -189,7 +243,36 @@ fn orchard_with_multiple_actions() -> BoxedStrategy<orchard::ShieldedData> {
         .boxed()
 }
 
+#[test]
+fn v5_serialized_size_preserves_lock_time_range_checks() {
+    let tx = Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::Time(
+            chrono::DateTime::from_timestamp(-1, 0).expect("this UTC time exists"),
+        ),
+        expiry_height: Height(0),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    assert!(std::panic::catch_unwind(|| tx.zcash_serialize_to_vec()).is_err());
+    assert!(std::panic::catch_unwind(|| tx.zcash_serialized_size()).is_err());
+}
+
 proptest! {
+    #[test]
+    fn transaction_serialized_size_matches_bytes(tx in any::<Transaction>()) {
+        let encoded = tx.zcash_serialize_to_vec().expect("the generated transaction serializes");
+        prop_assert_eq!(tx.zcash_serialized_size(), encoded.len());
+    }
+
+    #[test]
+    fn modern_transaction_serialized_size_matches_bundle_shapes(tx in native_zip244_tx_strategy()) {
+        let encoded = tx.zcash_serialize_to_vec().expect("the generated bundle combination serializes");
+        prop_assert_eq!(tx.zcash_serialized_size(), encoded.len());
+    }
+
     #[test]
     fn transaction_roundtrip(tx in any::<Transaction>()) {
         let _init_guard = zakura_test::init();

@@ -28,6 +28,16 @@ url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/
 [imports.zcashd]
 url = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audits.toml"
 
+# Keep the existing registry audits and require a reviewed delta for the backport.
+[policy.iroh-quinn]
+audit-as-crates-io = true
+
+[policy.iroh-quinn-proto]
+audit-as-crates-io = true
+
+[policy.iroh-quinn-udp]
+audit-as-crates-io = true
+
 [policy.zakura]
 audit-as-crates-io = false
 

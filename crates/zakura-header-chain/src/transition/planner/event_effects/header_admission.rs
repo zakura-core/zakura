@@ -158,12 +158,25 @@ pub(super) fn admit_prepared_headers(
                 )
                 .into());
             }
-            let selected_range_matches = event.batch.headers().iter().all(|header| {
+            // The selected projection is ordered by height, so the repair range must occupy one
+            // contiguous slice of it. Locating that slice once keeps the check linear in the
+            // repair range instead of scanning the whole projection for every repaired header.
+            let repair_range: Vec<_> = event
+                .batch
+                .headers()
+                .iter()
+                .map(|header| Frontier::new(header.height, header.hash))
+                .collect();
+            let selected_range_matches = repair_range.first().is_some_and(|first| {
                 event_context
                     .old_selected
-                    .iter()
-                    .find(|frontier| frontier.height == header.height)
-                    .is_some_and(|frontier| frontier.hash == header.hash)
+                    .binary_search_by_key(&first.height, |frontier| frontier.height)
+                    .is_ok_and(|start| {
+                        event_context
+                            .old_selected
+                            .get(start..start.saturating_add(repair_range.len()))
+                            == Some(repair_range.as_slice())
+                    })
             });
             if event.batch.headers().is_empty()
                 || event.aux.len() != event.batch.headers().len()

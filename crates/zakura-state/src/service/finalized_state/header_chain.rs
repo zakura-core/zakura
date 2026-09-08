@@ -1953,15 +1953,18 @@ impl HeaderChainReader {
             // means the branch moved under the request, so the requester must re-derive it.
             return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
         }
-        let mut common_ancestor = None;
+        // The nearest canonical locator bounds the leased path. Honouring list order instead
+        // would let a requester place a distant ancestor behind a useless near entry and lease a
+        // complete protocol range it never needed.
+        let mut common_ancestor: Option<Frontier> = None;
         for locator_hash in locator_hashes {
             if let Some(frontier) = self.finalized_frontier(*locator_hash)? {
                 let distance = target.height.0.checked_sub(frontier.height.0);
                 if distance.is_some_and(|distance| {
                     distance > 0 && distance <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE
-                }) {
+                }) && common_ancestor.is_none_or(|nearest| frontier.height > nearest.height)
+                {
                     common_ancestor = Some(frontier);
-                    break;
                 }
             }
         }

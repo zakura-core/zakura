@@ -202,8 +202,10 @@ impl VctWriteRetryManager {
         let new_stall = match self.root_stall {
             Some((stalled_height, _)) if stalled_height == height => false,
             _ => {
-                self.clear_root_stall();
                 self.root_stall = Some((height, Instant::now()));
+                if self.root_stall_reported {
+                    metrics::gauge!("state.vct.root.stalled.height").set(f64::from(height.0));
+                }
                 true
             }
         };
@@ -241,13 +243,20 @@ impl VctWriteRetryManager {
         if self.root_stall_reported {
             return None;
         }
-        self.root_stall
-            .map(|(_, since)| VCT_ROOT_STALL_WARN_AFTER.saturating_sub(since.elapsed()))
+        self.block_wait_started
+            .map(|since| VCT_ROOT_STALL_WARN_AFTER.saturating_sub(since.elapsed()))
     }
 
     /// Report the active stall after its diagnostic deadline.
+    ///
+    /// The deadline measures the parked block's complete metadata wait, not the time since the
+    /// latest missing height. Selection changes can move the missing height while the same block
+    /// stays parked, and a per-height deadline would restart before every report.
     pub(super) fn report_stall_if_due(&mut self, retry_cause: VctWriteRetryCause) {
-        let Some((height, since)) = self.root_stall else {
+        let Some((height, _)) = self.root_stall else {
+            return;
+        };
+        let Some(since) = self.block_wait_started else {
             return;
         };
         if self.root_stall_reported || since.elapsed() < VCT_ROOT_STALL_WARN_AFTER {

@@ -1547,6 +1547,30 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
         .release_retained_path(long_path_owner, 11, long_path_lease.lease_id, scope,)
         .expect("the bounded finalized path cursor releases"));
 
+    // The nearest canonical locator bounds the lease. Honouring list order instead would let a
+    // requester place a distant ancestor first and lease a complete range it never needed.
+    let nearest_owner = SourceId::from_digest([0x85; 32]);
+    let RetainedPathLeaseOutcome::Acquired(nearest_lease) = reader
+        .acquire_retained_path(
+            nearest_owner,
+            11,
+            target.hash,
+            &[genesis.hash, path[0].hash],
+            scope,
+        )
+        .expect("the nearest canonical locator resolves")
+    else {
+        panic!("the nearest canonical locator should acquire a lease");
+    };
+    assert_eq!(
+        nearest_lease.common_ancestor,
+        Frontier::new(path[0].height, path[0].hash),
+        "an ordered-first distant locator must not widen the leased range"
+    );
+    assert!(reader
+        .release_retained_path(nearest_owner, 11, nearest_lease.lease_id, scope)
+        .expect("the nearest canonical locator cursor releases"));
+
     // A locator at or above the target leaves no ancestor to continue from.
     let above_owner = SourceId::from_digest([0x82; 32]);
     assert!(matches!(

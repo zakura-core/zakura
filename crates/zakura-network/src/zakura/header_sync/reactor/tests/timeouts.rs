@@ -9,7 +9,9 @@ use zakura_header_chain::SourceId;
 use zakura_node_services::header_chain as port;
 
 use super::*;
-use crate::zakura::header_sync::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1;
+use crate::zakura::{
+    header_sync::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, testkit::TraceCapture,
+};
 
 #[derive(Debug)]
 struct PendingVctLocalPort {
@@ -438,7 +440,14 @@ struct ReadyVctRepairFixture {
 
 impl ReadyVctRepairFixture {
     fn new() -> Self {
+        Self::with_trace(None)
+    }
+
+    fn with_trace(trace: Option<crate::zakura::ZakuraTrace>) -> Self {
         let mut startup = startup(CancellationToken::new());
+        if let Some(trace) = trace {
+            startup.trace = trace;
+        }
         let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
         let mut snapshot = committed_snapshot(anchor);
         let target = zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
@@ -1142,6 +1151,57 @@ fn vct_auxiliary_capacity_refusal_waits_without_timed_replay() {
         "new committed state must query the blocked repair context: {actions:?}; task: {:?}",
         reactor.vct_repair.current()
     );
+}
+
+#[tokio::test]
+async fn a_failed_repair_send_still_tries_the_remaining_candidates() {
+    let mut capture =
+        TraceCapture::for_test("a_failed_repair_send_still_tries_the_remaining_candidates")
+            .expect("trace capture starts");
+    let mut fixture = ReadyVctRepairFixture::with_trace(Some(crate::zakura::ZakuraTrace::new(
+        capture.tracer(),
+        "vct-repair-test",
+    )));
+    let (peers, outbounds) = fixture.connect(&[1, 2, 3, 4], 7);
+    fixture.advertise(&peers, 7);
+    // Every candidate's outbound stream refuses the request, so the round can only end in a
+    // local backoff. A peer that stops reading its stream must not end the round before the
+    // remaining candidates get their turn.
+    drop(outbounds);
+    fixture.schedule();
+
+    fixture.reactor.try_assign_vct_repair();
+
+    assert!(matches!(
+        fixture
+            .reactor
+            .vct_repair
+            .current()
+            .expect("the repair remains")
+            .state,
+        RepairPolicyState::LocalBackoff { .. }
+    ));
+    capture.flush().await;
+    let reader = capture.reader().expect("the trace reloads");
+    let attempted = reader
+        .table(QUEUE_SEND_TABLE.table())
+        .rows()
+        .iter()
+        .filter(|row| {
+            row.get(qs_trace::EVENT).and_then(serde_json::Value::as_str)
+                == Some(qs_trace::QUEUE_SEND_FAILED)
+                && row
+                    .get(qs_trace::MESSAGE)
+                    .and_then(serde_json::Value::as_str)
+                    == Some("GetHeaders")
+        })
+        .count();
+    assert_eq!(
+        attempted,
+        peers.len(),
+        "one refused send must not consume the whole scheduling round"
+    );
+    let _ = capture.finish().await.expect("trace capture finishes");
 }
 
 #[test]

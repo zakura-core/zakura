@@ -84,14 +84,15 @@ fn on_commit_success_clears_an_escalated_stall() {
     let mut manager = VctWriteRetryManager::default();
     let height = Height(1);
 
-    // The backdated start time forces the manager to report the stall.
-    manager.root_stall = Some((height, Instant::now() - Duration::from_secs(31)));
+    // The backdated block wait forces the manager to report the stall.
+    manager.block_wait_started = Some(Instant::now() - Duration::from_secs(31));
     manager.on_retryable_error(height, MISSING_ROOT, queued_block(1));
     assert!(manager.root_stall_reported, "the manager reports the stall");
 
     manager.on_commit_success();
 
     assert!(manager.root_stall.is_none());
+    assert!(manager.block_wait_started.is_none());
     assert!(!manager.root_stall_reported);
 }
 
@@ -113,7 +114,7 @@ fn on_retryable_error_keeps_the_same_stall_start_for_a_repeated_height() {
 }
 
 #[test]
-fn on_retryable_error_resets_the_stall_for_a_different_height() {
+fn on_retryable_error_repoints_a_reported_stall_to_a_different_height() {
     let mut manager = VctWriteRetryManager::default();
 
     manager.on_retryable_error(Height(1), MISSING_ROOT, queued_block(1));
@@ -129,13 +130,31 @@ fn on_retryable_error_resets_the_stall_for_a_different_height() {
         Some(Height(2))
     );
     assert!(
-        !manager.root_stall_reported,
-        "a new height starts an unreported stall"
+        manager.root_stall_reported,
+        "a new missing height re-points the raised stall instead of clearing it"
     );
     assert_eq!(
         manager.block_wait_started,
         Some(block_wait_started),
         "a new missing height keeps the same checkpoint wait"
+    );
+}
+
+#[test]
+fn alternating_missing_heights_cannot_postpone_the_stall_report() {
+    let mut manager = VctWriteRetryManager::default();
+
+    manager.on_retryable_error(Height(1), MISSING_ROOT, queued_block(1));
+    assert!(!manager.root_stall_reported);
+
+    // The parked block keeps waiting while selection alternates the missing height. The
+    // diagnostic deadline measures that wait, so a changed height cannot restart it.
+    manager.block_wait_started = Some(Instant::now() - Duration::from_secs(31));
+    manager.on_retryable_error(Height(2), MISSING_ROOT, queued_block(2));
+
+    assert!(
+        manager.root_stall_reported,
+        "height churn must not suppress the stall diagnostic"
     );
 }
 
@@ -148,8 +167,8 @@ fn on_retryable_error_escalates_past_the_warn_threshold() {
     manager.on_retryable_error(height, MISSING_ROOT, queued_block(1));
     assert!(!manager.root_stall_reported);
 
-    // The backdated start time moves the stall past the warning threshold.
-    manager.root_stall = Some((height, Instant::now() - Duration::from_secs(31)));
+    // The backdated block wait moves the stall past the warning threshold.
+    manager.block_wait_started = Some(Instant::now() - Duration::from_secs(31));
     manager.on_retryable_error(height, MISSING_ROOT, queued_block(2));
     assert!(manager.root_stall_reported);
 }

@@ -1887,6 +1887,7 @@ impl HeaderSyncReactor {
                             })
                         });
                         if blocked {
+                            self.replay_committed_state_version(repair_owner);
                             if let Some(task) = self.vct_repair.get(repair_owner) {
                                 self.emit_vct_repair_state(
                                     task,
@@ -1915,6 +1916,7 @@ impl HeaderSyncReactor {
                         task.wait_for_state_change(receipt.state_version).is_ok()
                     });
                     if blocked {
+                        self.replay_committed_state_version(repair_owner);
                         if let Some(task) = self.vct_repair.get(repair_owner) {
                             self.emit_vct_repair_state(task, "wait", Some("resource_state_change"));
                         }
@@ -2085,6 +2087,24 @@ impl HeaderSyncReactor {
                 }),
             );
         });
+    }
+
+    /// Replay the newest committed state version against one just-blocked repair.
+    ///
+    /// Repair state changes are edge-triggered. A refusal can name a version the reactor has
+    /// already observed, and `StateBlocked` has no maintenance deadline, so a task blocked at a
+    /// superseded coordinate would wait for a snapshot that already arrived.
+    fn replay_committed_state_version(&mut self, owner: zakura_header_chain::BodyWorkOwner) {
+        let Some(state_version) = self
+            .committed_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.state_version)
+        else {
+            return;
+        };
+        if let Some(task) = self.vct_repair.get_mut(owner) {
+            task.observe_state_change(state_version);
+        }
     }
 
     fn retry_vct_repair(
@@ -3269,6 +3289,7 @@ impl HeaderSyncReactor {
         }
         candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.4));
         let mut local_capacity_unavailable = false;
+        let mut local_send_failure = false;
         for (peer, source, session, mut status, request_count) in candidates {
             self.peer_work_queue.remove_unstarted(&peer);
             if self
@@ -3309,24 +3330,12 @@ impl HeaderSyncReactor {
                             }
                             self.rotate_vct_supplier(source);
                         }
+                        // A full or closed outbound stream describes this one peer. Backing the
+                        // whole round off here would let a peer that stops reading its stream keep
+                        // its place at the front of every candidate list and fail the same send
+                        // forever, so the remaining candidates still get their turn.
                         VctRepairRetryAttribution::Local => {
-                            let deferred =
-                                self.vct_repair.get_mut(task.owner).is_some_and(|task| {
-                                    task.defer_local_retry_until(now + VCT_REPAIR_RETRY_INTERVAL)
-                                        .is_ok()
-                                });
-                            if deferred {
-                                if let Some(current) = self.vct_repair.get(task.owner).cloned() {
-                                    self.note_vct_repair_stall(
-                                        &current,
-                                        predecessor,
-                                        rejections,
-                                        VctRepairStallOutcome::LocalSendFailure,
-                                        now,
-                                    );
-                                }
-                            }
-                            return;
+                            local_send_failure = true;
                         }
                         VctRepairRetryAttribution::Stale => unreachable!(
                             "ordered-send failures cannot report a stale state episode"
@@ -3415,6 +3424,24 @@ impl HeaderSyncReactor {
                 hash = ?request_target.hash,
                 "requested selected VCT metadata repair"
             );
+            return;
+        }
+        if local_send_failure {
+            let deferred = self.vct_repair.get_mut(task.owner).is_some_and(|task| {
+                task.defer_local_retry_until(now + VCT_REPAIR_RETRY_INTERVAL)
+                    .is_ok()
+            });
+            if deferred {
+                if let Some(current) = self.vct_repair.get(task.owner).cloned() {
+                    self.note_vct_repair_stall(
+                        &current,
+                        predecessor,
+                        rejections,
+                        VctRepairStallOutcome::LocalSendFailure,
+                        now,
+                    );
+                }
+            }
             return;
         }
         if let Some(current) = self.vct_repair.get(task.owner).cloned() {
@@ -3705,10 +3732,20 @@ impl HeaderSyncReactor {
                         if let Some(task) = self.vct_repair.get(owner) {
                             self.emit_vct_repair_state(task, "timeout", Some("timed_out"));
                         }
+                        let session_id = self
+                            .peer_work_queue
+                            .active(&peer)
+                            .map(|active| active.owner.session_id());
                         self.retry_vct_repair(
                             owner,
                             VctRepairRetry::supplier(source, HeaderRequestTerminal::TimedOut),
                         );
+                        // A repair reserves aggregate header budget that ordinary staging cannot
+                        // use, so a supplier that withholds its response until the deadline must
+                        // be charged like any other unresponsive peer.
+                        if let Some(session_id) = session_id {
+                            self.charge_unproductive_request(&peer, session_id, "unresponsive");
+                        }
                         metrics::counter!("sync.header.vct.repair.timed_out.total").increment(1);
                     }
                     HeaderTargetPhase::Preparing | HeaderTargetPhase::Applying => {

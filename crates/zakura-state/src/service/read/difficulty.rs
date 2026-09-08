@@ -450,13 +450,12 @@ mod tests {
                 .expect("test time is in range")
         );
 
-        let mut header = Network::Mainnet
+        let mut header = *Network::Mainnet
             .block_parsed_iter()
             .next()
             .expect("Mainnet test vectors contain a block")
             .header
-            .as_ref()
-            .clone();
+            .as_ref();
         header.time = time_range.max_time.into();
         header
             .time_is_valid_at(local_time.into(), &Height::MIN, &header.hash())

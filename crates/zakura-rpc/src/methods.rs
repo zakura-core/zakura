@@ -1037,7 +1037,117 @@ enum Preparation {
     Failed(zakura_consensus::BoxError),
 }
 
-/// Validates one server mining template, giving up as soon as its parent stops being the tip.
+/// Runs one template's proposal validation to completion.
+///
+/// This is the whole cost of preparing a template: building the proposal block, then semantically
+/// verifying every transaction in it. Nothing here is cancellable. A caller that stops waiting
+/// leaves this running, which is why callers must account for it rather than assume it stopped.
+async fn verify_server_template<BlockVerifierRouter>(
+    verifier: BlockVerifierRouter,
+    template: &BlockTemplateResponse,
+    network: &Network,
+) -> Preparation
+where
+    BlockVerifierRouter: BlockVerifierService,
+{
+    let Ok(block) = proposal_block_from_template(template, None, network) else {
+        tracing::warn!(work_id = %template.work_id(), "server mining template cannot form a proposal");
+        return Preparation::Rejected;
+    };
+
+    // Building the block is itself CPU work, so give up here rather than start verification for a
+    // parent the chain has already left.
+    if zakura_chain::shutdown::is_shutting_down() {
+        return Preparation::Stale;
+    }
+
+    let parent = block.header.previous_block_hash;
+    let request = zakura_consensus::Request::Prepare {
+        block: Arc::new(block),
+        source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
+    };
+
+    match verifier.oneshot(request).await {
+        Ok(_hash) => Preparation::Prepared,
+        Err(error) => {
+            let rejects_template = rejects_template(&error);
+            tracing::debug!(
+                ?error,
+                work_id = %template.work_id(),
+                ?parent,
+                rejects_template,
+                "mining candidate preparation failed"
+            );
+            if rejects_template {
+                Preparation::Rejected
+            } else {
+                Preparation::Failed(error)
+            }
+        }
+    }
+}
+
+/// Starts one speculative preparation and waits for it, without binding the two together.
+///
+/// The verification runs in a detached task, so the deadline and the stale-tip watcher stop *this
+/// function* waiting without stopping the computation. The returned handle is how the caller
+/// observes when the computation actually finished; until it does, the caller must not start
+/// another one.
+fn start_speculative_preparation<BlockVerifierRouter, Tip>(
+    verifier: BlockVerifierRouter,
+    template: &BlockTemplateResponse,
+    latest_chain_tip: Tip,
+    network: &Network,
+) -> (
+    impl std::future::Future<Output = Preparation>,
+    tokio::task::JoinHandle<()>,
+)
+where
+    BlockVerifierRouter: BlockVerifierService,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+{
+    let parent = template.previous_block_hash;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let computation = tokio::spawn({
+        let template = template.clone();
+        let network = network.clone();
+        async move {
+            let outcome = verify_server_template(verifier, &template, &network).await;
+            // The receiver is gone whenever this preparation already missed its deadline.
+            let _ = result_tx.send(outcome);
+        }
+        .in_current_span()
+    });
+
+    let mut tip = latest_chain_tip;
+    let waiter = async move {
+        let stale = async {
+            loop {
+                tip.mark_best_tip_seen();
+                if tip.best_tip_hash() != Some(parent) {
+                    break;
+                }
+                if tip.best_tip_changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+
+        tokio::select! {
+            biased;
+            _ = stale => Preparation::Stale,
+            _ = tokio::time::sleep(TEMPLATE_PREPARATION_TIMEOUT) => Preparation::TimedOut,
+            outcome = result_rx => outcome.unwrap_or(Preparation::Stale),
+        }
+    };
+
+    (waiter, computation)
+}
+
+/// Validates one template in the foreground, for a caller that needs the answer now.
+///
+/// Unlike speculative preparation this is ordinary validation: a miner is waiting on it, so it
+/// runs whatever the speculation breaker says.
 async fn prepare_server_template<BlockVerifierRouter, Tip>(
     verifier: BlockVerifierRouter,
     template: &BlockTemplateResponse,
@@ -1048,16 +1158,7 @@ where
     BlockVerifierRouter: BlockVerifierService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
 {
-    let Ok(block) = proposal_block_from_template(template, None, network) else {
-        tracing::warn!(work_id = %template.work_id(), "server mining template cannot form a proposal");
-        return Preparation::Rejected;
-    };
-    let parent = block.header.previous_block_hash;
-    let request = zakura_consensus::Request::Prepare {
-        block: Arc::new(block),
-        source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
-    };
-
+    let parent = template.previous_block_hash;
     let mut tip = latest_chain_tip;
     let stale = async {
         loop {
@@ -1074,27 +1175,10 @@ where
     tokio::select! {
         biased;
         _ = stale => Preparation::Stale,
-        result = tokio::time::timeout(TEMPLATE_PREPARATION_TIMEOUT, verifier.oneshot(request)) => {
-            match result {
-                Err(_timeout) => Preparation::TimedOut,
-                Ok(Ok(_hash)) => Preparation::Prepared,
-                Ok(Err(error)) => {
-                    let rejects_template = rejects_template(&error);
-                    tracing::debug!(
-                        ?error,
-                        work_id = %template.work_id(),
-                        ?parent,
-                        rejects_template,
-                        "mining candidate preparation failed"
-                    );
-                    if rejects_template {
-                        Preparation::Rejected
-                    } else {
-                        Preparation::Failed(error)
-                    }
-                }
-            }
-        }
+        result = tokio::time::timeout(
+            TEMPLATE_PREPARATION_TIMEOUT,
+            verify_server_template(verifier, template, network),
+        ) => result.unwrap_or(Preparation::TimedOut),
     }
 }
 
@@ -1416,6 +1500,22 @@ where
     }
 
     /// Validates queued server templates in the background, newest first.
+    ///
+    /// # Compute bound
+    ///
+    /// Speculative preparation is work nobody asked for, so it must never be able to accumulate.
+    /// Two properties bound it, and both are load-bearing:
+    ///
+    /// - `TemplatePreparationQueue` admits one loop and holds one pending template.
+    /// - This loop waits for each preparation's *computation* to finish, not merely for its
+    ///   result. A deadline or a tip change stops the loop waiting for an answer it can no longer
+    ///   use, but the verification it dispatched keeps running, so taking the next template then
+    ///   would leave two verifications in flight. Repeating that is how a stream of tip changes
+    ///   turns speculation into unbounded work.
+    ///
+    /// Together they hold speculative preparation to one verification in flight at any moment.
+    /// A preparation that never returns therefore stops speculation entirely, which is the safe
+    /// direction: ordinary submission and foreground recovery do not go through here.
     fn prepare_template_in_background(&self, template: &BlockTemplateResponse) {
         let Some(template) = self.gbt.queue_template_preparation(template.clone()) else {
             metrics::counter!("mining.template_preparation.coalesced").increment(1);
@@ -1429,19 +1529,31 @@ where
             async move {
                 let mut template = template;
                 loop {
+                    let parent = template.previous_block_hash;
+                    let work_id = template.work_id().clone();
+
+                    // Recheck everything that may have changed while the previous template was
+                    // being prepared, before spending anything on this one.
+                    if zakura_chain::shutdown::is_shutting_down() {
+                        break;
+                    }
                     // Once a parent needs recovery, only foreground-validated fallback work may
                     // be published. Discard its queued speculative preparations.
-                    if !gbt.template_rejections.borrow().needs_fallback() {
-                        let parent = template.previous_block_hash;
-                        let work_id = template.work_id().clone();
-                        match prepare_server_template(
+                    let withdrawn = gbt.template_rejections.borrow().needs_fallback();
+                    let breaker_open = !gbt.speculation_breaker.allows(parent);
+                    if breaker_open {
+                        metrics::counter!("mining.template_preparation.declined").increment(1);
+                    }
+
+                    if !withdrawn && !breaker_open {
+                        let (preparation, computation) = start_speculative_preparation(
                             verifier.clone(),
                             &template,
                             latest_chain_tip.clone(),
                             &network,
-                        )
-                        .await
-                        {
+                        );
+
+                        match preparation.await {
                             Preparation::Prepared => {
                                 gbt.template_rejections.send_if_modified(|state| {
                                     state.mark_prepared(parent, &work_id);
@@ -1459,6 +1571,10 @@ where
                                     .increment(1);
                             }
                             Preparation::TimedOut => {
+                                // This parent's templates cost more than the deadline allows.
+                                // Stop speculating on it until the chain moves on, instead of
+                                // paying that cost again for every template built on it.
+                                gbt.speculation_breaker.trip(parent);
                                 metrics::counter!("mining.template_preparation.timed_out")
                                     .increment(1);
                             }
@@ -1470,6 +1586,19 @@ where
                                     "background mining candidate preparation failed"
                                 );
                             }
+                        }
+
+                        // The bound: no second verification starts while this one still runs.
+                        if !computation.is_finished() {
+                            metrics::counter!("mining.template_preparation.abandoned").increment(1);
+                            tracing::debug!(
+                                %work_id,
+                                ?parent,
+                                "waiting for an abandoned template preparation to finish"
+                            );
+                        }
+                        if let Err(error) = computation.await {
+                            tracing::warn!(?error, "template preparation task did not finish");
                         }
                     }
 

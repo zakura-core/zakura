@@ -136,6 +136,12 @@ impl TemplateRejections {
     }
 }
 
+/// Coalesces speculative template preparation onto one worker with one pending template.
+///
+/// `running` admits exactly one preparation loop, and that loop does not take its next template
+/// until the previous template's verification has actually finished, so at most one speculative
+/// verification is ever in flight. Templates that arrive meanwhile replace `pending` rather than
+/// queueing behind it: only the newest is worth preparing.
 #[derive(Clone, Debug)]
 struct TemplatePreparationQueue<T>(Arc<Mutex<TemplatePreparationState<T>>>);
 
@@ -179,6 +185,41 @@ impl<T> TemplatePreparationQueue<T> {
             state.running = false;
         }
         next
+    }
+}
+
+/// Whether speculative template preparation may start, and for which parent.
+///
+/// Speculative preparation runs full semantic verification on a template nobody submitted. The
+/// task that waits for it can give up, but giving up does not stop the verification: dropping a
+/// tower future leaves the work its request already dispatched running to completion. Starting
+/// another preparation on the same parent would repeat the cost that just failed to finish within
+/// its deadline, so one missed deadline stops speculation until the template parent changes.
+///
+/// This gates speculation only. Foreground template recovery and ordinary block submission still
+/// validate normally while it is tripped.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpeculationBreaker(Arc<Mutex<Option<block::Hash>>>);
+
+impl SpeculationBreaker {
+    /// Stops speculative preparation for `parent`, after one of its templates missed its deadline.
+    pub(crate) fn trip(&self, parent: block::Hash) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(parent);
+    }
+
+    /// Whether speculative preparation may start for `parent`.
+    ///
+    /// A new parent is the recovery condition: the chain moved on, so the templates that timed
+    /// out are gone and their cost says nothing about this one.
+    pub(crate) fn allows(&self, parent: block::Hash) -> bool {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            != Some(parent)
     }
 }
 
@@ -703,6 +744,9 @@ where
 
     /// Retains failures so late subscribers cannot miss template withdrawal.
     pub(crate) template_rejections: watch::Sender<TemplateRejections>,
+
+    /// Stops speculative preparation for a parent whose template missed its deadline.
+    pub(crate) speculation_breaker: SpeculationBreaker,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -732,6 +776,7 @@ where
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
             template_rejections: watch::channel(TemplateRejections::default()).0,
+            speculation_breaker: SpeculationBreaker::default(),
         }
     }
 

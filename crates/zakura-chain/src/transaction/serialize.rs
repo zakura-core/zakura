@@ -15,7 +15,7 @@ use crate::{
     primitives::{Halo2Proof, ZkSnarkProof},
     serialization::{
         zcash_deserialize_external_count, zcash_serialize_empty_list,
-        zcash_serialize_external_count, AtLeastOne, CompactSizeMessage, ReadZcashExt,
+        zcash_serialize_external_count, AtLeastOne, CompactSizeMessage, FakeWriter, ReadZcashExt,
         SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashDeserializeInto,
         ZcashSerialize,
     },
@@ -592,7 +592,92 @@ impl<T: reddsa::SigType> ZcashDeserialize for reddsa::Signature<T> {
     }
 }
 
+/// Count the V5 Sapling bundle without materializing its separated wire arrays.
+fn sapling_v5_serialized_size(
+    data: &Option<sapling::ShieldedData<sapling::SharedAnchor>>,
+) -> usize {
+    let Some(data) = data else {
+        return 2;
+    };
+    let spends = data.spends().count();
+    let outputs = data.outputs().count();
+    let spend_size = usize::try_from(sapling::spend::SHARED_ANCHOR_SPEND_SIZE)
+        .expect("the fixed Sapling spend encoding fits usize");
+    let output_size = usize::try_from(sapling::output::OUTPUT_SIZE)
+        .expect("the fixed Sapling output encoding fits usize");
+
+    // Section 7.1: each count is CompactSize; value balance and binding signature
+    // accompany a nonempty bundle, and a shared anchor accompanies its spends.
+    [
+        CompactSizeMessage::try_from(spends)
+            .expect("the Sapling spend count fits its wire encoding")
+            .zcash_serialized_size(),
+        CompactSizeMessage::try_from(outputs)
+            .expect("the Sapling output count fits its wire encoding")
+            .zcash_serialized_size(),
+        spends
+            .checked_mul(spend_size)
+            .expect("Sapling spends fit the address space"),
+        outputs
+            .checked_mul(output_size)
+            .expect("Sapling outputs fit the address space"),
+        8 + 64,
+        if data.shared_anchor().is_some() {
+            32
+        } else {
+            0
+        },
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
+    .expect("the Sapling bundle encoding fits the address space")
+}
+
 impl ZcashSerialize for Transaction {
+    fn zcash_serialized_size(&self) -> usize {
+        let Self::V5 {
+            network_upgrade,
+            lock_time,
+            inputs,
+            outputs,
+            sapling_shielded_data,
+            orchard_shielded_data,
+            ..
+        } = self
+        else {
+            let mut writer = FakeWriter(0);
+            self.zcash_serialize(&mut writer)
+                .expect("counting a serializable transaction is infallible");
+            return writer.0;
+        };
+
+        assert!(
+            network_upgrade.branch_id().is_some(),
+            "valid transactions must have a network upgrade with a branch id"
+        );
+        // The other four fixed fields are uint32; preserve lock-time range checks.
+        let mut writer = FakeWriter(16);
+        lock_time
+            .zcash_serialize(&mut writer)
+            .expect("counting a serializable lock time is infallible");
+        inputs
+            .zcash_serialize(&mut writer)
+            .expect("counting serializable transparent inputs is infallible");
+        outputs
+            .zcash_serialize(&mut writer)
+            .expect("counting serializable transparent outputs is infallible");
+        serialize_optional_orchard_shielded_data_with_flags(
+            orchard_shielded_data,
+            &mut writer,
+            !ALLOW_CROSS_ADDRESS_BIT,
+        )
+        .expect("counting a serializable Orchard bundle is infallible");
+        writer
+            .0
+            .checked_add(sapling_v5_serialized_size(sapling_shielded_data))
+            .expect("the transaction encoding fits the address space")
+    }
+
     #[allow(clippy::unwrap_in_result)]
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
         // Post-Sapling, transaction size is limited to MAX_BLOCK_BYTES.

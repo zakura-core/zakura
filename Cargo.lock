@@ -2875,8 +2875,7 @@ dependencies = [
 [[package]]
 name = "iroh-quinn"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cde160ebee7aabede6ae887460cd303c8b809054224815addf1469d54a6fcf7"
+source = "git+https://github.com/zakura-core/iroh-quinn?rev=1dcc7a43488fecd199d343d47e93e9ed8319fcaa#1dcc7a43488fecd199d343d47e93e9ed8319fcaa"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2895,8 +2894,7 @@ dependencies = [
 [[package]]
 name = "iroh-quinn-proto"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "929d5d8fa77d5c304d3ee7cae9aede31f13908bd049f9de8c7c0094ad6f7c535"
+source = "git+https://github.com/zakura-core/iroh-quinn?rev=1dcc7a43488fecd199d343d47e93e9ed8319fcaa#1dcc7a43488fecd199d343d47e93e9ed8319fcaa"
 dependencies = [
  "bytes",
  "getrandom 0.2.17",
@@ -2915,8 +2913,7 @@ dependencies = [
 [[package]]
 name = "iroh-quinn-udp"
 version = "0.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c53afaa1049f7c83ea1331f5ebb9e6ebc5fdd69c468b7a22dd598b02c9bcc973"
+source = "git+https://github.com/zakura-core/iroh-quinn?rev=1dcc7a43488fecd199d343d47e93e9ed8319fcaa#1dcc7a43488fecd199d343d47e93e9ed8319fcaa"
 dependencies = [
  "cfg_aliases",
  "libc",

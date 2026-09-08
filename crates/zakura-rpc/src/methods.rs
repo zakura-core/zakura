@@ -2753,6 +2753,7 @@ where
 
                 precomputed_coinbase = wait_for_new_tip => {
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
+                    let mempool_tx_deps = TransactionDependencies::default();
 
                     let server_long_poll_id = LongPollInput::new(
                         chain_info.tip_height,
@@ -2783,6 +2784,7 @@ where
                         &chain_info,
                         server_long_poll_id,
                         vec![],
+                        &mempool_tx_deps,
                         submit_old,
                     )
                     .into())
@@ -2827,7 +2829,7 @@ where
             height,
             miner_params,
             mempool_txs,
-            mempool_tx_deps,
+            mempool_tx_deps.clone(),
         );
 
         tracing::debug!(
@@ -2847,6 +2849,7 @@ where
             &chain_info,
             server_long_poll_id,
             mempool_txs,
+            &mempool_tx_deps,
             submit_old,
         )
         .into())

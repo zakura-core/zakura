@@ -9,6 +9,7 @@ pub mod zip317;
 mod tests;
 
 use std::{
+    collections::HashMap,
     fmt::{self},
     sync::Arc,
 };
@@ -71,6 +72,56 @@ pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
 /// See the `dependencies_depth()` function in [`zip317`] for more details.
 #[cfg(test)]
 type InBlockTxDependenciesDepth = usize;
+
+/// Converts selected mempool transactions into templates with their one-based
+/// direct dependency indexes.
+fn mempool_transaction_templates(
+    mempool_txs: &[VerifiedUnminedTx],
+    mempool_tx_deps: &TransactionDependencies,
+) -> Vec<TransactionTemplate<amount::NonNegative>> {
+    let transaction_indexes: HashMap<_, _> = mempool_txs
+        .iter()
+        .enumerate()
+        .map(|(index, tx)| {
+            let one_based_index = u16::try_from(index + 1)
+                .expect("the block size limit keeps transaction indexes within u16");
+
+            (tx.transaction.id().mined_id(), one_based_index)
+        })
+        .collect();
+
+    mempool_txs
+        .iter()
+        .enumerate()
+        .map(|(index, tx)| {
+            let transaction_id = tx.transaction.id().mined_id();
+            let mut dependency_indexes: Vec<_> = mempool_tx_deps
+                .dependencies()
+                .get(&transaction_id)
+                .into_iter()
+                .flatten()
+                .map(|dependency_id| {
+                    *transaction_indexes.get(dependency_id).expect(
+                        "selected dependent transactions have all dependencies in the template",
+                    )
+                })
+                .collect();
+
+            dependency_indexes.sort_unstable();
+
+            debug_assert!(
+                dependency_indexes
+                    .iter()
+                    .all(|dependency_index| usize::from(*dependency_index) <= index),
+                "transaction dependencies must precede their dependents"
+            );
+
+            let mut template = TransactionTemplate::from(tx);
+            template.depends = dependency_indexes;
+            template
+        })
+        .collect()
+}
 
 /// A serialized `getblocktemplate` RPC response in template mode.
 ///
@@ -277,6 +328,7 @@ impl BlockTemplateResponse {
         long_poll_id: LongPollId,
         #[cfg(not(test))] mempool_txs: Vec<VerifiedUnminedTx>,
         #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
+        mempool_tx_deps: &TransactionDependencies,
         submit_old: Option<bool>,
     ) -> Self {
         // Determine the next block height.
@@ -284,11 +336,6 @@ impl BlockTemplateResponse {
             .tip_height
             .next()
             .expect("chain tip must be below Height::MAX");
-
-        // Convert transactions into TransactionTemplates.
-        #[cfg(not(test))]
-        let (mempool_tx_templates, mempool_txs): (Vec<_>, Vec<_>) =
-            mempool_txs.into_iter().map(|tx| ((&tx).into(), tx)).unzip();
 
         // Transaction selection returns transactions in an arbitrary order,
         // but Zebra's snapshot tests expect the same order every time.
@@ -298,28 +345,23 @@ impl BlockTemplateResponse {
         // Transactions that spend outputs created in the same block must appear
         // after the transactions that create those outputs.
         #[cfg(test)]
-        let (mempool_tx_templates, mempool_txs): (Vec<_>, Vec<_>) = {
-            let mut mempool_txs_with_templates: Vec<(
-                InBlockTxDependenciesDepth,
-                TransactionTemplate<amount::NonNegative>,
-                VerifiedUnminedTx,
-            )> = mempool_txs
-                .into_iter()
-                .map(|(min_tx_index, tx)| (min_tx_index, (&tx).into(), tx))
-                .collect();
+        let mempool_txs: Vec<_> = {
+            let mut mempool_txs = mempool_txs;
 
             // `zcashd` sorts in serialized data order, excluding the length byte.
             // It sometimes seems to do this, but other times the order is arbitrary.
             // Sort by hash, this is faster.
-            mempool_txs_with_templates.sort_by_key(|(min_tx_index, tx_template, _tx)| {
-                (*min_tx_index, tx_template.hash.bytes_in_display_order())
+            mempool_txs.sort_by_key(|(dependency_depth, tx)| {
+                (
+                    *dependency_depth,
+                    tx.transaction.id().mined_id().bytes_in_display_order(),
+                )
             });
 
-            mempool_txs_with_templates
-                .into_iter()
-                .map(|(_, template, tx)| (template, tx))
-                .unzip()
+            mempool_txs.into_iter().map(|(_, tx)| tx).collect()
         };
+
+        let mempool_tx_templates = mempool_transaction_templates(&mempool_txs, mempool_tx_deps);
 
         let txs_fee = mempool_txs
             .iter()

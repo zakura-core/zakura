@@ -20,11 +20,49 @@ use zakura_chain::{
     transaction::Transaction,
     transparent,
 };
+use zakura_node_services::mempool::TransactionDependencies;
 
 use crate::client::TransactionTemplate;
 use crate::config::mining::{default_miner_address, MinerAddressType};
 
 use super::MinerParams;
+
+#[test]
+fn transaction_templates_report_direct_dependency_indexes() {
+    let mempool_txs: Vec<_> = Network::Mainnet
+        .unmined_transactions_in_blocks(..)
+        .take(4)
+        .collect();
+    assert_eq!(mempool_txs.len(), 4, "test vectors must contain four txs");
+
+    let transaction_ids: Vec<_> = mempool_txs
+        .iter()
+        .map(|tx| tx.transaction.id().mined_id())
+        .collect();
+    let mut mempool_tx_deps = TransactionDependencies::default();
+    mempool_tx_deps.add(
+        transaction_ids[2],
+        vec![
+            transparent::OutPoint::from_usize(transaction_ids[1], 0),
+            transparent::OutPoint::from_usize(transaction_ids[0], 0),
+        ],
+    );
+    mempool_tx_deps.add(
+        transaction_ids[3],
+        vec![transparent::OutPoint::from_usize(transaction_ids[2], 0)],
+    );
+
+    let templates = super::mempool_transaction_templates(&mempool_txs, &mempool_tx_deps);
+    let dependency_indexes: Vec<_> = templates
+        .iter()
+        .map(|template| template.depends.clone())
+        .collect();
+
+    assert_eq!(
+        dependency_indexes,
+        vec![vec![], vec![], vec![1, 2], vec![3]]
+    );
+}
 
 /// Tests transparent coinbase generation at every configured Sapling-and-later
 /// network upgrade activation.

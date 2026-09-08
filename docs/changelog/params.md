@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `MAX_CONCURRENT_UTXO_LOOKUPS` | `crates/zakura-consensus/src/transaction.rs` | serial (`1`) → `64` per block transaction | [#918](https://github.com/zakura-core/zakura/pull/918) | Overlap external UTXO waits while bounding pending lookups per transaction. Concurrent lookups start their six-minute timeout clocks together. |
 | `MAX_MINED_SUBMISSIONS` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | unbounded → `16` submissions | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound detached verification work across RPC cancellation. |
 | `non_finalized_write_slots` | `crates/zakura-state/src/service.rs` | unbounded → `1,000` contextual writes | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound writer block bodies using the existing orphan queue capacity. |
 | `LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE` | `crates/zakurad/src/commands/start/zakura/coordinator.rs` | new → `30 min` | [#831](https://github.com/zakura-core/zakura/pull/831) | Terminate the node when native block applies prevent legacy fallback from acquiring exclusive ownership, instead of leaving the fallback handoff pending forever. |

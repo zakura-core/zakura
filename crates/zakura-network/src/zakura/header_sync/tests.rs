@@ -780,7 +780,12 @@ fn decode_rejects_each_vector_hint_schema_and_byte_boundary() {
 }
 
 #[test]
-fn bounded_serving_allowance_covers_headers_metadata_and_single_header_framing() {
+fn bounded_serving_header_cap_keeps_encoded_responses_below_byte_ceiling() {
+    assert!(
+        u64::from(super::wire::MAX_HS_RANGE)
+            * zakura_header_chain::BOUNDED_HEADER_RESPONSE_BYTES_PER_HEADER
+            <= zakura_header_chain::MAX_BOUNDED_HEADER_RESPONSE_BYTES
+    );
     for network in [Network::Mainnet, Network::new_regtest(Default::default())] {
         for schema in [AuxSchema::None, AuxSchema::V1] {
             let bytes = super::wire::headers_response_bytes(&network, schema, 1)

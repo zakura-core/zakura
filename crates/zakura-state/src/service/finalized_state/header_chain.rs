@@ -859,7 +859,7 @@ struct RetainedPathLeaseRegistry {
     next_lease_id: u64,
     next_reservation_id: u64,
     by_peer: HashMap<SourceId, CanonicalHeaderPathCursor>,
-    reservations: HashMap<SourceId, u64>,
+    reservations: HashMap<SourceId, (u64, RetainedPathCapacity)>,
     reference_counts: HashMap<block::Hash, usize>,
     cached_references: Arc<[block::Hash]>,
     references_dirty: bool,
@@ -874,13 +874,7 @@ enum RetainedPathCapacity {
 impl RetainedPathCapacity {
     fn for_range(ancestor: Frontier, target: Frontier) -> Self {
         let count = target.height.0.saturating_sub(ancestor.height.0);
-        // Charge a complete response per header, including the largest supported metadata.
-        // This bounds total response bytes even when the requester asks for one-header pages.
-        let bytes =
-            u64::from(count.max(1)) * zakura_header_chain::BOUNDED_HEADER_RESPONSE_BYTES_PER_HEADER;
-        if count <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE
-            && bytes <= zakura_header_chain::MAX_BOUNDED_HEADER_RESPONSE_BYTES
-        {
+        if count <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE {
             Self::Bounded
         } else {
             Self::General
@@ -920,6 +914,7 @@ struct CanonicalHeaderPathCursor {
     retained_path: Arc<[block::Hash]>,
     idle_deadline: Instant,
     lifetime_deadline: Option<Instant>,
+    capacity: RetainedPathCapacity,
 }
 
 impl CanonicalHeaderPathCursor {
@@ -1038,27 +1033,41 @@ impl RetainedPathLeaseRegistry {
         capacity: RetainedPathCapacity,
     ) -> Option<(u64, RetainedPathCapacity)> {
         self.expire(now);
-        if self.by_peer.contains_key(&peer)
-            || self.reservations.contains_key(&peer)
-            || self.by_peer.len().saturating_add(self.reservations.len()) >= capacity.limit()
-        {
+        if self.by_peer.contains_key(&peer) || self.reservations.contains_key(&peer) {
             return None;
         }
+        let general_count = self
+            .by_peer
+            .values()
+            .filter(|cursor| cursor.capacity == RetainedPathCapacity::General)
+            .count()
+            + self
+                .reservations
+                .values()
+                .filter(|(_, class)| *class == RetainedPathCapacity::General)
+                .count();
+        let admitted_capacity = if general_count < RetainedPathCapacity::General.limit() {
+            RetainedPathCapacity::General
+        } else if capacity == RetainedPathCapacity::Bounded
+            && self.by_peer.len() + self.reservations.len() < MAX_RETAINED_PATH_LEASES
+        {
+            RetainedPathCapacity::Bounded
+        } else {
+            return None;
+        };
         let reservation_id = self.next_reservation_id.checked_add(1)?;
         self.next_reservation_id = reservation_id;
-        let admitted_capacity = if self.by_peer.len().saturating_add(self.reservations.len())
-            < RetainedPathCapacity::General.limit()
-        {
-            RetainedPathCapacity::General
-        } else {
-            capacity
-        };
-        self.reservations.insert(peer, reservation_id);
+        self.reservations
+            .insert(peer, (reservation_id, admitted_capacity));
         Some((reservation_id, admitted_capacity))
     }
 
     fn release_reservation(&mut self, peer: SourceId, reservation_id: u64) {
-        if self.reservations.get(&peer) == Some(&reservation_id) {
+        if self
+            .reservations
+            .get(&peer)
+            .is_some_and(|(id, _)| *id == reservation_id)
+        {
             self.reservations.remove(&peer);
         }
     }
@@ -1070,7 +1079,9 @@ impl RetainedPathLeaseRegistry {
         spec: RetainedPathLeaseSpec,
         now: Instant,
     ) -> RetainedPathLeaseOutcome {
-        if peer != spec.peer || self.reservations.get(&peer) != Some(&reservation_id) {
+        if peer != spec.peer
+            || self.reservations.get(&peer) != Some(&(reservation_id, spec.capacity))
+        {
             return RetainedPathLeaseOutcome::Busy;
         }
         self.reservations.remove(&peer);
@@ -1092,6 +1103,7 @@ impl RetainedPathLeaseRegistry {
             last_frontier: spec.common_ancestor,
             retained_path: spec.retained_path,
             idle_deadline: now + RETAINED_PATH_LEASE_IDLE,
+            capacity: spec.capacity,
             lifetime_deadline: (spec.capacity == RetainedPathCapacity::Bounded)
                 .then_some(now + RETAINED_PATH_LEASE_IDLE),
         };
@@ -1975,6 +1987,23 @@ impl HeaderChainReader {
             )
             .into());
         }
+        // Reserve before taking the engine lock or resolving any peer-selected hashes.
+        // The reserve permits only a protocol-sized ancestry walk.
+        let admission = self
+            .leases
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .reserve(peer, Instant::now(), RetainedPathCapacity::Bounded);
+        let Some((reservation_id, capacity)) = admission else {
+            return Ok(RetainedPathLeaseOutcome::Busy);
+        };
+        let reservation = RetainedPathReservation {
+            leases: self.leases.clone(),
+            peer,
+            reservation_id,
+            active: true,
+        };
+        let locators: HashSet<_> = locator_hashes.iter().copied().collect();
         let (snapshot, mut path) = {
             let engine = self
                 .transition_engine
@@ -1986,8 +2015,17 @@ impl HeaderChainReader {
             }
             let mut path = Vec::new();
             if let Some(mut current) = engine.graph().header_node(target_tip_hash) {
+                let target_height = current.height;
                 path.push(Frontier::new(current.height, current.hash));
-                while current.height > snapshot.frontiers.finalized.height {
+                while current.height > snapshot.frontiers.finalized.height
+                    && !locators.contains(&current.hash)
+                {
+                    if capacity == RetainedPathCapacity::Bounded
+                        && target_height.0.saturating_sub(current.height.0)
+                            >= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE
+                    {
+                        return Ok(RetainedPathLeaseOutcome::Busy);
+                    }
                     let Some(parent) = engine.graph().header_node(current.parent_hash) else {
                         return Ok(RetainedPathLeaseOutcome::HistoryPruned);
                     };
@@ -2000,7 +2038,9 @@ impl HeaderChainReader {
                     path.push(Frontier::new(parent.height, parent.hash));
                     current = parent;
                 }
-                if path.last().copied() != Some(snapshot.frontiers.finalized) {
+                if !locators.contains(&current.hash)
+                    && path.last().copied() != Some(snapshot.frontiers.finalized)
+                {
                     return Ok(RetainedPathLeaseOutcome::HistoryPruned);
                 }
             }
@@ -2015,23 +2055,36 @@ impl HeaderChainReader {
         };
         path.reverse();
         let finalized_end = target.height.min(snapshot.frontiers.finalized.height);
-        let mut common_ancestor: Option<Frontier> = None;
-        for locator_hash in locator_hashes {
-            let ancestor = match path.iter().find(|frontier| frontier.hash == *locator_hash) {
-                Some(frontier) => Some(*frontier),
-                None => self
+        // The downward walk stops at the nearest retained locator. Finalized locators
+        // cannot improve that intersection, so they need no database reads.
+        let mut common_ancestor = path
+            .first()
+            .copied()
+            .filter(|frontier| locators.contains(&frontier.hash));
+        if common_ancestor.is_none() {
+            for locator_hash in locator_hashes {
+                if let Some(ancestor) = self
                     .finalized_frontier(*locator_hash)?
-                    .filter(|frontier| frontier.height <= finalized_end),
-            };
-            if let Some(ancestor) = ancestor {
-                if common_ancestor.is_none_or(|nearest| ancestor.height > nearest.height) {
-                    common_ancestor = Some(ancestor);
+                    .filter(|frontier| frontier.height <= finalized_end)
+                {
+                    if common_ancestor.is_none_or(|nearest| ancestor.height > nearest.height) {
+                        common_ancestor = Some(ancestor);
+                    }
+                    if ancestor.height == finalized_end {
+                        break;
+                    }
                 }
             }
         }
         let Some(common_ancestor) = common_ancestor else {
             return Ok(RetainedPathLeaseOutcome::NoLocatorIntersection);
         };
+        if capacity == RetainedPathCapacity::Bounded
+            && RetainedPathCapacity::for_range(common_ancestor, target)
+                != RetainedPathCapacity::Bounded
+        {
+            return Ok(RetainedPathLeaseOutcome::Busy);
+        }
         let retained_path: Arc<[block::Hash]> = path
             .iter()
             .filter(|frontier| {
@@ -2050,21 +2103,6 @@ impl HeaderChainReader {
             }
         } else {
             CanonicalHeaderPathPosition::Retained { next: 0 }
-        };
-        let capacity = RetainedPathCapacity::for_range(common_ancestor, target);
-        let reservation_id = self
-            .leases
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .reserve(peer, Instant::now(), capacity);
-        let Some((reservation_id, capacity)) = reservation_id else {
-            return Ok(RetainedPathLeaseOutcome::Busy);
-        };
-        let reservation = RetainedPathReservation {
-            leases: self.leases.clone(),
-            peer,
-            reservation_id,
-            active: true,
         };
         self.commit_lease_if_branch_unchanged(
             reservation,

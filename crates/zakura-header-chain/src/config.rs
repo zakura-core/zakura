@@ -39,7 +39,8 @@ impl NetworkPolicyDigest {
 /// Conservative encoded response allowance per header, including metadata and framing.
 /// The wire codec verifies that every supported schema fits this allowance.
 pub const BOUNDED_HEADER_RESPONSE_BYTES_PER_HEADER: u64 = 2_048;
-/// Maximum total encoded response allowance for a lease eligible for reserved serving capacity.
+/// Encoded response ceiling guaranteed by the 4,000-header reserve cap.
+/// This ceiling documents the wire size bound; admission checks the header count.
 pub const MAX_BOUNDED_HEADER_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Exact v1 maximum number of retained non-finalized header nodes.

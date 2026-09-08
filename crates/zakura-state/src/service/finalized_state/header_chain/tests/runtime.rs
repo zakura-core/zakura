@@ -1695,7 +1695,7 @@ async fn retained_path_requests_have_identical_rules_across_finality() {
 #[tokio::test(start_paused = true)]
 async fn retained_path_reserves_bounded_repair_capacity_for_every_storage_band() {
     let (runtime, _db, genesis, path) =
-        reconciled_store_with_finalized_prefix(crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE + 1);
+        reconciled_store_with_finalized_prefix(crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE + 4);
     let reader = runtime.reader();
     let ordinary_target = path.last().unwrap();
     let ordinary_scope =
@@ -1728,6 +1728,20 @@ async fn retained_path_reserves_bounded_repair_capacity_for_every_storage_band()
             )
             .unwrap(),
         RetainedPathLeaseOutcome::Busy
+    );
+
+    assert_eq!(
+        reader
+            .acquire_retained_path(
+                owner,
+                1,
+                ordinary_target.hash,
+                &[block::Hash([0xee; 32])],
+                ordinary_scope
+            )
+            .unwrap(),
+        RetainedPathLeaseOutcome::Busy,
+        "reserve traversal stops at the range limit before resolving a missing locator"
     );
 
     // Each two-header repair uses the reserve and stops at its admitted target.
@@ -1784,6 +1798,23 @@ async fn retained_path_reserves_bounded_repair_capacity_for_every_storage_band()
     else {
         panic!("the released reserve must be reusable");
     };
+    let released = ordinary_leases.pop().unwrap();
+    assert!(reader
+        .release_retained_path(released.peer, 1, released.lease_id, ordinary_scope)
+        .unwrap());
+    let RetainedPathLeaseOutcome::Acquired(replacement) = reader
+        .acquire_retained_path(
+            released.peer,
+            2,
+            ordinary_target.hash,
+            &[genesis.hash],
+            ordinary_scope,
+        )
+        .unwrap()
+    else {
+        panic!("a reserve lease must not consume a released general slot");
+    };
+    ordinary_leases.push(replacement);
     tokio::time::advance(Duration::from_secs(20)).await;
     let ordinary = &ordinary_leases[0];
     assert!(matches!(
@@ -1879,5 +1910,125 @@ async fn retained_path_long_transfers_use_ordinary_capacity_across_finality() {
         assert!(runtime.leases.lock().unwrap().by_peer[&owner]
             .lifetime_deadline
             .is_none());
+        for marker in 1..MAX_RETAINED_PATH_LEASES - 1 {
+            assert!(matches!(
+                reader
+                    .acquire_retained_path(
+                        SourceId::from_digest([u8::try_from(marker).unwrap(); 32]),
+                        1,
+                        target.hash,
+                        &[genesis.hash],
+                        scope
+                    )
+                    .unwrap(),
+                RetainedPathLeaseOutcome::Acquired(_)
+            ));
+        }
+        let repair_owner = SourceId::from_digest([0xc5; 32]);
+        assert_eq!(
+            reader
+                .acquire_retained_path(repair_owner, 1, target.hash, &[genesis.hash], scope)
+                .unwrap(),
+            RetainedPathLeaseOutcome::Busy
+        );
+        assert!(
+            matches!(
+                reader
+                    .acquire_retained_path(repair_owner, 1, target.hash, &[path[0].hash], scope)
+                    .unwrap(),
+                RetainedPathLeaseOutcome::Acquired(_)
+            ),
+            "a protocol-sized repair must still use the reserve in either storage band"
+        );
     }
+}
+
+#[test]
+fn retained_path_reservations_keep_capacity_classes_separate() {
+    let mut registry = RetainedPathLeaseRegistry::default();
+    let now = Instant::now();
+    let peers: Vec<_> = (0..MAX_RETAINED_PATH_LEASES)
+        .map(|marker| SourceId::from_digest([u8::try_from(marker).unwrap(); 32]))
+        .collect();
+    let mut reservations = Vec::new();
+    for peer in &peers {
+        reservations.push(
+            registry
+                .reserve(*peer, now, RetainedPathCapacity::Bounded)
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        reservations.last().unwrap().1,
+        RetainedPathCapacity::Bounded
+    );
+    registry.release_reservation(peers[0], reservations[0].0);
+    assert_eq!(
+        registry
+            .reserve(peers[0], now, RetainedPathCapacity::General)
+            .unwrap()
+            .1,
+        RetainedPathCapacity::General
+    );
+    assert!(registry
+        .reserve(peers[0], now, RetainedPathCapacity::Bounded)
+        .is_none());
+    assert!(registry
+        .reserve(
+            SourceId::from_digest([0xff; 32]),
+            now,
+            RetainedPathCapacity::Bounded
+        )
+        .is_none());
+}
+
+#[test]
+fn retained_path_busy_admission_does_not_lock_the_engine() {
+    let (runtime, _db, genesis, path) = reconciled_store_with_finalized_prefix(4);
+    let reader = runtime.reader();
+    let target = path.last().unwrap();
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target.hash);
+    let owner = SourceId::from_digest([0xc6; 32]);
+    assert!(matches!(
+        reader
+            .acquire_retained_path(owner, 1, target.hash, &[genesis.hash], scope)
+            .unwrap(),
+        RetainedPathLeaseOutcome::Acquired(_)
+    ));
+    let engine = reader.transition_engine.clone();
+    let _ = std::thread::spawn(move || {
+        let _guard = engine.lock().unwrap();
+        panic!("poison the engine to detect any access after failed admission");
+    })
+    .join();
+    assert_eq!(
+        reader
+            .acquire_retained_path(owner, 2, target.hash, &[genesis.hash], scope)
+            .unwrap(),
+        RetainedPathLeaseOutcome::Busy
+    );
+    for marker in 0..MAX_RETAINED_PATH_LEASES - 1 {
+        reader
+            .leases
+            .lock()
+            .unwrap()
+            .reserve(
+                SourceId::from_digest([u8::try_from(marker).unwrap(); 32]),
+                Instant::now(),
+                RetainedPathCapacity::Bounded,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        reader
+            .acquire_retained_path(
+                SourceId::from_digest([0xff; 32]),
+                1,
+                target.hash,
+                &[genesis.hash],
+                scope
+            )
+            .unwrap(),
+        RetainedPathLeaseOutcome::Busy
+    );
 }

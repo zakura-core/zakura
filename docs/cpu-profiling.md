@@ -78,3 +78,9 @@ macOS: `perf` does not exist; use [samply](https://github.com/mstange/samply) (`
 - The `deploy/runner/` cohort harness (`make perf-*`) is the deterministic isolated-cohort deep-dive with per-phase commit attribution.
 - The `flamegraph` cargo feature (`tracing.flamegraph` config) renders span wall-time, not sampled CPU, and needs a special build; prefer this lane for CPU questions.
 - `zakura-mempool-load.yml` and `zakura-pr-node.yml` cover mempool throughput and long-running real-node behavior on the same droplet chassis.
+
+### Same-host crossover
+
+Set `crossover=true` for a historical comparison with two configurations. Each of the two temporary hosts runs both configurations; one runs primary then baseline, and the other reverses that order. Each invocation copies the untouched baked state into a distinct directory before starting, then clears the host page cache after copying and building. It never reuses state advanced by the preceding invocation. Provision enough cloned-volume space for two extra copies. Existing destinations or insufficient free space fail before the node starts.
+
+Artifacts contain `primary/` and `baseline/` subdirectories per host, including `order.json`. The comparison reports each host's result separately; there is no cross-host CPU-profile diff. A host failure can leave only its first result, which must not be treated as a complete pair. This design controls CPU model and physical host assignment, and counterbalances execution order; peer availability and temporal storage noise remain. The normal node runtime cap applies to each invocation, and the job timeout still bounds the entire host run.

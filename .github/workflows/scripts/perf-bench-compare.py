@@ -104,7 +104,7 @@ def render(primary: dict | None, baseline: dict | None) -> tuple[str, bool]:
     lines.append(
         f"**Speedup (primary vs baseline): {speedup:.2f}×** "
         f"({baseline['bps']} → {primary['bps']} blocks/s, "
-        "legs run on separate parallel droplets; host and peer noise remain)"
+        "separate benchmark runs; host and peer noise remain)"
     )
     if "comparison" in primary:
         lines.extend(["", "Configuration for each leg:"])

@@ -75,7 +75,7 @@ class Render(unittest.TestCase):
             "| primary | `1a2b3c4d5` | 151.75 | 88.5 | faster |\n"
             "\n"
             "**Speedup (primary vs baseline): 1.50×** "
-            "(101.0 → 151.75 blocks/s, legs run on separate parallel droplets; host and peer noise remain)",
+            "(101.0 → 151.75 blocks/s, separate benchmark runs; host and peer noise remain)",
         )
 
     def test_missing_meta_is_not_comparable(self):

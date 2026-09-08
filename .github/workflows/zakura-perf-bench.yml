@@ -61,6 +61,10 @@ on:
         options:
           - cpu
           - "off"
+      crossover:
+        description: "Run both configurations on each host, in opposite orders, from fresh state copies"
+        type: boolean
+        default: false
       stop_height:
         description: "historical_sync only: stop after committing this height (sandblast tip is 1,707,210)"
         required: false
@@ -113,6 +117,7 @@ jobs:
           REF: ${{ inputs.ref || 'main' }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
           COMPARISON: ${{ inputs.comparison || 'refs' }}
+          CROSSOVER: ${{ inputs.crossover || 'false' }}
           REQUESTED_WORKLOAD: ${{ github.event_name == 'schedule' && (github.event.schedule == '47 6 * * 1' && 'historical_semantic' || 'historical_checkpoint') || inputs.workload || 'historical_checkpoint' }}
         run: |
           set -euo pipefail
@@ -132,6 +137,10 @@ jobs:
             exit 1
           fi
           if [ "$COMPARISON" != refs ]; then BASELINE_REF="${BASELINE_REF:-$REF}"; fi
+          if [ "$CROSSOVER" = true ] && { [ "$WORKLOAD" != historical_sync ] || [ -z "$BASELINE_REF" ]; }; then
+            echo "crossover requires two historical configurations" >&2
+            exit 1
+          fi
           resolve() { gh api "repos/${REPO}/commits/$1" --jq .sha; }
           PRIMARY_SHA=$(resolve "$REF")
           leg() {
@@ -221,6 +230,8 @@ jobs:
           VCT_FAST_SYNC: ${{ matrix.leg.vct_fast_sync }}
           ENABLE_TRACES: ${{ matrix.leg.traces }}
           COMPARISON: ${{ inputs.comparison || 'refs' }}
+          CROSSOVER: ${{ inputs.crossover || 'false' }}
+          BENCH_LEGS_JSON: ${{ needs.plan.outputs.legs }}
           VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -243,6 +254,8 @@ jobs:
             printf 'VCT_FAST_SYNC=%q\n'    "${VCT_FAST_SYNC}"
             printf 'ENABLE_TRACES=%q\n'    "${ENABLE_TRACES}"
             printf 'COMPARISON=%q\n'       "${COMPARISON}"
+            printf 'CROSSOVER=%q\n'        "${CROSSOVER}"
+            printf 'BENCH_LEGS_JSON=%q\n'  "${BENCH_LEGS_JSON}"
             printf 'VOLUME_NAME=%q\n'      "${VOLUME_NAME}"
             printf 'GITHUB_RUN_URL=%q\n'   "${GITHUB_RUN_URL}"
             printf 'GITHUB_RUN_ID=%q\n'    "${GITHUB_RUN_ID}"
@@ -250,13 +263,14 @@ jobs:
           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
             /tmp/run.env \
             .github/workflows/scripts/perf-bench-run.sh \
+            .github/workflows/scripts/perf-bench-crossover.sh \
             scripts/zakura-bench-digest.py \
             scripts/zakura-metrics-dashboard.py \
             "root@${IP}:/root/"
           rm -f /tmp/run.env
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \
-            'set -euo pipefail; set -a; . /root/run.env; set +a; bash /root/perf-bench-run.sh'
+            'set -euo pipefail; set -a; . /root/run.env; set +a; if [ "$CROSSOVER" = true ]; then bash /root/perf-bench-crossover.sh; else bash /root/perf-bench-run.sh; fi'
 
       - name: Collect leg outputs
         if: always() && steps.droplet.outputs.ip != ''
@@ -268,6 +282,12 @@ jobs:
           cp /tmp/out/provisioning.json leg-out/provisioning.json
           scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
             "root@${IP}:/root/out/." leg-out/ || true
+          for nested in leg-out/primary leg-out/baseline; do
+            if [ -d "$nested" ]; then
+              cp leg-out/provisioning.json "$nested/provisioning.json"
+              if [ -f "$nested/leg-summary.md" ]; then cat "$nested/leg-summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
+            fi
+          done
           if [ -f leg-out/leg-summary.md ]; then
             cat leg-out/leg-summary.md >> "$GITHUB_STEP_SUMMARY"
           else
@@ -315,8 +335,21 @@ jobs:
 
       - name: Compare legs
         id: compare
+        env:
+          CROSSOVER: ${{ inputs.crossover || 'false' }}
         run: |
           set -euo pipefail
+          if [ "$CROSSOVER" = true ]; then
+            for host in primary baseline; do
+              echo "### Same-host comparison: ${host}" >> "$GITHUB_STEP_SUMMARY"
+              GITHUB_OUTPUT='' python3 .github/workflows/scripts/perf-bench-compare.py \
+                "legs/zakura-perf-bench-${GITHUB_RUN_ID}-${host}/primary/meta.json" \
+                "legs/zakura-perf-bench-${GITHUB_RUN_ID}-${host}/baseline/meta.json" \
+                >> "$GITHUB_STEP_SUMMARY"
+            done
+            echo 'compare=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           python3 .github/workflows/scripts/perf-bench-compare.py \
             "legs/zakura-perf-bench-${GITHUB_RUN_ID}-primary/meta.json" \
             "legs/zakura-perf-bench-${GITHUB_RUN_ID}-baseline/meta.json" \

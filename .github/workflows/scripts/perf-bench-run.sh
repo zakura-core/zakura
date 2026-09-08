@@ -36,7 +36,7 @@
 #   /root/zakura-metrics-dashboard.py  metrics recorder + bottleneck classifier
 set -euo pipefail
 
-OUT_DIR=/root/out
+OUT_DIR="${OUT_DIR:-/root/out}"
 DIGEST_PY=/root/zakura-bench-digest.py
 DASHBOARD_PY=/root/zakura-metrics-dashboard.py
 PROFILE_SECONDS="${PROFILE_SECONDS:-300}"
@@ -123,9 +123,26 @@ DEV="/dev/disk/by-id/scsi-0DO_Volume_${VOLUME_NAME}"
 for _ in $(seq 1 30); do [ -e "$DEV" ] && break; sleep 2; done
 [ -e "$DEV" ] || die "state volume device not found: $DEV"
 mkdir -p /mnt/snapshots
-mount "$DEV" /mnt/snapshots
+if mountpoint -q /mnt/snapshots; then
+  [[ "$(readlink -f "$DEV")" == "$(readlink -f "$(findmnt -n -o SOURCE --target /mnt/snapshots)")" ]] \
+    || die "another volume is mounted at /mnt/snapshots"
+else
+  mount "$DEV" /mnt/snapshots
+fi
 STATE_CACHE_DIR="/mnt/snapshots/${SNAPSHOT_MODE}"
 [ -d "$STATE_CACHE_DIR" ] || die "no ${SNAPSHOT_MODE}/ state on the volume"
+if [[ "${FRESH_STATE_COPY:-false}" == true ]]; then
+  [[ "$WORKLOAD" == historical_sync && "$LEG" =~ ^(primary|baseline)$ ]] \
+    || die "fresh state copies require a historical comparison leg"
+  COPY_DIR="/mnt/snapshots/perf-fresh-${LEG}"
+  [[ ! -e "$COPY_DIR" ]] || die "fresh state destination already exists"
+  REQUIRED_BYTES=$(du -s -B1 "$STATE_CACHE_DIR" | awk '{print $1}')
+  AVAILABLE_BYTES=$(df -B1 --output=avail /mnt/snapshots | tail -n1)
+  (( AVAILABLE_BYTES > REQUIRED_BYTES + 5 * 1024 * 1024 * 1024 )) \
+    || die "insufficient space for an independent state copy"
+  cp -a --reflink=auto -- "$STATE_CACHE_DIR" "$COPY_DIR"
+  STATE_CACHE_DIR="$COPY_DIR"
+fi
 df -h /mnt/snapshots >&2
 
 # ---------------------------------------------------------------------------- #
@@ -221,6 +238,12 @@ fi
 # ---------------------------------------------------------------------------- #
 # Node config + launch
 # ---------------------------------------------------------------------------- #
+
+# Each crossover leg starts cold after its copy and build on this disposable host.
+if [[ "${FRESH_STATE_COPY:-false}" == true ]]; then
+  sync
+  echo 3 > /proc/sys/vm/drop_caches
+fi
 
 TRACE_DIR="$OUT_DIR/zakura-traces"
 mkdir -p "$TRACE_DIR"

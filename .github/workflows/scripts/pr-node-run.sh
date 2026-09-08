@@ -130,6 +130,7 @@ vct_fast_sync = true
 rpc_listen_addr = "127.0.0.1:8232"
 rpc_enable_cookie_auth = false
 metrics_endpoint = "127.0.0.1:9999"
+zakura = { trace_dir = "/var/log/zakura/diagnostic-trace" }
 TOML
 
 export CARGO_TARGET_DIR=/root/cargo-target
@@ -208,6 +209,12 @@ python3 /root/pr-node-monitor.py \
   "${MONITOR_CROSSING_ARGS[@]}" \
   --out "$OUT_DIR" || MONITOR_RC=$?
 
+# Preserve supplier outcomes and flush the trace writer on this disposable node.
+curl --fail --silent --max-time 10 http://127.0.0.1:9999/metrics > "$OUT_DIR/metrics-final.txt" || true
+systemctl stop zakurad || true
+if [ -d /var/log/zakura/diagnostic-trace ]; then
+  tar -C /var/log/zakura -cf - diagnostic-trace | zstd -T0 -q -o "$OUT_DIR/diagnostic-trace.tar.zst"
+fi
 tail -n 2000 /var/log/zakura/zakura.log > "$OUT_DIR/zakura-tail.log" 2>/dev/null || true
 zstd -T0 -q -f /var/log/zakura/zakura.log -o "$OUT_DIR/zakura-full.log.zst" 2>/dev/null || true
 

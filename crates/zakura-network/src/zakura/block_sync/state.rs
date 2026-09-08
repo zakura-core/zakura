@@ -809,7 +809,8 @@ pub(super) struct PeerBlockState {
     /// `status_reply_meter`; this half stays reactor-side because the reactor owns
     /// serving-tip advertisement.
     pub(super) refresh_meter: RateMeter,
-    served_block_requests: VecDeque<ServingBlockRequest>,
+    // Admission allows one response producer per peer.
+    serving_request: Option<ServingBlockRequest>,
 }
 
 /// Ledger entry for one admitted inbound `GetBlocks` request.
@@ -856,26 +857,23 @@ impl PeerBlockState {
             direction: session.direction(),
             session,
             refresh_meter: RateMeter::new(config.status_refresh_interval),
-            served_block_requests: VecDeque::new(),
+            serving_request: None,
         }
     }
 
-    /// Insert a request and its permit, or return the permit if the peer cap is full.
+    /// Store the request, or return its permit if the peer already has one.
     pub(super) fn try_start_serving_blocks(
         &mut self,
-        local_inflight_cap: u32,
         request_id: BlockRangeRequestId,
         start_height: block::Height,
         original_count: u32,
         requested_count: u32,
         permit: super::serving_regulation::GetBlocksServingPermit,
     ) -> Result<(), super::serving_regulation::GetBlocksServingPermit> {
-        if self.served_block_requests.len()
-            >= usize::try_from(local_inflight_cap).unwrap_or(usize::MAX)
-        {
+        if self.serving_request.is_some() {
             return Err(permit);
         }
-        self.served_block_requests.push_back(ServingBlockRequest {
+        self.serving_request = Some(ServingBlockRequest {
             id: request_id,
             start_height,
             original_count,
@@ -892,10 +890,8 @@ impl PeerBlockState {
         request_id: BlockRangeRequestId,
         start_height: block::Height,
     ) -> Option<ServingBlockRequest> {
-        self.served_block_requests
-            .iter()
-            .position(|request| request.id == request_id && request.start_height == start_height)
-            .and_then(|index| self.served_block_requests.remove(index))
+        self.serving_request
+            .take_if(|request| request.id == request_id && request.start_height == start_height)
     }
 }
 

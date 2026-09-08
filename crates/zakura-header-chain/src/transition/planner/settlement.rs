@@ -244,14 +244,22 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     }
 
     selected_tip = projected.graph().view_select_best_header_chain()?.0;
-    let selected = if effect.is_checkpoint_finality()
+    let selected = if matches!(event, TransitionEvent::AuxEvidence(_))
+        && selected_tip == snapshot_before_commit.frontiers.header_best
+        && projected.graph().view_finalized_frontier() == snapshot_before_commit.frontiers.finalized
+    {
+        // Authentication changes delivery metadata. Retention protects the selected
+        // ancestry, so unchanged endpoints still describe the engine's exact path.
+        Cow::Borrowed(old_selected)
+    } else if effect.is_checkpoint_finality()
         && selected_tip == snapshot_before_commit.frontiers.header_best
         && finality_append.is_some_and(|record| {
             old_selected
                 .binary_search_by_key(&record.current.height, |frontier| frontier.height)
                 .ok()
                 .is_some_and(|index| old_selected[index] == record.current)
-        }) {
+        })
+    {
         let Some(record) = finality_append else {
             return Err(InvalidTransitionEvidence::Planner(
                 PlannerCoherenceViolation::MissingCheckpointRecord,

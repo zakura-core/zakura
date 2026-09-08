@@ -778,3 +778,17 @@ fn decode_rejects_each_vector_hint_schema_and_byte_boundary() {
         }) if actual == MAX_HS_MESSAGE_BYTES + 1
     ));
 }
+
+#[test]
+fn bounded_serving_allowance_covers_headers_metadata_and_single_header_framing() {
+    for network in [Network::Mainnet, Network::new_regtest(Default::default())] {
+        for schema in [AuxSchema::None, AuxSchema::V1] {
+            let bytes = super::wire::headers_response_bytes(&network, schema, 1)
+                .expect("a one-header response fits usize");
+            assert!(
+                u64::try_from(bytes).unwrap()
+                    <= zakura_header_chain::BOUNDED_HEADER_RESPONSE_BYTES_PER_HEADER
+            );
+        }
+    }
+}

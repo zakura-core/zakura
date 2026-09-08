@@ -515,7 +515,9 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 
 ### 5.3 Server snapshot contract
 
-**LC-WIRE-05 [ZW] — Snapshot-bound path serving.** On accepting a request, the server MUST acquire a retained-path snapshot for the exact target hash. It MUST select the first locator entry, in requester order, that lies on that target’s ancestor path, and serve only the contiguous path after that ancestor toward that target.
+**LC-WIRE-05 [ZW] — Snapshot-bound path serving.** On accepting a request, the server MUST resolve the exact target hash from the retained graph or canonical finalized indexes. It MUST select the highest locator ancestor on that target’s chain. It MUST serve only the contiguous path after that ancestor through the target. A locator at the target yields an empty, complete response. The server MUST apply these rules through one path-acquisition operation and one response cursor across the finalized boundary.
+
+The server MUST reserve serving capacity for bounded paths regardless of target storage. Ordinary transfers MUST NOT consume that reserve. A reserved lease admits at most 4,000 headers and an 8 MiB total response allowance. Admission charges 2,048 bytes per header, including the largest supported metadata and a complete response frame for each header. An empty path charges one frame allowance. The wire codec tests MUST verify this allowance for each supported header format and auxiliary schema. Reserved leases expire after 30 seconds without renewal. Continuations MUST NOT extend the admitted range. Leases admitted to ordinary capacity retain their renewable idle deadline.
 
 **LC-WIRE-06 [ZW] — No target substitution.** The accepted target MUST remain snapshot-bound even if the server’s selected tip changes concurrently. The server MUST either complete that exact path through one or more responses/continuations or return one explicit `HeadersOutcome`; it MUST NOT silently substitute its new selected path.
 

@@ -164,6 +164,9 @@ their behavior remains the maintainer's existing choice.
 
 Only this App's marked approvals are withdrawn. An explicit dismissal of an
 episode is respected until a fresh clean Codex review supplies a new receipt.
+The adapter can restore its own automatic withdrawal after all evidence qualifies
+again. It verifies the dismissal's actor and message in GitHub's timeline;
+missing or ambiguous dismissal history keeps the approval withheld.
 An unavailable API withholds approval and attempts to withdraw an existing one;
 failed withdrawal surfaces as a failed Actions run. Updates caused by review
 comments and reaction changes are asynchronous, with hourly reconciliation as a

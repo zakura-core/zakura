@@ -28,6 +28,8 @@ import urllib.request
 POLICY_PATH = Path(__file__).with_name("policy.json")
 SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
 RECEIPT_MARKER = "<!-- zakura-codex-approval:v1 "
+WITHDRAWAL_MESSAGE = ("Native Codex approval evidence could not be verified. "
+                      "The adapter may restore approval after rechecking it.")
 MAX_PAGES = 30
 MAX_RESPONSE = 16 * 1024 * 1024
 ACTOR = "login ... on Bot { databaseId }"
@@ -390,8 +392,30 @@ class Adapter:
 
     def dismiss(self, review_id):
         self.writer.request(f"{self.pull_path}/reviews/{int(review_id)}/dismissals", "PUT", {
-            "message": "Native Codex approval evidence is no longer current. A fresh clean review or human approval is needed."
+            "message": WITHDRAWAL_MESSAGE
         })
+
+    def automatic_withdrawals(self, owned):
+        """Identify our withdrawals from GitHub's actor-attributed dismissal events."""
+        dismissed = {r["id"] for r in owned if r["state"] == "DISMISSED"}
+        if not dismissed:
+            return set()
+        events = self.api.pages(f"{self.prefix}/issues/{self.number}/timeline")
+        matches = {review_id: [] for review_id in dismissed}
+        for event in events:
+            if event.get("event") != "review_dismissed":
+                continue
+            review = event["dismissed_review"]
+            require(re.fullmatch(r"[0-9]+", str(review["review_id"])) is not None,
+                    "Malformed dismissal review ID")
+            review_id = int(review["review_id"])
+            if review_id in matches:
+                matches[review_id].append(event)
+        return {review_id for review_id, entries in matches.items() if len(entries) == 1
+                and (entries[0].get("actor") or {}).get("id") == self.bot_id
+                and (entries[0].get("actor") or {}).get("type") == "Bot"
+                and entries[0]["dismissed_review"].get("state") == "approved"
+                and entries[0]["dismissed_review"].get("dismissal_message") == WITHDRAWAL_MESSAGE}
 
     def check_trusted_revision(self):
         require(self.trusted_sha is not None and re.fullmatch(r"[0-9a-f]{40}", self.trusted_sha),
@@ -409,6 +433,7 @@ class Adapter:
         try:
             self.check_trusted_revision()
             receipt = self.evaluate()
+            automatic = self.automatic_withdrawals(owned)
         except (Ineligible, APIError, KeyError, TypeError) as exc:
             for review in existing:
                 self.dismiss(review["id"])
@@ -417,7 +442,7 @@ class Adapter:
         episode_keys = ("head", "summary", "completed", "reaction")
         dismissed = False
         for review in owned:
-            if review["state"] != "DISMISSED":
+            if review["state"] != "DISMISSED" or review["id"] in automatic:
                 continue
             try:
                 prior = json.loads(review["body"].splitlines()[0][len(RECEIPT_MARKER):-4])

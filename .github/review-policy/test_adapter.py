@@ -523,6 +523,60 @@ class ReconcileTests(unittest.TestCase):
         self.assertFalse(self.worker.reconcile()["approved"])
         self.writer.request.assert_not_called()
 
+    def dismissal_event(self, actor=BOT_ID):
+        return {"event": "review_dismissed", "actor": {"id": actor, "type": "Bot"},
+                "dismissed_review": {"review_id": 400, "state": "approved",
+                                     "dismissal_message": adapter.WITHDRAWAL_MESSAGE}}
+
+    def set_dismissal_history(self, events):
+        self.api.pages.side_effect = lambda path: (
+            events if path.endswith("/timeline") else [owned_review("DISMISSED")])
+
+    def test_restore_own_withdrawal_after_api_recovers(self):
+        self.api.pages.return_value = [owned_review()]
+        self.worker.evaluate.side_effect = adapter.APIError("Temporary outage")
+        self.assertEqual(self.worker.reconcile()["dismissed"], 1)
+        self.worker.evaluate.side_effect = None
+        self.writer.reset_mock()
+        self.set_dismissal_history([self.dismissal_event()])
+        self.assertTrue(self.worker.reconcile()["approved"])
+        self.assertEqual(self.writes(), [("POST", self.worker.pull_path + "/reviews")])
+
+    def test_dismissal_recovery_requires_unambiguous_adapter_actor_and_message(self):
+        own = self.dismissal_event()
+        wrong_message = deepcopy(own)
+        wrong_message["dismissed_review"]["dismissal_message"] = "Operator dismissal"
+        wrong_review = deepcopy(own)
+        wrong_review["dismissed_review"]["review_id"] = 999
+        missing_actor = {**own, "actor": None}
+        for events in ([], [self.dismissal_event(900)], [wrong_message], [wrong_review], [missing_actor],
+                       [own, own], [own, self.dismissal_event(900)]):
+            with self.subTest(events=events):
+                self.set_dismissal_history(events)
+                self.assertFalse(self.worker.reconcile()["approved"])
+                self.writer.request.assert_not_called()
+
+    def test_restore_own_withdrawal_after_trusted_checkout_refresh(self):
+        self.api.pages.return_value = [owned_review()]
+        self.worker.check_trusted_revision.side_effect = adapter.Ineligible("Trusted branch advanced")
+        self.assertEqual(self.worker.reconcile()["dismissed"], 1)
+        self.worker.check_trusted_revision.side_effect = None
+        self.set_dismissal_history([self.dismissal_event()])
+        self.assertTrue(self.worker.reconcile()["approved"])
+
+    def test_human_dismissal_blocks_even_with_an_older_automatic_withdrawal(self):
+        human = {**owned_review("DISMISSED"), "id": 401}
+        self.api.pages.side_effect = lambda path: (
+            [self.dismissal_event()] if path.endswith("/timeline")
+            else [owned_review("DISMISSED"), human])
+        self.assertFalse(self.worker.reconcile()["approved"])
+        self.writer.request.assert_not_called()
+
+    def test_unavailable_dismissal_history_cannot_restore_approval(self):
+        self.api.pages.side_effect = [[owned_review("DISMISSED")], adapter.APIError("Unavailable")]
+        self.assertFalse(self.worker.reconcile()["approved"])
+        self.writer.request.assert_not_called()
+
     def test_base_or_policy_update_does_not_override_episode_dismissal(self):
         for key in ("base", "policy"):
             with self.subTest(key=key):

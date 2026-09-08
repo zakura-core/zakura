@@ -2750,11 +2750,11 @@ impl HeaderChainRuntime {
             full_state_authority: Some(&first_authority),
             retention_references: lease_references.as_ref(),
         };
-        let checkpoint_parent = match &checkpoint_request.event {
+        let checkpoint_event = match &checkpoint_request.event {
             TransitionEvent::VerifiedChainChanged(event)
                 if event.cause == VerifiedChangeCause::CheckpointFinalizedGrow =>
             {
-                event.old_tip
+                event
             }
             _ => {
                 return Err(HeaderChainStoreError::Incoherent(
@@ -2762,22 +2762,11 @@ impl HeaderChainRuntime {
                 ));
             }
         };
-        let checkpoint_headers_are_retained = match &checkpoint_request.event {
-            TransitionEvent::VerifiedChainChanged(event) => event
-                .new_path
-                .iter()
-                .all(|header| transition_engine.graph().header_node(header.hash).is_some()),
-            _ => false,
-        };
-        // Header sync normally admits headers before native checkpoint growth promotes them.
-        // Only a missing header needs contextual validation and a validation lease.
-        let validation_leases = if checkpoint_headers_are_retained {
-            Vec::new()
-        } else {
-            vec![self
-                .store
-                .validation_context(checkpoint_parent.hash, self.config.network())?]
-        };
+        let validation_leases = self.checkpoint_validation_leases(
+            checkpoint_event,
+            &transition_engine,
+            self.config.network(),
+        )?;
         let checkpoint_authority = StateIssuedAuthority {
             inner: checkpoint_context.full_state_authority,
             validation_leases: validation_leases.as_slice(),
@@ -2919,11 +2908,33 @@ impl HeaderChainRuntime {
         )
     }
 
+    /// Only missing checkpoint headers consume contextual validation facts.
+    /// Retained headers still undergo the planner's exact path and content checks.
+    fn checkpoint_validation_leases(
+        &self,
+        event: &VerifiedChainChanged,
+        engine: &HeaderChainEngine,
+        network: &Network,
+    ) -> Result<Vec<ValidationLease>, HeaderChainStoreError> {
+        if event
+            .new_path
+            .iter()
+            .all(|header| engine.graph().header_node(header.hash).is_some())
+        {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![self
+                .store
+                .validation_context(event.old_tip.hash, network)?])
+        }
+    }
+
     /// Bind a state-service request to the exact durable facts its event may consume.
     fn build_transition_input(
         &self,
         request: TransitionRequest,
         before: &EngineSnapshot,
+        engine: &HeaderChainEngine,
         network: &Network,
     ) -> Result<TransitionInput, HeaderChainStoreError> {
         let expected_version = request.expected_version;
@@ -2966,14 +2977,16 @@ impl HeaderChainRuntime {
                     }
                     VerifiedChangeCause::Reset => before.frontiers.finalized,
                 };
+                let validation_leases =
+                    if event.cause == VerifiedChangeCause::CheckpointFinalizedGrow {
+                        self.checkpoint_validation_leases(&event, engine, network)?
+                    } else {
+                        vec![self.store.validation_context(parent.hash, network)?]
+                    };
                 TransitionInput::VerifiedChainChanged {
                     expected_version,
                     event,
-                    facts: HeaderValidationFacts {
-                        validation_leases: vec![self
-                            .store
-                            .validation_context(parent.hash, network)?],
-                    },
+                    facts: HeaderValidationFacts { validation_leases },
                 }
             }
             TransitionEvent::VerifiedBlockAccepted(event) => {
@@ -3334,7 +3347,12 @@ impl HeaderChainRuntime {
                 }
             }
         }
-        let input = self.build_transition_input(request, &before, base_context.config.network())?;
+        let input = self.build_transition_input(
+            request,
+            &before,
+            &transition_engine,
+            base_context.config.network(),
+        )?;
         let validation_leases = input
             .header_validation_facts()
             .map(|facts| facts.validation_leases.clone())

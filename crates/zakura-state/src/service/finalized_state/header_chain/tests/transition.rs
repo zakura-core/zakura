@@ -1398,12 +1398,8 @@ fn checkpoint_auxiliary_staging_does_not_clone_the_retained_engine() {
         "pre-commit staging errors must restore the unchanged durable engine"
     );
     assert!(
-        implementation.contains("checkpoint_headers_are_retained"),
+        implementation.contains("self.checkpoint_validation_leases("),
         "already admitted checkpoint headers must not rebuild predecessor leases per block"
-    );
-    assert!(
-        implementation.contains("transition_engine.graph().header_node(header.hash).is_some()"),
-        "the predecessor-lease fast path must be justified by the coherent retained graph"
     );
     let validated = implementation
         .find("validate_full_state_finality_provenance")
@@ -1417,6 +1413,155 @@ fn checkpoint_auxiliary_staging_does_not_clone_the_retained_engine() {
          because staging the auxiliary transition advances the state version the \
          state writer bound its evidence to"
     );
+}
+
+#[test]
+fn checkpoint_growth_reuses_retained_headers_and_validates_missing_headers() {
+    for retained in [false, true] {
+        let db_config = Config::ephemeral();
+        let (config, anchor, metadata) = fixture();
+        let store = HeaderChainStore::new(open(&db_config, config.network()));
+        store
+            .initialize(metadata, anchor.clone())
+            .expect("the checkpoint fixture initializes");
+        let (runtime, _) = store.startup(&config).expect("the initial store audits");
+        let parent = Frontier::new(anchor.height, anchor.hash);
+        let mut header = *anchor.header;
+        header.previous_block_hash = anchor.hash;
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[0] = 0x97;
+        let header = Arc::new(header);
+        let child = Frontier::new(block::Height(1), header.hash());
+
+        if retained {
+            let lease = runtime
+                .reader()
+                .validation_context(anchor.hash)
+                .expect("the anchor context reads")
+                .expect("the anchor is retained");
+            let rules = HeaderRules::for_validation_lease(&lease)
+                .expect("the regtest anchor has coherent validation rules");
+            let batch = zakura_header_chain::prepare_headers(
+                HeaderBatchInput::new(std::slice::from_ref(&header)),
+                parent,
+                &rules,
+                &SystemClock,
+            )
+            .expect("the regtest child passes contextual validation");
+            let before = runtime.publisher().snapshot();
+            runtime
+                .apply(
+                    TransitionRequest {
+                        expected_version: before.state_version,
+                        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                            owner: header_owner(&before, child.hash, 97, 1),
+                            source: SourceId::from_digest([0x97; 32]),
+                            parent_hash: anchor.hash,
+                            target_tip_hash: child.hash,
+                            completion: TargetCompletion::TargetComplete {
+                                common_ancestor: parent,
+                            },
+                            batch,
+                            aux: Vec::new(),
+                        })),
+                    },
+                    &TransitionContext {
+                        config: &config,
+                        clock: &SystemClock,
+                        full_state_authority: None,
+                        retention_references: &[],
+                    },
+                )
+                .expect("the validated header is retained before its body arrives");
+        }
+
+        let before = runtime.publisher().snapshot();
+        let evidence =
+            zakura_header_chain::checkpoint_finality_evidence(before.state_version, child);
+        let event = VerifiedChainChanged {
+            full_state_transition_id: evidence,
+            old_tip: parent,
+            new_path: vec![VerifiedHeaderRef {
+                height: child.height,
+                hash: child.hash,
+                header,
+            }],
+            cause: VerifiedChangeCause::CheckpointFinalizedGrow,
+        };
+        let request = TransitionRequest {
+            expected_version: before.state_version,
+            event: TransitionEvent::VerifiedChainChanged(event.clone()),
+        };
+        let input = runtime
+            .build_transition_input(
+                request.clone(),
+                &before,
+                &runtime
+                    .transition_engine
+                    .lock()
+                    .expect("the engine lock is available"),
+                config.network(),
+            )
+            .expect("checkpoint input preparation succeeds");
+        assert_eq!(
+            input
+                .header_validation_facts()
+                .expect("checkpoint growth carries validation facts")
+                .validation_leases
+                .len(),
+            usize::from(!retained),
+        );
+
+        let mut invalid = event;
+        invalid.new_path[0].height = block::Height(2);
+        invalid.full_state_transition_id = zakura_header_chain::checkpoint_finality_evidence(
+            before.state_version,
+            Frontier::new(block::Height(2), child.hash),
+        );
+        let invalid_authority = Authority(invalid.full_state_transition_id);
+        assert!(
+            runtime
+                .apply_combined(
+                    TransitionRequest {
+                        expected_version: before.state_version,
+                        event: TransitionEvent::VerifiedChainChanged(invalid),
+                    },
+                    &TransitionContext {
+                        config: &config,
+                        clock: &SystemClock,
+                        full_state_authority: Some(&invalid_authority),
+                        retention_references: &[],
+                    },
+                    DiskWriteBatch::new(),
+                    || {},
+                )
+                .is_err(),
+            "retaining the header must not bypass path validation"
+        );
+        assert_eq!(runtime.publisher().snapshot(), before);
+
+        let authority = Authority(evidence);
+        let mut batch = DiskWriteBatch::new();
+        stage_full_state_canonical_hash(&runtime.store, &mut batch, child);
+        assert_eq!(
+            runtime
+                .apply_combined(
+                    request,
+                    &TransitionContext {
+                        config: &config,
+                        clock: &SystemClock,
+                        full_state_authority: Some(&authority),
+                        retention_references: &[],
+                    },
+                    batch,
+                    || {},
+                )
+                .expect("the valid checkpoint commits with or without an admitted header"),
+            ApplyResult::Committed
+        );
+        assert_eq!(runtime.publisher().snapshot().frontiers.finalized, child);
+        assert_transition_engine_matches_store(&runtime);
+    }
 }
 
 #[test]

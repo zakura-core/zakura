@@ -1084,19 +1084,14 @@ impl StateService {
             .into()));
             rsp_rx
         } else if self.non_finalized_state_queued_blocks.is_full()
-            && !self.can_fork_chain_at(&parent_hash)
+            && !self.drains_the_non_finalized_queue_now(&parent_hash)
         {
             // The bound only applies to blocks that must wait for a parent this state does not
-            // have. A block that can extend a chain now is admitted even when the queue is full,
-            // because the drain below walks forward from `parent_hash`: a block the queue refused
+            // have. A block that this call goes on to drain is admitted even when the queue is
+            // full, because the drain walks forward from `parent_hash`: a block the queue refused
             // is never the parent that releases its own queued descendants, and nothing else
             // empties the queue while the chain is stalled, so rejecting it here would strand
             // them permanently.
-            //
-            // Admitting one costs at most a transient overshoot. In the common case the drain
-            // below removes it in this same call. While the write task still commits checkpoint
-            // blocks it can stay queued, but only a child of the finalized tip qualifies then,
-            // and queuing one is itself a handoff trigger.
             if let Some(admission) = admission {
                 admission.reject();
             }
@@ -1140,6 +1135,34 @@ impl StateService {
         }
 
         rsp_rx
+    }
+
+    /// Returns whether queueing a block with this parent lets the rest of this call drain it
+    /// again, so admitting it past the queue bound overshoots by one entry and no more.
+    ///
+    /// Only a block the queue releases immediately may bypass the bound. Anything that stays
+    /// queued has to be rejected, or a caller could grow the queue without limit by choosing
+    /// parents that pass a liveness check but that nothing goes on to drain.
+    fn drains_the_non_finalized_queue_now(&self, parent_hash: &block::Hash) -> bool {
+        if self.block_write_sender.finalized.is_some() {
+            // The write task is still committing checkpoint blocks, so `send_ready_non_finalized_queued`
+            // does not run for this parent and only the handoff empties the queue. The handoff
+            // needs the last hash we sent to be durably written, and it needs a queued child of
+            // that same hash. A block meeting both is drained by `try_handoff_to_non_finalized_write`
+            // below, and it fires at most once in the life of the node.
+            //
+            // The durable finalized tip is not enough on its own. It lags the last hash we sent
+            // for as long as checkpoint writes are in flight, and a block naming the lagging tip
+            // neither completes the handoff condition nor gets reached by the eventual handoff
+            // traversal, which walks forward from the last hash we sent.
+            return self.read_service.db.finalized_tip_hash()
+                == self.finalized_block_write_last_sent_hash
+                && *parent_hash == self.finalized_block_write_last_sent_hash;
+        }
+
+        // The queue is live: `send_ready_non_finalized_queued` walks forward from this parent
+        // later in this same call.
+        self.can_fork_chain_at(parent_hash)
     }
 
     /// Returns `true` if `hash` is a valid previous block hash for new non-finalized blocks.

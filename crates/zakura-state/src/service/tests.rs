@@ -2054,3 +2054,51 @@ async fn a_reconsidered_parent_becomes_eligible_for_optimistic_relay_again() {
         "the later invalidation outlives the reconsideration it raced",
     );
 }
+
+/// While checkpoint writes are in flight the queue bound is hard, even for a block that names
+/// the durable finalized tip.
+///
+/// The durable tip lags the last hash sent to the write task for as long as checkpoint writes are
+/// outstanding. Nothing drains a block queued under the lagging tip: it does not complete the
+/// handoff condition, and the eventual handoff walks forward from the last hash sent, not from
+/// the tip that was durable when the block arrived. Admitting it past the bound would let a
+/// caller grow the queue without limit for the length of the checkpoint sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_write_lag_does_not_open_the_orphan_queue_bound() {
+    let network = Network::Mainnet;
+    let (mut state, _read, _tip, _height) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("an ephemeral state service is created");
+
+    assert!(
+        state.block_write_sender.finalized.is_some(),
+        "the test starts while the write task still commits checkpoint blocks",
+    );
+
+    let durable_tip = state.read_service.db.finalized_tip_hash();
+
+    // The write task has been sent a later checkpoint block that is not durable yet.
+    state.finalized_block_write_last_sent_hash = block::Hash([9; 32]);
+
+    assert!(
+        !state.drains_the_non_finalized_queue_now(&durable_tip),
+        "a block naming the lagging durable tip is not drained, so the bound must reject it",
+    );
+    assert!(
+        !state.drains_the_non_finalized_queue_now(&block::Hash([9; 32])),
+        "a child of the last hash sent is not drained either until that write is durable",
+    );
+
+    // Once the write task catches up, a child of the last hash sent completes the handoff
+    // condition, and the handoff drains it on the same call.
+    state.finalized_block_write_last_sent_hash = durable_tip;
+    assert!(
+        state.drains_the_non_finalized_queue_now(&durable_tip),
+        "a child of a durably written last sent hash is drained by the handoff",
+    );
+    assert!(
+        !state.drains_the_non_finalized_queue_now(&block::Hash([9; 32])),
+        "any other parent is still not drained",
+    );
+}

@@ -177,7 +177,6 @@ where
         .expect("the verifier is ready")
         .call(Request::Prepare {
             block,
-            work_id: Some("work".to_owned()),
             source: PreparedCandidateSource::ServerTemplate,
         })
         .await
@@ -266,7 +265,6 @@ async fn mined_orphan_replays_skip_transaction_verification() {
             .unwrap()
             .call(Request::CommitMined {
                 block: candidate.clone(),
-                work_id: None,
                 admission: zs::BlockAdmission::pending(),
             })
             .await;
@@ -309,7 +307,6 @@ async fn prepared_mined_commit_rechecks_equihash() {
         .expect("the verifier is ready")
         .call(Request::CommitMined {
             block: Arc::new(solved),
-            work_id: Some("work".to_owned()),
             admission: zs::BlockAdmission::pending(),
         })
         .await;
@@ -335,7 +332,6 @@ async fn prepared_mined_commit_rechecks_header_time() {
         .expect("the verifier is ready")
         .call(Request::CommitMined {
             block: Arc::new(solved),
-            work_id: Some("work".to_owned()),
             admission: zs::BlockAdmission::pending(),
         })
         .await;
@@ -363,7 +359,6 @@ async fn prepared_mined_commit_rechecks_transaction_lock_time() {
         .expect("the verifier is ready")
         .call(Request::CommitMined {
             block: Arc::new(solved),
-            work_id: Some("work".to_owned()),
             admission: zs::BlockAdmission::pending(),
         })
         .await;
@@ -413,7 +408,6 @@ async fn failed_preparation_does_not_populate_the_cache() {
         .expect("the verifier is ready")
         .call(Request::Prepare {
             block: candidate.clone(),
-            work_id: Some("work".to_owned()),
             source: PreparedCandidateSource::ServerTemplate,
         })
         .await;
@@ -429,69 +423,6 @@ async fn failed_preparation_does_not_populate_the_cache() {
         .expect("the verifier is ready")
         .call(Request::CommitMined {
             block: candidate,
-            work_id: Some("work".to_owned()),
-            admission: zs::BlockAdmission::pending(),
-        })
-        .await;
-    assert!(commit_result.is_ok());
-    assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
-}
-
-#[tokio::test]
-async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let _init_guard = zakura_test::init();
-    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
-    let candidate = Arc::new(nu5_prepared_test_block(&network, None));
-    let mut conflicting_proposal = (*candidate).clone();
-    Arc::make_mut(&mut conflicting_proposal.header).previous_block_hash = block::Hash([1; 32]);
-    let conflicting_proposal = Arc::new(conflicting_proposal);
-    let transaction_calls = Arc::new(AtomicUsize::new(0));
-    let transaction = service_fn({
-        let transaction_calls = transaction_calls.clone();
-        move |request| {
-            transaction_calls.fetch_add(1, Ordering::Relaxed);
-            async move { Ok::<_, BoxError>(accept_block_transaction(request)) }
-        }
-    });
-    let state = service_fn(|request: zs::Request| async move {
-        let response = match request {
-            zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
-                (hash == block::Hash([0; 32]) || hash == block::Hash([1; 32]))
-                    .then_some(zs::KnownBlock::Finalized),
-            ),
-            zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
-            zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
-                zs::Response::Committed(block.hash)
-            }
-            _ => panic!("cache-conflict test received an unexpected request: {request:?}"),
-        };
-        Ok::<_, BoxError>(response)
-    });
-    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
-
-    prepare_for_test(&mut verifier, candidate).await;
-    let proposal_result = verifier
-        .ready()
-        .await
-        .expect("the verifier is ready")
-        .call(Request::Prepare {
-            block: conflicting_proposal.clone(),
-            work_id: Some("work".to_owned()),
-            source: PreparedCandidateSource::ClientProposal,
-        })
-        .await;
-    assert!(proposal_result.is_ok());
-    assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
-
-    let commit_result = verifier
-        .ready()
-        .await
-        .expect("the verifier is ready")
-        .call(Request::CommitMined {
-            block: conflicting_proposal,
-            work_id: Some("work".to_owned()),
             admission: zs::BlockAdmission::pending(),
         })
         .await;

@@ -311,7 +311,8 @@ where
         async move {
             let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
                 .map_err(BlockError::from)?;
-            let preparation_start = request.should_cache().then(std::time::Instant::now);
+            let prepared_source = request.prepared_candidate_source();
+            let preparation_start = prepared_source.map(|_| std::time::Instant::now());
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");
             match state_service
@@ -375,10 +376,10 @@ where
 
             if request.is_mined_commit() {
                 let solved_header_start = std::time::Instant::now();
-                if let Some(prepared::CachedPreparedCandidate {
+                if let Some(prepared::CacheHit {
                     source,
                     prepared: cached_prepared_block,
-                }) = prepared_candidates.lookup(&block, request.work_id(), &network)
+                }) = prepared_candidates.lookup(&block, &network)
                 {
                     check::time_is_valid_at(&block.header, Utc::now(), &height, &hash)
                         .map_err(VerifyBlockError::Time)?;
@@ -553,7 +554,7 @@ where
 
             // Return early for proposal requests.
             if request.is_proposal() {
-                let cache_copy = request.should_cache().then(|| prepared_block.clone());
+                let cache_copy = prepared_source.map(|_| prepared_block.clone());
                 let response = match state_service
                     .ready()
                     .await
@@ -565,17 +566,11 @@ where
                     zs::Response::ValidBlockProposal => Ok(hash),
                     _ => unreachable!("wrong response for CheckBlockProposalValidity"),
                 };
-                if let (Ok(_), Some(cache_copy)) = (&response, cache_copy) {
-                    let candidate = cache_copy.block.clone();
-                    prepared_candidates.insert(
-                        &candidate,
-                        request.work_id(),
-                        request
-                            .prepared_candidate_source()
-                            .expect("cached preparation has a candidate source"),
-                        cache_copy,
-                        &network,
-                    );
+                if let (Ok(_), Some(source), Some(cache_copy)) =
+                    (&response, prepared_source, cache_copy)
+                {
+                    let id = prepared::CandidateId::of(&cache_copy.block, &network);
+                    prepared_candidates.insert(id, source, cache_copy);
                     metrics::histogram!("mining.preparation.duration_seconds").record(
                         preparation_start
                             .expect("cached preparation records its start time")

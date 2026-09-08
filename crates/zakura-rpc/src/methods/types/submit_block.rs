@@ -34,6 +34,10 @@ pub struct SubmitBlockParameters {
     /// > Therefore, using a "workid" is a very cheap solution to enable more mutations.
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0022#Rationale>
+    ///
+    /// Zakura accepts this field but does not read it. The verifier identifies a prepared
+    /// candidate by its content, so a submission reuses the prepared work whether or not the
+    /// miner echoes the work ID back.
     #[serde(rename = "workid")]
     pub work_id: Option<String>,
 }

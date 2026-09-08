@@ -856,7 +856,6 @@ pub async fn validate_block_proposal<BlockVerifierRouter, Tip, SyncStatus>(
     net: &Network,
     latest_chain_tip: Tip,
     sync_status: SyncStatus,
-    work_id: Option<String>,
 ) -> RpcResult<GetBlockTemplateResponse>
 where
     BlockVerifierRouter: Service<
@@ -894,7 +893,6 @@ where
         .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
         .call(zakura_consensus::Request::Prepare {
             block: Arc::new(block),
-            work_id,
             source: zakura_consensus::PreparedCandidateSource::ClientProposal,
         })
         .await;

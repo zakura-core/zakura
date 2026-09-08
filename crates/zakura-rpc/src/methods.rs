@@ -1249,7 +1249,6 @@ where
                     .block_verifier_router()
                     .oneshot(zakura_consensus::Request::Prepare {
                         block: Arc::new(block),
-                        work_id: Some(template.work_id().clone()),
                         source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
                     }),
             )
@@ -1309,7 +1308,6 @@ where
                         let parent = block.header.previous_block_hash;
                         let request = zakura_consensus::Request::Prepare {
                             block: Arc::new(block),
-                            work_id: Some(template.work_id().clone()),
                             source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
                         };
                         let mut tip = latest_chain_tip.clone();
@@ -2808,16 +2806,12 @@ where
             .as_ref()
             .and_then(GetBlockTemplateParameters::block_proposal_data)
         {
-            let work_id = parameters
-                .as_ref()
-                .and_then(|parameters| parameters.work_id.clone());
             return validate_block_proposal(
                 self.gbt.block_verifier_router(),
                 block_proposal_bytes,
                 &self.network,
                 latest_chain_tip,
                 sync_status,
-                work_id,
             )
             .await;
         }
@@ -3141,7 +3135,9 @@ where
     async fn submit_block(
         &self,
         HexData(block_bytes): HexData,
-        parameters: Option<SubmitBlockParameters>,
+        // The work ID is accepted for BIP 22 compatibility and identifies nothing: the verifier
+        // looks a prepared candidate up by its content.
+        _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
         let mut block_verifier_router = self.gbt.block_verifier_router();
         let submitted_at = std::time::Instant::now();
@@ -3167,11 +3163,9 @@ where
             Err(response) => return Ok(response.into()),
         };
         let block = Arc::new(block);
-        let work_id = parameters.and_then(|parameters| parameters.work_id);
         let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {
             block: block.clone(),
-            work_id,
             admission: admission.clone(),
         };
         let pending_blocks = self.gbt.pending_blocks();

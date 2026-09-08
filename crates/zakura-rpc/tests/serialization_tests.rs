@@ -1250,6 +1250,7 @@ fn test_get_block_template_response() -> Result<(), Box<dyn std::error::Error>> 
     let bits = template.bits().bytes_in_display_order();
     let height = template.height();
     let max_time = template.max_time();
+    let work_id = template.work_id().clone();
     let submit_old = template.submit_old();
 
     let new_obj = GetBlockTemplateResponse::TemplateMode(Box::new(BlockTemplateResponse::new(
@@ -1273,6 +1274,7 @@ fn test_get_block_template_response() -> Result<(), Box<dyn std::error::Error>> 
         CompactDifficulty::from_bytes_in_display_order(&bits).expect("was just serialized"),
         height,
         max_time,
+        work_id,
         submit_old,
     )));
 

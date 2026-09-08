@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""Regression tests for the approval boundary; no credentials or network used."""
+
+from copy import deepcopy
+import http.client
+import json
+import os
+import unittest
+from unittest.mock import Mock, patch
+
+import adapter
+
+
+HEAD = "a" * 40
+BASE = "b" * 40
+BOT_ID = 12345
+APP_ID = 6789
+POLICY = adapter.Policy.load()
+NATIVE = {"id": POLICY.data["codex_user_id"], "type": "Bot"}
+ACTOR = {"databaseId": POLICY.data["codex_user_id"], "login": "chatgpt-codex-connector"}
+START = "2026-09-01T10:00:00.123456Z"
+FINISH = "2026-09-01T10:02:00.123456Z"
+
+
+def summary_body(completed=True, sha=HEAD[:7], trigger="Draft marked ready"):
+    # This is the native summary table observed on both auto and manual reviews.
+    status = "✅ **Completed**" if completed else "🔄 **Running** since"
+    timestamp = FINISH if completed else START
+    return (adapter.SUMMARY_MARKER + "\n\n## Codex Review Summary\n\n"
+            "| Review | Status | Commit | Review trigger |\n"
+            "| --- | --- | --- | --- |\n"
+            f'| 📝 **Code Review** | {status} <relative-time datetime="{timestamp}">'
+            f"{timestamp}</relative-time> | `{sha}` | {trigger} |\n")
+
+
+def evidence(trigger="Draft marked ready"):
+    body = summary_body(trigger=trigger)
+    return {
+        "policy": POLICY,
+        "pull": {"head": {"sha": HEAD}},
+        "comments": [{"id": 100, "node_id": "IC_test", "body": body,
+                      "user": deepcopy(NATIVE),
+                      "performed_via_github_app": {"id": POLICY.data["codex_app_id"]}}],
+        "summary": {"databaseId": 100, "body": body,
+                    "author": deepcopy(ACTOR), "editor": deepcopy(ACTOR),
+                    "lastEditedAt": "2026-09-01T10:02:00Z",
+                    "userContentEdits": {"pageInfo": {"hasNextPage": False}, "nodes": [
+                        {"diff": body, "editedAt": "2026-09-01T10:02:00Z", "editor": deepcopy(ACTOR)},
+                        {"diff": summary_body(False, trigger=trigger),
+                         "editedAt": "2026-09-01T10:00:02Z", "editor": deepcopy(ACTOR)},
+                    ]}},
+        # GitHub's reaction endpoint reports this Bot's type as User; its stable
+        # numeric ID matches the authenticated App summary and GraphQL Bot.
+        "reactions": [{"id": 200, "content": "+1", "user": {**NATIVE, "type": "User"},
+                       "created_at": "2026-09-01T10:02:03Z"}],
+        "reviews": [], "threads": [], "resolved_sha": HEAD,
+    }
+
+
+def command(body="@codex review", created="2026-09-01T09:59:58Z"):
+    return {"id": 99, "body": body, "created_at": created, "updated_at": created,
+            "user": {"id": 900, "type": "User"}}
+
+
+def native_review(when="2026-09-01T10:01:30Z", commit=HEAD):
+    # GitHub REST reviews have no performed_via_github_app field.
+    return {"id": 300, "state": "COMMENTED", "user": deepcopy(NATIVE),
+            "commit_id": commit, "submitted_at": when}
+
+
+def thread(resolved=False, native=True):
+    return {"isResolved": resolved, "isOutdated": True,
+            "comments": {"nodes": [{"author": deepcopy(ACTOR) if native else {"login": "human"}}],
+                         "pageInfo": {"hasNextPage": False}}}
+
+
+class EvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.data = evidence()
+
+    def reject(self, message):
+        with self.assertRaisesRegex(adapter.Ineligible, message):
+            adapter.check_evidence(**self.data)
+
+    def replace_current_body(self, body):
+        self.data["comments"][0]["body"] = body
+        self.data["summary"]["body"] = body
+        self.data["summary"]["userContentEdits"]["nodes"][0]["diff"] = body
+
+    def test_native_automatic_review_yields_commit_and_episode_receipt(self):
+        receipt = adapter.check_evidence(**self.data)
+        self.assertEqual(receipt["head"], HEAD)
+        self.assertEqual(receipt["reaction"], 200)
+        self.assertEqual(receipt["policy"], POLICY.digest)
+
+    def test_native_new_commits_review(self):
+        self.assertEqual(adapter.check_evidence(**evidence("New commits"))["head"], HEAD)
+
+    def test_author_can_request_another_normal_review(self):
+        self.data = evidence("Manual request")
+        self.data["comments"].extend([command(created="2026-09-01T09:30:00Z"), command()])
+        self.data["reviews"] = [native_review("2026-09-01T09:31:30Z", "c" * 40)]
+        self.data["threads"] = [thread(resolved=True)]
+        self.assertEqual(adapter.check_evidence(**self.data)["head"], HEAD)
+
+    def test_copying_bot_text_does_not_make_a_native_review(self):
+        self.data["comments"][0]["user"] = {"id": 900, "type": "User", "login": ACTOR["login"]}
+        self.reject("exactly one")
+
+    def test_wrong_app_cannot_supply_summary(self):
+        self.data["comments"][0]["performed_via_github_app"]["id"] = 1
+        self.reject("exactly one")
+
+    def test_human_editor_cannot_replace_summary(self):
+        self.data["summary"]["editor"] = {"login": "human"}
+        self.reject("last editor")
+
+    def test_historical_human_edit_is_not_hidden_by_new_bot_edit(self):
+        self.data["summary"]["userContentEdits"]["nodes"][1]["editor"] = {"login": "human"}
+        self.reject("non-Codex editor")
+
+    def test_reaction_update_timestamp_is_not_a_content_edit(self):
+        self.data["comments"][0]["updated_at"] = "2026-09-07T20:00:00Z"
+        self.assertEqual(adapter.check_evidence(**self.data)["head"], HEAD)
+
+    def test_missing_or_truncated_history(self):
+        for change in ("missing", "truncated"):
+            with self.subTest(change=change):
+                self.data = evidence()
+                history = self.data["summary"]["userContentEdits"]
+                if change == "missing":
+                    history["nodes"] = history["nodes"][:1]
+                else:
+                    history["pageInfo"]["hasNextPage"] = True
+                self.reject("history")
+
+    def test_completed_without_immediately_preceding_running(self):
+        self.data["summary"]["userContentEdits"]["nodes"][1]["diff"] = summary_body()
+        self.reject("preceding Running")
+
+    def test_changed_summary_between_rest_and_graphql_reads(self):
+        self.data["summary"]["body"] = summary_body(False)
+        self.reject("changed while")
+
+    def test_running_failed_and_unknown_formats_withhold_approval(self):
+        for body in (summary_body(False), summary_body().replace("Completed", "Failed"),
+                     summary_body() + "| 🔒 **Security Review** | Running | `aaaaaaa` | Manual request |\n"):
+            with self.subTest(body=body):
+                self.data = evidence()
+                self.replace_current_body(body)
+                self.reject("Running|unsupported|Unknown")
+
+    def test_mixed_commit_episode_is_rejected(self):
+        self.data["summary"]["userContentEdits"]["nodes"][1]["diff"] = summary_body(False, sha="ccccccc")
+        self.reject("changed commit")
+
+    def test_old_head_or_abbreviated_sha_collision_is_rejected(self):
+        for resolved in ("c" * 40, HEAD[:7] + "c" * 33, HEAD[:7]):
+            with self.subTest(resolved=resolved):
+                self.data["resolved_sha"] = resolved
+                self.reject("ambiguous commit")
+
+    def test_new_same_head_review_request_invalidates_clean_receipt(self):
+        self.data["comments"].append(command(created="2026-09-01T10:03:00Z"))
+        self.reject("newer or edited")
+
+    def test_edited_command_invalidates_prior_receipt(self):
+        request = command()
+        request["updated_at"] = "2026-09-01T10:03:00Z"
+        self.data["comments"].append(request)
+        self.reject("newer or edited")
+
+    def test_scoped_manual_review_cannot_approve_whole_pr(self):
+        for body in ("@codex review only the README", "@codex security review"):
+            with self.subTest(body=body):
+                self.data = evidence("Manual request")
+                self.data["comments"].append(command(body))
+                self.reject("Scoped review")
+
+    def test_missing_manual_request(self):
+        self.data = evidence("Manual request")
+        self.reject("request is missing")
+
+    def test_unknown_auto_trigger(self):
+        self.data = evidence("Future scoped review")
+        self.reject("Unrecognized automatic")
+
+    def test_old_missing_wrong_author_or_late_thumbs_up_is_not_clean(self):
+        for change in ("old", "missing", "human", "late"):
+            with self.subTest(change=change):
+                self.data = evidence()
+                reaction = self.data["reactions"][0]
+                if change == "old":
+                    reaction["created_at"] = "2026-09-01T09:59:59Z"
+                elif change == "missing":
+                    self.data["reactions"] = []
+                elif change == "human":
+                    reaction["user"]["id"] = 900
+                else:
+                    reaction["created_at"] = "2026-09-01T10:10:00Z"
+                self.reject("fresh Codex thumbs-up")
+
+    def test_running_reaction_with_lingering_thumbs_up(self):
+        self.data["reactions"].append({"content": "eyes", "user": NATIVE})
+        self.reject("running-review reaction")
+
+    def test_resolving_current_findings_does_not_turn_review_clean(self):
+        self.data["reviews"] = [native_review()]
+        self.data["threads"] = [thread(resolved=True)]
+        self.reject("posted findings")
+
+    def test_outdated_unresolved_native_findings_still_block(self):
+        self.data["threads"] = [thread()]
+        self.reject("Unresolved Codex")
+
+    def test_old_resolved_findings_allow_fresh_clean_review(self):
+        self.data["reviews"] = [native_review("2026-09-01T09:00:00Z", "c" * 40)]
+        self.data["threads"] = [thread(resolved=True), thread(native=False)]
+        self.assertEqual(adapter.check_evidence(**self.data)["head"], HEAD)
+
+    def test_incomplete_threads_fail_closed(self):
+        self.data["threads"] = [thread(resolved=True)]
+        self.data["threads"][0]["comments"]["pageInfo"]["hasNextPage"] = True
+        self.reject("Incomplete review thread")
+
+
+class PathTests(unittest.TestCase):
+    def test_existing_files_in_all_three_roots(self):
+        files = [{"filename": p, "status": "modified"} for p in (
+            "deploy/deployer/deploy.py", ".github/workflows/lint.yml",
+            ".github/scripts/upstream-sync-run.sh")]
+        POLICY.check_files(files, 3)
+
+    def test_release_and_adapter_controls_always_need_humans(self):
+        paths = [p + "new-file.sh" if p.endswith("/") else p for p in POLICY.data["human_only"]]
+        paths += ["scripts/sign-release.sh", ".github/review-policy/policy.json", ".github/CODEOWNERS",
+                  ".github/actions/setup-zakura-build/action.yml", "crates/zakura-chain/src/lib.rs"]
+        for path in paths:
+            with self.subTest(path=path):
+                with self.assertRaises(adapter.Ineligible):
+                    POLICY.check_files([{"filename": path, "status": "modified"}], 1)
+
+    def test_mixed_pr_needs_human(self):
+        with self.assertRaises(adapter.Ineligible):
+            POLICY.check_files([{"filename": "deploy/a.py", "status": "modified"},
+                                {"filename": "Cargo.toml", "status": "modified"}], 2)
+
+    def test_source_to_eligible_rename_cannot_hide_source_change(self):
+        with self.assertRaisesRegex(adapter.Ineligible, "human review"):
+            POLICY.check_files([{"filename": "deploy/notes.md", "previous_filename": "crates/lib.rs",
+                                 "status": "renamed"}], 1)
+
+    def test_release_rename_cannot_hide_release_change(self):
+        with self.assertRaisesRegex(adapter.Ineligible, "human review"):
+            POLICY.check_files([{"filename": ".github/workflows/ordinary.yml", "status": "renamed",
+                                 "previous_filename": ".github/workflows/create-release.yml"}], 1)
+
+    def test_new_and_renamed_files_need_classification(self):
+        for status in ("added", "copied", "changed", "renamed"):
+            with self.subTest(status=status):
+                with self.assertRaises(adapter.Ineligible):
+                    POLICY.check_files([{"filename": "deploy/new.py", "status": status,
+                                         "previous_filename": "deploy/old.py"}], 1)
+
+    def test_path_representation_and_prefix_confusion(self):
+        for path in ("deploy-other/a", "deploy/../Cargo.toml", "deploy//a", "/deploy/a", "deploy/a\n",
+                     "deploy/./a", "deploy/dir\\a", ".github/workflows-evil/a"):
+            with self.subTest(path=path):
+                self.assertFalse(POLICY.eligible_path(path))
+
+    def test_empty_duplicate_and_truncated_file_lists(self):
+        file = {"filename": "deploy/a", "status": "modified"}
+        for files, count in (([], 0), ([file], 2), ([file, file], 2), ([file], 3000)):
+            with self.subTest(count=count):
+                with self.assertRaises(adapter.Ineligible):
+                    POLICY.check_files(files, count)
+
+
+def rules_fixture():
+    return [{"type": "pull_request", "ruleset_id": 1, "ruleset_source_type": "Repository",
+             "parameters": {"required_approving_review_count": 1,
+                            "dismiss_stale_reviews_on_push": True, "require_last_push_approval": True,
+                            "required_reviewers": [{"file_patterns": POLICY.human_patterns,
+                                                    "minimum_approvals": 1,
+                                                    "reviewer": {"id": 42, "type": "Team"}}]}},
+            {"type": "required_status_checks",
+             "parameters": {"required_status_checks": [{"context": "test success"}]}}]
+
+
+class RulesTests(unittest.TestCase):
+    def setUp(self):
+        self.rules = rules_fixture()
+        self.full = {"enforcement": "active", "bypass_actors": []}
+        self.api = Mock()
+        self.api.request.side_effect = lambda path: self.full if "/rulesets/" in path else self.rules
+
+    def test_native_human_paths_and_freshness_are_required(self):
+        adapter.check_rules(self.api, POLICY, 42)
+
+    def test_current_live_rule_configuration_cannot_enable_adapter(self):
+        self.rules[0]["parameters"]["required_reviewers"] = []
+        self.rules[0]["parameters"]["dismiss_stale_reviews_on_push"] = False
+        with self.assertRaises(adapter.Ineligible):
+            adapter.check_rules(self.api, POLICY, 42)
+
+    def test_each_freshness_switch_is_required(self):
+        for key in ("dismiss_stale_reviews_on_push", "require_last_push_approval"):
+            with self.subTest(key=key):
+                self.rules = rules_fixture()
+                self.rules[0]["parameters"][key] = False
+                with self.assertRaises(adapter.Ineligible):
+                    adapter.check_rules(self.api, POLICY, 42)
+
+    def test_human_patterns_must_match_including_order_and_exceptions(self):
+        self.rules[0]["parameters"]["required_reviewers"][0]["file_patterns"] = ["*"]
+        with self.assertRaises(adapter.Ineligible):
+            adapter.check_rules(self.api, POLICY, 42)
+
+    def test_missing_team_test_gate_or_bypass_stops_approval(self):
+        for change in ("team", "ci", "bypass", "evaluate"):
+            with self.subTest(change=change):
+                self.setUp()
+                if change == "ci":
+                    self.rules.pop()
+                if change == "bypass":
+                    self.full["bypass_actors"] = [{"actor_type": "Integration", "actor_id": APP_ID}]
+                if change == "evaluate":
+                    self.full["enforcement"] = "evaluate"
+                with self.assertRaises(adapter.Ineligible):
+                    adapter.check_rules(self.api, POLICY, 0 if change == "team" else 42)
+
+
+def receipt():
+    return {**adapter.check_evidence(**evidence()), "base": BASE}
+
+
+def owned_review(state="APPROVED", expected=None, identity=BOT_ID):
+    expected = expected or receipt()
+    return {"id": 400, "state": state, "user": {"id": identity, "type": "Bot"},
+            "commit_id": expected["head"],
+            "body": adapter.RECEIPT_MARKER + json.dumps(expected, sort_keys=True, separators=(",", ":")) + " -->\n"}
+
+
+class ReconcileTests(unittest.TestCase):
+    def setUp(self):
+        self.api, self.writer = Mock(), Mock()
+        self.api.pages.return_value = []
+        self.worker = adapter.Adapter(self.api, POLICY, 1, team_id=42, writer=self.writer,
+                                      app_id=APP_ID, bot_id=BOT_ID, trusted_sha=BASE)
+        self.worker.check_trusted_revision = Mock()
+        self.worker.evaluate = Mock(return_value=receipt())
+        self.writer.request.return_value = {"id": 500, "user": {"id": BOT_ID, "type": "Bot"}}
+
+    def writes(self):
+        return [(c.args[1], c.args[0]) for c in self.writer.request.call_args_list]
+
+    def test_approve_exact_commit_once(self):
+        result = self.worker.reconcile()
+        self.assertTrue(result["approved"])
+        self.assertEqual(self.writer.request.call_args.args[2]["commit_id"], HEAD)
+        self.assertEqual(self.writes(), [("POST", self.worker.pull_path + "/reviews")])
+        self.assertEqual(self.worker.evaluate.call_count, 3)
+
+    def test_existing_current_approval_is_idempotent(self):
+        self.api.pages.return_value = [owned_review()]
+        self.assertTrue(self.worker.reconcile()["approved"])
+        self.writer.request.assert_not_called()
+
+    def test_stale_approval_is_dismissed_without_touching_human_or_other_bot(self):
+        self.api.pages.return_value = [owned_review(), owned_review(identity=900)]
+        self.worker.evaluate.side_effect = adapter.Ineligible("New head is not reviewed")
+        result = self.worker.reconcile()
+        self.assertFalse(result["approved"])
+        self.assertEqual(self.writes(), [("PUT", self.worker.pull_path + "/reviews/400/dismissals")])
+
+    def test_missing_rules_or_api_failure_withdraws_existing_approval(self):
+        for error in (adapter.Ineligible("Rules missing"), adapter.APIError("Unavailable")):
+            with self.subTest(error=error):
+                self.setUp()
+                self.api.pages.return_value = [owned_review()]
+                self.worker.evaluate.side_effect = error
+                self.assertEqual(self.worker.reconcile()["dismissed"], 1)
+
+    def test_changed_receipt_is_replaced_after_dismissal(self):
+        stale = {**receipt(), "head": "c" * 40}
+        self.api.pages.return_value = [owned_review(expected=stale)]
+        self.assertTrue(self.worker.reconcile()["approved"])
+        self.assertEqual([method for method, _ in self.writes()], ["PUT", "POST"])
+
+    def test_do_not_reapprove_an_explicitly_dismissed_episode(self):
+        self.api.pages.return_value = [owned_review("DISMISSED")]
+        self.assertFalse(self.worker.reconcile()["approved"])
+        self.writer.request.assert_not_called()
+
+    def test_base_or_policy_update_does_not_override_episode_dismissal(self):
+        for key in ("base", "policy"):
+            with self.subTest(key=key):
+                self.setUp()
+                self.api.pages.return_value = [owned_review("DISMISSED", {**receipt(), key: "c" * 40})]
+                self.assertFalse(self.worker.reconcile()["approved"])
+                self.writer.request.assert_not_called()
+
+    def test_push_or_new_review_before_post_never_approves(self):
+        self.worker.evaluate.side_effect = [receipt(), adapter.Ineligible("New review is running")]
+        self.assertFalse(self.worker.reconcile()["approved"])
+        self.writer.request.assert_not_called()
+
+    def test_push_during_post_dismisses_just_created_approval(self):
+        self.worker.evaluate.side_effect = [receipt(), receipt(), {**receipt(), "head": "c" * 40}]
+        with self.assertRaises(adapter.Ineligible):
+            self.worker.reconcile()
+        self.assertEqual([method for method, _ in self.writes()], ["POST", "PUT"])
+        self.assertTrue(self.writes()[-1][1].endswith("/500/dismissals"))
+
+    def test_ambiguous_post_is_reconciled_without_post_retry(self):
+        self.writer.request.side_effect = [adapter.APIError("Timed out"), None]
+        self.api.pages.side_effect = [[], [owned_review()]]
+        with self.assertRaises(adapter.APIError):
+            self.worker.reconcile()
+        self.assertEqual([method for method, _ in self.writes()], ["POST", "PUT"])
+
+    def test_different_bot_token_is_detected_and_its_review_removed(self):
+        self.writer.request.return_value = {"id": 500, "user": {"id": 999, "type": "Bot"}}
+        with self.assertRaisesRegex(adapter.Ineligible, "configured App"):
+            self.worker.reconcile()
+        self.assertEqual([method for method, _ in self.writes()], ["POST", "PUT"])
+
+    def test_trusted_main_advancing_before_post_withholds_approval(self):
+        self.worker.check_trusted_revision.side_effect = [None, adapter.Ineligible("Main advanced")]
+        self.assertFalse(self.worker.reconcile()["approved"])
+        self.writer.request.assert_not_called()
+
+    def test_closed_draft_or_retargeted_pr_is_ineligible(self):
+        original = {"state": "open", "draft": False, "head": {"sha": HEAD},
+                    "base": {"ref": "main", "repo": {"full_name": POLICY.data["repository"]}}}
+        for change in ("closed", "draft", "base"):
+            with self.subTest(change=change):
+                pull = deepcopy(original)
+                if change == "closed":
+                    pull["state"] = "closed"
+                elif change == "draft":
+                    pull["draft"] = True
+                else:
+                    pull["base"]["ref"] = "release/v1"
+                self.api.request.return_value = pull
+                with self.assertRaises(adapter.Ineligible):
+                    adapter.Adapter(self.api, POLICY, 1).evaluate()
+
+
+class APITests(unittest.TestCase):
+    def test_partial_network_response_is_an_api_error(self):
+        with patch("urllib.request.urlopen") as open_url:
+            open_url.return_value.__enter__.return_value.read.side_effect = http.client.IncompleteRead(b"")
+            with self.assertRaises(adapter.APIError):
+                adapter.GitHub("unused").request("/test", "POST", {})
+
+    def test_rest_pagination_is_complete(self):
+        api = adapter.GitHub("unused")
+        api.request = Mock(side_effect=[[{}] * 100, [{"id": 1}]])
+        self.assertEqual(len(api.pages("/test")), 101)
+        self.assertIn("page=2", api.request.call_args.args[0])
+
+    def test_excessive_pagination_fails_closed(self):
+        api = adapter.GitHub("unused")
+        api.request = Mock(return_value=[{}] * 100)
+        with self.assertRaises(adapter.Ineligible):
+            api.pages("/test")
+        self.assertEqual(api.request.call_count, adapter.MAX_PAGES)
+
+    def test_graphql_partial_data_is_an_error(self):
+        api = adapter.GitHub("unused")
+        api.request = Mock(return_value={"data": {"node": {}}, "errors": [{"message": "unavailable"}]})
+        with self.assertRaises(adapter.APIError):
+            api.graphql("query { node }")
+
+    def test_event_targets_use_metadata_not_comment_text(self):
+        api = Mock()
+        numbers = adapter.target_numbers(api, POLICY, {"issue": {"number": 17, "pull_request": {"url": "unused"}},
+                                                       "comment": {"body": "@codex review PR 1234"}})
+        self.assertEqual(numbers, [17])
+        api.pages.assert_not_called()
+
+
+class CLITests(unittest.TestCase):
+    def test_default_mode_never_constructs_writer_or_reconciles(self):
+        with (patch.dict(os.environ, {"GH_TOKEN": "unused"}, clear=True),
+              patch("sys.argv", ["adapter.py", "--pr", "1"]),
+              patch("adapter.GitHub") as github,
+              patch("adapter.Adapter") as worker,
+              patch("builtins.print")):
+            worker.return_value.evaluate.return_value = receipt()
+            self.assertEqual(adapter.main(), 0)
+            self.assertEqual(github.call_count, 1)
+            worker.return_value.reconcile.assert_not_called()
+            self.assertIsNone(worker.call_args.kwargs["writer"])
+
+    def test_apply_flag_cannot_override_disabled_repository_setting(self):
+        with (patch.dict(os.environ, {"GH_TOKEN": "unused", "CODEX_APPROVAL_ENABLED": "false"}, clear=True),
+              patch("sys.argv", ["adapter.py", "--pr", "1", "--apply"]),
+              patch("adapter.GitHub") as github):
+            with self.assertRaisesRegex(adapter.Ineligible, "disabled"):
+                adapter.main()
+            github.return_value.request.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

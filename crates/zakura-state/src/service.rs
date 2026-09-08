@@ -15,7 +15,7 @@
 //!   chain tip changes.
 
 use std::{
-    collections::{hash_map, BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap},
     future::Future,
     ops::Bound,
     path::PathBuf,
@@ -181,27 +181,9 @@ pub(crate) struct StateService {
     /// Hashes of blocks below the finalized tip height are periodically pruned.
     non_finalized_block_write_sent_hashes: SentHashes,
 
-    /// Parents whose one optimistic relay slot a mined candidate already reserved, keyed by
-    /// parent hash and holding the height of the candidate that took the slot.
-    ///
-    /// A reservation only matters while its parent is still the best tip, so entries are pruned
-    /// once the reserving height is finalized, alongside the other per-block maps.
-    optimistic_relay_reserved_parents: HashMap<block::Hash, block::Height>,
-
-    /// Capacity held until the writer publishes each contextual or reconsideration result.
+    /// Capacity held until the writer publishes each contextual, reconsideration, or
+    /// invalidation result.
     non_finalized_write_slots: Arc<tokio::sync::Semaphore>,
-
-    /// Parents targeted by operator invalidation cannot authorize optimistic relay, counted by
-    /// how many invalidations are outstanding for each hash.
-    ///
-    /// `send_invalidate_block` increments a hash before the writer sees the invalidation, so a
-    /// candidate queued afterwards cannot advertise against a parent that is about to disappear.
-    /// A confirmed reconsideration decrements it, which releases a hash that is valid again while
-    /// leaving a later invalidation of the same hash in force.
-    ///
-    /// This is shared because the confirmation arrives in the detached `ReconsiderBlock` response
-    /// future, which has no access to the service.
-    optimistic_relay_invalidated_parents: Arc<Mutex<HashMap<block::Hash, usize>>>,
 
     /// Recent local write failures used to complete descendants that arrive after the failure.
     non_finalized_failed_ancestors:
@@ -597,11 +579,9 @@ impl StateService {
             block_write_sender,
             finalized_block_write_last_sent_hash,
             non_finalized_block_write_sent_hashes,
-            optimistic_relay_reserved_parents: HashMap::new(),
             non_finalized_write_slots: Arc::new(tokio::sync::Semaphore::new(
                 queued_blocks::MAX_QUEUED_BLOCKS,
             )),
-            optimistic_relay_invalidated_parents: Arc::new(Mutex::new(HashMap::new())),
             non_finalized_failed_ancestors: IndexMap::new(),
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
@@ -1149,8 +1129,6 @@ impl StateService {
 
             self.non_finalized_block_write_sent_hashes
                 .prune_by_height(finalized_tip_height);
-
-            self.prune_optimistic_relay_reservations(finalized_tip_height);
         }
 
         rsp_rx
@@ -1182,6 +1160,30 @@ impl StateService {
         // The queue is live: `send_ready_non_finalized_queued` walks forward from this parent
         // later in this same call.
         self.can_fork_chain_at(parent_hash)
+    }
+
+    /// Whether a candidate admitted right now may be advertised before its contextual commit.
+    ///
+    /// Called after this candidate's own write slot is acquired, so "one permit taken" means no
+    /// other commit, reconsideration, or invalidation is still unpublished. Every earlier
+    /// transition has already reached `update_latest_chain_channels`, so the published best tip
+    /// is the tip this candidate extends.
+    fn optimistic_relay_still_authorized(
+        &self,
+        admission: Option<&BlockAdmission>,
+        parent: block::Hash,
+    ) -> bool {
+        if !admission.is_some_and(BlockAdmission::optimistic_relay_authorized) {
+            return false;
+        }
+
+        let writer_idle = self.non_finalized_write_slots.available_permits()
+            == queued_blocks::MAX_QUEUED_BLOCKS - 1;
+
+        writer_idle
+            && self
+                .best_tip()
+                .is_some_and(|(_, tip_hash)| tip_hash == parent)
     }
 
     /// Returns `true` if `hash` is a valid previous block hash for new non-finalized blocks.
@@ -1231,28 +1233,8 @@ impl StateService {
                         .add(&queued_child.0);
                     let admission = queued_child.2.clone();
                     let candidate_parent = queued_child.0.block.header.previous_block_hash;
-                    let optimistic_relay_still_authorized = admission
-                        .as_ref()
-                        .is_some_and(BlockAdmission::optimistic_relay_authorized)
-                        && self.non_finalized_write_slots.available_permits()
-                            == queued_blocks::MAX_QUEUED_BLOCKS - 1
-                        && self
-                            .best_tip()
-                            .is_some_and(|(_, tip_hash)| tip_hash == candidate_parent)
-                        && (self
-                            .non_finalized_block_write_sent_hashes
-                            .contains(&candidate_parent)
-                            || self.read_service.db.finalized_tip_hash() == candidate_parent)
-                        && !self
-                            .optimistic_relay_reserved_parents
-                            .contains_key(&candidate_parent)
-                        && !self.optimistic_relay_is_blocked_by_invalidation();
-                    if optimistic_relay_still_authorized {
-                        // Only the first server candidate can reserve early relay for this parent.
-                        // Siblings receive the normal committed relay after contextual validation.
-                        self.optimistic_relay_reserved_parents
-                            .insert(candidate_parent, queued_child.0.height);
-                    }
+                    let optimistic_relay_still_authorized = self
+                        .optimistic_relay_still_authorized(admission.as_ref(), candidate_parent);
                     let send_result =
                         non_finalized_block_write_sender.send(NonFinalizedWriteMessage::Commit {
                             queued: queued_child,
@@ -1291,46 +1273,6 @@ impl StateService {
         self.read_service.best_tip()
     }
 
-    /// Drops optimistic relay reservations that can never be consulted again.
-    ///
-    /// A reservation is only read while its parent is the best tip. Once the candidate that took
-    /// the slot is finalized its parent is buried, so the entry is dead and would otherwise be
-    /// retained for the lifetime of the process.
-    fn prune_optimistic_relay_reservations(&mut self, finalized_tip_height: block::Height) {
-        self.optimistic_relay_reserved_parents
-            .retain(|_, height| *height > finalized_tip_height);
-    }
-
-    /// Any outstanding invalidation can remove an ancestor of the published tip.
-    fn optimistic_relay_is_blocked_by_invalidation(&self) -> bool {
-        !self
-            .optimistic_relay_invalidated_parents
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-    }
-
-    /// Releases one outstanding invalidation of `hash`, after the writer confirmed that it was
-    /// reconsidered.
-    ///
-    /// Counting rather than clearing keeps an invalidation issued after this reconsideration was
-    /// requested in force, because that later invalidation raised the count again.
-    fn release_optimistic_relay_invalidation(
-        invalidated_parents: &Mutex<HashMap<block::Hash, usize>>,
-        hash: block::Hash,
-    ) {
-        let mut invalidated_parents = invalidated_parents
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let hash_map::Entry::Occupied(mut entry) = invalidated_parents.entry(hash) else {
-            return;
-        };
-        *entry.get_mut() -= 1;
-        if *entry.get() == 0 {
-            entry.remove();
-        }
-    }
-
     fn send_invalidate_block(
         &mut self,
         hash: block::Hash,
@@ -1342,17 +1284,20 @@ impl StateService {
             return rsp_rx;
         };
 
-        // Block optimistic relay before the writer processes the invalidation. The write channel
-        // preserves request order, so a later candidate cannot advertise using this stale parent.
-        *self
-            .optimistic_relay_invalidated_parents
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(hash)
-            .or_default() += 1;
+        // The permit travels with the message and is released once the writer publishes the new
+        // tip, so a candidate queued in the meantime cannot advertise against a parent that this
+        // invalidation is about to remove.
+        let Ok(write_slot) = self.non_finalized_write_slots.clone().try_acquire_owned() else {
+            let _ = rsp_tx.send(Err(InvalidateError::WriterFull));
+            return rsp_rx;
+        };
 
         if let Err(tokio::sync::mpsc::error::SendError(error)) =
-            sender.send(NonFinalizedWriteMessage::Invalidate { hash, rsp_tx })
+            sender.send(NonFinalizedWriteMessage::Invalidate {
+                hash,
+                rsp_tx,
+                write_slot,
+            })
         {
             let NonFinalizedWriteMessage::Invalidate { rsp_tx, .. } = error else {
                 unreachable!("should return the same Invalidate message could not be sent");
@@ -2046,7 +1991,6 @@ impl Service<Request> for StateService {
 
             // The expected error type for this request is `ReconsiderError`
             Request::ReconsiderBlock(block_hash) => {
-                let invalidated_parents = self.optimistic_relay_invalidated_parents.clone();
                 let rsp_rx = tokio::task::block_in_place(move || {
                     span.in_scope(|| self.send_reconsider_block(block_hash))
                 });
@@ -2056,21 +2000,10 @@ impl Service<Request> for StateService {
                 // Then flatten the nested Result and convert any errors to a BoxError.
                 let span = Span::current();
                 async move {
-                    let reconsidered = rsp_rx
+                    rsp_rx
                         .await
                         .map_err(|_recv_error| ReconsiderError::ReconsiderResponseDropped)
-                        .and_then(|result| result);
-
-                    // Only a confirmed reconsideration releases the parent for optimistic relay.
-                    // A failed one leaves the block invalidated, so it must stay blocked.
-                    if reconsidered.is_ok() {
-                        StateService::release_optimistic_relay_invalidation(
-                            &invalidated_parents,
-                            block_hash,
-                        );
-                    }
-
-                    reconsidered
+                        .and_then(|result| result)
                         .map_err(BoxError::from)
                         .map(Response::Reconsidered)
                 }

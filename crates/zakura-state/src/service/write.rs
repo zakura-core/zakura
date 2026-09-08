@@ -1647,6 +1647,8 @@ pub enum NonFinalizedWriteMessage {
     Invalidate {
         hash: block::Hash,
         rsp_tx: oneshot::Sender<Result<block::Hash, InvalidateError>>,
+        /// Blocks relay against an unpublished transition, like [`Self::Reconsider`].
+        write_slot: tokio::sync::OwnedSemaphorePermit,
     },
     /// The hash of a block that was previously invalidated but should be
     /// reconsidered and reinserted into the non-finalized state.
@@ -2670,7 +2672,11 @@ impl WriteBlockWorkerTask {
                     queued_at,
                     write_slot,
                 } => Some((queued, queued_at, write_slot)),
-                NonFinalizedWriteMessage::Invalidate { hash, rsp_tx } => {
+                NonFinalizedWriteMessage::Invalidate {
+                    hash,
+                    rsp_tx,
+                    write_slot: _write_slot,
+                } => {
                     tracing::info!(?hash, "invalidating a block in the non-finalized state");
                     let result = if let Some(writer) = header_chain.as_ref() {
                         let mut staged = non_finalized_state.clone();

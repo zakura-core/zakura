@@ -1960,108 +1960,6 @@ fn read_only_open_with_malformed_version_returns_typed_error() {
     }
 }
 
-/// Optimistic relay reservations must not accumulate for the lifetime of the process.
-///
-/// Every optimistically relayed block reserves its parent's slot. A reservation is only read
-/// while its parent is the best tip, so once the reserving candidate is finalized the entry is
-/// unreachable and has to go.
-#[tokio::test(flavor = "multi_thread")]
-async fn finalized_optimistic_relay_reservations_are_pruned() {
-    let network = Network::Mainnet;
-    let (mut state, _read, _tip, _height) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
-            .await
-            .expect("an ephemeral state service is created");
-
-    let buried = block::Hash([1; 32]);
-    let at_the_tip = block::Hash([2; 32]);
-    let above_the_tip = block::Hash([3; 32]);
-
-    state
-        .optimistic_relay_reserved_parents
-        .insert(buried, Height(9));
-    state
-        .optimistic_relay_reserved_parents
-        .insert(at_the_tip, Height(10));
-    state
-        .optimistic_relay_reserved_parents
-        .insert(above_the_tip, Height(11));
-
-    state.prune_optimistic_relay_reservations(Height(10));
-
-    assert_eq!(
-        state
-            .optimistic_relay_reserved_parents
-            .keys()
-            .copied()
-            .collect::<Vec<_>>(),
-        vec![above_the_tip],
-        "only a reservation above the finalized tip can still be consulted",
-    );
-}
-
-/// An invalidated parent stays ineligible for optimistic relay until the writer confirms that
-/// the same invalidation was reconsidered.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_reconsidered_parent_becomes_eligible_for_optimistic_relay_again() {
-    let network = Network::Mainnet;
-    let (state, _read, _tip, _height) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
-            .await
-            .expect("an ephemeral state service is created");
-
-    let parent = block::Hash([7; 32]);
-    let invalidated = state.optimistic_relay_invalidated_parents.clone();
-
-    assert!(
-        !state.optimistic_relay_is_blocked_by_invalidation(),
-        "a parent nobody invalidated can authorize optimistic relay",
-    );
-
-    *invalidated
-        .lock()
-        .expect("the invalidation map is not poisoned")
-        .entry(parent)
-        .or_default() += 1;
-    assert!(
-        state.optimistic_relay_is_blocked_by_invalidation(),
-        "an invalidated parent cannot authorize optimistic relay",
-    );
-
-    StateService::release_optimistic_relay_invalidation(&invalidated, parent);
-    assert!(
-        !state.optimistic_relay_is_blocked_by_invalidation(),
-        "a confirmed reconsideration releases the parent",
-    );
-    assert!(
-        invalidated
-            .lock()
-            .expect("the invalidation map is not poisoned")
-            .is_empty(),
-        "a released parent leaves no entry behind",
-    );
-
-    // A reconsideration that the writer never confirmed, or one for a hash this service never
-    // invalidated, must not underflow or resurrect an entry.
-    StateService::release_optimistic_relay_invalidation(&invalidated, parent);
-    assert!(!state.optimistic_relay_is_blocked_by_invalidation());
-
-    // An invalidation issued while a reconsideration is in flight stays in force when that
-    // reconsideration is confirmed.
-    let mut invalidated_parents = invalidated
-        .lock()
-        .expect("the invalidation map is not poisoned");
-    *invalidated_parents.entry(parent).or_default() += 1;
-    *invalidated_parents.entry(parent).or_default() += 1;
-    drop(invalidated_parents);
-
-    StateService::release_optimistic_relay_invalidation(&invalidated, parent);
-    assert!(
-        state.optimistic_relay_is_blocked_by_invalidation(),
-        "the later invalidation outlives the reconsideration it raced",
-    );
-}
-
 /// While checkpoint writes are in flight the queue bound is hard, even for a block that names
 /// the durable finalized tip.
 ///
@@ -2171,23 +2069,24 @@ async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies(
     drop(reconsider);
     drop(writer.try_recv().unwrap());
 
-    state
-        .optimistic_relay_invalidated_parents
-        .lock()
-        .unwrap()
-        .insert(block::Hash([99; 32]), 1);
+    let _invalidate_response = state.send_invalidate_block(block::Hash([99; 32]));
+    let invalidate = writer.try_recv().unwrap();
     let (sibling, _response) = queue(&mut state, 4, true);
     assert!(sibling.wait().await);
     assert!(
         !sibling.optimistic_relay_authorized(),
         "invalidation need not name the immediate parent"
     );
+    drop(invalidate);
     drop(writer.try_recv().unwrap());
-    state
-        .optimistic_relay_invalidated_parents
-        .lock()
-        .unwrap()
-        .clear();
+
+    let (sibling, _response) = queue(&mut state, 7, true);
+    assert!(sibling.wait().await);
+    assert!(
+        sibling.optimistic_relay_authorized(),
+        "a published invalidation releases its write slot, so relay is authorized again"
+    );
+    drop(writer.try_recv().unwrap());
 
     let capacity = state
         .non_finalized_write_slots

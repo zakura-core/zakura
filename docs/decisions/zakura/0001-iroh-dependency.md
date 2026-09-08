@@ -58,23 +58,41 @@ address-lookup cache. `ZakuraTestNodeBuilder::transport` now accepts a complete
 `QuicTransportConfig` instead of a closure mutating the old transport type.
 These exposed Rust API changes require normal downstream compatibility review.
 
+## Rolling compatibility
+
+The native transport now requires Zakura protocol 2 and ALPN `p2p-v2/2`.
+Both the legacy upgrade prelude and native discovery advertise only protocol 2.
+A process probe against Iroh 0.92 completed in one mixed dialing direction but
+timed out in the other; same-version pairs succeeded. This is insufficient for
+a reliable rolling native upgrade, so protocol 1 is not offered by this cohort.
+The existing prelude and control encoding versions remain unchanged.
+
+Old and upgraded dual-stack nodes reject the native upgrade before handing off
+TCP and retain legacy connectivity. Independently built old/new process tests
+verify two Ping/Pong exchanges in both dialing directions with no native session
+registered. Native-only nodes in different cohorts cannot communicate. They
+need reachable same-cohort seeds and a coordinated upgrade; a protocol bump does
+not supply them with a legacy fallback.
+
 ## Validation and release gate
 
-The native process probe in `testkit/interop.rs` runs in two independently built
-network test binaries. `scripts/test_iroh_interop.py` checks old-old, new-new and
-both mixed dialing directions, using the production native control handshake
-and delivery of 1 MiB across bounded gossip frames. It is an ignored test because
-it requires an externally coordinated peer process. Both binaries must include
-the same probe, adapting only Iroh's renamed address/identity APIs on the old
-revision. The runner requires successful payload verification, not just a
-completed QUIC handshake.
+The native process probe in `testkit/interop.rs` runs in independently built
+network test binaries. `scripts/test_iroh_interop.py --expect-mixed-rejection`
+checks successful old-old and new-new payload delivery and bounded failure in
+both mixed native directions. Each successful pair uses the production native
+control handshake and checks 1 MiB across bounded gossip frames. With `--mode legacy`, the runner instead executes the ignored legacy handshake probe in both
+mixed directions and requires successful Ping/Pong completion. These tests are
+ignored because they require an externally coordinated peer process. Both
+binaries must include the same probes, adapting only the renamed Iroh APIs on
+the old revision and assigning ephemeral native ports to test endpoints.
 
-This probe complements the local network tests for identity persistence,
-per-IP admission, decoy addresses, legacy handoff/recovery, cancellation,
-framing and block sync. It does not replace independently pinned full-node
-sync/propagation tests, Linux impairment tests or an authorized mixed-cohort
-Testnet soak. No protocol version change should be inferred solely from the
-Iroh version number; use the actual compatibility results.
+The large bidirectional transfer regression sends 64 MiB each way with production
+transport limits, exceeding the send and receive windows. The exact noq 1.2.0
+`tail_loss_respect_max_datagrams` regression passes on macOS and Linux. Local
+workspace tests also cover identity persistence, per-IP admission, decoy
+addresses, legacy handoff/recovery, cancellation, framing and block sync.
+These checks do not replace independently pinned full-node sync/propagation
+tests, Linux impairment tests or an authorized mixed-cohort Testnet soak.
 
 Root Cargo patches are not inherited by library consumers and are not a
 registry distribution strategy. The existing crate publish-graph and release
@@ -83,3 +101,7 @@ no packages are created or published to crates.io. A registry-compatible
 upstream release or separately approved publication strategy is required before
 release readiness. Retire the fork when the upstream dependency graph resolves
 and passes the same interoperability checks.
+
+The Git source also needs explicit cargo-vet policy and audit coverage. Existing
+release and supply-chain checks remain enabled; passing cargo-deny does not
+satisfy cargo-vet or constitute a cryptographic audit.

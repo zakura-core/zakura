@@ -64,7 +64,7 @@ use crate::{
         ZakuraUpgradeDialStart, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
         FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
         TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        ZAKURA_PROTOCOL_VERSION_1, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        ZAKURA_PROTOCOL_VERSION_CURRENT, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 
@@ -1920,7 +1920,7 @@ pub(crate) fn service_registry(
     ))
 }
 
-/// Iroh protocol handler for the Zakura `p2p-v2/1` ALPN.
+/// Iroh protocol handler for the Zakura `p2p-v2/2` ALPN.
 #[derive(Debug, Clone)]
 pub struct ZakuraProtocolHandler {
     supervisor: ZakuraSupervisorHandle,
@@ -2211,7 +2211,7 @@ impl ZakuraProtocolHandler {
         let expected = ZakuraControlValidation {
             local: &handshake_config,
             authenticated_remote_id: remote_peer_id.as_bytes(),
-            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_1,
+            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
             handshake_path: ZakuraHandshakePath::Native,
             remote_role: ZakuraControlRole::Initiator,
             initiator_upgrade_nonce: [0; 32],
@@ -3889,7 +3889,7 @@ async fn run_native_initiator_handshake(
     let hello = ZakuraControlHello {
         magic: CONTROL_HELLO_MAGIC,
         control_version: CONTROL_VERSION,
-        selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_1,
+        selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
         handshake_path: ZakuraHandshakePath::Native,
         role: ZakuraControlRole::Initiator,
         network_id: handshake_config.network_id,
@@ -3913,7 +3913,7 @@ async fn run_native_initiator_handshake(
     .await?;
     let ack = ZakuraControlAck::decode(&ack_bytes)?;
     ack.validate(
-        ZAKURA_PROTOCOL_VERSION_1,
+        ZAKURA_PROTOCOL_VERSION_CURRENT,
         local_nonce,
         ack.peer_nonce,
         &limits.initial_limits(),
@@ -5425,6 +5425,7 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    mod quic_progress;
     use super::*;
     use crate::{
         protocol::internal::{InventoryResponse, Response},

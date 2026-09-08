@@ -4759,8 +4759,8 @@ mod tests {
             expected_network_id: ZakuraNetworkId::Regtest,
             expected_chain_id: CHAIN_ID,
             current_unix_secs: NOW,
-            supported_protocol_min: 1,
-            supported_protocol_max: 1,
+            supported_protocol_min: crate::zakura::ZAKURA_PROTOCOL_VERSION_CURRENT,
+            supported_protocol_max: crate::zakura::ZAKURA_PROTOCOL_VERSION_CURRENT,
             max_record_ttl: Duration::from_secs(24 * 60 * 60),
             clock_skew_tolerance: Duration::from_secs(300),
         }
@@ -4781,8 +4781,8 @@ mod tests {
                 ZakuraServiceId::legacy_gossip(),
                 ZakuraServiceId::legacy_requests(),
             ],
-            zakura_protocol_min: 1,
-            zakura_protocol_max: 1,
+            zakura_protocol_min: crate::zakura::ZAKURA_PROTOCOL_VERSION_CURRENT,
+            zakura_protocol_max: crate::zakura::ZAKURA_PROTOCOL_VERSION_CURRENT,
             network_id: ZakuraNetworkId::Regtest,
             chain_id: CHAIN_ID,
             sequence: 42,
@@ -4959,8 +4959,8 @@ mod tests {
             secret_key,
             direct_addrs,
             services,
-            zakura_protocol_min: 1,
-            zakura_protocol_max: 1,
+            zakura_protocol_min: crate::zakura::ZAKURA_PROTOCOL_VERSION_CURRENT,
+            zakura_protocol_max: crate::zakura::ZAKURA_PROTOCOL_VERSION_CURRENT,
             network_id: ZakuraNetworkId::Regtest,
             chain_id: CHAIN_ID,
             last_authored_sequence: None,
@@ -5369,7 +5369,7 @@ mod tests {
             }),
             Box::new(|record, _context| record.body.services.push(service(9))),
             Box::new(|record, _context| record.body.zakura_protocol_min = 0),
-            Box::new(|record, _context| record.body.zakura_protocol_max = 2),
+            Box::new(|record, _context| record.body.zakura_protocol_max += 1),
             Box::new(|record, context| {
                 record.body.network_id = ZakuraNetworkId::Mainnet;
                 context.expected_network_id = ZakuraNetworkId::Mainnet;
@@ -5470,8 +5470,8 @@ mod tests {
         ));
 
         let mut incompatible_context = context();
-        incompatible_context.supported_protocol_min = 2;
-        incompatible_context.supported_protocol_max = 2;
+        incompatible_context.supported_protocol_min = 1;
+        incompatible_context.supported_protocol_max = 1;
         assert!(matches!(
             record.verify(&incompatible_context),
             Err(DiscoveryRecordError::IncompatibleProtocol)

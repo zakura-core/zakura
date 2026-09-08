@@ -299,6 +299,71 @@ async fn start_test_zakura_endpoint_with_registry() -> (crate::zakura::ZakuraEnd
     (endpoint, peer_registry)
 }
 
+/// Process driver proving different native cohorts retain useful legacy TCP.
+#[allow(clippy::print_stdout)] // Machine-readable protocol for the process runner.
+#[tokio::test]
+#[ignore = "requires a separately started peer process"]
+async fn legacy_process_peer() -> Result<(), BoxError> {
+    use std::{io::Write as _, time::Duration};
+    use tokio::net::{TcpListener, TcpStream};
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let remote = std::env::var("ZAKURA_INTEROP_PEER").ok();
+        TEST_ZAKURA_SECRET_KEY_COUNTER
+            .store(if remote.is_some() { 92 } else { 91 }, Ordering::Relaxed);
+        let (endpoint, registry) = start_test_zakura_endpoint_with_registry().await;
+        let (stream, connected_addr) = if let Some(remote) = remote.as_ref() {
+            let stream = TcpStream::connect(remote).await?;
+            let addr = ConnectedAddr::new_outbound_direct(stream.peer_addr()?.into());
+            (stream, addr)
+        } else {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            println!("ZAKURA_INTEROP_READY={}", listener.local_addr()?);
+            std::io::stdout().flush()?;
+            let (stream, addr) = listener.accept().await?;
+            (stream, ConnectedAddr::new_inbound_direct(addr.into()))
+        };
+        let (address_book_tx, _address_book_rx) = tokio::sync::mpsc::channel(8);
+        let mut counter = ActiveConnectionCounter::new_counter();
+        let handshake = test_handshake_with_connector(
+            test_config(P2pStack::Dual),
+            address_book_tx,
+            endpoint.connector(),
+            registry,
+        );
+        // A native handoff returns an error here. Different cohorts must retain a client.
+        let mut client = handshake
+            .oneshot(HandshakeRequest {
+                data_stream: stream,
+                connected_addr,
+                connection_tracker: counter.track_connection(),
+            })
+            .await?;
+        assert!(endpoint.supervisor().registered_ids().await.is_empty());
+        if remote.is_some() {
+            for nonce in [1234, 5678] {
+                let response = client
+                    .ready()
+                    .await?
+                    .call(Request::Ping(Nonce(nonce)))
+                    .await?;
+                assert!(matches!(response, Response::Pong(_)));
+            }
+        } else {
+            // Keep TCP alive until the runner confirms the other process received both pongs.
+            let finish = std::env::var("ZAKURA_INTEROP_FINISH")?;
+            while !std::path::Path::new(&finish).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        drop(client);
+        endpoint.shutdown().await;
+        println!("ZAKURA_INTEROP_OK");
+        Ok::<_, BoxError>(())
+    })
+    .await?
+}
+
 /// Two mutually P2P-v2-capable nodes with live Zakura endpoints should exchange
 /// the legacy upgrade prelude over the TCP stream, drop the legacy connection,
 /// and establish a real Zakura QUIC connection that registers on both ends.

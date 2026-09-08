@@ -4690,6 +4690,9 @@ async fn a_stale_request_does_not_erase_the_current_parent_withdrawals() {
     let mut rejections = rpc.gbt.template_rejections.subscribe();
     rpc.track_template_parent(current, &mut rejections)
         .expect("the current tip is tracked");
+    let withdrawal = rpc.wait_for_mining_template_withdrawal(Some("work"));
+    tokio::pin!(withdrawal);
+    assert!(futures::poll!(&mut withdrawal).is_pending());
     rpc.gbt
         .template_rejections
         .send_if_modified(|state| state.reject(current, "work"));
@@ -4708,6 +4711,15 @@ async fn a_stale_request_does_not_erase_the_current_parent_withdrawals() {
         .expect("the current tip is still tracked");
     assert_eq!(tracked.parent, Some(current));
     assert!(tracked.contains("work"));
+
+    tip_sender.send_best_tip_hash(stale);
+    rpc.track_template_parent(stale, &mut rejections)
+        .expect("the new tip is tracked");
+    assert!(!rpc.mining_template_withdrawn("work"));
+    assert!(
+        futures::poll!(&mut withdrawal).is_ready(),
+        "a parent change must not erase a rejection the waiter has not read",
+    );
 }
 
 /// A preparation deadline classifies the cost; it does not stop the computation.

@@ -1403,8 +1403,16 @@ where
             return std::future::pending().await;
         };
         let mut rejections = self.gbt.template_rejections.subscribe();
+        let revision = rejections.borrow().revision;
         loop {
-            if rejections.borrow_and_update().withdrawn(work_id) {
+            let withdrawn = {
+                let state = rejections.borrow_and_update();
+                // A parent change can clear a rejection before this waiter observes it.
+                // Keep the revision so clearing the work sets cannot erase that notification.
+                state.withdrawn(work_id)
+                    || (state.revision != revision && !state.is_prepared(work_id))
+            };
+            if withdrawn {
                 return;
             }
             if rejections.changed().await.is_err() {
@@ -3450,6 +3458,8 @@ where
             let verification_result = tokio::select! {
                 biased;
 
+                // Observe a completed commit before advertising its pending body.
+                result = &mut verification => result,
                 admitted = admission.wait() => {
                     metrics::histogram!("mining.state_admission.duration_seconds")
                         .record(admission_start.elapsed().as_secs_f64());
@@ -3472,7 +3482,6 @@ where
                     }
                     verification.await
                 },
-                result = &mut verification => result,
             };
 
             if let Some(registration) = pending_registration {

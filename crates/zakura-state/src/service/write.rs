@@ -64,7 +64,9 @@ mod vct_authentication_sweep;
 mod vct_write_retry;
 
 use vct_authentication_sweep::VctAuthenticationSweeper;
-use vct_write_retry::{VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager};
+use vct_write_retry::{
+    VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager, VctWriteRetryWait,
+};
 pub use zakura_header_chain::{VctRootRepairState, VctRootRepairStatus};
 
 /// Classifies durable failure evidence as a new repair episode or an idempotent observation.
@@ -1894,10 +1896,15 @@ fn recover_resource_stall<M: HeaderChainMaintenance>(
     Ok(())
 }
 
+/// Apply one header-chain control message.
+///
+/// `Ok(true)` reports a durable commit. A refused, stale, resource-stalled, or no-change
+/// transition returns `Ok(false)`, so a parked checkpoint does not retry a prerequisite that did
+/// not change. `Err` returns a message that belongs to another writer phase.
 fn handle_header_chain_control_message(
     header_chain: Option<&HeaderChainWriter>,
     message: NonFinalizedWriteMessage,
-) -> Result<(), NonFinalizedWriteMessage> {
+) -> Result<bool, NonFinalizedWriteMessage> {
     match message {
         NonFinalizedWriteMessage::ApplyHeaderChainInsert { prepared, rsp_tx } => {
             let result = header_chain
@@ -1922,8 +1929,9 @@ fn handle_header_chain_control_message(
                         &context,
                     )
                 });
+            let committed = matches!(result, Ok(ApplyResult::Committed));
             let _ = rsp_tx.send(result);
-            Ok(())
+            Ok(committed)
         }
         NonFinalizedWriteMessage::RecordHeaderChainBodyUnavailable { prepared, rsp_tx }
         | NonFinalizedWriteMessage::RecordHeaderChainBodyInvalid { prepared, rsp_tx }
@@ -1931,17 +1939,101 @@ fn handle_header_chain_control_message(
             let result = header_chain
                 .ok_or(HeaderChainStoreError::Uninitialized)
                 .and_then(|writer| writer.apply_prepared_body_evidence(prepared));
+            let committed = matches!(result, Ok(ApplyResult::Committed));
             let _ = rsp_tx.send(result);
-            Ok(())
+            Ok(committed)
         }
         NonFinalizedWriteMessage::RetryHeaderChainBodyAvailability { prepared, rsp_tx } => {
             let result = header_chain
                 .ok_or(HeaderChainStoreError::Uninitialized)
                 .and_then(|writer| writer.retry_body_availability(prepared));
+            let committed = matches!(result, Ok(ApplyResult::Committed));
             let _ = rsp_tx.send(result);
-            Ok(())
+            Ok(committed)
         }
         message => Err(message),
+    }
+}
+
+/// Wait for a header-chain commit that can fill metadata for one parked checkpoint block.
+///
+/// The writer continues to apply header-chain control messages. It defers block-write messages
+/// in receive order. Any committed control transition can make the parked block retryable: an
+/// insertion can deliver the missing root, and body evidence can reselect a branch that already
+/// has one. A refused, stale, or no-change transition changes no prerequisite, so the writer
+/// keeps waiting instead of retrying the same block.
+///
+/// The writer also keeps resource-stall recovery reachable while it waits. The header engine
+/// short-circuits every insertion while the resource alarm is set, so a parked checkpoint that
+/// could not clear the alarm would wait for an insertion that can never commit.
+///
+/// The diagnostic deadline remains active while no commit arrives.
+fn wait_for_vct_root_insert(
+    receiver: &mut UnboundedReceiver<NonFinalizedWriteMessage>,
+    header_chain: Option<&HeaderChainWriter>,
+    deferred_messages: &mut VecDeque<NonFinalizedWriteMessage>,
+    deadline_runtime: &tokio::runtime::Runtime,
+    retry_manager: &mut VctWriteRetryManager,
+    last_resource_stall_recovery: &mut Option<StateVersion>,
+) -> Result<bool, HeaderChainStoreError> {
+    loop {
+        recover_resource_stall(header_chain, last_resource_stall_recovery)?;
+        let message = if let Some(wait) = retry_manager.stall_warning_remaining() {
+            match deadline_runtime
+                .block_on(async { tokio::time::timeout(wait, receiver.recv()).await })
+            {
+                Ok(message) => message,
+                Err(_) => {
+                    retry_manager.report_stall_if_due(VctWriteRetryCause::MissingRoot {
+                        trigger: VctRepairTrigger::MissingRootObserved,
+                    });
+                    continue;
+                }
+            }
+        } else {
+            receiver.blocking_recv()
+        };
+        let Some(message) = message else {
+            return Ok(false);
+        };
+        match handle_header_chain_control_message(header_chain, message) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(message) => deferred_messages.push_back(message),
+        }
+    }
+}
+
+/// Wait until one retry condition can change, or return the writer exit caused by the wait.
+fn wait_for_vct_retry(
+    wait: VctWriteRetryWait,
+    receiver: &mut UnboundedReceiver<NonFinalizedWriteMessage>,
+    header_chain: Option<&HeaderChainWriter>,
+    deferred_messages: &mut VecDeque<NonFinalizedWriteMessage>,
+    deadline_runtime: &tokio::runtime::Runtime,
+    retry_manager: &mut VctWriteRetryManager,
+    last_resource_stall_recovery: &mut Option<StateVersion>,
+) -> Option<BlockWriteTaskExit> {
+    let result = match wait {
+        VctWriteRetryWait::HeaderChainInsert => wait_for_vct_root_insert(
+            receiver,
+            header_chain,
+            deferred_messages,
+            deadline_runtime,
+            retry_manager,
+            last_resource_stall_recovery,
+        ),
+        VctWriteRetryWait::Delay(wait) => {
+            std::thread::park_timeout(wait);
+            Ok(true)
+        }
+    };
+    match result {
+        Ok(true) => None,
+        Ok(false) => Some(BlockWriteTaskExit::Completed),
+        Err(error) => Some(BlockWriteTaskExit::HeaderChainRuntimeFailed(
+            BlockWriteTaskFailure::runtime("VCT repair wait stopped the finalized writer", error),
+        )),
     }
 }
 
@@ -2031,6 +2123,9 @@ impl WriteBlockWorkerTask {
 
         // The retry manager parks checkpoint blocks that need VCT metadata repair.
         let mut vct_write_retry_manager = VctWriteRetryManager::new(vct_root_repair_sender.clone());
+        // The checkpoint phase runs its own resource-stall recovery while a block parks for VCT
+        // metadata. The non-finalized loop tracks the same coordinate separately.
+        let mut checkpoint_resource_stall_recovery = None;
         // The authentication sweeper verifies selected VCT metadata before block commit.
         let mut vct_authentication_sweeper = VctAuthenticationSweeper::default();
 
@@ -2140,7 +2235,17 @@ impl WriteBlockWorkerTask {
                             },
                             ordered_block,
                         );
-                        std::thread::park_timeout(wait);
+                        if let Some(exit) = wait_for_vct_retry(
+                            wait,
+                            non_finalized_block_write_receiver,
+                            header_chain.as_ref(),
+                            &mut deferred_non_finalized_messages,
+                            &deadline_runtime,
+                            &mut vct_write_retry_manager,
+                            &mut checkpoint_resource_stall_recovery,
+                        ) {
+                            return exit;
+                        }
                         continue;
                     }
                     Err(error) => {
@@ -2205,7 +2310,17 @@ impl WriteBlockWorkerTask {
                 );
                 let wait =
                     vct_write_retry_manager.on_retryable_error(height, retry_cause, ordered_block);
-                std::thread::park_timeout(wait);
+                if let Some(exit) = wait_for_vct_retry(
+                    wait,
+                    non_finalized_block_write_receiver,
+                    header_chain.as_ref(),
+                    &mut deferred_non_finalized_messages,
+                    &deadline_runtime,
+                    &mut vct_write_retry_manager,
+                    &mut checkpoint_resource_stall_recovery,
+                ) {
+                    return exit;
+                }
                 continue;
             }
 
@@ -2350,8 +2465,8 @@ impl WriteBlockWorkerTask {
                     // Retryable VCT root stalls park and retry the same block.
                     // The write loop does not reset the queue for these stalls.
                     // A later delivery of the same header range can fill an absent root.
-                    // Header sync does not request individual roots.
-                    // The write loop therefore polls absent-root stalls slowly.
+                    // Header sync repairs the missing selected range.
+                    // A completed header insertion wakes an absent-root stall.
                     // An await-successor stall waits only for state to store the next header.
                     // The write loop polls await-successor stalls faster.
                     if let Some(height) = error.vct_retryable_height() {
@@ -2372,7 +2487,17 @@ impl WriteBlockWorkerTask {
                             retry_cause,
                             ordered_block,
                         );
-                        std::thread::park_timeout(wait);
+                        if let Some(exit) = wait_for_vct_retry(
+                            wait,
+                            non_finalized_block_write_receiver,
+                            header_chain.as_ref(),
+                            &mut deferred_non_finalized_messages,
+                            &deadline_runtime,
+                            &mut vct_write_retry_manager,
+                            &mut checkpoint_resource_stall_recovery,
+                        ) {
+                            return exit;
+                        }
                         continue;
                     }
 

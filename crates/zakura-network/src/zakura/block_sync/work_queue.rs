@@ -799,9 +799,8 @@ impl WorkQueue {
     /// `floor` is the caller's mirror of the download floor; the queue's own floor
     /// wins when the mirror lags, since heights at or below it are already GC'd.
     ///
-    /// O(1) in the gap-free case: `pending`/`in_flight` are disjoint, so once the
-    /// lowest claimed height is known to be `anchor + 1`, the claimed set spans
-    /// `(anchor, max_claimed]` contiguously exactly when its size equals that span.
+    /// O(1) when the claimed range is contiguous and covers `anchor + 1`, even
+    /// when downloaded entries below the caller's floor still await commit.
     /// Only a real gap pays for the merge walk, which stops at the first hole.
     pub(super) fn first_unclaimed_above(&self, floor: block::Height) -> Option<block::Height> {
         let inner = self.lock();
@@ -818,13 +817,9 @@ impl WorkQueue {
             return Some(start);
         };
 
-        // The length check only decides contiguity when *every* key is above the
-        // anchor, so it is gated on the lowest claimed height being `start` itself.
-        // Entries at or below the anchor otherwise inflate the count and make a
-        // sparse range look contiguous: a forward `reset_above` pins the floor and
-        // pops only the `> floor` suffix, so it leaves the whole
-        // `(old_floor, new_floor]` prefix claimed at or below the new floor. A
-        // lagging caller `floor` mirror is excluded the same way.
+        // The maps are disjoint, so their combined length proves contiguity only
+        // against the complete [min_claimed, max_claimed] span. Comparing against
+        // the shorter above-floor span would let retained entries hide holes.
         let min_claimed = match (
             inner.pending.keys().next().copied(),
             inner.in_flight.keys().next().copied(),
@@ -832,9 +827,10 @@ impl WorkQueue {
             (Some(left), Some(right)) => Some(left.min(right)),
             (single, None) | (None, single) => single,
         };
-        if min_claimed == Some(start) {
-            let span = u64::from(max_claimed.0 - anchor.0);
-            let claimed = inner.pending.len().saturating_add(inner.in_flight.len()) as u64;
+        if let Some(min_claimed) = min_claimed.filter(|min| *min <= start) {
+            let span = u64::from(max_claimed.0 - min_claimed.0) + 1;
+            let claimed = u64::try_from(inner.pending.len().saturating_add(inner.in_flight.len()))
+                .expect("claimed entry counts fit u64 on supported targets");
             if claimed == span {
                 return max_claimed.next().ok();
             }

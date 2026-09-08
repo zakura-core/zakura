@@ -2291,6 +2291,67 @@ fn work_queue_first_unclaimed_above_ignores_entries_retained_at_or_below_a_forwa
 }
 
 #[test]
+fn work_queue_first_unclaimed_above_handles_downloads_ahead_of_commits() {
+    let queue = work_queue_with(
+        5,
+        (6..=4_005).map(|height| needed(height, BlockSizeEstimate::Advertised(100))),
+    );
+    queue.take_in_range(block::Height(6), block::Height(2_005), 2_000);
+    assert_eq!(
+        queue.first_unclaimed_above(block::Height(1_005)),
+        Some(block::Height(4_006)),
+    );
+    queue.advance_floor(block::Height(505));
+    assert_eq!(
+        queue.first_unclaimed_above(block::Height(1_005)),
+        Some(block::Height(4_006)),
+    );
+
+    let last = block::Height::MAX;
+    let queue = work_queue_with(
+        last.0 - 2,
+        [
+            needed(last.0 - 1, BlockSizeEstimate::Advertised(100)),
+            needed(last.0, BlockSizeEstimate::Advertised(100)),
+        ],
+    );
+    assert_eq!(queue.first_unclaimed_above(block::Height(last.0 - 1)), None);
+    assert_eq!(queue.first_unclaimed_above(last), None);
+}
+
+proptest::proptest! {
+    #[test]
+    fn work_queue_first_unclaimed_above_matches_claimed_set(
+        claimed in proptest::collection::btree_set(6u32..128, 0..64),
+        caller_floor in 0u32..140,
+        reset_floor in proptest::option::of(5u32..80),
+        refill in proptest::collection::btree_set(6u32..128, 0..64),
+    ) {
+        let queue = work_queue_with(
+            5,
+            claimed.iter().map(|height| needed(*height, BlockSizeEstimate::Advertised(100))),
+        );
+        queue.take_in_range(block::Height(6), block::Height(90), 12);
+        let mut expected_claims = claimed;
+        let mut queue_floor = 5;
+        if let Some(reset_floor) = reset_floor {
+            queue.reset_above(block::Height(reset_floor));
+            queue_floor = reset_floor;
+            expected_claims.retain(|height| *height <= reset_floor);
+        }
+        queue.extend(
+            test_work_scope(),
+            refill.iter().map(|height| needed(*height, BlockSizeEstimate::Advertised(100))),
+        );
+        expected_claims.extend(refill.into_iter().filter(|height| *height > queue_floor));
+        let expected = ((caller_floor.max(queue_floor) + 1)..)
+            .find(|height| !expected_claims.contains(height))
+            .map(block::Height);
+        prop_assert_eq!(queue.first_unclaimed_above(block::Height(caller_floor)), expected);
+    }
+}
+
+#[test]
 fn work_queue_take_respects_servable_range_contiguity_and_max() {
     // Heights 10,11,12 then a gap then 20,21.
     let queue = work_queue_with(

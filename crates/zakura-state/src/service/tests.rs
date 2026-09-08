@@ -32,9 +32,10 @@ use crate::{
         StateService,
     },
     tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
-    BoxError, CheckpointVerifiedBlock, CommitBlockError, Config, HistoricalTreeUnavailable,
-    PruningConfig, Request, Response, SemanticallyVerifiedBlock, StateInitError, StorageMode,
-    CHAIN_TIP_UPDATE_WAIT_LIMIT, MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    BlockAdmission, BoxError, CheckpointVerifiedBlock, CommitBlockError, Config,
+    HistoricalTreeUnavailable, PruningConfig, Request, Response, SemanticallyVerifiedBlock,
+    StateInitError, StorageMode, ValidateContextError, CHAIN_TIP_UPDATE_WAIT_LIMIT,
+    MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
@@ -81,6 +82,448 @@ fn block_range_response_includes_a_maximum_size_first_block() {
     assert_eq!(result, vec![(Height(10), Height(10), maximum)]);
 }
 
+#[test]
+fn mined_orphans_finish_without_entering_the_sync_queue() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let runtime = Runtime::new().expect("the Tokio runtime starts");
+    let (mut state_service, _, _, _) = runtime
+        .block_on(StateService::new(
+            Config::ephemeral(),
+            &network,
+            Height::MAX,
+            0,
+        ))
+        .expect("ephemeral state initialization succeeds");
+    let block = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("the mainnet height-one block is valid"),
+    )
+    .prepare();
+
+    for _ in 0..2 {
+        let admission = BlockAdmission::pending();
+        let response = state_service
+            .queue_and_commit_to_non_finalized_state(block.clone(), Some(admission.clone()));
+        assert!(!runtime.block_on(admission.wait()));
+        assert!(response
+            .blocking_recv()
+            .expect("state responds immediately")
+            .is_err());
+        assert!(state_service
+            .non_finalized_state_queued_blocks
+            .get_mut(&block.hash)
+            .is_none());
+    }
+
+    let mut response = state_service.queue_and_commit_to_non_finalized_state(block.clone(), None);
+    assert!(matches!(
+        response.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(state_service
+        .non_finalized_state_queued_blocks
+        .get_mut(&block.hash)
+        .is_some());
+}
+
+fn prepared_relay_test_state() -> (
+    Network,
+    super::finalized_state::FinalizedState,
+    super::non_finalized_state::NonFinalizedState,
+    Arc<Block>,
+) {
+    use crate::tests::FakeChainHelper;
+
+    let network = Network::Mainnet;
+    let heartwood_height = NetworkUpgrade::Heartwood
+        .activation_height(&network)
+        .expect("Heartwood activates")
+        .0;
+    let root = Arc::new(
+        network.block_map()[&(heartwood_height - 1)]
+            .zcash_deserialize_into::<Block>()
+            .expect("pre-Heartwood test block is valid"),
+    );
+    let finalized = super::finalized_state::FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("ephemeral finalized state opens");
+    let mut non_finalized = super::non_finalized_state::NonFinalizedState::new(&network);
+    non_finalized
+        .commit_new_chain(root.clone().prepare(), &finalized)
+        .expect("root commits");
+    let activation = root.make_fake_child().set_block_commitment([0; 32]);
+    non_finalized
+        .commit_block(activation.clone().prepare(), &finalized)
+        .expect("Heartwood activation commits");
+    let sibling_commitment: [u8; 32] = non_finalized
+        .best_chain()
+        .expect("activation chain exists")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("activation creates a history root")
+        .into();
+    let best = activation
+        .make_fake_child()
+        .set_block_commitment(sibling_commitment)
+        .set_work(100);
+    let side = activation
+        .make_fake_child()
+        .set_block_commitment(sibling_commitment)
+        .set_work(50);
+    non_finalized
+        .commit_block(best.prepare(), &finalized)
+        .expect("best child commits");
+    non_finalized
+        .commit_block(side.clone().prepare(), &finalized)
+        .expect("side child commits");
+
+    (network, finalized, non_finalized, side)
+}
+
+fn prepared_relay_difficulty_context() -> (
+    Network,
+    super::finalized_state::FinalizedState,
+    super::non_finalized_state::NonFinalizedState,
+    Arc<Block>,
+) {
+    use crate::tests::FakeChainHelper;
+    use zakura_header_chain::POW_ADJUSTMENT_BLOCK_SPAN;
+
+    let network = Network::Mainnet;
+    let heartwood_height = NetworkUpgrade::Heartwood
+        .activation_height(&network)
+        .expect("Heartwood activates")
+        .0;
+    let root = Arc::new(
+        network.block_map()[&(heartwood_height - 1)]
+            .zcash_deserialize_into::<Block>()
+            .expect("pre-Heartwood test block is valid"),
+    );
+    let finalized = super::finalized_state::FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("ephemeral finalized state opens");
+    let mut non_finalized = super::non_finalized_state::NonFinalizedState::new(&network);
+    non_finalized
+        .commit_new_chain(root.clone().prepare(), &finalized)
+        .expect("root commits");
+    let mut tip = root;
+    for context_index in 0..POW_ADJUSTMENT_BLOCK_SPAN {
+        let commitment = if context_index == 0 {
+            [0; 32]
+        } else {
+            non_finalized
+                .best_chain()
+                .expect("the context chain exists")
+                .history_block_commitment_tree()
+                .hash()
+                .expect("the context chain has a history root")
+                .into()
+        };
+        let mut child = tip.make_fake_child().set_block_commitment(commitment);
+        let child_height = child.coinbase_height().expect("the child has a height");
+        Arc::make_mut(&mut Arc::make_mut(&mut child).header).time =
+            tip.header.time + NetworkUpgrade::target_spacing_for_height(&network, child_height);
+        non_finalized
+            .commit_block(child.clone().prepare(), &finalized)
+            .expect("difficulty context block commits");
+        tip = child;
+    }
+
+    (network, finalized, non_finalized, tip)
+}
+
+#[test]
+fn prepared_relay_preflight_authorizes_a_selected_tip_child() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, _) = prepared_relay_test_state();
+    let best = non_finalized
+        .best_tip_block()
+        .expect("the test state has a best tip")
+        .block
+        .clone();
+    let commitment: [u8; 32] = non_finalized
+        .best_chain()
+        .expect("the best chain exists")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the best chain has a history root")
+        .into();
+    let child = best.make_fake_child().set_block_commitment(commitment);
+
+    let eligibility = super::check_prepared_mined_relay_eligibility_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect("the selected tip child passes the relay preflight");
+
+    assert_eq!(
+        eligibility,
+        crate::PreparedMinedRelayEligibility::Authorized
+    );
+}
+
+#[test]
+fn prepared_relay_preflight_uses_commit_first_for_a_side_chain() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, side) = prepared_relay_test_state();
+    let parent_hash = side.hash();
+    let parent_chain = non_finalized
+        .find_chain(|chain| chain.contains_block_hash(parent_hash))
+        .expect("side parent chain exists");
+    let history_tree =
+        super::read::tree::history_tree(Some(parent_chain), &finalized.db, parent_hash.into())
+            .expect("side parent has a history tree");
+    let commitment: [u8; 32] = history_tree
+        .hash()
+        .expect("the side chain has a history root")
+        .into();
+    let child = side.make_fake_child().set_block_commitment(commitment);
+
+    let eligibility = super::check_prepared_mined_relay_eligibility_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect("the side-chain child proves its expected work");
+
+    assert_eq!(
+        eligibility,
+        crate::PreparedMinedRelayEligibility::CommitFirst
+    );
+}
+
+#[test]
+fn prepared_relay_preflight_rejects_an_easier_claimed_target() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, tip) = prepared_relay_difficulty_context();
+    let commitment: [u8; 32] = non_finalized
+        .best_chain()
+        .expect("the best chain exists")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the best chain has a history root")
+        .into();
+    let mut child = tip
+        .make_fake_child()
+        .set_block_commitment(commitment)
+        .set_work(1);
+    let child_height = child.coinbase_height().expect("the child has a height");
+    Arc::make_mut(&mut Arc::make_mut(&mut child).header).time =
+        tip.header.time + NetworkUpgrade::target_spacing_for_height(&network, child_height);
+
+    let error = super::check_prepared_mined_relay_eligibility_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect_err("an easier claimed target fails the relay preflight");
+
+    assert!(matches!(
+        error.downcast_ref::<ValidateContextError>(),
+        Some(ValidateContextError::InvalidDifficultyThreshold { .. })
+    ));
+}
+
+#[test]
+fn prepared_relay_preflight_rejects_time_at_or_below_median() {
+    use crate::tests::FakeChainHelper;
+    use zakura_header_chain::{AdjustedDifficulty, POW_ADJUSTMENT_BLOCK_SPAN};
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, tip) = prepared_relay_difficulty_context();
+    let commitment: [u8; 32] = non_finalized
+        .best_chain()
+        .expect("the best chain exists")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the best chain has a history root")
+        .into();
+    let parent_hash = tip.hash();
+    let mut child = tip.make_fake_child().set_block_commitment(commitment);
+    let too_early = super::any_ancestor_blocks(&non_finalized, &finalized.db, parent_hash)
+        .take(11)
+        .last()
+        .expect("the context has a median-time window")
+        .header
+        .time;
+    Arc::make_mut(&mut Arc::make_mut(&mut child).header).time = too_early;
+    let relevant_data = super::any_ancestor_blocks(&non_finalized, &finalized.db, parent_hash)
+        .take(POW_ADJUSTMENT_BLOCK_SPAN)
+        .map(|block| (block.header.difficulty_threshold, block.header.time));
+    let expected_target = AdjustedDifficulty::new_from_block(&child, &network, relevant_data)
+        .expect("the context derives an expected target")
+        .expected_difficulty_threshold();
+    Arc::make_mut(&mut Arc::make_mut(&mut child).header).difficulty_threshold = expected_target;
+
+    let error = super::check_prepared_mined_relay_eligibility_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect_err("a time at or below median-time-past fails the relay preflight");
+
+    assert!(matches!(
+        error.downcast_ref::<ValidateContextError>(),
+        Some(ValidateContextError::TimeTooEarly { .. })
+    ));
+}
+
+#[test]
+fn prepared_relay_preflight_rejects_a_forged_commitment() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, side) = prepared_relay_test_state();
+    let child = side.make_fake_child().set_block_commitment([0x42; 32]);
+
+    let error = super::check_prepared_mined_relay_eligibility_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect_err("a forged commitment fails the relay preflight");
+
+    assert!(matches!(
+        error.downcast_ref::<ValidateContextError>(),
+        Some(ValidateContextError::InvalidBlockCommitment(_))
+    ));
+}
+
+/// A full orphan queue must not strand the descendants that are waiting on the very block
+/// that would release them.
+///
+/// The bound only applies to blocks that must wait for an absent parent. When the queue is
+/// filled by descendants of a missing block `B`, `B` itself can extend the chain now, and
+/// rejecting it leaves its descendants indexed under a hash that no drain ever visits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+
+    // Rewrite the early mainnet coinbases as v4, so these blocks can reach the non-finalized
+    // state, and relink each block onto its rewritten parent.
+    let mut chain: Vec<Arc<Block>> = Vec::new();
+    for (_height, block_bytes) in zakura_test::vectors::MAINNET_BLOCKS.range(0..=2) {
+        let mut block = block_bytes
+            .zcash_deserialize_into::<Block>()
+            .expect("the mainnet block vector decodes");
+        block.transactions = vec![Arc::new(transaction_v4_from_coinbase(
+            &block.transactions[0],
+        ))];
+        if let Some(parent) = chain.last() {
+            Arc::make_mut(&mut block.header).previous_block_hash = parent.hash();
+        }
+        chain.push(Arc::new(block));
+    }
+
+    let (mut state_service, _, _, _) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
+
+    // Commit the first two blocks as checkpoint verified blocks, so the finalized tip becomes a
+    // parent that `can_fork_chain_at` accepts.
+    for block in &chain[0..=1] {
+        let result = state_service
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .await;
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "the checkpoint verified block commits: {result:?}",
+        );
+    }
+
+    // `child` extends the finalized tip, so it can be committed as soon as it is queued.
+    // `grandchild` can only be released by `child`.
+    let child = chain[2].clone().prepare();
+    assert_eq!(child.block.header.previous_block_hash, chain[1].hash());
+
+    let mut grandchild_block = (*child.block).clone();
+    Arc::make_mut(&mut grandchild_block.header).previous_block_hash = child.hash;
+    let grandchild = Arc::new(grandchild_block).prepare();
+    let (grandchild_tx, _grandchild_rx) = tokio::sync::oneshot::channel();
+    state_service.non_finalized_state_queued_blocks.queue((
+        grandchild.clone(),
+        grandchild_tx,
+        None,
+    ));
+
+    // Fill the rest of the queue with blocks whose parents this state will never have.
+    let mut orphan_count = 0_u64;
+    while !state_service.non_finalized_state_queued_blocks.is_full() {
+        let mut orphan_block = (*child.block).clone();
+        Arc::make_mut(&mut orphan_block.header)
+            .previous_block_hash
+            .0[..8]
+            .copy_from_slice(&orphan_count.to_le_bytes());
+        let (orphan_tx, _orphan_rx) = tokio::sync::oneshot::channel();
+        state_service.non_finalized_state_queued_blocks.queue((
+            Arc::new(orphan_block).prepare(),
+            orphan_tx,
+            None,
+        ));
+        orphan_count += 1;
+    }
+    assert!(
+        orphan_count > 0,
+        "the queue reaches its bound through blocks with absent parents",
+    );
+
+    // The queue is full, but `child` extends the finalized tip, so it must still be admitted.
+    let admission = BlockAdmission::pending();
+    let _response = state_service
+        .queue_and_commit_to_non_finalized_state(child.clone(), Some(admission.clone()));
+
+    assert!(
+        state_service
+            .non_finalized_block_write_sent_hashes
+            .contains(&child.hash),
+        "a block whose parent is the finalized tip is sent for commit even when the queue is full",
+    );
+    assert!(
+        state_service
+            .non_finalized_block_write_sent_hashes
+            .contains(&grandchild.hash),
+        "the descendants waiting on that block are released with it",
+    );
+    assert!(
+        state_service
+            .non_finalized_state_queued_blocks
+            .get_mut(&grandchild.hash)
+            .is_none(),
+        "the released descendant leaves the queue",
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn descendant_arriving_after_a_local_parent_failure_completes_immediately() {
     let network = Network::Mainnet;
@@ -95,7 +538,7 @@ async fn descendant_arriving_after_a_local_parent_failure_completes_immediately(
     state.remember_failed_ancestor(ancestor, ancestor, NonFinalizedWriteFailureKind::Retryable);
 
     let response = state
-        .queue_and_commit_to_non_finalized_state(block.clone())
+        .queue_and_commit_to_non_finalized_state(block.clone(), None)
         .await
         .expect("the state keeps the response channel open")
         .expect_err("the failed parent prevents this request from waiting");
@@ -1255,7 +1698,8 @@ proptest! {
             let block_value_pool = &block.block.chain_value_pool_change(&transparent::utxos_from_ordered_utxos(utxos), None)?;
             expected_non_finalized_value_pool += *block_value_pool;
 
-            let result_receiver = state_service.queue_and_commit_to_non_finalized_state(block.clone());
+            let result_receiver =
+                state_service.queue_and_commit_to_non_finalized_state(block.clone(), None);
             let result = result_receiver.blocking_recv();
 
             prop_assert!(result.is_ok(), "unexpected failed non-finalized block commit: {:?}", result);
@@ -1348,7 +1792,8 @@ proptest! {
             // every non-finalized block (height >= 1) grows the chain.
             let expected_action = TipAction::grow_with(expected_block.clone().into());
 
-            let result_receiver = state_service.queue_and_commit_to_non_finalized_state(block);
+            let result_receiver =
+                state_service.queue_and_commit_to_non_finalized_state(block, None);
             let result = result_receiver.blocking_recv();
 
             prop_assert!(result.is_ok(), "unexpected failed non-finalized block commit: {:?}", result);
@@ -1555,4 +2000,260 @@ fn read_only_open_with_malformed_version_returns_typed_error() {
         Err(other) => panic!("expected DatabaseFormatVersion, got: {other:?}"),
         Ok(_) => panic!("expected malformed state version to fail closed"),
     }
+}
+
+/// Optimistic relay reservations must not accumulate for the lifetime of the process.
+///
+/// Every optimistically relayed block reserves its parent's slot. A reservation is only read
+/// while its parent is the best tip, so once the reserving candidate is finalized the entry is
+/// unreachable and has to go.
+#[tokio::test(flavor = "multi_thread")]
+async fn finalized_optimistic_relay_reservations_are_pruned() {
+    let network = Network::Mainnet;
+    let (mut state, _read, _tip, _height) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("an ephemeral state service is created");
+
+    let buried = block::Hash([1; 32]);
+    let at_the_tip = block::Hash([2; 32]);
+    let above_the_tip = block::Hash([3; 32]);
+
+    state
+        .optimistic_relay_reserved_parents
+        .insert(buried, Height(9));
+    state
+        .optimistic_relay_reserved_parents
+        .insert(at_the_tip, Height(10));
+    state
+        .optimistic_relay_reserved_parents
+        .insert(above_the_tip, Height(11));
+
+    state.prune_optimistic_relay_reservations(Height(10));
+
+    assert_eq!(
+        state
+            .optimistic_relay_reserved_parents
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![above_the_tip],
+        "only a reservation above the finalized tip can still be consulted",
+    );
+}
+
+/// An invalidated parent stays ineligible for optimistic relay until the writer confirms that
+/// the same invalidation was reconsidered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconsidered_parent_becomes_eligible_for_optimistic_relay_again() {
+    let network = Network::Mainnet;
+    let (state, _read, _tip, _height) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("an ephemeral state service is created");
+
+    let parent = block::Hash([7; 32]);
+    let invalidated = state.optimistic_relay_invalidated_parents.clone();
+
+    assert!(
+        !state.optimistic_relay_is_blocked_by_invalidation(),
+        "a parent nobody invalidated can authorize optimistic relay",
+    );
+
+    *invalidated
+        .lock()
+        .expect("the invalidation map is not poisoned")
+        .entry(parent)
+        .or_default() += 1;
+    assert!(
+        state.optimistic_relay_is_blocked_by_invalidation(),
+        "an invalidated parent cannot authorize optimistic relay",
+    );
+
+    StateService::release_optimistic_relay_invalidation(&invalidated, parent);
+    assert!(
+        !state.optimistic_relay_is_blocked_by_invalidation(),
+        "a confirmed reconsideration releases the parent",
+    );
+    assert!(
+        invalidated
+            .lock()
+            .expect("the invalidation map is not poisoned")
+            .is_empty(),
+        "a released parent leaves no entry behind",
+    );
+
+    // A reconsideration that the writer never confirmed, or one for a hash this service never
+    // invalidated, must not underflow or resurrect an entry.
+    StateService::release_optimistic_relay_invalidation(&invalidated, parent);
+    assert!(!state.optimistic_relay_is_blocked_by_invalidation());
+
+    // An invalidation issued while a reconsideration is in flight stays in force when that
+    // reconsideration is confirmed.
+    let mut invalidated_parents = invalidated
+        .lock()
+        .expect("the invalidation map is not poisoned");
+    *invalidated_parents.entry(parent).or_default() += 1;
+    *invalidated_parents.entry(parent).or_default() += 1;
+    drop(invalidated_parents);
+
+    StateService::release_optimistic_relay_invalidation(&invalidated, parent);
+    assert!(
+        state.optimistic_relay_is_blocked_by_invalidation(),
+        "the later invalidation outlives the reconsideration it raced",
+    );
+}
+
+/// While checkpoint writes are in flight the queue bound is hard, even for a block that names
+/// the durable finalized tip.
+///
+/// The durable tip lags the last hash sent to the write task for as long as checkpoint writes are
+/// outstanding. Nothing drains a block queued under the lagging tip: it does not complete the
+/// handoff condition, and the eventual handoff walks forward from the last hash sent, not from
+/// the tip that was durable when the block arrived. Admitting it past the bound would let a
+/// caller grow the queue without limit for the length of the checkpoint sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_write_lag_does_not_open_the_orphan_queue_bound() {
+    let network = Network::Mainnet;
+    let (mut state, _read, _tip, _height) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("an ephemeral state service is created");
+
+    assert!(
+        state.block_write_sender.finalized.is_some(),
+        "the test starts while the write task still commits checkpoint blocks",
+    );
+
+    let durable_tip = state.read_service.db.finalized_tip_hash();
+
+    // The write task has been sent a later checkpoint block that is not durable yet.
+    state.finalized_block_write_last_sent_hash = block::Hash([9; 32]);
+
+    assert!(
+        !state.drains_the_non_finalized_queue_now(&durable_tip),
+        "a block naming the lagging durable tip is not drained, so the bound must reject it",
+    );
+    assert!(
+        !state.drains_the_non_finalized_queue_now(&block::Hash([9; 32])),
+        "a child of the last hash sent is not drained either until that write is durable",
+    );
+
+    // Once the write task catches up, a child of the last hash sent completes the handoff
+    // condition, and the handoff drains it on the same call.
+    state.finalized_block_write_last_sent_hash = durable_tip;
+    assert!(
+        state.drains_the_non_finalized_queue_now(&durable_tip),
+        "a child of a durably written last sent hash is drained by the handoff",
+    );
+    assert!(
+        !state.drains_the_non_finalized_queue_now(&block::Hash([9; 32])),
+        "any other parent is still not drained",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies() {
+    let _init_guard = zakura_test::init();
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("ephemeral state opens");
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    state
+        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis))
+        .await
+        .unwrap()
+        .unwrap();
+    let (sender, mut writer) = tokio::sync::mpsc::unbounded_channel();
+    state.block_write_sender.non_finalized = Some(sender);
+
+    let candidate: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let parent = candidate.header.previous_block_hash;
+    let queue = |state: &mut StateService, nonce: u8, optimistic: bool| {
+        let mut block = (*candidate).clone();
+        Arc::make_mut(&mut block.header).nonce.0[0] = nonce;
+        let admission = BlockAdmission::pending();
+        if optimistic {
+            admission.authorize_optimistic_relay();
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.non_finalized_state_queued_blocks.queue((
+            Arc::new(block).prepare(),
+            tx,
+            Some(admission.clone()),
+        ));
+        state.send_ready_non_finalized_queued(parent);
+        (admission, rx)
+    };
+
+    let (_, _first_response) = queue(&mut state, 1, false);
+    let first = writer.try_recv().unwrap();
+    let (sibling, _response) = queue(&mut state, 2, true);
+    assert!(sibling.wait().await);
+    assert!(
+        !sibling.optimistic_relay_authorized(),
+        "an ordinary earlier write can change the selected tip"
+    );
+    drop(first);
+    drop(writer.try_recv().unwrap());
+
+    let _reconsider_response = state.send_reconsider_block(block::Hash([99; 32]));
+    let reconsider = writer.try_recv().unwrap();
+    let (sibling, _response) = queue(&mut state, 3, true);
+    assert!(sibling.wait().await);
+    assert!(
+        !sibling.optimistic_relay_authorized(),
+        "reconsideration can restore a different best chain"
+    );
+    drop(reconsider);
+    drop(writer.try_recv().unwrap());
+
+    state
+        .optimistic_relay_invalidated_parents
+        .lock()
+        .unwrap()
+        .insert(block::Hash([99; 32]), 1);
+    let (sibling, _response) = queue(&mut state, 4, true);
+    assert!(sibling.wait().await);
+    assert!(
+        !sibling.optimistic_relay_authorized(),
+        "invalidation need not name the immediate parent"
+    );
+    drop(writer.try_recv().unwrap());
+    state
+        .optimistic_relay_invalidated_parents
+        .lock()
+        .unwrap()
+        .clear();
+
+    let capacity = state
+        .non_finalized_write_slots
+        .clone()
+        .try_acquire_many_owned(u32::try_from(super::queued_blocks::MAX_QUEUED_BLOCKS).unwrap())
+        .unwrap();
+    let (rejected, response) = queue(&mut state, 5, true);
+    assert!(!rejected.wait().await);
+    assert!(response.await.unwrap().is_err());
+    assert!(
+        writer.try_recv().is_err(),
+        "a full writer cannot retain another block body"
+    );
+    drop(capacity);
+
+    let (admitted, _response) = queue(&mut state, 6, true);
+    assert!(admitted.wait().await);
+    assert!(
+        admitted.optimistic_relay_authorized(),
+        "an idle writer and live selected parent permit relay"
+    );
+    drop(writer.try_recv().unwrap());
+    assert_eq!(
+        state.non_finalized_write_slots.available_permits(),
+        super::queued_blocks::MAX_QUEUED_BLOCKS
+    );
 }

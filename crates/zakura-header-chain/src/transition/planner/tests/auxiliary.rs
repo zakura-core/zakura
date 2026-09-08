@@ -990,6 +990,10 @@ fn auxiliary_outcomes_derive_from_exact_owned_observations() {
     assert!(authenticated.change_set.put_nodes.is_empty());
     assert!(authenticated.change_set.eligibility_changes.is_empty());
     assert_eq!(
+        authenticated.change_set.selected_projection,
+        ProjectionDelta::default()
+    );
+    assert_eq!(
         authenticated.change_set.metadata.frontiers,
         before.frontiers
     );

@@ -2753,7 +2753,7 @@ where
 
                 precomputed_coinbase = wait_for_new_tip => {
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
-                    let mempool_tx_deps = TransactionDependencies::default();
+                    let mempool_tx_deps = Default::default();
 
                     let server_long_poll_id = LongPollInput::new(
                         chain_info.tip_height,

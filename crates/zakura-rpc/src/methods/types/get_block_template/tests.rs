@@ -31,6 +31,7 @@ use super::MinerParams;
 fn transaction_templates_report_direct_dependency_indexes() {
     let mempool_txs: Vec<_> = Network::Mainnet
         .unmined_transactions_in_blocks(..)
+        .filter(|tx| !tx.transaction.transaction().is_coinbase())
         .take(4)
         .collect();
     assert_eq!(mempool_txs.len(), 4, "test vectors must contain four txs");

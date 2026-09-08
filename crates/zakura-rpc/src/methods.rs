@@ -1082,48 +1082,6 @@ where
         VersionString: ToString + Clone + Send + 'static,
         UserAgentString: ToString + Clone + Send + 'static,
     {
-        Self::new_with_pending_blocks(
-            network,
-            mining_config,
-            debug_force_finished_sync,
-            build_version,
-            user_agent,
-            mempool,
-            state,
-            read_state,
-            block_verifier_router,
-            sync_status,
-            latest_chain_tip,
-            address_book,
-            last_warn_error_log_rx,
-            mined_block_sender,
-            PendingBlockRegistry::default(),
-        )
-    }
-
-    /// Creates an RPC handler with a pending-block registry shared with peer serving.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_pending_blocks<VersionString, UserAgentString>(
-        network: Network,
-        mining_config: config::mining::Config,
-        debug_force_finished_sync: bool,
-        build_version: VersionString,
-        user_agent: UserAgentString,
-        mempool: Mempool,
-        state: State,
-        read_state: ReadState,
-        block_verifier_router: BlockVerifierRouter,
-        sync_status: SyncStatus,
-        latest_chain_tip: Tip,
-        address_book: AddressBook,
-        last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
-        pending_blocks: PendingBlockRegistry,
-    ) -> (Self, JoinHandle<()>)
-    where
-        VersionString: ToString + Clone + Send + 'static,
-        UserAgentString: ToString + Clone + Send + 'static,
-    {
         let (runner, queue_sender) = Queue::start();
 
         let mut build_version = build_version.to_string();
@@ -1134,13 +1092,12 @@ where
             build_version.insert(0, 'v');
         }
 
-        let gbt = GetBlockTemplateHandler::new_with_pending_blocks(
+        let gbt = GetBlockTemplateHandler::new(
             &network,
             mining_config.clone(),
             block_verifier_router,
             sync_status,
             mined_block_sender,
-            pending_blocks,
         );
 
         let rpc_impl = RpcImpl {
@@ -1382,6 +1339,12 @@ where
             }
             .in_current_span(),
         );
+    }
+
+    /// Shares one pending-block registry with peer serving.
+    pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
+        self.gbt.set_pending_blocks(pending_blocks);
+        self
     }
 
     /// Sets the end-of-support height reported by `getdeprecationinfo`.

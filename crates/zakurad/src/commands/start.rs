@@ -529,14 +529,16 @@ impl StartCmd {
             .load_shed()
             .buffer(inbound::downloads::MAX_INBOUND_CONCURRENCY)
             .timeout(MAX_INBOUND_RESPONSE_TIME)
-            .service(Inbound::new_with_pending_blocks(
-                config.sync.full_verify_concurrency_limit,
-                config.network.expose_peer_addresses,
-                zcashd_compat_pruning_retention,
-                zcashd_compat_block_gossip_peer_ips.clone(),
-                setup_rx,
-                pending_blocks.clone(),
-            ));
+            .service(
+                Inbound::new(
+                    config.sync.full_verify_concurrency_limit,
+                    config.network.expose_peer_addresses,
+                    zcashd_compat_pruning_retention,
+                    zcashd_compat_block_gossip_peer_ips.clone(),
+                    setup_rx,
+                )
+                .with_pending_blocks(pending_blocks.clone()),
+            );
 
         let advertised_services = Self::advertised_services(&config);
 
@@ -684,7 +686,7 @@ impl StartCmd {
         let submit_block_channel = SubmitBlockChannel::new();
 
         // Launch RPC server
-        let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new_with_pending_blocks(
+        let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new(
             config.network.network.clone(),
             config.mining.clone(),
             config.rpc.debug_force_finished_sync,
@@ -699,12 +701,13 @@ impl StartCmd {
             address_book.clone(),
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
-            pending_blocks,
         );
         node_tasks.track(&rpc_tx_queue_handle);
-        let rpc_impl = rpc_impl.with_end_of_support_height(
-            sync::end_of_support::end_of_support_height(&config.network.network),
-        );
+        let rpc_impl = rpc_impl
+            .with_pending_blocks(pending_blocks)
+            .with_end_of_support_height(sync::end_of_support::end_of_support_height(
+                &config.network.network,
+            ));
 
         let rpc_task_handle = if config.rpc.listen_addr.is_some() {
             RpcServer::start(rpc_impl.clone(), config.rpc.clone())

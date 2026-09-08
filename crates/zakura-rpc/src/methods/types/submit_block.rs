@@ -189,25 +189,15 @@ pub(crate) struct PendingBlockRegistration {
     registry: PendingBlockRegistry,
     hash: block::Hash,
     owner_id: u64,
+    /// A receiver for this registration's own entry, kept so `signal` needs no lookup.
+    receiver: watch::Receiver<PendingStatus>,
     resolved: bool,
 }
 
 impl PendingBlockRegistration {
     /// Returns a signal that cancels stale early inventory after commit failure.
     pub(crate) fn signal(&self) -> PendingBlockSignal {
-        let entries = self
-            .registry
-            .0
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let status = entries
-            .get(&self.hash)
-            .filter(|entry| entry.owner_id == self.owner_id)
-            .expect("registration owns its entry until it resolves")
-            .status
-            .subscribe();
-        PendingBlockSignal(status)
+        PendingBlockSignal(self.receiver.clone())
     }
 
     /// Resolves this registration and wakes its peer waiters.
@@ -245,12 +235,13 @@ impl PendingBlockRegistry {
         }
 
         let owner_id = self.0.next_owner_id.fetch_add(1, Ordering::Relaxed);
-        let (status, _receiver) = watch::channel(PendingStatus::Waiting);
+        let (status, receiver) = watch::channel(PendingStatus::Waiting);
         entries.insert(hash, PendingBlock { owner_id, status });
         Some(PendingBlockRegistration {
             registry: self.clone(),
             hash,
             owner_id,
+            receiver,
             resolved: false,
         })
     }

@@ -702,14 +702,15 @@ where
     BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
-    /// Creates a handler with a registry shared by RPC and peer serving.
-    pub fn new_with_pending_blocks(
+    /// Creates a handler with its own pending-block registry.
+    ///
+    /// Use [`Self::set_pending_blocks`] to share one registry with peer serving.
+    pub fn new(
         net: &Network,
         conf: config::mining::Config,
         block_verifier_router: BlockVerifierRouter,
         sync_status: SyncStatus,
         mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
-        pending_blocks: PendingBlockRegistry,
     ) -> Self {
         let optimistic_block_inventory = conf.optimistic_block_inventory;
         Self {
@@ -718,12 +719,17 @@ where
             sync_status,
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
-            pending_blocks,
+            pending_blocks: PendingBlockRegistry::default(),
             mined_submissions: Default::default(),
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
             template_rejections: watch::channel(TemplateRejections::default()).0,
         }
+    }
+
+    /// Shares one pending-block registry with peer serving.
+    pub(crate) fn set_pending_blocks(&mut self, pending_blocks: PendingBlockRegistry) {
+        self.pending_blocks = pending_blocks;
     }
 
     pub(crate) fn reserve_mined_submission(

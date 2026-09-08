@@ -379,25 +379,6 @@ impl Inbound {
         zcashd_compat_peer_ips: Vec<IpAddr>,
         setup: oneshot::Receiver<InboundSetupData>,
     ) -> Inbound {
-        Self::new_with_pending_blocks(
-            full_verify_concurrency_limit,
-            expose_peer_addresses,
-            zcashd_compat_pruning_retention,
-            zcashd_compat_peer_ips,
-            setup,
-            PendingBlockRegistry::default(),
-        )
-    }
-
-    /// Creates an inbound service with a pending-block registry shared with mining RPCs.
-    pub fn new_with_pending_blocks(
-        full_verify_concurrency_limit: usize,
-        expose_peer_addresses: bool,
-        zcashd_compat_pruning_retention: Option<u32>,
-        zcashd_compat_peer_ips: Vec<IpAddr>,
-        setup: oneshot::Receiver<InboundSetupData>,
-        pending_blocks: PendingBlockRegistry,
-    ) -> Inbound {
         Inbound {
             setup: Setup::Pending {
                 full_verify_concurrency_limit,
@@ -408,8 +389,14 @@ impl Inbound {
                 zcashd_compat_pruning_retention,
                 zcashd_compat_peer_ips,
             )),
-            pending_blocks,
+            pending_blocks: PendingBlockRegistry::default(),
         }
+    }
+
+    /// Shares one pending-block registry with the mining RPCs.
+    pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
+        self.pending_blocks = pending_blocks;
+        self
     }
 
     /// Remove `self.setup`, temporarily replacing it with an invalid state.

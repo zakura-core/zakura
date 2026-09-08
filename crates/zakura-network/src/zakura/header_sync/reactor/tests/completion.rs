@@ -83,6 +83,122 @@ fn empty_complete_response_requires_the_exact_height_qualified_ancestor() {
 }
 
 #[test]
+fn early_checkpoint_prefix_preserves_minimum_work_and_exact_branch_scope() {
+    let (reactor, _actions, mut snapshot, peer, _source, _owner) = peer_violation_fixture();
+    let mut active = reactor.peer_work_queue.active(&peer).unwrap().clone();
+    let entry = active.entries[0].clone();
+    for (count, expected) in [(1, false), (250, false), (400, false), (401, true)] {
+        active.entries = vec![entry.clone(); count];
+        assert_eq!(
+            HeaderSyncReactor::should_prepare_checkpoint_prefix(&snapshot, &active),
+            expected
+        );
+    }
+    snapshot.frontiers.header_best.height = block::Height(401);
+    active.common_ancestor = Some(snapshot.frontiers.header_best);
+    assert!(
+        !HeaderSyncReactor::should_prepare_checkpoint_prefix(&snapshot, &active),
+        "a checkpoint-sized body backlog already has enough work"
+    );
+    snapshot.frontiers.verified_best.height = block::Height(1);
+    assert!(HeaderSyncReactor::should_prepare_checkpoint_prefix(
+        &snapshot, &active
+    ));
+    active.common_ancestor = Some(snapshot.frontiers.finalized);
+    assert!(
+        !HeaderSyncReactor::should_prepare_checkpoint_prefix(&snapshot, &active),
+        "a competing branch cannot use the selected-extension shortcut"
+    );
+    active.common_ancestor = Some(snapshot.frontiers.header_best);
+    snapshot.mode = zakura_header_chain::EngineMode::HeadersOnly;
+    assert!(!HeaderSyncReactor::should_prepare_checkpoint_prefix(
+        &snapshot, &active
+    ));
+    snapshot.mode = zakura_header_chain::EngineMode::Integrated;
+    active.purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
+        selected_target: snapshot.frontiers.header_best,
+        repair_generation: 0,
+    };
+    assert!(
+        !HeaderSyncReactor::should_prepare_checkpoint_prefix(&snapshot, &active),
+        "auxiliary repair must complete its exact owned range"
+    );
+}
+
+#[test]
+fn requester_prepares_checkpoint_sized_extension_before_the_chunk_budget_fills() {
+    let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
+    let active = reactor.peer_work_queue.active_mut(&peer).unwrap();
+    active.phase = HeaderTargetPhase::Receiving;
+    active.entries.clear();
+    active.target.status.selected_tip_height = block::Height(10_000);
+    active.max_header_count = 250;
+    let mut parent = snapshot.frontiers.header_best.hash;
+    let mut entries = Vec::new();
+    for index in 0..500 {
+        let mut header = *regtest_genesis_block().header;
+        header.previous_block_hash = parent;
+        header.time += chrono::Duration::seconds(index + 1);
+        parent = header.hash();
+        entries.push(HeaderEntry {
+            header: Arc::new(header),
+            body_size: 0,
+            tree_aux: None,
+        });
+    }
+    let response_entries = entries.split_off(250);
+    active.entries = entries;
+    let staged_tip = active.staged_tip().unwrap();
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&peer, 250, 250);
+    reactor.handle_headers(
+        peer.clone(),
+        owner.session_id(),
+        owner.header_authority(),
+        Headers {
+            request_id: owner.request_id().get(),
+            target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            common_ancestor_height: staged_tip.height,
+            common_ancestor_hash: staged_tip.hash,
+            complete: false,
+            tree_aux_schema: AuxSchema::None,
+            entries: response_entries,
+        },
+    );
+    let HeaderPortOperation::PrepareHeaderTarget {
+        entries,
+        owner: prefix_owner,
+        target,
+        completion,
+        ..
+    } = actions
+        .try_recv()
+        .expect("two full response pages unblock checkpoint validation")
+    else {
+        panic!("the prefix must still pass normal header preparation");
+    };
+    assert_eq!(entries.len(), 500);
+    assert_eq!(target.height, block::Height(500));
+    assert_eq!(
+        prefix_owner.header_authority().branch.target_tip_hash,
+        target.hash
+    );
+    assert_eq!(
+        completion,
+        zakura_header_chain::TargetCompletion::TargetPrefix {
+            common_ancestor: snapshot.frontiers.header_best,
+        }
+    );
+    assert_eq!(reactor.peer_work_queue.chunk_budget_usage(), (0, 500));
+    assert!(matches!(
+        reactor.peer_work_queue.active(&peer).unwrap().phase,
+        HeaderTargetPhase::Preparing
+    ));
+    assert!(actions.try_recv().is_err());
+}
+
+#[test]
 fn requester_admits_its_owned_prefix_when_the_chunk_budget_is_exhausted() {
     let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
     let active = reactor

@@ -1269,16 +1269,22 @@ impl StateService {
         span: Span,
     ) -> Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + 'static>> {
         let timer = CodeTimer::start();
+        // These histograms measure how long a mined submission waits, so the sync path must not
+        // mix its blocks into them. A mined submission is the only caller that supplies
+        // `requested_at`, so that is what tells the two apart.
+        let measure_submission_latency = requested_at.is_some();
         if let Some(requested_at) = requested_at {
             metrics::histogram!("state.semantic_commit.dispatch.duration_seconds")
                 .record(requested_at.elapsed().as_secs_f64());
         }
 
-        let prequeue_checks_start = Instant::now();
+        let prequeue_checks_start = measure_submission_latency.then(Instant::now);
         self.assert_block_can_be_validated(&block);
         self.pending_utxos.check_against_ordered(&block.new_outputs);
-        metrics::histogram!("state.semantic_commit.prequeue_checks.duration_seconds")
-            .record(prequeue_checks_start.elapsed().as_secs_f64());
+        if let Some(prequeue_checks_start) = prequeue_checks_start {
+            metrics::histogram!("state.semantic_commit.prequeue_checks.duration_seconds")
+                .record(prequeue_checks_start.elapsed().as_secs_f64());
+        }
 
         // # Performance
         //
@@ -1290,19 +1296,25 @@ impl StateService {
         // there shouldn't be any other code running in the same task,
         // so we don't need to worry about blocking it:
         // https://docs.rs/tokio/latest/tokio/task/fn.block_in_place.html
-        let queue_send_start = Instant::now();
+        let queue_send_start = measure_submission_latency.then(Instant::now);
         let rsp_rx = tokio::task::block_in_place(move || {
             span.in_scope(|| self.queue_and_commit_to_non_finalized_state(block, admission))
         });
-        metrics::histogram!("state.semantic_commit.queue_and_commit.duration_seconds")
-            .record(queue_send_start.elapsed().as_secs_f64());
+        if let Some(queue_send_start) = queue_send_start {
+            metrics::histogram!("state.semantic_commit.queue_and_commit.duration_seconds")
+                .record(queue_send_start.elapsed().as_secs_f64());
+        }
 
         // TODO:
         //   - check for panics in the block write task here,
         //     as well as in poll_ready()
 
         // The work is all done, the future just waits on a channel for the result
-        timer.finish_desc("CommitSemanticallyVerifiedBlock");
+        timer.finish_desc(if measure_submission_latency {
+            "CommitSemanticallyVerifiedBlockWithAdmission"
+        } else {
+            "CommitSemanticallyVerifiedBlock"
+        });
 
         // Await the channel response, flatten the result, map receive errors to
         // `CommitSemanticallyVerifiedError::WriteTaskExited`.

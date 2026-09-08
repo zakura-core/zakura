@@ -9,7 +9,9 @@ use zakura_test::prelude::*;
 
 use crate::{
     arbitrary::Prepare,
-    service::queued_blocks::{QueuedBlocks, QueuedSemanticallyVerified, SentHashes},
+    service::queued_blocks::{
+        QueuedBlocks, QueuedSemanticallyVerified, SentHashes, MAX_QUEUED_BLOCKS,
+    },
     tests::FakeChainHelper,
     CommitBlockError, CommitSemanticallyVerifiedError,
 };
@@ -115,6 +117,27 @@ fn same_hash_replacement_keeps_the_new_body() -> Result<()> {
             .block,
         &replacement_block
     ));
+    Ok(())
+}
+
+/// The orphan queue holds a fixed number of entries.
+///
+/// `MAX_QUEUED_BLOCKS` also sizes the non-finalized write slots, and optimistic relay reads an
+/// idle writer off that count, so this bound is load-bearing beyond the queue itself.
+#[test]
+fn orphan_queue_has_a_fixed_entry_bound() -> Result<()> {
+    let block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
+    let mut queue = QueuedBlocks::default();
+    assert!(!queue.is_full());
+
+    for index in 0..MAX_QUEUED_BLOCKS {
+        let mut queued = block.clone().into_queued();
+        let index = u64::try_from(index).expect("the queue bound fits in u64");
+        queued.0.hash.0[..8].copy_from_slice(&index.to_le_bytes());
+        queue.blocks.insert(queued.0.hash, queued);
+    }
+    assert!(queue.is_full());
     Ok(())
 }
 

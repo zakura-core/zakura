@@ -1412,8 +1412,11 @@ impl AsyncChecks {
 
     /// Wait until all checks in the set finish.
     ///
-    /// If any of the checks fail, this method immediately returns the error and cancels all other
-    /// checks by dropping them.
+    /// Returns the first error, once every check has finished. Dropping a check does not stop the
+    /// batch work its request already dispatched, so returning early would report completion
+    /// while that work is still running. A caller that bounds its compute on this response reads
+    /// completion literally, and the wait costs nothing extra: the batches are already queued, and
+    /// the batch verifiers flush them on their own latency bound at the latest.
     async fn check(
         mut self,
         block_batch_flush_key: Option<primitives::BlockVerifierBatchFlushKey>,
@@ -1430,6 +1433,7 @@ impl AsyncChecks {
 
         // Wait for all asynchronous checks to complete
         // successfully, or fail verification if they error.
+        let mut first_error = None;
         loop {
             tokio::select! {
                 biased;
@@ -1440,11 +1444,16 @@ impl AsyncChecks {
                             block_batch_flush.await;
                         }
 
-                        return Ok(());
+                        return match first_error {
+                            Some(error) => Err(error),
+                            None => Ok(()),
+                        };
                     };
 
                     tracing::trace!(?check, remaining = self.0.len());
-                    check?;
+                    if let Err(error) = check {
+                        first_error.get_or_insert(error);
+                    }
                 }
 
                 () = &mut block_batch_flush, if needs_block_batch_flush => {

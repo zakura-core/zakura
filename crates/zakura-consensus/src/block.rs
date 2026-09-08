@@ -304,6 +304,10 @@ where
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         async move {
+            // Preparing a template costs everything below, not just the contextual check at the
+            // end. The bound on speculative preparation is set from this measurement, so it must
+            // start where the work does.
+            let preparation_start = std::time::Instant::now();
             let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
                 .map_err(BlockError::from)?;
             let (mined, prepared_source) = match &request {
@@ -557,6 +561,7 @@ where
                     prepared_block,
                     hash,
                     prepared_source,
+                    preparation_start,
                 )
                 .await;
             }
@@ -636,12 +641,12 @@ async fn finish_proposal<S>(
     prepared_block: zs::SemanticallyVerifiedBlock,
     hash: block::Hash,
     prepared_source: Option<PreparedCandidateSource>,
+    preparation_start: std::time::Instant,
 ) -> Result<block::Hash, VerifyBlockError>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
 {
-    let preparation_start = std::time::Instant::now();
     let cache_copy = prepared_source.map(|_| prepared_block.clone());
     let response = match state_service
         .ready()

@@ -1,6 +1,6 @@
 use super::*;
 
-/// A write slot for a test message, held by a semaphore this helper leaks into the permit.
+/// A write slot for a test message, on a semaphore the returned permit keeps alive.
 fn test_write_slot() -> tokio::sync::OwnedSemaphorePermit {
     std::sync::Arc::new(tokio::sync::Semaphore::new(1))
         .try_acquire_owned()

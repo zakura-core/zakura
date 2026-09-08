@@ -2036,6 +2036,14 @@ async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies(
     drop(reconsider);
     drop(writer.try_recv().unwrap());
 
+    let (sibling, _response) = queue(&mut state, 8, true);
+    assert!(sibling.wait().await);
+    assert!(
+        sibling.optimistic_relay_authorized(),
+        "a published reconsideration releases its write slot, so relay is authorized again"
+    );
+    drop(writer.try_recv().unwrap());
+
     let _invalidate_response = state.send_invalidate_block(block::Hash([99; 32]));
     let invalidate = writer.try_recv().unwrap();
     let (sibling, _response) = queue(&mut state, 4, true);

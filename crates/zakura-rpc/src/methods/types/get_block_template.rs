@@ -118,13 +118,22 @@ impl TemplateRejections {
         self.saturated || !self.rejected.is_empty()
     }
 
-    pub(crate) fn mark_prepared(&mut self, parent: block::Hash, work_id: &str) {
-        if self.parent == Some(parent) && !self.prepared.iter().any(|id| id == work_id) {
-            if self.prepared.len() == MAX_PREPARED_WORK_IDS {
-                self.prepared.pop_front();
-            }
-            self.prepared.push_back(work_id.to_owned());
+    /// Records that `work_id` passed validation on `parent`.
+    ///
+    /// Returns whether this withdrew any other work: the oldest prepared ID is forgotten when the
+    /// queue is full, and during fallback losing that exemption withdraws it. Waiters observe
+    /// withdrawal through the watch channel, so the caller must publish that change.
+    pub(crate) fn mark_prepared(&mut self, parent: block::Hash, work_id: &str) -> bool {
+        if self.parent != Some(parent) || self.prepared.iter().any(|id| id == work_id) {
+            return false;
         }
+        let evicted = if self.prepared.len() == MAX_PREPARED_WORK_IDS {
+            self.prepared.pop_front().is_some()
+        } else {
+            false
+        };
+        self.prepared.push_back(work_id.to_owned());
+        evicted && self.needs_fallback()
     }
 
     pub(crate) fn is_prepared(&self, work_id: &str) -> bool {
@@ -161,7 +170,8 @@ impl<T> Default for TemplatePreparationQueue<T> {
 }
 
 impl<T> TemplatePreparationQueue<T> {
-    fn enqueue(&self, template: T) -> Option<T> {
+    /// Queues `template`, and returns it with the worker slot when no loop is running.
+    fn enqueue(&self, template: T) -> Option<(T, PreparationWorker<T>)> {
         let mut state = self
             .0
             .lock()
@@ -171,7 +181,14 @@ impl<T> TemplatePreparationQueue<T> {
             None
         } else {
             state.running = true;
-            Some(template)
+            drop(state);
+            Some((
+                template,
+                PreparationWorker {
+                    queue: TemplatePreparationQueue(Arc::clone(&self.0)),
+                    released: false,
+                },
+            ))
         }
     }
 
@@ -185,6 +202,40 @@ impl<T> TemplatePreparationQueue<T> {
             state.running = false;
         }
         next
+    }
+}
+
+/// Holds the one speculative preparation slot for as long as its loop runs.
+///
+/// The loop must release the slot however it ends, including a `break` or a panic. Leaving
+/// `running` set would stop every later template from ever being prepared, so the release is a
+/// `Drop` rather than something each exit has to remember.
+pub(crate) struct PreparationWorker<T> {
+    queue: TemplatePreparationQueue<T>,
+    released: bool,
+}
+
+impl<T> PreparationWorker<T> {
+    /// Returns the newest queued template, releasing the slot when there is none.
+    pub(crate) fn next(&mut self) -> Option<T> {
+        let next = self.queue.next_or_finish();
+        self.released = next.is_none();
+        next
+    }
+}
+
+impl<T> Drop for PreparationWorker<T> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut state = self
+            .queue
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending = None;
+        state.running = false;
     }
 }
 
@@ -823,17 +874,15 @@ where
         self.optimistic_block_inventory
     }
 
-    /// Queues a server template and returns the first item for a new worker.
+    /// Queues a server template, and returns it with the worker slot for a new loop.
     pub(crate) fn queue_template_preparation(
         &self,
         template: BlockTemplateResponse,
-    ) -> Option<BlockTemplateResponse> {
+    ) -> Option<(
+        BlockTemplateResponse,
+        PreparationWorker<BlockTemplateResponse>,
+    )> {
         self.template_preparation_queue.enqueue(template)
-    }
-
-    /// Returns the newest queued template or marks the worker idle.
-    pub(crate) fn next_template_preparation(&self) -> Option<BlockTemplateResponse> {
-        self.template_preparation_queue.next_or_finish()
     }
 
     /// Randomizes the coinbase data, if miner parameters are set.

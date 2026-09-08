@@ -1020,7 +1020,11 @@ where
     gbt: GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
 }
 
-/// How long the server waits for one mining template to pass proposal validation.
+/// How long one mining template may take to pass proposal validation.
+///
+/// Foreground recovery stops waiting at this deadline, because a miner is waiting on it.
+/// Speculative preparation cannot stop the work it dispatched, so it reads the same deadline as
+/// the point past which a parent's templates cost more than they are worth.
 const TEMPLATE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The outcome of validating one server mining template.
@@ -1055,8 +1059,8 @@ where
         return Preparation::Rejected;
     };
 
-    // Building the block is itself CPU work, so give up here rather than start verification for a
-    // parent the chain has already left.
+    // Building the block is itself CPU work, so re-check for shutdown rather than start a
+    // verification whose answer nobody will use.
     if zakura_chain::shutdown::is_shutting_down() {
         return Preparation::Stale;
     }
@@ -1087,72 +1091,35 @@ where
     }
 }
 
-/// Starts one speculative preparation and waits for it, without binding the two together.
+/// Dispatches one speculative preparation onto a detached task.
 ///
-/// The verification runs in a detached task, so the deadline and the stale-tip watcher stop *this
-/// function* waiting without stopping the computation. The returned handle is how the caller
-/// observes when the computation actually finished; until it does, the caller must not start
-/// another one.
+/// The verification runs in its own task, so nothing the caller does stops it: dropping a tower
+/// future leaves the work its request already dispatched running. The join handle is therefore
+/// the only honest signal that the computation is over, and the caller must not start another
+/// preparation until it resolves.
 ///
 /// Returns `None`, having dispatched nothing, when the chain has already left this template's
-/// parent. A template can go stale while it waits its turn, and the stale watcher below only
-/// stops this function waiting: by the time it fires, the verification is already running and
-/// holding the one speculative worker away from a template a miner could still use.
+/// parent. A template can go stale while it waits its turn, and preparing it then would hold the
+/// one speculative worker away from a template a miner could still use.
 fn start_speculative_preparation<BlockVerifierRouter, Tip>(
     verifier: BlockVerifierRouter,
     template: &BlockTemplateResponse,
     latest_chain_tip: Tip,
     network: &Network,
-) -> Option<(
-    impl std::future::Future<Output = Preparation>,
-    tokio::task::JoinHandle<()>,
-)>
+) -> Option<tokio::task::JoinHandle<Preparation>>
 where
     BlockVerifierRouter: BlockVerifierService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
 {
-    let parent = template.previous_block_hash;
-    let mut latest_chain_tip = latest_chain_tip;
-    latest_chain_tip.mark_best_tip_seen();
-    if latest_chain_tip.best_tip_hash() != Some(parent) {
+    if latest_chain_tip.best_tip_hash() != Some(template.previous_block_hash) {
         return None;
     }
 
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let computation = tokio::spawn({
+    Some(tokio::spawn({
         let template = template.clone();
         let network = network.clone();
-        async move {
-            let outcome = verify_server_template(verifier, &template, &network).await;
-            // The receiver is gone whenever this preparation already missed its deadline.
-            let _ = result_tx.send(outcome);
-        }
-        .in_current_span()
-    });
-
-    let mut tip = latest_chain_tip;
-    let waiter = async move {
-        let stale = async {
-            loop {
-                tip.mark_best_tip_seen();
-                if tip.best_tip_hash() != Some(parent) {
-                    break;
-                }
-                if tip.best_tip_changed().await.is_err() {
-                    break;
-                }
-            }
-        };
-
-        tokio::select! {
-            biased;
-            _ = stale => Preparation::Stale,
-            _ = tokio::time::sleep(TEMPLATE_PREPARATION_TIMEOUT) => Preparation::TimedOut,
-            outcome = result_rx => outcome.unwrap_or(Preparation::Stale),
-        }
-    };
-
-    Some((waiter, computation))
+        async move { verify_server_template(verifier, &template, &network).await }.in_current_span()
+    }))
 }
 
 /// Validates one template in the foreground, for a caller that needs the answer now.
@@ -1190,6 +1157,100 @@ where
             TEMPLATE_PREPARATION_TIMEOUT,
             verify_server_template(verifier, template, network),
         ) => result.unwrap_or(Preparation::TimedOut),
+    }
+}
+
+/// Prepares one queued server template, and returns once its computation is over.
+///
+/// Returning is the signal that the speculative worker is free again, so this must not return
+/// while work it dispatched is still running. See [`RpcImpl::prepare_template_in_background`].
+async fn prepare_one_server_template<BlockVerifierRouter, Tip, SyncStatus>(
+    gbt: &GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
+    verifier: BlockVerifierRouter,
+    template: &BlockTemplateResponse,
+    latest_chain_tip: &Tip,
+    network: &Network,
+) where
+    BlockVerifierRouter: BlockVerifierService,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
+{
+    let parent = template.previous_block_hash;
+    let work_id = template.work_id().clone();
+
+    // Once a parent needs recovery, only foreground-validated fallback work may be published.
+    // Discard its queued speculative preparations.
+    if gbt.template_rejections.borrow().needs_fallback() {
+        return;
+    }
+    if !gbt.speculation_breaker.allows(parent) {
+        metrics::counter!("mining.template_preparation.declined").increment(1);
+        return;
+    }
+
+    let Some(computation) =
+        start_speculative_preparation(verifier, template, latest_chain_tip.clone(), network)
+    else {
+        // The chain left this template's parent while it waited its turn.
+        metrics::counter!("mining.template_preparation.stale_before_dispatch").increment(1);
+        return;
+    };
+
+    let started = tokio::time::Instant::now();
+    let outcome = computation.await;
+    let elapsed = started.elapsed();
+
+    // The deadline classifies the cost; it does not stop the work, so it is read once the
+    // computation is actually over. An answer that arrives late still counts: withdrawing an
+    // invalid template late is better than never withdrawing it.
+    if elapsed >= TEMPLATE_PREPARATION_TIMEOUT {
+        // This parent's templates cost more than the deadline allows. Stop speculating on it
+        // until the chain moves on, instead of paying that cost again for every template built
+        // on it.
+        gbt.speculation_breaker.trip(parent);
+        metrics::counter!("mining.template_preparation.timed_out").increment(1);
+        tracing::debug!(
+            ?elapsed,
+            %work_id,
+            ?parent,
+            "a server mining template overran its preparation deadline"
+        );
+    }
+
+    match outcome {
+        Ok(Preparation::Prepared) => {
+            gbt.template_rejections
+                .send_if_modified(|state| state.mark_prepared(parent, &work_id));
+        }
+        Ok(Preparation::Rejected) => {
+            gbt.template_rejections.send_if_modified(|state| {
+                // A reorg away from this parent and back leaves the rejection state naming
+                // another parent while this validation finishes. Re-point it when the chain is
+                // back here, so the rejection is recorded rather than silently dropped.
+                if state.parent != Some(parent) && latest_chain_tip.best_tip_hash() == Some(parent)
+                {
+                    state.set_parent(parent);
+                }
+                state.reject(parent, &work_id)
+            });
+            metrics::counter!("mining.template_preparation.rejected").increment(1);
+        }
+        // The background path has no inner deadline, so `TimedOut` cannot reach here: both
+        // remaining outcomes mean the node gave up before it had an answer.
+        Ok(Preparation::Stale | Preparation::TimedOut) => {
+            metrics::counter!("mining.template_preparation.cancelled").increment(1);
+        }
+        Ok(Preparation::Failed(error)) => {
+            tracing::debug!(
+                ?error,
+                %work_id,
+                ?parent,
+                "background mining candidate preparation failed"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(?error, "template preparation task did not finish");
+        }
     }
 }
 
@@ -1356,25 +1417,35 @@ where
     ///
     /// Returns `None` when `latest_chain_tip` no longer agrees with the tip a template is being
     /// built on, so the caller must fetch the chain state again.
+    ///
+    /// The tip is checked while the rejection state is locked, because `set_parent` clears every
+    /// rejection recorded for the parent it replaces. Holding the lock across the check stops two
+    /// concurrent requests interleaving their checks and writes, so a request that already lost
+    /// the tip cannot erase the withdrawals of the parent that replaced it. `rejections` is both
+    /// the snapshot the caller works from and the marker of what it has seen, taken together so a
+    /// rejection published in between cannot be acknowledged unread.
     fn track_template_parent(
         &self,
         tip_hash: block::Hash,
+        rejections: &mut watch::Receiver<types::get_block_template::TemplateRejections>,
     ) -> Option<types::get_block_template::TemplateRejections> {
-        if self
-            .latest_chain_tip
-            .best_tip_hash()
-            .is_some_and(|tip| tip != tip_hash)
-        {
-            return None;
-        }
-
+        let mut tip_is_current = true;
         self.gbt.template_rejections.send_if_modified(|state| {
+            if self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != tip_hash)
+            {
+                tip_is_current = false;
+                return false;
+            }
+
             let changed = state.parent != Some(tip_hash);
             state.set_parent(tip_hash);
             changed
         });
 
-        Some(self.gbt.template_rejections.borrow().clone())
+        tip_is_current.then(|| rejections.borrow_and_update().clone())
     }
 
     /// Returns the template to publish, recovering an empty one when this parent needs a fallback.
@@ -1384,19 +1455,33 @@ where
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
         miner_params: &types::get_block_template::MinerParams,
     ) -> Result<GetBlockTemplateResponse> {
-        let state = self.gbt.template_rejections.borrow().clone();
+        let mut state = self.gbt.template_rejections.borrow().clone();
 
-        if state.parent != Some(chain_info.tip_hash) {
+        // Transaction selection ran after the chain state was fetched, so re-check both the
+        // rejection state's parent and the chain tip itself: neither request retargets the other.
+        if state.parent != Some(chain_info.tip_hash)
+            || self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != chain_info.tip_hash)
+        {
             return Err(ErrorObject::owned(
                 0,
                 "template parent changed; retry",
                 None::<()>,
             ));
         }
+
         if !state.needs_fallback() {
             self.prepare_template_in_background(&template);
-            return Ok(template.into());
+            // A rejection can land between the snapshot above and this point, which would leave
+            // this brand-new work withdrawn the moment it reaches the miner. Recover instead.
+            state = self.gbt.template_rejections.borrow().clone();
+            if !state.needs_fallback() {
+                return Ok(template.into());
+            }
         }
+
         if state.saturated {
             return Err(ErrorObject::owned(
                 0,
@@ -1482,10 +1567,9 @@ where
             ));
         }
 
-        self.gbt.template_rejections.send_if_modified(|state| {
-            state.mark_prepared(chain_info.tip_hash, template.work_id());
-            false
-        });
+        self.gbt
+            .template_rejections
+            .send_if_modified(|state| state.mark_prepared(chain_info.tip_hash, template.work_id()));
 
         Ok(template.into())
     }
@@ -1517,18 +1601,20 @@ where
     /// Speculative preparation is work nobody asked for, so it must never be able to accumulate.
     /// Two properties bound it, and both are load-bearing:
     ///
-    /// - `TemplatePreparationQueue` admits one loop and holds one pending template.
-    /// - This loop waits for each preparation's *computation* to finish, not merely for its
-    ///   result. A deadline or a tip change stops the loop waiting for an answer it can no longer
-    ///   use, but the verification it dispatched keeps running, so taking the next template then
-    ///   would leave two verifications in flight. Repeating that is how a stream of tip changes
-    ///   turns speculation into unbounded work.
+    /// - `TemplatePreparationQueue` admits one loop and holds one pending template. The loop's
+    ///   `PreparationWorker` releases that slot however the loop ends.
+    /// - [`prepare_one_server_template`] waits for each preparation's *computation* to finish,
+    ///   not merely for an answer the node can still use. A deadline or a tip change does not
+    ///   stop the verification that was dispatched, so taking the next template then would leave
+    ///   two verifications in flight. Repeating that is how a stream of tip changes turns
+    ///   speculation into unbounded work.
     ///
     /// Together they hold speculative preparation to one verification in flight at any moment.
     /// A preparation that never returns therefore stops speculation entirely, which is the safe
     /// direction: ordinary submission and foreground recovery do not go through here.
     fn prepare_template_in_background(&self, template: &BlockTemplateResponse) {
-        let Some(template) = self.gbt.queue_template_preparation(template.clone()) else {
+        let Some((template, mut worker)) = self.gbt.queue_template_preparation(template.clone())
+        else {
             metrics::counter!("mining.template_preparation.coalesced").increment(1);
             return;
         };
@@ -1540,88 +1626,22 @@ where
             async move {
                 let mut template = template;
                 loop {
-                    let parent = template.previous_block_hash;
-                    let work_id = template.work_id().clone();
-
                     // Recheck everything that may have changed while the previous template was
                     // being prepared, before spending anything on this one.
                     if zakura_chain::shutdown::is_shutting_down() {
                         break;
                     }
-                    // Once a parent needs recovery, only foreground-validated fallback work may
-                    // be published. Discard its queued speculative preparations.
-                    let withdrawn = gbt.template_rejections.borrow().needs_fallback();
-                    let breaker_open = !gbt.speculation_breaker.allows(parent);
-                    if breaker_open {
-                        metrics::counter!("mining.template_preparation.declined").increment(1);
-                    }
 
-                    if !withdrawn && !breaker_open {
-                        let Some((preparation, computation)) = start_speculative_preparation(
-                            verifier.clone(),
-                            &template,
-                            latest_chain_tip.clone(),
-                            &network,
-                        ) else {
-                            // The chain left this template's parent while it waited its turn.
-                            metrics::counter!("mining.template_preparation.cancelled").increment(1);
-                            let Some(next) = gbt.next_template_preparation() else {
-                                break;
-                            };
-                            template = next;
-                            continue;
-                        };
+                    prepare_one_server_template(
+                        &gbt,
+                        verifier.clone(),
+                        &template,
+                        &latest_chain_tip,
+                        &network,
+                    )
+                    .await;
 
-                        match preparation.await {
-                            Preparation::Prepared => {
-                                gbt.template_rejections.send_if_modified(|state| {
-                                    state.mark_prepared(parent, &work_id);
-                                    false
-                                });
-                            }
-                            Preparation::Rejected => {
-                                gbt.template_rejections
-                                    .send_if_modified(|state| state.reject(parent, &work_id));
-                                metrics::counter!("mining.template_preparation.rejected")
-                                    .increment(1);
-                            }
-                            Preparation::Stale => {
-                                metrics::counter!("mining.template_preparation.cancelled")
-                                    .increment(1);
-                            }
-                            Preparation::TimedOut => {
-                                // This parent's templates cost more than the deadline allows.
-                                // Stop speculating on it until the chain moves on, instead of
-                                // paying that cost again for every template built on it.
-                                gbt.speculation_breaker.trip(parent);
-                                metrics::counter!("mining.template_preparation.timed_out")
-                                    .increment(1);
-                            }
-                            Preparation::Failed(error) => {
-                                tracing::debug!(
-                                    ?error,
-                                    %work_id,
-                                    ?parent,
-                                    "background mining candidate preparation failed"
-                                );
-                            }
-                        }
-
-                        // The bound: no second verification starts while this one still runs.
-                        if !computation.is_finished() {
-                            metrics::counter!("mining.template_preparation.abandoned").increment(1);
-                            tracing::debug!(
-                                %work_id,
-                                ?parent,
-                                "waiting for an abandoned template preparation to finish"
-                            );
-                        }
-                        if let Err(error) = computation.await {
-                            tracing::warn!(?error, "template preparation task did not finish");
-                        }
-                    }
-
-                    let Some(next) = gbt.next_template_preparation() else {
+                    let Some(next) = worker.next() else {
                         break;
                     };
                     template = next;
@@ -3115,11 +3135,13 @@ where
                 cur_time,
                 ..
             } = fetch_chain_info(read_state.clone()).await?;
-            let Some(rejection_state) = self.track_template_parent(tip_hash) else {
+            // Tracking this iteration's parent marks the rejection state it snapshots as seen:
+            // this iteration's own parent update is not a reason to wake long polling again.
+            let Some(rejection_state) =
+                self.track_template_parent(tip_hash, &mut template_rejections)
+            else {
                 continue;
             };
-            // This iteration's own parent update is not a reason to wake long polling again.
-            template_rejections.mark_unchanged();
 
             // Fetch the mempool data for the block template:
             // - if the mempool transactions change, we might return from long polling.
@@ -3269,7 +3291,9 @@ where
 
                 precomputed_coinbase = wait_for_new_tip => {
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
-                    let Some(rejection_state) = self.track_template_parent(chain_info.tip_hash) else {
+                    let Some(rejection_state) =
+                        self.track_template_parent(chain_info.tip_hash, &mut template_rejections)
+                    else {
                         continue;
                     };
 

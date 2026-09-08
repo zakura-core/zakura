@@ -98,11 +98,30 @@ async fn template_rejection_retains_notifications_for_late_subscribers() {
 fn template_preparation_queue_keeps_the_latest_pending_template() {
     let queue = TemplatePreparationQueue::<u8>::default();
 
-    assert_eq!(queue.enqueue(1), Some(1));
-    assert_eq!(queue.enqueue(2), None);
-    assert_eq!(queue.enqueue(3), None);
-    assert_eq!(queue.next_or_finish(), Some(3));
-    assert_eq!(queue.next_or_finish(), None);
+    let (first, mut worker) = queue.enqueue(1).expect("an idle queue admits a worker");
+    assert_eq!(first, 1);
+    assert!(queue.enqueue(2).is_none());
+    assert!(queue.enqueue(3).is_none());
+    assert_eq!(worker.next(), Some(3));
+    assert_eq!(worker.next(), None);
+}
+
+/// A loop that ends without taking its next template still releases the worker slot.
+///
+/// Every exit releases it, including a `break` or a panic: `running` staying set would stop the
+/// node ever preparing another template.
+#[test]
+fn a_dropped_preparation_worker_releases_the_queue() {
+    let queue = TemplatePreparationQueue::<u8>::default();
+
+    let (_first, worker) = queue.enqueue(1).expect("an idle queue admits a worker");
+    assert!(queue.enqueue(2).is_none());
+    drop(worker);
+
+    let (next, _worker) = queue
+        .enqueue(3)
+        .expect("a released queue admits the next worker");
+    assert_eq!(next, 3, "the discarded loop's pending template is not run");
 }
 
 /// Tests transparent coinbase generation at every configured Sapling-and-later

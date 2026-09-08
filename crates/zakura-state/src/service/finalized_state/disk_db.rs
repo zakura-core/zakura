@@ -1558,11 +1558,8 @@ impl DiskDb {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
-        // Use the recommended Ribbon filter setting for all column families.
-        //
-        // Ribbon filters are faster than Bloom filters in Zebra, as of April 2022.
-        // (They aren't needed for single-valued column families, but they don't hurt either.)
-        block_based_opts.set_ribbon_filter(9.9);
+        // Benchmark Bloom construction at Ribbon's existing false-positive target.
+        block_based_opts.set_bloom_filter(9.9, false);
 
         // Use the recommended LZ4 compression type.
         //

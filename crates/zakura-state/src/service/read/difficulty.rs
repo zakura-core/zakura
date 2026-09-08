@@ -37,6 +37,16 @@ use crate::{
 /// This is a Zebra-specific standard rule.
 pub const EXTRA_TIME_TO_MINE_A_BLOCK: u32 = POST_BLOSSOM_POW_TARGET_SPACING * 2;
 
+/// The local-clock limit enforced by [`block::Header::time_is_valid_at`].
+const MAX_BLOCK_TIME_SINCE_LOCAL_CLOCK: Duration32 = Duration32::from_hours(2);
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct BlockTemplateTimeRange {
+    min_time: DateTime32,
+    cur_time: DateTime32,
+    max_time: DateTime32,
+}
+
 fn finalized_state_query_interrupted_error() -> BoxError {
     "Zakura is committing too many blocks to the state, \
      wait until it syncs to the chain tip"
@@ -44,6 +54,11 @@ fn finalized_state_query_interrupted_error() -> BoxError {
 }
 
 /// Returns the [`GetBlockTemplateChainInfo`] for the current best chain.
+///
+/// # Errors
+///
+/// Returns an error if the state queries are interrupted or the local clock is
+/// too far behind the chain tip to create a valid template time range.
 ///
 /// # Panics
 ///
@@ -71,13 +86,13 @@ pub fn get_block_template_chain_info(
     let (best_tip_height, best_tip_hash, best_relevant_chain, best_tip_history_tree) =
         best_relevant_chain_and_history_tree_result?;
 
-    Ok(difficulty_time_and_history_tree(
+    difficulty_time_and_history_tree(
         best_relevant_chain,
         best_tip_height,
         best_tip_hash,
         network,
         best_tip_history_tree,
-    ))
+    )
 }
 
 /// Accepts a `non_finalized_state`, [`ZakuraDb`], `num_blocks`, and a block hash to start at.
@@ -212,13 +227,11 @@ fn difficulty_time_and_history_tree(
     tip_hash: block::Hash,
     network: &Network,
     history_tree: Arc<HistoryTree>,
-) -> GetBlockTemplateChainInfo {
+) -> Result<GetBlockTemplateChainInfo, BoxError> {
     let relevant_data: Vec<(CompactDifficulty, DateTime<Utc>)> = relevant_chain
         .iter()
         .map(|block| (block.header.difficulty_threshold, block.header.time))
         .collect();
-
-    let cur_time = DateTime32::now();
 
     // > For each block other than the genesis block , nTime MUST be strictly greater than
     // > the median-time-past of that block.
@@ -231,19 +244,11 @@ fn difficulty_time_and_history_tree(
             .collect(),
     );
 
-    let min_time = median_time_past
-        .checked_add(Duration32::from_seconds(1))
-        .expect("a valid block time plus a small constant is in-range");
-
-    // > For each block at block height 2 or greater on Mainnet, or block height 653606 or greater on Testnet, nTime
-    // > MUST be less than or equal to the median-time-past of that block plus 90 * 60 seconds.
-    //
-    // We ignore the height as we are checkpointing on Canopy or higher in Mainnet and Testnet.
-    let max_time = median_time_past
-        .checked_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
-        .expect("a valid block time plus a small constant is in-range");
-
-    let cur_time = cur_time.clamp(min_time, max_time);
+    let BlockTemplateTimeRange {
+        min_time,
+        cur_time,
+        max_time,
+    } = valid_block_template_time_range(median_time_past, DateTime32::now())?;
 
     // Now that we have a valid time, get the difficulty for that time.
     let difficulty_adjustment = AdjustedDifficulty::new_from_header_time(
@@ -267,7 +272,46 @@ fn difficulty_time_and_history_tree(
 
     adjust_difficulty_and_time_for_testnet(&mut result, network, tip_height, relevant_data);
 
-    result
+    Ok(result)
+}
+
+/// Intersects the deterministic median-time range with the local-clock rule.
+///
+/// Returns an error if the local future-time limit is out of range or does not
+/// overlap the median-time range.
+fn valid_block_template_time_range(
+    median_time_past: DateTime32,
+    local_time: DateTime32,
+) -> Result<BlockTemplateTimeRange, &'static str> {
+    let min_time = median_time_past
+        .checked_add(Duration32::from_seconds(1))
+        .expect("a valid block time plus a small constant is in-range");
+
+    // > For each block at block height 2 or greater on Mainnet, or block height
+    // > 653606 or greater on Testnet, nTime MUST be less than or equal to the
+    // > median-time-past of that block plus 90 * 60 seconds.
+    //
+    // We ignore the height as we are checkpointing on Canopy or higher in
+    // Mainnet and Testnet.
+    let median_time_max = median_time_past
+        .checked_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
+        .expect("a valid block time plus a small constant is in-range");
+    let local_time_max = local_time
+        .checked_add(MAX_BLOCK_TIME_SINCE_LOCAL_CLOCK)
+        .ok_or("the local future-time limit is outside the timestamp range")?;
+    let max_time = median_time_max.min(local_time_max);
+
+    if min_time > max_time {
+        return Err(
+            "the local clock is too far behind the chain tip to create a valid block template",
+        );
+    }
+
+    Ok(BlockTemplateTimeRange {
+        min_time,
+        cur_time: local_time.clamp(min_time, max_time),
+        max_time,
+    })
 }
 
 /// Adjust the difficulty and time for the testnet minimum difficulty rule.
@@ -372,5 +416,66 @@ fn adjust_difficulty_and_time_for_testnet(
         )
         .expect("the testnet mining template retains the same complete difficulty context")
         .expected_difficulty_threshold();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOCAL_TIME: DateTime32 = DateTime32::from_seconds(1_700_000_000);
+
+    #[test]
+    fn block_template_max_time_respects_local_future_time_limit() {
+        let median_time_past = LOCAL_TIME
+            .checked_add(Duration32::from_minutes(31))
+            .expect("test time is in range");
+
+        let time_range = valid_block_template_time_range(median_time_past, LOCAL_TIME)
+            .expect("the time ranges overlap");
+
+        assert_eq!(
+            time_range.min_time,
+            median_time_past
+                .checked_add(Duration32::from_seconds(1))
+                .expect("test time is in range")
+        );
+        assert_eq!(time_range.cur_time, time_range.min_time);
+        assert_eq!(
+            time_range.max_time,
+            LOCAL_TIME
+                .checked_add(MAX_BLOCK_TIME_SINCE_LOCAL_CLOCK)
+                .expect("test time is in range")
+        );
+    }
+
+    #[test]
+    fn block_template_max_time_uses_tighter_median_time_limit() {
+        let median_time_past = LOCAL_TIME
+            .checked_sub(Duration32::from_hours(1))
+            .expect("test time is in range");
+
+        let time_range = valid_block_template_time_range(median_time_past, LOCAL_TIME)
+            .expect("the time ranges overlap");
+
+        assert_eq!(time_range.cur_time, LOCAL_TIME);
+        assert_eq!(
+            time_range.max_time,
+            median_time_past
+                .checked_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
+                .expect("test time is in range")
+        );
+    }
+
+    #[test]
+    fn block_template_time_range_rejects_non_overlapping_limits() {
+        let median_time_past = LOCAL_TIME
+            .checked_add(MAX_BLOCK_TIME_SINCE_LOCAL_CLOCK)
+            .expect("test time is in range");
+
+        assert_eq!(
+            valid_block_template_time_range(median_time_past, LOCAL_TIME),
+            Err("the local clock is too far behind the chain tip to create a valid block template")
+        );
     }
 }

@@ -210,7 +210,7 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-allow-git = []
+allow-git = ["https://github.com/zakura-core/iroh-quinn"]
 
 [sources.allow-org]
 github = [

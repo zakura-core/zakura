@@ -43,6 +43,13 @@ PROFILE_SECONDS="${PROFILE_SECONDS:-300}"
 # 49Hz keeps DWARF unwinding fast while retaining enough samples for comparison.
 PROFILE_FREQ="${PROFILE_FREQ:-49}"
 PROFILE_DWARF_STACK="${PROFILE_DWARF_STACK:-8192}"
+DETAILED_PROFILE=false
+if [[ "$PROFILE" == diagnostic ]]; then
+  DETAILED_PROFILE=true
+  PROFILE=cpu
+  PROFILE_SECONDS="$WALL_CAP"
+  PROFILE_DWARF_STACK=32768
+fi
 CKPT_LIMIT="${CKPT_LIMIT:-1500}"
 DL_LIMIT="${DL_LIMIT:-150}"
 P2P_STACK="${P2P_STACK:-}"
@@ -75,11 +82,12 @@ ZAKURA_BOOTSTRAP_PEERS=(
   "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234"
 )
 
-NODE_PID=""; PERF_PID=""; STAT_PID=""; REC_PID=""
+NODE_PID=""; PERF_PID=""; STAT_PID=""; REC_PID=""; SYSTEM_PID=""
 cleanup() {
   { [[ -n "$PERF_PID" ]] && kill "$PERF_PID"; } 2>/dev/null || true
   { [[ -n "$STAT_PID" ]] && kill "$STAT_PID"; } 2>/dev/null || true
   { [[ -n "$REC_PID" ]] && kill "$REC_PID"; } 2>/dev/null || true
+  { [[ -n "$SYSTEM_PID" ]] && kill "$SYSTEM_PID"; } 2>/dev/null || true
   { [[ -n "$NODE_PID" ]] && kill -9 "$NODE_PID"; } 2>/dev/null || true
   return 0
 }
@@ -221,7 +229,9 @@ if [[ "$PROFILE" == "cpu" ]]; then
   found=0
   if command -v perf >/dev/null 2>&1; then
     # Prefer hardware cycles when available, then fall back to cpu-clock.
-    for event in "cycles:u" "cpu-clock:u"; do
+    events=("cycles:u" "cpu-clock:u")
+    [[ "$DETAILED_PROFILE" == true ]] && events=("cpu-clock")
+    for event in "${events[@]}"; do
       if perf record -o /root/.perf-probe -e "$event" -F 9 -- true >/dev/null 2>&1; then
         PERF_EVENT="$event"; found=1; break
       fi
@@ -230,6 +240,7 @@ if [[ "$PROFILE" == "cpu" ]]; then
   fi
   if (( ! found )); then
     log "WARNING: perf cannot record on this droplet; disabling CPU profiling"
+    [[ "$DETAILED_PROFILE" == true ]] && die "diagnostic profiling requires perf"
     PROFILE="off"
   else
     if command -v inferno-flamegraph >/dev/null 2>&1; then
@@ -348,6 +359,11 @@ LOGF="$OUT_DIR/node.log"
 log "starting zakurad ($SHA), workload=$WORKLOAD leg=$LEG verify_mode=$VERIFY_MODE p2p_stack=$P2P_STACK cap=${WALL_CAP}s peers=${FEED_PEER:-DNS-seeders}/${PEERSET_SIZE}"
 "$ZAKURAD_BIN" -c "$CFG" start >"$LOGF" 2>&1 &
 NODE_PID=$!
+if [[ "$DETAILED_PROFILE" == true ]]; then
+  python3 /root/zakura-sync-profile-sample.py --pid "$NODE_PID" \
+    --seconds "$WALL_CAP" --out "$OUT_DIR" >"$OUT_DIR/system-sampler.log" 2>&1 &
+  SYSTEM_PID=$!
+fi
 T0=$(date +%s)
 sleep 3
 kill -0 "$NODE_PID" 2>/dev/null || { tail -20 "$LOGF" >&2; die "zakurad died on startup"; }
@@ -469,7 +485,16 @@ head_sample_is_healthy() {
 
 start_profile() {
   [[ "$PROFILE" == "cpu" && -z "$PERF_PID" ]] || return 0
+  local record_options=()
+  if [[ "$DETAILED_PROFILE" == true ]]; then
+    record_options=(--clockid mono --switch-events --sample-cpu)
+    perf record -o /root/.perf-diagnostic-probe -e cpu-clock -F 9 \
+      "${record_options[@]}" -- true >"$OUT_DIR/perf-probe.log" 2>&1 \
+      || die "perf diagnostic options are unavailable"
+    rm -f /root/.perf-diagnostic-probe
+  fi
   perf record -o "$OUT_DIR/perf.data" -e "$PERF_EVENT" -F "$PROFILE_FREQ" \
+    "${record_options[@]}" \
     --call-graph "dwarf,$PROFILE_DWARF_STACK" -p "$NODE_PID" -- sleep "$PROFILE_SECONDS" \
     >"$OUT_DIR/perf.log" 2>&1 &
   PERF_PID=$!
@@ -669,6 +694,11 @@ else
 fi
 
 T_END=$(date +%s)
+if [[ -n "$SYSTEM_PID" ]]; then
+  kill "$SYSTEM_PID" 2>/dev/null || true
+  wait "$SYSTEM_PID" || die "system sampler failed"
+  SYSTEM_PID=""
+fi
 if [[ -n "$REC_PID" ]]; then kill "$REC_PID" 2>/dev/null || true; wait "$REC_PID" 2>/dev/null || true; REC_PID=""; fi
 if [[ "$WORKLOAD" == historical_sync ]]; then
   { [[ -f "$METRICS_SNAP.tmp" ]] && mv -f "$METRICS_SNAP.tmp" "$METRICS_SNAP"; } 2>/dev/null || true
@@ -680,7 +710,7 @@ fi
 # Profile digest: folded stacks, flamegraph SVG, top-functions markdown
 # ---------------------------------------------------------------------------- #
 
-PROFILE_NOTE="workload=$WORKLOAD verify_mode=$VERIFY_MODE p2p_stack=$P2P_STACK $PERF_EVENT @ ${PROFILE_FREQ}Hz, ${PROFILE_SECONDS}s window"
+PROFILE_NOTE="diagnostic=$DETAILED_PROFILE workload=$WORKLOAD verify_mode=$VERIFY_MODE p2p_stack=$P2P_STACK $PERF_EVENT @ ${PROFILE_FREQ}Hz, ${PROFILE_SECONDS}s window"
 if [[ -n "$PERF_PID" ]]; then
   if [[ "$WORKLOAD" != live_head || "$WINDOW_COMPLETE" -ne 1 ]]; then
     kill "$PERF_PID" 2>/dev/null || true
@@ -701,10 +731,31 @@ if [[ -s "$OUT_DIR/perf.data" ]]; then
   # inline info is partial on line-tables-only builds anyway
   log "folding $(du -m "$OUT_DIR/perf.data" | cut -f1)MB of perf data (dwarf unwinding) ..."
   FOLD_START=$(date +%s)
-  if ! perf script --no-inline -i "$OUT_DIR/perf.data" 2>>"$OUT_DIR/perf.log" \
-        | "${DEMANGLE[@]}" \
-        | python3 "$DIGEST_PY" collapse > "$OUT_DIR/profile.folded" \
-        || [[ ! -s "$OUT_DIR/profile.folded" ]]; then
+  if [[ "$DETAILED_PROFILE" == true ]]; then
+    perf script --no-inline --ns -F +pid,+tid -i "$OUT_DIR/perf.data" \
+      2>>"$OUT_DIR/perf.log" | "${DEMANGLE[@]}" \
+      | gzip -1 > "$OUT_DIR/cpu-timeline.perf.txt.gz" \
+      || die "timestamped CPU export failed"
+    perf script --ns -G -F comm,pid,tid,cpu,time,event \
+      --show-switch-events --show-task-events --show-lost-events \
+      -i "$OUT_DIR/perf.data" 2>>"$OUT_DIR/perf.log" \
+      | gzip -1 > "$OUT_DIR/scheduling-timeline.perf.txt.gz" \
+      || die "scheduling export failed"
+    gzip -dc "$OUT_DIR/cpu-timeline.perf.txt.gz" \
+      | python3 "$DIGEST_PY" collapse > "$OUT_DIR/profile.folded" \
+      || die "diagnostic stack folding failed"
+    perf report --header-only -i "$OUT_DIR/perf.data" > "$OUT_DIR/perf-header.txt" 2>&1
+    perf buildid-list -i "$OUT_DIR/perf.data" > "$OUT_DIR/perf-buildids.txt"
+    zstd -q -T2 "$OUT_DIR/perf.data" -o "$OUT_DIR/perf.data.zst"
+    zstd -q -T2 "$ZAKURAD_BIN" -o "$OUT_DIR/zakurad-profile-binary.zst"
+  else
+    perf script --no-inline -i "$OUT_DIR/perf.data" 2>>"$OUT_DIR/perf.log" \
+      | "${DEMANGLE[@]}" \
+      | python3 "$DIGEST_PY" collapse > "$OUT_DIR/profile.folded" \
+      || rm -f "$OUT_DIR/profile.folded"
+  fi
+  if [[ ! -s "$OUT_DIR/profile.folded" ]]; then
+    [[ "$DETAILED_PROFILE" == true ]] && die "diagnostic profile contains no usable stacks"
     log "WARNING: perf script/collapse produced no stacks:" \
       "$(head -2 "$OUT_DIR/perf.log" 2>/dev/null | tr '\n' ' ')"
     rm -f "$OUT_DIR/profile.folded"
@@ -721,6 +772,7 @@ if [[ -s "$OUT_DIR/perf.data" ]]; then
   fi
   rm -f "$OUT_DIR/perf.data"
 elif [[ "$PROFILE" == "cpu" ]]; then
+  [[ "$DETAILED_PROFILE" == true ]] && die "diagnostic perf data is missing"
   log "WARNING: no perf data captured"
 fi
 if [[ -s "$OUT_DIR/perf-stat.csv" ]]; then

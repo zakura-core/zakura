@@ -55,12 +55,13 @@ on:
           - transport
           - tracing
       profile:
-        description: "CPU profiling: cpu = flamegraph + CPU counters; off = workload only"
+        description: "Profiling: diagnostic = timed CPU/scheduling/system capture; cpu = summary; off = workload only"
         type: choice
         required: false
         default: "cpu"
         options:
           - cpu
+          - diagnostic
           - "off"
       crossover:
         description: "Run both configurations on each host, in opposite orders, from fresh state copies"
@@ -272,6 +273,7 @@ jobs:
             .github/workflows/scripts/perf-bench-run.sh \
             .github/workflows/scripts/perf-bench-crossover.sh \
             scripts/zakura-bench-digest.py \
+            scripts/zakura-sync-profile-sample.py \
             scripts/zakura-metrics-dashboard.py \
             "root@${IP}:/root/"
           rm -f /tmp/run.env

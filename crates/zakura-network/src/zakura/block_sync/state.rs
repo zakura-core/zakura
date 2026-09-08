@@ -862,6 +862,8 @@ pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
     pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
+    /// Send-time rescue deadline if this range later blocks the download floor.
+    pub(super) floor_deadline: Instant,
     pub(super) delivery_snapshot: DeliverySnapshot,
     pub(super) delivered_bytes: u64,
     pub(super) received: ReceivedBlockTracker,
@@ -874,6 +876,18 @@ pub(super) struct DeliverySnapshot {
 }
 
 impl OutstandingBlockRange {
+    /// Tighten a speculative request only when it holds the next missing body.
+    pub(super) fn promote_floor_deadline(&mut self, height: block::Height) -> bool {
+        if self.request.offset_for_height(height).is_none()
+            || self.has_received(height)
+            || self.deadline <= self.floor_deadline
+        {
+            return false;
+        }
+        self.deadline = self.floor_deadline;
+        true
+    }
+
     /// Size estimates still reserved for unreceived heights.
     pub(super) fn reserved_bytes(&self) -> u64 {
         self.request

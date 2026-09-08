@@ -1132,6 +1132,7 @@ fn window_request(height: u32) -> OutstandingBlockRange {
         },
         queued_at: now,
         deadline: now,
+        floor_deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
@@ -1158,10 +1159,38 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
         },
         queued_at: now,
         deadline: now,
+        floor_deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
     }
+}
+
+#[test]
+fn floor_deadline_promotion_preserves_received_and_above_floor_requests() {
+    let mut request = window_request_range(2, 2);
+    request.deadline = request.queued_at + Duration::from_secs(10);
+    request.floor_deadline = request.queued_at + Duration::from_secs(3);
+    let original = request.deadline;
+
+    assert!(!request.promote_floor_deadline(block::Height(1)));
+    request.mark_received(block::Height(2));
+    assert!(!request.promote_floor_deadline(block::Height(2)));
+    assert_eq!(request.deadline, original);
+    assert!(request.promote_floor_deadline(block::Height(3)));
+    assert_eq!(request.deadline, request.queued_at + Duration::from_secs(3));
+    assert!(!request.promote_floor_deadline(block::Height(3)));
+    assert!(!request.promote_floor_deadline(block::Height(4)));
+}
+
+#[test]
+fn floor_deadline_promotion_never_extends_an_existing_deadline() {
+    let mut request = window_request(2);
+    request.deadline = request.queued_at + Duration::from_secs(1);
+    request.floor_deadline = request.queued_at + Duration::from_secs(3);
+    let deadline = request.deadline;
+    assert!(!request.promote_floor_deadline(block::Height(2)));
+    assert_eq!(request.deadline, deadline);
 }
 
 #[test]
@@ -5791,6 +5820,7 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
         request,
         queued_at: now,
         deadline: now,
+        floor_deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
@@ -6187,6 +6217,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
         request,
         queued_at: now,
         deadline: now,
+        floor_deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),

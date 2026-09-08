@@ -324,6 +324,8 @@ pub(super) struct PeerRoutine {
     /// Last `reset_epoch` that this routine processed.
     /// A `view.changed()` event uses the epoch to distinguish a reset from an advance.
     last_reset_epoch: u64,
+    /// Last download floor considered for outstanding request deadlines.
+    last_deadline_floor: block::Height,
     /// Start of the current interval in which this peer's outbound queue stayed full.
     /// The liveness check uses the interval to distinguish congestion from a peer that stopped reading.
     outbound_full_since: Option<Instant>,
@@ -366,7 +368,9 @@ impl PeerRoutine {
         );
         let source = zakura_header_chain::SourceId::from_digest(source_digest);
         let window = DownloadWindow::new(&config);
-        let last_reset_epoch = sequencer_view.borrow().reset_epoch;
+        let initial_view = *sequencer_view.borrow();
+        let last_reset_epoch = initial_view.reset_epoch;
+        let last_deadline_floor = initial_view.download_floor;
         let status_reply_meter = super::state::RateMeter::new(config.status_refresh_interval);
         let inbound_status_meter = super::state::RateMeter::new(
             config.status_refresh_interval.min(Duration::from_secs(1)),
@@ -403,6 +407,7 @@ impl PeerRoutine {
             routine_to_reactor,
             sequencer_view,
             last_reset_epoch,
+            last_deadline_floor,
             outbound_full_since: None,
             cancel,
             trace,
@@ -660,12 +665,25 @@ impl PeerRoutine {
     /// the post-`reset_above` `WorkQueue`. The transport is never torn down:
     /// reset clears outstanding work in place instead of respawning the routine.
     fn on_view_changed(&mut self) {
-        let reset_epoch = self.sequencer_view.borrow().reset_epoch;
+        let view = *self.sequencer_view.borrow();
+        let reset_epoch = view.reset_epoch;
+        let floor_changed = view.download_floor != self.last_deadline_floor;
+        self.last_deadline_floor = view.download_floor;
         if reset_epoch == self.last_reset_epoch {
-            // A non-destructive advance: the floor/tip the routine reads come
-            // straight from the live `view` each time they are needed, so nothing
-            // to do but let the want-work loop re-run at the top (a committed
-            // floor advance may GC our fully-committed outstanding).
+            // Speculative requests can become the next missing body without
+            // being sent again. Keep the transfer allowance captured at send time.
+            if !floor_changed {
+                return;
+            }
+            if let Ok(height) = view.download_floor.next() {
+                let mut changed = false;
+                for outstanding in &mut self.window.outstanding {
+                    changed |= outstanding.promote_floor_deadline(height);
+                }
+                if changed {
+                    self.publish_outstanding();
+                }
+            }
             return;
         }
         self.last_reset_epoch = reset_epoch;
@@ -1097,6 +1115,14 @@ impl PeerRoutine {
                 // now-slow peer cannot tighten the deadline below what it can meet.
                 self.window.bbr_btlbw_bytes_per_sec(queued_at),
             );
+            let floor_deadline = request_deadline(
+                RequestPriority::Floor,
+                queued_at,
+                self.config.request_timeout,
+                self.config.effective_floor_rescue_timeout(),
+                reserved_bytes,
+                self.window.bbr_btlbw_bytes_per_sec(queued_at),
+            );
             metrics::counter!("sync.block.request.sent").increment(1);
             if in_bypass {
                 // A floor request borrowed a bypass slot while the cwnd was saturated.
@@ -1109,6 +1135,7 @@ impl PeerRoutine {
                 request,
                 queued_at,
                 deadline,
+                floor_deadline,
                 delivery_snapshot: self.window.delivery_snapshot(queued_at),
                 delivered_bytes: 0,
                 received: ReceivedBlockTracker::default(),
@@ -2423,6 +2450,103 @@ mod tests {
             Some(now),
             now + Duration::from_secs(10)
         ));
+    }
+
+    #[tokio::test]
+    async fn floor_advance_reschedules_speculative_timeout_and_releases_once() {
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.extend(
+            super::super::test_work_scope(),
+            [(
+                block::Height(2),
+                block::Hash([2; 32]),
+                BlockSizeEstimate::Advertised(1_000),
+            )],
+        );
+        let cancel = CancellationToken::new();
+        let (out_send, mut out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let registry = Arc::new(PeerRegistry::new());
+        let generation = registry
+            .admit_session(
+                &peer,
+                super::super::ServicePeerDirection::Outbound,
+                &config,
+                0,
+                Instant::now(),
+            )
+            .generation();
+        let mut routine = PeerRoutine::new(
+            peer,
+            0,
+            session,
+            in_recv,
+            config,
+            true,
+            generation,
+            budget.clone(),
+            work.clone(),
+            registry.clone(),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            routine_to_reactor_tx,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+        routine.received_status = true;
+        routine.servable_low = block::Height(1);
+        routine.servable_high = block::Height(10);
+        let _ = routine.try_fill().await;
+        assert!(timeout(Duration::from_secs(1), out_recv.recv())
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(routine.window.outstanding.len(), 1);
+        let original = routine.window.outstanding[0].deadline;
+        let rescue = routine.window.outstanding[0].floor_deadline;
+        assert!(original > rescue);
+        assert_eq!(
+            registry.earliest_outstanding_deadline_at(block::Height(2)),
+            Some(original)
+        );
+        assert!(budget.reserved() > 0);
+
+        view_tx.send_modify(|view| view.download_floor = block::Height(1));
+        routine.on_view_changed();
+        assert_eq!(routine.window.outstanding[0].deadline, rescue);
+        assert_eq!(
+            registry.earliest_outstanding_deadline_at(block::Height(2)),
+            Some(rescue)
+        );
+        assert!(
+            routine.earliest_deadline_sleep(None).deadline().into_std()
+                <= rescue + Duration::from_millis(1)
+        );
+        assert!(!routine.expire_due_timeouts(rescue - Duration::from_millis(1)));
+        assert!(routine.expire_due_timeouts(rescue));
+        assert!(work.pending_contains(block::Height(2)));
+        assert!(!work.in_flight_contains(block::Height(2)));
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(
+            registry.earliest_outstanding_deadline_at(block::Height(2)),
+            None
+        );
+        assert!(!routine.expire_due_timeouts(original));
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// A floor request overdrafts a full in-flight budget by at most one request

@@ -2,6 +2,7 @@
 """Regression tests for the approval boundary; no credentials or network used."""
 
 from copy import deepcopy
+import base64
 import http.client
 import json
 import os
@@ -225,6 +226,39 @@ class EvidenceTests(unittest.TestCase):
 
 
 class PathTests(unittest.TestCase):
+    def test_eligible_watchdog_change_can_add_its_own_fragment(self):
+        files = [{"filename": "deploy/zakura-watchdog/src/main.rs", "status": "modified"},
+                 {"filename": "docs/changelog/unreleased/123.md", "status": "added"}]
+        self.assertEqual(POLICY.check_files(files, 2, 123), "docs/changelog/unreleased/123.md")
+
+    def test_fragment_does_not_make_application_or_release_changes_eligible(self):
+        for path in ("crates/zakura-chain/src/lib.rs", ".github/workflows/create-release.yml"):
+            with self.subTest(path=path):
+                with self.assertRaises(adapter.Ineligible):
+                    POLICY.check_files([{"filename": path, "status": "modified"},
+                                        {"filename": "docs/changelog/unreleased/123.md", "status": "added"}], 2, 123)
+
+    def test_only_own_new_fragment_is_exempt(self):
+        for path, status in (("docs/changelog/unreleased/124.md", "added"),
+                             ("docs/changelog/unreleased/123.md", "modified"),
+                             ("docs/changelog/unreleased/123.md", "removed"),
+                             ("docs/changelog/unreleased/123.md", "renamed"),
+                             ("docs/changelog/unreleased/123.md", "copied"),
+                             ("docs/changelog/unreleased/123-extra.md", "added"),
+                             ("docs/changelog/unreleased/README.md", "modified"),
+                             ("CHANGELOG.md", "modified")):
+            with self.subTest(path=path, status=status):
+                with self.assertRaises(adapter.Ineligible):
+                    POLICY.check_files([{"filename": "deploy/a.py", "status": "modified"},
+                                        {"filename": path, "status": status}], 2, 123)
+
+    def test_fragment_alone_or_without_pr_identity_does_not_qualify(self):
+        fragment = {"filename": "docs/changelog/unreleased/123.md", "status": "added"}
+        with self.assertRaises(adapter.Ineligible):
+            POLICY.check_files([fragment], 1, 123)
+        with self.assertRaises(adapter.Ineligible):
+            POLICY.check_files([{"filename": "deploy/a.py", "status": "modified"}, fragment], 2)
+
     def test_existing_files_in_all_three_roots(self):
         files = [{"filename": p, "status": "modified"} for p in (
             "deploy/deployer/deploy.py", ".github/workflows/lint.yml",
@@ -274,6 +308,86 @@ class PathTests(unittest.TestCase):
             with self.subTest(count=count):
                 with self.assertRaises(adapter.Ineligible):
                     POLICY.check_files(files, count)
+
+
+class FragmentTests(unittest.TestCase):
+    def setUp(self):
+        self.api = Mock()
+        self.worker = adapter.Adapter(self.api, POLICY, 123)
+        self.content = "<!-- changelog: none -->\n\nInternal watchdog tests only.\n"
+        self.responses = []
+        for index, part in enumerate(("docs", "changelog", "unreleased", "123.md")):
+            self.responses.append({"truncated": False, "tree": [{
+                "path": part, "sha": str(index + 1) * 40,
+                "type": "blob" if index == 3 else "tree",
+                "mode": "100644" if index == 3 else "040000",
+            }]})
+        self.responses.append({"sha": "4" * 40, "encoding": "base64", "size": len(self.content),
+                               "content": base64.b64encode(self.content.encode()).decode() + "\n"})
+
+    def check(self):
+        self.api.request.side_effect = self.responses
+        self.worker.check_fragment("docs/changelog/unreleased/123.md", HEAD)
+
+    def test_reads_regular_fragment_from_exact_head_tree(self):
+        self.check()
+        self.assertTrue(self.api.request.call_args_list[0].args[0].endswith("/git/trees/" + HEAD))
+        self.assertTrue(self.api.request.call_args_list[-1].args[0].endswith("/git/blobs/" + "4" * 40))
+
+    def test_release_waiver_requires_human_review(self):
+        text = "<!-- release-readiness: allow-patch; reason: Compatible changes. -->\n"
+        self.responses[-1].update(size=len(text), content=base64.b64encode(text.encode()).decode())
+        with self.assertRaisesRegex(adapter.Ineligible, "release-policy"):
+            self.check()
+
+    def test_symlink_executable_and_submodule_cannot_be_fragments(self):
+        for mode in ("120000", "100755", "160000"):
+            with self.subTest(mode=mode):
+                self.responses[3]["tree"][0]["mode"] = mode
+                with self.assertRaisesRegex(adapter.Ineligible, "regular non-executable"):
+                    self.check()
+
+    def test_parent_symlink_and_truncated_tree_fail_closed(self):
+        for change in ("symlink", "truncated"):
+            with self.subTest(change=change):
+                self.setUp()
+                if change == "symlink":
+                    self.responses[0]["tree"][0].update(type="blob", mode="120000")
+                else:
+                    self.responses[0]["truncated"] = True
+                with self.assertRaises(adapter.Ineligible):
+                    self.check()
+
+    def test_malformed_oversized_and_non_utf8_blob_fail_closed(self):
+        for change in ("sha", "size", "base64", "utf8"):
+            with self.subTest(change=change):
+                self.setUp()
+                blob = self.responses[-1]
+                if change == "sha":
+                    blob["sha"] = "5" * 40
+                elif change == "size":
+                    blob["size"] = 65537
+                elif change == "base64":
+                    blob["content"] = "not base64!"
+                else:
+                    blob.update(size=1, content=base64.b64encode(b"\xff").decode())
+                with self.assertRaises(adapter.Ineligible):
+                    self.check()
+
+    def test_evaluation_checks_fragment_before_native_approval_evidence(self):
+        pull = {"state": "open", "draft": False, "head": {"sha": HEAD}, "changed_files": 2,
+                "base": {"ref": "main", "sha": BASE, "repo": {"full_name": POLICY.data["repository"]}}}
+        self.api.request.return_value = pull
+        self.api.pages.return_value = [
+            {"filename": "deploy/a.py", "status": "modified"},
+            {"filename": "docs/changelog/unreleased/123.md", "status": "added"},
+        ]
+        self.worker.check_fragment = Mock(side_effect=adapter.Ineligible("Release waiver"))
+        self.worker.evidence = Mock()
+        with self.assertRaisesRegex(adapter.Ineligible, "Release waiver"):
+            self.worker.evaluate(enforce_rules=False)
+        self.worker.check_fragment.assert_called_once_with("docs/changelog/unreleased/123.md", HEAD)
+        self.worker.evidence.assert_not_called()
 
 
 def rules_fixture():

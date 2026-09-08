@@ -1,6 +1,7 @@
 {
   "repository": "zakura-core/zakura",
   "base_branch": "main",
+  "changelog_fragment_root": "docs/changelog/unreleased/",
   "eligible_roots": [
     "deploy/",
     ".github/workflows/",

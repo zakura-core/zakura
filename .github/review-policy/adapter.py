@@ -8,6 +8,8 @@ Approval policy and this executable must come from the trusted default branch.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -76,6 +78,8 @@ class Policy:
     def human_patterns(self):
         # GitHub required-reviewer patterns are ordered gitignore patterns.
         return ["*"] + [f"!/{root}**" for root in self.data["eligible_roots"]] + [
+            f"!/{self.data['changelog_fragment_root']}[0-9]*.md"
+        ] + [
             f"/{path}{'**' if path.endswith('/') else ''}"
             for path in self.data["human_only"]
         ]
@@ -91,10 +95,19 @@ class Policy:
             for p in self.data["human_only"]
         )
 
-    def check_files(self, files, expected_count):
+    def check_files(self, files, expected_count, pr_number=None):
+        """Return the optional new PR-owned fragment; other changes must qualify."""
         require(0 < len(files) == expected_count < 3000, "Incomplete or empty changed-file list")
         require(len({f["filename"] for f in files}) == len(files), "Duplicate changed files")
+        fragment = None
+        own_fragment = (f"{self.data['changelog_fragment_root']}{pr_number}.md"
+                        if isinstance(pr_number, int) and pr_number > 0 else None)
         for file in files:
+            if file["filename"] == own_fragment:
+                require(file.get("status") == "added" and not file.get("previous_filename"),
+                        "Only a newly added changelog fragment for this PR qualifies")
+                fragment = own_fragment
+                continue
             require(file.get("status") in ("modified", "removed", "renamed"),
                     "New or unclassified files require human review")
             paths = [file["filename"]]
@@ -104,6 +117,9 @@ class Policy:
             require(all(self.eligible_path(p) for p in paths),
                     "Changed files include a path requiring human review")
             require(file["status"] != "renamed", "Renamed files require human classification")
+        require(len(files) > int(fragment is not None),
+                "A changelog fragment must accompany an eligible CI or deployment change")
+        return fragment
 
     def native(self, obj):
         return (obj.get("user", {}).get("id") == self.data["codex_user_id"]
@@ -328,13 +344,46 @@ class Adapter:
         return check_evidence(self.policy, pull, comments, summary, reactions, reviews,
                               self.threads(), resolved)
 
+    def check_fragment(self, path, head):
+        """Read the regular fragment blob at the reviewed head without executing it."""
+        tree_sha = head
+        parts = path.split("/")
+        for index, part in enumerate(parts):
+            tree = self.api.request(f"{self.prefix}/git/trees/{tree_sha}")
+            require(tree.get("truncated") is False, "Incomplete changelog tree")
+            entries = [entry for entry in tree["tree"] if entry["path"] == part]
+            require(len(entries) == 1, "Changelog fragment is missing from the current commit")
+            entry = entries[0]
+            if index < len(parts) - 1:
+                require(entry["type"] == "tree" and entry["mode"] == "040000",
+                        "Changelog parent must be a directory")
+            else:
+                require(entry["type"] == "blob" and entry["mode"] == "100644",
+                        "Changelog fragment must be a regular non-executable file")
+            require(re.fullmatch(r"[0-9a-f]{40}", entry["sha"]) is not None, "Invalid changelog object ID")
+            tree_sha = entry["sha"]
+        blob = self.api.request(f"{self.prefix}/git/blobs/{tree_sha}")
+        require(blob["sha"] == tree_sha and blob["encoding"] == "base64"
+                and 0 < blob["size"] <= 65536 and isinstance(blob["content"], str),
+                "Unsupported changelog fragment blob")
+        try:
+            raw = base64.b64decode("".join(blob["content"].splitlines()), validate=True)
+            content = raw.decode("utf-8")
+        except (binascii.Error, UnicodeError, ValueError) as exc:
+            raise Ineligible("Changelog fragment is not valid UTF-8 text") from exc
+        require(len(raw) == blob["size"], "Incomplete changelog fragment blob")
+        require("release-readiness" not in content.casefold(),
+                "Changelog release-policy directives require human review")
+
     def evaluate(self, enforce_rules=True):
         pull = self.api.request(self.pull_path)
         require(pull["state"] == "open" and not pull["draft"], "PR is closed or a draft")
         require(pull["base"]["repo"]["full_name"] == self.repo
                 and pull["base"]["ref"] == self.policy.data["base_branch"], "Unsupported base branch")
         files = self.api.pages(self.pull_path + "/files")
-        self.policy.check_files(files, pull["changed_files"])
+        fragment = self.policy.check_files(files, pull["changed_files"], self.number)
+        if fragment:
+            self.check_fragment(fragment, pull["head"]["sha"])
         if enforce_rules:
             check_rules(self.api, self.policy, self.team_id)
         receipt = self.evidence(pull)

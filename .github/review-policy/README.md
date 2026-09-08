@@ -38,6 +38,16 @@ One excluded file makes the whole PR ineligible. Both names in a rename are
 checked; additions and renames require human classification before they can be
 treated as existing eligible files in later PRs.
 
+There is one addition exception: an otherwise eligible PR may add its own
+`docs/changelog/unreleased/<PR-number>.md` fragment. For example, PR #123 may
+modify `deploy/zakura-watchdog/src/main.rs` and add
+`docs/changelog/unreleased/123.md`. Later edits to that new fragment within the
+same PR still qualify because it remains an addition relative to the base.
+The fragment must be a regular text file without `release-readiness` directives;
+release-policy waivers still need human review. The root `CHANGELOG.md`, other
+PRs' fragments, existing fragment edits/deletions, and changelog-only PRs remain
+on the human-review path. Changelog CI continues to validate fragment syntax.
+
 Release exclusions cover the existing release gates and publishing helpers.
 Ordinary fleet deployment and the advisory VCT canary remain in the deployment
 scope; the release workflow treats these as advisory operations. When adding or
@@ -105,6 +115,8 @@ Keep `CODEX_APPROVAL_ENABLED` unset or `false` until setup and validation finish
    python3 .github/review-policy/adapter.py --patterns
    ```
 
+   The patterns include the numbered-fragment exception; the adapter additionally
+   enforces PR ownership, addition-only status, and the release-directive exclusion.
    Add them as one **Required reviewers** entry. In the REST ruleset schema this
    is `required_reviewers[{file_patterns, minimum_approvals: 1,
    reviewer: {id: TEAM_ID, type: "Team"}}]`. Keep the ruleset active with no bypass
@@ -133,6 +145,8 @@ eligible PR, a PR with findings, fixes followed by another review, and a push
 after approval. Also test a mixed PR, a release helper edit, and a source file
 renamed into an eligible directory. The App's review must count for the eligible
 PR while protected paths still require a human team member.
+Test an eligible change accompanied by its own new changelog fragment, plus
+rejections for another PR's fragment and a fragment containing a release waiver.
 
 Specifically delay an approval request until after a new commit is pushed and
 confirm GitHub will not permit merging based on that old-commit review. The

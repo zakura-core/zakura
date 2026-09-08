@@ -393,10 +393,7 @@ class FragmentTests(unittest.TestCase):
 def rules_fixture():
     return [{"type": "pull_request", "ruleset_id": 1, "ruleset_source_type": "Repository",
              "parameters": {"required_approving_review_count": 1,
-                            "dismiss_stale_reviews_on_push": True, "require_last_push_approval": True,
-                            "required_reviewers": [{"file_patterns": POLICY.human_patterns,
-                                                    "minimum_approvals": 1,
-                                                    "reviewer": {"id": 42, "type": "Team"}}]}},
+                            "dismiss_stale_reviews_on_push": True, "require_last_push_approval": True}},
             {"type": "required_status_checks",
              "parameters": {"required_status_checks": [{"context": "test success"}]}}]
 
@@ -408,14 +405,13 @@ class RulesTests(unittest.TestCase):
         self.api = Mock()
         self.api.request.side_effect = lambda path: self.full if "/rulesets/" in path else self.rules
 
-    def test_native_human_paths_and_freshness_are_required(self):
-        adapter.check_rules(self.api, POLICY, 42)
+    def test_normal_approval_rules_work_without_a_reviewer_team(self):
+        adapter.check_rules(self.api, POLICY)
 
     def test_current_live_rule_configuration_cannot_enable_adapter(self):
-        self.rules[0]["parameters"]["required_reviewers"] = []
         self.rules[0]["parameters"]["dismiss_stale_reviews_on_push"] = False
         with self.assertRaises(adapter.Ineligible):
-            adapter.check_rules(self.api, POLICY, 42)
+            adapter.check_rules(self.api, POLICY)
 
     def test_each_freshness_switch_is_required(self):
         for key in ("dismiss_stale_reviews_on_push", "require_last_push_approval"):
@@ -423,17 +419,23 @@ class RulesTests(unittest.TestCase):
                 self.rules = rules_fixture()
                 self.rules[0]["parameters"][key] = False
                 with self.assertRaises(adapter.Ineligible):
-                    adapter.check_rules(self.api, POLICY, 42)
+                    adapter.check_rules(self.api, POLICY)
 
-    def test_human_patterns_must_match_including_order_and_exceptions(self):
-        self.rules[0]["parameters"]["required_reviewers"][0]["file_patterns"] = ["*"]
-        with self.assertRaises(adapter.Ineligible):
-            adapter.check_rules(self.api, POLICY, 42)
+    def test_existing_reviewer_rules_are_preserved(self):
+        self.rules[0]["parameters"]["required_reviewers"] = [
+            {"file_patterns": ["crates/**"], "minimum_approvals": 1,
+             "reviewer": {"id": 42, "type": "Team"}}]
+        self.rules[0]["parameters"]["require_code_owner_review"] = True
+        before = deepcopy(self.rules)
+        adapter.check_rules(self.api, POLICY)
+        self.assertEqual(self.rules, before)
 
-    def test_missing_team_test_gate_or_bypass_stops_approval(self):
-        for change in ("team", "ci", "bypass", "evaluate"):
+    def test_missing_approval_test_gate_or_bypass_stops_approval(self):
+        for change in ("approval", "ci", "bypass", "evaluate"):
             with self.subTest(change=change):
                 self.setUp()
+                if change == "approval":
+                    self.rules[0]["parameters"]["required_approving_review_count"] = 0
                 if change == "ci":
                     self.rules.pop()
                 if change == "bypass":
@@ -441,7 +443,7 @@ class RulesTests(unittest.TestCase):
                 if change == "evaluate":
                     self.full["enforcement"] = "evaluate"
                 with self.assertRaises(adapter.Ineligible):
-                    adapter.check_rules(self.api, POLICY, 0 if change == "team" else 42)
+                    adapter.check_rules(self.api, POLICY)
 
 
 def receipt():
@@ -459,7 +461,7 @@ class ReconcileTests(unittest.TestCase):
     def setUp(self):
         self.api, self.writer = Mock(), Mock()
         self.api.pages.return_value = []
-        self.worker = adapter.Adapter(self.api, POLICY, 1, team_id=42, writer=self.writer,
+        self.worker = adapter.Adapter(self.api, POLICY, 1, writer=self.writer,
                                       app_id=APP_ID, bot_id=BOT_ID, trusted_sha=BASE)
         self.worker.check_trusted_revision = Mock()
         self.worker.evaluate = Mock(return_value=receipt())
@@ -481,7 +483,9 @@ class ReconcileTests(unittest.TestCase):
         self.writer.request.assert_not_called()
 
     def test_stale_approval_is_dismissed_without_touching_human_or_other_bot(self):
-        self.api.pages.return_value = [owned_review(), owned_review(identity=900)]
+        self.api.pages.return_value = [owned_review(), owned_review(identity=900),
+                                      {"id": 600, "state": "APPROVED", "body": "Looks good",
+                                       "user": {"id": 901, "type": "User"}, "commit_id": HEAD}]
         self.worker.evaluate.side_effect = adapter.Ineligible("New head is not reviewed")
         result = self.worker.reconcile()
         self.assertFalse(result["approved"])

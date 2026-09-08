@@ -57,8 +57,8 @@ jobs:
       vars.CODEX_APPROVAL_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Restrict this environment to main. The App must not be a member of the
-    # required human team or have a ruleset bypass or administration permission.
+    # Restrict this environment to main. The App must not have a ruleset bypass
+    # or administration permission.
     environment: codex-approval
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -83,5 +83,4 @@ jobs:
           CODEX_APPROVAL_APP_CLIENT_ID: ${{ vars.CODEX_APPROVAL_APP_CLIENT_ID }}
           CODEX_APPROVAL_APP_SLUG: ${{ steps.approval-token.outputs.app-slug }}
           CODEX_APPROVAL_BOT_ID: ${{ vars.CODEX_APPROVAL_BOT_ID }}
-          CODEX_APPROVAL_HUMAN_TEAM_ID: ${{ vars.CODEX_APPROVAL_HUMAN_TEAM_ID }}
         run: TRUSTED_SHA="$(git rev-parse HEAD)" python3 .github/review-policy/adapter.py --apply --event "$GITHUB_EVENT_PATH" --wait-seconds 10

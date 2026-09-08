@@ -18,6 +18,12 @@ new clean review. Resolving a finding by itself does not qualify the PR.
 Personal automatic-review settings and native Codex comments stay as they are.
 The adapter does not need an OpenAI API key or consume a second review.
 
+The App supplies an approval through the repository's normal approval process.
+No dedicated reviewer team or additional path-based reviewer rule is required.
+The adapter enforces its own file eligibility policy. If it cannot approve a PR,
+the contributor requests review from the usual reviewers under the existing
+repository rules. Existing reviewer or code-owner requirements still apply.
+
 If a PR does not qualify, get a normal human approval. The adapter never submits
 `REQUEST_CHANGES` or installs a mandatory Codex status check. Its Actions summary
 explains why it withheld approval. Scoped prompts, security-only reviews, drafts,
@@ -52,7 +58,7 @@ Release exclusions cover the existing release gates and publishing helpers.
 Ordinary fleet deployment and the advisory VCT canary remain in the deployment
 scope; the release workflow treats these as advisory operations. When adding or
 moving a release helper into an eligible root, add it to `human_only` in the same
-human-reviewed PR. Update the GitHub reviewer patterns with every scope change.
+human-reviewed PR.
 
 ## Native review evidence
 
@@ -94,38 +100,28 @@ Keep `CODEX_APPROVAL_ENABLED` unset or `false` until setup and validation finish
 3. Create the `codex-approval` environment, restricted to the `main` branch.
    Keep the App key in Infisical with a dedicated service scope, and sync it to
    the environment secret `CODEX_APPROVAL_APP_PRIVATE_KEY`. Required environment
-   reviewers would make each adapter execution manual, so use the native PR
-   reviewer rules below for human approval requirements.
-4. Set these repository variables from the App and human team metadata:
+   reviewers would make each adapter execution manual, so leave them unset for
+   normal automatic operation.
+4. Set these repository variables from the App metadata:
 
    | Variable | Value |
    | --- | --- |
    | `CODEX_APPROVAL_APP_CLIENT_ID` | The dedicated App's client ID |
    | `CODEX_APPROVAL_APP_ID` | Its numeric App ID |
    | `CODEX_APPROVAL_BOT_ID` | Numeric ID of its `[bot]` account |
-   | `CODEX_APPROVAL_HUMAN_TEAM_ID` | Numeric ID of the human reviewer team with repository write access |
 
 5. Update the active `main` repository ruleset. Retain the global one-approval
    requirement and the existing required `test success` check. Enable both
    **Dismiss stale pull request approvals when new commits are pushed** and
-   **Require approval of the most recent reviewable push**. Require one approval
-   from the human team on the ordered patterns printed by:
-
-   ```sh
-   python3 .github/review-policy/adapter.py --patterns
-   ```
-
-   The patterns include the numbered-fragment exception; the adapter additionally
-   enforces PR ownership, addition-only status, and the release-directive exclusion.
-   Add them as one **Required reviewers** entry. In the REST ruleset schema this
-   is `required_reviewers[{file_patterns, minimum_approvals: 1,
-   reviewer: {id: TEAM_ID, type: "Team"}}]`. Keep the ruleset active with no bypass
-   actors. Human team approval can satisfy the global requirement too; the App
-   cannot satisfy the human team requirement for release or application changes.
+   **Require approval of the most recent reviewable push**. Keep the ruleset
+   active with no bypass actors. Preserve existing reviewer and code-owner
+   requirements; do not add a dedicated team or path-based reviewer rule for
+   this adapter. Release and other excluded changes get no adapter approval and
+   follow the normal approval process.
 6. Run the validation below with disposable PRs before enabling normal use.
    Finally set `CODEX_APPROVAL_ENABLED=true`.
 
-The writer independently rereads the ruleset and checks its patterns, team,
+The writer independently rereads the ruleset and checks its approval requirement,
 freshness controls, and required test check before every approval. Missing or
 weakened configuration prevents new approvals. A trusted `main` checkout is used
 in both jobs; PR code, artifacts, and commands never execute with the App token.
@@ -144,7 +140,7 @@ In a repository with matching rules and App permissions, validate a clean
 eligible PR, a PR with findings, fixes followed by another review, and a push
 after approval. Also test a mixed PR, a release helper edit, and a source file
 renamed into an eligible directory. The App's review must count for the eligible
-PR while protected paths still require a human team member.
+PR while excluded paths receive no adapter approval and need normal review.
 Test an eligible change accompanied by its own new changelog fragment, plus
 rejections for another PR's fragment and a fragment containing a release waiver.
 
@@ -166,10 +162,10 @@ backstop. There is no synchronous Codex merge check.
 To stop new approval writes, set `CODEX_APPROVAL_ENABLED=false`. Dismiss existing
 adapter approvals if they must stop counting immediately; disabling the workflow
 or revoking the key does not erase reviews already submitted. Retain the global
-approval requirement and human path rules so ordinary human review keeps working.
+approval requirement so ordinary human review keeps working.
 
 ## References
 
 - [Native Codex GitHub reviews](https://learn.chatgpt.com/docs/third-party/github)
-- [GitHub required reviewers and freshness rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
+- [GitHub PR approval and freshness rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 - [GitHub pull request review API](https://docs.github.com/en/rest/pulls/reviews#create-a-review-for-a-pull-request)

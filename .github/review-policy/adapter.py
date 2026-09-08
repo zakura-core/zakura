@@ -74,16 +74,6 @@ class Policy:
     def digest(self):
         return hashlib.sha256(json.dumps(self.data, sort_keys=True).encode()).hexdigest()
 
-    @property
-    def human_patterns(self):
-        # GitHub required-reviewer patterns are ordered gitignore patterns.
-        return ["*"] + [f"!/{root}**" for root in self.data["eligible_roots"]] + [
-            f"!/{self.data['changelog_fragment_root']}[0-9]*.md"
-        ] + [
-            f"/{path}{'**' if path.endswith('/') else ''}"
-            for path in self.data["human_only"]
-        ]
-
     def eligible_path(self, path):
         # Reject paths whose representation could disagree with GitHub matching.
         if (not isinstance(path, str) or not path or "\\" in path
@@ -262,8 +252,8 @@ def check_evidence(policy, pull, comments, summary, reactions, reviews, threads,
             "policy": policy.digest}
 
 
-def check_rules(api, policy, team_id):
-    require(team_id > 0, "Human reviewer team is not configured")
+def check_rules(api, policy):
+    """Check approval freshness without changing the repository's reviewer policy."""
     repo = policy.data["repository"]
     branch = urllib.parse.quote(policy.data["base_branch"], safe="")
     rules = api.request(f"/repos/{repo}/rules/branches/{branch}")
@@ -279,25 +269,20 @@ def check_rules(api, policy, team_id):
                 and parameters.get("dismiss_stale_reviews_on_push")
                 and parameters.get("require_last_push_approval")):
             continue
-        matching = any(r.get("file_patterns") == policy.human_patterns
-                       and r.get("minimum_approvals", 0) >= 1
-                       and r.get("reviewer") == {"id": team_id, "type": "Team"}
-                       for r in parameters.get("required_reviewers", []))
-        if matching:
-            require(rule.get("ruleset_source_type") == "Repository",
-                    "Expected a repository ruleset")
-            full = api.request(f"/repos/{repo}/rulesets/{int(rule['ruleset_id'])}")
-            require(full.get("enforcement") == "active" and not full.get("bypass_actors"),
-                    "Review ruleset must be active without bypass actors")
-            return
-    raise Ineligible("Required human-path and stale-review protections are not active")
+        require(rule.get("ruleset_source_type") == "Repository",
+                "Expected a repository ruleset")
+        full = api.request(f"/repos/{repo}/rulesets/{int(rule['ruleset_id'])}")
+        require(full.get("enforcement") == "active" and not full.get("bypass_actors"),
+                "Review ruleset must be active without bypass actors")
+        return
+    raise Ineligible("Required approval and stale-review protections are not active")
 
 
 class Adapter:
-    def __init__(self, api, policy, number, team_id=0, writer=None, app_id=0, bot_id=0,
+    def __init__(self, api, policy, number, writer=None, app_id=0, bot_id=0,
                  trusted_sha=None):
         self.api, self.policy, self.number = api, policy, number
-        self.team_id, self.writer = team_id, writer
+        self.writer = writer
         self.app_id, self.bot_id, self.trusted_sha = app_id, bot_id, trusted_sha
         self.repo = policy.data["repository"]
         self.prefix = f"/repos/{self.repo}"
@@ -385,7 +370,7 @@ class Adapter:
         if fragment:
             self.check_fragment(fragment, pull["head"]["sha"])
         if enforce_rules:
-            check_rules(self.api, self.policy, self.team_id)
+            check_rules(self.api, self.policy)
         receipt = self.evidence(pull)
         again = self.api.request(self.pull_path)
         require(pull["head"]["sha"] == again["head"]["sha"]
@@ -461,7 +446,7 @@ class Adapter:
         body = (marker + "\n\nNative Codex completed a clean review of `" + receipt["head"]
                 + "`. Every changed path is eligible for Codex approval.\n\n"
                 + f"[Native review summary](https://github.com/{self.repo}/pull/{self.number}"
-                + f"#issuecomment-{receipt['summary']}). Required CI and human path rules still apply.")
+                + f"#issuecomment-{receipt['summary']}). Existing merge requirements still apply.")
         created = None
         try:
             created = self.writer.request(self.pull_path + "/reviews", "POST", {
@@ -504,14 +489,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pr", type=int)
     parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--patterns", action="store_true", help="Print required human reviewer patterns")
     parser.add_argument("--event", type=Path)
     parser.add_argument("--wait-seconds", type=int, default=0, choices=range(0, 61), metavar="0..60")
     args = parser.parse_args()
     policy = Policy.load()
-    if args.patterns:
-        print(json.dumps(policy.human_patterns, indent=2))
-        return 0
     require(os.environ.get("GITHUB_REPOSITORY", policy.data["repository"]) == policy.data["repository"],
             "This policy is only for the canonical repository")
     api = GitHub(os.environ["GH_TOKEN"])
@@ -535,7 +516,6 @@ def main():
     results = []
     for number in numbers:
         adapter = Adapter(api, policy, number,
-                          team_id=int(os.environ.get("CODEX_APPROVAL_HUMAN_TEAM_ID") or 0),
                           writer=writer, app_id=int(os.environ.get("CODEX_APPROVAL_APP_ID") or 0),
                           bot_id=int(os.environ.get("CODEX_APPROVAL_BOT_ID") or 0),
                           trusted_sha=os.environ.get("TRUSTED_SHA"))

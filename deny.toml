@@ -14,11 +14,7 @@ yanked = "deny"
 ignore = [
     "RUSTSEC-2025-0119", # number_prefix — transitive via indicatif
     "RUSTSEC-2025-0141", # bincode — direct dependency
-    "RUSTSEC-2026-0118", # hickory-proto — transitive via iroh
-    "RUSTSEC-2026-0119", # hickory-proto — transitive via iroh
-    "RUSTSEC-2024-0384", # instant — transitive via iroh
-    "RUSTSEC-2024-0436", # paste — transitive via iroh/netdev/stun-rs
-    "RUSTSEC-2023-0089", # atomic-polyfill — transitive via iroh-metrics/postcard
+    "RUSTSEC-2024-0436", # paste — transitive via netwatch/netlink-packet-core
 ]
 
 # This section is considered when running `cargo deny check licenses`.
@@ -175,22 +171,28 @@ skip-tree = [
     # wait for hashlink/petgraph/metrics-util to update hashbrown and foldhash
     { name = "hashbrown", version = "0.15" },
 
-    # iroh uses a renamed Quinn stack and network-interface helper crates that
-    # are not yet unified with Zebra's existing reqwest/rustls dependency stack.
-    # Keep these narrow and remove them as the upstream crates converge.
-    { name = "cpufeatures", version = "=0.3.0" },
-    { name = "derive_more", version = "=1.0.0" },
-    { name = "derive_more", version = "=2.1.1" },
-    { name = "derive_more-impl", version = "=1.0.0" },
-    { name = "hmac", version = "=0.12.1" },
-    { name = "netdev", version = "=0.36.0" },
-    { name = "netwatch", version = "=0.9.0" },
-    # OpenTelemetry 0.32 uses reqwest 0.13; iroh 0.92 remains on 0.12.
-    # Remove this once the iroh 1.x upgrade unifies Zakura on reqwest 0.13.
+    # Existing consumers still use these versions alongside Iroh's newer graph.
+    { name = "convert_case", version = "=0.8.0" },
+    { name = "rand_core", version = "=0.9.5" },
     { name = "reqwest", version = "=0.12.28" },
-    { name = "socket2", version = "=0.5.10" },
+    { name = "shlex", version = "=1.3.0" },
     { name = "spin", version = "=0.10.1" },
-    { name = "webpki-roots", version = "=0.26.11" },
+
+    # Iroh's netwatch uses two netdev releases for platform support. Remove
+    # these exceptions when its OS dependency families converge.
+    { name = "netdev", version = "=0.45.1" },
+    { name = "netlink-packet-core", version = "=0.8.2" },
+    { name = "netlink-packet-route", version = "=0.31.0" },
+    { name = "jni", version = "=0.21.1" },
+    { name = "jni-sys", version = "=0.3.1" },
+    # Hickory's system configuration and reqwest's platform verifier differ.
+    { name = "core-foundation", version = "=0.9.4" },
+    # Iroh's derive_more and netdev have moved ahead of the rest of the workspace.
+    { name = "derive_more", version = "=1.0.0" },
+    { name = "derive_more-impl", version = "=1.0.0" },
+    { name = "strum", version = "=0.27.2" },
+    { name = "strum_macros", version = "=0.27.2" },
+
 ]
 
 # This section is considered when running `cargo deny check sources`.
@@ -210,7 +212,8 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-allow-git = []
+allow-git = ["https://github.com/zakura-core/iroh"]
+required-git-spec = "rev"
 
 [sources.allow-org]
 github = [

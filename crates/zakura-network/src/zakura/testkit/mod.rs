@@ -8,6 +8,8 @@ mod cluster;
 mod endpoint;
 mod gossip;
 mod hostile;
+#[cfg(test)]
+mod interop;
 mod matrix;
 #[cfg(test)]
 mod mock_blocksync;

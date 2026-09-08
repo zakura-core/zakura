@@ -3641,7 +3641,7 @@ mod tests {
 
     async fn node_peer_id(node: &ZakuraTestNode) -> Result<ZakuraPeerId, BoxError> {
         Ok(ZakuraPeerId::new(
-            node.node_addr().await.node_id.as_bytes().to_vec(),
+            node.node_addr().await.id.as_bytes().to_vec(),
         )?)
     }
 

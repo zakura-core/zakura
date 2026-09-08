@@ -17,13 +17,10 @@ use std::{
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use futures::StreamExt as _;
-use iroh::Watcher as _;
 use iroh::{
-    endpoint::{
-        Connection, ConnectionType, Endpoint, RecvStream, SendStream, TransportConfig, VarInt,
-    },
+    endpoint::{Connection, Endpoint, QuicTransportConfig, RecvStream, SendStream, VarInt},
     protocol::{AcceptError, ProtocolHandler, Router},
-    NodeAddr, NodeId, SecretKey,
+    EndpointAddr, EndpointId, SecretKey,
 };
 use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
@@ -474,9 +471,8 @@ impl ZakuraLocalLimits {
     }
 
     /// Returns the QUIC transport config matching these local limits.
-    pub fn transport_config(&self) -> TransportConfig {
-        let mut transport = TransportConfig::default();
-        transport
+    pub fn transport_config(&self) -> QuicTransportConfig {
+        QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(VarInt::from_u32(u32::from(self.max_open_streams)))
             .max_concurrent_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW))
@@ -487,10 +483,10 @@ impl ZakuraLocalLimits {
                     .try_into()
                     .expect("default Zakura idle timeout is a valid QUIC idle timeout"),
             ))
-            .keep_alive_interval(Some(self.keep_alive_interval))
+            .keep_alive_interval(self.keep_alive_interval)
             .datagram_receive_buffer_size(None)
-            .datagram_send_buffer_size(0);
-        transport
+            .datagram_send_buffer_size(0)
+            .build()
     }
 }
 
@@ -592,8 +588,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
 
 impl ZakuraEndpoint {
     /// Returns the local iroh identity used to authenticate native connections.
-    pub(crate) fn local_node_id(&self) -> NodeId {
-        self.router.endpoint().node_id()
+    pub(crate) fn local_node_id(&self) -> EndpointId {
+        self.router.endpoint().id()
     }
 
     /// Returns the connector injected into the legacy handshake path.
@@ -608,10 +604,10 @@ impl ZakuraEndpoint {
     /// so the encoded prelude stays within its bounded hint limits.
     pub(crate) async fn local_upgrade_hints(&self) -> (Vec<u8>, Vec<Vec<u8>>) {
         let endpoint = self.router.endpoint();
-        let node_id = endpoint.node_id().as_bytes().to_vec();
-        let node_addr = endpoint.node_addr().initialized().await;
+        let node_id = endpoint.id().as_bytes().to_vec();
+        let node_addr = endpoint.addr();
         let direct_addresses = node_addr
-            .direct_addresses()
+            .ip_addrs()
             .take(super::MAX_IROH_DIRECT_ADDRESSES)
             .map(|addr| addr.to_string().into_bytes())
             .collect();
@@ -710,16 +706,8 @@ impl ZakuraEndpoint {
     }
 
     /// Returns the endpoint's current direct node address.
-    pub async fn node_addr(&self) -> NodeAddr {
-        self.router.endpoint().node_addr().initialized().await
-    }
-
-    /// Teach this endpoint how to reach a peer directly.
-    pub fn add_node_addr(
-        &self,
-        node_addr: NodeAddr,
-    ) -> Result<(), iroh::endpoint::AddNodeAddrError> {
-        self.router.endpoint().add_node_addr(node_addr)
+    pub async fn node_addr(&self) -> EndpointAddr {
+        self.router.endpoint().addr()
     }
 
     /// Start a native Zakura dial in the background, maintaining it with
@@ -733,7 +721,7 @@ impl ZakuraEndpoint {
     /// recovery path for short Zakura disconnects; the address-book liveness
     /// keeper prevents the slower legacy crawler from churning while this dial
     /// owns the peer.
-    pub fn spawn_native_dial(&self, node_addr: NodeAddr) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_native_dial(&self, node_addr: EndpointAddr) -> tokio::task::JoinHandle<()> {
         let endpoint = self.clone();
         let limits = self.handler.limits.clone();
         let policy = RedialPolicy::maintain(
@@ -749,8 +737,11 @@ impl ZakuraEndpoint {
     /// connection is still settling. Deduplicate those retries so repeated
     /// legacy upgrades do not create a swarm of independent maintained QUIC
     /// dial loops to the same peer.
-    pub(crate) fn start_upgrade_native_dial(&self, node_addr: NodeAddr) -> ZakuraUpgradeDialStart {
-        let Ok(peer_id) = ZakuraPeerId::new(node_addr.node_id.as_bytes().to_vec()) else {
+    pub(crate) fn start_upgrade_native_dial(
+        &self,
+        node_addr: EndpointAddr,
+    ) -> ZakuraUpgradeDialStart {
+        let Ok(peer_id) = ZakuraPeerId::new(node_addr.id.as_bytes().to_vec()) else {
             return ZakuraUpgradeDialStart::InvalidPeerId;
         };
 
@@ -1963,45 +1954,27 @@ fn random_stream_session_seed() -> u64 {
     }
 }
 
-/// Resolve a connected peer's confirmed UDP source IP from the endpoint's node
-/// map so the per-IP connection cap can be enforced against the path that
-/// actually carries the connection.
+/// Charge the selected authenticated IP path, never an advertised dial hint.
 ///
-/// Used for both directions. Inbound: iroh exposes the peer address on
-/// `Incoming`, which the Router consumes before `ProtocolHandler::accept`.
-/// Outbound: a dialed peer may advertise several addresses, but only one path
-/// ends up carrying the connection — charging the first *advertised* address
-/// lets a record list a decoy address to escape the cap. In both cases, after
-/// the native control handshake the connection has exchanged real QUIC payload
-/// over its direct path, so the endpoint's node map knows the peer's UDP
-/// address: prefer the connection's confirmed current path (`conn_type`), then
-/// fall back to the direct address that most recently delivered payload from
-/// this peer. Relay-only paths have no single attributable source IP, so they
-/// correctly yield `None` (the global connection cap still bounds them).
-fn confirmed_remote_ip(endpoint: &Endpoint, node_id: NodeId) -> Option<IpAddr> {
-    if let Some(mut conn_type) = endpoint.conn_type(node_id) {
-        match conn_type.get() {
-            ConnectionType::Direct(addr) | ConnectionType::Mixed(addr, _) => {
-                return Some(addr.ip())
-            }
-            ConnectionType::Relay(_) | ConnectionType::None => {}
+/// A peer can advertise decoy addresses. The completed control handshake has
+/// exchanged application data on this connection, whose selected path identifies
+/// the actual source IP. Relay and custom paths have no attributable IP here.
+fn confirmed_remote_ip(connection: &Connection) -> Option<IpAddr> {
+    connection.paths().iter().find_map(|path| {
+        if !path.is_selected() {
+            return None;
         }
-    }
-    endpoint.remote_info(node_id).and_then(|info| {
-        info.addrs
-            .into_iter()
-            .filter(|addr| addr.last_payload.is_some())
-            // Smallest elapsed-since-last-payload is the path actively carrying
-            // this connection's traffic, i.e. the real inbound source address.
-            .min_by_key(|addr| addr.last_payload)
-            .map(|addr| addr.addr.ip())
+        match path.remote_addr() {
+            iroh::TransportAddr::Ip(addr) => Some(addr.ip()),
+            _ => None,
+        }
     })
 }
 
 fn native_connection_transcript_hash(
     direction: ServicePeerDirection,
-    local_node_id: &NodeId,
-    remote_node_id: &NodeId,
+    local_node_id: &EndpointId,
+    remote_node_id: &EndpointId,
 ) -> [u8; TRANSCRIPT_HASH_BYTES] {
     let initiator = match direction {
         ServicePeerDirection::Inbound => remote_node_id,
@@ -2014,7 +1987,7 @@ fn native_connection_transcript_hash(
 /// The endpoint with the smaller node ID opens the stream.
 /// The other endpoint accepts the stream.
 /// Older peers also use this result to resolve simultaneous offers.
-fn i_open_collision_winner(local_node_id: &NodeId, remote_node_id: &NodeId) -> bool {
+fn i_open_collision_winner(local_node_id: &EndpointId, remote_node_id: &EndpointId) -> bool {
     local_node_id.as_bytes() < remote_node_id.as_bytes()
 }
 
@@ -2137,7 +2110,7 @@ impl ZakuraProtocolHandler {
             return Ok(());
         };
 
-        let remote_node_id = connection.remote_node_id()?;
+        let remote_node_id = connection.remote_id();
         let remote_peer_id =
             ZakuraPeerId::new(remote_node_id.as_bytes().to_vec()).map_err(AcceptError::from_err)?;
         let conn = ZakuraConnTrace::new(&self.trace, conn_id, &remote_peer_id);
@@ -2156,22 +2129,12 @@ impl ZakuraProtocolHandler {
         };
 
         let conn_limits = self.limits.clamp(&negotiated.limits);
-        // Iroh's Router hands ProtocolHandler only the established Connection;
-        // the peer UDP address lives on Incoming, which the Router consumes
-        // before this point. Recover it from the endpoint's node map so the
-        // per-IP admission cap applies to inbound accepts and a single source
-        // IP cannot fill the global connection budget with distinct node ids.
-        // The handshake above has already exchanged QUIC payload over the
-        // direct path, so the node map knows the peer's address. Native
-        // outbound dials still pass the configured direct IP.
-        let remote_ip = self
-            .endpoint
-            .as_ref()
-            .and_then(|endpoint| confirmed_remote_ip(endpoint, remote_node_id));
+        // Attribute inbound peers to the authenticated connection's active path.
+        let remote_ip = confirmed_remote_ip(&connection);
         let local_node_id = self
             .endpoint
             .as_ref()
-            .map(|endpoint| endpoint.node_id())
+            .map(|endpoint| endpoint.id())
             .unwrap_or(remote_node_id);
         let direction = ServicePeerDirection::Inbound;
         self.register_and_serve(
@@ -3355,17 +3318,17 @@ const ZAKURA_LOOPBACK_BIND_V6: SocketAddrV6 = SocketAddrV6::new(Ipv6Addr::LOCALH
 fn bind_native_endpoint(
     builder: iroh::endpoint::Builder,
     listen_addr: Option<SocketAddr>,
-) -> iroh::endpoint::Builder {
+) -> Result<iroh::endpoint::Builder, iroh::endpoint::InvalidSocketAddr> {
+    let builder = builder.clear_ip_transports();
     match listen_addr {
-        Some(SocketAddr::V4(addr)) => builder.bind_addr_v4(addr),
-        Some(SocketAddr::V6(addr)) => builder.bind_addr_v6(addr),
+        Some(addr) => builder.bind_addr(addr),
         None => builder
-            .bind_addr_v4(ZAKURA_LOOPBACK_BIND_V4)
-            .bind_addr_v6(ZAKURA_LOOPBACK_BIND_V6),
+            .bind_addr(ZAKURA_LOOPBACK_BIND_V4)?
+            .bind_addr(ZAKURA_LOOPBACK_BIND_V6),
     }
 }
 
-fn discovery_direct_addrs(config: &Config, local_node_id: NodeId) -> Vec<SocketAddr> {
+fn discovery_direct_addrs(config: &Config, local_node_id: EndpointId) -> Vec<SocketAddr> {
     let Some(listen_addr) = config.zakura.listen_addr else {
         return Vec::new();
     };
@@ -3381,8 +3344,8 @@ fn discovery_direct_addrs(config: &Config, local_node_id: NodeId) -> Vec<SocketA
         let Ok(node_addr) = super::discovery::parse_bootstrap_peer(entry) else {
             continue;
         };
-        if node_addr.node_id == local_node_id {
-            direct_addrs.extend(node_addr.direct_addresses().copied());
+        if node_addr.id == local_node_id {
+            direct_addrs.extend(node_addr.ip_addrs().copied());
         }
     }
 
@@ -3391,12 +3354,12 @@ fn discovery_direct_addrs(config: &Config, local_node_id: NodeId) -> Vec<SocketA
     direct_addrs
 }
 
-fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId) -> usize {
+fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: EndpointId) -> usize {
     bootstrap_peers
         .iter()
         .filter_map(|entry| super::discovery::parse_bootstrap_peer(entry).ok())
-        .filter(|node_addr| node_addr.node_id != local_node_id)
-        .map(|node_addr| node_addr.node_id)
+        .filter(|node_addr| node_addr.id != local_node_id)
+        .map(|node_addr| node_addr.id)
         .collect::<HashSet<_>>()
         .len()
 }
@@ -3553,7 +3516,7 @@ async fn spawn_zakura_endpoint_inner(
     // Bind a fixed address when configured so this node has a stable, advertisable
     // Zakura endpoint; otherwise bind loopback-only so the unset (dial-out-only)
     // case does not expose the native P2P_V2_ALPN surface on all interfaces.
-    let builder = bind_native_endpoint(builder, config.zakura.listen_addr);
+    let builder = bind_native_endpoint(builder, config.zakura.listen_addr)?;
     let endpoint = builder.bind().await?;
     let supervisor = match peer_registry {
         Some(peer_registry) => ZakuraSupervisorHandle::new_with_peer_registry(
@@ -3768,11 +3731,11 @@ async fn spawn_zakura_endpoint_inner(
                 _ = shutdown.cancelled() => {}
                 node_addr = log_endpoint.node_addr() => {
                     let direct_addresses: Vec<String> = node_addr
-                        .direct_addresses()
+                        .ip_addrs()
                         .map(|addr| addr.to_string())
                         .collect();
                     info!(
-                        node_id = %node_addr.node_id,
+                        node_id = %node_addr.id,
                         ?direct_addresses,
                         "Zakura P2P endpoint ready; advertise <node_id>@<direct_addr> as a bootstrap peer",
                     );
@@ -3812,7 +3775,7 @@ async fn spawn_zakura_endpoint_inner(
 
 pub(crate) async fn serve_native_dial_connection(
     endpoint: &ZakuraEndpoint,
-    node_addr: NodeAddr,
+    node_addr: EndpointAddr,
     limits: &ZakuraLocalLimits,
 ) -> Result<(), ZakuraHandlerError> {
     let conn_id = endpoint
@@ -3831,10 +3794,10 @@ pub(crate) async fn serve_native_dial_connection(
     )
     .await
     .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
-    let remote_node_id = connection.remote_node_id()?;
+    let remote_node_id = connection.remote_id();
     let peer_id = ZakuraPeerId::new(remote_node_id.as_bytes().to_vec())?;
     let conn = ZakuraConnTrace::new(&endpoint.handler.trace, conn_id, &peer_id);
-    let local_node_id = endpoint.router.endpoint().node_id();
+    let local_node_id = endpoint.router.endpoint().id();
     let local_peer_id = ZakuraPeerId::new(local_node_id.as_bytes().to_vec())?;
     let negotiated = {
         let _handshake = endpoint
@@ -3860,7 +3823,7 @@ pub(crate) async fn serve_native_dial_connection(
     // its first direct address to escape the per-IP cap while the connection is
     // served over a different (shared) address. The handshake above exchanged
     // QUIC payload, so the node map now knows the confirmed path.
-    let remote_ip = confirmed_remote_ip(endpoint.router.endpoint(), remote_node_id);
+    let remote_ip = confirmed_remote_ip(&connection);
     let direction = ServicePeerDirection::Outbound;
     endpoint
         .handler
@@ -5205,7 +5168,7 @@ fn validate_idle_invariant(limits: &ZakuraLocalLimits) -> Result<(), ZakuraHandl
 
 fn zakura_secret_key(config: &Config) -> Result<SecretKey, ZakuraHandlerError> {
     // Loads the configured key, or loads/generates+persists a stable key under the
-    // cache dir so the node keeps a consistent NodeId across restarts.
+    // cache dir so the node keeps a consistent EndpointId across restarts.
     config
         .zakura_secret_key()
         .map_err(|_| ZakuraHandlerError::InvalidSecretKey)
@@ -5421,9 +5384,6 @@ pub enum ZakuraHandlerError {
     /// Iroh connect error.
     #[error(transparent)]
     IrohConnect(#[from] iroh::endpoint::ConnectError),
-    /// Iroh remote id error.
-    #[error(transparent)]
-    IrohRemoteId(#[from] iroh::endpoint::RemoteNodeIdError),
     /// Iroh write error.
     #[error(transparent)]
     IrohWrite(#[from] iroh::endpoint::WriteError),
@@ -5530,8 +5490,7 @@ mod tests {
         let dialer = node(140).await?;
         let listener = node(141).await?;
 
-        let listener_peer =
-            ZakuraPeerId::new(listener.node_addr().await.node_id.as_bytes().to_vec())?;
+        let listener_peer = ZakuraPeerId::new(listener.node_addr().await.id.as_bytes().to_vec())?;
         let block_sync = dialer
             .block_sync()
             .expect("the header-sync driver spawns the block-sync reactor");
@@ -5663,8 +5622,8 @@ mod tests {
     /// documented as dial-out only.
     #[tokio::test]
     async fn unset_listen_addr_binds_loopback_not_unspecified() {
-        let builder = direct_endpoint_builder(SecretKey::generate(OsRng));
-        let builder = bind_native_endpoint(builder, None);
+        let builder = direct_endpoint_builder(SecretKey::generate());
+        let builder = bind_native_endpoint(builder, None).expect("loopback addresses are valid");
         let endpoint = builder.bind().await.expect("loopback bind should succeed");
 
         let sockets = endpoint.bound_sockets();
@@ -5683,9 +5642,37 @@ mod tests {
         endpoint.close().await;
     }
 
+    #[tokio::test]
+    async fn configured_listen_addr_binds_only_requested_family() -> Result<(), BoxError> {
+        for addr in [
+            ZAKURA_LOOPBACK_BIND_V4.into(),
+            ZAKURA_LOOPBACK_BIND_V6.into(),
+        ] {
+            let builder = direct_endpoint_builder(LocalEndpointFactory::secret_key(90210));
+            let endpoint = bind_native_endpoint(builder, Some(addr))?.bind().await?;
+            let sockets = endpoint.bound_sockets();
+            assert_eq!(sockets.len(), 1);
+            assert_eq!(sockets[0].ip(), addr.ip());
+            endpoint.close().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn occupied_listen_addr_fails_without_changing_ports() -> Result<(), BoxError> {
+        let occupied = std::net::UdpSocket::bind(ZAKURA_LOOPBACK_BIND_V4)?;
+        let addr = occupied.local_addr()?;
+        let builder = direct_endpoint_builder(LocalEndpointFactory::secret_key(90211));
+        assert!(bind_native_endpoint(builder, Some(addr))?
+            .bind()
+            .await
+            .is_err());
+        Ok(())
+    }
+
     #[test]
     fn discovery_uses_external_ip_with_the_native_listen_port() {
-        let secret_key = SecretKey::generate(OsRng);
+        let secret_key = SecretKey::generate();
         let mut config = Config::default();
         config.zakura.listen_addr = Some("0.0.0.0:8234".parse().expect("test address parses"));
         config.external_addr = Some("203.0.113.42:8233".parse().expect("test address parses"));
@@ -5699,8 +5686,8 @@ mod tests {
 
     #[test]
     fn discovery_uses_matching_local_bootstrap_address_and_counts_only_remote_peers() {
-        let local_secret_key = SecretKey::generate(OsRng);
-        let remote_secret_key = SecretKey::generate(OsRng);
+        let local_secret_key = SecretKey::generate();
+        let remote_secret_key = SecretKey::generate();
         let local_node_id = local_secret_key.public();
         let remote_node_id = remote_secret_key.public();
         let local_entry = format!("{local_node_id}@198.51.100.7:8234");
@@ -6675,8 +6662,12 @@ mod tests {
         // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): guaranteed unreachable, so the
         // maintained loop stays in connect/backoff and never finishes on its own.
         let unreachable_addr: SocketAddr = "192.0.2.1:65535".parse().expect("valid test address");
-        let unreachable = NodeAddr::new(LocalEndpointFactory::secret_key(987_654).public())
-            .with_direct_addresses([unreachable_addr]);
+        let unreachable = EndpointAddr::new(LocalEndpointFactory::secret_key(987_654).public())
+            .with_addrs(
+                ([unreachable_addr])
+                    .into_iter()
+                    .map(iroh::TransportAddr::Ip),
+            );
         let dial = endpoint.spawn_native_dial(unreachable);
 
         // Let the maintained loop start before tearing the endpoint down.
@@ -6713,7 +6704,7 @@ mod tests {
         let limits = ZakuraLocalLimits::from_config(&config);
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
         let discovery = crate::zakura::discovery::build_discovery_handle(
-            SecretKey::generate(OsRng),
+            SecretKey::generate(),
             Vec::new(),
             crate::zakura::discovery::default_advertised_services(),
             &handshake,
@@ -6765,7 +6756,7 @@ mod tests {
         .expect("v2_p2p is enabled in test config");
 
         // The Accept the attacker would advertise: a real 32-byte iroh node id
-        // (so `node_addr_from_hints` builds a `NodeAddr` and the dial spawns)
+        // (so `node_addr_from_hints` builds a `EndpointAddr` and the dial spawns)
         // pointing at an unreachable address that never registers.
         let node_id = LocalEndpointFactory::secret_key(0x0BAD_C0DE)
             .public()
@@ -6808,8 +6799,11 @@ mod tests {
         .expect("v2_p2p is enabled in test config");
         let node_id = LocalEndpointFactory::secret_key(0x0BAD_CAFE).public();
         let peer_id = ZakuraPeerId::new(node_id.as_bytes().to_vec())?;
-        let node_addr = NodeAddr::new(node_id)
-            .with_direct_addresses(["192.0.2.2:1".parse().expect("test direct address parses")]);
+        let node_addr = EndpointAddr::new(node_id).with_addrs(
+            (["192.0.2.2:1".parse().expect("test direct address parses")])
+                .into_iter()
+                .map(iroh::TransportAddr::Ip),
+        );
 
         assert_eq!(
             endpoint.start_upgrade_native_dial(node_addr.clone()),
@@ -6864,7 +6858,7 @@ mod tests {
         .expect("test server uses Zakura");
         let server_addr = server.node_addr().await;
         let server_direct = server_addr
-            .direct_addresses()
+            .ip_addrs()
             .copied()
             .find(|addr| addr.ip().is_loopback())
             .ok_or("test server has no loopback address")?;
@@ -6872,8 +6866,7 @@ mod tests {
         let mut client_config = Config::for_test(P2pStack::Dual);
         client_config.identity_dir = client_identity.path().to_owned();
         client_config.zakura.listen_addr = Some(listen_addr);
-        client_config.zakura.bootstrap_peers =
-            vec![format!("{}@{server_direct}", server_addr.node_id)];
+        client_config.zakura.bootstrap_peers = vec![format!("{}@{server_direct}", server_addr.id)];
         let client = spawn_zakura_endpoint_with_services(
             &client_config,
             |_supervisor, _trace| Arc::new(NoopService),
@@ -7833,8 +7826,7 @@ mod tests {
             )
             .spawn();
         let client = LocalEndpointFactory::new().endpoint(51).await?;
-        let server_addr = router.endpoint().node_addr().initialized().await;
-        client.add_node_addr(server_addr.clone())?;
+        let server_addr = router.endpoint().addr();
 
         let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
             .await
@@ -7994,8 +7986,7 @@ mod tests {
             )
             .spawn();
         let client = LocalEndpointFactory::new().endpoint(81).await?;
-        let server_addr = router.endpoint().node_addr().initialized().await;
-        client.add_node_addr(server_addr.clone())?;
+        let server_addr = router.endpoint().addr();
 
         let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
             .await
@@ -8178,8 +8169,7 @@ mod tests {
             )
             .spawn();
         let client = LocalEndpointFactory::new().endpoint(75).await?;
-        let server_addr = router.endpoint().node_addr().initialized().await;
-        client.add_node_addr(server_addr.clone())?;
+        let server_addr = router.endpoint().addr();
 
         let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
             .await
@@ -8261,8 +8251,7 @@ mod tests {
             )
             .spawn();
         let client = LocalEndpointFactory::new().endpoint(71).await?;
-        let server_addr = router.endpoint().node_addr().initialized().await;
-        client.add_node_addr(server_addr.clone())?;
+        let server_addr = router.endpoint().addr();
 
         let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
             .await
@@ -8402,8 +8391,7 @@ mod tests {
             )
             .spawn();
         let client = LocalEndpointFactory::new().endpoint(73).await?;
-        let server_addr = router.endpoint().node_addr().initialized().await;
-        client.add_node_addr(server_addr.clone())?;
+        let server_addr = router.endpoint().addr();
 
         // A frame header (message_type, flags, payload_len) with no payload bytes.
         let frame_header = |payload_len: u32| -> Vec<u8> {
@@ -8558,8 +8546,8 @@ mod tests {
             )
             .spawn();
         let client = LocalEndpointFactory::new().endpoint(91).await?;
-        let server_addr = router.endpoint().node_addr().initialized().await;
-        client.add_node_addr(server_addr.clone())?;
+        let server_addr = router.endpoint().addr();
+
         let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
             .await
             .expect("client connects to the open-rate-churn endpoint")?;
@@ -9364,15 +9352,16 @@ mod tests {
         // IPv4 loopback, one global IPv6) and therefore present different source
         // IPs. Pin both dials to the server's IPv4 loopback address so they share
         // one source IP (127.0.0.1) -- the single-source-IP shape of the finding.
-        let full_addr = router.endpoint().node_addr().initialized().await;
-        let loopback_addr = NodeAddr::new(full_addr.node_id).with_direct_addresses(
-            full_addr
-                .direct_addresses()
+        let full_addr = router.endpoint().addr();
+        let loopback_addr = EndpointAddr::new(full_addr.id).with_addrs(
+            (full_addr
+                .ip_addrs()
                 .copied()
-                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()),
+                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()))
+            .map(iroh::TransportAddr::Ip),
         );
         assert!(
-            loopback_addr.direct_addresses().next().is_some(),
+            loopback_addr.ip_addrs().next().is_some(),
             "server must advertise an IPv4 loopback direct address",
         );
         let server_addr = loopback_addr;
@@ -9381,14 +9370,14 @@ mod tests {
         // separately so a per-IP rejection mid-handshake (the second identity)
         // can be observed instead of aborting the test.
         async fn connect_native(
-            server_addr: &NodeAddr,
+            server_addr: &EndpointAddr,
             seed: u64,
             limits: &ZakuraLocalLimits,
         ) -> Result<(Endpoint, Connection), BoxError> {
             let endpoint = LocalEndpointFactory::with_transport_config(limits.transport_config())
                 .endpoint(seed)
                 .await?;
-            endpoint.add_node_addr(server_addr.clone())?;
+
             let connection = endpoint.connect(server_addr.clone(), P2P_V2_ALPN).await?;
             Ok((endpoint, connection))
         }
@@ -9398,7 +9387,7 @@ mod tests {
             limits: &ZakuraLocalLimits,
         ) -> Result<(), BoxError> {
             let config = ZakuraHandshakeConfig::for_network(&Config::default().network);
-            let local_peer_id = ZakuraPeerId::new(endpoint.node_id().as_bytes().to_vec())?;
+            let local_peer_id = ZakuraPeerId::new(endpoint.id().as_bytes().to_vec())?;
             run_native_initiator_handshake_without_trace(
                 connection,
                 limits,
